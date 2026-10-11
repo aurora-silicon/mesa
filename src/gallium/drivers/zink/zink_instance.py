@@ -132,6 +132,70 @@ impl_code = """
 #include "vk_enum_to_str.h"
 #include "zink_instance.h"
 #include "zink_screen.h"
+#ifdef __linux__
+#include <dlfcn.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static void
+zink_instance_diagnostic_binding(const char *name, void *function)
+{
+   Dl_info info = {0};
+   struct stat st = {0};
+   const char *kind = "unknown";
+   bool available = function && dladdr(function, &info) && info.dli_fname;
+   if (available) {
+      const char *base = strrchr(info.dli_fname, '/');
+      base = base ? base + 1 : info.dli_fname;
+      if (!strcmp(base, "libvulkan.so") || !strcmp(base, "libvulkan.so.1"))
+         kind = "vulkan_loader";
+      else if (!strcmp(base, "libvulkan_asahi.so"))
+         kind = "vulkan_icd";
+      else
+         kind = "other";
+      if (stat(info.dli_fname, &st))
+         available = false;
+   }
+   fprintf(stderr, "AURORA_VK_BIND pid=%ld name=%s module_kind=%s identity=%u dev=%ju ino=%ju\\n",
+           (long)getpid(), name, kind, (unsigned)available, (uintmax_t)st.st_dev,
+           (uintmax_t)st.st_ino);
+}
+
+static void
+zink_instance_diagnostic(struct zink_screen *screen, PFN_vkCreateInstance create,
+                         const struct zink_instance_info *instance_info,
+                         const VkApplicationInfo *ai,
+                         const VkInstanceCreateInfo *ici, const char *phase,
+                         int32_t result)
+{
+   const char *enabled = getenv("AURORA_VK_INSTANCE_DIAGNOSTIC");
+   if (!enabled || strcmp(enabled, "1"))
+      return;
+   unsigned machine = 0;
+#if defined(__aarch64__)
+   machine = 183;
+#elif defined(__x86_64__)
+   machine = 62;
+#elif defined(__i386__)
+   machine = 3;
+#endif
+   fprintf(stderr, "AURORA_VK_INSTANCE phase=%s pid=%ld ppid=%ld pages=%lu machine=%u requested_api=%u loader_api=%u layers=%u extensions=%u flags=%u pnext=%u result_known=%u result=%d\\n",
+           phase, (long)getpid(), (long)getppid(), getauxval(AT_PAGESZ),
+           machine, ai->apiVersion, instance_info->loader_version,
+           ici->enabledLayerCount, ici->enabledExtensionCount, ici->flags,
+           (unsigned)(ici->pNext != NULL), (unsigned)!strcmp(phase, "after"), result);
+   if (!strcmp(phase, "before")) {
+      zink_instance_diagnostic_binding("gipa", (void *)screen->vk_GetInstanceProcAddr);
+      zink_instance_diagnostic_binding("enum_version", (void *)screen->vk_GetInstanceProcAddr(NULL, "vkEnumerateInstanceVersion"));
+      zink_instance_diagnostic_binding("create", (void *)create);
+   }
+}
+#endif
 
 VkInstance
 zink_create_instance(struct zink_screen *screen, struct zink_instance_info *instance_info)
@@ -279,7 +343,13 @@ zink_create_instance(struct zink_screen *screen, struct zink_instance_info *inst
    assert(vk_CreateInstance);
 
    VkInstance instance;
+#ifdef __linux__
+   zink_instance_diagnostic(screen, vk_CreateInstance, instance_info, &ai, &ici, "before", 0);
+#endif
    VkResult err = vk_CreateInstance(&ici, NULL, &instance);
+#ifdef __linux__
+   zink_instance_diagnostic(screen, vk_CreateInstance, instance_info, &ai, &ici, "after", err);
+#endif
    if (err != VK_SUCCESS) {
       if (!screen->driver_name_is_inferred)
           mesa_loge("ZINK: vkCreateInstance failed (%s)", vk_Result_to_str(err));
