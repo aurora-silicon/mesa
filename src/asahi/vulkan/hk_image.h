@@ -62,6 +62,14 @@ struct hk_image_plane {
     * secondary page table. Otherwise, this map is NULL.
     */
    struct agx_bo *sparse_map;
+
+   /* Byte offset of this plane from the start of its memory binding, given
+    * by VkImageDrmFormatModifierExplicitCreateInfoEXT::pPlaneLayouts. Only
+    * valid if has_explicit_offset is set; otherwise planes are packed
+    * sequentially, aligned to HK_PLANE_ALIGN_B.
+    */
+   bool has_explicit_offset;
+   uint64_t explicit_offset_B;
 };
 
 struct hk_image {
