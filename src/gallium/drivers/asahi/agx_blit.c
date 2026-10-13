@@ -585,7 +585,8 @@ agx_g17p_direct_resolve_blit_shape(const struct pipe_blit_info *info,
 static bool
 agx_g17p_attach_direct_resolve(struct agx_context *ctx,
                                struct pipe_resource *msaa,
-                               struct pipe_resource *single)
+                               struct pipe_resource *single,
+                               bool preserve_source)
 {
    struct agx_batch *batch =
       agx_writer_get(ctx, agx_resource(msaa)->bo->handle);
@@ -599,8 +600,11 @@ agx_g17p_attach_direct_resolve(struct agx_context *ctx,
        batch->key.cbufs[0].last_layer != 0)
       return false;
 
+   batch->g17p_resolve_preserve |= preserve_source;
    if (!batch->key.resolve) {
       pipe_resource_reference(&batch->key.resolve, single);
+      if (ctx->batch == batch)
+         ctx->batch = NULL;
       agx_batch_writes(batch, agx_resource(single), 0);
    }
    return true;
@@ -655,7 +659,7 @@ agx_g17p_staged_resolve_blit(struct agx_context *ctx,
    if (!resolved)
       return false;
 
-   if (!agx_g17p_attach_direct_resolve(ctx, src, resolved)) {
+   if (!agx_g17p_attach_direct_resolve(ctx, src, resolved, true)) {
       pipe_resource_reference(&resolved, NULL);
       return false;
    }
@@ -736,13 +740,12 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                                    : info->dst.resource;
          stencil.dst.format = PIPE_FORMAT_R8_UINT;
          stencil.mask = PIPE_MASK_R;
-         /* There is no meaningful average of stencil values, so resolving a
-          * multisample stencil buffer takes sample zero. Saying so also keeps
-          * u_blitter off its per-sample shading path, whose sample loop the
-          * G17P fast linker cannot encode: without this the blit's fragment
-          * program fails to link and the stencil aspect is silently dropped.
+         /* Resolve stencil by selecting sample zero, but preserve every
+          * sample when copying between multisample images. G17P sample
+          * shading handles the latter through the shared static lowering.
           */
-         stencil.sample0_only = info->src.resource->nr_samples > 1;
+         stencil.sample0_only = info->src.resource->nr_samples > 1 &&
+                                info->dst.resource->nr_samples <= 1;
          agx_blit(pipe, &stencil);
          return;
       }
@@ -763,7 +766,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
        agx_g17p_direct_resolve_blit_shape(info, true) &&
        agx_g17p_attach_direct_resolve(ctx, info->src.resource,
-                                      info->dst.resource))
+                                      info->dst.resource, true))
       return;
 
    if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
@@ -800,7 +803,7 @@ agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    if (agx_device(ctx->base.screen)->chip == AGX_CHIP_G17P &&
        agx_g17p_direct_resolve_blit_shape(info, false)) {
       if (agx_g17p_attach_direct_resolve(ctx, info->dst.resource,
-                                       info->src.resource)) {
+                                       info->src.resource, false)) {
          struct agx_batch *batch =
             agx_writer_get(ctx, agx_resource(info->dst.resource)->bo->handle);
          batch->g17p_resolve_reload = true;

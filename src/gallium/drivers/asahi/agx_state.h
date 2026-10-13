@@ -177,6 +177,7 @@ struct PACKED agx_stage_uniforms {
     * tables to bindless access.
     */
    uint64_t texture_base;
+   uint64_t buffer_texture_base;
 
    /* Uniform buffer objects */
    uint64_t ubo_base[PIPE_MAX_CONSTANT_BUFFERS];
@@ -318,6 +319,9 @@ struct agx_uncompiled_shader {
       bool has_edgeflags;
       bool uses_fbfetch;
       bool uses_sample_shading;
+      bool needs_sample_count;
+      bool uses_buffer_textures;
+      bool uses_query_lod;
       bool writes_memory;
 
       /* Number of bindful textures, images used */
@@ -434,6 +438,7 @@ struct agx_batch {
 
    /* Executable storage is owned by this batch's pipeline pool. */
    uint64_t g17p_fragment_program;
+   uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
 
@@ -445,6 +450,7 @@ struct agx_batch {
 
    /* Only a loader-provided resolve may seed the multisample tile reload. */
    bool g17p_resolve_reload;
+   bool g17p_resolve_preserve;
 
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
@@ -564,9 +570,14 @@ struct asahi_fs_shader_key {
 };
 static_assert(sizeof(struct asahi_fs_shader_key) == 40, "no holes");
 
+struct asahi_cs_shader_key {
+   bool custom_borders;
+};
+
 union asahi_shader_key {
    struct asahi_vs_shader_key vs;
    struct asahi_fs_shader_key fs;
+   struct asahi_cs_shader_key cs;
 };
 
 enum agx_dirty {
@@ -845,7 +856,7 @@ struct agx_compiled_shader *agx_build_meta_shader(struct agx_context *ctx,
 void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 struct agx_workgroup wg, struct agx_compiled_shader *cs,
                 struct agx_linked_shader *linked, mesa_shader_stage stage,
-                unsigned variable_shared_mem);
+                unsigned variable_shared_mem, uint64_t indirect_num_workgroups);
 
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                         enum agx_barrier barrier, enum libagx_program program,

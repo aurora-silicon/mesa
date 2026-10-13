@@ -1310,6 +1310,8 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          .pbe_argument_va = pbe_argument_va,
          .imageblock_offset_B = agx_tilebuffer_offset_B(&key->tib, 0),
          .attachment_count = attachment_count,
+         /* Layered MRT uses the shared array builtin, like Gallium. */
+         .mixed_mrt = attachment_count >= 2,
          .imageblock_offset1_B =
             attachment_count > 1 ? agx_tilebuffer_offset_B(&key->tib, 1) : 0,
          .imageblock_offset2_B = attachment_count > 2 ? agx_tilebuffer_offset_B(&key->tib, 2) : 0,
@@ -4148,45 +4150,9 @@ build_fs_prolog(nir_builder *b, const void *key)
 }
 
 static void
-build_g17p_fs_epilog(nir_builder *b, const void *key_)
+build_g17p_fs_epilog(nir_builder *b, const void *key)
 {
-   const struct agx_fs_epilog_key *key = key_;
-   if (key->link.sample_shading) {
-      /* The main fragment exported every sample's colours. Build the per-pixel
-       * epilog, then store and blend each sample from its own colours. */
-      struct agx_fs_epilog_key pixel = *key;
-      pixel.link.sample_shading = false;
-      pixel.defer_monolithic_msaa = true;
-      agx_nir_fs_epilog(b, &pixel);
-
-      struct agx_g17p_colour_layout layout;
-      agx_g17p_colour_layout_init(&layout, key->link.loc_written,
-                                  key->link.size_32, key->link.colour_comps,
-                                  key->link.packed_colour);
-
-      NIR_PASS(_, b->shader, agx_nir_lower_to_per_sample);
-      NIR_PASS(_, b->shader, agx_nir_unroll_g17p_samples_layout,
-               key->nr_samples, &layout);
-      bool opt_progress;
-      do {
-         opt_progress = false;
-         NIR_PASS(opt_progress, b->shader, nir_opt_constant_folding);
-         NIR_PASS(opt_progress, b->shader, nir_opt_algebraic);
-      } while (opt_progress);
-      NIR_PASS(_, b->shader, agx_nir_hoist_g17p_zs_writes);
-   } else {
-      /* G17P's tile operations carry the live coverage register. With
-       * alpha-to-coverage, Apple's 2x/4x blended fragments therefore issue
-       * one masked tile load/store pair rather than cloning the blend once
-       * per sample. Keep the ordinary per-sample lowering for every other
-       * pixel-shaded epilog. */
-      struct agx_fs_epilog_key pixel = *key;
-      pixel.defer_monolithic_msaa = key->blend.alpha_to_coverage &&
-                                    key->nr_samples > 1;
-      agx_nir_fs_epilog(b, &pixel);
-   }
-
-   NIR_PASS(_, b->shader, agx_nir_lower_g17p_tile_samples, key->nr_samples);
+   agx_nir_fs_epilog_g17p(b, key);
 }
 
 /*
@@ -8176,6 +8142,11 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
 
    if (draw.restart) {
       uint32_t index_size_B = agx_index_size_to_B(draw.index_size);
+      /* The range helper removes firstIndex for direct draws. Adjust its
+       * matching base too; indirect draws retain their original base/range
+       * and read firstIndex from the application draw descriptor.
+       */
+      uint64_t index_buffer = agx_draw_index_buffer(draw);
 
       if (dev->dev.chip == AGX_CHIP_G17P) {
          /* Disabled statistics are represented by the writable scratch page,
@@ -8184,13 +8155,13 @@ hk_ia_update(struct hk_cmd_buffer *cmd, struct agx_draw draw,
          libagx_increment_ia_restart_nonnull(
             cmd, agx_1d(1024), AGX_BARRIER_ALL | AGX_PREGFX, ia_vertices,
             ia_prims, vs_invocations, c_prims, c_inv, draw_ptr,
-            draw.index_buffer, agx_draw_index_range_el(draw),
+            index_buffer, agx_draw_index_range_el(draw),
             dyn->ia.primitive_restart_index, index_size_B, prim, patch_size);
       } else {
          libagx_increment_ia_restart(
             cmd, agx_1d(1024), AGX_BARRIER_ALL | AGX_PREGFX, ia_vertices,
             ia_prims, vs_invocations, c_prims, c_inv, draw_ptr,
-            draw.index_buffer, agx_draw_index_range_el(draw),
+            index_buffer, agx_draw_index_range_el(draw),
             dyn->ia.primitive_restart_index, index_size_B, prim, patch_size);
       }
    } else {

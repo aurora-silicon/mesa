@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_nir_sampler_bias.h"
 #include "util/u_debug.h"
 
 #include "hk_nir_ray_tracing.h"
@@ -42,6 +43,7 @@
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
 #include "hk_shader.h"
+#include "hk_nir_sampler_bias.h"
 
 #include "nir_builder_opcodes.h"
 #include "nir_builtin_builder.h"
@@ -1958,11 +1960,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * Only the Gen4 sampler word has no LOD-bias field. On every later
     * generation hk_CreateSampler writes the API bias into the hardware
     * sampler (SAMPLER_HAL200.lod_bias, SAMPLER_GEN5.lod_bias) and
-    * deliberately publishes a *zero* software bias, so lowering the software
-    * bias into the shader adds a descriptor crawl that provably computes
+    * keeps ordinary sampling in hardware. Lowering a zero software bias
+    * into every shader would add a descriptor crawl that computes
     * nothing: it turns every tex into txb(load 0), and every txd into
     * gradients scaled by exp2(load 0). Skipping it is a no-op for the value
     * and keeps a genuine API bias or gradient as the shader's own operand.
+    * G17P txb is handled separately below: its two biases must be added
+    * before the sampler/instruction's fixed-point quantization.
     */
    const bool support_lod_bias =
       agx_chip_sampler_generation(dev->dev.chip) == AGX_SAMPLER_GENERATION_GEN4;
@@ -1979,6 +1983,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, agx_nir_lower_g17p_texture_early, support_lod_bias);
    else
       NIR_PASS(_, nir, agx_nir_lower_texture_early, support_lod_bias);
+
+   if (dev->dev.chip == AGX_CHIP_G17P)
+      NIR_PASS(_, nir, nir_shader_tex_pass, hk_lower_g17p_sampler_bias,
+               nir_metadata_control_flow, NULL);
 
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);
@@ -3000,48 +3008,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          assert(key && (key->fs.g17p_samples == 2 ||
                         key->fs.g17p_samples == 4));
 
-         struct agx_fs_epilog_link_info *link = &shader->info.fs.epilog_key;
-         struct agx_g17p_colour_layout layout;
-
-         /* Pack the colours only where the ABI's slots do not fit the
-          * register file, which hk_g17p_unrolls_sample_shading() has already
-          * admitted this shader on. Every shape that fits keeps the layout
-          * and the code it has today. */
-         agx_g17p_colour_layout_init(&layout, link->loc_written,
-                                     link->size_32, link->colour_comps,
-                                     false);
-
-         if (agx_g17p_sample_exports_end(&layout, key->fs.g17p_samples) >
-             AGX3B_NUM_REGS) {
-            NIR_PASS(_, nir, agx_nir_pack_g17p_colour_exports, link);
-            agx_g17p_colour_layout_init(&layout, link->loc_written,
-                                        link->size_32, link->colour_comps,
-                                        true);
-         }
-
-         /* hk_g17p_unrolls_sample_shading() charges every location it could
-          * not read exactly the ABI's whole slot, so the layout the split
-          * recorded is never larger than the one it admitted. Fail the shader
-          * rather than name export registers outside the file if that ever
-          * stops holding: halves 192..255 fit the encoding but crash the
-          * co-processor. */
-         if (agx_g17p_sample_exports_end(&layout, key->fs.g17p_samples) >
-             AGX3B_NUM_REGS) {
+         if (!agx_nir_lower_g17p_sample_shading(
+                nir, &shader->info.fs.epilog_key, key->fs.g17p_samples)) {
             assert(!"the gate admitted a fragment whose exports do not fit");
             ralloc_free(nir);
             return vk_errorf(dev, VK_ERROR_UNKNOWN,
-                             "G17P: %u-sample colour exports need %u halves "
-                             "of a %u-half register file",
-                             key->fs.g17p_samples,
-                             agx_g17p_sample_exports_end(&layout,
-                                                         key->fs.g17p_samples),
-                             (unsigned)AGX3B_NUM_REGS);
+                             "G17P: %u-sample colour exports exceed the register file",
+                             key->fs.g17p_samples);
          }
-
-         NIR_PASS(_, nir, agx_nir_lower_to_per_sample);
-         NIR_PASS(_, nir, agx_nir_unroll_g17p_samples_layout,
-                  key->fs.g17p_samples, &layout);
-         nir->info.fs.uses_sample_shading = false;
       } else if (nir->info.fs.uses_sample_shading) {
          /* Ensure the sample mask is preserved in register */
          nir_builder b =

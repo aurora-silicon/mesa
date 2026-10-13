@@ -1646,7 +1646,8 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
                               enum agx_isa_encoding enc, const agx_instr *I,
                               uint16_t wait_mask,
                               struct agx3_staging_banks *banks,
-                              uint16_t bank_floor, uint16_t *outstanding)
+                              uint16_t bank_floor, uint16_t *outstanding,
+                              uint8_t *write_slot)
 {
    const bool normalized = I->format == AGX_FORMAT_U8NORM ||
                            I->format == AGX_FORMAT_RGB10A2;
@@ -1839,6 +1840,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
          fprintf(stderr, "G17P imgwci instruction compose refusal\n");
       goto fail;
    }
+   *write_slot = slot;
    util_dynarray_fini(&staged);
    return true;
 
@@ -2142,20 +2144,12 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
    const bool cube_register_lod =
       cube && ((explicit_lod && !immediate_lod) || register_bias || bias_min);
 
-   /* The immediate cube corpus uses fixed r0/r7/r2 CEM destinations. Dynamic
-    * descriptor forms, and any cube whose staged LOD must survive CEM, use
-    * the allocator-owned bank supplied below. */
-   const bool fixed_cem = immediate && !cube_register_lod;
-   if (cube && fixed_cem) {
-      const unsigned coord_first = I->src[0].value;
-      const unsigned coord_last = coord_first + (cube_array && !query_lod ? 8 : 6);
-      if (coord_first < 2 || (coord_first < 16 && coord_last > 14))
-         return agx3_tex_decline(I, __LINE__);
-   } else if (cube &&
-              (cem_scratch == NULL || (cem_scratch[0] & 1) ||
-               cem_scratch[2] > 190)) {
+   /* Every cube pipeline needs scratch outside the allocated live values.
+    * Immediate descriptors do not make r0/r7/r2 free: a preceding gather
+    * may still hold its result there when this CEM pipeline executes. */
+   if (cube && (cem_scratch == NULL || (cem_scratch[0] & 1) ||
+                cem_scratch[2] > 190))
       return agx3_tex_decline(I, __LINE__);
-   }
 
    /* Native register-indexed array and cube samples publish their coordinate /
     * face operand bank on slot 6 and wait slot 6 in SMP, independently of the
@@ -2322,38 +2316,25 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       if (wait_mask && (!register_operands || wait_mask != staged_wait))
          return agx3_tex_decline(I, __LINE__);
 
-      const uint16_t fixed_scratch[3] = {0, 14, 4};
-      const uint16_t *scratch = fixed_cem ? fixed_scratch : cem_scratch;
+      const uint16_t *scratch = cem_scratch;
       for (unsigned axis = 0; axis < 3; ++axis) {
-         const bool packed = fixed_cem
-            ? agx3_tex_cube_cem_calc(
-                 enc, I->src[0].value, I->src[0].value + 2,
-                 I->src[0].value + 4, axis,
-                 axis == 2 && I->src[0].discard, bytes, &len)
-            : agx3_tex_cube_cem_calc_to(
-                 enc, I->src[0].value, I->src[0].value + 2,
-                 I->src[0].value + 4, scratch[axis], axis,
-                 axis == 2 && I->src[0].discard, bytes, &len);
-         if (!packed ||
+         if (!agx3_tex_cube_cem_calc_to(
+                enc, I->src[0].value, I->src[0].value + 2,
+                I->src[0].value + 4, scratch[axis], axis,
+                axis == 2 && I->src[0].discard, bytes, &len) ||
              !agx3_append(emission, bytes, len))
             return agx3_tex_decline(I, __LINE__);
 
          if (axis == 0 &&
-             (!(fixed_cem
-                   ? agx3_tex_cube_cem_rcp(enc, bytes, &len)
-                   : agx3_tex_cube_cem_rcp_to(enc, scratch[0], bytes, &len)) ||
+             (!agx3_tex_cube_cem_rcp_to(enc, scratch[0], bytes, &len) ||
               !agx3_append(emission, bytes, len)))
             return agx3_tex_decline(I, __LINE__);
       }
 
       for (unsigned component = 0; component < 2; ++component) {
-         const bool packed = fixed_cem
-            ? agx3_tex_cube_cem_finalize(enc, component, component == 1,
-                                         bytes, &len)
-            : agx3_tex_cube_cem_finalize_to(
-                 enc, component, scratch[0], scratch[component + 1],
-                 stage_slot, bytes, &len);
-         if (!packed ||
+         if (!agx3_tex_cube_cem_finalize_to(
+                enc, component, scratch[0], scratch[component + 1],
+                stage_slot, bytes, &len) ||
              !agx3_append(emission, bytes, len))
             return agx3_tex_decline(I, __LINE__);
       }
@@ -2400,7 +2381,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       return agx3_tex_decline(I, __LINE__);
 
    if (cube) {
-      const uint16_t face = fixed_cem ? 2 : cem_scratch[0] + 2;
+      const uint16_t face = cem_scratch[0] + 2;
       const uint16_t layer = I->src[0].value + 6;
       bool packed;
       if (cube_array && cube_register_lod) {
@@ -5594,6 +5575,12 @@ agx3_g17p_vertex_output_count(agx_context *ctx, enum agx_isa_encoding enc)
                 I->sr != AGX_SR_INSTANCE_ID)
                return 0;
             break;
+         case AGX_OPCODE_SCOPED_BARRIER_AGX3:
+            /* A memory fence does not overwrite vertex staging. The
+             * nonterminal output path retires each COPY before it, and the
+             * normal barrier encoder preserves the requested memory scope.
+             */
+            break;
          default:
             /* Once writeout begins only ST_VARY followed by STOP is safe.
              * Before it begins, side-effecting instructions are fine: they
@@ -7626,8 +7613,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
       for (unsigned rt = 0; rt < array_eot_count; ++rt) {
          const uint8_t selector = ctx->key->g17p_mrt_eot_selectors[rt];
+         const bool store_samples = multisample &&
+            !(ctx->key->g17p_mrt_eot_resolve_mask & BITFIELD_BIT(rt));
          program[agx3_g17p_array_eot[array_eot_count].selector[rt]] =
-            multisample ? (selector & 0xf0) : selector;
+            store_samples ? (selector & 0xf0) : selector;
       }
 
       /* The matched synthetic graph used registers that are absent from the
@@ -7685,7 +7674,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          for (unsigned rt = 0; rt < multi_eot_count; ++rt) {
             const unsigned imgwblk = templates[multi_eot_count].imgwblk[rt];
             uint8_t selector = ctx->key->g17p_mrt_eot_selectors[rt];
-            if (multisample) {
+            const bool store_samples = multisample &&
+               !(ctx->key->g17p_mrt_eot_resolve_mask & BITFIELD_BIT(rt));
+            if (store_samples) {
                program[templates[multi_eot_count].imgwir_wire[rt]] |= 0x02;
                program[imgwblk + 8] &= 0x7f;
                selector = (selector & 0xf0) | 0x02;
@@ -7988,6 +7979,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    struct util_dynarray fixups;
    uint16_t outstanding = 0;
+   uint16_t image_write_slots = 0;
    uint8_t next_uvs_slot = 1;
    unsigned texture_ops_left = 0;
    unsigned tile_loads_left = 0;
@@ -8020,7 +8012,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
       for (unsigned h = 0; h < ctx->out->rodata.size_16 && base + h < 512; ++h)
          uniform_half_used[base + h] = true;
    }
-   bool has_dynamic_cube_sample = false;
+   bool has_cube_sample = false;
    bool has_packed_array_layer = false;
    unsigned observed_max_reg = ctx->max_reg;
    unsigned count = 0;
@@ -8132,10 +8124,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ((scan_I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                  scan_I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
                 scan_I->src[1].type != AGX_INDEX_IMMEDIATE);
-            if (register_lod ||
-                scan_I->src[3].type != AGX_INDEX_IMMEDIATE ||
-                scan_I->src[4].type != AGX_INDEX_IMMEDIATE)
-               has_dynamic_cube_sample = true;
+            has_cube_sample = true;
             /* So is a cube face packed beside a bias and minimum. */
             if (register_lod &&
                 (scan_I->dim == AGX_DIM_CUBE_ARRAY || bias_min))
@@ -8214,7 +8203,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * (the CEM destination field reaches half 190), so no live register is
     * overwritten. */
    uint16_t cem_scratch[3] = {0};
-   if (has_dynamic_cube_sample) {
+   if (has_cube_sample) {
       const unsigned base = (observed_max_reg + 2) & ~1u;
       if (base + 6 > 190)
          goto fail;
@@ -8681,12 +8670,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ((I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
                  I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS) &&
                 I->src[1].type != AGX_INDEX_IMMEDIATE);
-            const bool dynamic_cem = register_lod ||
-               I->src[3].type != AGX_INDEX_IMMEDIATE ||
-               I->src[4].type != AGX_INDEX_IMMEDIATE;
-            const uint16_t fixed_scratch[3] = {0, 14, 4};
-            const uint16_t *scratch = dynamic_cem ? cem_scratch
-                                                   : fixed_scratch;
+            const uint16_t *scratch = cem_scratch;
             assert(nd + 5 <= AGX3_SLOT_MAX_REGS);
             e->dst[nd++] = scratch[0];
             e->dst[nd++] = scratch[0] + 2;
@@ -8941,6 +8925,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          /* A wait retires its slots before this instruction issues its own. */
          outstanding &= (uint16_t)~wait;
          const uint16_t outstanding_here = outstanding;
+         image_write_slots &= outstanding_here;
+         /* A new scheduled producer starts a different slot generation. */
+         if (slot)
+            image_write_slots &= (uint16_t)~(1u << (slot - 1));
          if (slot)
             outstanding |= (uint16_t)(1u << (slot - 1));
 
@@ -9492,11 +9480,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_IMAGE_WRITE) {
+            uint8_t write_slot;
             if (!agx3_emit_storage_image_write(emission, enc, I, wait,
                                                &staging_banks,
                                                image_write_bank_floor,
-                                               &outstanding))
+                                               &outstanding, &write_slot))
                AGX3_REFUSE(I);
+            image_write_slots &= outstanding;
+            image_write_slots |= 1u << (write_slot - 1);
             ctx->agx3_staging_halfs =
                MAX2(ctx->agx3_staging_halfs, MAX2(staging_banks.end, 16));
             continue;
@@ -10691,11 +10682,24 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * issued writes, which the scheduler's drain cannot see. */
             const bool device = I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
                                 I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE;
-            const uint16_t retire = wait | (device ? outstanding_here : 0);
+            /* The native PBE-to-texture fence includes a wait on slot1.
+             * Heap image writes rotate through the six completion slots,
+             * however, so retire their other live generations before the
+             * fence invalidates the texture cache. Waiting after the fence
+             * is too late: a following read can still observe the old texel.
+             * Unrelated memory/texture producers do not join this wait. */
+            const bool texture_wait =
+               I->imm == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT;
+            const uint16_t image_wait = texture_wait
+               ? image_write_slots & outstanding_here & ~1u : 0;
+            const uint16_t retire =
+               wait | image_wait | (device ? outstanding_here : 0);
             if (!agx3_emit_scoped_barrier(emission, enc, I, retire))
                AGX3_REFUSE(I);
-            outstanding &= (uint16_t)~retire;
-            agx3_staging_forget(&staging_banks, retire);
+            const uint16_t completed = retire | (texture_wait ? 1u : 0);
+            outstanding &= (uint16_t)~completed;
+            image_write_slots &= (uint16_t)~completed;
+            agx3_staging_forget(&staging_banks, completed);
             continue;
          }
 

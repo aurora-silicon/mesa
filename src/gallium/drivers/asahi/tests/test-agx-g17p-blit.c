@@ -173,7 +173,7 @@ build_webgl_shadow_fs(enum glsl_sampler_dim dim, bool array)
    tex->src[0] = nir_tex_src_for_ssa(
       nir_tex_src_coord,
       nir_fmul_imm(&b, nir_channels(&b, frag,
-                                    BITFIELD_MASK(coord_components)),
+                                    (nir_component_mask_t)BITFIELD_MASK(coord_components)),
                    1.0f / 64.0f));
    tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
                                      nir_channel(&b, frag, 2));
@@ -316,6 +316,136 @@ check_sampler_boundary_compile(struct pipe_context *pctx)
    pctx->delete_fs_state(pctx, dynamic);
    free(dynamic_cso.error_message);
 
+   return true;
+}
+
+static bool
+check_query_lod_custom_border_bindings(void)
+{
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      nir_shader *nir = build_sampler_boundary_fs(0);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
+      nir_def *frag = nir_load_frag_coord(&b);
+      nir_def *dynamic = nir_iand_imm(
+         &b, nir_f2u32(&b, nir_channel(&b, frag, 0)), 31);
+      nir_tex_instr *query = nir_tex_instr_create(nir, mode == 2 ? 2 : 1);
+      query->op = nir_texop_lod;
+      query->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      query->dest_type = nir_type_float32;
+      query->coord_components = 2;
+      query->sampler_index = mode == 1 ? 31 : 0;
+      query->src[0] = nir_tex_src_for_ssa(
+         nir_tex_src_coord, nir_channels(&b, frag, 3));
+      if (mode == 2)
+         query->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_offset, dynamic);
+      nir_builder_instr_insert(&b, &query->instr);
+      nir_def_init(&query->instr, &query->def, 2, 32);
+      nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_output)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *sum = nir_fadd(&b, intr->src[0].ssa,
+                                    nir_channel(&b, &query->def, 0));
+            nir_src_rewrite(&intr->src[0], sum);
+         }
+      }
+      BITSET_SET(nir->info.samplers_used, mode == 0 ? 0 : 31);
+      bool bindless = false;
+      struct agx_lower_bindings_options options = {
+         .uses_bindless_samplers = &bindless,
+         .g17p_native_sampler_handles = true,
+         .bindful_sampler_count = AGX_GALLIUM_G17P_IMMEDIATE_API_SAMPLERS,
+      };
+      agx_nir_lower_bindings(nir, &options);
+      const int handle_idx =
+         nir_tex_instr_src_index(query, nir_tex_src_sampler_handle);
+      assert(handle_idx >= 0);
+      nir_def *handle = query->src[handle_idx].src.ssa;
+      const bool lowered = agx_nir_lower_custom_border_g17p(nir);
+      unsigned count = 0;
+      for (unsigned i = 0; i < query->num_srcs; ++i) {
+         if (query->src[i].src_type == nir_tex_src_sampler_handle) {
+            ++count;
+            if (query->src[i].src.ssa != handle)
+               count += 100;
+         }
+      }
+      const bool ok = lowered && bindless && count == 1;
+      if (!ok)
+         fprintf(stderr, "G17P query/custom-border mode %u changed query handle "
+                         "or duplicated source (%u)\n", mode, count);
+      if (ok)
+         nir_validate_shader(nir, "query LOD with custom border");
+      ralloc_free(nir);
+      if (!ok)
+         return false;
+   }
+   return true;
+}
+
+static bool
+check_query_lod_compile(struct pipe_context *pctx)
+{
+   static const enum glsl_sampler_dim dimensions[] = {
+      GLSL_SAMPLER_DIM_1D, GLSL_SAMPLER_DIM_2D,
+      GLSL_SAMPLER_DIM_3D,
+   };
+
+   for (unsigned d = 0; d < ARRAY_SIZE(dimensions); ++d) {
+      for (unsigned mode = 0; mode < 3; ++mode) {
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_FRAGMENT, &agx_nir_options,
+            "G17P biased query LOD sampler bank");
+         const unsigned components = d == 0 ? 1 : d == 1 ? 2 : 3;
+         nir_def *frag = nir_load_frag_coord(&b);
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, mode == 2 ? 2 : 1);
+         tex->op = nir_texop_lod;
+         tex->sampler_dim = dimensions[d];
+         tex->dest_type = nir_type_float32;
+         tex->coord_components = components;
+         tex->sampler_index = mode == 1 ? 31 : 0;
+         tex->src[0] = nir_tex_src_for_ssa(
+            nir_tex_src_coord, nir_trim_vector(&b, frag, components));
+         if (mode == 2) {
+            tex->src[1] = nir_tex_src_for_ssa(
+               nir_tex_src_sampler_offset,
+               nir_iand_imm(&b, nir_f2u32(&b, nir_channel(&b, frag, 0)), 31));
+         }
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_def_init(&tex->instr, &tex->def, 2, 32);
+         nir_def *result = nir_vec4(&b, nir_channel(&b, &tex->def, 0),
+                                   nir_channel(&b, &tex->def, 1),
+                                   nir_imm_float(&b, 0), nir_imm_float(&b, 1));
+         nir_store_output(&b, result, nir_imm_int(&b, 0), .base = 0,
+                          .write_mask = 0xf,
+                          .io_semantics.location = FRAG_RESULT_DATA0);
+         b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+         BITSET_SET(b.shader->info.textures_used, 0);
+         BITSET_SET(b.shader->info.samplers_used, mode == 0 ? 0 : 31);
+         struct pipe_shader_state cso = {
+            .type = PIPE_SHADER_IR_NIR,
+            .report_compile_error = true,
+            .ir.nir = b.shader,
+         };
+         struct agx_uncompiled_shader *shader = pctx->create_fs_state(pctx, &cso);
+         const bool ok = shader && !cso.error_message &&
+                         shader->info.uses_query_lod &&
+                         shader->uses_bindless_samplers;
+         if (!ok)
+            fprintf(stderr, "G17P query LOD dimension %u mode %u: %s\n",
+                    dimensions[d], mode,
+                    cso.error_message ? cso.error_message : "missing query bank");
+         if (shader)
+            pctx->delete_fs_state(pctx, shader);
+         free(cso.error_message);
+         if (!ok)
+            return false;
+      }
+   }
    return true;
 }
 
@@ -1147,6 +1277,110 @@ check_vertex_output_shapes(struct pipe_context *pctx)
    }
    return ok;
 }
+static bool
+check_discard_main_sample_key(struct pipe_context *pctx)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   nir_builder vs = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, &agx_nir_options, "sample key vertex");
+   nir_store_output(&vs, nir_imm_vec4(&vs, 0, 0, 0, 1), nir_imm_int(&vs, 0),
+                    .base = 0, .write_mask = 0xf,
+                    .io_semantics.location = VARYING_SLOT_POS);
+   nir_shader_gather_info(vs.shader, nir_shader_get_entrypoint(vs.shader));
+   struct pipe_shader_state vs_state = {.type = PIPE_SHADER_IR_NIR, .ir.nir = vs.shader};
+   void *vs_cso = pctx->create_vs_state(pctx, &vs_state);
+   nir_builder fs = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "discard main raster sample key");
+   fs.shader->info.internal = false;
+   const bool force_early = getenv("AGX_TEST_MAIN_SAMPLE_EARLY") != NULL;
+   fs.shader->info.fs.early_fragment_tests = force_early;
+   nir_def *x = nir_channel(&fs, nir_load_frag_coord(&fs), 0);
+   nir_demote_if(&fs, nir_flt(&fs, x, nir_imm_float(&fs, 8.0)));
+   nir_store_output(&fs, nir_imm_vec4(&fs, 1, 0, 0, 0.5), nir_imm_int(&fs, 0),
+                    .base = 0, .write_mask = 0xf,
+                    .io_semantics.location = FRAG_RESULT_DATA0);
+   nir_shader_gather_info(fs.shader, nir_shader_get_entrypoint(fs.shader));
+   struct pipe_shader_state fs_state = {.type = PIPE_SHADER_IR_NIR, .ir.nir = fs.shader};
+   struct agx_uncompiled_shader *fs_cso = pctx->create_fs_state(pctx, &fs_state);
+   struct pipe_rasterizer_state rast = {
+      .depth_clip_near = true, .depth_clip_far = true, .multisample = true,
+      .point_size = 1, .line_width = 1,
+   };
+   struct pipe_depth_stencil_alpha_state depth = {0};
+   void *rast_cso = pctx->create_rasterizer_state(pctx, &rast);
+   void *depth_cso = pctx->create_depth_stencil_alpha_state(pctx, &depth);
+   void *ve_cso = pctx->create_vertex_elements_state(pctx, 0, NULL);
+   if (!vs_cso || !fs_cso || !rast_cso || !depth_cso || !ve_cso)
+      return false;
+   if (fs_cso->info.needs_sample_count || fs_cso->info.uses_fbfetch ||
+       fs_cso->info.uses_sample_shading)
+      return false;
+   pctx->bind_vs_state(pctx, vs_cso);
+   pctx->bind_fs_state(pctx, fs_cso);
+   pctx->bind_rasterizer_state(pctx, rast_cso);
+   pctx->bind_depth_stencil_alpha_state(pctx, depth_cso);
+   pctx->bind_vertex_elements_state(pctx, ve_cso);
+   struct pipe_viewport_state viewport = {.scale = {8, 8, 0.5}, .translate = {8, 8, 0.5}};
+   pctx->set_viewport_states(pctx, 0, 1, &viewport);
+   pctx->set_sample_mask(pctx, ~0u);
+   const unsigned sequence[] = {1, 4, 2, 1};
+   struct agx_compiled_shader *variants[5] = {0};
+   bool ok = true;
+   for (unsigned alpha = 0; alpha < 4; ++alpha) {
+      struct pipe_blend_state blend = {.rt[0].colormask = 0xf, .alpha_to_coverage = alpha & 1};
+      void *blend_cso = pctx->create_blend_state(pctx, &blend);
+      pctx->bind_blend_state(pctx, blend_cso);
+      for (unsigned step = 0; step < ARRAY_SIZE(sequence); ++step) {
+         const unsigned samples = sequence[step];
+         struct pipe_resource templ = {
+            .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .width0 = 16, .height0 = 16, .depth0 = 1, .array_size = 1,
+            .nr_samples = samples, .nr_storage_samples = samples,
+            .bind = PIPE_BIND_RENDER_TARGET, .usage = PIPE_USAGE_DEFAULT,
+         };
+         struct pipe_resource *color = pctx->screen->resource_create(pctx->screen, &templ);
+         if (!color) return false;
+         struct pipe_framebuffer_state fb = {
+            .width = 16, .height = 16, .layers = 1, .samples = samples, .nr_cbufs = 1,
+            .cbufs[0] = {.texture = color, .format = templ.format},
+         };
+         pctx->set_framebuffer_state(pctx, &fb);
+         const unsigned full_mask = (1u << samples) - 1;
+         const unsigned mask = (alpha & 2) && samples > 1 ? (samples == 4 ? 5u : 2u) : full_mask;
+         pctx->set_sample_mask(pctx, mask);
+         const struct pipe_draw_info info = {.mode = MESA_PRIM_TRIANGLES, .instance_count = 1};
+         const struct pipe_draw_start_count_bias draw = {.count = 3};
+         pctx->draw_vbo(pctx, &info, 0, NULL, &draw, 1);
+         unsigned found = 0, keyed_samples = ~0u;
+         hash_table_foreach(fs_cso->variants, ent) {
+            if (ent->data == ctx->fs) {
+               keyed_samples = ((const struct asahi_fs_shader_key *)ent->key)->nr_samples;
+               found++;
+            }
+         }
+         bool phase_ok = found == 1 && keyed_samples == samples && ctx->fs &&
+                         !ctx->fs->failed && ctx->fs->b.info.main_size &&
+                         ctx->skipped_no_program == 0 && ctx->batch && ctx->batch->draws;
+         if (variants[samples]) phase_ok &= variants[samples] == ctx->fs;
+         variants[samples] = ctx->fs;
+         const bool main_may_test = force_early || (!(alpha & 1) && mask == full_mask);
+         const bool actual_main_test = ctx->batch && ctx->batch->uniforms.no_epilog_discard;
+         phase_ok &= actual_main_test == main_may_test;
+         printf("test-owner alpha=%u mask=%x samples=%u main=%u expected=%u\n",
+                alpha & 1, mask, samples, actual_main_test, main_may_test);
+         printf("sample-key alpha=%u samples=%u actual=%u main_size=%u result=%s\n",
+                alpha, samples, keyed_samples, ctx->fs ? ctx->fs->b.info.main_size : 0,
+                phase_ok ? "PASS" : "FAIL");
+         ok &= phase_ok;
+         pipe_resource_reference(&color, NULL);
+      }
+      pctx->bind_blend_state(pctx, NULL);
+      pctx->delete_blend_state(pctx, blend_cso);
+   }
+   ok &= variants[1] != variants[2] && variants[1] != variants[4] && variants[2] != variants[4];
+   return ok;
+}
+
 int
 main(void)
 {
@@ -1180,6 +1414,16 @@ main(void)
    if (!pctx) {
       fprintf(stderr, "context_create failed\n");
       return 1;
+   }
+
+   if (getenv("AGX_TEST_MAIN_SAMPLE_KEY")) {
+      glsl_type_singleton_init_or_ref();
+      const bool ok = check_discard_main_sample_key(pctx);
+      pctx->destroy(pctx);
+      screen->destroy(screen);
+      glsl_type_singleton_decref();
+      close(fd);
+      return ok ? 0 : 1;
    }
 
    if (getenv("AGX_TEST_VERTEX_OUTPUT_SHAPES")) {
@@ -1232,7 +1476,9 @@ main(void)
           AGX_GALLIUM_G17P_API_SAMPLERS ||
        screen->shader_caps[MESA_SHADER_COMPUTE].max_texture_samplers !=
           AGX_GALLIUM_G17P_API_SAMPLERS ||
-       !check_sampler_boundary_compile(pctx))
+       !check_sampler_boundary_compile(pctx) ||
+       !check_query_lod_compile(pctx) ||
+       !check_query_lod_custom_border_bindings())
       return 1;
    printf("G17P native sampler slots 0..31 compile through the local table\n");
 
@@ -1313,6 +1559,27 @@ main(void)
       .f = {0.125f, 0.5f, 0.875f, 1.0f},
    };
    pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->flush(pctx, NULL, 0);
+   xrgb8_msaa_fb.resolve = NULL;
+   pctx->set_framebuffer_state(pctx, &xrgb8_msaa_fb);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   const struct pipe_blit_info xrgb8_resolve_blit = {
+      .src = {
+         .resource = xrgb8_msaa,
+         .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+         .box = {.width = 8, .height = 8, .depth = 1},
+      },
+      .dst = {
+         .resource = xrgb8_resolve,
+         .format = PIPE_FORMAT_B8G8R8X8_UNORM,
+         .box = {.width = 8, .height = 8, .depth = 1},
+      },
+      .mask = PIPE_MASK_RGBA,
+      .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   pctx->blit(pctx, &xrgb8_resolve_blit);
+   pctx->clear(pctx, PIPE_CLEAR_COLOR0, 0xf, 0, NULL, &xrgb8_clear, 0.0, 0);
+   pctx->blit(pctx, &xrgb8_resolve_blit);
    pctx->flush(pctx, NULL, 0);
    pipe_resource_reference(&xrgb8_msaa, NULL);
    pipe_resource_reference(&xrgb8_resolve, NULL);

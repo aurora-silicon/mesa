@@ -15,6 +15,9 @@
 #include "util/u_tristate.h"
 #include "shader_enums.h"
 
+/* G17P's register file: halves 0..191. */
+#define AGX3B_NUM_REGS (192)
+
 struct agx_cf_binding {
    /* Base coefficient register */
    uint8_t cf_base;
@@ -547,6 +550,9 @@ struct agx_shader_key {
     * arbitrary target formats, and the IMGWBLK selector of each target in
     * store order. Zero selects the format-specific EOT recognizers. */
    uint8_t g17p_mrt_eot_count;
+   /* Override selected multisample stores with single-sample resolves.
+    * A source-preserving resolve binds separate MS and SS PBE outputs. */
+   uint8_t g17p_mrt_eot_resolve_mask;
    uint8_t g17p_mrt_eot_selectors[AGX_MAX_RTS];
 
    /* Set if this is a secondary shader part (prolog or epilog). This prevents

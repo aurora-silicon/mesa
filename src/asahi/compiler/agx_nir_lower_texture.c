@@ -23,6 +23,7 @@
 struct agx_texture_lower_options {
    bool gen9;
    bool buffer_metadata;
+   agx_buffer_texture_metadata_cb buffer_metadata_cb;
    /* Formatless image loads still need view-bounds robustness. */
    bool robust_formatless_images;
    /* G17P texel fetches need explicit view-bounds checks (image robustness). */
@@ -90,6 +91,16 @@ texture_descriptor_ptr(nir_builder *b, nir_tex_instr *tex)
    return nir_load_from_texture_handle_agx(b, tex->src[handle_idx].src.ssa);
 }
 
+static nir_def *
+buffer_texture_descriptor_ptr(nir_builder *b, nir_tex_instr *tex,
+                                const struct agx_texture_lower_options *options)
+{
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF && options &&
+       options->buffer_metadata_cb)
+      return options->buffer_metadata_cb(b, tex);
+   return texture_descriptor_ptr(b, tex);
+}
+
 static bool
 has_nonzero_lod(nir_tex_instr *tex)
 {
@@ -136,7 +147,8 @@ lower_tex_crawl(nir_builder *b, nir_instr *instr, void *data)
        tex->op != nir_texop_query_levels)
       return false;
 
-   nir_def *ptr = texture_descriptor_ptr(b, tex);
+   const struct agx_texture_lower_options *options = data;
+   nir_def *ptr = buffer_texture_descriptor_ptr(b, tex, options);
    unsigned nr_comps = tex->def.num_components;
    assert(nr_comps <= 3);
 
@@ -145,7 +157,6 @@ lower_tex_crawl(nir_builder *b, nir_instr *instr, void *data)
                                : nir_imm_intN_t(b, 0, 16);
 
    nir_def *res;
-   const struct agx_texture_lower_options *options = data;
    const bool gen9 = options && options->gen9;
    if (options && options->buffer_metadata && tex->op == nir_texop_txs &&
        tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
@@ -303,7 +314,7 @@ lower_sparse_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
 
    b->cursor = nir_before_instr(instr);
 
-   nir_def *desc = texture_descriptor_ptr(b, tex);
+   nir_def *desc = buffer_texture_descriptor_ptr(b, tex, options);
    nir_def *coord = tex->src[coord_idx].src.ssa;
 
    /* The element the fetch addresses, tail offset included. */
@@ -373,7 +384,7 @@ lower_buffer_texture(nir_builder *b, nir_tex_instr *tex, bool buffer_metadata,
    nir_def *oob = nir_uge(b, coord, size);
 
    /* Apply the buffer offset after calculating oob but before remapping */
-   nir_def *desc = texture_descriptor_ptr(b, tex);
+   nir_def *desc = buffer_texture_descriptor_ptr(b, tex, options);
    coord = buffer_metadata
       ? nir_iadd(b, coord, load_buffer_metadata(
            b, desc, AGX_G17P_BUFFER_TEXTURE_TAIL_OFFSET, 32))
@@ -1478,6 +1489,27 @@ lower_g17p_projected_3d_runtime_offset(nir_builder *b, nir_instr *instr,
    return true;
 }
 
+/* nir_lower_tex intentionally leaves rectangle samples implicit because
+ * they have no mip chain. G17P still requires an explicit level outside a
+ * derivative-capable stage. The sampler retains unnormalized coordinates;
+ * this changes only the LOD operand, just like ordinary non-fragment tex.
+ * Run after sampler-bias lowering, whose bias is ignored in these stages.
+ */
+static bool
+lower_g17p_rectangle_lod(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+{
+   if (nir_shader_supports_implicit_lod(b->shader) ||
+       tex->sampler_dim != GLSL_SAMPLER_DIM_RECT ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb))
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_steal_tex_src(tex, nir_tex_src_bias);
+   tex->op = nir_texop_txl;
+   nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0));
+   return true;
+}
+
 bool
 agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias)
 {
@@ -1501,6 +1533,8 @@ agx_nir_lower_g17p_texture_early(nir_shader *s, bool support_lod_bias)
     * zero, and folding a bias into that level would leave the shape
     * unencodable. agx_upload_samplers() packs the field to match. */
    progress |= lower_texture_early(s, support_lod_bias, false, true);
+   NIR_PASS(progress, s, nir_shader_tex_pass, lower_g17p_rectangle_lod,
+            nir_metadata_control_flow, NULL);
 
    /* No qualified runtime-offset ABI can place 3D Z beside the gradient
     * banks, and the inferred bank-8 continuation fails filtered samples on
@@ -1574,13 +1608,15 @@ lower_lod_clamp(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 static bool
 lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
               bool robust_formatless_images, bool robust_texel_fetch,
-              uint64_t sparse_ro_offset, bool sparse_buffer_residency)
+              uint64_t sparse_ro_offset, bool sparse_buffer_residency,
+              agx_buffer_texture_metadata_cb buffer_metadata_cb)
 {
    bool progress = false;
    const bool gen9 = generation == 9;
    const struct agx_texture_lower_options options = {
       .gen9 = gen9,
       .buffer_metadata = buffer_metadata,
+      .buffer_metadata_cb = buffer_metadata_cb,
       .robust_formatless_images = robust_formatless_images,
       .robust_texel_fetch = robust_texel_fetch,
       .sparse_ro_offset = sparse_ro_offset,
@@ -1667,7 +1703,7 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
 bool
 agx_nir_lower_texture_for_generation(nir_shader *s, unsigned generation)
 {
-   return lower_texture(s, generation, false, false, true, 0, false);
+   return lower_texture(s, generation, false, false, true, 0, false, NULL);
 }
 
 bool
@@ -1679,7 +1715,16 @@ agx_nir_lower_texture_with_buffer_metadata(nir_shader *s, unsigned generation,
    /* hk's image robustness covers both formatless loads and texel fetches. */
    return lower_texture(s, generation, true, robust_formatless_images,
                         robust_formatless_images, sparse_ro_offset,
-                        sparse_buffer_residency);
+                        sparse_buffer_residency, NULL);
+}
+
+bool
+agx_nir_lower_texture_with_buffer_metadata_cb(
+   nir_shader *s, unsigned generation,
+   agx_buffer_texture_metadata_cb buffer_metadata)
+{
+   return lower_texture(s, generation, true, false, true, 0, false,
+                        buffer_metadata);
 }
 
 bool

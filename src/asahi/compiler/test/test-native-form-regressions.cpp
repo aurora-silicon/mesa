@@ -1,7 +1,11 @@
 #include "agx_test.h"
 #include "agx3_alu_core.h"
 #include "agx3_pack.h"
+#include "agx3_tex_core.h"
+extern "C" {
 #include "agx_nir.h"
+#include "asahi/layout/layout.h"
+}
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -206,5 +210,334 @@ TEST(NativeForms, MinmaxReusesUniformCopiedForComparison)
       EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
       EXPECT_TRUE(agx_is_equiv(I->src[0], I->src[2]));
       ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, AtomicVertexOutputsReachTerminalBundle)
+{
+   for (bool position : {false, true}) {
+      SCOPED_TRACE(position);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_VERTEX, &agx_nir_options, "atomic vertex outputs");
+      nir_def *address = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *value = nir_global_atomic_agx(
+         &b, 32, address, nir_imm_int(&b, 0), nir_imm_int(&b, 1));
+      nir_intrinsic_set_atomic_op(nir_def_as_intrinsic(value), nir_atomic_op_iadd);
+      nir_store_uvs_agx(&b, value, nir_imm_intN_t(&b, 4, 16));
+      nir_def *second = nir_global_atomic_agx(
+         &b, 32, address, nir_imm_int(&b, 4), nir_imm_int(&b, -1));
+      nir_intrinsic_set_atomic_op(nir_def_as_intrinsic(second), nir_atomic_op_iadd);
+      nir_store_uvs_agx(&b, nir_iadd(&b, value, second),
+                       nir_imm_intN_t(&b, 5, 16));
+      if (position) {
+         for (unsigned c = 0; c < 4; ++c)
+            nir_store_uvs_agx(&b, nir_imm_float(&b, c == 3 ? 1.0 : 0.0),
+                             nir_imm_intN_t(&b, c, 16));
+      }
+      b.shader->info.outputs_written = BITFIELD64_BIT(VARYING_SLOT_VAR0) |
+                                     (position ? VARYING_BIT_POS : 0);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.reserved_preamble = 4;
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.main_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(NativeForms, RectangleImplicitLodOutsideFragment)
+{
+   for (mesa_shader_stage stage : {MESA_SHADER_VERTEX, MESA_SHADER_COMPUTE,
+                                   MESA_SHADER_FRAGMENT}) {
+      for (bool sampler_bias : {false, true}) {
+         SCOPED_TRACE(stage);
+         SCOPED_TRACE(sampler_bias);
+         nir_builder b = nir_builder_init_simple_shader(
+            stage, &agx_nir_options, "rectangle implicit lod");
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 1);
+         tex->op = nir_texop_tex;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_RECT;
+         tex->dest_type = nir_type_float32;
+         tex->coord_components = 2;
+         tex->src[0] = nir_tex_src_for_ssa(
+            nir_tex_src_coord, nir_imm_vec2(&b, 3.0, 5.0));
+         nir_def_init(&tex->instr, &tex->def, 4, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         agx_nir_lower_g17p_texture_early(b.shader, sampler_bias);
+         EXPECT_EQ(tex->sampler_dim, GLSL_SAMPLER_DIM_RECT);
+         EXPECT_GE(nir_tex_instr_src_index(tex, nir_tex_src_coord), 0);
+         if (stage == MESA_SHADER_FRAGMENT) {
+            EXPECT_EQ(tex->op, sampler_bias ? nir_texop_txb : nir_texop_tex);
+         } else {
+            EXPECT_EQ(tex->op, nir_texop_txl);
+            EXPECT_LT(nir_tex_instr_src_index(tex, nir_tex_src_bias), 0);
+            int lod = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+            ASSERT_GE(lod, 0);
+            EXPECT_EQ(nir_src_as_float(tex->src[lod].src), 0.0);
+         }
+         nir_validate_shader(b.shader, "rectangle level zero");
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(NativeForms, ImageFenceWaitsRotatingWriteSlots)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   agx_index data = agx_register(16, AGX_SIZE_32);
+   data.channels_m1 = 3;
+   agx_index coord = agx_register(24, AGX_SIZE_32);
+   coord.channels_m1 = 1;
+   for (unsigned i = 0; i < 3; ++i) {
+      agx_image_write(b, data, coord, agx_zero(), agx_uniform(8, AGX_SIZE_64),
+                      agx_register(28, AGX_SIZE_32), AGX_DIM_2D, true);
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+
+   agx3_encoded_scoped_barrier fence;
+   ASSERT_TRUE(agx3_pack_scoped_barrier(AGX_ISA_ENCODING_AGX3B,
+                                       AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT,
+                                       &fence));
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   unsigned fences = 0;
+   for (unsigned i = 0; i + fence.length <= binary.size; ++i) {
+      if (memcmp(bytes + i, fence.bytes, fence.length))
+         continue;
+      /* The first write uses the fence's embedded slot1 wait. Later writes
+       * rotate to slots2/3 and must finish before the cache fence, not after. */
+      if (fences > 0) {
+         uint8_t carrier[AGX3_ALU_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_alu_band_identity_wait(
+            AGX_ISA_ENCODING_AGX3B, 0, 1u << fences, carrier, &len));
+         ASSERT_GE(i, len);
+         EXPECT_EQ(memcmp(bytes + i - len, carrier, len), 0) << fences;
+      }
+      ++fences;
+      i += fence.length - 1;
+   }
+   EXPECT_EQ(fences, 3u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+TEST(NativeForms, ImmediateCubeGathersReserveCemScratch)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 31;
+
+   /* This is the hardware reproducer's allocated shape. The red gather
+    * remains live in r0 while the remaining gathers compute their cube
+    * coordinates. The old immediate-descriptor path used r0 as CEM scratch
+    * and overwrote red with the next face calculation. */
+   agx_index coords = agx_register(16, AGX_SIZE_32);
+   coords.channels_m1 = 3;
+   const unsigned destinations[] = {0, 8, 24, 16};
+   for (unsigned component = 0; component < 4; ++component) {
+      agx_index dst = agx_register(destinations[component], AGX_SIZE_32);
+      dst.channels_m1 = 3;
+      agx_texture_sample_to(b, dst, coords, agx_immediate(0),
+                           agx_immediate(0), agx_immediate(0),
+                           agx_immediate(1), agx_null(), AGX_DIM_CUBE_ARRAY,
+                           AGX_LOD_MODE_AUTO_LOD, 15, false, false, false,
+                           (enum agx_gather)(AGX_GATHER_R + 2 * component), false);
+   }
+   agx_stop(b);
+
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   EXPECT_GE(b->shader->max_reg, 39u);
+
+   /* Check the actual emitted CEM destination, not just the reservation.
+    * All four axis-zero operations must write above the live result bank. */
+   uint8_t cem[AGX3_TEX_MAX_LENGTH], len = 0;
+   ASSERT_TRUE(agx3_tex_cube_cem_calc_to(AGX_ISA_ENCODING_AGX3B, 16, 18, 20,
+                                         32, 0, false, cem, &len));
+   const uint8_t *bytes = (const uint8_t *)binary.data;
+   unsigned count = 0;
+   for (unsigned i = 0; i + len <= binary.size; ++i)
+      count += memcmp(bytes + i, cem, len) == 0;
+   EXPECT_EQ(count, 4u);
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+
+TEST(NativeForms, LateCoverageStaysAfterImageSideEffects)
+{
+   for (bool depth : {false, true}) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_index data = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, data, agx_uniform(8, AGX_SIZE_64), agx_immediate(0),
+                         AGX_FORMAT_I32, 15, 0, false);
+      agx_index coord = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_device_load_to(b, coord, agx_uniform(8, AGX_SIZE_64), agx_immediate(4),
+                         AGX_FORMAT_I32, 3, 0, false);
+      agx_instr *store = agx_image_write(
+         b, data, coord, agx_zero(), agx_uniform(12, AGX_SIZE_64),
+         agx_mov_imm(b, 32, 1), AGX_DIM_2D, true);
+      agx_index mask = agx_mov_imm(b, 16, 1);
+      agx_index coverage[8];
+      for (unsigned i = 0; i < 8; ++i)
+         coverage[i] = agx_get_coverage_1x_agx3(b, 16);
+      agx_index word = coverage[0];
+      for (unsigned i = 1; i < 8; ++i)
+         word = agx_iadd(b, word, coverage[i], 0);
+      word = agx_iadd(b, mask, word, 4);
+      agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+      agx_mov_to(b, wide, word);
+      agx_instr *tests = depth ? agx_zs_emit_agx3(b, wide, 1)
+                              : agx_sample_mask_agx3(b, mask, wide, 2);
+      agx_export(b, data, 8);
+      agx_pressure_schedule(b->shader);
+      bool saw_store = false;
+      agx_foreach_instr_global(b->shader, I) {
+         saw_store |= I == store;
+         if (I == tests) {
+            EXPECT_TRUE(saw_store) << "Native late tests preceded imageStore";
+         }
+      }
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, VertexOutputsAllowTrailingMemoryFence)
+{
+   for (unsigned count : {5u, 6u, 11u}) {
+      SCOPED_TRACE(count);
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_VERTEX;
+      for (unsigned i = 0; i < count; ++i)
+         agx_st_vary(b, agx_immediate(i), agx_register(2 * i, AGX_SIZE_32));
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE);
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT);
+      agx_stop(b);
+      util_dynarray bytes;
+      util_dynarray_init(&bytes, mem);
+      EXPECT_TRUE(agx3_pack_binary(b->shader, &bytes));
+      EXPECT_GT(bytes.size, 0u);
+      ralloc_free(mem);
+   }
+}
+
+TEST(NativeForms, CubeArrayShadowZeroLodUsesNativeDescriptors)
+{
+   for (mesa_shader_stage stage : {MESA_SHADER_VERTEX, MESA_SHADER_TESS_CTRL,
+                                MESA_SHADER_TESS_EVAL, MESA_SHADER_GEOMETRY,
+                                MESA_SHADER_FRAGMENT, MESA_SHADER_COMPUTE}) {
+      for (float lod : {0.0f, 1.0f}) {
+         SCOPED_TRACE(::testing::Message() << "stage=" << stage << " lod=" << lod);
+         nir_builder b = nir_builder_init_simple_shader(
+            stage, &agx_nir_options, "cube array shadow native descriptors");
+         nir_def *texture = nir_bindless_image_agx(&b, nir_imm_int(&b, 0));
+         nir_def *sampler = nir_bindless_sampler_agx(
+            &b, nir_imm_int(&b, 32), nir_imm_intN_t(&b, 5, 16));
+         nir_tex_instr *tex = nir_tex_instr_create(b.shader, 5);
+         tex->op = nir_texop_txl;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+         tex->is_array = true;
+         tex->is_shadow = true;
+         tex->is_new_style_shadow = true;
+         tex->coord_components = 4;
+         tex->dest_type = nir_type_float32;
+         tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_backend1,
+                                         nir_imm_vec4(&b, 1, 0, 0, 0));
+         tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_comparator,
+                                         nir_imm_float(&b, 0.5));
+         tex->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(&b, lod));
+         tex->src[3] = nir_tex_src_for_ssa(nir_tex_src_texture_handle, texture);
+         tex->src[4] = nir_tex_src_for_ssa(nir_tex_src_sampler_handle, sampler);
+         nir_def_init(&tex->instr, &tex->def, 1, 32);
+         nir_builder_instr_insert(&b, &tex->instr);
+         nir_store_ssbo(&b, &tex->def, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+         EXPECT_EQ(agx_nir_lower_g17p_indexed_samplers(b.shader), lod == 0.0f);
+         ralloc_free(b.shader);
+      }
+   }
+}
+
+TEST(NativeForms, EndOfTilePreservesSamplesAndResolvesSameTile)
+{
+   /* Both outputs read offset zero. Their descriptors are distinct, and
+    * only the second descriptor names a single-sample image. Keep all four
+    * dimension combinations as controls; no host check establishes pixels. */
+   for (unsigned resolves = 0; resolves < 4; ++resolves) {
+      SCOPED_TRACE(resolves);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "EOT store and resolve");
+      nir_def *xy = nir_trim_vector(&b, nir_load_global_invocation_id(&b, 32), 2);
+      for (unsigned pbe = 0; pbe < 2; ++pbe) {
+         nir_intrinsic_instr *intr = nir_image_store_block_agx(
+            &b, nir_imm_intN_t(&b, pbe, 16), nir_imm_int(&b, 0), xy);
+         nir_intrinsic_set_format(intr, (enum pipe_format)AIL_ISA_FORMAT_U8NORM);
+         nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+         nir_intrinsic_set_image_array(intr, false);
+         nir_intrinsic_set_explicit_coord(intr, true);
+      }
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.no_preamble = true;
+      key.g17p_rt0_eot_multisample = true;
+      key.g17p_mrt_eot_count = 2;
+      key.g17p_mrt_eot_resolve_mask = resolves;
+      key.g17p_mrt_eot_selectors[0] = 0x75;
+      key.g17p_mrt_eot_selectors[1] = 0x75;
+      agx_preprocess_nir(b.shader);
+      agx_shader_part part = {};
+      bool ok = agx_compile_shader_nir(b.shader, &key, &part);
+      EXPECT_TRUE(ok);
+      if (ok) {
+         EXPECT_EQ(part.info.binary_size, 120u);
+         EXPECT_EQ(part.info.main_size, 120u);
+         EXPECT_TRUE(part.info.agx3_staging_known);
+         EXPECT_EQ(part.info.agx3_staging_halfs, 16u);
+         if (part.info.binary_size == 120) {
+            const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+            /* Native single-target MS and SS dimension fields, independently
+             * selected for each store of the existing dual-target program. */
+            for (unsigned pbe = 0; pbe < 2; ++pbe) {
+               bool ms = !(resolves & (1u << pbe));
+               EXPECT_EQ(code[pbe ? 63 : 43],
+                         (pbe ? 0x0c : 0x04) | (ms ? 0x02 : 0x00));
+               EXPECT_EQ(code[92 + 12 * pbe + 8], ms ? 0x28 : 0xa8);
+               EXPECT_EQ(code[92 + 12 * pbe + 9], ms ? 0x72 : 0x75);
+            }
+         }
+      }
+      free(part.binary);
+      ralloc_free(b.shader);
    }
 }
