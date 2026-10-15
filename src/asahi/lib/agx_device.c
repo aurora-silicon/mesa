@@ -8,6 +8,8 @@
 #include "agx_device.h"
 #include "agx_g17p_bind0.h"
 #include "agx_linker.h"
+#include "agx_m5_va.h"
+#include "agx3_code_container_core.h"
 #include "agx_va_runtime_hole.h"
 #include <errno.h>
 #include <stdlib.h>
@@ -890,7 +892,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * is implemented; otherwise a newly-recognised chip can silently reach an
     * encoder from the wrong generation.
     */
-   if (!agx_params_driver_supported(&dev->params)) {
+   const bool m5_bringup =
+      debug_get_bool_option("ASAHI_M5_BRINGUP", false) &&
+      agx_params_m5_bringup_supported(&dev->params);
+   if (m5_bringup)
+      fprintf(stderr, "Experimental M5 HAL300 integration enabled; general rendering is unqualified\n");
+   if (!agx_params_driver_supported(&dev->params) && !m5_bringup) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
          fprintf(stderr,
                  "Unsupported Apple GPU architecture G%u (variant 0x%x, %u "
@@ -1024,6 +1031,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * a practical limit. */
    if (dev->chip == AGX_CHIP_G17P)
       dev->shader_base = AGX_G17P_USC_WINDOW_BASE;
+   else if (agx_chip_g17_m5(dev->chip))
+      dev->shader_base = AGX_M5_SHADER_BASE;
 
    if (dev->shader_base < reservation) {
       /* Our robustness implementation requires the bottom unmapped */
@@ -1057,7 +1066,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * robustness carveout untouched while making every ordinary VDM payload
     * directly representable, with no per-run alias option.
     */
-   const bool heap_below_usc = dev->chip == AGX_CHIP_G17P;
+   const bool heap_below_usc = dev->chip == AGX_CHIP_G17P ||
+                               agx_chip_g17_m5(dev->chip);
 
    /*
     * Start the low heap as high as it can go rather than at the reservation.
@@ -1111,8 +1121,21 @@ agx_open_device(void *memctx, struct agx_device *dev)
    /* G17P is bounded by the narrower of the compact VDM aperture and the
     * absolute USC texture/sampler table pointer, both of which sit below the
     * USC window. Other chips retain the kernel-reported user limit. */
-   const uint64_t user_limit =
-      heap_below_usc ? AGX_G17P_USER_LIMIT : vm_create.kernel_start;
+   if (agx_chip_g17_m5(dev->chip)) {
+      struct agx_m5_va_layout layout;
+      if (!agx_m5_va_layout(dev->params.vm_start, dev->params.vm_end,
+                            dev->params.vm_kernel_min_size, dev->shader_base,
+                            &layout)) {
+         fprintf(stderr, "M5 address windows do not fit the reported GPU VM\n");
+         goto fail;
+      }
+      vm_create.kernel_start = layout.driver_start;
+      vm_create.kernel_end = layout.driver_end;
+      user_start = layout.data_start;
+   }
+   const uint64_t user_limit = agx_chip_g17_m5(dev->chip)
+      ? AGX_M5_DATA_END
+      : heap_below_usc ? AGX_G17P_USER_LIMIT : vm_create.kernel_start;
    uint64_t user_size = user_limit - user_start;
 
    int ret = dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
@@ -1233,6 +1256,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
          dev->libagx_programs = libagx_g13g;
    } else if (dev->chip == AGX_CHIP_G17P) {
       dev->libagx_programs = libagx_g17p;
+   } else if (agx_chip_g17_m5(dev->chip)) {
+      dev->libagx_programs = libagx_g17g;
    } else {
       dev->libagx_programs = NULL;
    }
@@ -1303,8 +1328,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
       initialized |= AGX_INIT_CONTEXT_SLOTS;
    }
 
+   const bool dynamic_printf = dev->chip == AGX_CHIP_G17P ||
+                               agx_chip_g17_m5(dev->chip);
    struct agx_bo *bo =
-      dev->chip == AGX_CHIP_G17P
+      dynamic_printf
          ? agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
                          "Printf/abort")
          : agx_create_fixed_bo(
@@ -1316,7 +1343,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
-   if (dev->chip == AGX_CHIP_G17P &&
+   if (dynamic_printf &&
        (bo->va == NULL || dev->main_heap_size < LIBAGX_PRINTF_BUFFER_SIZE ||
         bo->va->addr < dev->main_heap_base ||
         bo->va->addr - dev->main_heap_base >
@@ -1327,7 +1354,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    dev->printf_buffer_address =
-      dev->chip == AGX_CHIP_G17P ? bo->va->addr
+      dynamic_printf ? bo->va->addr
                                  : LIBAGX_PRINTF_BUFFER_ADDRESS;
 
    dev->printf.bo = bo;
@@ -1337,23 +1364,8 @@ agx_open_device(void *memctx, struct agx_device *dev)
    u_printf_init(&dev->printf, bo, printf_map);
    initialized |= AGX_INIT_PRINTF;
 
-   /* G17P: make the USC exec window's base page resident.
-    *
-    * The kernel programs dev->shader_base into USC_EXEC_BASE_CP for every
-    * command on the queue, so that register always names a real address to
-    * the hardware.  In every m1n1 witness that address is the base of the
-    * code container and is mapped; in Honeykrisp it was the bottom of a
-    * top-down heap and was mapped by nothing, which the kernel audit confirms
-    * on hardware ("usc_exec_base 0x1100000000+0x4000 covered=false phys=0x0").
-    * That is the last structural difference left between a passing add3 kick
-    * and a failing Honeykrisp one.
-    *
-    * The page carries the container's fixed leading block -- the same bytes
-    * both captured Apple code images start with -- and its own block-size
-    * dword terminates the chain, so it is a well-formed empty container
-    * rather than a blank page.
-    */
-   if (dev->chip == AGX_CHIP_G17P) {
+   /* Map the stage helper tables at the USC execution-window base. */
+   if (dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip)) {
       const size_t usc_base_size = AIL_PAGESIZE;
 
       simple_mtx_lock(&dev->vma_lock);
@@ -1382,7 +1394,13 @@ agx_open_device(void *memctx, struct agx_device *dev)
       }
 
       memset(map, 0, usc_base_size);
-      agx3_build_container_lead(map);
+      if (agx_chip_g17_m5(dev->chip)) {
+         if (!agx3_build_m5_container_lead(map, usc_base_size,
+                                          dev->params.num_clusters_total))
+            goto fail;
+      } else {
+         agx3_build_container_lead(map);
+      }
       agx_bo_assert_range(usc_base, 0, usc_base_size);
 
    }

@@ -20,7 +20,8 @@ _Static_assert(offsetof(struct drm_asahi_cmd_render_with_prior, prior_vdm) ==
 _Static_assert(offsetof(struct drm_asahi_cmd_render_with_prior, prior_cdm) ==
                   264,
                "render prior cdm");
-_Static_assert(sizeof(struct drm_asahi_cmd_compute_with_prior) == 88,
+/* 88 legacy bytes plus the 48-byte M5 auxiliary/intersection tail. */
+_Static_assert(sizeof(struct drm_asahi_cmd_compute_with_prior) == 136,
                "compute wire");
 _Static_assert(offsetof(struct drm_asahi_cmd_compute_with_prior, scs_layout) ==
                   64,
@@ -331,12 +332,49 @@ test_pass_software_graphics_dependencies(void)
    hk_sync_end_rendering(cmd);
 }
 
+static void
+test_barrier_chains_without_work(void)
+{
+   struct hk_cmd_buffer *cmd = new_cmd();
+   cmd->sync.kind_override = HK_SYNC_XFER;
+   struct hk_cs *copy = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_COMPUTE);
+   hk_sync_barrier(cmd, HK_SYNC_COMPUTE, HK_SYNC_GFX);
+   struct hk_cs *draw = add(cmd, false);
+   T("transfer-compute-graphics chain retains transfer source",
+     draw->sync.dep[HK_SYNC_CDM].cut == copy);
+   T("transfer-compute-graphics chain reaches vertex work",
+     draw->sync.dep_ta[HK_SYNC_CDM].cut == copy);
+
+   cmd = new_cmd();
+   cmd->sync.kind_override = HK_SYNC_XFER;
+   copy = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_COMPUTE);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+   draw = add(cmd, false);
+   T("disjoint barrier scopes do not serialize unrelated graphics",
+     draw->sync.dep[HK_SYNC_CDM].cut == NULL);
+
+   cmd = new_cmd();
+   cmd->sync.kind_override = HK_SYNC_XFER;
+   copy = add(cmd, true);
+   cmd->sync.kind_override = 0;
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_GFX_FRAG);
+   hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_COMPUTE);
+   struct hk_cs *compute = add(cmd, true);
+   T("fragment destination chains into a later graphics source",
+     compute->sync.dep[HK_SYNC_CDM].cut == copy);
+}
+
 int
 main(void)
 {
    test_context = ralloc_context(NULL);
    if (!test_context)
       return EXIT_FAILURE;
+   test_barrier_chains_without_work();
    test_multiview_layer_preservation();
    test_compute_clear_layer_preservation();
    test_pass_software_graphics_dependencies();

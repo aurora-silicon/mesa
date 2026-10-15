@@ -500,7 +500,7 @@ hk_cmd_pool_free_bo_list(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
 {
    const struct hk_device *dev = hk_cmd_pool_device(pool);
    const unsigned max_free =
-      dev->dev.chip == AGX_CHIP_G17P && type == HK_CMD_BO_MAIN
+      agx_chip_isa(dev->dev.chip) == AGX_ISA_AGX3 && type == HK_CMD_BO_MAIN
          ? HK_G17P_CMD_POOL_MAIN_BO_MAX
          : HK_CMD_POOL_BO_MAX;
 

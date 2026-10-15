@@ -90,6 +90,9 @@ struct agx3_cdm_barrier_info {
    /* G17 Gen7 drives bits 12, 11, 10 and 1 from flags 0..3.  Earlier
     * inspected emitters expose only canonical flag sets 0 and 0b0101. */
    uint8_t flags;
+   /* HAL300 memory visibility also requires the low cache-scope bits.
+    * The ordering-only record leaves these clear. */
+   bool flush_memory;
 };
 
 struct agx3_cdm_substream_barrier_info {
@@ -606,7 +609,12 @@ agx3_cdm_barrier_pack(const struct agx3_cdm_barrier_info *info,
    if (!info || !agx3_cdm_barrier_flags_grounded(info->chip, info->flags))
       return false;
 
-   agx3_cmdstream_store_le32(packed, agx3_cdm_barrier_word(info->flags));
+   const bool gen7 = info->chip == AGX_CHIP_G17G ||
+                     info->chip == AGX_CHIP_G17S || info->chip == AGX_CHIP_G17C;
+   if (info->flush_memory && (!gen7 || info->flags != 5))
+      return false;
+   agx3_cmdstream_store_le32(packed, agx3_cdm_barrier_word(info->flags) |
+                                     (info->flush_memory ? 0x1c : 0));
    return true;
 }
 
@@ -623,7 +631,13 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
       return false;
 
    const uint32_t word = agx3_cmdstream_load_le32((const uint8_t *)packed);
-   const uint32_t optional_mask = UINT32_C(0x00001c02);
+   const bool flush_memory = (word & 0x1c) == 0x1c;
+   const bool gen7 = chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
+                     chip == AGX_CHIP_G17C;
+   if ((word & 0x1c) && (!gen7 || !flush_memory))
+      return false;
+   const uint32_t optional_mask = UINT32_C(0x00001c02) |
+                                 (flush_memory ? 0x1c : 0);
    if ((word & ~optional_mask) != UINT32_C(0x60000160))
       return false;
 
@@ -634,12 +648,15 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
    if (!agx3_cdm_barrier_flags_grounded(chip, flags))
       return false;
 
+   if (flush_memory && flags != 5)
+      return false;
    info->chip = chip;
    info->flags = flags;
+   info->flush_memory = flush_memory;
    return true;
 }
 
-/* HAL200's encodeSSTTFlushInvalidate emits this standalone record after the
+/* HAL200 and HAL300 encodeSSTTFlushInvalidate emit this standalone record after the
  * CPU changes a sparse texture translation table. It is not an ordinary CDM
  * barrier: the low control byte and SSTT selector at bit 14 are distinct. */
 static inline bool
@@ -651,7 +668,7 @@ agx3_cdm_sstt_flush_invalidate_pack(
       return false;
 
    memset(packed, 0, AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE);
-   if (chip != AGX_CHIP_G17P)
+   if (chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip))
       return false;
 
    agx3_cmdstream_store_le32(packed, UINT32_C(0x60024102));
@@ -663,7 +680,7 @@ agx3_cdm_sstt_flush_invalidate_validate(enum agx_chip chip,
                                         const void *packed,
                                         size_t available)
 {
-   return chip == AGX_CHIP_G17P && packed &&
+   return (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) && packed &&
           available >= AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE &&
           agx3_cmdstream_load_le32(packed) == UINT32_C(0x60024102);
 }

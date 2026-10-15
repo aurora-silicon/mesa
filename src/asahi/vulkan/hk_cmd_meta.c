@@ -432,7 +432,8 @@ hk_g17p_sparse_buffer_copy(struct hk_cmd_buffer *cmd,
                            uint64_t dst_addr, VkDeviceSize size)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   assert(dev->dev.chip == AGX_CHIP_G17P && src_buffer->sparse_map);
+   assert((dev->dev.chip == AGX_CHIP_G17P ||
+           agx_chip_g17_m5(dev->dev.chip)) && src_buffer->sparse_map);
 
    /* Resident writes use the primary VA while nonresident reads must use the
     * zero-page shadow. Read the live map in the copy shader so a sparse bind
@@ -1069,7 +1070,8 @@ build_image_copy_shader(const struct vk_meta_image_copy_key *key,
 
    image->data.descriptor_set = 0;
    image->data.binding = BINDING_OUTPUT;
-   image->data.access = ACCESS_NON_READABLE;
+   /* Partial tile copies read the destination before preserving its pixels. */
+   image->data.access = key->block_based ? 0 : ACCESS_NON_READABLE;
 
    texture->data.descriptor_set = 0;
    texture->data.binding = BINDING_INPUT;
@@ -1314,8 +1316,8 @@ get_image_copy_pipeline(struct vk_device *device, struct vk_meta_device *meta,
        * The existing NIR pack/unpack path retains a single aligned raw store.
        * Meta pipelines are cached per device, so no extra key is needed. */
       .nir = build_image_copy_shader(key,
-         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G17P &&
-         container_of(device, struct hk_device, vk)->dev.chip != AGX_CHIP_G16G),
+         agx_chip_isa(container_of(device, struct hk_device, vk)->dev.chip) !=
+            AGX_ISA_AGX3),
    };
    const VkPipelineShaderStageCreateInfo cs_info = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1373,9 +1375,14 @@ hk_meta_copy_image_to_buffer2(struct vk_command_buffer *cmd,
 
          VkImageAspectFlags aspect = region->imageSubresource.aspectMask;
          VkFormat aspect_fmt = aspect_format(image->format, aspect);
+         /* M5 reads uncompressed colour through the same integer alias as
+          * G17P: a canonical R9G9B9E5_FLOAT (or UNORM) view decodes and
+          * re-encodes, which renormalizes shared-exponent texels and is not
+          * the bit-exact copy Vulkan specifies (queue_transfer e5b9g9r9). */
+         const enum agx_chip chip =
+            container_of(device, struct hk_device, vk)->dev.chip;
          const bool g17p_color =
-            container_of(device, struct hk_device, vk)->dev.chip ==
-               AGX_CHIP_G17P &&
+            (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
             !vk_format_is_depth_or_stencil(image->format);
          const struct hk_image *hk_image =
             container_of(image, struct hk_image, vk);
@@ -2477,7 +2484,8 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (dev->dev.chip == AGX_CHIP_G17P ||
+       agx_chip_g17_m5(dev->dev.chip)) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       /* Retain the aligned 16-byte bulk path even when the original
@@ -2603,7 +2611,8 @@ hk_g17p_copy_buffer_to_image_supported(
 static bool
 hk_g17p_block_copy_format(struct hk_device *dev, VkFormat format)
 {
-   if (!dev || dev->dev.chip != AGX_CHIP_G17P)
+   if (!dev || (dev->dev.chip != AGX_CHIP_G17P &&
+                !agx_chip_g17_m5(dev->dev.chip)))
       return false;
 
    switch (hk_g17p_block_format_family(format)) {
@@ -2883,7 +2892,8 @@ hk_g17p_copy_padded_rgb_buffer_image(
    VkImageLayout image_layout, bool to_image)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip != AGX_CHIP_G17P || region_count == 0 ||
+   if ((dev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(dev->dev.chip)) ||
+       region_count == 0 ||
        image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
        (image_layout != (to_image ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
                                   : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) &&
@@ -3059,7 +3069,8 @@ hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
    const struct hk_image *image, const VkCopyBufferToImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0)
+   if ((dev->dev.chip != AGX_CHIP_G17P &&
+        !agx_chip_g17_m5(dev->dev.chip)) || info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -3349,7 +3360,8 @@ hk_g17p_raw_image_copy_supported(struct hk_device *dev,
                                  const struct hk_image *dst,
                                  const VkCopyImageInfo2 *info)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || info->regionCount == 0 ||
+   if ((dev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(dev->dev.chip)) ||
+       info->regionCount == 0 ||
        src->vk.samples != dst->vk.samples ||
        (src->vk.samples != VK_SAMPLE_COUNT_1_BIT &&
         src->vk.samples != VK_SAMPLE_COUNT_2_BIT &&
@@ -3577,8 +3589,21 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, dst_image, pCopyBufferToImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   /* Share the native raw tiled upload with M5. It preserves partial
+    * rectangles without an imageblock round trip or extra firmware job. */
+   if (agx_chip_g17_m5(dev->dev.chip) &&
+       hk_g17p_copy_uncompressed_buffer_to_image_supported(
+          dev, src_buffer, dst_image, pCopyBufferToImageInfo)) {
+      struct hk_meta_save save;
+      hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      hk_g17p_copy_uncompressed_buffer_to_image(
+         cmd, src_buffer, dst_image, pCopyBufferToImageInfo);
+      hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+      return;
+   }
+
    bool gfx = hk_copy_requires_gfx(dst_image);
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) {
       uint8_t plane;
       VkFormat format;
       uint32_t api_block_B, physical_block_B;
@@ -3846,7 +3871,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
    VkFormat format;
    uint32_t api_block_B, physical_block_B;
    const bool padded_rgb =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
       pCopyImageToBufferInfo->regionCount > 0 &&
       hk_g17p_buffer_upload_plane(
          src_image,
@@ -3862,8 +3887,7 @@ hk_xfer_copyimagetobuffer2(VkCommandBuffer commandBuffer,
              pCopyImageToBufferInfo->pRegions,
              pCopyImageToBufferInfo->srcImageLayout, false))
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-   } else if (dev->dev.chip == AGX_CHIP_G17P &&
-              hk_g17p_block_copy_format(dev, src_image->vk.format)) {
+   } else if (hk_g17p_block_copy_format(dev, src_image->vk.format)) {
       /* A compressed Vulkan copy preserves the encoded block bytes.  The
        * common meta path samples and decodes the source, so use the symmetric
        * raw AIL-addressed path on G17P instead. */
@@ -3902,6 +3926,7 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
     * The common meta path preserves partial rectangles, layers and format
     * reinterpretation without the AGX2 compute imageblock protocol. */
    bool gfx = dev->dev.chip == AGX_CHIP_G17P ||
+              agx_chip_g17_m5(dev->dev.chip) ||
               hk_copy_requires_gfx(dst_image);
    VkPipelineBindPoint bind_point = hk_bind_point(gfx);
 
@@ -3911,10 +3936,12 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    if (gfx) {
       struct vk_meta_copy_image_properties src_props =
          hk_meta_copy_get_image_properties(src_image,
-                                          dev->dev.chip == AGX_CHIP_G17P);
+                                          dev->dev.chip == AGX_CHIP_G17P ||
+                                          agx_chip_g17_m5(dev->dev.chip));
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image,
-                                          dev->dev.chip == AGX_CHIP_G17P);
+                                          dev->dev.chip == AGX_CHIP_G17P ||
+                                          agx_chip_g17_m5(dev->dev.chip));
 
       if (dev->dev.chip == AGX_CHIP_G17P) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 hk_files = files(
   'hk_acceleration_structure.c',
+  'hk_m5_acceleration_structure.c',
   'hk_acceleration_structure.h',
   'hk_buffer.c',
   'hk_buffer.h',
@@ -137,6 +138,16 @@ if with_tests
 
   endif
 
+  test(
+    'hk_render_resource_span',
+    executable(
+      'hk_render_resource_span_test',
+      files('tests/test-hk-render-resource-span.c', 'hk_drm_render_core.c'),
+      include_directories : [include_directories('.'), inc_include],
+      c_args : [c_msvc_compat_args],
+    ),
+    suite : ['asahi'],
+  )
   test(
     'hk_g17p_compression',
     executable(
