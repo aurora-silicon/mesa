@@ -93,7 +93,8 @@ struct hk_shader_info {
           * [0, 1] (computed only with the flag set). */
          bool g17p_colour_unit_range;
 
-         uint8_t _pad[5];
+         bool m5_inline_sample_shading;
+         uint8_t _pad[4];
       } fs;
 
       struct {
