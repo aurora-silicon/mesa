@@ -320,7 +320,6 @@ struct hk_rt_compiler {
    VkPipelineCreateFlags2KHR flags;
    bool position_fetch;
    bool native_agx;
-   nir_variable *native_query, *native_hit_kind;
    bool native_m5;
    bool callable_dispatch;
 
