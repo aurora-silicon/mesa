@@ -929,6 +929,13 @@ hk_get_device_features(
       features->textureCompressionASTC_HDR = true;
    }
 
+   /* Compute derivatives are NIR quad-swap lowering plus explicit-gradient
+    * samples, both available on M5; quad control stays off as on G17P. */
+   if (agx_chip_g17_m5(dev->chip)) {
+      features->computeDerivativeGroupQuads = true;
+      features->computeDerivativeGroupLinear = true;
+   }
+
    /* A multiview promise for a stage this device does not expose is
     * meaningless, so keep the pair consistent however the stage bits above
     * resolved. */
@@ -1852,6 +1859,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.EXT_shader_atomic_float2 = true;
       supported_extensions.EXT_texture_compression_astc_hdr = true;
    }
+
+   if (agx_chip_g17_m5(pdev->dev.chip))
+      supported_extensions.KHR_compute_shader_derivatives = true;
 
    /* AGX3C has no witnessed native float atomic; agx_nir_lower_atomics turns
     * fp32 add/min/max on buffers, shared memory and (lowered) images into
