@@ -48,6 +48,7 @@
 #include "hk_shader.h"
 
 #include "vk_alloc.h"
+#include "vk_descriptor_set_layout.h"
 #include "vk_common_entrypoints.h"
 #include "vk_nir.h"
 #include "vk_pipeline.h"
@@ -56,6 +57,8 @@
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "nir_serialize.h"
+#include "util/mesa-blake3.h"
 
 #include "spirv/spirv.h"
 
@@ -3209,6 +3212,292 @@ hk_compile_ray_tracing_pipeline(
    return VK_SUCCESS;
 }
 
+/* The RT pipeline owns megakernels, not vk_rt_pipeline stage records. Keep its
+ * binary representation independent of the common pipeline object's layout. */
+#define HK_RT_BINARY_MAGIC UINT64_C(0x314e494254524b48)
+
+static bool
+hk_rt_binary_serialize(struct hk_device *dev,
+                       const struct hk_ray_tracing_pipeline *pipeline,
+                       struct blob *blob)
+{
+   const struct vk_properties *props =
+      &hk_device_physical(dev)->vk.properties;
+   blob_write_uint64(blob, HK_RT_BINARY_MAGIC);
+   blob_write_bytes(blob, props->shaderBinaryUUID, VK_UUID_SIZE);
+   blob_write_uint32(blob, props->shaderBinaryVersion);
+   blob_write_uint32(blob, pipeline->stage_count);
+   blob_write_uint32(blob, pipeline->group_count);
+   blob_write_uint32(blob, pipeline->kernel_count);
+   blob_write_bytes(blob, &pipeline->stack_sizes, sizeof(pipeline->stack_sizes));
+   blob_write_uint32(blob, pipeline->stack_size);
+   for (uint32_t i = 0; i < pipeline->stage_count; ++i) {
+      struct blob nir;
+      blob_init(&nir);
+      nir_serialize(&nir, pipeline->stages[i]->nir, true);
+      if (nir.out_of_memory) {
+         blob_finish(&nir);
+         return false;
+      }
+      blob_write_uint32(blob, nir.size);
+      blob_write_bytes(blob, nir.data, nir.size);
+      blob_finish(&nir);
+   }
+   blob_write_bytes(blob, pipeline->groups,
+                    pipeline->group_count * sizeof(*pipeline->groups));
+   for (uint32_t i = 0; i < pipeline->kernel_count; ++i) {
+      struct blob shader;
+      blob_init(&shader);
+      const struct vk_shader *vk_shader = &pipeline->kernels[i].shader->vk;
+      if (!vk_shader->ops->serialize(&dev->vk, vk_shader, &shader)) {
+         blob_finish(&shader);
+         return false;
+      }
+      blob_write_uint32(blob, pipeline->kernels[i].raygen_handle_index);
+      blob_write_uint32(blob, shader.size);
+      blob_write_bytes(blob, shader.data, shader.size);
+      blob_finish(&shader);
+   }
+   return !blob->out_of_memory;
+}
+
+static VkResult
+hk_rt_binary_load(struct hk_device *dev, struct hk_ray_tracing_pipeline *pipeline,
+                   const VkPipelineBinaryInfoKHR *info,
+                   const VkAllocationCallbacks *alloc)
+{
+   if (info->binaryCount != 1)
+      return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+   VkPipelineBinaryDataInfoKHR data_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR,
+      .pipelineBinary = info->pPipelineBinaries[0],
+   };
+   VkPipelineBinaryKeyKHR key = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
+   };
+   size_t size = 0;
+   VkResult result = vk_common_GetPipelineBinaryDataKHR(
+      hk_device_to_handle(dev), &data_info, &key, &size, NULL);
+   if (result != VK_SUCCESS)
+      return result;
+   void *data = malloc(size);
+   if (!data)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   result = vk_common_GetPipelineBinaryDataKHR(
+      hk_device_to_handle(dev), &data_info, &key, &size, data);
+   if (result != VK_SUCCESS) {
+      free(data);
+      return result;
+   }
+   blake3_hash hash;
+   _mesa_blake3_compute(data, size, hash);
+   struct blob_reader blob;
+   blob_reader_init(&blob, data, size);
+   const uint64_t magic = blob_read_uint64(&blob);
+   const void *uuid = blob_read_bytes(&blob, VK_UUID_SIZE);
+   const uint32_t version = blob_read_uint32(&blob);
+   const struct vk_properties *props =
+      &hk_device_physical(dev)->vk.properties;
+   if (blob.overrun || magic != HK_RT_BINARY_MAGIC ||
+       version != props->shaderBinaryVersion ||
+       memcmp(uuid, props->shaderBinaryUUID, VK_UUID_SIZE) ||
+       key.keySize != sizeof(hash) || memcmp(hash, key.key, sizeof(hash))) {
+      result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+      goto out;
+   }
+   pipeline->stage_count = blob_read_uint32(&blob);
+   pipeline->group_count = blob_read_uint32(&blob);
+   const uint32_t kernel_count = blob_read_uint32(&blob);
+   blob_copy_bytes(&blob, &pipeline->stack_sizes, sizeof(pipeline->stack_sizes));
+   pipeline->stack_size = blob_read_uint32(&blob);
+   if (blob.overrun || pipeline->stage_count > 65536 ||
+       pipeline->group_count > 65536 || kernel_count > pipeline->group_count) {
+      result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+      goto out;
+   }
+   pipeline->stages = calloc(pipeline->stage_count, sizeof(*pipeline->stages));
+   pipeline->groups = calloc(pipeline->group_count, sizeof(*pipeline->groups));
+   pipeline->kernels = calloc(kernel_count, sizeof(*pipeline->kernels));
+   if ((pipeline->stage_count && !pipeline->stages) ||
+       (pipeline->group_count && !pipeline->groups) ||
+       (kernel_count && !pipeline->kernels)) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto out;
+   }
+   const nir_shader_compiler_options *options =
+      hk_get_nir_options(&hk_device_physical(dev)->vk, MESA_SHADER_COMPUTE,
+                         &dev->vk.robustness_state);
+   for (uint32_t i = 0; i < pipeline->stage_count; ++i) {
+      const uint32_t nir_size = blob_read_uint32(&blob);
+      const void *nir_data = blob_read_bytes(&blob, nir_size);
+      if (blob.overrun) {
+         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         goto out;
+      }
+      struct blob_reader nir_blob;
+      blob_reader_init(&nir_blob, nir_data, nir_size);
+      struct hk_rt_stage_nir *stage = calloc(1, sizeof(*stage));
+      if (!stage) { result = VK_ERROR_OUT_OF_HOST_MEMORY; goto out; }
+      stage->ref_cnt = 1;
+      pipeline->stages[i] = stage;
+      stage->nir = nir_deserialize(NULL, options, &nir_blob);
+      if (!stage->nir || nir_blob.overrun || nir_blob.current != nir_blob.end) {
+         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         goto out;
+      }
+      pipeline->base.stages |= mesa_to_vk_shader_stage(stage->nir->info.stage);
+   }
+   blob_copy_bytes(&blob, pipeline->groups,
+                    pipeline->group_count * sizeof(*pipeline->groups));
+   for (uint32_t i = 0; i < kernel_count; ++i) {
+      const uint32_t handle = blob_read_uint32(&blob);
+      const uint32_t shader_size = blob_read_uint32(&blob);
+      const void *shader_data = blob_read_bytes(&blob, shader_size);
+      if (blob.overrun) {
+         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         goto out;
+      }
+      struct blob_reader shader_blob;
+      blob_reader_init(&shader_blob, shader_data, shader_size);
+      struct vk_shader *shader = NULL;
+      result = dev->vk.shader_ops->deserialize(&dev->vk, &shader_blob,
+                                               version, alloc, &shader);
+      if (result != VK_SUCCESS)
+         goto out;
+      pipeline->kernels[i].shader =
+         container_of(shader, struct hk_api_shader, vk);
+      pipeline->kernels[i].raygen_handle_index = handle;
+      pipeline->kernel_count++;
+      if (shader_blob.overrun || shader_blob.current != shader_blob.end) {
+         result = VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT;
+         goto out;
+      }
+   }
+   result = blob.overrun || blob.current != blob.end
+      ? VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT : VK_SUCCESS;
+out:
+   free(data);
+   return result;
+}
+
+/* The common key path also expects common-layout pipeline libraries. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetPipelineKeyKHR(VkDevice device, const VkPipelineCreateInfoKHR *info,
+                      VkPipelineBinaryKeyKHR *key)
+{
+   const VkRayTracingPipelineCreateInfoKHR *rt = info ?
+      vk_find_struct_const(info->pNext, RAY_TRACING_PIPELINE_CREATE_INFO_KHR) : NULL;
+   if (!rt || !rt->pLibraryInfo || !rt->pLibraryInfo->libraryCount)
+      return vk_common_GetPipelineKeyKHR(device, info, key);
+
+   VK_FROM_HANDLE(hk_device, dev, device);
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   if (rt->stageCount) {
+      VkRayTracingPipelineCreateInfoKHR own = *rt;
+      own.pLibraryInfo = NULL;
+      own.groupCount = 0;
+      own.pGroups = NULL;
+      VkPipelineCreateInfoKHR own_info = *info;
+      own_info.pNext = &own;
+      VkPipelineBinaryKeyKHR own_key = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
+      };
+      VkResult result = vk_common_GetPipelineKeyKHR(device, &own_info, &own_key);
+      if (result != VK_SUCCESS)
+         return result;
+      _mesa_blake3_update(&hash, own_key.key, own_key.keySize);
+   }
+   const VkPipelineCreateFlags2KHR flags =
+      vk_rt_pipeline_create_flags(rt) & MESA_VK_PIPELINE_RAY_TRACING_FLAGS;
+   _mesa_blake3_update(&hash, &flags, sizeof(flags));
+   _mesa_blake3_update(&hash, &rt->maxPipelineRayRecursionDepth,
+                        sizeof(rt->maxPipelineRayRecursionDepth));
+   VK_FROM_HANDLE(vk_pipeline_layout, layout, rt->layout);
+   if (layout) {
+      _mesa_blake3_update(&hash, &layout->set_count, sizeof(layout->set_count));
+      for (uint32_t i = 0; i < layout->set_count; ++i) {
+         const bool present = layout->set_layouts[i] != NULL;
+         _mesa_blake3_update(&hash, &present, sizeof(present));
+         if (present)
+            _mesa_blake3_update(&hash, layout->set_layouts[i]->blake3,
+                                 sizeof(layout->set_layouts[i]->blake3));
+      }
+      _mesa_blake3_update(&hash, layout->push_ranges,
+                           layout->push_range_count * sizeof(layout->push_ranges[0]));
+   }
+   for (uint32_t i = 0; i < rt->groupCount; ++i) {
+      const VkRayTracingShaderGroupCreateInfoKHR *group = &rt->pGroups[i];
+      const uint32_t fields[] = {group->type, group->generalShader,
+         group->closestHitShader, group->anyHitShader, group->intersectionShader};
+      _mesa_blake3_update(&hash, fields, sizeof(fields));
+   }
+   for (uint32_t i = 0; i < rt->pLibraryInfo->libraryCount; ++i) {
+      VK_FROM_HANDLE(hk_ray_tracing_pipeline, library, rt->pLibraryInfo->pLibraries[i]);
+      struct blob blob;
+      blob_init(&blob);
+      if (!hk_rt_binary_serialize(dev, library, &blob)) {
+         blob_finish(&blob);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+      _mesa_blake3_update(&hash, blob.data, blob.size);
+      blob_finish(&blob);
+   }
+   _mesa_blake3_final(&hash, key->key);
+   key->keySize = sizeof(blake3_hash);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_CreatePipelineBinariesKHR(VkDevice device,
+                             const VkPipelineBinaryCreateInfoKHR *info,
+                             const VkAllocationCallbacks *alloc,
+                             VkPipelineBinaryHandlesInfoKHR *handles)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VK_FROM_HANDLE(vk_pipeline, base, info->pipeline);
+   if (!base || base->bind_point != VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
+      if (info->pPipelineCreateInfo &&
+          vk_find_struct_const(info->pPipelineCreateInfo->pNext,
+                               RAY_TRACING_PIPELINE_CREATE_INFO_KHR)) {
+         handles->pipelineBinaryCount = 0;
+         return VK_PIPELINE_BINARY_MISSING_KHR;
+      }
+      return vk_common_CreatePipelineBinariesKHR(device, info, alloc, handles);
+   }
+   if (!handles->pPipelineBinaries) {
+      handles->pipelineBinaryCount = 1;
+      return VK_SUCCESS;
+   }
+   if (!handles->pipelineBinaryCount)
+      return VK_INCOMPLETE;
+   handles->pipelineBinaryCount = 1;
+   handles->pPipelineBinaries[0] = VK_NULL_HANDLE;
+   struct blob blob;
+   blob_init(&blob);
+   VkResult result;
+   if (!hk_rt_binary_serialize(dev, hk_pipeline_to_ray_tracing(base), &blob)) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   } else {
+      VkPipelineBinaryKeyKHR key = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
+         .keySize = sizeof(blake3_hash),
+      };
+      _mesa_blake3_compute(blob.data, blob.size, key.key);
+      VkPipelineBinaryDataKHR data = {.dataSize = blob.size, .pData = blob.data};
+      VkPipelineBinaryKeysAndDataKHR keys_data = {
+         .binaryCount = 1, .pPipelineBinaryKeys = &key, .pPipelineBinaryData = &data,
+      };
+      VkPipelineBinaryCreateInfoKHR binary_info = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR,
+         .pKeysAndDataInfo = &keys_data,
+      };
+      result = vk_common_CreatePipelineBinariesKHR(device, &binary_info, alloc, handles);
+   }
+   blob_finish(&blob);
+   return result;
+}
+
 static VkResult
 hk_create_ray_tracing_pipeline(
    struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
@@ -3245,6 +3534,16 @@ hk_create_ray_tracing_pipeline(
                        "driver advertises",
                        create_info->maxPipelineRayRecursionDepth,
                        HK_MAX_RAY_RECURSION_DEPTH);
+   }
+
+   const VkPipelineBinaryInfoKHR *binary_info =
+      vk_find_struct_const(create_info->pNext, PIPELINE_BINARY_INFO_KHR);
+   if (binary_info && binary_info->binaryCount) {
+      result = hk_rt_binary_load(dev, pipeline, binary_info, pAllocator);
+      if (result != VK_SUCCESS)
+         goto fail;
+      *out_pipeline = vk_pipeline_to_handle(&pipeline->base);
+      return VK_SUCCESS;
    }
 
    pipeline->stage_count = create_info->stageCount;
