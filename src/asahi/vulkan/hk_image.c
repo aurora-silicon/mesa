@@ -1104,7 +1104,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
     * AGX3 chips stay plain until their packets are recovered. */
    const bool m5_storage = hk_m5_storage_compression_eligible(dev, plane, info);
    bool allow_agx3 = m5_storage ||
-                     hk_g17p_compression_eligible(dev->chip, plane, info);
+                     hk_g17p_compression_eligible(dev->chip, plane, info) ||
+                     hk_m5_color_compression_eligible(dev->chip, plane, info);
 
    /* Compressed data is only decodable through its own channel class. Every
     * G17P writer of a colour image is a PBE; the end-of-tile PBE may store a
