@@ -1954,14 +1954,23 @@ hk_meta_bitwise_copy_format(VkFormat format)
 }
 
 static inline struct vk_meta_copy_image_properties
-hk_meta_copy_get_image_properties(struct hk_image *img, bool g17p)
+hk_meta_copy_get_image_properties(struct hk_image *img, bool g17p,
+                                  bool msaa_depth_stencil_aspect_views)
 {
+   /* A split depth/stencil image has separate depth and stencil planes. The
+    * interleaved R32G32_UINT alias below is a colour view, which selects
+    * image plane 0 (the depth plane) for both aspects, so on M5 copy each
+    * plane through its own raw alias at every sample count. */
+   const bool aspect_views =
+      g17p && hk_split_depth_stencil(img->vk.format) &&
+      (img->vk.samples == VK_SAMPLE_COUNT_1_BIT ||
+       msaa_depth_stencil_aspect_views);
    /* Keep the existing multisample render-target formats: G17P's native
     * multisample tile path does not support these integer aliases yet. */
    g17p &= img->vk.samples == VK_SAMPLE_COUNT_1_BIT;
    struct vk_meta_copy_image_properties props = {
       .tile_size = {16, 16, 1},
-      .depth_stencil_aspect_views = g17p && hk_split_depth_stencil(img->vk.format),
+      .depth_stencil_aspect_views = aspect_views,
    };
    const struct vk_format_ycbcr_info *ycbcr =
       vk_format_get_ycbcr_info(img->vk.format);
@@ -3676,7 +3685,8 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
    if (gfx) {
       struct vk_meta_copy_image_properties dst_props =
          hk_meta_copy_get_image_properties(dst_image,
-                                          dev->dev.chip == AGX_CHIP_G17P);
+                                          dev->dev.chip == AGX_CHIP_G17P,
+                                          false);
 
       if (dev->dev.chip == AGX_CHIP_G17P) {
          /* Native single-slice EOT views already select the mip and array
@@ -3934,14 +3944,13 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    hk_meta_begin(cmd, &save, bind_point);
 
    if (gfx) {
+      const bool native = dev->dev.chip == AGX_CHIP_G17P ||
+                          agx_chip_g17_m5(dev->dev.chip);
+      const bool m5 = agx_chip_g17_m5(dev->dev.chip);
       struct vk_meta_copy_image_properties src_props =
-         hk_meta_copy_get_image_properties(src_image,
-                                          dev->dev.chip == AGX_CHIP_G17P ||
-                                          agx_chip_g17_m5(dev->dev.chip));
+         hk_meta_copy_get_image_properties(src_image, native, m5);
       struct vk_meta_copy_image_properties dst_props =
-         hk_meta_copy_get_image_properties(dst_image,
-                                          dev->dev.chip == AGX_CHIP_G17P ||
-                                          agx_chip_g17_m5(dev->dev.chip));
+         hk_meta_copy_get_image_properties(dst_image, native, m5);
 
       if (dev->dev.chip == AGX_CHIP_G17P) {
          /* The qualified HAL200 BG/EOT contract is single-layer.  Preserve
