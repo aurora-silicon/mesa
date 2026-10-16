@@ -10744,7 +10744,7 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
 }
 
 /*
- * Records of an indirect (multi-)draw on G17P whose draws would find nothing
+ * Records of an indirect (multi-)draw on G17P or M5 whose draws would find nothing
  * to do in hk_draw_impl() / hk_flush_gfx_state() /
  * hk_flush_dynamic_state_slow() except their own publication: no dirty
  * dynamic, shader, link, root, descriptor or vertex-buffer state, and none of
@@ -10756,6 +10756,10 @@ hk_g17p_normalize_indirect_draw(const struct hk_cmd_buffer *cmd,
  * when the vertex shader reads draw parameters, then the draw record
  * (hk_g17p_emit_draw()) -- so records are emitted directly, byte for byte
  * what the general path emits.
+ *
+ * On M5 the general path also derives the HAL300 graphics core, which is then
+ * the one the stream already latched (hk_cs.m5_ppp_emitted), so it emits
+ * nothing there either.
  *
  * The check reads no per-record value except the indirect address, and
  * emitting a record changes none of what it reads, so a multi-draw checks it
@@ -10799,7 +10803,7 @@ hk_g17p_indirect_records_eligible(struct hk_cmd_buffer *cmd,
          VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT)) ||
-       dyn->rs.depth_bias.enable ||
+       hk_prims_generated_active(cmd) || dyn->rs.depth_bias.enable ||
        (dyn->ms.rasterization_samples && !gfx->render.tilebuffer.nr_samples))
       return false;
 
@@ -10900,9 +10904,17 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       return;
 
    cs->stats.calls++;
-   if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
-                          tail_emitted))
-      return;
+   if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P) {
+      if (!hk_g17p_emit_draw(cmd, cs, cs->current, draw, gfx->topology,
+                             tail_emitted))
+         return;
+   } else {
+      /* As hk_draw_impl() emits an indirect HAL300 draw: the packet carries
+       * its own restart state. */
+      cs->current = (void *)agx_vdm_draw((uint32_t *)cs->current,
+                                         hk_cmd_buffer_device(cmd)->dev.chip,
+                                         draw, gfx->topology);
+   }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    hk_m5_note_render_resources(cmd, cs);
    cs->stats.cmds++;
@@ -10954,7 +10966,8 @@ hk_draw_indirect_inner(VkCommandBuffer commandBuffer, uint64_t base,
       assert(stride >= sizeof(VkDrawIndirectCommand));
    }
 
-   int eligible = hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ? -1 : 0;
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   int eligible = chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip) ? -1 : 0;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {
       uint64_t addr = base + stride * draw_id;
       hk_draw_indirect_record(cmd, draw_id, agx_draw_indirect(addr),
@@ -10995,7 +11008,8 @@ hk_draw_indexed_indirect_inner(VkCommandBuffer commandBuffer, uint64_t buffer,
       assert(stride >= sizeof(VkDrawIndexedIndirectCommand));
    }
 
-   int eligible = hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ? -1 : 0;
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   int eligible = chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip) ? -1 : 0;
    for (unsigned draw_id = 0; draw_id < drawCount; ++draw_id) {
       uint64_t addr = buffer + stride * draw_id;
       struct hk_addr_range buf = cmd->state.gfx.index.buffer;
