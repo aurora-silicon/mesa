@@ -3939,9 +3939,9 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
  * Deferred whole-image clears (M5).
  *
  * A vkCmdClearColorImage or vkCmdClearDepthStencilImage of a whole
- * single-level, single-layer attachment image is a compute fill of the
- * entire allocation: M5 attachments are not compressed, so there is no
- * metadata fast clear. Applications commonly clear an image this way and
+ * single-level, single-layer attachment image is a compute job: a fill of
+ * the entire allocation for a plain image, a metadata fast clear for a
+ * compressed one. Applications commonly clear an image this way and
  * then begin a full-area render pass that loads it, which reads the whole
  * image back into the tilebuffer. Minecraft clears six 2976x1872 images
  * per frame like that: 138 MB of fills, then the loads.
@@ -3975,10 +3975,6 @@ hk_deferred_clear_image_whole(const struct hk_image *image,
        vk_image_subresource_layer_count(&image->vk, &ranges[0]) != 1)
       return false;
 
-   for (unsigned p = 0; p < image->plane_count; ++p) {
-      if (image->planes[p].layout.compressed)
-         return false;
-   }
    return true;
 }
 
