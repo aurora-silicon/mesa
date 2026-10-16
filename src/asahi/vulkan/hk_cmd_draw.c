@@ -3150,9 +3150,9 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
       m5 ? 65536 : g17p ? 32768 : 0, (g17p || m5) ? 2048 : 0);
 }
 
-VKAPI_ATTR void VKAPI_CALL
-hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
-                     const VkRenderingInfo *pRenderingInfo)
+static void
+hk_begin_rendering(VkCommandBuffer commandBuffer,
+                   const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -3707,6 +3707,27 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
        */
       cs->cr.process_empty_tiles = process_empty_tiles;
    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                     const VkRenderingInfo *pRenderingInfo)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (likely(!cmd->state.deferred_clear_count)) {
+      hk_begin_rendering(commandBuffer, pRenderingInfo);
+      return;
+   }
+
+   /* Attachments that take a deferred clear as their load-op clear, then
+    * the other deferred clears, before the pass (hk_flush_deferred_clears()). */
+   VkRenderingInfo info;
+   VkRenderingAttachmentInfo color[HK_MAX_RTS], depth, stencil;
+   const VkRenderingInfo *taken = hk_take_deferred_clears(
+      cmd, pRenderingInfo, &info, color, &depth, &stencil);
+   hk_flush_deferred_clears(cmd);
+   hk_begin_rendering(commandBuffer, taken);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -11223,6 +11244,7 @@ hk_CmdBeginConditionalRenderingEXT(
    const VkConditionalRenderingBeginInfoEXT *pConditionalRenderingBegin)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_buffer, buffer, pConditionalRenderingBegin->buffer);
    struct hk_conditional_render_state *conditional =
       &cmd->state.conditional;
