@@ -10,9 +10,11 @@
 #include <assert.h>
 
 #include "vk_log.h"
+#include "util/u_debug.h"
+#include "asahi/lib/agx_chip.h"
 #include "vk_util.h"
 
-#define HK_MAX_SETS                      8
+#define HK_MAX_SETS                      16
 #define HK_MAX_PUSH_SIZE                 256
 #define HK_MAX_DYNAMIC_BUFFERS           64
 #define HK_MAX_RTS                       8
@@ -20,7 +22,11 @@
 #define HK_MIN_TEXEL_BUFFER_ALIGNMENT    16
 #define HK_MIN_UBO_ALIGNMENT             64
 #define HK_MAX_VIEWPORTS                 16
-#define HK_MAX_DESCRIPTOR_SIZE           64
+/* The largest per-descriptor stride any binding can take. G17P storage images
+ * occupy 80 bytes and round to 96 so every array element's PBE half remains
+ * 32-byte aligned. Mutable descriptors must be large enough for that member.
+ */
+#define HK_MAX_DESCRIPTOR_SIZE           96
 #define HK_MAX_PUSH_DESCRIPTORS          32
 #define HK_MAX_DESCRIPTOR_SET_SIZE       (1u << 30)
 #define HK_MAX_INLINE_UNIFORM_BLOCK_SIZE (1u << 16)
@@ -52,3 +58,9 @@ struct hk_addr_range {
       if (hk_cmd_buffer_device(cmd)->dev.debug & AGX_DBG_PERF)                 \
          mesa_log(MESA_LOG_WARN, (MESA_LOG_TAG), (fmt), ##__VA_ARGS__);        \
    } while (0)
+
+static inline bool
+hk_g17p_rt_enabled(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P && !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
+}

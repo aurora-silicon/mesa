@@ -31,6 +31,11 @@
 /* This should be the same as nir_search_max_comm_ops in nir_algebraic.py. */
 #define NIR_SEARCH_MAX_COMM_OPS 8
 
+struct match_variable {
+   nir_def *def;
+   uint8_t swizzle[NIR_MAX_VEC_COMPONENTS];
+};
+
 struct match_state {
    unsigned fp_math_ctrl;
    uint8_t comm_op_direction;
@@ -41,7 +46,7 @@ struct match_state {
    const struct per_op_table *pass_op_table;
    const nir_algebraic_table *table;
 
-   nir_alu_src variables[NIR_SEARCH_MAX_VARIABLES];
+   struct match_variable variables[NIR_SEARCH_MAX_VARIABLES];
    const nir_search_state *state;
 };
 
@@ -49,6 +54,36 @@ static bool
 match_expression(const nir_algebraic_table *table, const nir_search_expression *expr, nir_alu_instr *instr,
                  unsigned num_components, const uint8_t *swizzle,
                  struct match_state *state);
+static bool
+nir_algebraic_automaton_alu(nir_alu_instr *alu, struct util_dynarray *states,
+                           const struct per_op_table *tbl)
+{
+   const nir_op op = alu->op;
+   if (tbl->num_filtered_states == 0)
+      return false;
+
+   /* Calculate the index into the transition table. Note the index
+    * calculated must match the iteration order of Python's
+    * itertools.product(), which was used to emit the transition
+    * table.
+    */
+   unsigned index = 0;
+   for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
+      index *= tbl->num_filtered_states;
+      if (tbl->filter)
+         index += tbl->filter[*util_dynarray_element(states, uint16_t,
+                                                     alu->src[i].src.ssa->index)];
+   }
+
+   uint16_t *state = util_dynarray_element(states, uint16_t,
+                                           alu->def.index);
+   if (*state != tbl->table[index]) {
+      *state = tbl->table[index];
+      return true;
+   }
+   return false;
+}
+
 static bool
 nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
                         const struct per_op_table *pass_op_table);
@@ -201,7 +236,8 @@ match_value(const nir_algebraic_table *table,
             unsigned num_components, const uint8_t *swizzle,
             struct match_state *state)
 {
-   uint8_t new_swizzle[NIR_MAX_VEC_COMPONENTS];
+   uint8_t swizzle_storage[NIR_MAX_VEC_COMPONENTS];
+   uint8_t *new_swizzle = swizzle_storage;
 
    /* If the source is an explicitly sized source, then we need to reset
     * both the number of components and the swizzle.
@@ -211,13 +247,27 @@ match_value(const nir_algebraic_table *table,
       swizzle = identity_swizzle;
    }
 
-   for (unsigned i = 0; i < num_components; ++i)
-      new_swizzle[i] = instr->src[src].swizzle[swizzle[i]];
-
    /* If the value has a specific bit size and it doesn't match, bail */
    if (value->bit_size > 0 &&
        nir_src_bit_size(instr->src[src].src) != value->bit_size)
       return false;
+
+   if (value->type == nir_search_value_variable) {
+      const nir_search_variable *var = nir_search_value_as_variable(value);
+      assert(var->variable < NIR_SEARCH_MAX_VARIABLES);
+      if (var->cond_index == -1) {
+         if (state->variables_seen & (1 << var->variable)) {
+            if (state->variables[var->variable].def != instr->src[src].src.ssa)
+               return false;
+         } else {
+            new_swizzle = state->variables[var->variable].swizzle;
+            memset(new_swizzle, 0, NIR_MAX_VEC_COMPONENTS);
+         }
+      }
+   }
+
+   for (unsigned i = 0; i < num_components; ++i)
+      new_swizzle[i] = instr->src[src].swizzle[swizzle[i]];
 
    switch (value->type) {
    case nir_search_value_expression:
@@ -241,17 +291,19 @@ match_value(const nir_algebraic_table *table,
          return false;
 
       if (state->variables_seen & (1 << var->variable)) {
-         if (state->variables[var->variable].src.ssa != instr->src[src].src.ssa)
+         if (state->variables[var->variable].def != instr->src[src].src.ssa)
             return false;
 
          return !memcmp(state->variables[var->variable].swizzle, new_swizzle, num_components);
       } else {
          state->variables_seen |= (1 << var->variable);
-         nir_alu_src *dst = &state->variables[var->variable];
-         dst->src = instr->src[src].src;
+         struct match_variable *dst = &state->variables[var->variable];
+         dst->def = instr->src[src].src.ssa;
 
-         memcpy(dst->swizzle, new_swizzle, num_components);
-         memset(dst->swizzle + num_components, 0, NIR_MAX_VEC_COMPONENTS - num_components);
+         if (new_swizzle != dst->swizzle) {
+            memcpy(dst->swizzle, new_swizzle, num_components);
+            memset(dst->swizzle + num_components, 0, NIR_MAX_VEC_COMPONENTS - num_components);
+         }
 
          return true;
       }
@@ -314,6 +366,38 @@ match_value(const nir_algebraic_table *table,
    }
 }
 
+static inline bool
+match_expression_sources(const nir_algebraic_table *table,
+                         const nir_search_expression *expr, nir_alu_instr *instr,
+                         unsigned num_components, const uint8_t *swizzle,
+                         struct match_state *state)
+{
+   /* If this is a commutative expression and it's one of the first few, look
+    * up its direction for the current search operation.  We'll use that value
+    * to possibly flip the sources for the match.
+    */
+   unsigned comm_op_flip =
+      !!(state->comm_op_direction & expr->comm_expr_mask);
+
+   bool matched = true;
+   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
+      /* If src1 of the search expression is a constant, check that first since it's faster. */
+      unsigned src_idx = i < 2 ? i ^ expr->src1_is_const : i;
+
+      /* 2src_commutative instructions that have 3 sources are only commutative
+       * in the first two sources.  Source 2 is always source 2.
+       */
+      if (!match_value(table, &state->table->values[expr->srcs[src_idx]].value, instr,
+                       i < 2 ? src_idx ^ comm_op_flip : src_idx,
+                       num_components, swizzle, state)) {
+         matched = false;
+         break;
+      }
+   }
+
+   return matched;
+}
+
 static bool
 match_expression(const nir_algebraic_table *table, const nir_search_expression *expr, nir_alu_instr *instr,
                  unsigned num_components, const uint8_t *swizzle,
@@ -355,33 +439,8 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
       }
    }
 
-   /* If this is a commutative expression and it's one of the first few, look
-    * up its direction for the current search operation.  We'll use that value
-    * to possibly flip the sources for the match.
-    */
-   unsigned comm_op_flip =
-      (expr->comm_expr_idx >= 0 &&
-       expr->comm_expr_idx < NIR_SEARCH_MAX_COMM_OPS)
-         ? ((state->comm_op_direction >> expr->comm_expr_idx) & 1)
-         : 0;
-
-   bool matched = true;
-   for (unsigned i = 0; i < nir_op_infos[instr->op].num_inputs; i++) {
-      /* If src1 of the search expression is a constant, check that first since it's faster. */
-      unsigned src_idx = i < 2 ? i ^ expr->src1_is_const : i;
-
-      /* 2src_commutative instructions that have 3 sources are only commutative
-       * in the first two sources.  Source 2 is always source 2.
-       */
-      if (!match_value(table, &state->table->values[expr->srcs[src_idx]].value, instr,
-                       i < 2 ? src_idx ^ comm_op_flip : src_idx,
-                       num_components, swizzle, state)) {
-         matched = false;
-         break;
-      }
-   }
-
-   return matched;
+   return match_expression_sources(table, expr, instr, num_components,
+                                   swizzle, state);
 }
 
 static unsigned
@@ -391,7 +450,7 @@ replace_bitsize(const nir_search_value *value, unsigned search_bitsize,
    if (value->bit_size > 0)
       return value->bit_size;
    if (value->bit_size < 0)
-      return nir_src_bit_size(state->variables[-value->bit_size - 1].src);
+      return state->variables[-value->bit_size - 1].def->bit_size;
    return search_bitsize;
 }
 
@@ -473,8 +532,8 @@ construct_value(nir_builder *build,
       const nir_search_variable *var = nir_search_value_as_variable(value);
       assert(state->variables_seen & (1 << var->variable));
 
-      nir_alu_src val = { NIR_SRC_INIT };
-      nir_alu_src_copy(&val, &state->variables[var->variable]);
+      nir_alu_src val;
+      val.src = nir_src_for_ssa(state->variables[var->variable].def);
       assert(!var->is_constant);
 
       for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
@@ -653,9 +712,24 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
    state.table = table;
 
    STATIC_ASSERT(sizeof(state.comm_op_direction) * 8 >= NIR_SEARCH_MAX_COMM_OPS);
+   STATIC_ASSERT(sizeof(search->comm_expr_mask) * 8 >= NIR_SEARCH_MAX_COMM_OPS);
 
    unsigned comm_expr_combinations =
       1 << MIN2(search->comm_exprs, NIR_SEARCH_MAX_COMM_OPS);
+
+   const bool direct_root = search->cond_index == -1;
+   if (direct_root) {
+      if (!nir_op_matches_search_op(instr->op, search->opcode) ||
+          (search->value.bit_size > 0 &&
+           instr->def.bit_size != search->value.bit_size) ||
+          (search->fp_math_ctrl_exclude & instr->fp_math_ctrl) ||
+          (search->swizzle >= 0 &&
+           (instr->def.num_components != 1 || search->swizzle != 0)))
+         return false;
+      assert(nir_op_infos[instr->op].num_inputs > 0);
+   }
+   const unsigned root_fp_math_ctrl = nir_fp_fast_math |
+      (direct_root ? instr->fp_math_ctrl : 0);
 
    bool found = false;
    for (unsigned comb = 0; comb < comm_expr_combinations; comb++) {
@@ -663,12 +737,17 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
        * binary.
        */
       state.comm_op_direction = comb;
-      state.fp_math_ctrl = nir_fp_fast_math;
+      state.fp_math_ctrl = root_fp_math_ctrl;
       state.variables_seen = 0;
 
-      if (match_expression(table, search, instr,
-                           instr->def.num_components,
-                           identity_swizzle, &state)) {
+      const bool matched = direct_root
+         ? match_expression_sources(table, search, instr,
+                                    instr->def.num_components,
+                                    identity_swizzle, &state)
+         : match_expression(table, search, instr,
+                            instr->def.num_components,
+                            identity_swizzle, &state);
+      if (matched) {
          found = true;
          break;
       }
@@ -760,32 +839,9 @@ nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
    switch (instr->type) {
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      nir_op op = alu->op;
-      uint16_t search_op = nir_search_op_for_nir_op(op);
-      const struct per_op_table *tbl = &pass_op_table[search_op];
-      if (tbl->num_filtered_states == 0)
-         return false;
-
-      /* Calculate the index into the transition table. Note the index
-       * calculated must match the iteration order of Python's
-       * itertools.product(), which was used to emit the transition
-       * table.
-       */
-      unsigned index = 0;
-      for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
-         index *= tbl->num_filtered_states;
-         if (tbl->filter)
-            index += tbl->filter[*util_dynarray_element(states, uint16_t,
-                                                        alu->src[i].src.ssa->index)];
-      }
-
-      uint16_t *state = util_dynarray_element(states, uint16_t,
-                                              alu->def.index);
-      if (*state != tbl->table[index]) {
-         *state = tbl->table[index];
-         return true;
-      }
-      return false;
+      uint16_t search_op = nir_search_op_for_nir_op(alu->op);
+      return nir_algebraic_automaton_alu(alu, states,
+                                        &pass_op_table[search_op]);
    }
 
    case nir_instr_type_load_const: {
@@ -872,7 +928,20 @@ nir_algebraic_impl(nir_function_impl *impl,
    /* Walk top-to-bottom setting up the automaton state. */
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
-         nir_algebraic_automaton(instr, &states, table->pass_op_table);
+         instr->pass_flags = 0;
+         if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const uint16_t op = nir_search_op_for_nir_op(alu->op);
+            const struct per_op_table *tbl = &table->pass_op_table[op];
+            if (tbl->num_filtered_states == 0 &&
+                table->transforms[table->transform_offsets[0]].condition_offset ==
+                   ~0u)
+               continue;
+            nir_algebraic_automaton_alu(alu, &states, tbl);
+            nir_instr_worklist_push_tail(&worklist, instr);
+         } else {
+            nir_algebraic_automaton(instr, &states, table->pass_op_table);
+         }
       }
    }
 
@@ -880,12 +949,13 @@ nir_algebraic_impl(nir_function_impl *impl,
     * first.  This will encourage us to match the biggest source patterns when
     * possible.
     */
-   nir_foreach_block_reverse(block, impl) {
-      nir_foreach_instr_reverse(instr, block) {
-         instr->pass_flags = 0;
-         if (instr->type == nir_instr_type_alu)
-            nir_instr_worklist_push_tail(&worklist, instr);
-      }
+   assert(worklist.instr_vec.tail == 0);
+   const unsigned initial_count = nir_instr_worklist_length(&worklist);
+   nir_instr **initial = worklist.instr_vec.data;
+   for (unsigned i = 0; i < initial_count / 2; ++i) {
+      nir_instr *tmp = initial[i];
+      initial[i] = initial[initial_count - 1 - i];
+      initial[initial_count - 1 - i] = tmp;
    }
 
    struct exec_list dead_instrs;

@@ -351,8 +351,11 @@ poly_load_per_vertex_input(nir_builder *b, nir_intrinsic_instr *intr,
    addr = poly_vertex_output_address(b, vp, input_mask, vertex, location);
 
    addr = nir_iadd_imm(b, addr, 4 * nir_intrinsic_component(intr));
-   return nir_load_global_constant(b, intr->def.num_components,
-                                   intr->def.bit_size, addr, .align_mul = 4);
+   /* Vertex output storage has one raw word per component, including narrow
+    * interfaces. */
+   nir_def *value = nir_load_global_constant(b, intr->def.num_components, 32,
+                                             addr, .align_mul = 4);
+   return nir_u2uN(b, value, intr->def.bit_size);
 }
 
 static bool
@@ -751,6 +754,10 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       const char *slot_name =
          gl_varying_slot_name_for_stage(slot, MESA_SHADER_GEOMETRY);
 
+      if (output->type == nir_type_invalid) {
+         output->type = nir_type_float32;
+         output->nr_components = 4;
+      }
       enum glsl_base_type type =
          nir_get_glsl_base_type_for_nir_type(output->type);
 
@@ -1490,7 +1497,7 @@ lower_vs_before_gs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    assert(nir_src_bit_size(intr->src[0]) <= 32);
    addr = nir_iadd_imm(b, addr, nir_intrinsic_component(intr) * 4);
 
-   nir_store_global(b, intr->src[0].ssa, addr,
+   nir_store_global(b, nir_u2u32(b, intr->src[0].ssa), addr,
                     .write_mask = nir_intrinsic_write_mask(intr));
    return true;
 }

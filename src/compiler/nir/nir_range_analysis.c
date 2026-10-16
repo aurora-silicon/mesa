@@ -2244,7 +2244,9 @@ bool
 nir_is_op_nuw(nir_shader *shader, struct hash_table *range_ht, nir_op op, nir_scalar src0, nir_scalar src1)
 {
    assert(src0.def->bit_size <= 32);
-   assert(src0.def->bit_size == src1.def->bit_size);
+   /* A shift count is always 32-bit, whatever the size of the value. */
+   assert(op == nir_op_ishl ? src1.def->bit_size == 32
+                            : src0.def->bit_size == src1.def->bit_size);
 
    uint32_t ub0 = nir_unsigned_upper_bound(shader, range_ht, src0);
    uint32_t ub1 = nir_unsigned_upper_bound(shader, range_ht, src1);
@@ -2632,6 +2634,7 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
    case nir_op_ixor:
    case nir_op_iadd:
    case nir_op_iand:
+   case nir_op_amul:
    case nir_op_imul:
    case nir_op_pack_64_2x32_split:
       if (!q.head.pushed_queries) {
@@ -2677,6 +2680,7 @@ get_alu_num_lsb(struct analysis_state *state, struct scalar_query q, uint32_t *r
       *result = MAX2(src[0], src[1]);
       break;
    }
+   case nir_op_amul:
    case nir_op_imul: {
       *result = MIN2(src[0] + src[1], q.scalar.def->bit_size);
       break;

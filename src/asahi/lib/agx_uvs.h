@@ -8,10 +8,12 @@
 #include <stdint.h>
 #include "agx_pack.h"
 #include "shader_enums.h"
+#include "../compiler/agx_mesh_abi.h"
 
 struct nir_shader;
 
 /* Matches the hardware order */
+
 enum uvs_group {
    UVS_POSITION,
    UVS_VARYINGS,
@@ -49,7 +51,7 @@ struct agx_unlinked_uvs_layout {
    /* Size of the UVS_VARYINGS */
    uint8_t user_size;
 
-   uint8_t pad;
+   bool mesh_primitive_page;
 
    /* Number of 32-bit components written for each slot. TODO: Model 16-bit.
     *
@@ -60,8 +62,12 @@ struct agx_unlinked_uvs_layout {
 };
 static_assert(sizeof(struct agx_unlinked_uvs_layout) == 88, "packed");
 
+/* Supply the API's default Layer for drivers transporting it as a varying. */
+bool agx_nir_lower_default_layer(struct nir_shader *s);
+
 bool agx_nir_lower_uvs(struct nir_shader *s,
-                       struct agx_unlinked_uvs_layout *layout);
+                       struct agx_unlinked_uvs_layout *layout,
+                       bool layer_as_varying);
 
 /**
  * Represents a linked UVS layout.

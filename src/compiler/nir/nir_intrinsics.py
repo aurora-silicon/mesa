@@ -314,6 +314,9 @@ index("struct nir_io_xfb", "io_xfb", size = 2)
 # Ray query values accessible from the RayQueryKHR object
 index("nir_ray_query_value", "ray_query_value")
 
+# Hit object values accessible from a HitObjectEXT object
+index("nir_hit_object_value", "hit_object_value")
+
 # Select between committed and candidate ray queriy intersections
 index("bool", "committed")
 
@@ -764,6 +767,34 @@ intrinsic("rq_generate_intersection", src_comp=[-1, 1])
 intrinsic("rq_confirm_intersection", src_comp=[-1])
 # src[] = { query }
 intrinsic("rq_load", src_comp=[-1], dest_comp=0, indices=[RAY_QUERY_VALUE,COMMITTED,COLUMN])
+
+# Hit objects (SPV_EXT_shader_invocation_reorder). src[0] is the hit object.
+#   0. Hit Object
+#   1. Acceleration Structure
+#   2. Ray Flags
+#   3. Cull Mask
+#   4. SBT Offset and SBT Stride
+#   5. Miss Index
+#   6. Ray Origin
+#   7. Ray Tmin
+#   8. Ray Direction
+#   9. Ray Tmax
+#   10. Payload
+intrinsic("hit_object_trace_ray", src_comp=[-1, -1, 1, 1, 2, 1, 3, 1, 3, 1, -1])
+# src[] = { hit_object, ray_flags, miss_index, origin, tmin, direction, tmax }
+intrinsic("hit_object_record_miss", src_comp=[-1, 1, 1, 3, 1, 3, 1])
+# src[] = { hit_object }
+intrinsic("hit_object_record_empty", src_comp=[-1])
+# src[] = { hit_object, ray_query, sbt_record_index, hit_kind, attributes }
+intrinsic("hit_object_record_from_query", src_comp=[-1, -1, 1, 1, 0])
+# src[] = { hit_object, payload }
+intrinsic("hit_object_execute_shader", src_comp=[-1, -1])
+# src[] = { hit_object }
+intrinsic("hit_object_load", src_comp=[-1], dest_comp=0, indices=[HIT_OBJECT_VALUE, COLUMN], bit_sizes=[1, 32])
+# src[] = { hit_object }
+intrinsic("hit_object_load_attributes", src_comp=[-1], dest_comp=0, bit_sizes=[32])
+# src[] = { hit_object, sbt_record_index }
+intrinsic("hit_object_set_sbt_record_index", src_comp=[-1, 1])
 
 # Driver independent raytracing helpers
 
@@ -2487,7 +2518,6 @@ system_value("is_first_fan_agx", 1, bit_sizes=[1])
 
 # Root descriptor address
 system_value("root_agx", 1, bit_sizes=[64])
-
 # Load a bindless sampler handle mapping a binding table sampler.
 intrinsic("load_sampler_handle_agx", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],
@@ -2495,6 +2525,17 @@ intrinsic("load_sampler_handle_agx", [1], 1, [],
 
 # Load a bindless texture handle mapping a binding table texture.
 intrinsic("load_texture_handle_agx", [1], 1, [],
+          flags=[CAN_ELIMINATE, CAN_REORDER],
+          bit_sizes=[32])
+
+# Load the first 32-bit word of the native texture descriptor bound to a
+# texture deref (source 0), before descriptor lowering resolves the deref.
+intrinsic("load_texture_descriptor_word_agx", [1], 1, [],
+          flags=[CAN_ELIMINATE, CAN_REORDER],
+          bit_sizes=[32])
+
+# Same for the read (texture) half of a storage image deref (source 0).
+intrinsic("load_image_descriptor_word_agx", [1], 1, [],
           flags=[CAN_ELIMINATE, CAN_REORDER],
           bit_sizes=[32])
 
@@ -2552,11 +2593,12 @@ intrinsic("load_uvs_index_agx", dest_comp = 1, bit_sizes=[16],
 #   (((((y * tile_width) + x) * nr_samples) + sample) * sample_stride) + offset
 #
 # src[] = { sample mask }
-# base = offset
-load("local_pixel_agx", [1], [BASE, FORMAT], [CAN_REORDER, CAN_ELIMINATE])
+# base = byte offset, target = logical colour attachment index. The latter
+# remains unchanged when inactive attachments compact the physical layout.
+load("local_pixel_agx", [1], [BASE, FORMAT, TARGET], [CAN_REORDER, CAN_ELIMINATE])
 # src[] = { value, sample mask, coordinates }
-# base = offset
-store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD], [CAN_REORDER])
+# base = byte offset, target = logical colour attachment index
+store("local_pixel_agx", [1, -1], [BASE, WRITE_MASK, FORMAT, EXPLICIT_COORD, TARGET], [CAN_REORDER])
 
 # Combined depth/stencil emit, applying to a mask of samples. base indicates
 # which to write (1 = depth, 2 = stencil, 3 = both).
@@ -2597,6 +2639,8 @@ load("constant_agx", [1, 1], [ACCESS, BASE, FORMAT, SIGN_EXTEND],
 # src[] = { value, address, index }.
 store("agx", [1, 1], [ACCESS, BASE, FORMAT, SIGN_EXTEND])
 
+
+
 # Logical complement of load_front_face, mapping to an AGX system value
 system_value("back_face_agx", 1, bit_sizes=[1, 32])
 
@@ -2624,7 +2668,10 @@ load("sysval_agx", [], [DESC_SET, BINDING, FLAGS], [CAN_REORDER, CAN_ELIMINATE])
 # Write out a sample mask for a targeted subset of samples, specified in the two
 # masks. Maps to the corresponding AGX instruction, the actual workings are
 # documented elsewhere as they are too complicated for this comment.
-intrinsic("sample_mask_agx", src_comp=[1, 1])
+#
+# FLAGS (AGX G17P one-sample coverage words): bit i set means source i is
+# already reduced to bit 0 (0 or 1), so the backend need not mask it.
+intrinsic("sample_mask_agx", src_comp=[1, 1], indices=[FLAGS])
 
 # For a given row of the polygon stipple given as an integer source in [0, 31],
 # load the 32-bit stipple pattern for that row.
@@ -2633,6 +2680,11 @@ intrinsic("load_polygon_stipple_agx", src_comp=[1], dest_comp=1, bit_sizes=[32],
 
 # The fixed-function sample mask specified in the API (e.g. glSampleMask)
 system_value("api_sample_mask_agx", 1, bit_sizes=[16])
+
+# Nonzero when alpha-to-coverage is enabled for the draw. Read by fragment
+# shaders that write the sample mask, which apply alpha-to-coverage themselves
+# ahead of their own coverage update instead of in the epilog.
+system_value("alpha_to_coverage_agx", 1, bit_sizes=[16])
 
 # Bit mask of samples currently being shaded. For API-level sample shading, this
 # will usually equal (1 << sample_id). Multiple bits can be set when sample
@@ -2681,6 +2733,23 @@ barrier("fence_pbe_to_tex_pixel_agx")
 
 # Unknown fence used in the helper program on exit.
 barrier("fence_helper_exit_agx")
+
+intrinsic("intersect_ray_gen1_agx", src_comp=[1, 1, 1, 1], indices=[BASE])
+intrinsic("continue_ray_gen1_agx", src_comp=[1], indices=[BASE])
+
+intrinsic("load_scs_agx", [], dest_comp=0, bit_sizes=[16, 32], indices=[BASE])
+intrinsic("store_scs_agx", [0], indices=[BASE])
+intrinsic("load_scs_indexed_agx", [1, 1], dest_comp=0, bit_sizes=[16, 32],
+          indices=[BASE, COMPONENT, FLAGS])
+intrinsic("store_scs_indexed_agx", [0, 1, 1],
+          indices=[BASE, COMPONENT])
+intrinsic("load_scs_uniform_agx", [1, 1], dest_comp=0, bit_sizes=[16, 32],
+          indices=[BASE, FORMAT, COMPONENT, FLAGS])
+intrinsic("store_scs_uniform_agx", [0, 1, 1], indices=[BASE, FORMAT, COMPONENT])
+intrinsic("load_scs_base_agx", [1], dest_comp=0, bit_sizes=[16, 32],
+          indices=[BASE, FORMAT, COMPONENT, FLAGS])
+intrinsic("store_scs_base_agx", [0, 1], indices=[BASE, FORMAT, COMPONENT])
+
 
 # Helper shader intrinsics
 # src[] = { value }.
@@ -3332,3 +3401,20 @@ system_value("is_depth_clamp_emulated_kk", 1, bit_sizes=[1])
 system_value("is_viewport_z_transform_emulated_kk", 1, bit_sizes=[1])
 # Loads the viewport Z range for a given viewport index.
 load("viewport_z_range_kk", [1], [], [CAN_ELIMINATE, CAN_REORDER])
+
+# Native G17P/G17X SR59 identifies the resident SCS thread.
+system_value("scs_thread_index_agx", 1, bit_sizes=[32])
+
+intrinsic("allocate_mesh_uvb_agx", [1, 1])
+intrinsic("store_mesh_uvb_agx", [2], indices=[FLAGS])
+intrinsic("store_object_childcount_agx", [1])
+
+intrinsic("load_mesh_payload_address_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("load_mesh_primitive_storage_agx", dest_comp=2, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("mesh_payload_entry_barrier_agx")
+
+intrinsic("object_payload_exit_barrier_agx")

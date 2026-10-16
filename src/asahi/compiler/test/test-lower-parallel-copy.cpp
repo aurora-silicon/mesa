@@ -285,6 +285,30 @@ TEST_F(LowerParallelCopy, StackCopies)
    });
 }
 
+TEST_F(LowerParallelCopy, G17PStackCopiesAvoidDivergentShuffleScratch)
+{
+   struct agx_copy copies[] = {
+      {.dest = 0,
+       .dest_mem = true,
+       .src = agx_memory_register(12, AGX_SIZE_32)},
+   };
+
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   actual->shader->key = &key;
+   actual->shader->any_quad_divergent_shuffle = true;
+
+   agx_emit_parallel_copies(actual, copies, ARRAY_SIZE(copies));
+   agx_mov_to(expected, agx_register(4, AGX_SIZE_32),
+              agx_memory_register(12, AGX_SIZE_32));
+   agx_mov_to(expected, agx_memory_register(0, AGX_SIZE_32),
+              agx_register(4, AGX_SIZE_32));
+
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
 #if 0
 TEST_F(LowerParallelCopy, LooksLikeASwap) {
    struct agx_copy test[] = {
@@ -300,3 +324,64 @@ TEST_F(LowerParallelCopy, LooksLikeASwap) {
    });
 }
 #endif
+
+TEST_F(LowerParallelCopy, EmptyCopies)
+{
+   agx_builder *actual = agx_test_builder(mem_ctx);
+   agx_builder *expected = agx_test_builder(mem_ctx);
+
+   agx_emit_parallel_copies(actual, NULL, 0);
+   ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+}
+
+TEST_F(LowerParallelCopy, MemoryOnlyAtFileEnd)
+{
+   struct agx_copy copies[] = {
+      {.dest = 2047, .dest_mem = true,
+       .src = agx_memory_register(2045, AGX_SIZE_16)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(2, AGX_SIZE_16),
+                 agx_memory_register(2045, AGX_SIZE_16));
+      agx_mov_to(b, agx_memory_register(2047, AGX_SIZE_16),
+                 agx_register(2, AGX_SIZE_16));
+   });
+}
+
+TEST_F(LowerParallelCopy, MemoryOnly64AtFileEnd)
+{
+   struct agx_copy copies[] = {
+      {.dest = 2044, .dest_mem = true,
+       .src = agx_memory_register(2040, AGX_SIZE_64)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(2040, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(2044, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(2042, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(2046, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+   });
+}
+
+TEST_F(LowerParallelCopy, IndependentClassesWithSameIndices)
+{
+   struct agx_copy copies[] = {
+      {.dest = 8, .dest_mem = true,
+       .src = agx_memory_register(10, AGX_SIZE_32)},
+      {.dest = 8, .src = agx_register(10, AGX_SIZE_32)},
+   };
+
+   CASE(copies, {
+      agx_mov_to(b, agx_register(8, AGX_SIZE_32),
+                 agx_register(10, AGX_SIZE_32));
+      agx_mov_to(b, agx_register(2, AGX_SIZE_32),
+                 agx_memory_register(10, AGX_SIZE_32));
+      agx_mov_to(b, agx_memory_register(8, AGX_SIZE_32),
+                 agx_register(2, AGX_SIZE_32));
+   });
+}

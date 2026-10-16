@@ -39,6 +39,8 @@ agx_disk_cache_compute_key(struct disk_cache *cache,
       key_size = sizeof(shader_key->vs);
    else if (uncompiled->type == MESA_SHADER_FRAGMENT)
       key_size = sizeof(shader_key->fs);
+   else if (uncompiled->type == MESA_SHADER_COMPUTE)
+      key_size = sizeof(shader_key->cs);
    else
       key_size = 0;
 
@@ -54,6 +56,11 @@ static void
 write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
              bool is_root_gs)
 {
+   /* Geometry variants contain a pre-GS compute helper with no API shader
+    * owner. Preserve each component's identity instead of inheriting the
+    * parent geometry stage and its resource bindings on a cache hit. */
+   blob_write_uint8(blob, binary->stage);
+   blob_write_uint8(blob, binary->so != NULL);
    blob_write_bytes(blob, &binary->b.info, sizeof(binary->b.info));
 
    if (binary->b.info.binary_size) {
@@ -64,6 +71,8 @@ write_shader(struct blob *blob, const struct agx_compiled_shader *binary,
    blob_write_bytes(blob, &binary->attrib_components_read,
                     sizeof(binary->attrib_components_read));
    blob_write_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
+   blob_write_uint8(blob, binary->g17p_texture_resources);
+   blob_write_uint8(blob, binary->g17p_custom_border_emulation);
    blob_write_uint32(blob, binary->push_range_count);
    blob_write_bytes(blob, binary->push,
                     sizeof(binary->push[0]) * binary->push_range_count);
@@ -87,8 +96,8 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
             const struct agx_uncompiled_shader *uncompiled, bool is_root)
 {
    struct agx_compiled_shader *binary = CALLOC_STRUCT(agx_compiled_shader);
-   binary->stage = uncompiled->type;
-   binary->so = uncompiled;
+   binary->stage = blob_read_uint8(blob);
+   binary->so = blob_read_uint8(blob) ? uncompiled : NULL;
 
    blob_copy_bytes(blob, &binary->b.info, sizeof(binary->b.info));
    size_t size = binary->b.info.binary_size;
@@ -108,13 +117,22 @@ read_shader(struct agx_screen *screen, struct blob_reader *blob,
    } else if (size) {
       binary->bo = agx_bo_create(&screen->dev, size, 0,
                                  AGX_BO_EXEC | AGX_BO_LOW_VA, "Executable");
-      blob_copy_bytes(blob, agx_bo_map(binary->bo), size);
+      if (screen->dev.chip == AGX_CHIP_G17P) {
+         /* Native compute Ioto programs need the cached CPU shader bytes. */
+         binary->b.binary = malloc(size);
+         blob_copy_bytes(blob, binary->b.binary, size);
+         memcpy(agx_bo_map(binary->bo), binary->b.binary, size);
+      } else {
+         blob_copy_bytes(blob, agx_bo_map(binary->bo), size);
+      }
    }
 
    blob_copy_bytes(blob, &binary->uvs, sizeof(binary->uvs));
    blob_copy_bytes(blob, &binary->attrib_components_read,
                    sizeof(binary->attrib_components_read));
    blob_copy_bytes(blob, &binary->epilog_key, sizeof(binary->epilog_key));
+   binary->g17p_texture_resources = blob_read_uint8(blob);
+   binary->g17p_custom_border_emulation = blob_read_uint8(blob);
    binary->push_range_count = blob_read_uint32(blob);
    blob_copy_bytes(blob, binary->push,
                    sizeof(binary->push[0]) * binary->push_range_count);

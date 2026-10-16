@@ -33,6 +33,7 @@
 #include "util/u_range.h"
 #include "agx_bg_eot.h"
 #include "agx_helpers.h"
+#include "agx_native_descriptor.h"
 #include "agx_nir_texture.h"
 
 #ifdef __GLIBC__
@@ -176,6 +177,7 @@ struct PACKED agx_stage_uniforms {
     * tables to bindless access.
     */
    uint64_t texture_base;
+   uint64_t buffer_texture_base;
 
    /* Uniform buffer objects */
    uint64_t ubo_base[PIPE_MAX_CONSTANT_BUFFERS];
@@ -185,8 +187,21 @@ struct PACKED agx_stage_uniforms {
    uint64_t ssbo_base[PIPE_MAX_SHADER_BUFFERS];
    uint32_t ssbo_size[PIPE_MAX_SHADER_BUFFERS];
 
+   /* Gen9 has no AGX2 buffer-image size sideband in its native descriptor. */
+   uint32_t image_buffer_size[PIPE_MAX_SHADER_IMAGES];
+
    /* If lowered to bindless, sampler index in the heap */
    uint16_t sampler_handle[PIPE_MAX_SAMPLERS];
+
+   /* HAL200 register-indirect texture operands name local table slots. */
+   uint16_t texture_handle[PIPE_MAX_SAMPLERS];
+
+   /* G17P custom-border emulation uses a clamp-to-zero companion sampler.
+    * Negative means that the bound sampler has a native standard border. */
+   int16_t custom_border_sampler_handle[PIPE_MAX_SAMPLERS];
+
+   /* Logical API colour returned after texture swizzling. */
+   uint32_t custom_border[PIPE_MAX_SAMPLERS][4];
 
    /* LOD bias as float16 */
    uint16_t lod_bias[PIPE_MAX_SAMPLERS];
@@ -222,6 +237,31 @@ struct agx_compiled_shader {
 
    /* Mapped executable memory */
    struct agx_bo *bo;
+
+   /* The backend refused to encode this variant. agx_compile_shader_nir() is
+    * fail-closed: it returns false and leaves a zeroed agx_shader_part, so
+    * binary_size is 0 and no executable BO is ever allocated. A main shader
+    * in that state must never reach a draw or a dispatch -- consuming it
+    * dereferences a null bo and takes the process down, which for a
+    * compositor means the whole desktop rather than one degraded draw.
+    *
+    * This is NOT the same as `bo == NULL`. A fragment main whose work all
+    * lives in the epilog legitimately has an empty binary, and prologs,
+    * epilogs and other secondary parts never own a BO at all.
+    */
+   bool failed;
+
+   /* Set once the draw/dispatch path has reported that this program is
+    * unusable, so a refused shader logs once instead of once per draw.
+    */
+   bool refusal_reported;
+
+   /* G17P graphics and compute programs reserve uniform halves 0..7 for the
+    * native texture and sampler table pointers when they access resources. */
+   bool g17p_texture_resources;
+
+   /* The variant contains Honeykrisp-style custom-border emulation. */
+   bool g17p_custom_border_emulation;
 
    /* Uniforms the driver must push */
    unsigned push_range_count;
@@ -278,9 +318,21 @@ struct agx_uncompiled_shader {
       uint8_t cull_distance_size;
       bool has_edgeflags;
       bool uses_fbfetch;
+      bool uses_sample_shading;
+      bool needs_sample_count;
+      bool uses_buffer_textures;
+      bool uses_query_lod;
+      bool writes_memory;
 
       /* Number of bindful textures, images used */
       unsigned nr_bindful_textures, nr_bindful_images;
+
+      /* Texture-table records per image: a texture and a PBE descriptor,
+       * plus on G17P the software tail Honeykrisp's storage descriptor
+       * carries (see AGX_G17P_IMAGE_ATOMIC_SW_OFFSET).
+       */
+      uint8_t image_records;
+
    } info;
 
    struct hash_table *variants;
@@ -334,7 +386,7 @@ struct agx_stage {
    uint32_t ssbo_mask;
 
    struct pipe_image_view images[PIPE_MAX_SHADER_IMAGES];
-   uint32_t image_mask;
+   uint64_t image_mask;
 
    /* Need full CSOs for u_blitter */
    struct agx_sampler_state *samplers[PIPE_MAX_SAMPLERS];
@@ -372,6 +424,7 @@ uint16_t agx_sampler_heap_add(struct agx_device *dev,
 
 struct agx_encoder {
    struct agx_bo *bo;
+   uint64_t g17p_vdm_alias;
    uint8_t *current;
    uint8_t *end;
 };
@@ -383,13 +436,24 @@ struct agx_batch {
    uint32_t syncobj;
    uint32_t draws;
 
+   /* Executable storage is owned by this batch's pipeline pool. */
+   uint64_t g17p_fragment_program;
+   uint64_t g17p_emrt_heap;
+   struct agx_compiled_shader *g17p_fragment_shader;
+   struct agx_linked_shader *g17p_fragment_linked;
+
    struct agx_tilebuffer_layout tilebuffer_layout;
 
    /* PIPE_CLEAR_* bitmask */
    uint32_t clear, draw, load, resolve, feedback;
    bool initialized;
 
+   /* Only a loader-provided resolve may seed the multisample tile reload. */
+   bool g17p_resolve_reload;
+   bool g17p_resolve_preserve;
+
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
+   union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
    double clear_depth;
    unsigned clear_stencil;
 
@@ -402,7 +466,7 @@ struct agx_batch {
    bool generate_primitive_id;
 
    /* Current varyings linkage structures */
-   uint32_t varyings;
+   uint64_t varyings;
    struct agx_varyings_vs linked_varyings;
 
    struct agx_draw_uniforms uniforms;
@@ -433,6 +497,7 @@ struct agx_batch {
    bool incoherent_writes;
 
    struct agx_pool pool, pipeline_pool;
+   struct util_dynarray g17p_vdm_aliases;
 
    /* We may enqueue both CDM and VDM work, possibly to the same batch for
     * geometry/tessellation.
@@ -485,6 +550,7 @@ struct asahi_vs_shader_key {
     * compute job used to feed a TCS or GS.
     */
    bool hw;
+   bool custom_borders;
 };
 
 struct agx_vertex_elements {
@@ -499,13 +565,19 @@ struct agx_vertex_elements {
 struct asahi_fs_shader_key {
    enum pipe_format rt_formats[PIPE_MAX_COLOR_BUFS];
    uint8_t nr_samples;
-   bool padding[7];
+   bool custom_borders;
+   bool padding[6];
 };
 static_assert(sizeof(struct asahi_fs_shader_key) == 40, "no holes");
+
+struct asahi_cs_shader_key {
+   bool custom_borders;
+};
 
 union asahi_shader_key {
    struct asahi_vs_shader_key vs;
    struct asahi_fs_shader_key fs;
+   struct asahi_cs_shader_key cs;
 };
 
 enum agx_dirty {
@@ -589,6 +661,11 @@ struct agx_context {
    struct agx_compiled_shader *vs, *fs, *gs, *tcs;
    struct {
       struct agx_linked_shader *vs, *fs;
+
+      /* G17P: the geometry copy program linked as the hardware vertex
+       * shader of a geometry-assisted draw. NULL on other chips, which run
+       * the copy program's main part directly. */
+      struct agx_linked_shader *gs_copy;
    } linked;
    uint32_t dirty;
 
@@ -601,6 +678,12 @@ struct agx_context {
    /* Acts as a context-level shader key */
    bool support_lod_bias;
    bool robust;
+
+   /* Draws and dispatches dropped because a bound program had no encoding.
+    * Exposed so an offline oracle can tell "the draw was skipped" apart from
+    * "the draw silently rendered nothing".
+    */
+   unsigned skipped_no_program;
 
    /* Set of batches. When full, the LRU entry (the batch with the smallest
     * seqnum) is flushed to free a slot.
@@ -685,6 +768,7 @@ struct agx_context {
    struct agx_bg_eot_cache bg_eot;
 
    bool any_faults;
+   struct pipe_device_reset_callback reset;
 
    uint32_t syncobj;
    uint32_t dummy_syncobj;
@@ -772,7 +856,7 @@ struct agx_compiled_shader *agx_build_meta_shader(struct agx_context *ctx,
 void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 struct agx_workgroup wg, struct agx_compiled_shader *cs,
                 struct agx_linked_shader *linked, mesa_shader_stage stage,
-                unsigned variable_shared_mem);
+                unsigned variable_shared_mem, uint64_t indirect_num_workgroups);
 
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                         enum agx_barrier barrier, enum libagx_program program,
@@ -843,8 +927,15 @@ struct agx_sampler_state {
    /* Whether a custom border colour is required */
    bool uses_custom_border;
 
+   /* Native compact border selector. CUSTOM is used only with the packed
+    * custom-border payload below. */
+   enum agx_border_colour border_colour;
+
    /* Packed custom border colour, or zero if none is required */
    struct agx_border_packed border;
+
+   /* Logical colour consumed by G17P's shader-backed border emulation. */
+   uint32_t custom_border[4];
 
    /* LOD bias packed as fp16, the form we'll pass to the shader */
    uint16_t lod_bias_as_fp16;
@@ -858,7 +949,7 @@ struct agx_sampler_view {
    enum pipe_format format;
 
    /* Prepared descriptor */
-   struct agx_texture_packed desc;
+   struct agx_gallium_texture_descriptor desc;
 };
 
 struct agx_screen {
@@ -1008,13 +1099,29 @@ void agx_set_ssbo_uniforms(struct agx_batch *batch, mesa_shader_stage stage);
 bool agx_nir_lower_point_size(nir_shader *nir, bool insert_write);
 
 bool agx_nir_lower_sysvals(nir_shader *shader, mesa_shader_stage desc_stage,
-                           bool lower_draw_params);
+                           bool lower_draw_params,
+                           unsigned texture_descriptor_size);
 
 bool agx_nir_layout_uniforms(nir_shader *shader,
                              struct agx_compiled_shader *compiled,
-                             unsigned *push_size);
+                             unsigned *push_size, unsigned uniform_base,
+                             bool dword_ranges);
 
-bool agx_nir_lower_bindings(nir_shader *shader, bool *uses_bindless_samplers);
+struct agx_lower_bindings_options {
+   bool *uses_bindless_samplers;
+   bool g17p_plain_txf_crawl;
+   bool g17p_native_sampler_handles;
+   bool g17p_bindless_storage;
+   unsigned image_records;
+   unsigned bindful_sampler_count;
+};
+
+bool agx_nir_lower_bindings(nir_shader *shader,
+                       struct agx_lower_bindings_options *options);
+bool agx_nir_lower_custom_border_g17p(nir_shader *shader);
+bool agx_nir_rebind_g17p_texture_crawls(nir_shader *shader);
+bool agx_nir_lower_g17p_storage_records(nir_shader *shader,
+                                        unsigned record_size_B);
 
 bool agx_batch_is_active(struct agx_batch *batch);
 bool agx_batch_is_submitted(struct agx_batch *batch);
@@ -1152,6 +1259,13 @@ void agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
 
 void agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info);
 
+bool agx_g17p_direct_resolve_blit_shape(const struct pipe_blit_info *info,
+                                        bool source_multisampled);
+
+bool agx_g17p_staged_resolve_blit_shape(const struct pipe_blit_info *info);
+
+bool agx_g17p_stencil_plane_blit_shape(const struct pipe_blit_info *info);
+
 void agx_resource_copy_region(struct pipe_context *pctx,
                               struct pipe_resource *dst, unsigned dst_level,
                               unsigned dstx, unsigned dsty, unsigned dstz,
@@ -1163,11 +1277,14 @@ void agx_resource_copy_region(struct pipe_context *pctx,
 struct agx_encoder agx_encoder_allocate(struct agx_batch *batch,
                                         struct agx_device *dev);
 
+uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
+                                      struct agx_bo *bo, uint64_t address);
+
 void agx_batch_init_state(struct agx_batch *batch);
 
 struct asahi_bg_eot {
    uint64_t usc;
-   struct agx_counts_packed counts;
+   uint64_t rsrc_spec;
 };
 
 struct asahi_bg_eot agx_build_bg_eot(struct agx_batch *batch, bool store,

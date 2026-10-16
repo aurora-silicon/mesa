@@ -184,6 +184,13 @@ struct vk_bvh_geometry_data {
    uint32_t index_format;
 };
 
+struct vk_build_range_info {
+   uint32_t primitive_count;
+   uint32_t primitive_offset;
+   uint32_t first_vertex;
+   uint32_t transform_offset;
+};
+
 struct key32_id_pair {
    uint32_t id;
    uint32_t key;
@@ -407,6 +414,8 @@ TYPE(vk_global_sync_data, 4);
 
 TYPE(vk_bvh_geometry_data, 8);
 
+TYPE(vk_build_range_info, 4);
+
 /* A GLSL-adapted copy of VkAccelerationStructureInstanceKHR. */
 struct AccelerationStructureInstance {
    mat3x4 transform;
@@ -431,6 +440,7 @@ TYPE(vk_prefix_scan_partition, 4);
 #define ROOT_FLAGS_OFFSET_ID 3
 #define MORTON_SORT_WORKGROUP_SIZE_ID 4
 #define MORTON_SORT_KVS_PER_THREAD_ID 5
+#define MORTON_PHASE_DISPATCH_ID 6
 
 #define VK_BUILD_FLAG_ALWAYS_ACTIVE (1 << 0)
 #define VK_BUILD_FLAG_PROPAGATE_CULL_FLAGS (1 << 1)
@@ -447,6 +457,8 @@ struct leaf_args {
    VOID_REF ids;
 
    vk_bvh_geometry_data geom_data;
+
+   REF(vk_build_range_info) indirect;
 };
 
 #define VK_MORTON_BUILD_FLAGS (VK_BUILD_FLAG_64BIT_KEYS)
@@ -458,6 +470,7 @@ struct morton_sort_args {
    VOID_REF ids_odd;
    REF(morton_ready_count) counts;
    uint32_t leaf_count;
+   uint32_t pass;
 };
 
 #define LBVH_RIGHT_CHILD_BIT_SHIFT 29

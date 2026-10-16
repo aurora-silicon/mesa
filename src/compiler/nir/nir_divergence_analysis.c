@@ -370,7 +370,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_abort_buffer_address:
    case nir_intrinsic_load_abort_buffer_size:
    case nir_intrinsic_load_samples_log2_agx:
+   case nir_intrinsic_load_sample_positions_agx:
    case nir_intrinsic_load_active_subgroup_count_agx:
+   case nir_intrinsic_load_depth_never_agx:
    case nir_intrinsic_load_root_agx:
    case nir_intrinsic_load_descriptor_set_agx:
    case nir_intrinsic_load_sm_count_nv:
@@ -970,6 +972,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_raw_vertex_id:
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_local_invocation_index:
+   case nir_intrinsic_load_scs_thread_index_agx:
    case nir_intrinsic_load_global_invocation_id:
    case nir_intrinsic_load_global_invocation_index:
    case nir_intrinsic_load_subgroup_invocation:
@@ -980,6 +983,10 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_subgroup_lt_mask:
    case nir_intrinsic_load_helper_invocation:
    case nir_intrinsic_is_helper_invocation:
+   case nir_intrinsic_load_scs_agx:
+   case nir_intrinsic_load_scs_indexed_agx:
+   case nir_intrinsic_load_scs_uniform_agx:
+   case nir_intrinsic_load_scs_base_agx:
    case nir_intrinsic_load_scratch:
    case nir_intrinsic_load_scratch_nv:
    case nir_intrinsic_load_scratch_intel:
@@ -1111,6 +1118,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_tcs_header_ir3:
    case nir_intrinsic_load_rel_patch_id_ir3:
    case nir_intrinsic_brcst_active_ir3:
+   case nir_intrinsic_load_mesh_primitive_storage_agx:
    case nir_intrinsic_load_helper_op_id_agx:
    case nir_intrinsic_load_helper_arg_lo_agx:
    case nir_intrinsic_load_helper_arg_hi_agx:
@@ -1121,6 +1129,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_coefficients_agx:
    case nir_intrinsic_load_active_subgroup_invocation_agx:
    case nir_intrinsic_load_sample_mask:
+   case nir_intrinsic_load_active_samples_agx:
    case nir_intrinsic_quad_ballot_agx:
    case nir_intrinsic_load_agx:
    case nir_intrinsic_load_shared_lock_nv:

@@ -25,6 +25,7 @@ struct hk_queue_family {
 struct hk_memory_heap {
    uint64_t size;
    uint64_t used;
+   p_atomic_uint64_t cached;
    VkMemoryHeapFlags flags;
 };
 
@@ -54,6 +55,19 @@ struct hk_physical_device {
    const struct vk_sync_type *sync_types[2];
 
    simple_mtx_t debug_compile_lock;
+
+   /* Whether any [SU]SCALED format has sampled-image (or input-attachment)
+    * features. Only then can a valid application descriptor carry a nonzero
+    * hk_sampled_image_descriptor_sw::scaled_conversion kind. */
+   bool scaled_sampling;
+   bool scaled_storage;
+
+   /* Set once a device of this GPU creates a sampler whose border colour G17P
+    * shaders must emulate (hk_CreateSampler). Shaders compiled before then
+    * leave the emulation out and are replaced by emulating twins when bound
+    * (hk_border_twin); the shader cache key carries it. Per physical device
+    * because the cache key is computed from it (hk_hash_graphics_state). */
+   uint32_t border_emulation;
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_physical_device, vk.base, VkPhysicalDevice,

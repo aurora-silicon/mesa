@@ -162,9 +162,14 @@ zink_context_destroy(struct pipe_context *pctx)
 
    u_upload_destroy(pctx->stream_uploader);
    u_upload_destroy(pctx->const_uploader);
+   /* A failed submit can leave the current batch in the submitted list.
+    * Keep ctx->bs alive for deferred query cleanup, but transfer it only once.
+    */
+   bool current_batch_is_listed = false;
    struct zink_batch_state *bs = ctx->batch_states;
    while (bs) {
       struct zink_batch_state *bs_next = bs->next;
+      current_batch_is_listed |= ctx->bs == bs;
       zink_clear_batch_state(ctx, bs);
       bs->ctx = NULL;
       /* restore link as we insert them into the screens free_batch_states
@@ -205,7 +210,7 @@ zink_context_destroy(struct pipe_context *pctx)
    }
    while (screen->last_free_batch_state && screen->last_free_batch_state->next)
       screen->last_free_batch_state = screen->last_free_batch_state->next;
-   if (ctx->bs) {
+   if (ctx->bs && !current_batch_is_listed) {
       zink_clear_batch_state(ctx, ctx->bs);
       ctx->bs->ctx = NULL;
       if (screen->free_batch_states)
@@ -3127,6 +3132,16 @@ prep_fb_attachment(struct zink_context *ctx, struct zink_resource *res, unsigned
    return true;
 }
 
+/* Vulkan only allows VK_RESOLVE_MODE_SAMPLE_ZERO_BIT for integer formats,
+ * and GL resolves an integer multisample buffer by taking a single sample.
+ */
+static VkResolveModeFlagBits
+color_resolve_mode(enum pipe_format format)
+{
+   return util_format_is_pure_integer(format) ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT :
+                                                VK_RESOLVE_MODE_AVERAGE_BIT;
+}
+
 static unsigned
 begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
 {
@@ -3159,14 +3174,15 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
          else
             ctx->dynamic_fb.attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-         if (use_tc_info) {
-            if (very_legal_and_conformant_msaa_opt ||
-                /* don't invalidate cbufs without resolve */
-                (ctx->dynamic_fb.tc_info.has_resolve && ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i)))
-               ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            else
-               ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-         }
+         /* Blitter passes have no threaded-context discard information.
+          * Their destination must not inherit a previous pass's storeOp.
+          */
+         if (use_tc_info && (very_legal_and_conformant_msaa_opt ||
+             /* don't invalidate cbufs without resolve */
+             (ctx->dynamic_fb.tc_info.has_resolve && ctx->dynamic_fb.tc_info.cbuf_invalidate & BITFIELD_BIT(i))))
+            ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+         else
+            ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
          if (ctx->dynamic_fb.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
             attachment_shadow_mask |= BITFIELD_BIT(i);
             if (res->base.b.nr_samples > 1 && zink_debug & ZINK_DEBUG_PERFINFO)
@@ -3192,12 +3208,12 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
          else
             ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
 
-         if (use_tc_info) {
-            if ((very_legal_and_conformant_msaa_opt && !ctx->fb_state.nr_cbufs) || ctx->dynamic_fb.tc_info.zsbuf_invalidate)
-               ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            else
-               ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-         }
+         if (use_tc_info && ((very_legal_and_conformant_msaa_opt && !ctx->fb_state.nr_cbufs) ||
+                            (ctx->dynamic_fb.tc_info.zsbuf_invalidate &&
+                             !ctx->dynamic_fb.tc_info.has_resource_changes)))
+            ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+         else
+            ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 
          if (res->base.b.nr_samples > 1 && zink_debug & ZINK_DEBUG_PERFINFO) {
             if (ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
@@ -3354,7 +3370,7 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
             iv = zink_create_fb_surface(&ctx->base, &templ)->image_view;
          }
          if (ctx->fb_state.cbufs[i].nr_samples && !has_msrtss) {
-            ctx->dynamic_fb.attachments[i].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            ctx->dynamic_fb.attachments[i].resolveMode = color_resolve_mode(ctx->fb_state.cbufs[i].format);
             ctx->dynamic_fb.attachments[i].resolveImageView = iv;
             ctx->dynamic_fb.attachments[i].resolveImageLayout = res->layout;
 
@@ -3501,7 +3517,7 @@ begin_rendering(struct zink_context *ctx, bool check_attachment_shadow)
          unsigned idx = is_depth ? PIPE_MAX_COLOR_BUFS : 0;
          screen->image_barrier(ctx, res, layout, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
          zink_resource_disable_unordered(res, true);
-         ctx->dynamic_fb.attachments[idx].resolveMode = is_depth ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : VK_RESOLVE_MODE_AVERAGE_BIT;
+         ctx->dynamic_fb.attachments[idx].resolveMode = is_depth ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT : color_resolve_mode(format);
          ctx->dynamic_fb.attachments[idx].resolveImageLayout = res->layout;
          ctx->dynamic_fb.attachments[idx].resolveImageView = surf->image_view;
          if (idx == PIPE_MAX_COLOR_BUFS) {
