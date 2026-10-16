@@ -291,6 +291,9 @@ enum drm_asahi_feature {
 	DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 = (1UL) << 10,
 	DRM_ASAHI_FEATURE_COMPUTE_MATRIX = (1UL) << 12,
 	DRM_ASAHI_FEATURE_SPARSE_TILES = (1UL) << 11,
+	/* Render programs accept DRM_ASAHI_RENDER_PROGRAM_TASK; task kicks get the
+	 * TA mesh rendering buffer that backs the object payload address. */
+	DRM_ASAHI_FEATURE_TASK_MESH_STORAGE = (1UL) << 13,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -885,6 +888,11 @@ struct drm_asahi_render_program {
 #define DRM_ASAHI_RENDER_PROGRAM_SCS (1U << 0)
 #define DRM_ASAHI_RENDER_PROGRAM_MESH (1U << 1)
 #define DRM_ASAHI_RENDER_PROGRAM_OBJECT (1U << 2)
+/* With OBJECT: the object program is an API task stage. The kernel binds the
+ * TA mesh rendering buffer (native register 0x1ca48, the backing of the
+ * object payload address) to such kicks only. Requires
+ * DRM_ASAHI_FEATURE_TASK_MESH_STORAGE. */
+#define DRM_ASAHI_RENDER_PROGRAM_TASK (1U << 3)
 struct drm_asahi_render_program_v2 {
 	struct drm_asahi_render_program legacy;
 	/** @threads: Mesh/object workgroup invocation count; zero otherwise. */
