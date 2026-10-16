@@ -652,6 +652,23 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
    }
 }
 
+bool
+poly_nir_strip_gs_main_atomics(nir_shader *gs)
+{
+   bool any = false, progress;
+   do {
+      progress = false;
+      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
+               strip_side_effect_from_main, nir_metadata_control_flow,
+               (void *)false);
+
+      NIR_PASS(progress, gs, nir_opt_dce);
+      NIR_PASS(progress, gs, nir_opt_dead_cf);
+      any |= progress;
+   } while (progress);
+   return any;
+}
+
 /*
  * The stream # is encoded into the lower bits of an index. The stream
  * multiplier is the factor to multiply vertex IDs before adding the stream #.
@@ -1388,15 +1405,7 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    } while (progress);
 
    /* Strip remaining atomics, but not stores - since those are from us */
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
-               strip_side_effect_from_main, nir_metadata_control_flow,
-               (void *)false);
-
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
-   } while (progress);
+   poly_nir_strip_gs_main_atomics(gs);
 
    /* All those variables we created should've gone away by now */
    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);
