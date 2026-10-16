@@ -1140,6 +1140,8 @@ struct hk_cmd_buffer {
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
       bool deferred_clear_flushing;
+      /* Recording a buffer-only command that does not touch their memory. */
+      bool deferred_clear_hold;
    } state;
 
    struct {
@@ -1573,6 +1575,8 @@ void hk_g17p_note_depth_clear(struct hk_cmd_buffer *cmd);
 uint64_t hk_default_sample_positions(unsigned nr_samples);
 
 void hk_flush_deferred_clears(struct hk_cmd_buffer *cmd);
+void hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
+                                    uint64_t size);
 bool hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
                     VkImageAspectFlags aspects, const VkClearValue *value,
                     uint32_t range_count, const VkImageSubresourceRange *ranges);
@@ -1589,7 +1593,7 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
 {
    /* Any recorded work may read an image with a deferred clear. */
    if (unlikely(cmd->state.deferred_clear_count) &&
-       !cmd->state.deferred_clear_flushing)
+       !cmd->state.deferred_clear_flushing && !cmd->state.deferred_clear_hold)
       hk_flush_deferred_clears(cmd);
 
    if (vk_command_buffer_has_error(&cmd->vk))

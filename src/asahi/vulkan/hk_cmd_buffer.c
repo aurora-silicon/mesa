@@ -4029,9 +4029,35 @@ hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
    return true;
 }
 
+/* A buffer command (copy, fill, update) cannot access an image except
+ * through memory the two share. Keep the deferred clears across one whose
+ * buffer ranges miss every image they clear; call it for each range of the
+ * command before recording it, and clear deferred_clear_hold after. */
+void
+hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
+                               uint64_t size)
+{
+   if (!cmd->state.deferred_clear_count)
+      return;
+
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      const struct hk_image *image = cmd->state.deferred_clear[i].image;
+      for (unsigned p = 0; p < image->plane_count; ++p) {
+         const uint64_t base = image->planes[p].addr;
+         const uint64_t end = base + image->planes[p].layout.size_B;
+         if (!base || (addr < end && base < addr + size)) {
+            hk_flush_deferred_clears(cmd);
+            return;
+         }
+      }
+   }
+   cmd->state.deferred_clear_hold = true;
+}
+
 void
 hk_flush_deferred_clears(struct hk_cmd_buffer *cmd)
 {
+   cmd->state.deferred_clear_hold = false;
    if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
       return;
 
