@@ -124,30 +124,10 @@ lower_gs_intrinsics(nir_shader *shader)
       }
    }
 
-   /* If we have side effects, make sure we run the geometry shader at least
-    * once by outputting a dummy primitive if we wouldn't output anything.
+   /* No dummy primitive is needed for a shader with side effects that emits
+    * nothing: the main kernel performs them, and it runs for every input
+    * primitive.
     */
-   if (shader->info.writes_memory) {
-      unsigned n = nir_verts_in_output_prim(shader);
-      shader->info.gs.vertices_out = MAX2(shader->info.gs.vertices_out, n);
-
-      nir_push_if(&b, nir_ieq_imm(&b, nir_load_var(&b, state.indices), 0));
-      {
-         nir_def *zero = nir_imm_int(&b, 0);
-         nir_def *n_ = nir_imm_int(&b, n);
-         bool restart = n > 1;
-
-         shader->info.outputs_written |= VARYING_BIT_POS;
-         for (unsigned i = 0; i < 4; i++)
-            nir_store_output(&b, nir_imm_float(&b, NAN), zero,
-                             .component = i,
-                             .io_semantics.location = VARYING_SLOT_POS);
-         nir_select_vertex_poly(&b, zero);
-         nir_emit_primitive_poly(&b, zero, zero, n_, zero);
-         nir_store_var(&b, state.indices, nir_iadd_imm(&b, n_, restart), 1);
-      }
-      nir_pop_if(&b, NULL);
-   }
 
    /* Report the counts */
    for (unsigned stream = 0; stream < NIR_MAX_XFB_STREAMS; ++stream) {
@@ -494,11 +474,16 @@ lower_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  * summed prior to running the real geometry shader. This is skipped if the
  * counts are statically known.
  */
+static void strip_api_side_effects(nir_shader *s,
+                                   poly_nir_remove_dead_fn remove_dead);
+
 static nir_shader *
-create_geometry_count_shader(nir_shader *gs, struct lower_gs_state *state)
+create_geometry_count_shader(nir_shader *gs, struct lower_gs_state *state,
+                             poly_nir_remove_dead_fn remove_dead)
 {
    /* Don't muck up the original shader */
    nir_shader *shader = nir_shader_clone(NULL, gs);
+   strip_api_side_effects(shader, remove_dead);
 
    if (shader->info.name) {
       shader->info.name =
@@ -618,9 +603,9 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
+/* Remove an API store or image store, or an atomic whose result is unused. */
 static bool
-strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
-                            void *data)
+strip_api_side_effect(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    switch (intr->intrinsic) {
    case nir_intrinsic_global_atomic:
@@ -640,33 +625,36 @@ strip_side_effect_from_main(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_store:
    case nir_intrinsic_fence_pbe_to_tex_agx:
-      if (data) {
-         nir_instr_remove(&intr->instr);
-         return true;
-      }
-
-      return false;
+      nir_instr_remove(&intr->instr);
+      return true;
 
    default:
       return false;
    }
 }
 
-bool
-poly_nir_strip_gs_main_atomics(nir_shader *gs)
+/*
+ * A geometry shader invocation's stores and atomics must happen once. The
+ * main kernel runs once per invocation and performs them; the count and
+ * raster variants re-run the shader (the raster one once per output vertex)
+ * and must not repeat them. Strip them there, with everything that only fed
+ * them. remove_dead lets the driver remove work NIR DCE cannot, such as a
+ * lowered ray query, so the side effects it guarded can go too. An atomic
+ * whose result reaches an output stays, because the output depends on it.
+ */
+static void
+strip_api_side_effects(nir_shader *s, poly_nir_remove_dead_fn remove_dead)
 {
-   bool any = false, progress;
+   bool progress;
    do {
       progress = false;
-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
-               strip_side_effect_from_main, nir_metadata_control_flow,
-               (void *)false);
-
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
-      any |= progress;
+      NIR_PASS(progress, s, nir_shader_intrinsics_pass, strip_api_side_effect,
+               nir_metadata_control_flow, NULL);
+      NIR_PASS(progress, s, nir_opt_dce);
+      NIR_PASS(progress, s, nir_opt_dead_cf);
+      if (remove_dead)
+         NIR_PASS(progress, s, remove_dead);
    } while (progress);
-   return any;
 }
 
 /*
@@ -685,10 +673,12 @@ stream_multiplier(const nir_shader *gs)
  * shades each rasterized output vertex in parallel.
  */
 static nir_shader *
-create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
+create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state,
+                      poly_nir_remove_dead_fn remove_dead)
 {
    /* Don't muck up the original shader */
    nir_shader *shader = nir_shader_clone(NULL, gs);
+   strip_api_side_effects(shader, remove_dead);
 
    /* Turn into a vertex shader run only for rasterization. Transform feedback
     * was handled in the prepass.
@@ -1249,7 +1239,8 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
 
 bool
 poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
-                  nir_shader **pre_gs, struct poly_gs_info *info)
+                  nir_shader **pre_gs, struct poly_gs_info *info,
+                  poly_nir_remove_dead_fn remove_dead)
 {
    /* Lower I/O as assumed by the rest of GS lowering */
    if (gs->xfb_info != NULL) {
@@ -1355,7 +1346,7 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    /* Ensure that outputs_written is still accurate after DCE. */
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
 
-   *gs_copy = create_gs_rast_shader(gs, &gs_state);
+   *gs_copy = create_gs_rast_shader(gs, &gs_state, remove_dead);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
             nir_metadata_control_flow, NULL);
@@ -1368,20 +1359,12 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
 
    /* If there is any unknown count, we need a geometry count shader */
    if (info->count_words > 0)
-      *gs_count = create_geometry_count_shader(gs, &gs_state);
+      *gs_count = create_geometry_count_shader(gs, &gs_state, remove_dead);
    else
       *gs_count = NULL;
 
-   /* Strip stores and atomics */
-   do {
-      progress = false;
-      NIR_PASS(progress, gs, nir_shader_intrinsics_pass,
-               strip_side_effect_from_main, nir_metadata_control_flow,
-               (void *)true);
-
-      NIR_PASS(progress, gs, nir_opt_dce);
-      NIR_PASS(progress, gs, nir_opt_dead_cf);
-   } while (progress);
+   /* The main kernel keeps the API stores and atomics: it is the one variant
+    * that runs once per invocation (see strip_api_side_effects). */
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
             nir_metadata_none, &gs_state);
@@ -1403,9 +1386,6 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
       NIR_PASS(progress, gs, nir_opt_loop_unroll);
 
    } while (progress);
-
-   /* Strip remaining atomics, but not stores - since those are from us */
-   poly_nir_strip_gs_main_atomics(gs);
 
    /* All those variables we created should've gone away by now */
    NIR_PASS(_, gs, nir_remove_dead_variables, nir_var_function_temp, NULL);
