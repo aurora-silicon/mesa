@@ -428,6 +428,15 @@ agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
    return chip == AGX_CHIP_G17P;
 }
 
+/* Whether an image load misses a store made earlier in the same invocation,
+ * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
+ * behave this way; G15 loads observe the invocation's own stores. */
+static inline bool
+agx_chip_image_load_misses_own_store(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
 /* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
  * layout has a bias field; Gen4 does not, so the shader applies the bias. */
 static inline bool
