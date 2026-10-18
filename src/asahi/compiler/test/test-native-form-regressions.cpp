@@ -983,22 +983,24 @@ TEST(NativeForms, TexturePublicationWaitPreservesUnrelatedResult)
 TEST(NativeForms, MinmaxReusesUniformCopiedForComparison)
 {
    for (agx_fcond cond : {AGX_FCOND_LTN, AGX_FCOND_GTN}) {
-      void *mem = ralloc_context(NULL);
-      agx_shader_key key = {};
-      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-      key.dev.chip = AGX_CHIP_G17P;
-      agx_builder *b = agx_test_builder(mem);
-      b->shader->key = &key;
-      agx_instr *I = agx_alloc_instr(b, AGX_OPCODE_FCMPSEL, 1, 4);
-      I->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
-      I->src[0] = I->src[2] = agx_uniform(8, AGX_SIZE_32);
-      I->src[1] = I->src[3] = agx_immediate(176); /* -1.0 minifloat */
-      I->fcond = cond;
-      agx_builder_insert(&b->cursor, I);
-      agx_lower_uniform_sources(b->shader);
-      EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
-      EXPECT_TRUE(agx_is_equiv(I->src[0], I->src[2]));
-      ralloc_free(mem);
+      for (unsigned immediate : {0u, 176u}) {
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         agx_instr *I = agx_alloc_instr(b, AGX_OPCODE_FCMPSEL, 1, 4);
+         I->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+         I->src[0] = I->src[2] = agx_uniform(8, AGX_SIZE_32);
+         I->src[1] = I->src[3] = agx_immediate(immediate);
+         I->fcond = cond;
+         agx_builder_insert(&b->cursor, I);
+         agx_lower_uniform_sources(b->shader);
+         EXPECT_EQ(I->src[0].type, AGX_INDEX_NORMAL);
+         EXPECT_TRUE(agx_is_equiv(I->src[0], I->src[2]));
+         ralloc_free(mem);
+      }
    }
 }
 
@@ -1072,6 +1074,32 @@ TEST(NativeForms, RectangleImplicitLodOutsideFragment)
          nir_validate_shader(b.shader, "rectangle level zero");
          ralloc_free(b.shader);
       }
+   }
+}
+
+TEST(NativeForms, ImageWriteHighUniformHeap)
+{
+   for (unsigned uniform : {252u, 256u, 296u, 508u}) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G16G;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index data = agx_register(16, AGX_SIZE_32);
+      data.channels_m1 = 3;
+      agx_index coord = agx_register(24, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      agx_image_write(b, data, coord, agx_zero(),
+                      agx_uniform(uniform, AGX_SIZE_64),
+                      agx_register(28, AGX_SIZE_32), AGX_DIM_2D, true);
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      EXPECT_TRUE(agx3_pack_binary(b->shader, &binary)) << uniform;
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
    }
 }
 
