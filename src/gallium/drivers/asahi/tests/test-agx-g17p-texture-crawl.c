@@ -209,6 +209,71 @@ check_custom_border(void)
    return ok;
 }
 
+static bool
+check_shadow_border(void)
+{
+   const struct shape shape = {
+      "shadow border array", GLSL_SAMPLER_DIM_2D, true, 3,
+   };
+   nir_shader *shader = build(&shape);
+   nir_builder b = nir_builder_create(nir_shader_get_entrypoint(shader));
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         tex->op = nir_texop_tg4;
+         tex->is_shadow = true;
+         tex->is_new_style_shadow = false;
+         nir_steal_tex_src(tex, nir_tex_src_lod);
+         b.cursor = nir_before_instr(instr);
+         nir_tex_instr_add_src(tex, nir_tex_src_comparator,
+                               nir_imm_float(&b, 1.25));
+      }
+   }
+
+   bool uses_bindless_samplers = false;
+   struct agx_lower_bindings_options options = {
+      .uses_bindless_samplers = &uses_bindless_samplers,
+      .g17p_native_sampler_handles = true,
+      .bindful_sampler_count = AGX_GALLIUM_G17P_API_SAMPLERS,
+   };
+   NIR_PASS(_, shader, agx_nir_lower_bindings, &options);
+   NIR_PASS(_, shader, agx_nir_lower_texture_for_generation,
+            AGX_DESCRIPTOR_GENERATION_9);
+   NIR_PASS(_, shader, agx_nir_rebind_g17p_texture_crawls);
+   agx_preprocess_nir(shader);
+   NIR_PASS(_, shader, agx_nir_lower_custom_border_g17p);
+   nir_validate_shader(shader, "after custom shadow gather lowering");
+
+   unsigned raw = 0, shadow = 0;
+   bool ok = true;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            ok &= tex->op == nir_texop_tg4;
+            if (tex->is_shadow) {
+               shadow++;
+            } else {
+               raw++;
+               ok &= tex->def.bit_size == 32;
+               ok &= tex->dest_type == nir_type_float32;
+               ok &= nir_tex_instr_src_index(tex, nir_tex_src_comparator) < 0;
+            }
+            ok &= nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) < 0;
+         }
+      }
+   }
+   ok &= raw == 2 && shadow == 1;
+   printf("shadow border array %s (%u raw, %u shadow)\n",
+          ok ? "ok" : "FAIL", raw, shadow);
+   ralloc_free(shader);
+   return ok;
+}
+
 int
 main(void)
 {
@@ -219,6 +284,7 @@ main(void)
       ok &= check(&shapes[i]);
 
    ok &= check_custom_border();
+   ok &= check_shadow_border();
 
    glsl_type_singleton_decref();
    return ok ? 0 : 1;

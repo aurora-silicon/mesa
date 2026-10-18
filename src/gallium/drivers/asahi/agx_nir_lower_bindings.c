@@ -358,8 +358,9 @@ has_custom_border(nir_builder *b, nir_tex_instr *tex)
 static bool
 lower_custom_border(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 {
+   const bool shadow_gather = tex->is_shadow && tex->op == nir_texop_tg4;
    if (!nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex) ||
-       tex->is_shadow)
+       (tex->is_shadow && !shadow_gather))
       return false;
 
    b->cursor = nir_after_instr(&tex->instr);
@@ -378,17 +379,66 @@ lower_custom_border(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
       nir_def *clamp_to_zero = &tex_zero->def;
       tex_zero->backend_flags |= AGX_TEXTURE_FLAG_CLAMP_TO_0;
 
-      nir_def *border = query_custom_border(b, tex_zero);
-      if (tex->op == nir_texop_tg4)
-         border = nir_replicate(b, nir_channel(b, border, tex->component), 4);
+      if (shadow_gather) {
+         nir_tex_instr *raw_one = nir_instr_as_tex(
+            nir_instr_clone(b->shader, &tex->instr));
+         nir_builder_instr_insert(b, &raw_one->instr);
+         nir_tex_instr *raw[] = {tex_zero, raw_one};
+         for (unsigned i = 0; i < ARRAY_SIZE(raw); ++i) {
+            nir_steal_tex_src(raw[i], nir_tex_src_comparator);
+            raw[i]->is_shadow = false;
+            raw[i]->is_new_style_shadow = false;
+            raw[i]->dest_type = nir_type_float32;
+            raw[i]->def.bit_size = 32;
+         }
 
-      if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float &&
-          tex->op != nir_texop_tg4) {
-         replaced = nir_flrp(b, clamp_to_zero, clamp_to_one, border);
-         b->shader->info.flrp_lowered = false;
+         nir_def *border = nir_channel(b, query_custom_border(b, tex_zero), 0);
+         nir_def *depth = nir_bcsel(b, nir_ieq(b, clamp_to_zero, &raw_one->def),
+                                    clamp_to_zero, border);
+         struct agx_stage_uniforms *s = NULL;
+         nir_def *state = load_stage_array(
+            b, sampler_index(b, tex), 1, 16, (uintptr_t)&s->shadow_compare,
+            sizeof(s->shadow_compare[0]), 2, PIPE_MAX_SAMPLERS);
+         nir_def *clamp = nir_test_mask(b, state, 0x100);
+         nir_def *ref = nir_f2f32(
+            b, tex->src[nir_tex_instr_src_index(tex, nir_tex_src_comparator)]
+                  .src.ssa);
+         ref = nir_bcsel(b, clamp, nir_fsat(b, ref), ref);
+         depth = nir_bcsel(b, clamp, nir_fsat(b, depth), depth);
+
+         static const enum compare_func funcs[] = {
+            [PIPE_FUNC_NEVER] = COMPARE_FUNC_NEVER,
+            [PIPE_FUNC_LESS] = COMPARE_FUNC_LESS,
+            [PIPE_FUNC_EQUAL] = COMPARE_FUNC_EQUAL,
+            [PIPE_FUNC_LEQUAL] = COMPARE_FUNC_LEQUAL,
+            [PIPE_FUNC_GREATER] = COMPARE_FUNC_GREATER,
+            [PIPE_FUNC_NOTEQUAL] = COMPARE_FUNC_NOTEQUAL,
+            [PIPE_FUNC_GEQUAL] = COMPARE_FUNC_GEQUAL,
+            [PIPE_FUNC_ALWAYS] = COMPARE_FUNC_ALWAYS,
+         };
+         nir_def *func = nir_iand_imm(b, state, 0xff);
+         nir_def *compared = nir_imm_false(b);
+         for (unsigned i = 0; i < ARRAY_SIZE(funcs); ++i) {
+            nir_def *value = (i == PIPE_FUNC_NEVER || i == PIPE_FUNC_ALWAYS)
+               ? nir_imm_bool(b, i == PIPE_FUNC_ALWAYS)
+               : nir_compare_func(b, funcs[i], ref, depth);
+            compared = nir_bcsel(b, nir_ieq_imm(b, func, i), value, compared);
+         }
+         replaced = nir_b2fN(b, compared, tex->def.bit_size);
       } else {
-         replaced = nir_bcsel(b, nir_ieq(b, clamp_to_zero, clamp_to_one),
-                              clamp_to_zero, border);
+         nir_def *border = query_custom_border(b, tex_zero);
+         if (tex->op == nir_texop_tg4)
+            border =
+               nir_replicate(b, nir_channel(b, border, tex->component), 4);
+
+         if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float &&
+             tex->op != nir_texop_tg4) {
+            replaced = nir_flrp(b, clamp_to_zero, clamp_to_one, border);
+            b->shader->info.flrp_lowered = false;
+         } else {
+            replaced = nir_bcsel(b, nir_ieq(b, clamp_to_zero, clamp_to_one),
+                                 clamp_to_zero, border);
+         }
       }
    }
    nir_pop_if(b, NULL);
@@ -401,8 +451,8 @@ lower_custom_border(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 bool
 agx_nir_lower_custom_border_g17p(nir_shader *shader)
 {
-   bool progress = nir_shader_tex_pass(shader, lower_custom_border,
-                                       nir_metadata_none, NULL);
+   bool progress =
+      nir_shader_tex_pass(shader, lower_custom_border, nir_metadata_none, NULL);
 
    if (progress) {
       bool uses_bindless_samplers = false;
