@@ -2547,6 +2547,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool lower_g17p_robust_images =
       dev->dev.chip == AGX_CHIP_G17P &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
+   const bool lower_agx3_robust_fetches =
+      (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+      rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
       dev->dev.chip == AGX_CHIP_G16G &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
@@ -2866,7 +2869,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
        * pass. */
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata,
                agx_chip_descriptor_generation(dev->dev.chip),
-               lower_g17p_robust_images, dev->dev.sparse_ro_offset,
+               lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
                dev->vk.enabled_features.sparseResidencyBuffer);
    } else {
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
