@@ -67,7 +67,7 @@ TEST(AGXChip, G16GUsesSharedNativePathWithItsOwnCapabilities)
    EXPECT_FALSE(agx_chip_native_g15(AGX_CHIP_G16G));
    EXPECT_FALSE(agx_chip_has_native_render_context(AGX_CHIP_G16G));
    EXPECT_FALSE(agx_chip_native_preamble(AGX_CHIP_G16G));
-   EXPECT_FALSE(agx_chip_uncovered_tile_ms_defect(AGX_CHIP_G16G));
+   EXPECT_TRUE(agx_chip_uncovered_tile_ms_defect(AGX_CHIP_G16G));
    EXPECT_FALSE(agx_chip_tri_merge_across_side_effects(AGX_CHIP_G16G));
    EXPECT_FALSE(agx_chip_exact_fma32(AGX_CHIP_G16G));
    EXPECT_FALSE(agx_chip_uses_legacy_precompiled_programs(AGX_CHIP_G16G));
