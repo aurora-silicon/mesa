@@ -203,6 +203,8 @@ struct PACKED agx_stage_uniforms {
    /* Logical API colour returned after texture swizzling. */
    uint32_t custom_border[PIPE_MAX_SAMPLERS][4];
 
+   uint16_t shadow_compare[PIPE_MAX_SAMPLERS];
+
    /* LOD bias as float16 */
    uint16_t lod_bias[PIPE_MAX_SAMPLERS];
 };

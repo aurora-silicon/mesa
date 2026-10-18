@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include "pipe/p_state.h"
 #include "util/half_float.h"
+#include "util/format/u_format.h"
 #include "util/macros.h"
 #include "agx_device.h"
 #include "agx_state.h"
@@ -91,6 +92,7 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
       for (unsigned s = 0; s < PIPE_MAX_SAMPLERS; ++s) {
          unif->custom_border_sampler_handle[s] = -1;
          memset(unif->custom_border[s], 0, sizeof(unif->custom_border[s]));
+         unif->shadow_compare[s] = PIPE_FUNC_NEVER;
       }
    }
 
@@ -106,6 +108,13 @@ agx_set_sampler_uniforms(struct agx_batch *batch, mesa_shader_stage stage)
          unif->custom_border_sampler_handle[s] = handle;
          memcpy(unif->custom_border[s], st->samplers[s]->custom_border,
                 sizeof(unif->custom_border[s]));
+         const struct pipe_sampler_state *sampler = &st->samplers[s]->base;
+         const enum pipe_format format = sampler->border_color_format;
+         unif->shadow_compare[s] =
+            sampler->compare_func | ((util_format_is_depth_or_stencil(format) &&
+                                      !util_format_is_float(format))
+                                        ? 0x100
+                                        : 0);
       }
    }
 
