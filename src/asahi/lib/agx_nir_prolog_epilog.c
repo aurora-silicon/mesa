@@ -1843,6 +1843,7 @@ agx_nir_fs_epilog_g17p(nir_builder *b, const void *key_)
          opt_progress = false;
          NIR_PASS(opt_progress, b->shader, nir_opt_constant_folding);
          NIR_PASS(opt_progress, b->shader, nir_opt_algebraic);
+         NIR_PASS(opt_progress, b->shader, nir_opt_dead_cf);
       } while (opt_progress);
       NIR_PASS(_, b->shader, agx_nir_hoist_g17p_zs_writes);
    } else {
