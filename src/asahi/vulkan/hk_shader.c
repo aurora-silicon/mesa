@@ -531,6 +531,7 @@ enum hk_feature_key {
    HK_FEAT_ROBUST_BUFFER_ACCESS = BITFIELD_BIT(2),
    HK_FEAT_ROBUST_BUFFER_ACCESS_2 = BITFIELD_BIT(3),
    HK_FEAT_PIPELINE_ROBUSTNESS = BITFIELD_BIT(4),
+   HK_FEAT_NULL_DESCRIPTOR = BITFIELD_BIT(5),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -589,7 +590,8 @@ hk_make_feature_key(const struct vk_features *feats)
               : 0) |
           (feats->robustBufferAccess ? HK_FEAT_ROBUST_BUFFER_ACCESS : 0) |
           (feats->robustBufferAccess2 ? HK_FEAT_ROBUST_BUFFER_ACCESS_2 : 0) |
-          (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0);
+          (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0) |
+          (feats->nullDescriptor ? HK_FEAT_NULL_DESCRIPTOR : 0);
 }
 
 /*
@@ -2053,7 +2055,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * invocation; forward the stored value. Run it before the robust lowering
     * so the loads and stores it tracks are still unconditional. */
    if (agx_chip_image_load_misses_own_store(dev->dev.chip))
-      NIR_PASS(_, nir, hk_nir_forward_image_stores, lower_g17p_robust_images);
+      NIR_PASS(_, nir, hk_nir_forward_image_stores,
+               lower_g17p_robust_images || native_robust_images ||
+                  (features & HK_FEAT_NULL_DESCRIPTOR));
    NIR_PASS(_, nir, hk_nir_lower_robust_image_access,
             lower_g17p_robust_images);
    if (native_robust_images) {
