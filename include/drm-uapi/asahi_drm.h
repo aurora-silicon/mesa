@@ -1613,7 +1613,23 @@ enum drm_asahi_compute_flags {
 	 * three-buffer table from this command's three compute attachments.
 	 */
 	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
-	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 1),
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_WIDE_VISIBILITY: Publish the command's memory with
+	 * the wide-visibility barrier. Requires
+	 * DRM_ASAHI_FEATURE_COMPUTE_WIDE_VISIBILITY.
+	 */
+	DRM_ASAHI_COMPUTE_WIDE_VISIBILITY = (1L << 1),
+
+	/*
+	 * Bits 16 and up are accepted only by the M5 (G17G/G17S) runtime.
+	 */
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_USES_MATRIX: The command's dispatches use native
+	 * matrix instructions. Requires DRM_ASAHI_FEATURE_COMPUTE_MATRIX.
+	 */
+	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 16),
 };
 
 /**
