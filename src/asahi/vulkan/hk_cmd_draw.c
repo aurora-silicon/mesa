@@ -3210,7 +3210,7 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
 }
 
 /*
- * M5 render pass continuation.
+ * AGX3 render pass continuation.
  *
  * Two consecutive render pass instances on the same attachments, where the
  * second loads what the first stored and nothing but state binding and
@@ -3244,8 +3244,8 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
 
    /* The instance is one ordinary render stream with draws, with no
     * pre/post-graphics streams, heap use or timestamps attached. */
-   if (!agx_chip_g17_m5(dev->dev.chip) || cmd->in_meta ||
-       cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
+   if (!agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip)) ||
+       cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
        cmd->uses_heap || cs->timestamp.start.handle ||
        cs->timestamp.end.handle)
@@ -8695,6 +8695,7 @@ hk_g17p_read_only_early_reject_in(const struct hk_device *dev,
     * test nor the skipped fragment has a side effect. The all-live prolog
     * also must not inherit an API-mask or cull-distance kill. */
    return agx_native_graphics(&dev->dev) && fs->b.info.writes_sample_mask &&
+          !fs->info.fs.m5_static_tests &&
           !fs->b.info.early_fragment_tests && !fs->info.fs.writes_memory &&
           !fs->info.fs.epilog_key.write_z && !fs->info.fs.epilog_key.write_s &&
           samples == 1 && in->depth_attachment && dyn->ds.depth.test_enable &&
@@ -9447,7 +9448,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        (gfx->dirty & HK_DIRTY_OCCLUSION) || desc->root_dirty) {
       const uint16_t no_epilog_discard =
          !epilog_discards && !read_only_early_reject ? UINT16_MAX : 0;
-      /* A main part compiled with the selector folded (M5 static state)
+      /* A main part compiled with the selector folded (AGX3 static state)
        * always tests; nothing else may then own the tests. */
       assert(!(fs && fs->info.fs.m5_static_tests && !no_epilog_discard) &&
              "folded depth/stencil test selector disagrees with the draw");
@@ -11691,10 +11692,10 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       hk_reserve_scratch(cmd, cs, hw_vs);
       struct hk_linked_shader *linked_hw_vs =
          (hw_vs == sw_vs) ? linked_vs : hw_vs->only_linked;
-      /* A record after the first of a multi-draw on M5 republishes the
+      /* A record after the first of a multi-draw on AGX3 republishes the
        * previous record's program with its own draw parameters. */
       const uint64_t pipeline_program =
-         continuing && agx_chip_g17_m5(dev->dev.chip)
+         continuing && agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip))
             ? hk_m5_multi_draw_vertex_program(cmd, hw_vs, linked_hw_vs)
             : hk_upload_usc_words(cmd, hw_vs, linked_hw_vs);
 

@@ -110,10 +110,11 @@ struct hk_fs_key {
    /** M5 sample-position width selection; 0 means dynamic or unknown. */
    uint8_t m5_position_samples;
 
-   /** M5: alpha-to-coverage is statically disabled, so no fragment epilog of
+   /** AGX3: alpha-to-coverage is statically disabled, so no fragment epilog of
     * this shader discards unless the shader writes depth or stencil
     * (agx_fs_epilog_may_discard()). The main part then always runs the
-    * depth/stencil tests itself and need not select that at draw time.
+    * depth/stencil tests itself and need not select that at draw time. On
+    * G15 and G17P the pipeline state also rules out a read-only early reject.
     */
    bool m5_static_tests;
    uint8_t _pad[3];
@@ -137,7 +138,11 @@ struct hk_vs_key {
    bool skip_prolog;
    bool static_strides;
    bool kill_psiz;
-   bool pad[1];
+
+   /** Compiled together with a fragment shader that never reads gl_Layer:
+    * no default layer output (agx_nir_lower_default_layer()) is needed.
+    */
+   bool no_default_layer;
 };
 static_assert(sizeof(struct hk_vs_key) == 260, "packed");
 
@@ -582,6 +587,36 @@ hk_populate_vs_key(struct hk_vs_key *key,
    }
 }
 
+/* The native AGX3B parts (G15, G17P) run a discarding shader's read-only
+ * depth test in the prolog instead (hk_g17p_read_only_early_reject_in()),
+ * with the main part's selector off. Whether a draw takes that path is
+ * draw-time state; these pipeline states rule it out for every draw. */
+static bool
+hk_g17p_static_no_early_reject(const struct vk_graphics_pipeline_state *state)
+{
+   if (state->ms != NULL &&
+       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) &&
+       state->ms->rasterization_samples > 1)
+      return true;
+
+   const struct vk_depth_stencil_state *ds = state->ds;
+   if (ds == NULL)
+      return false;
+
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE) &&
+       !ds->depth.test_enable)
+      return true;
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_WRITE_ENABLE) &&
+       ds->depth.write_enable)
+      return true;
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_COMPARE_OP) &&
+       ds->depth.compare_op == VK_COMPARE_OP_ALWAYS)
+      return true;
+   return !BITSET_TEST(state->dynamic,
+                       MESA_VK_DYNAMIC_DS_DEPTH_BOUNDS_TEST_ENABLE) &&
+          ds->depth.bounds_test.enable;
+}
+
 static void
 hk_populate_fs_key(struct hk_fs_key *key,
                    const struct vk_graphics_pipeline_state *state,
@@ -602,10 +637,11 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
 
-   if (agx_chip_g17_m5(chip) && state->ms != NULL &&
+   if (agx_isa_is_agx3(agx_chip_isa_encoding(chip)) && state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
-       !state->ms->alpha_to_coverage_enable)
+       !state->ms->alpha_to_coverage_enable &&
+       (!agx_chip_native_agx3(chip) || hk_g17p_static_no_early_reject(state)))
       key->m5_static_tests = true;
 
    if (state->pipeline_flags &
@@ -3284,7 +3320,8 @@ hk_g17p_saturate_layer_viewport(nir_builder *b, nir_intrinsic_instr *intr,
 
 static void
 hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz,
-               bool layer_as_varying, bool original_vertex_stage)
+               bool layer_as_varying, bool default_layer,
+               bool original_vertex_stage)
 {
    /* Point size must be clamped, excessively large points don't render
     * properly on G13.
@@ -3307,7 +3344,7 @@ hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz,
       original_vertex_stage && layer_as_varying &&
       !nir->info.layer_viewport_relative &&
       !(nir->info.outputs_written & VARYING_BIT_LAYER);
-   if (layer_as_varying)
+   if (layer_as_varying && default_layer)
       NIR_PASS(_, nir, agx_nir_lower_default_layer);
 
    NIR_PASS(_, nir, agx_nir_lower_uvs, &shader->info.uvs,
@@ -3642,6 +3679,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       hk_shader_writes_external_memory(nir);
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
+   bool default_layer = true;
    if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
        (sw_stage != MESA_SHADER_FRAGMENT && sw_stage != MESA_SHADER_COMPUTE &&
         dev->gen1_native_graphics_rq) ||
@@ -3857,6 +3895,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       nr_vbos = DIV_ROUND_UP(
          BITSET_LAST_BIT(shader->info.vs.attrib_components_read), 4);
       kill_psiz = key->vs.kill_psiz;
+      default_layer = !key->vs.no_default_layer;
    } else if (sw_stage == MESA_SHADER_FRAGMENT) {
       shader->info.fs.writes_memory = nir->info.writes_memory;
       shader->info.fs.interp.linear = nir->info.linear_varyings;
@@ -3890,13 +3929,15 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
 
       /* With alpha-to-coverage statically off and no depth/stencil export,
-       * no epilog of this shader discards, so on M5 the main part always
-       * owns the depth/stencil tests: the draw-time selector
-       * (hk_root_descriptor_table::draw.no_epilog_discard) is all ones for
-       * every draw that can use it. Fold it, leaving the single unconditional
-       * testing coverage update of the native form instead of a uniform
-       * branch between a testing and a killing one. */
-      if (agx_chip_g17_m5(dev->dev.chip) && key && key->fs.m5_static_tests &&
+       * no epilog of this shader discards, so on AGX3 the main part always
+       * owns the depth/stencil tests (on G15 and G17P, while no read-only
+       * early reject can apply, hk_g17p_static_no_early_reject()): the
+       * draw-time selector (hk_root_descriptor_table::draw.no_epilog_discard)
+       * is all ones for every draw that can use it. Fold it, leaving the
+       * single unconditional testing coverage update of the native form
+       * instead of a uniform branch between a testing and a killing one. */
+      if (agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip)) && key &&
+          key->fs.m5_static_tests &&
           !shader->info.fs.epilog_key.write_z &&
           !shader->info.fs.epilog_key.write_s) {
          bool folded = false;
@@ -4011,7 +4052,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          }
          hk_lower_hw_vs(nir, shader, kill_psiz,
                         agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                        sw_stage == MESA_SHADER_VERTEX);
+                        default_layer, sw_stage == MESA_SHADER_VERTEX);
          outputs = nir->info.outputs_written;
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
@@ -4794,6 +4835,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   const struct vk_features *vk_features,
                   const VkAllocationCallbacks *pAllocator,
                   const struct hk_border_source *twin_of,
+                  bool no_default_layer,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -4890,6 +4932,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       has_key = true;
    } else if (info->stage == MESA_SHADER_VERTEX) {
       hk_populate_vs_key(&key_tmp.vs, state);
+      key_tmp.vs.no_default_layer = no_default_layer;
       has_key = true;
    }
 
@@ -5317,7 +5360,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   NULL);
       }
       hk_lower_hw_vs(rast, shader, false,
-                     agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip), false);
+                     agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
+                     true, false);
       shader->info.gs = count_variant->info.gs;
       main_variant->info.gs = count_variant->info.gs;
 
@@ -5588,7 +5632,7 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                   struct hk_api_shader **shader_out)
 {
    return hk_compile_shader_impl(dev, info, state, features, allocator, NULL,
-                                 shader_out);
+                                 false, shader_out);
 }
 
 struct hk_api_shader *
@@ -5615,7 +5659,7 @@ hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
          };
          struct hk_api_shader *built = NULL;
          if (hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
-                                    &built) == VK_SUCCESS)
+                                    false, &built) == VK_SUCCESS)
             p_atomic_set(&src->twin, built);
       }
    }
@@ -5886,10 +5930,31 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       }
    }
 
+   /* A vertex shader compiled together with its fragment shader writes no
+    * default layer when that fragment shader never reads gl_Layer: nothing
+    * else consumes the output, and its UVS words would be stored for every
+    * vertex. A vertex shader compiled alone keeps it for whichever fragment
+    * shader it meets. */
+   bool fs_reads_layer = true;
    for (uint32_t i = 0; i < shader_count; i++) {
+      if (shaders[i]->info.stage == MESA_SHADER_FRAGMENT) {
+         nir_shader_gather_info(shaders[i],
+                                nir_shader_get_entrypoint(shaders[i]));
+         fs_reads_layer =
+            (shaders[i]->info.inputs_read & VARYING_BIT_LAYER) ||
+            BITSET_TEST(shaders[i]->info.system_values_read,
+                        SYSTEM_VALUE_LAYER_ID);
+      }
+   }
+
+   for (uint32_t i = 0; i < shader_count; i++) {
+      const bool no_default_layer =
+         !fs_reads_layer && infos[i].stage == MESA_SHADER_VERTEX &&
+         infos[i].next_stage_mask == VK_SHADER_STAGE_FRAGMENT_BIT;
       VkResult result =
          hk_compile_shader_impl(dev, &infos[i], state, features, pAllocator,
-                                NULL, (struct hk_api_shader **)&shaders_out[i]);
+                                NULL, no_default_layer,
+                                (struct hk_api_shader **)&shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
