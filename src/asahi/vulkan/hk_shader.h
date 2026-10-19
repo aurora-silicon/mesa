@@ -114,6 +114,9 @@ struct hk_shader_info {
       uint8_t _pad[32];
    };
 
+   /* External API memory writes, before compiler-private transport lowering. */
+   bool writes_external_memory;
+
    struct hk_mesh_info mesh;
    struct agx_unlinked_uvs_layout uvs;
 

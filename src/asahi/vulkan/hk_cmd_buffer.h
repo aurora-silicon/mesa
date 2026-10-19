@@ -820,6 +820,8 @@ struct hk_cs {
    bool gen1_native_vertex_rq;
    bool m5_native_rq;
    bool m5_matrix_ops;
+   /* OR of external-write metadata for graphics programs recorded in this CS. */
+   bool m5_shader_writes_memory;
 
    /* Scratch requirements */
    struct {

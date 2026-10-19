@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_shader.h"
+#include "hk_native_write_class.h"
 #include "asahi/compiler/agx_nir_m5_ray_query.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
@@ -3604,6 +3605,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_xfb_info *xfb_info, unsigned set_count,
                uint8_t static_set_mask)
 {
+   const bool writes_external_memory =
+      hk_shader_writes_external_memory(nir);
    unsigned nr_vbos = 0;
    bool kill_psiz = false;
    if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
@@ -4270,6 +4273,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       shader->info.fs.g17p_samples = MAX2(backend_key.fs.nr_samples, 1);
 
    shader->info.stage = sw_stage;
+   shader->info.writes_external_memory = writes_external_memory;
    shader->info.clip_distance_array_size = nir->info.clip_distance_array_size;
    shader->info.cull_distance_array_size = nir->info.cull_distance_array_size;
    shader->b.info.outputs = outputs;
@@ -4896,6 +4900,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    }
 
    mesa_shader_stage sw_stage = nir->info.stage;
+   const bool api_writes_external_memory =
+      hk_shader_writes_external_memory(nir);
 
    if (sw_stage == MESA_SHADER_FRAGMENT) {
       key = &key_tmp;
@@ -5118,6 +5124,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
       }
+      /* Native mesh lowering introduces private transport stores after the
+       * API write class was gathered. They do not change this declaration. */
+      shader->info.writes_external_memory = api_writes_external_memory;
       struct hk_shader *object = &obj->variants[HK_MESH_VARIANT_RAST];
       if (dev->dev.chip == AGX_CHIP_G17P) {
       
@@ -5135,6 +5144,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
       }
+      object->info.writes_external_memory = false;
       } else {
       /* Mesh-only Vulkan pipelines use Apple's native three-thread
        * passthrough object stage, whose operand-bearing code is composed,
@@ -5183,6 +5193,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return result;
       }
+      /* This compiler-generated object only transports the mesh launch. */
+      predicated->info.writes_external_memory = false;
    } else if (sw_stage == MESA_SHADER_TASK) {
       /* Compile the actual API object shader through captured native payload
        * addressing and child-grid UVSW, never as a CDM mesh producer.
@@ -5211,6 +5223,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                              sw_stage, true, NULL, info->set_layout_count,
                              static_set_mask);
       if (result == VK_SUCCESS) {
+         obj->variants[0].info.writes_external_memory = api_writes_external_memory;
          /* hk_draw_mesh_native publishes the API grid and draw index to the
           * object stage's draw root only when it reads them. */
          obj->variants[0].info.mesh.reads_draw_id = mesh_reads_draw_id;
