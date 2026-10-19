@@ -3033,7 +3033,7 @@ hk_pack_zls_control(struct agx_zls_control_packed *packed,
    agx_pack_zls_control(packed, z_layout, s_layout, &zls);
 }
 
-/* Precise depth store (G17P).
+/* Precise depth store (AGX3).
  *
  * hk_pack_zls_control() forces the depth store on ("|| true") because a pass
  * split across several of Honeykrisp's own control streams needs every stream
@@ -3060,7 +3060,7 @@ hk_pack_zls_control(struct agx_zls_control_packed *packed,
  * reads stencil from memory as an input attachment. That stream keeps the
  * forced word; only the stream that ends the pass gets this one.
  *
- * Untouched depth/stencil elision (G17P).
+ * Untouched depth/stencil elision (AGX3).
  *
  * Minecraft opens every full-screen pass with loadOp LOAD / storeOp STORE on
  * its D32 attachment, including passes whose pipelines neither test nor
@@ -4075,12 +4075,13 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    hk_pack_zls_control(&render->cr.zls_control_partial, z_layout, s_layout,
                        attach_z, attach_s, incomplete_render_area, true);
 
-   render->zls_precise = dev->dev.chip == AGX_CHIP_G17P && z_layout != NULL;
+   const bool agx3 = agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip));
+   render->zls_precise = agx3 && z_layout != NULL;
    render->g17p_depth_touched = false;
    const bool preserve_none = hk_g17p_zls_attachment_none(attach_z) &&
                               hk_g17p_zls_attachment_none(attach_s);
    render->g17p_zls_elide_ok =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      agx3 &&
       (preserve_none ||
        !(render->flags & VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT)) &&
       (z_layout != NULL || s_layout != NULL) &&
