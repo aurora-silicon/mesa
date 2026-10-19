@@ -1137,7 +1137,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * the ioctl, preserving independent execution while covering earlier work.
     */
    const bool cumulative_signals =
-      dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES;
+      dev->dev.chip == AGX_CHIP_G17P ||
+      (agx_chip_g17_m5(dev->dev.chip) &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
    const unsigned kernel_signal_count =
       cumulative_signals ? 0 : submit->signal_count;
    unsigned wait_count = 0;
@@ -1548,13 +1550,21 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* Quantize relative priorities to the two unprivileged firmware classes.
-    * An explicit global class takes precedence; the kernel checks permission
-    * for elevated classes. No scheduling work is needed during submission.
+   /* On M5, quantize relative priorities to the two unprivileged firmware
+    * classes. An explicit global class takes precedence; the kernel checks
+    * permission for elevated classes. No scheduling work is needed during
+    * submission. Elsewhere high-priority scheduling still needs kernel
+    * qualification.
     */
    enum drm_asahi_priority drm_priority = translate_priority(priority);
-   if (!priority_info && pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
-      drm_priority = DRM_ASAHI_PRIORITY_LOW;
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      if (!priority_info &&
+          pCreateInfo->pQueuePriorities[index_in_family] < 0.5f)
+         drm_priority = DRM_ASAHI_PRIORITY_LOW;
+   } else if (drm_priority >= DRM_ASAHI_PRIORITY_HIGH) {
+      vk_free(&dev->vk.alloc, queue);
+      return VK_ERROR_NOT_PERMITTED_EXT;
+   }
 
    result = vk_queue_init(&queue->vk, &dev->vk, pCreateInfo, index_in_family);
    if (result != VK_SUCCESS) {
