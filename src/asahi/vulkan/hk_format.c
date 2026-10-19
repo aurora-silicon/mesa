@@ -41,8 +41,16 @@ hk_modifier_features(const struct agx_device *dev, uint64_t mod,
    if (mod == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED) {
       if (!hk_can_compress_format(dev, vk_format))
          return 0;
-      return props->optimalTilingFeatures &
-             ~VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
+      VkFormatFeatureFlags2 unsupported =
+         VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
+      /* M5 shares compressed images without storage access
+       * (hk_m5_shared_compression_shape()). */
+      if (agx_chip_g17_m5(dev->chip))
+         unsupported |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                        VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+                        VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                        VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      return props->optimalTilingFeatures & ~unsupported;
    }
 
    /* Interchange: the 32-bit RGBA formats on G17P; never storage or host

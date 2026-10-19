@@ -34,7 +34,9 @@
  *
  * Images that may be shared with another process or device (external
  * memory, WSI, DRM modifiers) stay plain: the compositor and display paths
- * have their own compressed-format contracts.
+ * have their own compressed-format contracts. (M5 shares compressed colour
+ * images between hk processes through the GPU_TILED_COMPRESSED modifier, see
+ * hk_m5_shared_compression_eligible().)
  *
  * This is the only G17P policy: every eligible image is compressed, with no
  * runtime opt-out.
@@ -266,6 +268,55 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
           !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
           info->extent.height >= 16 &&
           hk_g17p_compression_color_format(info->format);
+}
+
+/* M5 colour images shared through DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
+ *
+ * The modifier is the sharing contract: exporter and importer derive the
+ * same allocation (GPU tiling, AIL_LAYOUT_POLICY_M5 and its metadata, one
+ * memory plane) from format and extent, and hk_map_compression() follows the
+ * modifier. The shape is the colour policy's above restricted to one level,
+ * without its exclusion of external memory and WSI images and without its
+ * colour-attachment requirement: hk_image_init() makes every transfer
+ * destination renderable, so a swapchain image written only by blits or
+ * copies takes the compressed PBE as well. Storage and host-transfer usages
+ * stay excluded; feedback-loop usage is accepted on import only (zink adds
+ * it to every imported render-target dmabuf) and never chosen at allocation
+ * (hk_can_compress() refuses it). hk_image.c adds the PBE store-class check.
+ */
+static inline bool
+hk_m5_shared_compression_shape(enum agx_chip chip, VkFormat format,
+                               VkImageType type, VkImageCreateFlags flags,
+                               VkImageUsageFlags usage)
+{
+   /* WSI creates every swapchain image with ALIAS: images of identical
+    * parameters on the same memory, which here derive the same layout. */
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      VK_IMAGE_CREATE_ALIAS_BIT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+
+   return agx_chip_g17_m5(chip) && type == VK_IMAGE_TYPE_2D &&
+          !(flags & ~allowed_flags) && !(usage & ~allowed_usage) &&
+          hk_g17p_compression_color_format(format);
+}
+
+static inline bool
+hk_m5_shared_compression_eligible(enum agx_chip chip, unsigned plane,
+                                  const VkImageCreateInfo *info)
+{
+   return plane == 0 && info &&
+          info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+          hk_m5_shared_compression_shape(chip, info->format, info->imageType,
+                                         info->flags, info->usage) &&
+          info->extent.depth == 1 && info->mipLevels == 1 &&
+          info->arrayLayers == 1 && info->samples == VK_SAMPLE_COUNT_1_BIT &&
+          info->extent.width >= 16 && info->extent.height >= 16;
 }
 
 /* M5 lossless compression of depth attachments.
