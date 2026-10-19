@@ -94,7 +94,12 @@ struct hk_shader_info {
          bool g17p_colour_unit_range;
 
          bool m5_inline_sample_shading;
-         uint8_t _pad[4];
+
+         /* M5: the main part's depth/stencil test selector was folded to
+          * "this part tests" (hk_fs_key::m5_static_tests); its epilog must
+          * not discard. */
+         bool m5_static_tests;
+         uint8_t _pad[3];
       } fs;
 
       struct {

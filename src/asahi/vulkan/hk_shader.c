@@ -109,6 +109,14 @@ struct hk_fs_key {
 
    /** M5 sample-position width selection; 0 means dynamic or unknown. */
    uint8_t m5_position_samples;
+
+   /** M5: alpha-to-coverage is statically disabled, so no fragment epilog of
+    * this shader discards unless the shader writes depth or stencil
+    * (agx_fs_epilog_may_discard()). The main part then always runs the
+    * depth/stencil tests itself and need not select that at draw time.
+    */
+   bool m5_static_tests;
+   uint8_t _pad[3];
 };
 
 struct hk_shader_binary_cache_entry {
@@ -122,7 +130,7 @@ struct hk_shader_binary_cache_entry {
    uint32_t refcount;
 };
 
-static_assert(sizeof(struct hk_fs_key) == 4, "packed");
+static_assert(sizeof(struct hk_fs_key) == 8, "packed");
 
 struct hk_vs_key {
    struct agx_velem_key attribs[32];
@@ -593,6 +601,12 @@ hk_populate_fs_key(struct hk_fs_key *key,
    if (agx_chip_g17_m5(chip) && state->ms != NULL &&
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
+
+   if (agx_chip_g17_m5(chip) && state->ms != NULL &&
+       !BITSET_TEST(state->dynamic,
+                    MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
+       !state->ms->alpha_to_coverage_enable)
+      key->m5_static_tests = true;
 
    if (state->pipeline_flags &
        VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)
@@ -3596,6 +3610,19 @@ hk_m5_needs_query_abi(nir_shader *nir)
    return false;
 }
 
+static bool
+hk_fold_m5_tests_zs(nir_builder *b, nir_intrinsic_instr *intr,
+                    UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_shader_part_tests_zs_agx)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def,
+                   nir_imm_intN_t(b, UINT16_MAX, intr->def.bit_size));
+   return true;
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -3855,6 +3882,22 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
       else
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
+
+      /* With alpha-to-coverage statically off and no depth/stencil export,
+       * no epilog of this shader discards, so on M5 the main part always
+       * owns the depth/stencil tests: the draw-time selector
+       * (hk_root_descriptor_table::draw.no_epilog_discard) is all ones for
+       * every draw that can use it. Fold it, leaving the single unconditional
+       * testing coverage update of the native form instead of a uniform
+       * branch between a testing and a killing one. */
+      if (agx_chip_g17_m5(dev->dev.chip) && key && key->fs.m5_static_tests &&
+          !shader->info.fs.epilog_key.write_z &&
+          !shader->info.fs.epilog_key.write_s) {
+         bool folded = false;
+         NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
+                  hk_fold_m5_tests_zs, nir_metadata_control_flow, NULL);
+         shader->info.fs.m5_static_tests = folded;
+      }
       NIR_PASS(_, nir, agx_nir_apply_api_mask_to_force_early, dev->dev.chip);
 
       if (nir->info.fs.uses_sample_shading &&
