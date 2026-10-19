@@ -472,11 +472,14 @@ main()
       return;
    }
 #endif
+#if !HK_AGX3_GEN1
+   /* The single-leaf phase is dispatched by the M5 backend only. */
    if (args.phase == 5) {
       if (id == 0)
          plan_single_leaf();
       return;
    }
+#endif
    if (args.phase == 0) {
       initialize(id);
       return;

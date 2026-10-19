@@ -48,6 +48,9 @@ static const uint8_t hk_g17p_native_write_control[32] = {
 };
 
 #define HK_G17P_COMPUTE_MAX_RANGES (4u + 2u * AGX3_UNIFORM_DMA_MAX_SPANS)
+/* Ranges a launch without direct uniform DMA spans (every chip but M5) may
+ * collect before the Gen1 ray-query state range is appended. */
+#define HK_G17P_COMPUTE_BASE_RANGES 8u
 #define HK_G17P_LOADER_MAX_SHAPES  4u
 static_assert(HK_G17P_COMPUTE_MAX_RANGES <= HK_G17P_PATCH_MAX_RANGES,
               "patch plan capacity");
@@ -953,7 +956,7 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if(s->b.info.uses_ray_traversal && hk_cmd_buffer_device(cmd)->gen1_native_rq) {
       struct hk_device *dev=hk_cmd_buffer_device(cmd);
       if((internal_graphics && !dev->gen1_native_graphics_rq) ||
-         range_count>=HK_G17P_COMPUTE_MAX_RANGES) {
+         range_count>=HK_G17P_COMPUTE_BASE_RANGES) {
          vk_command_buffer_set_error(&cmd->vk,VK_ERROR_FEATURE_NOT_PRESENT);return false;
       }
       const uint64_t packed = hk_gen1_ray_query_scs_layout(dev);
