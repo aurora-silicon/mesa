@@ -801,16 +801,25 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, void *data)
        * level check below can fail for it; a null descriptor already swizzles
        * every channel to zero. Skipping those components drops the size query,
        * which depends on a varying level, from a fetch of texel 0. */
-      nir_def *size = NULL;
-      g17p_txf_oob = nir_imm_false(b);
-      for (unsigned c = 0; c < tex->coord_components; ++c) {
-         if (nir_scalar_is_zero(nir_get_scalar(coord, c)))
-            continue;
+      if (options->gen10) {
+         nir_def *size = NULL;
+         g17p_txf_oob = nir_imm_false(b);
+         for (unsigned c = 0; c < tex->coord_components; ++c) {
+            if (nir_scalar_is_zero(nir_get_scalar(coord, c)))
+               continue;
 
-         size = size ?: nir_get_texture_size(b, tex);
-         g17p_txf_oob =
-            nir_ior(b, g17p_txf_oob,
-                    nir_uge(b, nir_channel(b, coord, c), nir_channel(b, size, c)));
+            size = size ?: nir_get_texture_size(b, tex);
+            g17p_txf_oob = nir_ior(
+               b, g17p_txf_oob,
+               nir_uge(b, nir_channel(b, coord, c), nir_channel(b, size, c)));
+         }
+      } else {
+         /* Gen9 keeps the whole-vector check: the zero-component skip is
+          * qualified on M5 only. */
+         const unsigned n = tex->coord_components;
+         nir_def *size = nir_trim_vector(b, nir_get_texture_size(b, tex), n);
+         nir_def *checked = nir_trim_vector(b, coord, n);
+         g17p_txf_oob = nir_bany(b, nir_uge(b, checked, size));
       }
 
       if (has_nonzero_lod(tex)) {
