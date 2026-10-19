@@ -8043,6 +8043,7 @@ static bool agx3_nir_lower_uniform_dma(nir_shader *nir,
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool m5,
+                 bool loop_schedule,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info)
@@ -8187,7 +8188,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    nir_opt_reassociate_loop(
       nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-              (m5 ? nir_reassociate_loop_invariant : 0));
+              (loop_schedule ? nir_reassociate_loop_invariant : 0));
 
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
@@ -8308,7 +8309,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, agx_nir_fuse_algebraic_late);
-      if (m5)
+      if (loop_schedule)
          NIR_PASS(progress, nir, agx_nir_fuse_doubled_add);
    } while (progress);
 
@@ -12876,10 +12877,16 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
+   /* The long-loop sample schedule: AGX3C and G17P. G15S/G15C share G17P's
+    * AGX3B packer but have not been qualified with it. */
+   const bool loop_schedule =
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3C ||
+      key->dev.chip == AGX_CHIP_G17P;
+
    agx_optimize_nir(
       nir, key->dev.soft_fault, uniform_atomics,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3C, loop_schedule,
       form_preamble ? &info->push_count : NULL,
       (form_preamble && key->promote_textures) ? &info->texture_state_count
                                               : NULL,
@@ -12961,9 +12968,9 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
    /* Apple issues a loop body's samples in source order and consumes all of
     * them after the last one (native robust_loop witness); Mesa consumed each
-    * right after its sample. Geometry-side M5 stages, like the M5 copy-loop
-    * schedule; see agx_nir_opt_sink_loop_sample_uses.c. */
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+    * right after its sample. Geometry-side stages of both AGX3 encodings, which
+    * share the texture scoreboard; see agx_nir_opt_sink_loop_sample_uses.c. */
+   if (loop_schedule &&
        nir->info.stage != MESA_SHADER_FRAGMENT &&
        nir->info.stage != MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, agx_nir_opt_sink_loop_sample_uses);
