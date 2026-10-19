@@ -990,7 +990,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
-   /* M5: a render pass instance that ended may still be continued by the
+   /* AGX3: a render pass instance that ended may still be continued by the
     * next one if this dependency is framebuffer-local. */
    if (unlikely(cmd->state.pass_merge.valid))
       hk_m5_pass_merge_barrier(cmd, pDependencyInfo);
@@ -1300,13 +1300,14 @@ hk_descriptor_type_has_image_view(VkDescriptorType type)
           type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
 }
 
-/* M5 render pass continuation: the image views a graphics push descriptor
+/* AGX3 render pass continuation: the image views a graphics push descriptor
  * update writes (hk_m5_pass_merge_note_push()). */
 static void
 hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,
                        const VkWriteDescriptorSet *writes)
 {
-   if (!agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+   if (!agx_isa_is_agx3(
+          agx_chip_isa_encoding(hk_cmd_buffer_device(cmd)->dev.chip)))
       return;
 
    for (uint32_t i = 0; i < count; ++i) {
@@ -1326,7 +1327,8 @@ hk_m5_note_push_template(struct hk_cmd_buffer *cmd,
                          const struct vk_descriptor_update_template *template,
                          const void *data)
 {
-   if (!agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+   if (!agx_isa_is_agx3(
+          agx_chip_isa_encoding(hk_cmd_buffer_device(cmd)->dev.chip)))
       return;
 
    for (uint32_t i = 0; i < template->entry_count; ++i) {

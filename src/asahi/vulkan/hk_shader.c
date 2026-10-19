@@ -110,10 +110,11 @@ struct hk_fs_key {
    /** M5 sample-position width selection; 0 means dynamic or unknown. */
    uint8_t m5_position_samples;
 
-   /** M5: alpha-to-coverage is statically disabled, so no fragment epilog of
+   /** AGX3: alpha-to-coverage is statically disabled, so no fragment epilog of
     * this shader discards unless the shader writes depth or stencil
     * (agx_fs_epilog_may_discard()). The main part then always runs the
-    * depth/stencil tests itself and need not select that at draw time.
+    * depth/stencil tests itself and need not select that at draw time. On
+    * G17P the pipeline state also rules out a read-only early reject.
     */
    bool m5_static_tests;
    uint8_t _pad[3];
@@ -582,6 +583,36 @@ hk_populate_vs_key(struct hk_vs_key *key,
    }
 }
 
+/* G17P runs a discarding shader's read-only depth test in the prolog instead
+ * (hk_g17p_read_only_early_reject_in()), with the main part's selector off.
+ * Whether a draw takes that path is draw-time state; these pipeline states
+ * rule it out for every draw. */
+static bool
+hk_g17p_static_no_early_reject(const struct vk_graphics_pipeline_state *state)
+{
+   if (state->ms != NULL &&
+       !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES) &&
+       state->ms->rasterization_samples > 1)
+      return true;
+
+   const struct vk_depth_stencil_state *ds = state->ds;
+   if (ds == NULL)
+      return false;
+
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE) &&
+       !ds->depth.test_enable)
+      return true;
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_WRITE_ENABLE) &&
+       ds->depth.write_enable)
+      return true;
+   if (!BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_DS_DEPTH_COMPARE_OP) &&
+       ds->depth.compare_op == VK_COMPARE_OP_ALWAYS)
+      return true;
+   return !BITSET_TEST(state->dynamic,
+                       MESA_VK_DYNAMIC_DS_DEPTH_BOUNDS_TEST_ENABLE) &&
+          ds->depth.bounds_test.enable;
+}
+
 static void
 hk_populate_fs_key(struct hk_fs_key *key,
                    const struct vk_graphics_pipeline_state *state,
@@ -602,10 +633,11 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
 
-   if (agx_chip_g17_m5(chip) && state->ms != NULL &&
+   if (agx_isa_is_agx3(agx_chip_isa_encoding(chip)) && state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
-       !state->ms->alpha_to_coverage_enable)
+       !state->ms->alpha_to_coverage_enable &&
+       (chip != AGX_CHIP_G17P || hk_g17p_static_no_early_reject(state)))
       key->m5_static_tests = true;
 
    if (state->pipeline_flags &
@@ -3884,13 +3916,15 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
 
       /* With alpha-to-coverage statically off and no depth/stencil export,
-       * no epilog of this shader discards, so on M5 the main part always
-       * owns the depth/stencil tests: the draw-time selector
-       * (hk_root_descriptor_table::draw.no_epilog_discard) is all ones for
-       * every draw that can use it. Fold it, leaving the single unconditional
-       * testing coverage update of the native form instead of a uniform
-       * branch between a testing and a killing one. */
-      if (agx_chip_g17_m5(dev->dev.chip) && key && key->fs.m5_static_tests &&
+       * no epilog of this shader discards, so on AGX3 the main part always
+       * owns the depth/stencil tests (on G17P, while no read-only early
+       * reject can apply, hk_g17p_static_no_early_reject()): the draw-time
+       * selector (hk_root_descriptor_table::draw.no_epilog_discard) is all
+       * ones for every draw that can use it. Fold it, leaving the single
+       * unconditional testing coverage update of the native form instead of
+       * a uniform branch between a testing and a killing one. */
+      if (agx_isa_is_agx3(agx_chip_isa_encoding(dev->dev.chip)) && key &&
+          key->fs.m5_static_tests &&
           !shader->info.fs.epilog_key.write_z &&
           !shader->info.fs.epilog_key.write_s) {
          bool folded = false;

@@ -95,7 +95,7 @@ struct hk_shader_info {
 
          bool m5_inline_sample_shading;
 
-         /* M5: the main part's depth/stencil test selector was folded to
+         /* AGX3: the main part's depth/stencil test selector was folded to
           * "this part tests" (hk_fs_key::m5_static_tests); its epilog must
           * not discard. */
          bool m5_static_tests;
