@@ -48,9 +48,16 @@ struct poly_gs_info {
    uint8_t topology[64];
 };
 
+/* Optional driver pass that removes dead work NIR DCE keeps, such as a
+ * lowered ray query, so the API side effects it guarded can be stripped. */
+typedef bool (*poly_nir_remove_dead_fn)(struct nir_shader *shader);
+
+/* The main kernel performs the API stores and atomics once per invocation;
+ * the count and raster variants drop them. */
 bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
-                       struct poly_gs_info *info);
+                       struct poly_gs_info *info,
+                       poly_nir_remove_dead_fn remove_dead);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);

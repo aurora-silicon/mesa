@@ -98,6 +98,8 @@ write_accel_struct_desc(struct hk_descriptor_set *set,
                                              struct hk_device, vk);
       if (dev->g17p_native_as)
          addr = ALIGN_POT(addr, UINT64_C(16384));
+      else if (dev->m5_native_as)
+         addr = ALIGN_POT(addr, UINT64_C(1024));
    }
 
    write_desc(set, binding, elem, &addr, sizeof(addr));
@@ -432,13 +434,15 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
          view->planes[0].storage_pbe_valid;
       supported = hk_native_pbe_supported(generation) || native_basic;
       /* A readable native texture does not require a writable PBE. In
-       * particular, linear storage views have a valid texture descriptor
-       * even when the native PBE packer cannot represent their layout.
+       * particular, linear and multisampled storage views have a valid
+       * texture descriptor even when the native PBE packer cannot represent
+       * their layout.
        * Keep imageLoad/imageSize bound to that view instead of replacing
        * both halves with a null descriptor because stores are unsupported.
        */
       texture_supported = supported ||
-         (generation == 9 && view->plane_count == 1);
+         (hk_descriptor_generation_is_agx3(generation) &&
+          view->plane_count == 1);
       if (texture_supported) {
          /* Storage images are always single plane */
          assert(view->plane_count == 1);
@@ -564,9 +568,11 @@ write_buffer_view_desc(struct hk_descriptor_set *set,
       hk_storage_image_descriptor_layout(generation);
    uint32_t heap_index = 0;
 
-   /* G17P buffer views carry a Gen9 linear PBE; imageBuffer reads still use
-    * the native texture heap. */
-   if ((!storage || generation == 9 || hk_native_pbe_supported(generation)) &&
+   /* Native buffer-image reads use the same texture heap and software
+    * metadata as uniform texel buffers. A missing writable PBE must not
+    * replace their readable texture with the null descriptor. */
+   if ((!storage || hk_descriptor_generation_is_agx3(generation) ||
+        hk_native_pbe_supported(generation)) &&
        bufferView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(hk_buffer_view, view, bufferView);
 

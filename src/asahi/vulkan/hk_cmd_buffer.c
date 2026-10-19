@@ -5,7 +5,10 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "hk_ppp_state.h"
+#include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
+#include "asahi/lib/agx_scs_layout.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -20,6 +23,7 @@
 #include "hk_agx3_vdm_decode.h"
 #include "asahi/lib/agx_ioto_load_core.h"
 #include "hk_buffer.h"
+#include "hk_acceleration_structure.h"
 #include "hk_cmd_pool.h"
 #include "hk_descriptor_set.h"
 #include "hk_descriptor_set_layout.h"
@@ -33,8 +37,14 @@
 #include "libagx_shaders.h"
 
 #include "util/cache_ops.h"
+#include "util/os_misc.h"
+#include "util/u_atomic.h"
+#include <inttypes.h>
+#include <stdio.h>
+#include <unistd.h>
 #include "util/log.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 #include "util/u_debug.h"
 #include "util/os_time.h"
 
@@ -46,6 +56,7 @@
 #include "asahi/lib/agx_ppp_w_clamp_cull2_core.h"
 #include "asahi/lib/agx_vdm_barrier_core.h"
 #include "asahi/lib/agx_vdm_stream_link_core.h"
+#include "asahi/lib/agx_m5_va.h"
 #include "asahi/lib/agx_vdm_stream_terminate_core.h"
 #include "asahi/lib/agx_va_runtime_hole.h"
 #include "libagx_dgc.h"
@@ -162,9 +173,92 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
+struct hk_m5_rt_state_diag_entry {
+   uint8_t *cpu;
+   uint64_t gpu, size;
+   uint8_t *initial;
+};
+
+/* Opt-in diagnostic (ASAHI_M5_RT_STATE_DIAG=<dir>): remember the initial
+ * contents of each SCS state block this recording allocates, so the bytes the
+ * GPU changed can be reported once the application has finished with the
+ * command buffer. No effect on the recorded commands. */
+void
+hk_m5_rt_state_diag_record(struct hk_cmd_buffer *cmd, struct agx_ptr state,
+                           uint64_t size)
+{
+   struct hk_m5_rt_state_diag_entry e = {
+      .cpu = state.cpu, .gpu = state.gpu, .size = size, .initial = malloc(size),
+   };
+   if (!e.initial)
+      return;
+   memcpy(e.initial, state.cpu, size);
+   util_dynarray_append(&cmd->m5_rt_state.diag, e);
+}
+
+static void
+hk_m5_rt_state_diag_flush(struct hk_cmd_buffer *cmd)
+{
+   const char *dir = os_get_option("ASAHI_M5_RT_STATE_DIAG");
+   static unsigned seq;
+   util_dynarray_foreach(&cmd->m5_rt_state.diag,
+                         struct hk_m5_rt_state_diag_entry, e) {
+      const unsigned n = p_atomic_inc_return(&seq);
+      char path[512];
+      snprintf(path, sizeof(path), "%s/state-%d-%u.txt", dir ? dir : "/tmp",
+               (int)getpid(), n);
+      FILE *f = fopen(path, "w");
+      if (f) {
+         uint64_t changed = 0, ranges = 0, start = UINT64_MAX, last = 0;
+         fprintf(f, "gpu 0x%" PRIx64 " size 0x%" PRIx64 "\n", e->gpu, e->size);
+         for (uint64_t o = 0; o < e->size; o += 16) {
+            if (!memcmp(e->cpu + o, e->initial + o, 16))
+               continue;
+            changed += 16;
+            if (start != UINT64_MAX && o > last + 256) {
+               fprintf(f, "range 0x%" PRIx64 " 0x%" PRIx64 "\n", start, last + 16);
+               ranges++;
+               start = UINT64_MAX;
+            }
+            if (start == UINT64_MAX)
+               start = o;
+            last = o;
+         }
+         if (start != UINT64_MAX) {
+            fprintf(f, "range 0x%" PRIx64 " 0x%" PRIx64 "\n", start, last + 16);
+            ranges++;
+         }
+         fprintf(f, "changed16 %" PRIu64 " ranges %" PRIu64 "\n", changed, ranges);
+         fclose(f);
+      }
+      if (n <= 4) {
+         snprintf(path, sizeof(path), "%s/state-%d-%u.final.bin", dir ? dir : "/tmp",
+                  (int)getpid(), n);
+         f = fopen(path, "wb");
+         if (f) {
+            fwrite(e->cpu, 1, e->size, f);
+            fclose(f);
+         }
+         snprintf(path, sizeof(path), "%s/state-%d-%u.initial.bin", dir ? dir : "/tmp",
+                  (int)getpid(), n);
+         f = fopen(path, "wb");
+         if (f) {
+            fwrite(e->initial, 1, e->size, f);
+            fclose(f);
+         }
+      }
+      free(e->initial);
+   }
+   util_dynarray_fini(&cmd->m5_rt_state.diag);
+   memset(&cmd->m5_rt_state.diag, 0, sizeof(cmd->m5_rt_state.diag));
+}
+
 static void
 hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
+   if (cmd->m5_rt_state.diag.size)
+      hk_m5_rt_state_diag_flush(cmd);
+
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
 
@@ -205,6 +299,8 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    hk_free_resettable_cmd_buffer(cmd);
    util_dynarray_fini(&cmd->large_bos);
    free(cmd->retained_set);
+   if (cmd->m5_pushed_images)
+      _mesa_set_destroy(cmd->m5_pushed_images, NULL);
    util_dynarray_fini(&cmd->sync_pass_records);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
@@ -296,6 +392,8 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->geom_instance_count = 0;
    cmd->uses_heap = false;
    hk_sync_reset(cmd);
+   if (cmd->m5_pushed_images)
+      _mesa_set_clear(cmd->m5_pushed_images, NULL);
 
    memset(&cmd->state, 0, sizeof(cmd->state));
    for (unsigned i = 0; i < HK_G17P_BG_EOT_CACHE_ENTRIES; ++i)
@@ -322,6 +420,8 @@ hk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       cmd->vk.base.device->command_dispatch_table;
    const struct hk_conditional_render_state primary_conditional =
       cmd->state.conditional;
+
+   hk_flush_deferred_clears(cmd);
 
    /* Secondary command buffers are materialized by replaying their common
     * command queues into the primary.  Their last bound state is therefore
@@ -565,6 +665,12 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
 
    if (vdm && hk_g17p_vdm_low_window_enabled(&dev->dev))
       target = hk_g17p_vdm_compact(cmd, target);
+   else if (vdm && agx_chip_g17_m5(dev->dev.chip)) {
+      if (!agx_m5_vdm_compact(target, &target)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return current;
+      }
+   }
 
    switch (agx_chip_command_stream_generation(dev->dev.chip)) {
    case AGX_CS_GENERATION_AGX2:
@@ -796,6 +902,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           "must end rendering before ending the command buffer");
 
    perf_debug(cmd, "End command buffer");
+   hk_flush_deferred_clears(cmd);
    hk_sync_flush_pending_timestamp(cmd);
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
@@ -883,6 +990,16 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    perf_debug(cmd, "Pipeline barrier");
 
+   /* M5: a render pass instance that ended may still be continued by the
+    * next one if this dependency is framebuffer-local. */
+   if (unlikely(cmd->state.pass_merge.valid))
+      hk_m5_pass_merge_barrier(cmd, pDependencyInfo);
+
+   /* Host availability is recorded against the work already recorded. */
+   if (cmd->state.deferred_clear_count &&
+       hk_dependency_has_host_read(pDependencyInfo))
+      hk_flush_deferred_clears(cmd);
+
    /* Inside a render pass instance both scopes are limited to that instance
     * (Vulkan 1.3, 7.6.1: "If vkCmdPipelineBarrier2 is called inside a render
     * pass instance, the first synchronization scope includes only commands
@@ -930,9 +1047,9 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* A barrier-only command buffer otherwise records no GPU work, so it
     * cannot make a preceding fragment store visible to the host. Emit the
-    * exact G17P strong CDM cache-maintenance record only when the API requests
+    * native strong CDM cache-maintenance record only when the API requests
     * host-read availability, in a stream ordered after the source scope. */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
        hk_dependency_has_host_read(pDependencyInfo)) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
@@ -946,6 +1063,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_cache_flush(dev, flush);
    }
+
+   /* The dependency this barrier recorded is the one a continued instance
+    * applies to its stream (hk_sync_merge_rendering()); a stream it created
+    * or extended still ends the candidacy there. */
+   if (unlikely(cmd->state.pass_merge.valid))
+      cmd->state.pass_merge.sync_epoch = cmd->sync.epoch;
 }
 
 __attribute__((hot)) void
@@ -1093,6 +1216,7 @@ hk_CmdBindDescriptorSets2KHR(
 
    if (pBindDescriptorSetsInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
        VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT)) {
+      hk_m5_pass_merge_note_set_bind(cmd);
       hk_bind_descriptor_sets(cmd, &cmd->state.gfx.descriptors,
                               pBindDescriptorSetsInfo);
    }
@@ -1166,12 +1290,70 @@ hk_cmd_push_descriptors(struct hk_cmd_buffer *cmd,
    return desc->push[set];
 }
 
+/* Whether a descriptor of this type names an image view. */
+static inline bool
+hk_descriptor_type_has_image_view(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+}
+
+/* M5 render pass continuation: the image views a graphics push descriptor
+ * update writes (hk_m5_pass_merge_note_push()). */
+static void
+hk_m5_note_push_writes(struct hk_cmd_buffer *cmd, uint32_t count,
+                       const VkWriteDescriptorSet *writes)
+{
+   if (!agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+      return;
+
+   for (uint32_t i = 0; i < count; ++i) {
+      if (!hk_descriptor_type_has_image_view(writes[i].descriptorType))
+         continue;
+      for (uint32_t j = 0; j < writes[i].descriptorCount; ++j) {
+         VK_FROM_HANDLE(hk_image_view, iview,
+                        writes[i].pImageInfo[j].imageView);
+         if (iview)
+            hk_m5_pass_merge_note_push(cmd, iview);
+      }
+   }
+}
+
+static void
+hk_m5_note_push_template(struct hk_cmd_buffer *cmd,
+                         const struct vk_descriptor_update_template *template,
+                         const void *data)
+{
+   if (!agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+      return;
+
+   for (uint32_t i = 0; i < template->entry_count; ++i) {
+      const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      if (!hk_descriptor_type_has_image_view(entry->type))
+         continue;
+      for (uint32_t j = 0; j < entry->array_count; ++j) {
+         const VkDescriptorImageInfo *info =
+            (const void *)((const uint8_t *)data + entry->offset +
+                           j * entry->stride);
+         VK_FROM_HANDLE(hk_image_view, iview, info->imageView);
+         if (iview)
+            hk_m5_pass_merge_note_push(cmd, iview);
+      }
+   }
+}
+
 static void
 hk_push_descriptor_set(struct hk_cmd_buffer *cmd,
                        struct hk_descriptor_state *desc,
                        const VkPushDescriptorSetInfoKHR *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+
+   if (desc == &cmd->state.gfx.descriptors)
+      hk_m5_note_push_writes(cmd, info->descriptorWriteCount,
+                             info->pDescriptorWrites);
 
    struct hk_push_descriptor_set *push_set =
       hk_cmd_push_descriptors(cmd, desc, info->set);
@@ -1248,6 +1430,10 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
    struct hk_descriptor_set_layout *set_layout = vk_to_hk_descriptor_set_layout(
       pipeline_layout->set_layouts[pPushDescriptorSetWithTemplateInfo->set]);
 
+   if (desc == &cmd->state.gfx.descriptors)
+      hk_m5_note_push_template(cmd, template,
+                               pPushDescriptorSetWithTemplateInfo->pData);
+
    hk_push_descriptor_set_update_template(
       push_set, set_layout, template,
       pPushDescriptorSetWithTemplateInfo->pData);
@@ -1277,6 +1463,10 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
       dev->samplers.table.bo && dev->samplers.table.bo->va
          ? dev->samplers.table.bo->va->addr
          : 0;
+   root->physical_sparse_map = dev->physical_sparse_map
+      ? dev->physical_sparse_map->va->addr : 0;
+   root->physical_sparse_base = dev->dev.main_heap_base;
+   root->physical_sparse_size = dev->dev.main_heap_size;
 
    /* Dynamic buffers past the highest one ever bound are read by no bound
     * layout: copy the table around them. */
@@ -1429,6 +1619,19 @@ hk_reserve_scratch_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 static bool
 hk_g17p_basic_fragment_layout(struct hk_cmd_buffer *cmd)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct agx_tilebuffer_layout *tib = &cmd->state.gfx.render.tilebuffer;
+   if (agx_chip_g17_m5(dev->dev.chip) && tib->nr_samples > 1) {
+      return (tib->nr_samples == 2 || tib->nr_samples == 4 ||
+              tib->nr_samples == 8) &&
+             (tib->tile_size == 32 * 32 || tib->tile_size == 32 * 16 ||
+              tib->tile_size == 16 * 16) &&
+             tib->sample_size_B >= 8 && !(tib->sample_size_B & 7) &&
+             tib->sample_size_B <= tib->max_sample_size_B &&
+             tib->nr_samples * tib->tile_size <= tib->max_samples_per_tile &&
+             tib->sample_size_B * tib->nr_samples * tib->tile_size <=
+                tib->max_bytes_per_tile;
+   }
    return cmd->state.gfx.render.g17p_rt0_layout_supported;
 }
 
@@ -1526,8 +1729,16 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
           * generate_primitive_id. Admit it as a system coefficient beside
           * FragCoord Z and 1/W -- scalar, flat, and indexing no vertex
           * output. A VS-written gl_PrimitiveID would take the ordinary user
-          * word path instead and stays refused, having no witness. */
-         if (b->slot == VARYING_SLOT_PRIMITIVE_ID) {
+          * word path instead and stays refused, having no witness. A mesh
+          * shader's per-primitive gl_PrimitiveID is a flat user word of the
+          * primitive's private vertices (agx_m5_mesh_gather_varyings) and
+          * links like any other user word below. */
+         const bool mesh_primitive_id =
+            mesh && vs->info.stage == MESA_SHADER_MESH &&
+            b->slot == VARYING_SLOT_PRIMITIVE_ID &&
+            gfx->linked_varyings.slots[VARYING_SLOT_PRIMITIVE_ID] &&
+            b->count == 1 && b->offset == 0 && !b->smooth && !b->perspective;
+         if (b->slot == VARYING_SLOT_PRIMITIVE_ID && !mesh_primitive_id) {
             if (gfx->linked_varyings.slots[VARYING_SLOT_PRIMITIVE_ID] ||
                 b->count != 1 || b->offset != 0 || b->smooth || b->perspective)
                return false;
@@ -1571,7 +1782,8 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
             b->count == vs->info.uvs.components[AGX_MESH_PRIMITIVE_PAGE_SLOT] &&
             b->count >= 1 && b->count <= 2 &&
             b->offset == 0 && !b->smooth && !b->perspective;
-         const bool user_slot = primitive_page || (b->slot >= VARYING_SLOT_VAR0 &&
+         const bool user_slot = primitive_page || mesh_primitive_id ||
+                                (b->slot >= VARYING_SLOT_VAR0 &&
                                  b->slot <= VARYING_SLOT_VAR31) ||
                                 b->slot == VARYING_SLOT_LAYER ||
                                 b->slot == VARYING_SLOT_VIEWPORT || clip_slot ||
@@ -1834,10 +2046,12 @@ hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
  * (agx_shader_key::g17p_dma_static_set_mask), so its contents cannot change
  * before the launch runs. An unbound set reads as a null buffer. */
 static bool
-hk_g17p_dma_buffer(const struct hk_cmd_buffer *cmd, int set,
+hk_g17p_dma_buffer(const struct hk_cmd_buffer *cmd,
+                   VkPipelineBindPoint bind_point, int set,
                    unsigned descriptor_B, struct hk_buffer_address *buffer)
 {
-   const struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
+   const struct hk_descriptor_state *desc = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE
+      ? &cmd->state.cs.descriptors : &cmd->state.gfx.descriptors;
    const void *table;
    size_t table_B;
    if (set < 0) {
@@ -1862,6 +2076,140 @@ hk_g17p_dma_buffer(const struct hk_cmd_buffer *cmd, int set,
    if (descriptor_B + sizeof(*buffer) > table_B)
       return false;
    memcpy(buffer, (const uint8_t *)table + descriptor_B, sizeof(*buffer));
+   return true;
+}
+
+/* Native compute IOTO reads immutable addresses when the launch runs, as
+ * the original constant loads did. Buffer descriptors are eligible only for
+ * layouts whose contents cannot be updated after recording (compiler mask).
+ * Every dispatch resolves the currently bound compute descriptor state; no
+ * pointer-value cache or GPU prepass is introduced. */
+bool
+hk_m5_compute_uniform_dma_ranges(
+   struct hk_cmd_buffer *cmd, const struct hk_shader *s, uint64_t root_ptr,
+   struct agx3_ioto_uniform_range *ranges, size_t capacity, size_t *count)
+{
+   if (!cmd || !s || !ranges || !count || *count > capacity)
+      return false;
+   const unsigned root = s->info.agx3_root_uniform;
+   for (unsigned i = 0; i < s->b.info.agx3_uniform_dma_count; ++i) {
+      const struct agx3_uniform_dma_span *span = &s->b.info.agx3_uniform_dma[i];
+      const unsigned pointer = span->pointer;
+      const int set = pointer == root ? -1
+         : pointer >= root + 4 && (pointer - root - 4) % 4 == 0 &&
+           (pointer - root - 4) / 4 < HK_MAX_SETS
+            ? (int)(pointer - root - 4) / 4 : -2;
+      if (set == -2 || (span->dest & 1) || (span->halfs & 1) ||
+          (span->offset_B & 3) || *count >= capacity)
+         return false;
+      if (span->source == AGX3_UNIFORM_DMA_BUFFER) {
+         struct hk_buffer_address buffer;
+         if (!hk_g17p_dma_buffer(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, set,
+                                span->descriptor_B, &buffer))
+            return false;
+         const uint64_t size_B = (uint64_t)buffer.size & ~UINT64_C(3);
+         const unsigned covered = size_B > span->offset_B
+            ? MIN2(span->halfs, (size_B - span->offset_B) / 2) : 0;
+         if (covered) {
+            const uint64_t address = buffer.base_addr + span->offset_B;
+            if (address & 3)
+               return false;
+            ranges[(*count)++] = (struct agx3_ioto_uniform_range){
+               .start_halfs = span->dest, .size_halfs = covered,
+               .address = address,
+            };
+         }
+         if (covered < span->halfs) {
+            if (*count >= capacity)
+               return false;
+            ranges[(*count)++] = (struct agx3_ioto_uniform_range){
+               .start_halfs = span->dest + covered,
+               .size_halfs = span->halfs - covered,
+               .address = AGX_ZERO_PAGE_ADDRESS,
+            };
+         }
+      } else if (span->source == AGX3_UNIFORM_DMA_POINTER) {
+         const uint64_t base = set < 0 ? root_ptr
+            : cmd->state.cs.descriptors.root.sets[set];
+         if (set < 0 && !base)
+            return false;
+         const uint64_t address = base ? base + span->offset_B
+                                       : AGX_ZERO_PAGE_ADDRESS;
+         if (address & 3)
+            return false;
+         ranges[(*count)++] = (struct agx3_ioto_uniform_range){
+            .start_halfs = span->dest, .size_halfs = span->halfs,
+            .address = address,
+         };
+      } else {
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+hk_m5_graphics_query_uniforms(struct hk_cmd_buffer *cmd, bool vertex,
+                             struct agx3_ioto_uniform_range *range)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const uint64_t packed = UINT64_C(0x01140000600100e8);
+   struct agx_scs_layout_gen2 scs;
+   if (!dev->m5_native_rq || !dev->m5_rq_instances ||
+       !agx_scs_layout_gen2_init(packed, &scs) || !cmd->current_cs.gfx)
+      return false;
+   const uint64_t size = MAX2(UINT64_C(0x800000),
+      ALIGN_POT((uint64_t)scs.end[12], 0x4000));
+   struct agx_ptr state = hk_pool_alloc(cmd, size, 0x4000);
+   struct agx_ptr uniforms = hk_pool_alloc(cmd, 512, 16);
+   uint64_t table = hk_m5_upload_as_table(cmd);
+   if (!state.cpu || !uniforms.cpu || !table)
+      return false;
+   memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
+   if (size > 0x800000)
+      memset((uint8_t *)state.cpu + 0x800000, 0, size - 0x800000);
+   agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
+   memset(uniforms.cpu, 0, 512);
+   memcpy(uniforms.cpu, dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms));
+   uint64_t sizes = (uint64_t)scs.end[6] | ((uint64_t)scs.end[11] << 32);
+   uint64_t driver = scs.end[5];
+   memcpy((uint8_t *)uniforms.cpu + 48*2, &sizes, 8);
+   memcpy((uint8_t *)uniforms.cpu + 52*2, &packed, 8);
+   memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
+   uint64_t query_payload = UINT64_C(0x3fffffff00008000);
+   memcpy((uint8_t *)uniforms.cpu + 152*2, &query_payload, 8);
+   for (unsigned i = 0; i < 80; i += 2) {
+      uint64_t pointer;
+      memcpy(&pointer, (uint8_t *)uniforms.cpu + i*4, 8);
+      if (pointer >= UINT64_C(0x10000000000) && pointer < UINT64_C(0x10000800000)) {
+         pointer += state.gpu - UINT64_C(0x10000000000);
+         memcpy((uint8_t *)uniforms.cpu + i*4, &pointer, 8);
+      }
+   }
+   memcpy((uint8_t *)uniforms.cpu + 32*2, &table, 8);
+   uint32_t context[32] = {0, 0, (uint32_t)packed, (uint32_t)(packed >> 32)};
+   const uint32_t offsets[] = {0x18000,0x18200,0x18400,0x18500,0x18700,0x19b00};
+   for (unsigned i = 0; i < 6; ++i) {
+      uint64_t pointer = i == 4 ? table : state.gpu + offsets[i];
+      memcpy(context + 4 + 2*i, &pointer, 8);
+   }
+   context[20] = scs.end[5];
+   context[22] = scs.end[10] - scs.end[5];
+   const unsigned levels = (packed >> 16) & 0xff;
+   context[23] = (levels + (levels > 1)) * 8;
+   uint64_t extra = state.gpu + 0x80050;
+   memcpy(context + 26, &extra, 8);
+   extra = state.gpu + 0x18900;
+   memcpy(context + 30, &extra, 8);
+   uint64_t ctx = uniforms.gpu + 352;
+   memcpy((uint8_t *)uniforms.cpu + 352, context, sizeof(context));
+   memcpy((uint8_t *)uniforms.cpu + 320, &ctx, 8);
+   memcpy((uint8_t *)uniforms.cpu + 328, &table, 8);
+   *range = (struct agx3_ioto_uniform_range){0, 168, uniforms.gpu};
+   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_code);
+   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_ift);
+   if (vertex) cmd->current_cs.gfx->gen1_native_vertex_rq = true;
+   else cmd->current_cs.gfx->gen1_native_fragment_rq = true;
    return true;
 }
 
@@ -1890,8 +2238,9 @@ hk_g17p_graphics_uniform_ranges(
       if (linked->g17p_prolog_uses_root ||
           agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) ||
           hk_cmd_uses_blend_constant(cmd) ||
-          !hk_gen1_upload_fragment_query_state(
-             cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count]))
+          !(agx_chip_g17_m5(dev->dev.chip)
+             ? hk_m5_graphics_query_uniforms(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])
+             : hk_gen1_upload_fragment_query_state(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])))
          return hk_g17p_graphics_ranges_refused(range_count,count);
       count++;
    }
@@ -1960,9 +2309,10 @@ hk_g17p_graphics_uniform_ranges(
          };
       }
 
-   } else if (s->info.stage == MESA_SHADER_MESH) {
-      
-
+   } else if (s->info.stage == MESA_SHADER_MESH ||
+              s->info.stage == MESA_SHADER_TASK) {
+      /* Native TA mesh and object bodies have the same driver-root/descriptor
+       * ranges, without vertex attribute or base-instance ABI ranges. */
    } else if ((s->info.stage == MESA_SHADER_GEOMETRY ||
                s->info.stage == MESA_SHADER_TESS_EVAL) &&
               s->b.info.stage == MESA_SHADER_VERTEX) {
@@ -1996,7 +2346,8 @@ hk_g17p_graphics_uniform_ranges(
          sources[count] = HK_G17P_RANGE_SOURCE_ROOT;
          count++;
       }
-   } else if (s->info.stage != MESA_SHADER_MESH) {
+   } else if (s->info.stage != MESA_SHADER_MESH &&
+              s->info.stage != MESA_SHADER_TASK) {
       return hk_g17p_graphics_ranges_refused(range_count, count);
    }
 
@@ -2102,7 +2453,10 @@ hk_g17p_graphics_uniform_ranges(
 
    if (s->info.agx3_indexed_sampler_valid || native_spills) {
       if ((s->b.info.stage != MESA_SHADER_FRAGMENT &&
-           s->b.info.stage != MESA_SHADER_VERTEX) ||
+           s->b.info.stage != MESA_SHADER_VERTEX &&
+           !(agx_chip_g17_m5(dev->dev.chip) &&
+             (s->b.info.stage == MESA_SHADER_MESH ||
+              s->b.info.stage == MESA_SHADER_TASK))) ||
           !dev->sampled_images.base_va || !dev->samplers.table.bo ||
           !dev->rodata.indexed_heap_pointers)
          return hk_g17p_graphics_ranges_refused(range_count, count);
@@ -2174,7 +2528,8 @@ hk_g17p_graphics_uniform_ranges(
 
       if (span->source == AGX3_UNIFORM_DMA_BUFFER) {
          struct hk_buffer_address buffer;
-         if (!hk_g17p_dma_buffer(cmd, set, span->descriptor_B, &buffer))
+         if (!hk_g17p_dma_buffer(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, set,
+                                  span->descriptor_B, &buffer))
             return hk_g17p_graphics_ranges_refused(range_count, count);
 
          /* Dwords below the size rounded up to 4 bytes come from the buffer,
@@ -2561,7 +2916,7 @@ hk_g17p_launch_replay(struct hk_cmd_buffer *cmd,
          /* As hk_g17p_graphics_uniform_ranges(), for a buffer that still
           * covers the whole span; otherwise the span splits differently. */
          struct hk_buffer_address buffer;
-         if (!hk_g17p_dma_buffer(cmd,
+         if (!hk_g17p_dma_buffer(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                  launch->set[i] == HK_G17P_LAUNCH_ROOT_SET
                                     ? -1 : launch->set[i],
                                  launch->descriptor_B[i], &buffer) ||
@@ -2605,7 +2960,11 @@ hk_g17p_publish_gfx_loader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    const struct agx_tilebuffer_layout *tib = &cmd->state.gfx.render.tilebuffer;
    const struct agx_ioto_g17p_imageblock imageblock = {
       .sample_size_B = tib->sample_size_B,
-      .nr_samples = tib->nr_samples,
+      /* Empty M5 fragment programs use the single-sample loader form. */
+      .nr_samples = agx_chip_g17_m5(dev->dev.chip) &&
+                       s->info.stage == MESA_SHADER_FRAGMENT &&
+                       !tib->sample_size_B && !tib->nr_samples
+                       ? 1 : tib->nr_samples,
       .tile_size_px = tib->tile_size,
    };
 
@@ -2722,6 +3081,13 @@ hk_g17p_graphics_program_desc_init(
       },
    };
 
+   /* Attachmentless discard never resolves a raster sample count. Its inert
+    * fragment loader uses the native empty single-sample imageblock without
+    * changing the render state's deferred sample count. */
+   if (agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip) && fragment &&
+       desc->imageblock.nr_samples == 0 && desc->imageblock.sample_size_B == 0)
+      desc->imageblock.nr_samples = 1;
+
    if (s->b.info.has_preamble &&
        (!s->bo || !s->bo->va || s->code_size != s->b.info.binary_size ||
         !hk_agx3_g17p_constant_program_from_binary(
@@ -2749,16 +3115,26 @@ hk_g17p_graphics_program_desc_init(
 
 uint64_t
 hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
-                              struct hk_linked_shader *linked, bool object)
+                              struct hk_linked_shader *linked, bool object,
+                              bool task)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (dev->dev.chip != AGX_CHIP_G17P || !linked ||
-       !linked->b.g17p_compiler_d_valid ||
-       hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)
+   if (!linked ||
+       (dev->dev.chip == AGX_CHIP_G17P
+          ? (!linked->b.g17p_compiler_d_valid || hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)
+          : (dev->dev.chip != AGX_CHIP_G17S ||
+             !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
-   if (object) {
+   /* An API task shader is a compiled object program with the ordinary
+    * driver-root/descriptor ranges and its own threadgroup memory. */
+   const bool task_object = object && task && dev->dev.chip == AGX_CHIP_G17S &&
+                            s->info.stage == MESA_SHADER_TASK;
+   if (task_object) {
+      if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked, ranges, &count, NULL))
+         goto refused;
+   } else if (object) {
       const uint64_t grid = cmd->state.gfx.mesh.object_params ?: cmd->state.gfx.mesh.grid;
       if (!grid)
          goto refused;
@@ -2770,28 +3146,32 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                                                ranges, &count, NULL)) {
       goto refused;
    }
-
    struct agx3_g17p_graphics_program_desc d = {
-      .threadgroup_memory_size_B = object ? 0 : s->b.info.local_size,
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges, .uniform_range_count = count,
       .shader_binary_size = linked->b.size,
       .scratch_size = MAX2(linked->b.scratch_size,
-                           s->b.info.scratch_size),
+                           dev->dev.chip == AGX_CHIP_G17P
+                              ? s->b.info.scratch_size : linked->b.agx3_spectpr_scratch_size),
       .nr_gprs = linked->b.nr_gprs,
       .compiler_d_valid = linked->b.g17p_compiler_d_valid,
       .compiler_d = linked->b.g17p_compiler_d,
-
+      .threadgroup_memory_size_B = dev->dev.chip == AGX_CHIP_G17P && object
+                                    ? 0 : s->b.info.local_size,
    };
    size_t bound;
-   if (!agx3_g17p_graphics_program_bound(dev->dev.chip, ranges, count, &bound))
+   if (!(dev->dev.chip == AGX_CHIP_G17P
+          ? agx3_g17p_graphics_program_bound(dev->dev.chip, ranges, count, &bound)
+          : agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, count, &bound)))
       goto refused;
    struct agx_ptr allocation = hk_pool_usc_alloc(cmd, bound, 64);
    if (!allocation.cpu)
       return 0;
    d.program_va = allocation.gpu;
    struct agx3_g17p_graphics_program program;
-   if (!agx3_g17p_graphics_program_generate(dev->dev.chip, &d, &program))
+   if (!(dev->dev.chip == AGX_CHIP_G17P
+          ? agx3_g17p_graphics_program_generate(dev->dev.chip, &d, &program)
+          : agx3_g17g_mesh_program_generate(dev->dev.chip, &d, object, &program)))
       goto refused;
    memcpy(allocation.cpu, program.bytes, program.length);
    return allocation.gpu;
@@ -2802,10 +3182,109 @@ refused:
 }
 
 static uint64_t
+hk_m5_upload_graphics_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                              struct hk_linked_shader *linked)
+{
+   const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
+   struct hk_g17p_graphics_ioto_cache_entry *cached =
+      &cmd->state.gfx.g17p_ioto[stage];
+
+   /* As on HAL200: a launch recorded for the same program and draw state
+    * already passed admission, and replays the ranges the collector below
+    * would build, so the same loader publishes the same program. */
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct hk_shader *hw_vs =
+      gfx->shaders[MESA_SHADER_VERTEX] ? hk_bound_hw_vs(gfx) : NULL;
+   const uint8_t flags = hk_g17p_launch_flags(cmd, s);
+   struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, stage, linked);
+   if (!s->info.agx3_gen1_fragment_rq &&
+       hk_g17p_launch_matches(cmd, launch, s, linked, flags, hw_vs)) {
+      const uint64_t published =
+         hk_g17p_launch_replay(cmd, launch, linked, cached);
+      if (published)
+         return published;
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return 0;
+   }
+
+   if (!hk_g17p_basic_graphics_program_supported(cmd, s, linked))
+      goto refused;
+
+   struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint8_t sources[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   size_t count = 0;
+   if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked, ranges, &count,
+                                        sources))
+      goto refused;
+
+   /* Linked shader-owned loader templates use the same range shape and
+    * relocation plan as HAL200. Each recording publishes immutable bytes
+    * with its own addresses; executable lifetime follows the linked shader. */
+   const uint64_t program =
+      hk_g17p_publish_gfx_loader(cmd, s, linked, cached, ranges, count);
+   if (!program && !vk_command_buffer_has_error(&cmd->vk))
+      goto refused;
+   if (program)
+      hk_g17p_launch_record(cmd, launch, s, linked, cached->loader, flags,
+                            hw_vs, ranges, count, sources);
+   return program;
+
+refused:
+   mesa_loge_once("M5 graphics launch refused: stage=%u", (unsigned)s->info.stage);
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+   return 0;
+}
+
+static uint64_t
+hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                             struct hk_linked_shader *linked);
+
+uint64_t
+hk_m5_multi_draw_vertex_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                                struct hk_linked_shader *linked)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+   const struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+
+   /* No command was recorded between the records of one multi-draw, so
+    * every range the previous record's launch replay derived from the root,
+    * the descriptor sets and their buffers (hk_g17p_launch_replay()) is
+    * unchanged; only the draw-parameter and draw-index ranges follow the
+    * record. The previous record left that launch's loader and ranges as the
+    * stage's last publication. Anything else takes the general path. */
+   if (s->info.stage == MESA_SHADER_VERTEX && !s->info.agx3_gen1_fragment_rq &&
+       launch->valid && launch->s == s && launch->linked == linked &&
+       launch->loader && cached->loader == launch->loader &&
+       cached->loader_linked == linked && cached->loader_program &&
+       launch->flags == hk_g17p_launch_flags(cmd, s)) {
+      struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+      const unsigned count = launch->count;
+      memcpy(ranges, cached->loader_ranges, count * sizeof(ranges[0]));
+      for (unsigned i = 0; i < count; ++i) {
+         if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_PARAMS)
+            ranges[i].address = gfx->draw_params;
+         else if (launch->source[i] == HK_G17P_RANGE_SOURCE_DRAW_ID)
+            ranges[i].address = gfx->draw_id_ptr;
+      }
+
+      if (hk_g17p_patch_plan_fits(&launch->loader->plan, ranges)) {
+         return hk_g17p_gfx_loader_publish(cmd, linked, cached, launch->loader,
+                                           ranges, count);
+      }
+   }
+
+   return hk_upload_usc_words_internal(cmd, s, linked);
+}
+
+static uint64_t
 hk_upload_usc_words_internal(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                              struct hk_linked_shader *linked)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   if (agx_chip_g17_m5(dev->dev.chip))
+      return hk_m5_upload_graphics_program(cmd, s, linked);
 
    if (agx_native_graphics(&dev->dev)) {
       const unsigned stage = s->info.stage == MESA_SHADER_FRAGMENT ? 1 : 0;
@@ -3005,6 +3484,11 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       return;
    }
 
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      hk_dispatch_precomp_m5(cmd, grid, barrier, idx, data, data_size);
+      return;
+   }
+
    struct agx_precompiled_shader *prog = agx_get_precompiled(&dev->bg_eot, idx);
    if (!prog) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -3149,7 +3633,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       hk_drm_attachment_set_add(&cs->fragment_attachments, plane->addr, size);
    }
 
-   if (agx_native_graphics(&dev->dev)) {
+   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       /* The kext preserves a zero final VDM word when this selector is the
        * UINT32_MAX sentinel.  This reproduces m1n1's direct-triangle prefix. */
       cs->agx3_active_context_selector_valid = true;
@@ -3157,6 +3641,37 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
 
    cs->tib = render->tilebuffer;
+   /* Attachmentless rendering defers its API sample count. Publish the
+    * native one-sample no-imageblock profile in this control stream while
+    * preserving the deferred count in render state. */
+   if (agx_chip_g17_m5(dev->dev.chip) && !cs->tib.sample_size_B &&
+       !cs->tib.nr_samples && !render->color_att_count &&
+       !render->depth_att.iview && !render->stencil_att.iview)
+      cs->tib.nr_samples = 1;
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      const struct hk_bg_eot *programs[] = {
+         &render->cr.bg.main, &render->cr.bg.partial,
+         &render->cr.eot.main, &render->cr.eot.partial,
+      };
+      cs->tile_resources = (struct drm_asahi_render_program){
+         .stage = 1,
+         .imageblock_bytes = cs->tib.tile_size * cs->tib.sample_size_B *
+                             cs->tib.nr_samples,
+         .multisample_bytes = cs->tib.nr_samples == 2
+                                ? cs->tib.tile_size * cs->tib.sample_size_B / 4
+                                : cs->tib.nr_samples == 4
+                                     ? cs->tib.tile_size * cs->tib.sample_size_B
+                                     : cs->tib.nr_samples == 8
+                                          ? 4 * cs->tib.tile_size * cs->tib.sample_size_B
+                                          : 0,
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(programs); i++) {
+         cs->tile_resources.primary_bytes = MAX2(cs->tile_resources.primary_bytes,
+                                                  programs[i]->primary_storage_B);
+         cs->tile_resources.secondary_bytes = MAX2(cs->tile_resources.secondary_bytes,
+                                                    programs[i]->staging_storage_B);
+      }
+   }
 
    /* Assume this is not the first control stream of the render pass, so
     * initially use the partial background/EOT program and ZLS control.
@@ -3238,9 +3753,9 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       uint8_t records[2 * AGX_PPP_STATE_LENGTH];
       uint8_t *record = records;
       if (!depth_stencil_gpu || !gpu ||
-          !agx_ppp_emit_state(dev->dev.chip, &record, depth_stencil_gpu,
+          !hk_ppp_emit_state(dev->dev.chip, &record, depth_stencil_gpu,
                               depth_stencil.length) ||
-          !agx_ppp_emit_state(dev->dev.chip, &record, gpu, initial.length) ||
+          !hk_ppp_emit_state(dev->dev.chip, &record, gpu, initial.length) ||
           record != records + sizeof(records)) {
          mesa_loge("failed to emit HAL300 initial PPP state for %s",
                    agx_chip_name(dev->dev.chip));
@@ -3284,7 +3799,7 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       }
 
       memcpy(T.cpu, initial.bytes, initial.length);
-      if (!agx_ppp_emit_state(dev->dev.chip, &map, T.gpu, initial.length)) {
+      if (!hk_ppp_emit_state(dev->dev.chip, &map, T.gpu, initial.length)) {
          mesa_loge("failed to emit G17P initial PPP state for %s",
                    agx_chip_name(dev->dev.chip));
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -3431,10 +3946,11 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    /* An empty final stream of a pass with earlier draws is not an empty
     * render. Replacing it with the load-op clears would erase those draws. */
    const bool continuation = cmd->sync.pass_vdm != cs;
-   if (continuation && !agx_native_graphics(&dev->dev))
+   if (continuation && !agx_native_graphics(&dev->dev) &&
+       !agx_chip_g17_m5(dev->dev.chip))
       return false;
 
-   /* Two reasons to keep the graphics representation on G17P rather than
+   /* Two reasons to keep the graphics representation on AGX3 rather than
     * replace it with the image clears below.
     *
     * The first is capability: G17P has native BG/EOT programs for the
@@ -3458,18 +3974,20 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * common finalizer will append the native VDM terminator without uploading
     * any ordinary vertex or fragment program.
     */
-   const bool g17p_output_only_through_eot =
-      agx_native_graphics(&dev->dev) && render->g17p_direct_color_resolve;
+   const bool native_eot = agx_native_graphics(&dev->dev) ||
+                           agx_chip_g17_m5(dev->dev.chip);
+   const bool output_only_through_eot =
+      native_eot && render->g17p_direct_color_resolve;
 
    /* A timestamp rides on this exact command; replacing the render with
     * image clears would drop it. Keep the render. */
    if (cs->timestamp.start.handle || cs->timestamp.end.handle)
       return false;
 
-   if (agx_native_graphics(&dev->dev) &&
+   if (native_eot &&
        (continuation ||
         (cs->cr.process_empty_tiles &&
-         (g17p_output_only_through_eot ||
+         (output_only_through_eot ||
           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
@@ -3535,4 +4053,371 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
    list_del(&cs->node);
    hk_cs_destroy(cs);
    return true;
+}
+
+/*
+ * Deferred whole-image clears (M5).
+ *
+ * A vkCmdClearColorImage or vkCmdClearDepthStencilImage of a whole
+ * single-level, single-layer attachment image is a compute job: a fill of
+ * the entire allocation for a plain image, a metadata fast clear for a
+ * compressed one. Applications commonly clear an image this way and
+ * then begin a full-area render pass that loads it, which reads the whole
+ * image back into the tilebuffer. Minecraft clears six 2976x1872 images
+ * per frame like that: 138 MB of fills, then the loads.
+ *
+ * Instead such a clear is remembered. When the next render pass covers the
+ * whole image with it as an attachment that it loads (or does not care
+ * about) and stores (or does not care about), the attachment's load
+ * becomes a load-op clear of the same value: the tilebuffer starts with the
+ * clear value and the pass stores the image, which is what the fill
+ * followed by the load and the store produces. Anything else records the
+ * fill first: any other work, through hk_cmd_buffer_get_cs_general(); a
+ * render pass that does not take the clear; the end of the command buffer;
+ * and the commands below that order or observe earlier work without
+ * recording any. A pass that may also read the image's memory takes the
+ * load-op clear and records the fill as well, before the pass
+ * (hk_deferred_clear_layout_use()). The fill is then recorded after the
+ * barriers that followed the clear, so it is followed by a transfer-to-all
+ * barrier of its own: later work still waits for it.
+ */
+static bool
+hk_deferred_clear_image_whole(const struct hk_image *image,
+                              uint32_t range_count,
+                              const VkImageSubresourceRange *ranges,
+                              VkImageAspectFlags aspects)
+{
+   if (range_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
+       image->vk.extent.depth != 1 || image->vk.samples != 1 ||
+       image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
+       ranges[0].aspectMask != aspects || ranges[0].baseMipLevel != 0 ||
+       vk_image_subresource_level_count(&image->vk, &ranges[0]) != 1 ||
+       ranges[0].baseArrayLayer != 0 ||
+       vk_image_subresource_layer_count(&image->vk, &ranges[0]) != 1)
+      return false;
+
+   return true;
+}
+
+bool
+hk_defer_clear(struct hk_cmd_buffer *cmd, struct hk_image *image,
+               VkImageAspectFlags aspects, const VkClearValue *value,
+               uint32_t range_count, const VkImageSubresourceRange *ranges)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+   const VkImageUsageFlags attachment =
+      aspects == VK_IMAGE_ASPECT_COLOR_BIT
+         ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+         : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+
+   if (!agx_chip_g17_m5(dev->dev.chip) || cmd->in_meta ||
+       cmd->vk.pool->queue_family_index >= pdev->queue_family_count ||
+       !(pdev->queue_families[cmd->vk.pool->queue_family_index].queue_flags &
+         VK_QUEUE_GRAPHICS_BIT) ||
+       !(image->vk.usage & attachment) ||
+       aspects != (image->vk.aspects &
+                   (aspects == VK_IMAGE_ASPECT_COLOR_BIT
+                       ? VK_IMAGE_ASPECT_COLOR_BIT
+                       : (VK_IMAGE_ASPECT_DEPTH_BIT |
+                          VK_IMAGE_ASPECT_STENCIL_BIT))) ||
+       !hk_deferred_clear_image_whole(image, range_count, ranges, aspects))
+      return false;
+
+   /* The deferred clear overwrites the whole image, whether it becomes a
+    * load-op clear or a fill: a pending store of it is dead. */
+   if (cmd->state.pending_z_store.cs &&
+       cmd->state.pending_z_store.image == image &&
+       (aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+      hk_kill_pending_z_store(cmd);
+
+   /* A later clear of the same image replaces the earlier one. */
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      if (e->image == image) {
+         e->aspects = aspects;
+         e->value = *value;
+         return true;
+      }
+   }
+
+   if (cmd->state.deferred_clear_count == HK_MAX_DEFERRED_CLEARS)
+      hk_flush_deferred_clears(cmd);
+
+   cmd->state.deferred_clear[cmd->state.deferred_clear_count++] =
+      (struct hk_deferred_clear){
+         .image = image,
+         .aspects = aspects,
+         .value = *value,
+      };
+   return true;
+}
+
+/* A buffer command (copy, fill, update) cannot access an image except
+ * through memory the two share. Keep the deferred clears across one whose
+ * buffer ranges miss every image they clear; call it for each range of the
+ * command before recording it, and clear deferred_clear_hold after. */
+void
+hk_deferred_clears_hold_buffer(struct hk_cmd_buffer *cmd, uint64_t addr,
+                               uint64_t size)
+{
+   /* The same holds for the depth image of a pending store. */
+   const struct hk_image *z_image = cmd->state.pending_z_store.cs
+                                       ? cmd->state.pending_z_store.image
+                                       : NULL;
+   if (z_image) {
+      for (unsigned p = 0; p < z_image->plane_count; ++p) {
+         const uint64_t base = z_image->planes[p].addr;
+         const uint64_t end = base + z_image->planes[p].layout.size_B;
+         if (!base || (addr < end && base < addr + size)) {
+            cmd->state.pending_z_store.cs = NULL;
+            break;
+         }
+      }
+   }
+
+   if (!cmd->state.deferred_clear_count) {
+      if (cmd->state.pending_z_store.cs)
+         cmd->state.deferred_clear_hold = true;
+      return;
+   }
+
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      const struct hk_image *image = cmd->state.deferred_clear[i].image;
+      for (unsigned p = 0; p < image->plane_count; ++p) {
+         const uint64_t base = image->planes[p].addr;
+         const uint64_t end = base + image->planes[p].layout.size_B;
+         if (!base || (addr < end && base < addr + size)) {
+            hk_flush_deferred_clears(cmd);
+            return;
+         }
+      }
+   }
+   cmd->state.deferred_clear_hold = true;
+}
+
+void
+hk_flush_deferred_clears(struct hk_cmd_buffer *cmd)
+{
+   /* Whatever observes the deferred clears may also read a pending store. */
+   cmd->state.pending_z_store.cs = NULL;
+   cmd->state.deferred_clear_hold = false;
+   if (!cmd->state.deferred_clear_count || cmd->state.deferred_clear_flushing)
+      return;
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   cmd->state.deferred_clear_flushing = true;
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      const struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      const VkImageSubresourceRange range = {
+         .aspectMask = e->aspects,
+         .levelCount = 1,
+         .layerCount = 1,
+      };
+      uint32_t colour[4];
+      if (e->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
+         memcpy(colour, e->value.color.uint32, sizeof(colour));
+      } else {
+         colour[0] = fui(e->value.depthStencil.depth);
+         colour[1] = e->value.depthStencil.stencil;
+         colour[2] = colour[3] = 0;
+      }
+
+      hk_sync_xfer_begin(cmd);
+      hk_clear_image(cmd, e->image, PIPE_FORMAT_NONE, colour, &range, true);
+      hk_sync_xfer_end(cmd);
+   }
+   cmd->state.deferred_clear_count = 0;
+
+   /* The barriers that followed the clears were recorded before the fills;
+    * order everything recorded from now on after them, as
+    * hk_CmdPipelineBarrier2() does outside a render pass. */
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (cs && cs->stats.cmds > 0 && cs->current != cs->strong_flush_end) {
+      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+      hk_cdm_cache_flush(dev, cs);
+   }
+   hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
+   cmd->state.deferred_clear_flushing = false;
+}
+
+/* How a pass may use a deferred clear for an attachment of the given aspect
+ * in this layout. A load-op clear lands in the tilebuffer, not in memory.
+ *
+ * In an attachment layout the pass can access the image only as that
+ * attachment, so the load-op clear replaces the fill. In GENERAL, a
+ * feedback-loop or the local-read layout the pass may also read the image's
+ * memory, as a sampled or storage image, an input attachment (lowered to a
+ * texture load) or through local read; it still takes the load-op clear in
+ * place of the load, but the fill is recorded before the pass. Every layout
+ * is GENERAL under unified image layouts, which zink uses. A read-only
+ * aspect takes nothing: the clear is recorded as a fill. */
+enum hk_deferred_clear_use {
+   HK_DEFERRED_CLEAR_UNUSED,
+   HK_DEFERRED_CLEAR_LOAD,
+   HK_DEFERRED_CLEAR_LOAD_AND_FILL,
+};
+
+static enum hk_deferred_clear_use
+hk_deferred_clear_layout_use(VkImageLayout layout, VkImageAspectFlags aspect)
+{
+   bool attachment;
+   switch (layout) {
+   case VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL:
+      attachment = true;
+      break;
+   case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+      attachment = aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+      break;
+   case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+      attachment = aspect != VK_IMAGE_ASPECT_COLOR_BIT;
+      break;
+   case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL:
+      attachment = aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+      break;
+   case VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL:
+      attachment = aspect == VK_IMAGE_ASPECT_STENCIL_BIT;
+      break;
+   case VK_IMAGE_LAYOUT_GENERAL:
+   case VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT:
+   case VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR:
+      return HK_DEFERRED_CLEAR_LOAD_AND_FILL;
+   default:
+      return HK_DEFERRED_CLEAR_UNUSED;
+   }
+   return attachment ? HK_DEFERRED_CLEAR_LOAD : HK_DEFERRED_CLEAR_UNUSED;
+}
+
+/* The deferred clear of the image an attachment views, if the attachment can
+ * take it as its load-op clear (see above); *fill is set when the clear must
+ * also be recorded as a fill before the pass. */
+static struct hk_deferred_clear *
+hk_deferred_clear_for(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                      const VkRenderingAttachmentInfo *att,
+                      VkImageAspectFlags aspect, bool *fill)
+{
+   if (!att || !att->imageView)
+      return NULL;
+
+   enum hk_deferred_clear_use use =
+      hk_deferred_clear_layout_use(att->imageLayout, aspect);
+   if (use == HK_DEFERRED_CLEAR_UNUSED)
+      return NULL;
+
+   /* An input-attachment feedback flag reads the attachment in the pass. */
+   const VkRenderingAttachmentFlagsInfoKHR *flags =
+      vk_find_struct_const(att->pNext, RENDERING_ATTACHMENT_FLAGS_INFO_KHR);
+   if (flags && flags->flags)
+      use = HK_DEFERRED_CLEAR_LOAD_AND_FILL;
+
+   VK_FROM_HANDLE(hk_image_view, view, att->imageView);
+   struct hk_image *image = container_of(view->vk.image, struct hk_image, vk);
+   struct hk_deferred_clear *e = NULL;
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      if (cmd->state.deferred_clear[i].image == image)
+         e = &cmd->state.deferred_clear[i];
+   }
+
+   if (!e || !(e->aspects & aspect) ||
+       (att->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD &&
+        att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE) ||
+       (att->storeOp != VK_ATTACHMENT_STORE_OP_STORE &&
+        att->storeOp != VK_ATTACHMENT_STORE_OP_DONT_CARE) ||
+       view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D ||
+       view->vk.format != image->vk.format ||
+       view->vk.base_mip_level != 0 || view->vk.level_count != 1 ||
+       view->vk.base_array_layer != 0 || view->vk.layer_count != 1 ||
+       info->renderArea.offset.x != 0 || info->renderArea.offset.y != 0 ||
+       info->renderArea.extent.width != image->vk.extent.width ||
+       info->renderArea.extent.height != image->vk.extent.height)
+      return NULL;
+
+   *fill = use == HK_DEFERRED_CLEAR_LOAD_AND_FILL;
+   return e;
+}
+
+const VkRenderingInfo *
+hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
+                        VkRenderingInfo *copy,
+                        VkRenderingAttachmentInfo *color,
+                        VkRenderingAttachmentInfo *depth,
+                        VkRenderingAttachmentInfo *stencil)
+{
+   if (cmd->in_meta || (info->flags & VK_RENDERING_RESUMING_BIT) ||
+       info->viewMask || info->layerCount != 1 ||
+       info->colorAttachmentCount > HK_MAX_RTS)
+      return info;
+
+   struct hk_deferred_clear *col[HK_MAX_RTS] = {NULL};
+   bool col_fill[HK_MAX_RTS] = {false}, z_fill = false, s_fill = false;
+   for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
+      col[i] = hk_deferred_clear_for(cmd, info, &info->pColorAttachments[i],
+                                     VK_IMAGE_ASPECT_COLOR_BIT, &col_fill[i]);
+   }
+   struct hk_deferred_clear *z = hk_deferred_clear_for(
+      cmd, info, info->pDepthAttachment, VK_IMAGE_ASPECT_DEPTH_BIT, &z_fill);
+   struct hk_deferred_clear *s = hk_deferred_clear_for(
+      cmd, info, info->pStencilAttachment, VK_IMAGE_ASPECT_STENCIL_BIT,
+      &s_fill);
+
+   /* A depth/stencil clear is taken only if every aspect it cleared is. */
+   struct hk_deferred_clear *zs[2] = {z, s};
+   for (unsigned i = 0; i < 2; ++i) {
+      struct hk_deferred_clear *e = zs[i];
+      if (e && (((e->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) && z != e) ||
+                ((e->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) && s != e))) {
+         if (z == e)
+            z = NULL;
+         if (s == e)
+            s = NULL;
+      }
+   }
+
+   bool any = z || s;
+   for (unsigned i = 0; i < info->colorAttachmentCount; ++i)
+      any |= col[i] != NULL;
+   if (!any)
+      return info;
+
+   *copy = *info;
+   for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
+      color[i] = info->pColorAttachments[i];
+      if (col[i]) {
+         color[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         color[i].clearValue = col[i]->value;
+      }
+   }
+   copy->pColorAttachments = color;
+   if (z) {
+      *depth = *info->pDepthAttachment;
+      depth->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      depth->clearValue = z->value;
+      copy->pDepthAttachment = depth;
+   }
+   if (s) {
+      *stencil = *info->pStencilAttachment;
+      stencil->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+      stencil->clearValue = s->value;
+      copy->pStencilAttachment = stencil;
+   }
+
+   /* Drop the taken clears that need no fill; the caller records the rest
+    * before the pass. */
+   unsigned kept = 0;
+   for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
+      struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
+      bool taken = e == z || e == s;
+      bool fill = (e == z && z_fill) || (e == s && s_fill);
+      for (unsigned j = 0; j < info->colorAttachmentCount; ++j) {
+         taken |= e == col[j];
+         fill |= e == col[j] && col_fill[j];
+      }
+      if (!taken || fill)
+         cmd->state.deferred_clear[kept++] = *e;
+   }
+   cmd->state.deferred_clear_count = kept;
+   return copy;
 }

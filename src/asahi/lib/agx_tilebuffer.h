@@ -53,7 +53,10 @@ struct agx_tilebuffer_layout {
    uint8_t nr_samples;
 
    /* If layered rendering is used */
-   bool layered;
+   bool layered : 1;
+
+   /* Native imageblock state replaces the AGX2 USC shared record. */
+   bool native_imageblock : 1;
 
    /* Most bytes a sample may hold before render targets spill, or zero for
     * the 64-byte AGX2 bound. The tile size bounds it separately. */
@@ -61,7 +64,7 @@ struct agx_tilebuffer_layout {
 
    /* Independent storage and raster-sample budgets. Zero retains the legacy
     * byte capacity or imposes no additional sample budget, respectively. */
-   uint16_t max_bytes_per_tile;
+   uint32_t max_bytes_per_tile;
    uint16_t max_samples_per_tile;
 
    /* Selected tile size in pixels. Either 32*32, 32*16, or 16*16. */
@@ -118,8 +121,15 @@ struct agx_tilebuffer_layout
 agx_build_tilebuffer_layout_with_limits(const enum pipe_format *formats,
                                       uint8_t nr_cbufs, uint8_t nr_samples,
                                       bool layered, uint8_t max_sample_size_B,
-                                      uint16_t max_bytes_per_tile,
+                                      uint32_t max_bytes_per_tile,
                                       uint16_t max_samples_per_tile);
+
+/* Native imageblock strides are not limited by the AGX2 USC bitfield. */
+struct agx_tilebuffer_layout
+agx_build_tilebuffer_layout_for_imageblock(
+   const enum pipe_format *formats, uint8_t nr_cbufs, uint8_t nr_samples,
+   bool layered, uint8_t max_sample_size_B, uint32_t max_bytes_per_tile,
+   uint16_t max_samples_per_tile);
 
 /* Compact attachment slots for internal programs without moving tile data.
  * map[dense slot] identifies the original logical attachment. */
@@ -138,9 +148,15 @@ bool agx_nir_lower_tilebuffer(struct nir_shader *shader,
                               bool lower_g17p_formats);
 
 bool agx_nir_lower_to_per_sample(struct nir_shader *shader);
+bool agx_nir_apply_api_mask_to_force_early(struct nir_shader *shader,
+                                          enum agx_chip chip);
 
 bool agx_nir_lower_monolithic_msaa(struct nir_shader *shader,
                                    uint8_t nr_samples);
+bool agx_nir_lower_monolithic_msaa_m5(struct nir_shader *shader,
+                                      uint8_t nr_samples);
+bool agx_nir_lower_m5_zs_sample_loop(struct nir_shader *shader,
+                                     unsigned nr_samples);
 
 /* Export registers of one sample's colours in a G17P fragment unrolled per
  * sample: eight halves for each location up to the last one written. */
@@ -250,6 +266,7 @@ agx_g17p_sample_exports_end(const struct agx_g17p_colour_layout *l,
    return agx_g17p_sample_zs_base_layout(l, nr_samples, nr_samples);
 }
 
+void agx_nir_lower_sample_exports_to_end(struct nir_shader *shader);
 bool agx_nir_needs_sample_count(const struct nir_shader *shader);
 bool agx_nir_specialize_sample_count(struct nir_shader *shader, unsigned samples);
 bool agx_nir_unroll_g17p_samples(struct nir_shader *shader,
@@ -262,6 +279,9 @@ bool agx_nir_hoist_g17p_zs_writes(struct nir_shader *shader);
 
 bool agx_nir_lower_sample_intrinsics(struct nir_shader *shader,
                                      bool ignore_sample_mask_without_msaa);
+
+bool agx_nir_lower_sample_intrinsics_wide(struct nir_shader *shader,
+                                          bool ignore_sample_mask_without_msaa);
 
 uint32_t agx_tilebuffer_total_size(struct agx_tilebuffer_layout *tib);
 

@@ -194,3 +194,133 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    return hk_g17p_compression_depth_format(info->format) &&
           info->mipLevels == 1;
 }
+
+/* M5 lossless compression of colour render targets.
+ *
+ * The Gen10 compressed PBE (write) packet and texture (read) descriptor are
+ * native-verified for GPU-tiled one-layer 2D images (byte-identical to
+ * the native M5 PBE and texture descriptor encoders), and the allocation is
+ * the measured M5 layout with its metadata (AIL_LAYOUT_POLICY_M5). Every
+ * write of such an image then goes through the PBE: end-of-tile stores,
+ * and the graphics meta paths hk_xfer_copyimage2() and the buffer uploads
+ * take for a compressed destination (the raw tiled copiers refuse one).
+ *
+ * Admitted: the G17P colour formats (1-8 byte texels, so a single-sample
+ * tilebuffer never spills a compressed target), one layer, any mip count
+ * (one level for one-byte texels, see hk_m5_compression_one_byte()),
+ * one sample, a colour attachment, and otherwise only sampled,
+ * input-attachment and transfer usages. Shared images (external memory,
+ * WSI) stay plain.
+ *
+ * Every level of a compressed mip chain is described by the level-0 surface
+ * and metadata addresses plus the level fields, in the PBE (StateFields) and
+ * texture (tpuState) packets alike, as native does; the hardware finds the
+ * level, so AIL_LAYOUT_POLICY_M5's per-level metadata placement must be the
+ * hardware's.
+ */
+/* One-byte texels. The M5 hardware places a compressed level after a 32x32
+ * one-byte level 2 KiB on, where AIL_LAYOUT_POLICY_M5 puts it 1 KiB on: the
+ * end-of-tile store and texture reads use the hardware's offset, AIL-addressed
+ * writes (fast clears, copies) the other. Two- to eight-byte texels agree with
+ * the hardware at every level tested (64x64 to 2976x1872, odd sizes). */
+static inline bool
+hk_m5_compression_one_byte(VkFormat format)
+{
+   return format == VK_FORMAT_R8_UNORM || format == VK_FORMAT_R8_SNORM ||
+          format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_SINT;
+}
+
+static inline bool
+hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
+                                 const VkImageCreateInfo *info)
+{
+   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+      return false;
+
+   for (const void *next = info->pNext; next;) {
+      VkBaseInStructure ext;
+      memcpy(&ext, next, sizeof(ext));
+      if (ext.sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
+         return false;
+      if (ext.sType == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+         return false;
+      next = ext.pNext;
+   }
+
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+
+   return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
+          info->arrayLayers == 1 &&
+          (info->mipLevels == 1 || !hk_m5_compression_one_byte(info->format)) &&
+          info->samples == VK_SAMPLE_COUNT_1_BIT &&
+          info->tiling == VK_IMAGE_TILING_OPTIMAL &&
+          !(info->flags & ~allowed_flags) &&
+          (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+          !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
+          info->extent.height >= 16 &&
+          hk_g17p_compression_color_format(info->format);
+}
+
+/* M5 lossless compression of depth attachments.
+ *
+ * The native HAL300 framebuffer setup sets ZLS control bits 2 and
+ * 6 exactly when the attached depth level has compression metadata, bits 4
+ * and 8 for stencil metadata and bit 26 for Depth16Unorm, and programs the
+ * metadata address and its cache-line layer stride beside the surface: the
+ * encoding agx_pack_zls_control() and hk's render setup already produce.
+ * Depth is read through the same Gen10 texture descriptor as colour, and the
+ * copy paths write it through its R16/R32_UINT colour alias with the
+ * compressed PBE.
+ *
+ * Admitted: D16_UNORM, D32_SFLOAT and the depth plane of
+ * D32_SFLOAT_S8_UINT (stencil stays plain), one layer, one mip, one sample,
+ * a depth attachment, and otherwise only sampled, input-attachment,
+ * feedback-loop and transfer usages. Zink marks its depth attachments
+ * sample-location compatible and feedback-loop capable, which changes
+ * neither. Shared images (external memory, WSI) stay plain.
+ */
+static inline bool
+hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
+                                 const VkImageCreateInfo *info)
+{
+   if (!agx_chip_g17_m5(chip) || plane != 0 || !info)
+      return false;
+
+   for (const void *next = info->pNext; next;) {
+      VkBaseInStructure ext;
+      memcpy(&ext, next, sizeof(ext));
+      if (ext.sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO &&
+          ((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
+         return false;
+      if (ext.sType == HK_G17P_WSI_IMAGE_CREATE_INFO_MESA)
+         return false;
+      next = ext.pNext;
+   }
+
+   const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+      VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+   const VkImageUsageFlags allowed_usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+
+   return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
+          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          info->samples == VK_SAMPLE_COUNT_1_BIT &&
+          info->tiling == VK_IMAGE_TILING_OPTIMAL &&
+          !(info->flags & ~allowed_flags) &&
+          (info->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+          !(info->usage & ~allowed_usage) && info->extent.width >= 16 &&
+          info->extent.height >= 16 &&
+          hk_g17p_compression_depth_format(info->format);
+}

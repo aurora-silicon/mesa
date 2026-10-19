@@ -53,14 +53,25 @@ struct hk_ray_tracing_pipeline {
    struct hk_rt_stage_nir **stages;
    struct hk_ray_tracing_group *groups;
 
-   /* The compiled megakernel.  NULL for a pipeline library, which is never
-    * executable. */
-   struct hk_api_shader *shader;
+   /*
+    * One compute kernel per ray-generation group.  Each kernel inlines only
+    * its own raygen plus every hit/miss/intersection/callable stage reachable
+    * through the shader binding table; vkCmdTraceRays selects the kernel on the
+    * GPU from the raygen record's group handle (hk_cmd_trace_rays.c), because
+    * the record's contents are only required to be valid at execution time.
+    * Empty for a pipeline library, which is never executable.
+    */
+   uint32_t kernel_count;
+   struct hk_rt_kernel {
+      struct hk_api_shader *shader;
+      /* The hk_ray_tracing_group_handle::index this kernel's raygen answers to. */
+      uint32_t raygen_handle_index;
+   } *kernels;
 
-   /* What the megakernel reserves above its own frame, reported through
-    * vkGetRayTracingShaderGroupStackSizeKHR and used by nothing else: the
-    * stack is static scratch inside the compiled binary, so the dynamic
-    * stack-size state cannot change it. */
+   /* What the kernels reserve above their own frame (maximum over kernels),
+    * reported through vkGetRayTracingShaderGroupStackSizeKHR and used by
+    * nothing else: the stack is static scratch inside each compiled binary,
+    * so the dynamic stack-size state cannot change it. */
    struct hk_rt_stack_sizes stack_sizes;
    uint32_t stack_size;
 };

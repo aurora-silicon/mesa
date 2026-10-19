@@ -298,6 +298,29 @@ enum drm_asahi_feature {
 	 */
 	DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS = (1UL) << 14,
 	DRM_ASAHI_FEATURE_RENDER_RAY_QUERY = (1UL) << 15,
+
+	/*
+	 * Bits 16 and up are reported only by the M5 (G17G/G17S) runtime. They
+	 * follow the merged numbering above, so one userspace reads every
+	 * kernel's features the same way.
+	 */
+
+	/** @DRM_ASAHI_FEATURE_COMPUTE_RESOURCES: Per-dispatch storage declarations. */
+	DRM_ASAHI_FEATURE_COMPUTE_RESOURCES = (1UL) << 16,
+	/** @DRM_ASAHI_FEATURE_RENDER_RESOURCES: Per-program render storage declarations. */
+	DRM_ASAHI_FEATURE_RENDER_RESOURCES = (1UL) << 17,
+	/** @DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2: Versioned SCS and mesh storage. */
+	DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2 = (1UL) << 18,
+	/** @DRM_ASAHI_FEATURE_SPARSE_TILES: DRM_ASAHI_BIND_SPARSE_TILE accepted. */
+	DRM_ASAHI_FEATURE_SPARSE_TILES = (1UL) << 19,
+	/** @DRM_ASAHI_FEATURE_COMPUTE_MATRIX: Native compute matrix instructions. */
+	DRM_ASAHI_FEATURE_COMPUTE_MATRIX = (1UL) << 20,
+	/* Render programs accept DRM_ASAHI_RENDER_PROGRAM_TASK; task kicks get the
+	 * TA mesh rendering buffer that backs the object payload address. */
+	DRM_ASAHI_FEATURE_TASK_MESH_STORAGE = (1UL) << 21,
+
+	/** @DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: Per-render external shader writes. */
+	DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES = (1UL) << 22,
 };
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
@@ -540,6 +563,15 @@ enum drm_asahi_bind_flags {
 	 * It is intended as a mechanism to accelerate sparse.
 	 */
 	DRM_ASAHI_BIND_SINGLE_PAGE = (1L << 3),
+
+	/**
+	 * @DRM_ASAHI_BIND_SPARSE_TILE: With DRM_ASAHI_BIND_SINGLE_PAGE, fill
+	 * the range from kernel-owned, physically contiguous tiles instead of
+	 * repeating the BO's first page: read-only binds read zeroes, writable
+	 * binds target a sink; both tile pools are private to the VM. The BO
+	 * only anchors the mapping. Requires DRM_ASAHI_FEATURE_SPARSE_TILES.
+	 */
+	DRM_ASAHI_BIND_SPARSE_TILE = (1L << 4),
 };
 
 /**
@@ -701,6 +733,18 @@ enum drm_asahi_cmd_type {
 	 * Followed by (possibly multiple) @drm_asahi_attachment payloads.
 	 */
 	DRM_ASAHI_SET_COMPUTE_ATTACHMENTS = 4,
+	/**
+	 * @DRM_ASAHI_SET_RENDER_RESOURCES: Replace linked render program storage.
+	 * Followed by zero or more drm_asahi_render_program entries. This software
+	 * command has no barriers and does not advance either command index.
+	 */
+	DRM_ASAHI_SET_RENDER_RESOURCES = 5,
+
+	/** @DRM_ASAHI_SET_COMPUTE_RESOURCES: Replace compute storage declarations. */
+	DRM_ASAHI_SET_COMPUTE_RESOURCES = 6,
+	/** Replace the render list with drm_asahi_render_program_v2 entries. */
+	DRM_ASAHI_SET_RENDER_RESOURCES_V2 = 7,
+
 };
 
 /**
@@ -812,6 +856,89 @@ struct drm_asahi_sync {
  * should not wait on any previous work.
  */
 #define DRM_ASAHI_BARRIER_NONE (0xFFFFu)
+
+/**
+ * struct drm_asahi_compute_program - Storage of one linked compute dispatch.
+ *
+ * SET_COMPUTE_RESOURCES replaces the list for subsequent compute commands.
+ * Include each distinct dispatch profile in the command stream. The kernel
+ * combines their requirements before publishing work. All sizes are bytes.
+ */
+struct drm_asahi_compute_program {
+	/** @primary_bytes: Per-thread primary storage. */
+	__u32 primary_bytes;
+	/** @secondary_bytes: Per-thread secondary storage. */
+	__u32 secondary_bytes;
+	/** @linked_bytes: Additional primary storage after linking. */
+	__u32 linked_bytes;
+	/** @minimum_primary_bytes: Minimum primary storage across variants. */
+	__u32 minimum_primary_bytes;
+	/** @threadgroup_bytes: Storage shared by a workgroup. */
+	__u32 threadgroup_bytes;
+	/** @threads: Number of invocations in a workgroup. */
+	__u32 threads;
+	/** @flags: Reserved; must be zero. */
+	__u32 flags;
+};
+
+/**
+ * struct drm_asahi_render_program - Storage of one linked render program.
+ *
+ * SET_RENDER_RESOURCES replaces the list for subsequent renders in this submit.
+ * Include every vertex and fragment program, including background and end-of-tile
+ * programs. Sizes describe the final linked program, in bytes. Each entry is
+ * evaluated separately before taking the maximum demand across the pass.
+ */
+struct drm_asahi_render_program {
+	/** @stage: 0 for vertex, 1 for fragment (including background/end-of-tile). */
+	__u32 stage;
+	/** @primary_bytes: Primary per-thread storage after linking. */
+	__u32 primary_bytes;
+	/** @secondary_bytes: Secondary per-thread storage after linking. */
+	__u32 secondary_bytes;
+	/** @linked_bytes: Additional primary storage from linked programs. */
+	__u32 linked_bytes;
+	/** @minimum_primary_bytes: Minimum primary storage across linked variants. */
+	__u32 minimum_primary_bytes;
+	/** @auxiliary_count: Fragment auxiliary entries; zero for vertex programs. */
+	__u32 auxiliary_count;
+	/** @threadgroup_bytes: Fragment threadgroup storage; zero for vertex. */
+	__u32 threadgroup_bytes;
+	/** @imageblock_bytes: Fragment imageblock storage; zero for vertex. */
+	__u32 imageblock_bytes;
+	/** @multisample_bytes: Fragment multisample storage; zero for vertex. */
+	__u32 multisample_bytes;
+	/** @flags: MBZ. */
+	__u32 flags;
+};
+/** Version 2 linked render storage. Version 1 remains exactly 40 bytes. */
+#define DRM_ASAHI_RENDER_PROGRAM_SCS (1U << 0)
+#define DRM_ASAHI_RENDER_PROGRAM_MESH (1U << 1)
+#define DRM_ASAHI_RENDER_PROGRAM_OBJECT (1U << 2)
+/* With OBJECT: the object program is an API task stage. The kernel binds the
+ * TA mesh rendering buffer (native register 0x1ca48, the backing of the
+ * object payload address) to such kicks only. Requires
+ * DRM_ASAHI_FEATURE_TASK_MESH_STORAGE. */
+#define DRM_ASAHI_RENDER_PROGRAM_TASK (1U << 3)
+struct drm_asahi_render_program_v2 {
+	struct drm_asahi_render_program legacy;
+	/** @threads: Mesh/object workgroup invocation count; zero otherwise. */
+	__u32 threads;
+	/** @usage_flags: DRM_ASAHI_RENDER_PROGRAM_* bits. */
+	__u32 usage_flags;
+	/** @scs_layout: Packed depth/levels/cliques/user/driver SCS layout. */
+	__u64 scs_layout;
+	/** @auxiliary_allocation: Stage native auxiliary allocation word. */
+	__u32 auxiliary_allocation;
+	__u32 reserved;
+	__u64 intersection_pool;
+	__u64 intersection_pool_bytes;
+	__u32 intersection_first;
+	__u32 intersection_count;
+	__u64 intersection_default_program;
+	__u64 intersection_default_control;
+};
+
 
 /**
  * struct drm_asahi_cmd_header - Top level command structure
@@ -1026,6 +1153,18 @@ enum drm_asahi_render_flags {
 	 * may depend on it. Requires DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS.
 	 */
 	DRM_ASAHI_RENDER_FRAGMENT_BARRIERS = (1U << 20),
+
+	/**
+	 * @DRM_ASAHI_RENDER_SHADER_WRITES: A graphics program in this command
+	 * writes external memory, including buffer/image stores or atomic RMW.
+	 * Ordinary raster outputs and compiler-private transport do not count.
+	 * The native M5 producer accumulates the tested compiler write metadata
+	 * across its graphics programs and forwards it to TA command byte0x89a.
+	 * Its firmware/hardware effect is not established by that correspondence.
+	 * Requires DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES. Omission retains the
+	 * existing encoding, allowing older userspace to submit unchanged.
+	 */
+	DRM_ASAHI_RENDER_SHADER_WRITES = (1U << 21),
 };
 
 /**
@@ -1438,13 +1577,30 @@ struct drm_asahi_cmd_compute_with_prior {
 	__u64 scs_layout;
 	__u64 prior_vdm;
 	__u64 prior_cdm;
+	/* Native M5 compute allocation word, independent of scs_layout.
+	 * Zero preserves the legacy path. Older kernels reject a nonzero tail. */
 	__u32 cdm_auxiliary_allocation;
 	__u32 reserved;
+	/** @intersection_pool: M5 intersection-table pool, 16 KiB aligned. */
 	__u64 intersection_pool;
+	/** @intersection_pool_bytes: Mapped size, a multiple of 16 KiB. */
 	__u64 intersection_pool_bytes;
+	/** @intersection_first: First 128-byte driver table block. */
 	__u32 intersection_first;
+	/** @intersection_count: Number of driver table blocks (1..262143). */
 	__u32 intersection_count;
+	/**
+	 * @intersection_default_program: Native default program descriptor.
+	 * Low 48 bits are the 64-byte aligned program address; upper 16 bits
+	 * contain the low resource-specification bits.
+	 */
 	__u64 intersection_default_program;
+	/**
+	 * @intersection_default_control: Native default program control word.
+	 * Bits 13:0 and 46:32 are defined by the M5 program descriptor. All
+	 * other bits must be zero. A nonzero default program requires bit 40.
+	 * An all-zero intersection extension preserves the ordinary compute path.
+	 */
 	__u64 intersection_default_control;
 };
 
@@ -1457,6 +1613,7 @@ enum drm_asahi_compute_flags {
 	 * three-buffer table from this command's three compute attachments.
 	 */
 	DRM_ASAHI_COMPUTE_G17P_ADD3_PROOF = (1L << 0),
+	DRM_ASAHI_COMPUTE_USES_MATRIX = (1L << 1),
 };
 
 /**

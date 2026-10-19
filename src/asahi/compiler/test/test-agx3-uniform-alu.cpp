@@ -1,19 +1,139 @@
 /* SPDX-License-Identifier: MIT */
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <set>
 #include <string>
+#include <vector>
 #include <gtest/gtest.h>
 #include "agx3_binder.h"
+#include "agx3_alu_core.h"
+#include "agx3_cf_core.h"
 #include "agx3_uniform_alu.h"
+#include "agx3_stage_core.h"
+#include "agx3_isel_core.h"
 #include "agx3_tex_core.h"
 #include "agx_test.h"
 #include "util/u_debug.h"
 
+static uint32_t
+uniform_difference_zero_bits(bool relax)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   agx_index input = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index multiplier = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index difference = agx_temp(b->shader, AGX_SIZE_32);
+   agx_instr *sub = agx_fadd_to(b, difference, agx_uniform(12, AGX_SIZE_32),
+                               agx_neg(input));
+   sub->no_signed_zero = relax;
+   agx_index product = agx_fmul(b, difference, multiplier);
+   agx_lower_uniform_sources(b->shader);
+
+   std::vector<float> values(b->shader->alloc, 0.0f);
+   values[input.value] = values[multiplier.value] = 1.0f;
+   auto read = [&](agx_index x) {
+      float f = x.type == AGX_INDEX_UNIFORM ? 1.0f : values[x.value];
+      uint32_t bits;
+      std::memcpy(&bits, &f, sizeof(bits));
+      if (x.abs) bits &= 0x7fffffff;
+      if (x.neg) bits ^= 0x80000000;
+      std::memcpy(&f, &bits, sizeof(f));
+      return f;
+   };
+   agx_foreach_instr_global(b->shader, I) {
+      volatile float a = read(I->src[0]);
+      volatile float result;
+      if (I->op == AGX_OPCODE_MOV) {
+         result = a;
+      } else {
+         volatile float c = read(I->src[1]);
+         assert(I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL);
+         result = I->op == AGX_OPCODE_FADD ? a + c : a * c;
+      }
+      values[I->dest[0].value] = result;
+   }
+   uint32_t bits;
+   std::memcpy(&bits, &values[product.value], sizeof(bits));
+   ralloc_free(mem);
+   return bits;
+}
+
+TEST(AGX3UniformALU, UniformDifferencePreservesPositiveZero)
+{
+   EXPECT_EQ(uniform_difference_zero_bits(false), 0u);
+}
+
+TEST(AGX3UniformALU, UniformDifferenceMayNegateRelaxedZero)
+{
+   EXPECT_EQ(uniform_difference_zero_bits(true), 0x80000000u);
+}
+
+TEST(AGX3UniformALU, CSEKeepsDifferentSignedZeroContracts)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_index input = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index strict = agx_temp(b->shader, AGX_SIZE_32);
+   agx_index relaxed = agx_temp(b->shader, AGX_SIZE_32);
+   agx_fadd_to(b, strict, agx_uniform(12, AGX_SIZE_32), agx_neg(input));
+   agx_fadd_to(b, relaxed, agx_uniform(12, AGX_SIZE_32),
+               agx_neg(input))->no_signed_zero = true;
+   agx_instr *use = agx_fmul_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                               strict, relaxed);
+   agx_opt_cse(b->shader);
+   EXPECT_NE(use->src[0].value, use->src[1].value);
+   ralloc_free(mem);
+}
+
+TEST(AGX3FetchBanks, MultisampleRetirementPreservesPendingR0)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 95;
+   const unsigned destinations[] = {8, 0, 16, 24, 32};
+   for (unsigned i = 0; i < 5; ++i) {
+      agx_index coords = agx_register(64 + 6 * i, AGX_SIZE_32);
+      coords.channels_m1 = 2;
+      agx_index dest = agx_register(destinations[i], AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
+                         agx_immediate(i), agx_immediate(0), agx_null(),
+                         AGX_DIM_2D_MS, AGX_LOD_MODE_AUTO_LOD, 15, false, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   for (unsigned carrier : {0u, 88u}) {
+      uint8_t expected[AGX3_ALU_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_alu_band_identity_wait(AGX_ISA_ENCODING_AGX3C,
+                                            carrier, 1, expected, &length));
+      unsigned matches = 0;
+      for (unsigned i = 0; i + length <= binary.size; ++i)
+         matches += std::memcmp(bytes + i, expected, length) == 0;
+      EXPECT_EQ(matches, carrier == 88 ? 1u : 0u);
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
 TEST(AGX3UniformALU, VertexTextureUniformQualification)
 {
    /* Both operands name the same aligned uniform, a witnessed
-    * uniform/uniform pair, so every stage keeps them in the uniform file. */
+    * uniform/uniform pair, so every G17P stage keeps them in the uniform
+    * file; M5 keeps a 64-bit pair in fragment main programs (the witnessed
+    * argument-buffer sample). */
    for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
       for (auto stage : {MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT}) {
          for (bool preamble : {false, true}) {
@@ -38,8 +158,11 @@ TEST(AGX3UniformALU, VertexTextureUniformQualification)
                   agx_optimizer_forward(b->shader);
                   agx_lower_uniform_sources(b->shader);
                   const bool keep =
-                     encoding == AGX_ISA_ENCODING_AGX3B &&
-                     value <= 252 && !(value & 3) && size != AGX_SIZE_16;
+                     value <= 252 && !(value & 3) &&
+                     (encoding == AGX_ISA_ENCODING_AGX3B
+                         ? size != AGX_SIZE_16
+                         : size == AGX_SIZE_64 &&
+                              stage == MESA_SHADER_FRAGMENT && !preamble);
                   EXPECT_EQ(I->src[3].type == AGX_INDEX_UNIFORM, keep);
                   EXPECT_EQ(I->src[4].type == AGX_INDEX_UNIFORM, keep);
                   EXPECT_NE(I->src[1].type, AGX_INDEX_UNIFORM);
@@ -329,6 +452,17 @@ TEST(AGX3UniformALU, RefusesInvalidInputsWithoutWriting)
                                           AGX3_UNIFORM_FADD, 0, src, false,
                                           false, 0, bytes, &length));
    src[1].discard = false;
+   /* M5 ADD takes one uniform and one register; only the uniform may be
+    * negated, and the result is never saturated. */
+   src[0].neg = true;
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
+                                          AGX3_UNIFORM_FADD, 0, src, false,
+                                          false, 0, bytes, &length));
+   src[0].neg = false;
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
+                                          AGX3_UNIFORM_FADD, 0, src, true,
+                                          false, 0, bytes, &length));
+   src[0].kind = AGX3_FLOAT_UNIFORM;
    EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
                                           AGX3_UNIFORM_FADD, 0, src, false,
                                           false, 0, bytes, &length));
@@ -443,6 +577,129 @@ TEST(AGX3ArrayStaging, ReusedCompletionSlotRetainsCoordinateConsumer)
    ralloc_free(mem);
 }
 
+static void
+check_fetch_group(unsigned mode)
+{
+   struct option_guard {
+      bool had = getenv("ASAHI_M5_FETCH_REUSE") != nullptr;
+      std::string old = had ? getenv("ASAHI_M5_FETCH_REUSE") : "";
+      option_guard() { setenv("ASAHI_M5_FETCH_REUSE", "1", 1); }
+      ~option_guard() {
+         if (had) setenv("ASAHI_M5_FETCH_REUSE", old.c_str(), 1);
+         else unsetenv("ASAHI_M5_FETCH_REUSE");
+      }
+   } guard;
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 40;
+   for (unsigned i = 0; i < 3; ++i) {
+      if (mode == 3 && i == 1)
+         agx_mov_imm_to(b, agx_register(24, AGX_SIZE_32), 0);
+      agx_index coords = agx_register(mode == 1 && i ? 4 : 0, AGX_SIZE_32);
+      coords.channels_m1 = 1;
+      agx_index dest = agx_register(mode == 2 && !i ? 0 : 32 + i * 16,
+                                    AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
+                           agx_immediate(i), agx_immediate(0), agx_null(),
+                           AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 15, false, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   std::array<agx3_tex_fetch_desc, 3> fetches = {};
+   unsigned found = 0;
+   for (unsigned i = 0; i + 8 <= binary.size; ++i) {
+      agx3_tex_fetch_desc d;
+      if (agx3_tex_decode_fetch(AGX_ISA_ENCODING_AGX3C, bytes + i, 8, &d)) {
+         ASSERT_LT(found, fetches.size());
+         fetches[found++] = d;
+         i += 7;
+      }
+   }
+   ASSERT_EQ(found, 3u);
+   EXPECT_EQ(fetches[0].coord_kill, mode != 0);
+   EXPECT_FALSE(fetches[1].coord_kill);
+   EXPECT_TRUE(fetches[2].coord_kill);
+   EXPECT_EQ(fetches[1].coord, fetches[2].coord);
+   EXPECT_EQ(fetches[2].wait_mask, 0u);
+   if (mode == 0) {
+      EXPECT_EQ(fetches[0].coord, fetches[1].coord);
+      EXPECT_EQ(fetches[1].wait_mask, 0u);
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
+TEST(AGX3FetchGroups, SameCoordinates) { check_fetch_group(0); }
+TEST(AGX3FetchGroups, ChangedCoordinates) { check_fetch_group(1); }
+TEST(AGX3FetchGroups, OverwrittenCoordinates) { check_fetch_group(2); }
+TEST(AGX3FetchGroups, InterveningInstruction) { check_fetch_group(3); }
+
+TEST(AGX3FetchBanks, EightIndependentCoordinates)
+{
+   struct option_guard {
+      const char *name;
+      bool had;
+      std::string old;
+      option_guard(const char *n, const char *value) : name(n), had(getenv(n)),
+         old(had ? getenv(n) : "") { setenv(n, value, 1); }
+      ~option_guard() {
+         if (had) setenv(name, old.c_str(), 1);
+         else unsetenv(name);
+      }
+   } reuse("ASAHI_M5_FETCH_REUSE", "0"), banks("ASAHI_M5_FETCH_BANKS", "8");
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17S;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 63;
+   for (unsigned i = 0; i < 8; ++i) {
+      agx_index coords = agx_register(i * 4, AGX_SIZE_32);
+      coords.channels_m1 = 1;
+      agx_index dest = agx_register(64 + i * 8, AGX_SIZE_32);
+      dest.channels_m1 = 3;
+      agx_texture_load_to(b, dest, coords, agx_immediate(0), agx_immediate(0),
+                           agx_immediate(i), agx_immediate(0), agx_null(),
+                           AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 15, false, false);
+   }
+   agx_stop(b);
+   util_dynarray binary;
+   util_dynarray_init(&binary, mem);
+   ASSERT_TRUE(agx3_pack_binary(b->shader, &binary));
+   const uint8_t *bytes = static_cast<const uint8_t *>(binary.data);
+   for (unsigned i = 0; i < 8; ++i) {
+      agx3_tex_fetch_desc d = {};
+      d.dest = 64 + i * 8;
+      d.coord = i * 8;
+      d.width = AGX3_TEX_W32;
+      d.mask = 15;
+      d.texture = i;
+      d.slot = i + 1;
+      d.wait_mask = 1u << i;
+      d.coord_kill = true;
+      d.final = i == 7;
+      uint8_t expected[AGX3_TEX_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3C, &d, expected, &len));
+      bool found = false;
+      for (unsigned j = 0; j + len <= binary.size; ++j)
+         found |= std::memcmp(bytes + j, expected, len) == 0;
+      EXPECT_TRUE(found) << "bank " << i;
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(mem);
+}
+
 TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
 {
    for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
@@ -450,7 +707,7 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
          void *mem = ralloc_context(NULL);
          agx_shader_key key = {};
          key.dev.encoding = encoding;
-         key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P : AGX_CHIP_G16G;
+         key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P : AGX_CHIP_G17S;
          agx_builder *b = agx_test_builder(mem);
          b->shader->key = &key;
          b->shader->stage = MESA_SHADER_FRAGMENT;
@@ -466,7 +723,9 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
          agx_stop(&last);
          agx_opt_jmp_none(b->shader);
          agx_instr *jump = agx_last_instr(entry);
-         bool required = encoding == AGX_ISA_ENCODING_AGX3B && mode == 2;
+         /* Every AGX3 encoding: M5 (AGX3C) stops its 3D stage on an
+          * empty-EXEC testing update just as G17P does. */
+         bool required = mode == 2;
          EXPECT_EQ(jump->op == AGX_OPCODE_JMP_EXEC_NONE, required);
          if (required) {
             EXPECT_EQ(jump->target, end);
@@ -478,22 +737,806 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingBlocks)
 
 TEST(AGX3PixelTests, EmptyExecutionSkipsShortTestingElse)
 {
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = encoding;
+      key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B ? AGX_CHIP_G17P : AGX_CHIP_G17S;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_block *body = list_first_entry(&b->shader->blocks, agx_block, link);
+      agx_instr *else_ = agx_else_fcmp(b, agx_zero(), agx_zero(), 1,
+                                     AGX_FCOND_EQ, false, body);
+      agx_sample_mask_agx3(b, agx_register(0, AGX_SIZE_16),
+                           agx_register(2, AGX_SIZE_32), 2);
+      agx_pop_exec(b, 1);
+      agx_opt_jmp_none(b->shader);
+      agx_instr *jump = list_entry(else_->link.next, agx_instr, link);
+      EXPECT_EQ(jump->op, AGX_OPCODE_JMP_EXEC_NONE_AFTER);
+      EXPECT_EQ(jump->target, body);
+      ralloc_free(mem);
+   }
+}
+
+TEST(AGX3UniformALU, M5NativeMultiplyAndFmaUniformWitnesses)
+{
+   const struct {
+      agx3_uniform_float_op op; uint16_t dest; bool sat, cache; uint8_t wait;
+      agx3_uniform_float_src src[3]; uint8_t length; uint8_t expected[16];
+   } cases[] = {
+      {AGX3_UNIFORM_FMA, 14, false, true, 2, {{AGX3_FLOAT_REGISTER, 20, false, false, true, false},{AGX3_FLOAT_UNIFORM, 22, false, true, false, false},{AGX3_FLOAT_REGISTER, 12, false, false, false, true}}, 8, {0x79,0x95,0x26,0x17,0x81,0x0c,0x02,0x4a}},
+      {AGX3_UNIFORM_FMA, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false},{AGX3_FLOAT_UNIFORM, 20, false, true, false, false},{AGX3_FLOAT_REGISTER, 10, false, false, false, true}}, 8, {0x59,0x93,0x26,0x15,0x81,0x0a,0x02,0x0a}},
+      {AGX3_UNIFORM_FMUL, 18, true, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false},{AGX3_FLOAT_REGISTER, 18, false, false, false, true},{}}, 8, {0x99,0x1d,0x35,0x13,0x81,0x00,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true},{AGX3_FLOAT_UNIFORM, 36, false, false, false, false},{}}, 6, {0x59,0x01,0x2d,0x25,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true},{AGX3_FLOAT_UNIFORM, 38, false, false, false, false},{AGX3_FLOAT_REGISTER, 10, false, false, false, true}}, 6, {0x19,0x03,0x2e,0x27,0xa0,0x0a}},
+      {AGX3_UNIFORM_FMA, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true},{AGX3_FLOAT_UNIFORM, 34, false, false, false, false},{AGX3_FLOAT_REGISTER, 2, false, false, false, true}}, 6, {0x29,0x05,0x2e,0x23,0xa0,0x02}},
+      {AGX3_UNIFORM_FMUL, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true},{AGX3_FLOAT_UNIFORM, 22, false, false, false, false},{}}, 6, {0x59,0x0b,0x2d,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true},{AGX3_FLOAT_UNIFORM, 22, false, false, false, false},{AGX3_FLOAT_REGISTER, 6, false, false, false, true}}, 6, {0x29,0x05,0x2e,0x17,0xa0,0x06}},
+      {AGX3_UNIFORM_FMUL, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true},{AGX3_FLOAT_UNIFORM, 150, false, false, false, false},{}}, 6, {0x09,0x01,0x3d,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true},{AGX3_FLOAT_UNIFORM, 158, false, false, false, false},{}}, 6, {0x19,0x03,0x3d,0x1f,0x00,0x02}},
+   };
+   for (const auto &c : cases) {
+      uint8_t bytes[16], length = 0;
+      ASSERT_TRUE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C, c.op,
+                  c.dest, c.src, c.sat, c.cache, c.wait, bytes, &length));
+      ASSERT_EQ(length, c.length);
+      EXPECT_EQ(std::memcmp(bytes, c.expected, length), 0);
+   }
+}
+
+/* Native applegpu_g17g (metal-nt) Minecraft 26.3 terrain, entity, cloud and
+ * sky pipelines: every distinct f32 ADD/MUL/FMA with a uniform operand or a
+ * uniform-file result in their mains and constant programs whose fields the
+ * encoder names, re-encoded from the decoded operands; plus the R*R+U FMAs of
+ * the agx3-diff-corpus applegpu_g17g r_heavy_loop fragment. */
+TEST(AGX3UniformALU, M5NativeUniformOperandAndResultShapes)
+{
+   const struct {
+      agx3_uniform_float_op op; bool uniform_dest; uint16_t dest;
+      bool sat, cache; uint8_t wait; agx3_uniform_float_src src[3];
+      uint8_t length; uint8_t expected[16];
+   } cases[] = {
+      {AGX3_UNIFORM_FMA, false, 8, false, true, 0, {{AGX3_FLOAT_REGISTER, 6, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 4, false, true, false, false, false}, {AGX3_FLOAT_IMMEDIATE, 48, false, false, false, false, false}}, 8, {0x49,0x87,0x26,0x05,0x21,0xb0,0x02,0x0a}},
+      {AGX3_UNIFORM_FMUL, true, 32, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 8, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {}}, 6, {0x09,0x89,0x45,0x89,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, true, 36, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {}}, 6, {0x29,0x99,0x55,0x09,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, true, 34, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 10, false, false, true, false, false}, {}}, 6, {0x19,0x99,0x45,0x8b,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, true, 38, false, false, 0, {{AGX3_FLOAT_IMMEDIATE, 8, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {}}, 6, {0x39,0x89,0x55,0x0b,0xc0,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {}}, 6, {0x69,0x0d,0x2d,0x1f,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {}}, 6, {0x99,0x21,0x24,0x83,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {}}, 6, {0x79,0x23,0x24,0x81,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 32, false, true, false, false, false}, {}}, 6, {0x99,0x83,0x24,0x21,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 34, false, true, false, false, false}, {}}, 6, {0x79,0x81,0x24,0x23,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {}}, 6, {0x99,0x25,0x24,0x83,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, true, false, false, false}, {}}, 6, {0x79,0x81,0x24,0x27,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, true, false, false, false}, {}}, 6, {0x99,0x83,0x24,0x25,0x00,0x0a}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {}}, 6, {0x79,0x27,0x24,0x81,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 90, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 20, false, false, false, false, false}, {}}, 6, {0xd9,0x03,0xad,0x15,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 88, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 22, false, false, false, false, false}, {}}, 6, {0xc9,0x01,0xad,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 88, false, true, 0, {{AGX3_FLOAT_REGISTER, 88, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {}}, 6, {0xc9,0x59,0xad,0x1b,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 90, false, true, 0, {{AGX3_FLOAT_REGISTER, 90, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {}}, 6, {0xd9,0x5b,0xad,0x19,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 52, false, true, 0, {{AGX3_FLOAT_REGISTER, 62, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 28, false, true, false, false, false}, {}}, 6, {0xa9,0x3f,0x6c,0x1d,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 56, true, true, 0, {{AGX3_FLOAT_REGISTER, 52, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {}}, 8, {0xc9,0x35,0x6d,0x1f,0x01,0x02,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 20, false, false, false, false, false}, {}}, 6, {0x99,0x83,0x25,0x15,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 22, false, false, false, false, false}, {}}, 6, {0x89,0x81,0x25,0x17,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {}}, 6, {0x99,0x13,0x2d,0x19,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {}}, 6, {0x89,0x11,0x2d,0x1b,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {}}, 6, {0x89,0x3f,0x25,0x8f,0x80,0x00}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 40, false, true, false, false, false}, {}}, 6, {0x79,0x91,0x24,0x29,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 20, false, true, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}, {}}, 6, {0xa9,0x0f,0x2d,0x31,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 44, false, true, false, false, false}, {}}, 6, {0x79,0x93,0x24,0x2d,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}, {}}, 6, {0xb9,0x0f,0x2d,0x33,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 26, false, true, 0, {{AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}}, 8, {0xd9,0x39,0x26,0x8d,0x21,0x38,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}}, 8, {0xa9,0x3b,0x26,0x8d,0x21,0x3a,0x82,0x08}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {}}, 6, {0x19,0x03,0x2d,0x3f,0x00,0x02}},
+      /* Native G17G compile of fma(x, u, -y) in a fragment: R*U-R. */
+      {AGX3_UNIFORM_FMA, false, 0, false, false, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 32, false, true, true, false, false}}, 8, {0x09,0x93,0x06,0x05,0x11,0xa0,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 6, {0x09,0x83,0x26,0x39,0xa0,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x89,0x83,0x26,0x3b,0xa0,0x10}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}}, 8, {0x79,0x3d,0x26,0x8d,0x21,0x3c,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x19,0x03,0x2e,0x3d,0xa0,0x04}},
+      {AGX3_UNIFORM_FADD, false, 8, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 16, false, true, false, false, false}, {}}, 6, {0x49,0x8b,0x24,0x11,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 8, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {}}, 6, {0x49,0x09,0x2d,0x19,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 20, false, true, false, false, false}, {}}, 6, {0x59,0x89,0x24,0x15,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {}}, 6, {0x59,0x0b,0x2d,0x1b,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 0, false, true, 0, {{AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {}}, 6, {0x09,0x25,0x35,0x01,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {}}, 6, {0x19,0x27,0x35,0x03,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 8, false, false, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {}}, 6, {0x49,0x09,0x0d,0x23,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 6, {0x09,0x89,0x26,0x1d,0xa0,0x00}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}}, 6, {0x19,0x89,0x26,0x1f,0xa0,0x0c}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_UNIFORM, 40, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {}}, 6, {0x19,0x29,0x35,0x05,0x80,0x00}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 42, false, false, false, false, false}, {}}, 6, {0x19,0x03,0x2d,0x2b,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 8, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x29,0x09,0x2e,0x21,0xa0,0x04}},
+      {AGX3_UNIFORM_FADD, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 40, false, true, false, false, false}, {}}, 6, {0x79,0x93,0x24,0x29,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}, {}}, 6, {0x79,0x0f,0x2d,0x31,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 44, false, true, false, false, false}, {}}, 6, {0x89,0x8d,0x24,0x2d,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}, {}}, 6, {0x89,0x11,0x2d,0x33,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {}}, 6, {0x69,0x0d,0x2d,0x3f,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 24, false, true, 0, {{AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}}, 8, {0xc9,0x39,0x26,0x83,0x21,0x38,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}}, 8, {0xb9,0x3b,0x26,0x83,0x21,0x3a,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x09,0x8d,0x26,0x39,0xa0,0x10}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x79,0x8d,0x26,0x3b,0xa0,0x0e}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}}, 8, {0x99,0x3d,0x26,0x83,0x21,0x3c,0x82,0x08}},
+      {AGX3_UNIFORM_FMUL, false, 10, false, true, 0, {{AGX3_FLOAT_UNIFORM, 62, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 6, false, false, true, false, false}, {}}, 6, {0x59,0x3f,0x25,0x87,0x80,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x29,0x0d,0x2e,0x3d,0xa0,0x04}},
+      {AGX3_UNIFORM_FADD, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 20, false, true, false, false, false}, {}}, 6, {0x29,0x81,0x24,0x15,0x00,0x0a}},
+      {AGX3_UNIFORM_FMUL, false, 6, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 8, false, false, false, false, false}, {}}, 6, {0x39,0x83,0x25,0x09,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 18, false, false, false, false, false}, {}}, 6, {0x19,0x01,0x2d,0x13,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}}, 8, {0x09,0x19,0x26,0x83,0x21,0x18,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}}, 8, {0x29,0x1b,0x26,0x83,0x21,0x1a,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 12, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 6, {0x09,0x83,0x26,0x0d,0xa0,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 14, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x29,0x83,0x26,0x0f,0xa0,0x04}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 2, false, true, true, false, false}, {AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}}, 8, {0x29,0x1d,0x26,0x83,0x21,0x1c,0x82,0x08}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 16, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x19,0x03,0x2e,0x11,0xa0,0x04}},
+      {AGX3_UNIFORM_FMA, true, 24, false, false, 8, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 68, false, false, false, true, false}}, 8, {0xc9,0xc1,0x06,0x81,0x81,0x44,0x42,0x80}},
+      {AGX3_UNIFORM_FMA, true, 26, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 66, false, false, false, true, false}}, 8, {0xd9,0xc1,0x06,0x83,0x81,0x42,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 28, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0xe9,0xc1,0x06,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 30, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 62, false, false, false, true, false}}, 8, {0xf9,0x41,0x0e,0x07,0x81,0x3e,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 32, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}}, 8, {0x09,0xb9,0x46,0x81,0x81,0x40,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 34, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 58, false, false, false, true, false}}, 8, {0x19,0xb9,0x46,0x83,0x81,0x3a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 36, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x29,0xb9,0x46,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 38, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 52, false, false, false, true, false}}, 8, {0x39,0x39,0x4e,0x07,0x81,0x34,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 40, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 50, false, false, false, true, false}}, 8, {0x49,0xaf,0x46,0x81,0x81,0x32,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 42, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x59,0xaf,0x46,0x83,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 44, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 42, false, false, false, true, false}}, 8, {0x69,0xaf,0x46,0x05,0x81,0x2a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 46, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 44, false, false, false, true, false}}, 8, {0x79,0x2f,0x4e,0x07,0x81,0x2c,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 48, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 40, false, false, false, true, false}}, 8, {0x89,0x8f,0x56,0x01,0x81,0x28,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 50, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 8, {0x99,0x8f,0x56,0x03,0x81,0x10,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 52, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}}, 8, {0xa9,0x8f,0x56,0x05,0x81,0x00,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 70, false, false, false, false, true}, {AGX3_FLOAT_IMMEDIATE, 2, false, false, false, false, false}}, 8, {0x29,0x05,0x2e,0x46,0x21,0x82,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 70, false, false, false, false, true}, {AGX3_FLOAT_IMMEDIATE, 2, false, false, false, false, false}}, 8, {0x19,0x03,0x2e,0x46,0x21,0x82,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 40, false, true, 0, {{AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}}, 8, {0x49,0x19,0x66,0x91,0x21,0x30,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}}, 8, {0xb9,0x1b,0x26,0x91,0x21,0x32,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 40, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 40, false, false, false, true, false}}, 6, {0x49,0x93,0x66,0x21,0xa0,0x28}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}}, 6, {0xb9,0x93,0x26,0x23,0xa0,0x16}},
+      {AGX3_UNIFORM_FMA, false, 40, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 52, false, false, false, false, false}}, 8, {0x49,0x1d,0x66,0x91,0x21,0x34,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 46, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 40, false, false, false, true, false}}, 6, {0x79,0x93,0x66,0x25,0xa0,0x28}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 54, false, false, false, false, false}}, 8, {0x89,0x1f,0x36,0x11,0x21,0x36,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x89,0x93,0x26,0x27,0xa0,0x10}},
+      {AGX3_UNIFORM_FMUL, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 36, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 64, false, false, false, false, false}, {}}, 6, {0x99,0xa5,0x25,0x41,0x00,0x02}},
+      {AGX3_UNIFORM_FMUL, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 36, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 56, false, false, false, false, false}, {}}, 6, {0xb9,0x25,0x2d,0x39,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 38, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 66, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 6, {0x99,0xa7,0x26,0x43,0xa0,0x12}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 38, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 58, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}}, 6, {0xb9,0x27,0x2e,0x3b,0xa0,0x16}},
+      {AGX3_UNIFORM_FMA, false, 22, false, true, 0, {{AGX3_FLOAT_REGISTER, 20, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 60, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}}, 6, {0xb9,0x95,0x26,0x3d,0xa0,0x16}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 68, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 6, {0x99,0x15,0x2e,0x45,0xa0,0x12}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 74, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 72, false, false, false, false, false}}, 8, {0xa9,0x15,0x2e,0x4b,0x21,0x48,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 74, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 72, false, false, false, false, false}}, 8, {0x99,0x13,0x2e,0x4b,0x21,0x48,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, true, 20, false, false, 8, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 68, false, false, false, true, false}}, 8, {0xa9,0xc1,0x06,0x01,0x81,0x44,0x42,0x80}},
+      {AGX3_UNIFORM_FMA, true, 22, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 66, false, false, false, true, false}}, 8, {0xb9,0xc1,0x06,0x83,0x81,0x42,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 24, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0xc9,0xc1,0x06,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 26, false, false, 0, {{AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 62, false, false, false, true, false}}, 8, {0xd9,0x41,0x0e,0x07,0x81,0x3e,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 28, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 64, false, false, false, true, false}}, 8, {0xe9,0xb9,0x06,0x01,0x81,0x40,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 30, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 58, false, false, false, true, false}}, 8, {0xf9,0xb9,0x06,0x83,0x81,0x3a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 32, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x09,0xb9,0x46,0x05,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 34, false, false, 0, {{AGX3_FLOAT_REGISTER, 56, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 52, false, false, false, true, false}}, 8, {0x19,0x39,0x4e,0x07,0x81,0x34,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 36, false, false, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 50, false, false, false, true, false}}, 8, {0x29,0x01,0x46,0xaf,0x81,0x32,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 38, false, false, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 48, false, false, false, true, false}}, 8, {0x39,0x83,0x46,0xaf,0x81,0x30,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 40, false, false, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 42, false, false, false, true, false}}, 8, {0x49,0x05,0x46,0xaf,0x81,0x2a,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 42, false, false, 0, {{AGX3_FLOAT_REGISTER, 6, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 46, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 44, false, false, false, true, false}}, 8, {0x59,0x07,0x56,0x2f,0x81,0x2c,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 44, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 34, false, false, false, true, false}}, 8, {0x69,0x8f,0x56,0x01,0x81,0x22,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 46, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 8, {0x79,0x8f,0x56,0x03,0x81,0x10,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 48, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 8, {0x89,0x8f,0x56,0x05,0x81,0x12,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 74, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 66, false, false, false, false, false}}, 8, {0x89,0x4b,0x36,0x13,0x21,0x42,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 72, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 64, false, false, false, false, false}}, 8, {0x69,0x0d,0x2e,0x49,0x21,0x40,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 76, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 68, false, false, false, false, false}}, 8, {0x59,0x0b,0x2e,0x4d,0x21,0x44,0x02,0x02}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 44, false, false, false, false, false}}, 8, {0xa9,0x1d,0x26,0x91,0x21,0x2c,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 46, false, false, false, false, false}}, 8, {0x79,0x1f,0x26,0x91,0x21,0x2e,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}}, 6, {0x99,0x8d,0x26,0x25,0xa0,0x14}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x79,0x8d,0x26,0x27,0xa0,0x0e}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}}, 8, {0x79,0x21,0x26,0x91,0x21,0x30,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 16, false, true, 0, {{AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}}, 8, {0x89,0x23,0x36,0x11,0x21,0x32,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 40, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x79,0x8d,0x26,0x29,0xa0,0x0e}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 42, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}}, 6, {0x69,0x0d,0x2e,0x2b,0xa0,0x10}},
+      {AGX3_UNIFORM_FMA, true, 40, false, false, 0, {{AGX3_FLOAT_REGISTER, 46, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 50, false, false, false, true, false}}, 8, {0x49,0xaf,0x46,0x01,0x81,0x32,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 48, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 34, false, false, false, true, false}}, 8, {0x89,0x8f,0x56,0x01,0x81,0x22,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, true, 52, false, false, 0, {{AGX3_FLOAT_REGISTER, 14, false, false, true, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}}, 8, {0xa9,0x8f,0x56,0x05,0x81,0x12,0x42,0x00}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 70, false, false, false, false, true}, {AGX3_FLOAT_IMMEDIATE, 2, false, false, false, false, false}}, 8, {0x09,0x01,0x2e,0x46,0x21,0x82,0x02,0x02}},
+      {AGX3_UNIFORM_FADD, false, 18, false, true, 0, {{AGX3_FLOAT_REGISTER, 16, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 64, false, false, false, false, false}, {}}, 6, {0x99,0x11,0x2c,0x41,0x00,0x02}},
+      {AGX3_UNIFORM_FADD, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 66, false, false, false, false, false}, {}}, 6, {0x09,0x01,0x2c,0x43,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 24, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 48, false, false, false, false, false}}, 8, {0xa9,0x19,0x26,0x93,0x21,0x30,0x82,0x00}},
+      {AGX3_UNIFORM_FADD, false, 16, false, true, 0, {{AGX3_FLOAT_REGISTER, 22, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 68, false, false, false, false, false}, {}}, 6, {0x89,0x17,0x2c,0x45,0x00,0x02}},
+      {AGX3_UNIFORM_FMA, false, 32, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 32, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}}, 6, {0x09,0x81,0x66,0x21,0xa0,0x14}},
+      {AGX3_UNIFORM_FMA, false, 20, false, true, 0, {{AGX3_FLOAT_UNIFORM, 28, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 52, false, false, false, false, false}}, 8, {0xa9,0x1d,0x26,0x93,0x21,0x34,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 20, false, false, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 36, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 20, false, false, false, true, false}}, 6, {0xa9,0x81,0x06,0x25,0xa0,0x14}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_UNIFORM, 26, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 50, false, false, false, false, false}}, 8, {0x29,0x1b,0x26,0x93,0x21,0x32,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 34, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}}, 6, {0x69,0x81,0x26,0x23,0xa0,0x04}},
+      {AGX3_UNIFORM_FMA, false, 14, false, true, 0, {{AGX3_FLOAT_UNIFORM, 30, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 18, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 54, false, false, false, false, false}}, 8, {0x79,0x1f,0x36,0x13,0x21,0x36,0x82,0x00}},
+      {AGX3_UNIFORM_FMA, false, 12, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, false, false}, {AGX3_FLOAT_UNIFORM, 38, false, false, false, false, false}, {AGX3_FLOAT_REGISTER, 14, false, false, false, true, false}}, 6, {0x69,0x01,0x26,0x27,0xa0,0x0e}},
+
+      /* agx3-diff-corpus applegpu_g17g r_heavy_loop fragment: R*R+U. */
+      {AGX3_UNIFORM_FMA, false, 2, false, true, 0, {{AGX3_FLOAT_REGISTER, 2, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 4, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x19,0x03,0x2e,0x85,0x21,0x06,0x02,0x00}},
+      {AGX3_UNIFORM_FMA, false, 4, false, true, 0, {{AGX3_FLOAT_REGISTER, 4, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 0, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x29,0x05,0x2e,0x81,0x21,0x06,0x02,0x00}},
+      {AGX3_UNIFORM_FMA, false, 0, false, true, 0, {{AGX3_FLOAT_REGISTER, 0, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 10, false, false, true, false, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x09,0x01,0x2e,0x8b,0x21,0x06,0x02,0x00}},
+      {AGX3_UNIFORM_FMA, false, 10, false, true, 0, {{AGX3_FLOAT_REGISTER, 10, false, false, false, true, false}, {AGX3_FLOAT_REGISTER, 12, false, false, false, true, false}, {AGX3_FLOAT_UNIFORM, 6, false, false, false, false, false}}, 8, {0x59,0x0b,0x3e,0x0d,0x21,0x06,0x02,0x00}},
+   };
+   unsigned failed = 0;
+   for (const auto &c : cases) {
+      uint8_t bytes[16] = {0}, length = 0;
+      const bool ok = c.uniform_dest
+         ? agx3_uniform_float_store_encode(AGX_ISA_ENCODING_AGX3C, c.op,
+                                           c.dest, c.src, c.wait, bytes,
+                                           &length)
+         : agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C, c.op, c.dest,
+                                     c.src, c.sat, c.cache, c.wait, bytes,
+                                     &length);
+      if (!ok || length != c.length || std::memcmp(bytes, c.expected, length)) {
+         ++failed;
+         fprintf(stderr, "mismatch op=%u ud=%u dest=%u ok=%u len=%u/%u got=",
+                 (unsigned)c.op, c.uniform_dest, c.dest, ok, length, c.length);
+         for (unsigned i = 0; i < length; ++i)
+            fprintf(stderr, "%02x", bytes[i]);
+         fprintf(stderr, " want=");
+         for (unsigned i = 0; i < c.length; ++i)
+            fprintf(stderr, "%02x", c.expected[i]);
+         fprintf(stderr, "\n");
+      }
+   }
+   EXPECT_EQ(failed, 0u);
+}
+
+/* The same native M5 vertex mains write their outputs' final FMUL/FMA
+ * straight into the staging file (f9=5) that UVSW reads. Every distinct
+ * staged R*R MUL, U*R+R FMA and R*R+R FMA whose fields the encoder names,
+ * with sources in agx3_stage_vertex_alu order (src[0] is the second
+ * hardware operand, the uniform of U*R+R). */
+TEST(AGX3UniformALU, M5NativeStagedVertexOutputALU)
+{
+   const struct {
+      bool fma; uint16_t dest; uint8_t slot; uint16_t src[3]; bool uniform0;
+      bool live[3], discard[3]; uint8_t wait; uint8_t length;
+      uint8_t expected[16];
+   } cases[] = {
+      {true, 8, 1, {40, 20, 40}, true, {false, true, false}, {false, false, true}, 0, 8, {0x49,0x95,0x26,0x29,0x81,0x28,0x42,0x02}},
+      {true, 10, 2, {42, 20, 22}, true, {false, true, false}, {false, false, true}, 0, 10, {0x59,0x95,0x26,0x2b,0x82,0x16,0x42,0x02,0x00,0x04}},
+      {true, 12, 2, {44, 20, 46}, true, {false, true, false}, {false, false, true}, 0, 10, {0x69,0x95,0x26,0x2d,0x82,0x2e,0x42,0x02,0x00,0x04}},
+      {true, 14, 2, {46, 20, 16}, true, {false, true, false}, {false, false, true}, 0, 10, {0x79,0x95,0x26,0x2f,0x82,0x10,0x42,0x02,0x00,0x04}},
+      {false, 16, 8, {40, 38, 0}, false, {false, false, false}, {true, true, false}, 0, 14, {0xa1,0x02,0x05,0x30,0x22,0x70,0xa0,0x02,0x1c,0x0a,0x20,0x00,0x02,0x10}},
+      {false, 18, 8, {32, 36, 0}, false, {true, true, false}, {false, false, false}, 0, 14, {0xb1,0x80,0x05,0x30,0x22,0x70,0xa0,0x02,0x18,0x08,0x10,0x00,0x02,0x10}},
+      {false, 20, 8, {34, 36, 0}, false, {true, true, false}, {false, false, false}, 0, 14, {0xa1,0x80,0x05,0x30,0x22,0x70,0xa0,0x0a,0x98,0x08,0x10,0x00,0x02,0x10}},
+      {false, 22, 6, {32, 18, 0}, false, {false, true, false}, {true, false, false}, 0, 8, {0xb9,0x93,0x35,0x21,0x41,0x00,0x00,0x14}},
+      {false, 24, 6, {34, 18, 0}, false, {false, true, false}, {true, false, false}, 0, 8, {0xc9,0x93,0x35,0x23,0x41,0x00,0x00,0x14}},
+      {false, 26, 6, {28, 36, 0}, false, {true, false, false}, {false, true, false}, 0, 8, {0xd9,0x25,0x2d,0x9d,0x41,0x00,0x00,0x14}},
+      {false, 28, 3, {28, 18, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0xe9,0x13,0x3d,0x1d,0x41,0x00,0x00,0x08}},
+      {false, 0, 2, {14, 18, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x09,0x13,0x3d,0x0f,0x41,0x00,0x00,0x04}},
+      {true, 2, 3, {20, 10, 18}, true, {false, true, false}, {false, false, true}, 0, 10, {0x19,0x8b,0x26,0x15,0x82,0x12,0x42,0x02,0x00,0x08}},
+      {true, 4, 4, {22, 10, 14}, true, {false, true, false}, {false, false, true}, 0, 10, {0x29,0x8b,0x26,0x17,0x82,0x0e,0x42,0x02,0x00,0x0c}},
+      {true, 6, 5, {24, 10, 14}, true, {false, true, false}, {false, false, true}, 0, 10, {0x39,0x8b,0x26,0x19,0x82,0x0e,0x42,0x02,0x00,0x10}},
+      {true, 8, 6, {26, 10, 12}, true, {false, false, false}, {false, true, true}, 0, 10, {0x49,0x0b,0x2e,0x1b,0x82,0x0c,0x42,0x02,0x00,0x14}},
+      {true, 4, 2, {40, 16, 32}, true, {false, true, false}, {false, false, true}, 0, 10, {0x29,0x91,0x26,0x29,0x82,0x20,0x42,0x02,0x00,0x04}},
+      {false, 0, 3, {28, 8, 0}, false, {false, false, false}, {true, true, false}, 1, 8, {0x09,0x09,0x3d,0x1d,0x41,0x20,0x00,0x08}},
+      {false, 2, 3, {30, 10, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x19,0x0b,0x3d,0x1f,0x41,0x00,0x00,0x08}},
+      {false, 6, 3, {2, 12, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x39,0x0d,0x3d,0x03,0x41,0x00,0x00,0x08}},
+      {false, 8, 3, {4, 14, 0}, false, {false, false, false}, {true, true, false}, 0, 8, {0x49,0x0f,0x3d,0x05,0x41,0x00,0x00,0x08}},
+      {true, 10, 7, {42, 16, 12}, true, {false, true, false}, {false, false, true}, 0, 10, {0x59,0x91,0x26,0x2b,0x82,0x0c,0x42,0x02,0x00,0x18}},
+      {true, 12, 8, {44, 16, 20}, true, {false, true, false}, {false, false, true}, 0, 16, {0x21,0x80,0x07,0x8a,0x20,0x07,0xa3,0x1a,0x18,0x0b,0x88,0x00,0x14,0x08,0x00,0x80}},
+      {true, 14, 1, {46, 16, 12}, true, {false, false, false}, {false, true, true}, 0, 8, {0x79,0x11,0x2e,0x2f,0x81,0x0c,0x42,0x02}},
+      {true, 16, 4, {4, 6, 8}, false, {false, false, false}, {true, true, true}, 0, 10, {0x89,0x07,0x3e,0x05,0x82,0x08,0x42,0x00,0x00,0x0c}},
+
+   };
+   unsigned failed = 0;
+   for (const auto &c : cases) {
+      uint8_t bytes[16] = {0}, length = 0;
+      const bool ok = agx3_stage_vertex_alu(AGX_ISA_ENCODING_AGX3C, c.fma,
+                                            c.dest, c.slot, c.src, c.uniform0,
+                                            c.live, c.discard, c.wait, bytes,
+                                            &length);
+      if (!ok || length != c.length || std::memcmp(bytes, c.expected, length)) {
+         ++failed;
+         fprintf(stderr, "staged mismatch fma=%u dest=%u slot=%u ok=%u len=%u/%u got=",
+                 c.fma, c.dest, c.slot, ok, length, c.length);
+         for (unsigned i = 0; i < length; ++i)
+            fprintf(stderr, "%02x", bytes[i]);
+         fprintf(stderr, " want=");
+         for (unsigned i = 0; i < c.length; ++i)
+            fprintf(stderr, "%02x", c.expected[i]);
+         fprintf(stderr, "\n");
+      }
+   }
+   EXPECT_EQ(failed, 0u);
+}
+
+TEST(AGX3UniformALU, M5LoweringRetainsWitnessedFloatUniforms)
+{
    void *mem = ralloc_context(NULL);
    agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
-   key.dev.chip = AGX_CHIP_G17P;
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
    agx_builder *b = agx_test_builder(mem);
    b->shader->key = &key;
-   b->shader->stage = MESA_SHADER_FRAGMENT;
-   agx_block *body = list_first_entry(&b->shader->blocks, agx_block, link);
-   agx_instr *else_ = agx_else_fcmp(b, agx_zero(), agx_zero(), 1,
-                                  AGX_FCOND_EQ, false, body);
-   agx_sample_mask_agx3(b, agx_register(0, AGX_SIZE_16),
-                        agx_register(2, AGX_SIZE_32), 2);
-   agx_pop_exec(b, 1);
-   agx_opt_jmp_none(b->shader);
-   agx_instr *jump = list_entry(else_->link.next, agx_instr, link);
-   EXPECT_EQ(jump->op, AGX_OPCODE_JMP_EXEC_NONE_AFTER);
-   EXPECT_EQ(jump->target, body);
+   agx_index value = agx_mov(b, agx_register(0, AGX_SIZE_32));
+   agx_instr *mul = agx_fmul_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                              value, agx_uniform(158, AGX_SIZE_32));
+   agx_instr *add = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                              value, agx_uniform(158, AGX_SIZE_32));
+   /* U*R+U and R*U+imm (native terrain/sky witnesses) keep both uniforms. */
+   agx_instr *fma = agx_ffma_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                agx_uniform(56, AGX_SIZE_32), value,
+                                agx_uniform(56, AGX_SIZE_32));
+   agx_instr *fma_imm = agx_ffma_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                    value, agx_uniform(70, AGX_SIZE_16),
+                                    agx_immediate_f(1.0));
+   /* An absolute uniform is not a witnessed operand. */
+   agx_instr *add_abs = agx_fadd_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                    value,
+                                    agx_abs(agx_uniform(158, AGX_SIZE_32)));
+   agx_lower_uniform_sources(b->shader);
+   EXPECT_EQ(mul->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(add->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(fma->src[0].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(fma->src[2].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(fma_imm->src[1].type, AGX_INDEX_UNIFORM);
+   EXPECT_NE(add_abs->src[1].type, AGX_INDEX_UNIFORM);
    ralloc_free(mem);
+}
+
+TEST(AGX3UniformALU, M5SelectKeepsWitnessedUniformComparand)
+{
+   for (unsigned cond : {(unsigned)AGX_FCOND_GE, (unsigned)AGX_FCOND_LTN,
+                         (unsigned)AGX_FCOND_EQ}) {
+      for (bool zero : {true, false}) {
+         void *mem = ralloc_context(NULL);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         agx_builder *b = agx_test_builder(mem);
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_FRAGMENT;
+         agx_index x = agx_mov(b, agx_register(0, AGX_SIZE_32));
+         agx_index y = agx_mov(b, agx_register(2, AGX_SIZE_32));
+         /* LTN normalizes to GE with the selected operands exchanged, so
+          * its zero belongs in the other slot. */
+         const bool exchanged = cond == AGX_FCOND_LTN;
+         agx_index imm = agx_immediate(zero ? 0 : 1);
+         agx_instr *I = agx_fcmpsel_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                                       agx_uniform(40, AGX_SIZE_32), x,
+                                       exchanged ? y : imm,
+                                       exchanged ? imm : y,
+                                       (enum agx_fcond)cond);
+         agx_lower_uniform_sources(b->shader);
+         EXPECT_EQ(I->src[0].type == AGX_INDEX_UNIFORM,
+                   zero && cond != AGX_FCOND_EQ);
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(AGX3UniformALU, M5FloatUniformEightCompletionSlots)
+{
+   const agx3_uniform_float_src src[3] = {
+      {AGX3_FLOAT_REGISTER, 26}, {AGX3_FLOAT_UNIFORM, 294},
+      {AGX3_FLOAT_REGISTER, 40},
+   };
+   /* ADD has endpoints 0..3 only; a multi-producer wait takes its 12-byte
+    * ep3, as Minecraft's terrain vertex shaders need. */
+   for (auto op : {AGX3_UNIFORM_FADD, AGX3_UNIFORM_FMUL, AGX3_UNIFORM_FMA}) {
+      std::set<std::string> unique;
+      for (unsigned wait = 0; wait < 256; ++wait) {
+         uint8_t bytes[16], length = 0;
+         ASSERT_TRUE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C, op,
+                      26, src, false, true, wait, bytes, &length));
+         unique.emplace(reinterpret_cast<char *>(bytes), length);
+      }
+      EXPECT_EQ(unique.size(), 256u);
+   }
+}
+
+TEST(AGX3UniformALU, M5NativeIntegerUniformSelectWitnesses)
+{
+   {
+      agx3_isel_desc d = {};
+      d.dest = 6;
+      d.dest_cache = true;
+      d.cmp0 = 28;
+      d.cmp1 = 30;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)1;
+      d.explicit_hints = true;
+      d.sel_true = 28;
+      d.sel_false = 30;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x32,0x1d,0x2e,0x1f,0x05,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 0;
+      d.dest_cache = true;
+      d.cmp0 = 26;
+      d.cmp1 = 30;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)1;
+      d.explicit_hints = true;
+      d.sel_true = 26;
+      d.sel_false = 30;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x02,0x1b,0x2e,0x1f,0x05,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 12;
+      d.dest_cache = true;
+      d.cmp0 = 4;
+      d.cmp1 = 16;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 4;
+      d.sel_false = 16;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x62,0x05,0x2e,0x11,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 10;
+      d.dest_cache = true;
+      d.cmp0 = 6;
+      d.cmp1 = 16;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 6;
+      d.sel_false = 16;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x52,0x07,0x2e,0x11,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 6;
+      d.dest_cache = true;
+      d.cmp0 = 4;
+      d.cmp1 = 16;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 4;
+      d.sel_false = 16;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x32,0x05,0x2e,0x11,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 4;
+      d.dest_cache = true;
+      d.cmp0 = 4;
+      d.cmp1 = 18;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 4;
+      d.sel_false = 18;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x22,0x05,0x2e,0x13,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 16;
+      d.dest_cache = true;
+      d.cmp0 = 14;
+      d.cmp1 = 18;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 14;
+      d.sel_false = 18;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x82,0x0f,0x2e,0x13,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 14;
+      d.dest_cache = true;
+      d.cmp0 = 14;
+      d.cmp1 = 18;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)5;
+      d.explicit_hints = true;
+      d.sel_true = 14;
+      d.sel_false = 18;
+      d.true_kind = AGX3_ISEL_REGISTER;
+      d.false_kind = AGX3_ISEL_UNIFORM;
+      d.wait_mask = 0;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = true;
+      d.discard[3] = false;
+      const uint8_t expected[] = {0x72,0x0f,0x2e,0x13,0x07,0x02};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 10;
+      d.dest_cache = true;
+      d.cmp0 = 2;
+      d.cmp1 = 154;
+      d.cmp1_immediate = false;
+      d.cmp1_uniform = true;
+      d.cond = (agx3_isel_icond)1;
+      d.explicit_hints = true;
+      d.sel_true = 156;
+      d.sel_false = 0;
+      d.true_kind = AGX3_ISEL_UNIFORM;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.wait_mask = 1;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = false;
+      d.discard[3] = true;
+      const uint8_t expected[] = {0x52,0x03,0x3f,0x1b,0xa2,0x1c,0x05,0x22,0x80,0x00};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 4;
+      d.dest_cache = false;
+      d.cmp0 = 40;
+      d.cmp1 = 0;
+      d.cmp1_immediate = true;
+      d.cmp1_uniform = false;
+      d.cond = (agx3_isel_icond)4;
+      d.explicit_hints = true;
+      d.sel_true = 144;
+      d.sel_false = 36;
+      d.true_kind = AGX3_ISEL_UNIFORM;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.wait_mask = 0;
+      d.cache[0] = true;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = false;
+      d.discard[1] = false;
+      d.discard[2] = false;
+      d.discard[3] = true;
+      const uint8_t expected[] = {0x22,0xa9,0x07,0x80,0xa6,0x10,0x07,0x02,0x80,0x24};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+   {
+      agx3_isel_desc d = {};
+      d.dest = 6;
+      d.dest_cache = false;
+      d.cmp0 = 40;
+      d.cmp1 = 0;
+      d.cmp1_immediate = true;
+      d.cmp1_uniform = false;
+      d.cond = (agx3_isel_icond)4;
+      d.explicit_hints = true;
+      d.sel_true = 144;
+      d.sel_false = 14;
+      d.true_kind = AGX3_ISEL_UNIFORM;
+      d.false_kind = AGX3_ISEL_REGISTER;
+      d.wait_mask = 1;
+      d.cache[0] = false;
+      d.cache[1] = false;
+      d.cache[2] = false;
+      d.cache[3] = false;
+      d.discard[0] = true;
+      d.discard[1] = false;
+      d.discard[2] = false;
+      d.discard[3] = true;
+      const uint8_t expected[] = {0x32,0x29,0x0f,0x80,0xa6,0x10,0x07,0x22,0x80,0x0e};
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+      ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, sizeof(expected));
+      EXPECT_EQ(std::memcmp(bytes, expected, length), 0);
+   }
+}
+
+TEST(AGX3UniformALU, M5IntegerUniformSelectLowering)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->is_preamble = mode == 1;
+      agx_index x = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index bound = agx_uniform(mode == 3 ? 379 : 378, AGX_SIZE_32);
+      agx_instr *I = agx_icmpsel_to(b,
+         agx_temp(b->shader, mode == 2 ? AGX_SIZE_16 : AGX_SIZE_32),
+         x, bound, agx_uniform(374, AGX_SIZE_32), agx_immediate(0), AGX_ICOND_ULT);
+      agx_lower_uniform_sources(b->shader);
+      EXPECT_EQ(I->src[1].type == AGX_INDEX_UNIFORM, mode == 0);
+      EXPECT_EQ(I->src[2].type == AGX_INDEX_UNIFORM, mode == 0);
+      EXPECT_EQ(I->icond, AGX_ICOND_ULT);
+      ralloc_free(mem);
+   }
+}
+
+TEST(AGX3UniformALU, M5IntegerUniformSelectEightCompletionSlots)
+{
+   agx3_isel_desc d = {};
+   d.dest = 40; d.cmp0 = 36; d.cmp1 = 378; d.cmp1_uniform = true;
+   d.cond = AGX3_ISEL_ICOND_ULT; d.explicit_hints = true;
+   d.true_kind = AGX3_ISEL_UNIFORM; d.sel_true = 374;
+   d.false_kind = AGX3_ISEL_IMMEDIATE; d.sel_false = 0;
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      d.cmp1 = mode == 0 ? 378 : mode == 1 ? 38 : 7;
+      d.cmp1_uniform = mode == 0;
+      d.cmp1_immediate = mode == 2;
+      d.false_kind = mode == 0 ? AGX3_ISEL_IMMEDIATE :
+                     mode == 1 ? AGX3_ISEL_REGISTER : AGX3_ISEL_UNIFORM;
+      d.sel_false = mode == 0 ? 0 : mode == 1 ? 42 : 376;
+      std::set<std::string> unique;
+      for (unsigned wait = 0; wait < 256; ++wait) {
+         d.wait_mask = wait;
+         uint8_t bytes[AGX3_ISEL_MAX_LENGTH], length = 0;
+         ASSERT_TRUE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+         unique.emplace(reinterpret_cast<char *>(bytes), length);
+      }
+      EXPECT_EQ(unique.size(), 256u);
+   }
+}
+
+TEST(AGX3UniformALU, M5IntegerUniformSelectInvalidFormsAreTransactional)
+{
+   agx3_isel_desc good = {};
+   good.dest = 40; good.cmp0 = 36; good.cmp1 = 378;
+   good.cmp1_uniform = true; good.cond = AGX3_ISEL_ICOND_ULT;
+   good.explicit_hints = true;
+   good.true_kind = AGX3_ISEL_UNIFORM; good.sel_true = 374;
+   good.false_kind = AGX3_ISEL_IMMEDIATE; good.sel_false = 0;
+   for (unsigned mode = 0; mode < 12; ++mode) {
+      agx3_isel_desc d = good;
+      switch (mode) {
+      case 0: d.cmp0_uniform = true; break;
+      case 1: d.dest_16 = true; break;
+      case 2: d.cmp_16 = true; break;
+      case 3: d.cmp_mixed_width = true; break;
+      case 4: d.cmp1 = 379; break;
+      case 5: d.cmp1 = 512; break;
+      case 6: d.cmp1_immediate = true; break;
+      case 7: d.cache[1] = true; break;
+      case 8: d.discard[1] = true; break;
+      case 9: d.sel_true = 375; break;
+      case 10: d.sel_true = 512; break;
+      case 11: d.discard[2] = true; break;
+      }
+      uint8_t bytes[AGX3_ISEL_MAX_LENGTH], expected[AGX3_ISEL_MAX_LENGTH];
+      std::memset(bytes, 0xa5, sizeof(bytes));
+      std::memset(expected, 0xa5, sizeof(expected));
+      uint8_t length = 0xa5;
+      EXPECT_FALSE(agx3_isel_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      EXPECT_EQ(std::memcmp(bytes, expected, sizeof(bytes)), 0);
+      EXPECT_EQ(length, 0xa5);
+   }
+}
+
+TEST(AGX3UniformALU, M5NativeUniformBranchWitnesses)
+{
+   uint8_t out[AGX3_CF_MAX_LENGTH], length = 0;
+   const uint8_t reg_uniform[] = {0x0a,0x05,0x23,0x09,0x06,0x00,0x07,0x02,0x00,0x00};
+   ASSERT_TRUE(agx3_cf_icmp_reg_uniform32(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 4, 8, {false,false}, out, &length));
+   ASSERT_EQ(length, sizeof(reg_uniform));
+   EXPECT_EQ(std::memcmp(out, reg_uniform, length), 0);
+   const uint8_t uniform_zero[] = {0x0a,0x09,0x23,0x80,0x06,0x00,0x87,0x02,0x00,0x00};
+   ASSERT_TRUE(agx3_cf_icmp_uniform_imm(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 8, 0, out, &length));
+   ASSERT_EQ(length, sizeof(uniform_zero));
+   EXPECT_EQ(std::memcmp(out, uniform_zero, length), 0);
+   EXPECT_FALSE(agx3_cf_icmp_uniform_imm(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 9, 0, out, &length));
+   EXPECT_FALSE(agx3_cf_icmp_reg_uniform32(AGX_ISA_ENCODING_AGX3C,
+      AGX3_CF_ICOND_EQ, 0, 4, 256, {false,false}, out, &length));
 }
