@@ -51,6 +51,7 @@
 
 #include <stdio.h>
 
+struct set;
 struct hk_buffer;
 struct hk_cmd_bo;
 struct hk_cmd_pool;
@@ -294,9 +295,11 @@ struct hk_attachment {
    VkFormat vk_format;
    struct hk_image_view *iview;
 
-   /* The API load and store operations the pass was begun with. */
+   /* The API load and store operations and the layout the pass was begun
+    * with. */
    VkAttachmentLoadOp load_op;
    VkAttachmentStoreOp store_op;
+   VkImageLayout layout;
 
    VkResolveModeFlagBits resolve_mode;
    struct hk_image_view *resolve_iview;
@@ -840,6 +843,13 @@ struct hk_cs {
     * committed sample locations (hk_flush_gfx_state()). */
    bool m5_continued_pass;
 
+   /* M5: the continued instance was ordered after this stream's earlier work
+    * by a dependency that is not framebuffer-local (hk_m5_pass_merge_begin()).
+    * While this is the open render stream, every draw recorded into it must
+    * leave the merge memory-equivalent to the two separate instances, or the
+    * stream ends first (hk_m5_ordered_draw_hazard()). */
+   bool m5_ordered;
+
    /* Scratch requirements */
    struct {
       union {
@@ -1179,9 +1189,18 @@ struct hk_cmd_buffer {
          uint32_t sync_epoch;
          struct hk_cs *open_cs;
          void *open_cs_current;
+         /* A recorded dependency orders the next instance after this one
+          * beyond attachment operations; continuing then needs the stronger
+          * conditions of hk_m5_ordered_refusal(). */
+         bool ordered;
          /* The render state the instance ended with. */
          struct hk_rendering_state render;
       } pass_merge;
+
+      /* M5: the open render stream is an ordered continuation (hk_cs::
+       * m5_ordered) and a command recorded since may read the instance's
+       * attachments through memory; the next draw ends the stream first. */
+      bool m5_ordered_split;
    } state;
 
    struct {
@@ -1278,6 +1297,12 @@ struct hk_cmd_buffer {
    struct agx_bo **retained_set;
    uint32_t retained_set_capacity;
    uint32_t retained_set_count;
+
+   /* M5: every attachment-capable image (hk_image) a graphics push descriptor
+    * has referenced since recording began. Push descriptors stay valid until
+    * overwritten, so an image recorded here may still be readable by the
+    * bound shaders (hk_m5_ordered_refusal()). Created on first use. */
+   struct set *m5_pushed_images;
 
    /* Executable USC-window arena the G17P Ioto programs recorded by this
     * command buffer are bump-allocated from. Its chunks are owned by
@@ -1885,6 +1910,17 @@ hk_stat_enabled(uint64_t addr)
  * may continue in its stream. */
 void hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
                               const VkDependencyInfo *info);
+
+/* An ordered continuation (hk_cs::m5_ordered) ends at a command that may
+ * break its memory equivalence; reason names it in the frame anatomy log. */
+void hk_m5_pass_merge_end_ordered(struct hk_cmd_buffer *cmd,
+                                  const char *reason);
+
+/* Graphics descriptor updates while an ordered continuation is open, and
+ * bookkeeping of the images graphics push descriptors reference. */
+void hk_m5_pass_merge_note_push(struct hk_cmd_buffer *cmd,
+                                struct hk_image_view *iview);
+void hk_m5_pass_merge_note_set_bind(struct hk_cmd_buffer *cmd);
 
 /* The vertex stage program of record draw_id > 0 of a multi-draw on M5
  * (hk_cmd_buffer.c): only the draw parameters and draw index may differ from
