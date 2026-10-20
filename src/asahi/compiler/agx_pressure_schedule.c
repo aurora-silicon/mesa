@@ -454,6 +454,11 @@ agx_pressure_schedule(agx_context *ctx)
 #define AGX_ILP_FS_SAMPLE_HALVES 88
 /* Samples a fragment block may issue ahead of the first unissued one. */
 #define AGX_ILP_FS_HOIST_SAMPLES 6
+/* Independent loads at the head of a straight-line compute block that make
+ * it worth latency-scheduling, and the register pressure such a schedule may
+ * reach (of 192 halves). */
+#define AGX_ILP_CS_MIN_LOADS 8
+#define AGX_ILP_CS_HALVES 128
 
 static unsigned
 ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
@@ -1016,6 +1021,46 @@ ilp_block_samples(const agx_block *block)
    return samples;
 }
 
+/* Independent loads at the head of a straight-line block. A load counts
+ * when none of its sources is a value an earlier load defined: a pointer
+ * chase is already serialized, so hoisting it buys nothing. Counting stops
+ * at the first store, atomic or barrier: later loads may alias it, and the
+ * memory_store chain keeps their order against it anyway. */
+static unsigned
+ilp_block_independent_loads(const agx_context *ctx, const agx_block *block,
+                            void *memctx)
+{
+   unsigned loads = 0;
+   BITSET_WORD *load_defs =
+      rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(ctx->alloc));
+   if (!load_defs)
+      return 0;
+
+   agx_foreach_instr_in_block(block, I) {
+      if (instr_after_logical_end(I))
+         break;
+
+      const enum agx_schedule_class dep =
+         agx_opcodes_info[I->op].schedule_class;
+      if (dep == AGX_SCHEDULE_CLASS_STORE ||
+          dep == AGX_SCHEDULE_CLASS_ATOMIC ||
+          dep == AGX_SCHEDULE_CLASS_BARRIER)
+         break;
+      if (dep != AGX_SCHEDULE_CLASS_LOAD)
+         continue;
+
+      bool depends = false;
+      agx_foreach_ssa_src(I, s)
+         depends |= BITSET_TEST(load_defs, I->src[s].value) != 0;
+      if (!depends)
+         ++loads;
+      agx_foreach_ssa_dest(I, d)
+         BITSET_SET(load_defs, I->dest[d].value);
+   }
+
+   return loads;
+}
+
 /* Schedule only a small, explicit arithmetic/tile domain. Schedule-class
  * NONE alone is not a purity guarantee (e.g. DOORBELL and texture ops).
  * SSA operands expose all data dependencies; physical register accesses and
@@ -1133,6 +1178,23 @@ agx_ilp_schedule(agx_context *ctx)
                             16 * alu_latency, AGX_ILP_FS_SAMPLE_SLACK, 0, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
                             AGX_ILP_FS_HOIST_SAMPLES, &dag_state);
+      } else if (!in_loop[block->index] && !ctx->is_preamble &&
+                 ctx->stage == MESA_SHADER_COMPUTE &&
+                 ilp_block_independent_loads(ctx, block, memctx) >=
+                    AGX_ILP_CS_MIN_LOADS) {
+         /* A straight-line compute block's device loads are mostly
+          * independent, but the pressure schedule places each one right
+          * before its consumer, so the warp waits on one load at a time.
+          * Apple's compiler issues the batch first and consumes the results
+          * afterwards. Loads stay ordered against each other and against
+          * stores by the memory_store chain, so only their distance to the
+          * consumers changes. Loops are excluded for the documented
+          * grid-stride pressure regression; the budget matches the constant
+          * program's. */
+         ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
+                            16 * alu_latency, AGX_ILP_SLACK,
+                            AGX_ILP_CS_HALVES, false, true,
+                            AGX_ILP_CS_HALVES - 16, 0, &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
