@@ -24,6 +24,123 @@ struct agx_subgroup_lower_options {
    bool g17p_clustered_float;
 };
 
+/* Whether a scan is handled by the dense-guarded lowering in lower(): a
+ * scalar scan at a width the shuffles cover, for an operation the
+ * hardware prefix op does not implement over a partial subgroup.  The
+ * filter below must return false for exactly these.
+ */
+static bool
+agx_scan_eligible(const nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_exclusive_scan &&
+       intr->intrinsic != nir_intrinsic_inclusive_scan)
+      return false;
+
+   if (intr->def.num_components != 1 ||
+       (intr->def.bit_size != 16 && intr->def.bit_size != 32))
+      return false;
+
+   switch (nir_intrinsic_reduction_op(intr)) {
+   case nir_op_imul:
+   case nir_op_fmin:
+   case nir_op_fmax:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Shuffle read of data[index] for a per-lane index.
+ *
+ * The hardware shuffle instruction chooses a single index within the
+ * target quad to shuffle each source quad with: the low two index bits
+ * are accumulated across the quad, so they must not be quad divergent.
+ * A raw read_invocation with an arbitrary per-lane index therefore reads
+ * the wrong lane -- this is what broke the first version of the scan
+ * lowering on hardware.  To implement an arbitrary index, pull each low
+ * 2-bits index in the quad separately, as with nir_intrinsic_shuffle.
+ */
+static nir_def *
+agx_subgroup_read(nir_builder *b, nir_def *data, nir_def *index)
+{
+   nir_def *quad_start = nir_iand_imm(b, index, 0x1c);
+   nir_def *result = NULL;
+
+   for (unsigned i = 0; i < 4; ++i) {
+      nir_def *target_i = nir_iadd_imm(b, quad_start, i);
+      nir_def *shuf = nir_read_invocation(b, data, target_i);
+
+      if (result)
+         result = nir_bcsel(b, nir_ieq(b, index, target_i), shuf, result);
+      else
+         result = shuf;
+   }
+
+   return result;
+}
+
+/* Subgroup scan over the active-lane predecessor chain.
+ *
+ * The common lowering guards a full-subgroup Kogge-Stone sweep with a
+ * ballot==full branch whose partial-mask side walks the ballot one buddy
+ * at a time; that masked walk costs hundreds of instructions.  But a
+ * partially-active subgroup has stale registers in its inactive lanes,
+ * not values a shuffle may read, so simply guarding each fixed-distance
+ * buddy drops every contribution that lies below an inactive lane.
+ *
+ * Instead, each lane finds its closest active predecessor once, straight
+ * from the ballot, and the scan runs as pointer doubling down that
+ * chain: after step k each lane has folded in its first 2^k predecessors
+ * and its frontier is the 2^k-th predecessor.  Five steps cover a
+ * 32-lane subgroup and only active lanes' registers are ever consumed.
+ */
+static nir_def *
+agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
+                  bool inclusive)
+{
+   nir_def *m = nir_ballot(b, 1, 32, nir_imm_true(b));
+   nir_def *lane = nir_load_subgroup_invocation(b);
+
+   /* Bit 31 - k of `below` is set when lane (l - k) is active; bit 31 is
+    * the lane's own bit.
+    */
+   nir_def *below = nir_ishl(b, m, nir_isub_imm(b, 31, lane));
+
+   /* prev = highest active lane strictly below this one.  ufind_msb
+    * returns -1 when no predecessor exists, so prev lands in [-32, -1]:
+    * as an unsigned value it sorts past 31, which both fails the `f < 32`
+    * validity test and clamps to a legal lane for the shuffle index.
+    */
+   nir_def *below_exc = nir_iand_imm(b, below, 0x7fffffff);
+   nir_def *prev = nir_iadd(b, lane,
+                            nir_iadd_imm(b, nir_ufind_msb(b, below_exc),
+                                         -31));
+
+   nir_def *v = data;
+   nir_def *f = prev;
+   for (unsigned i = 0; i < 5; ++i) {
+      nir_def *ok = nir_ult_imm(b, f, 32);
+      nir_def *idx = nir_umin_imm(b, f, 31);
+      nir_def *buddy = agx_subgroup_read(b, v, idx);
+      v = nir_bcsel(b, ok, nir_build_alu2(b, red_op, v, buddy), v);
+      nir_def *next = agx_subgroup_read(b, f, idx);
+      f = nir_bcsel(b, ok, next, f);
+   }
+
+   if (inclusive)
+      return v;
+
+   /* The exclusive result is the inclusive value held by the closest
+    * active predecessor, or the identity where there is none.
+    */
+   nir_def *ok = nir_ult_imm(b, prev, 32);
+   nir_def *idx = nir_umin_imm(b, prev, 31);
+   nir_def *buddy = agx_subgroup_read(b, v, idx);
+   nir_const_value ident = nir_alu_binop_identity(red_op, data->bit_size);
+   nir_def *identity = nir_build_imm(b, 1, data->bit_size, &ident);
+   return nir_bcsel(b, ok, buddy, identity);
+}
+
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -108,81 +225,30 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_shuffle: {
-      nir_def *data = intr->src[0].ssa;
-      nir_def *target = intr->src[1].ssa;
-
-      /* Recognise lane-relative shuffle indices and use the dedicated
-       * hardware forms instead of the quad-split below:
-       *
-       *    lane ^ x  ->  shuffle_xor
-       *    lane - x  ->  shuffle_up
-       *    lane + x  ->  shuffle_down
-       */
-      nir_scalar target_s = nir_scalar_resolved(target, 0);
-      if (nir_scalar_is_alu(target_s)) {
-         nir_op op = nir_scalar_alu_op(target_s);
-         nir_intrinsic_op rel = nir_num_intrinsics;
-
-         if (op == nir_op_ixor)
-            rel = nir_intrinsic_shuffle_xor;
-         else if (op == nir_op_isub)
-            rel = nir_intrinsic_shuffle_up;
-         else if (op == nir_op_iadd)
-            rel = nir_intrinsic_shuffle_down;
-
-         if (rel != nir_num_intrinsics) {
-            for (unsigned i = 0; i < 2; ++i) {
-               nir_scalar side = nir_scalar_chase_alu_src(target_s, i);
-               bool is_lane =
-                  nir_scalar_is_intrinsic(side) &&
-                  nir_scalar_intrinsic_op(side) ==
-                     nir_intrinsic_load_subgroup_invocation;
-
-               if (is_lane && !(op == nir_op_isub && i == 1)) {
-                  nir_def *res = NULL;
-                  nir_def *delta = nir_scalar_chase_alu_src(target_s, 1 - i).def;
-                  if (rel == nir_intrinsic_shuffle_xor)
-                     res = nir_shuffle_xor(b, data, delta);
-                  else if (rel == nir_intrinsic_shuffle_up)
-                     res = nir_shuffle_up(b, data, delta);
-                  else
-                     res = nir_shuffle_down(b, data, delta);
-                  nir_def_rewrite_uses(&intr->def, res);
-                  return true;
-               }
-            }
-         }
-      }
-
-      /* The hardware shuffle instruction chooses a single index within the
-       * target quad to shuffle each source quad with. Consequently, the low
-       * 2-bits of shuffle indices should not be quad divergent.  To implement
-       * arbitrary shuffle, pull each low 2-bits index in the quad separately.
-       */
-      nir_def *quad_start = nir_iand_imm(b, target, 0x1c);
-      nir_def *result = NULL;
-
-      for (unsigned i = 0; i < 4; ++i) {
-         nir_def *target_i = nir_iadd_imm(b, quad_start, i);
-         nir_def *shuf = nir_read_invocation(b, data, target_i);
-
-         if (result)
-            result = nir_bcsel(b, nir_ieq(b, target, target_i), shuf, result);
-         else
-            result = shuf;
-      }
-
+      nir_def *result =
+         agx_subgroup_read(b, intr->src[0].ssa, intr->src[1].ssa);
       nir_def_rewrite_uses(&intr->def, result);
       return true;
    }
 
-   case nir_intrinsic_inclusive_scan: {
-      /* If we got here, we support the corresponding exclusive scan in
-       * hardware, so just handle the last element.
-       */
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan: {
       nir_op red_op = nir_intrinsic_reduction_op(intr);
       nir_def *data = intr->src[0].ssa;
 
+      if (agx_scan_eligible(intr)) {
+         nir_def *res = agx_subgroup_scan(b, red_op, data,
+            intr->intrinsic == nir_intrinsic_inclusive_scan);
+         nir_def_rewrite_uses(&intr->def, res);
+         return true;
+      }
+
+      if (intr->intrinsic == nir_intrinsic_exclusive_scan)
+         return false;
+
+      /* If we got here, we support the corresponding exclusive scan in
+       * hardware, so just handle the last element.
+       */
       b->cursor = nir_after_instr(&intr->instr);
       intr->intrinsic = nir_intrinsic_exclusive_scan;
       nir_def *accum = nir_build_alu2(b, red_op, data, &intr->def);
@@ -240,6 +306,12 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    if (intr->def.num_components > 1 || intr->def.bit_size == 1)
       return true;
 
+   /* Scans the dense-guarded lowering handles stay intrinsics and reach
+    * lower() untouched.
+    */
+   if (agx_scan_eligible(intr))
+      return false;
+
    /* Hardware supports quad ops but no other support clustered reductions. */
    if (nir_intrinsic_has_cluster_size(intr)) {
       cluster = nir_intrinsic_cluster_size(intr);
@@ -253,15 +325,11 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 
    case nir_op_fmin:
    case nir_op_fmax:
-      /* Fresh G17P witnesses pin the native qRedfmin/qRedfmax forms, and the
-       * same captures show sRedfmin/sRedfmax for full-subgroup reduces. Keep
-       * every other target and non-quad clustered shape on the established
-       * common lowering path. Scans of float min/max have no prefix
-       * encoding and must always take the common lowering. */
-      if (agx_options->g17p_clustered_float &&
-          intr->def.bit_size == 32 &&
-          intr->intrinsic == nir_intrinsic_reduce &&
-          (cluster == 4 || cluster == 0 || cluster >= 32))
+      /* Fresh G17P witnesses pin the native qRedfmin/qRedfmax forms. Keep
+       * every other target and non-quad shape on the established common
+       * lowering path. */
+      if (agx_options->g17p_clustered_float && cluster == 4 &&
+          intr->def.bit_size == 32)
          return false;
       return true;
 
@@ -295,7 +363,7 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
       .lower_read_first_invocation = true,
       .lower_inverse_ballot = true,
       .lower_to_scalar = true,
-      .lower_relative_shuffle = false,
+      .lower_relative_shuffle = true,
       .lower_rotate_to_shuffle = true,
       .lower_subgroup_masks = true,
       .lower_reduce = true,
