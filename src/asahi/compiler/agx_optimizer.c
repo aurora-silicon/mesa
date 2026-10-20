@@ -1919,7 +1919,7 @@ agx_optimizer_forward(agx_context *ctx)
       } else if (I->op == AGX_OPCODE_CONVERT) {
          agx_optimizer_narrow_convert(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_FCMPSEL || I->op == AGX_OPCODE_FCMP) {
-         if (0) agx_optimizer_fcmp_mods(ctx, defs, I);
+         agx_optimizer_fcmp_mods(ctx, defs, I);
       }
    }
 
