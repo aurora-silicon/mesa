@@ -7063,31 +7063,11 @@ agx_nir_lower_imul64_filter(const nir_instr *instr, const void *_)
    if (instr->type != nir_instr_type_alu)
       return false;
 
+   /* umul_2x32_64/imul_2x32_64 stay unlowered (lower_int64_options excludes
+    * nir_lower_imul_2x32_64): the backend maps both to the single widening
+    * 32x32->64 imad, unsigned via the per-operand ABS zero-extension. */
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
-   return (alu->op == nir_op_imul || alu->op == nir_op_umul_2x32_64 ||
-           alu->op == nir_op_imul_2x32_64) &&
-          alu->def.bit_size == 64;
-}
-
-static nir_def *
-agx_nir_umul_high32(nir_builder *b, nir_def *x, nir_def *y)
-{
-   nir_def *shift = nir_imm_int(b, 16);
-   nir_def *mask = nir_imm_int(b, 0xffff);
-
-   /* Hacker's Delight unsigned 16-bit partial-product expansion. */
-   nir_def *xl = nir_iand(b, x, mask);
-   nir_def *yl = nir_iand(b, y, mask);
-   nir_def *xh = nir_ushr(b, x, shift);
-   nir_def *yh = nir_ushr(b, y, shift);
-   nir_def *lo = nir_imul(b, xl, yl);
-   nir_def *m1 = nir_imul(b, xl, yh);
-   nir_def *m2 = nir_imul(b, xh, yl);
-   nir_def *hi = nir_imul(b, xh, yh);
-   nir_def *t = nir_iadd(b, m2, nir_ushr(b, lo, shift));
-   nir_def *w1 = nir_iadd(b, m1, nir_iand(b, t, mask));
-   nir_def *w2 = nir_ushr(b, t, shift);
-   return nir_iadd(b, hi, nir_iadd(b, nir_ushr(b, w1, shift), w2));
+   return alu->op == nir_op_imul && alu->def.bit_size == 64;
 }
 
 static nir_def *
@@ -7096,24 +7076,20 @@ agx_nir_lower_imul64_instr(nir_builder *b, nir_instr *instr, void *_)
    nir_alu_instr *alu = nir_instr_as_alu(instr);
    nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
    nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
-   if (alu->op == nir_op_umul_2x32_64 || alu->op == nir_op_imul_2x32_64) {
-      nir_def *hi = agx_nir_umul_high32(b, x, y);
-      if (alu->op == nir_op_imul_2x32_64) {
-         /* Convert the unsigned high word to the signed product. */
-         hi = nir_isub(b, hi, nir_iand(b, nir_ishr_imm(b, x, 31), y));
-         hi = nir_isub(b, hi, nir_iand(b, nir_ishr_imm(b, y, 31), x));
-      }
-      return nir_pack_64_2x32_split(b, nir_imul(b, x, y), hi);
-   }
    nir_def *xl = nir_unpack_64_2x32_split_x(b, x);
    nir_def *xh = nir_unpack_64_2x32_split_y(b, x);
    nir_def *yl = nir_unpack_64_2x32_split_x(b, y);
    nir_def *yh = nir_unpack_64_2x32_split_y(b, y);
-   nir_def *hi = nir_iadd(
-      b, agx_nir_umul_high32(b, xl, yl),
-      nir_iadd(b, nir_imul(b, xl, yh), nir_imul(b, xh, yl)));
 
-   return nir_pack_64_2x32_split(b, nir_imul(b, xl, yl), hi);
+   /* The widening multiply gives the low halves' full product in one imad;
+    * the cross terms contribute only their low 32 bits to the high word, so
+    * 32-bit multiplies and adds finish the 64x64->64 product. */
+   nir_def *mul_lo = nir_umul_2x32_64(b, xl, yl);
+   nir_def *hi = nir_iadd(b, nir_unpack_64_2x32_split_y(b, mul_lo),
+                          nir_iadd(b, nir_imul(b, xl, yh),
+                                   nir_imul(b, xh, yl)));
+
+   return nir_pack_64_2x32_split(b, nir_unpack_64_2x32_split_x(b, mul_lo), hi);
 }
 
 static bool
@@ -11824,13 +11800,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * compiler options preserve them.  G17P has no grounded 64-bit add, so
     * lower it to low/add, carry, high/add.
     *
-    * G17P's 32x32->64 multiply IS grounded (agx3_iadd_core.h, dest_64), but a
-    * full 64x64->64 multiply still needs several of them plus the carry
-    * arithmetic, which is what agx_nir_lower_imul64 builds out of 32-bit
-    * pieces.  Keep that lowering; the only cost of leaving it alone is that
-    * its inner high-word multiply is expanded in software rather than using
-    * one wide imad.  Changing that is a codegen optimisation and belongs with
-    * a hardware measurement, not with enabling the instruction.
+    * G17P's 32x32->64 multiply IS grounded (agx3_iadd_core.h, dest_64): both
+    * *mul_2x32_64 ops reach instruction selection directly and encode as one
+    * widening imad.  A full 64x64->64 multiply needs that widening imad for
+    * the low halves plus 32-bit cross terms for the high word, which is what
+    * agx_nir_lower_imul64 builds.
     *
     * Keep the override local to this compile so the other encodings retain
     * their paths and frontends continue sharing agx_nir_options. */
@@ -11873,9 +11847,10 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
        * That refusal is reached by ordinary shaderInt64 code -- one 64-bit
        * multiply followed by a 64-bit add -- while shaderInt64 is advertised.
        * Lowering here leaves only 32-bit multiplies and adds plus
-       * pack_64_2x32_split, so no rule in the late fusion can form a 64-bit
-       * add out of it, and the expansion additionally gets optimized by the
-       * passes that follow rather than being emitted raw.
+       * pack_64_2x32_split and the unlowered umul_2x32_64, so no rule in the
+       * late fusion can form a 64-bit add out of it, and the expansion
+       * additionally gets optimized by the passes that follow rather than
+       * being emitted raw.
        *
        * The existing call after agx_optimize_nir stays: this pass is
        * idempotent, and it still covers a 64-bit multiply created during
