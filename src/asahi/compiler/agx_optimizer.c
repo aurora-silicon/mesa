@@ -1910,12 +1910,12 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_ballot(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_BITOP) {
          agx_optimizer_bitop(ctx, defs, I);
-         if (0) agx_optimizer_pack_mask(ctx, defs, I);
+         agx_optimizer_pack_mask(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL) {
-         if (0) agx_optimizer_pack_mask(ctx, defs, I);
+         agx_optimizer_pack_mask(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(defs, I);
-         if (0) agx_optimizer_iadd_copy(ctx, defs, I);
+         agx_optimizer_iadd_copy(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_CONVERT) {
          agx_optimizer_narrow_convert(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_FCMPSEL || I->op == AGX_OPCODE_FCMP) {
