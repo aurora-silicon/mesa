@@ -2649,11 +2649,14 @@ agx_get_compute_state_info(struct pipe_context *pctx, void *cso,
                            struct pipe_compute_state_object_info *info)
 {
    union asahi_shader_key key = {0};
+   struct agx_device_key dev_key =
+      agx_gather_device_key(agx_device(pctx->screen));
    struct agx_compiled_shader *so =
       agx_get_shader_variant(agx_screen(pctx->screen), pctx, cso, &key);
 
    info->max_threads =
-      agx_occupancy_for_register_count(so->b.info.nr_gprs).max_threads;
+      agx_occupancy_for_register_count(&dev_key, so->b.info.nr_gprs)
+         .max_threads;
    info->private_memory = 0;
    info->preferred_simd_size = 32;
    info->simd_sizes = 32;

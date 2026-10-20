@@ -6865,7 +6865,9 @@ agx_calc_stats(agx_context *ctx, unsigned size, struct agx2_stats *stats)
       .gprs = ctx->max_reg,
       .uniforms = ctx->out->push_count,
       .scratch = ctx->scratch_size_B,
-      .threads = agx_occupancy_for_register_count(ctx->max_reg).max_threads,
+      .threads =
+         agx_occupancy_for_register_count(&ctx->key->dev, ctx->max_reg)
+            .max_threads,
       .loops = ctx->loop_count,
       .preamble_inst = old_preamble_inst,
    };

@@ -12,6 +12,12 @@
  * best-case thread count.
  *
  * Sorted in ascending order of maximum registers for easy lookup.
+ *
+ * This is AGX2's shared register pool, where registers trade against
+ * residency. AGX3B is deliberately absent: its register file is a fixed
+ * AGX3B_NUM_REGS halves per thread and its compute launch descriptor carries
+ * no register-count field, so residency never trades registers. The
+ * functions below answer that single step for it.
  */
 static const struct agx_occupancy occupancies[] = {
    {104, 1024}, {112, 896}, {128, 832}, {136, 768}, {144, 704},
@@ -19,8 +25,13 @@ static const struct agx_occupancy occupancies[] = {
 };
 
 struct agx_occupancy
-agx_occupancy_for_register_count(unsigned halfregs)
+agx_occupancy_for_register_count(const struct agx_device_key *dev,
+                                 unsigned halfregs)
 {
+   /* Every AGX3B thread owns the whole file whatever it uses. */
+   if (dev->encoding == AGX_ISA_ENCODING_AGX3B)
+      return (struct agx_occupancy){AGX3B_NUM_REGS, 1024};
+
    for (unsigned i = 0; i < ARRAY_SIZE(occupancies); ++i) {
       unsigned max = occupancies[i].max_registers;
       assert((i == 0 || max > occupancies[i - 1].max_registers) && "ascending");
@@ -33,8 +44,14 @@ agx_occupancy_for_register_count(unsigned halfregs)
 }
 
 unsigned
-agx_max_registers_for_occupancy(unsigned occupancy)
+agx_max_registers_for_occupancy(const struct agx_device_key *dev,
+                                unsigned occupancy)
 {
+   if (dev->encoding == AGX_ISA_ENCODING_AGX3B) {
+      assert(occupancy <= 1024 && "Thread count must be less than the maximum");
+      return AGX3B_NUM_REGS;
+   }
+
    unsigned max_regs = 0;
 
    for (unsigned i = 0; i < ARRAY_SIZE(occupancies); ++i) {
