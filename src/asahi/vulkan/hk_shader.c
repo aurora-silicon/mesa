@@ -726,6 +726,35 @@ bounds_check(nir_builder *b, nir_def *data, nir_def *offs, nir_def *bound)
    }
 }
 
+/* Check a load's bounds against a shared "slack" value.  `slack` is
+ * usub_sat(bound, common) where `common` is the shared scalar the load's
+ * offset decomposed to, and `end` is the exclusive byte end of the access
+ * relative to that scalar (delta + byte size).  The access is in bounds iff
+ * common + end <= bound without wrap, which is exactly slack >= end:
+ * usub_sat saturates to 0 when common > bound and a wrapping common + end
+ * only makes slack < end in every case.
+ *
+ * All loads of one vectorized group share the same (bound, common) pair, so
+ * the saturating subtract is emitted once and CSE'd; each component keeps
+ * only its own compare-and-select with its constant end.  On AGX3B the
+ * constant lands on the compare side where it encodes as an inline
+ * immediate, instead of inside the register-only saturating add where it
+ * needed a mov_imm.  The per-component checks are kept so a lane whose
+ * access is in bounds still returns real data when a neighbour is out of
+ * bounds.
+ */
+static nir_def *
+bounds_check_slack(nir_builder *b, nir_def *data, nir_def *slack, uint32_t end)
+{
+   if (data->bit_size == 32 && data->num_components == 1) {
+      /* bounds_agx(data, x, y) = x <= y ? data : 0 */
+      return nir_bounds_agx(b, data, nir_imm_int(b, end), slack);
+   } else {
+      return nir_bcsel(b, nir_uge(b, slack, nir_imm_int(b, end)), data,
+                       nir_imm_zero(b, data->num_components, data->bit_size));
+   }
+}
+
 static bool
 is_op(nir_scalar s, nir_op op)
 {
@@ -912,7 +941,8 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
       uint32_t delta = 0;
       nir_scalar common = hk_bounded_offset_common(
          b, nir_scalar_resolved(offset, 0), &delta, 0);
-      nir_def *off32 = nir_mov_scalar(b, common);
+      nir_def *common_def = nir_mov_scalar(b, common);
+      nir_def *off32 = common_def;
       if (delta) {
          /* common + delta is exactly the original offset, which fits in
           * 32 bits by construction of the split (amul products and nuw adds
@@ -920,7 +950,7 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
           * delta in the index both avoids a 64-bit carry chain and lets the
           * vectoriser parse it as a constant offset difference.
           */
-         off32 = nir_iadd_imm(b, off32, delta);
+         off32 = nir_iadd_imm(b, common_def, delta);
          if (nir_def_is_alu(off32))
             nir_def_as_alu(off32)->no_unsigned_wrap = true;
       }
@@ -958,12 +988,28 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
           * so a lane whose access is in bounds still returns real data when
           * a neighbour is out of bounds. */
          uint64_t end_delta = (uint64_t)delta + load_size;
-         nir_def *end =
-            end_delta > UINT32_MAX
-               ? nir_imm_int(b, UINT32_MAX)
-               : nir_uadd_sat(b, nir_mov_scalar(b, common),
-                              nir_imm_int(b, end_delta));
-         val = bounds_check(b, val, end, bound);
+
+         /* Storage-buffer loads check against a shared slack value instead:
+          * usub_sat(bound, common) is identical for every load of a
+          * vectorized group, so the group pays one saturating subtract and
+          * each lane only its own compare-and-select with an inline
+          * immediate end.  Constant loads keep the saturating add form: the
+          * uniform-DMA peephole recognises its (const end, size) operands
+          * when dropping checks the copy already guarantees. */
+         if (intr->intrinsic == nir_intrinsic_load_global_bounded) {
+            if (end_delta > UINT32_MAX) {
+               val = nir_imm_zero(b, val->num_components, val->bit_size);
+            } else {
+               nir_def *slack = nir_usub_sat(b, bound, common_def);
+               val = bounds_check_slack(b, val, slack, (uint32_t)end_delta);
+            }
+         } else {
+            nir_def *end =
+               end_delta > UINT32_MAX
+                  ? nir_imm_int(b, UINT32_MAX)
+                  : nir_uadd_sat(b, common_def, nir_imm_int(b, end_delta));
+            val = bounds_check(b, val, end, bound);
+         }
       }
 
       nir_def_replace(&intr->def, val);
