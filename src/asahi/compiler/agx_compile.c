@@ -5692,22 +5692,9 @@ agx_emit_g17p_ufind_msb(agx_builder *b, agx_index dst, agx_index value)
    for (unsigned i = 0; i < ARRAY_SIZE(smear_shifts); ++i)
       scan = agx_or(b, scan, agx_g17p_ushr_imm(b, scan, smear_shifts[i]));
 
-   agx_index odd = agx_g17p_and_imm(
-      b, agx_g17p_ushr_imm(b, scan, 1), UINT32_C(0x55555555));
-   scan = agx_iadd(b, scan, agx_neg(odd), 0);
-
-   agx_index pairs_lo = agx_g17p_and_imm(b, scan, UINT32_C(0x33333333));
-   agx_index pairs_hi = agx_g17p_and_imm(
-      b, agx_g17p_ushr_imm(b, scan, 2), UINT32_C(0x33333333));
-   scan = agx_iadd(b, pairs_lo, pairs_hi, 0);
-
-   scan = agx_g17p_and_imm(
-      b, agx_iadd(b, scan, agx_g17p_ushr_imm(b, scan, 4), 0),
-      UINT32_C(0x0f0f0f0f));
-   scan = agx_iadd(b, scan, agx_g17p_ushr_imm(b, scan, 8), 0);
-   scan = agx_iadd(b, scan, agx_g17p_ushr_imm(b, scan, 16), 0);
-
-   agx_index count = agx_g17p_and_imm(b, scan, 0x3f);
+   /* The smeared prefix holds top-bit+1 set bits; the popcount is the
+    * position plus one, so subtract one for the -1-on-zero contract. */
+   agx_index count = agx_popcount(b, scan);
    return agx_iadd_to(b, dst, count, agx_neg(agx_immediate(1)), 0);
 }
 
