@@ -1295,6 +1295,44 @@ pick_bank_affinity(struct ra_ctx *rctx, agx_instr *I, unsigned d,
       }
    }
 
+   /* Scalar and vector export coalescing, as in pick_regs, but admitted only
+    * when the pinned export half lies inside this destination's constrained
+    * window. On the full AGX3B file the occupancy-rounded bound exceeds the
+    * seven-bit TEX/tiling windows, so constrained destinations reach this
+    * path and would otherwise pay a copy per exported channel.
+    */
+   agx_instr *collect_phi = rctx->src_to_collect_phi[I->dest[d].value];
+   if (collect_phi && collect_phi->op == AGX_OPCODE_EXPORT) {
+      const unsigned reg = collect_phi->imm;
+
+      if (reg >= minimum && reg + count <= limit && !(reg % align) &&
+          !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align)) {
+         unsigned lower;
+         if (BITSET_TEST(rctx->early_scalar_export, I->dest[d].value) &&
+             reg + count > *rctx->count[cls] &&
+             find_regs_simple(rctx, cls, count, align, minimum, reg, &lower)) {
+            *out = lower;
+            return true;
+         }
+         *out = reg;
+         return true;
+      }
+   }
+
+   if (collect_phi && collect_phi->op == AGX_OPCODE_SPLIT &&
+       collect_phi->dest[0].type == AGX_INDEX_NORMAL) {
+      agx_instr *exp = rctx->src_to_collect_phi[collect_phi->dest[0].value];
+      if (exp && exp->op == AGX_OPCODE_EXPORT) {
+         const unsigned reg = exp->imm;
+
+         if (reg >= minimum && reg + count <= limit && !(reg % align) &&
+             !BITSET_TEST_COUNT(rctx->used_regs[cls], reg, align)) {
+            *out = reg;
+            return true;
+         }
+      }
+   }
+
    return pick_collect_affinity(rctx, I, d, count, align, out);
 }
 
@@ -2538,8 +2576,8 @@ agx_ra(agx_context *ctx)
                                  ctx->nir->info.workgroup_size[2];
       }
 
-      max_possible_regs =
-         agx_max_registers_for_occupancy(threads_per_workgroup);
+      max_possible_regs = agx_max_registers_for_occupancy(
+         &ctx->key->dev, threads_per_workgroup);
    }
 
    /* G17P's register file is 192 halves. Halves 192..255 still fit its
@@ -2632,7 +2670,7 @@ agx_ra(agx_context *ctx)
    /* If we need multiple waves, see if we can rematerialize constants to save
     * waves. If we only have a single wave regardless, this is pointless.
     */
-   if (effective_demand > agx_round_registers(1) && !spilling) {
+   if (effective_demand > agx_round_registers(&ctx->key->dev, 1) && !spilling) {
       unsigned effective_demand_remat = agx_calc_register_demand(ctx, true);
 
       /* Worst-case assume we need 6 16-bit registers for constants, for a
@@ -2647,10 +2685,13 @@ agx_ra(agx_context *ctx)
          4 + MAX2(2, agx_reserved_registers(ctx));
       if ((effective_demand_remat + remat_slack) < effective_demand) {
          unsigned l = agx_round_registers(
-            align(agx_round_registers(effective_demand_remat + remat_slack), 16));
+            &ctx->key->dev,
+            align(agx_round_registers(&ctx->key->dev,
+                                      effective_demand_remat + remat_slack),
+                  16));
 
          /* Only rematerialize if it actually lets us save a wave */
-         if (l < agx_round_registers(effective_demand)) {
+         if (l < agx_round_registers(&ctx->key->dev, effective_demand)) {
             remat = true;
             max_possible_regs = MIN2(l, max_possible_regs);
          }
@@ -2959,7 +3000,8 @@ agx_ra(agx_context *ctx)
    /* Round up the demand to the maximum number of registers we can use without
     * affecting occupancy. This reduces live range splitting.
     */
-   unsigned max_regs = agx_occupancy_for_register_count(demand).max_registers;
+   unsigned max_regs =
+      agx_occupancy_for_register_count(&ctx->key->dev, demand).max_registers;
    if (ctx->key->is_helper || force_spilling)
       max_regs = max_possible_regs;
 

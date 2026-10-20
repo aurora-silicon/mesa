@@ -623,8 +623,11 @@ struct agx_occupancy {
    unsigned max_threads;
 };
 
-struct agx_occupancy agx_occupancy_for_register_count(unsigned halfregs);
-unsigned agx_max_registers_for_occupancy(unsigned occupancy);
+struct agx_occupancy
+agx_occupancy_for_register_count(const struct agx_device_key *dev,
+                                 unsigned halfregs);
+unsigned agx_max_registers_for_occupancy(const struct agx_device_key *dev,
+                                         unsigned occupancy);
 
 /* Vertex attributes a vertex prolog can hand to the main shader on this
  * device through the register ABI (AGX_ABI_VIN_ATTRIB): component i of the
@@ -642,9 +645,9 @@ unsigned agx_max_vertex_attribs(const struct agx_device_key *dev);
 #endif
 
 static inline unsigned
-agx_round_registers(unsigned halfregs)
+agx_round_registers(const struct agx_device_key *dev, unsigned halfregs)
 {
-   return agx_occupancy_for_register_count(halfregs).max_registers;
+   return agx_occupancy_for_register_count(dev, halfregs).max_registers;
 }
 
 static const nir_shader_compiler_options agx_nir_options = {
