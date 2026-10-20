@@ -4244,6 +4244,7 @@ agx_lower_agx3_widening_int(agx_context *ctx)
          if (src.size != AGX_SIZE_16 || src.type == AGX_INDEX_IMMEDIATE ||
              src.type == AGX_INDEX_NULL || agx_channels(src) != 1)
             continue;
+
          bool is_unsigned = src.abs;
          bool negate = src.neg;
          src.abs = false;
@@ -4679,14 +4680,17 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
           !I->src[0].abs && !I->src[0].neg)
          I->src[0] = agx_mov_imm(&b, 32, I->src[0].value);
       /* A negated full-width IADD source means subtraction, not signed
-       * extension. Materialize the minuend so the native register ISUB can
-       * implement constant - value, including the negation in udiv refinement.
-       * Shifted subtraction has already been lowered to a separate shift. */
+       * extension. Constants up to the isub form's 8-bit minuend field pack
+       * directly; materialize only a wider one so the native register ISUB
+       * can implement constant - value, including the negation in udiv
+       * refinement. Shifted subtraction has already been lowered to a
+       * separate shift. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_IADD && I->nr_dests == 1 && I->nr_srcs == 2 &&
           !I->saturate && !I->shift && I->dest[0].size == AGX_SIZE_32 &&
           I->src[0].type == AGX_INDEX_IMMEDIATE && !I->src[0].abs &&
-          !I->src[0].neg && I->src[1].size == AGX_SIZE_32 &&
+          !I->src[0].neg && I->src[0].value > 0xff &&
+          I->src[1].size == AGX_SIZE_32 &&
           I->src[1].neg && !I->src[1].abs &&
           I->src[1].type != AGX_INDEX_IMMEDIATE) {
          I->src[0] = agx_mov_imm(&b, 32, I->src[0].value);
@@ -5914,10 +5918,22 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
 
    case nir_op_iabs: {
       assert((sz == 16 || sz == 32) && "8-bit absolute values lowered");
-      /* Keep G17P's absolute value independent of signed isel.  The usual
-       * two's-complement identity is exact even for the most negative value,
-       * and a 16-bit value uses the same arithmetic shift, XOR and subtract
-       * at half width. */
+      /* G17P computes 32-bit |x| as max(x, 0 - x): an isub with an
+       * immediate-zero minuend feeds one fused signed compare-select, two
+       * instructions against three for the shift/XOR/subtract identity.
+       * 0 - INT_MIN wraps back to INT_MIN, so max still produces the same
+       * wrapped value the identity does. */
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          sz == 32) {
+         agx_index negated = agx_temp(b->shader, AGX_SIZE_32);
+         agx_iadd_to(b, negated, i0, agx_neg(s0), 0);
+         return agx_icmpsel_to(b, dst, s0, negated, s0, negated,
+                               AGX_ICOND_SGT);
+      }
+      /* Keep the absolute value independent of signed isel elsewhere.  The
+       * usual two's-complement identity is exact even for the most negative
+       * value, and a 16-bit value uses the same arithmetic shift, XOR and
+       * subtract at half width. */
       agx_index sign = agx_asr(b, s0, agx_immediate(sz - 1));
       agx_index magnitude = agx_xor(b, s0, sign);
       return agx_iadd_to(b, dst, magnitude, agx_neg(sign), 0);
@@ -5942,26 +5958,16 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    case nir_op_imsubshl_agx:
       return agx_emit_imadshl_agx(b, instr, dst, s0, s1, agx_neg(s2), s3);
    case nir_op_isub:
-      /* The native G17P subtract form takes two registers. Do not route an
-       * immediate minuend through iadd's narrow-source sign-extension bit:
-       * that bit is not arithmetic negation and would turn `c - x` into
-       * `c + x`.
-       */
+      /* G17P's isub carries an 8-bit immediate minuend itself. A wider or
+       * modified immediate still materializes: routing it through iadd's
+       * narrow-source sign-extension bit would turn `c - x` into `c + x`. */
       if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-          sz == 32 && s0.type == AGX_INDEX_IMMEDIATE)
+          sz == 32 && s0.type == AGX_INDEX_IMMEDIATE &&
+          (s0.value > 0xff || s0.abs || s0.neg))
          s0 = agx_mov_imm(b, 32, s0.value);
       return agx_iadd_to(b, dst, s0, agx_neg(s1), 0);
    case nir_op_ineg:
-      /* G17P's iadd operand modifier is a narrow-source sign extension, not
-       * an arithmetic negate. Materialize the zero minuend so post-RA
-       * instruction selection reaches the native register-register isub
-       * form instead of silently encoding `0 + x`.
-       */
-      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-          sz == 32) {
-         agx_index zero = agx_mov_imm(b, 32, 0);
-         return agx_iadd_to(b, dst, zero, agx_neg(s0), 0);
-      }
+      /* The isub immediate-minuend form encodes `-x` directly on G17P. */
       return agx_iadd_to(b, dst, i0, agx_neg(s0), 0);
    case nir_op_imul:
       return agx_imad_to(b, dst, s0, s1, i0, 0);
