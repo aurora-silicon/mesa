@@ -51,6 +51,41 @@ agx3_alu_popcount(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 }
 
 bool
+agx3_alu_rev(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
+             enum agx3_alu_hint hint, bool dest_cache, uint16_t wait_mask,
+             uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
+{
+   if (enc != AGX_ISA_ENCODING_AGX3B || !out || !len || dest >= 256 ||
+       src >= 256 || ((dest | src) & 1) ||
+       (unsigned)hint > AGX3_ALU_HINT_CACHE || (wait_mask & ~0x3fu))
+      return false;
+
+   /* applegpu_g17p `rev` shares the cbs operand block: f9/f23 select
+    * register operands, f10/f24 the 32-bit widths, f2/f16 the registers,
+    * f11 destination cache, f25/f27 source cache/discard, f31..f36 the six
+    * scoreboard slots. All four reference witnesses are 32-bit
+    * register-to-register:
+    *   a704560403004e04  r2 <- rev(^r0), wait slot 6
+    *   a714540a03104e04  r5 <- rev(^r4), wait slot 1
+    *   a704540403085c04  r2 <- rev(~r2), in-place
+    *   a704540603005c04  r3 <- rev(~r0) */
+   const struct agx3_field_kv base[] = {
+      {9, 2}, {10, 2}, {23, 2}, {24, 2},
+   };
+   struct agx3_field_kv fields[11] = {
+      {2, dest}, {11, dest_cache}, {16, src},
+      {25, hint == AGX3_ALU_HINT_CACHE},
+      {27, hint == AGX3_ALU_HINT_DISCARD},
+   };
+   unsigned n = 5;
+   for (unsigned slot = 0; slot < 6; ++slot) {
+      if (wait_mask & (1u << slot))
+         fields[n++] = (struct agx3_field_kv){31 + slot, 1};
+   }
+   return agx3_bind_compose(enc, "rev", 0, base, 4, fields, n, out, len);
+}
+
+bool
 agx3_alu_ft1_u32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                  enum agx3_alu_hint hint, bool dest_cache,
                  uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
