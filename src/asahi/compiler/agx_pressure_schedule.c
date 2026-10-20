@@ -459,6 +459,14 @@ agx_pressure_schedule(agx_context *ctx)
  * reach (of 192 halves). */
 #define AGX_ILP_CS_MIN_LOADS 8
 #define AGX_ILP_CS_HALVES 128
+/* Absolute pressure (in halves, of 192) at which a compute block cannot
+ * absorb load batching. The block's own peak is not the whole story: a
+ * load-issue block whose results are all live-out shows no pressure of its
+ * own, yet with most of the file live through it every half the batch adds
+ * is paid back in register-allocator copies (vkquake's temporal
+ * accumulation: +45 copies and no spill relief at 191 gprs). Half the file
+ * keeps every measured winner (<= 91 halves) and drops the regression (122). */
+#define AGX_ILP_CS_BUSY_HALVES 96
 
 static unsigned
 ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
@@ -1061,6 +1069,59 @@ ilp_block_independent_loads(const agx_context *ctx, const agx_block *block,
    return loads;
 }
 
+/* Maximum pressure of the block's original order, in halves, including the
+ * values that are merely live through it. ilp_max_pressure counts only what
+ * the block's own instructions touch, so it reads zero for a pure
+ * load-issue block even when the rest of the program fills the file around
+ * it; this walk starts from the weighted live set instead, giving the
+ * register demand the schedule actually has to fit inside. */
+static signed
+ilp_abs_pressure(agx_context *ctx, agx_block *block, void *memctx)
+{
+   /* Halves each SSA value occupies. */
+   uint16_t *vsize = rzalloc_array(memctx, uint16_t, ctx->alloc);
+   if (!vsize)
+      return 0;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         vsize[I->dest[d].value] = agx_index_size_16(I->dest[d]);
+   }
+
+   /* Live set at the logical end, as in ilp_schedule_block. */
+   struct u_sparse_bitset live;
+   u_sparse_bitset_init(&live, ctx->alloc, memctx);
+   u_sparse_bitset_dup(&live, &block->live_out);
+
+   agx_instr *first_after = NULL;
+   agx_foreach_instr_in_block(block, I) {
+      if (instr_after_logical_end(I)) {
+         first_after = I;
+         break;
+      }
+   }
+   if (first_after) {
+      agx_foreach_instr_in_block_rev(block, I) {
+         agx_liveness_ins_update(&live, I);
+         if (I == first_after)
+            break;
+      }
+   }
+
+   signed pressure = 0;
+   for (unsigned v = 0; v < ctx->alloc; ++v)
+      pressure += u_sparse_bitset_test(&live, v) ? vsize[v] : 0;
+
+   signed max_pressure = pressure;
+   agx_foreach_instr_in_block_rev(block, I) {
+      if (instr_after_logical_end(I))
+         continue;
+      pressure += calculate_pressure_delta(I, &live);
+      max_pressure = MAX2(pressure, max_pressure);
+      agx_liveness_ins_update(&live, I);
+   }
+   return max_pressure;
+}
+
 /* Schedule only a small, explicit arithmetic/tile domain. Schedule-class
  * NONE alone is not a purity guarantee (e.g. DOORBELL and texture ops).
  * SSA operands expose all data dependencies; physical register accesses and
@@ -1181,7 +1242,9 @@ agx_ilp_schedule(agx_context *ctx)
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_COMPUTE &&
                  ilp_block_independent_loads(ctx, block, memctx) >=
-                    AGX_ILP_CS_MIN_LOADS) {
+                    AGX_ILP_CS_MIN_LOADS &&
+                 ilp_abs_pressure(ctx, block, memctx) <
+                    AGX_ILP_CS_BUSY_HALVES) {
          /* A straight-line compute block's device loads are mostly
           * independent, but the pressure schedule places each one right
           * before its consumer, so the warp waits on one load at a time.
