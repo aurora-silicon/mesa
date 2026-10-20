@@ -5777,9 +5777,30 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       }
       return agx_popcount_to(b, dst, s0);
    case nir_op_ufind_msb:
-      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-          src_sz == 32)
-         return agx_emit_g17p_ufind_msb(b, dst, s0);
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+         /* G17P's ft1 is the direct hardware ufind_msb, including the
+          * -1-on-zero contract; the packer emits the witnessed
+          * cached-destination wait0 form. Its execution semantics have not
+          * been verified on AGX3B silicon yet (no AGX3B device is reachable
+          * on the development harness), so it stays behind an explicit
+          * opt-in until a real G17P-class run confirms the completed bit
+          * index rather than the internal logarithmic intermediate. */
+         if (src_sz == 32 &&
+             debug_get_bool_option("ASAHI_G17P_FT1", false))
+            return agx_ffs_to(b, dst, s0);
+
+         /* The ft1 encoder admits 32-bit words only. Zero-extending a
+          * narrower source can neither move its top bit nor alter the
+          * -1-on-zero result, so keep the integer smear+popcount sequence on
+          * the widened value. */
+         assert(src_sz <= 32 && dst.size == AGX_SIZE_32);
+         agx_index scan_src = s0;
+         if (src_sz < 32) {
+            scan_src = agx_temp(b->shader, AGX_SIZE_32);
+            agx_mov_to(b, scan_src, s0);
+         }
+         return agx_emit_g17p_ufind_msb(b, dst, scan_src);
+      }
       return agx_ffs_to(b, dst, s0);
       BINOP(iand, and);
       BINOP(ior, or);
