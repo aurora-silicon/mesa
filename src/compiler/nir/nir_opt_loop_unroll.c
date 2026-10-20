@@ -1119,7 +1119,7 @@ process_loops(nir_function_impl *impl, nir_cf_node *cf_node, bool *has_nested_lo
       if (loop->info->exact_trip_count_known) {
          simple_unroll(loop);
          progress = true;
-      } else {
+      } else if (!impl->function->shader->options->no_inexact_loop_unroll) {
          /* Attempt to unroll loops with two terminators. */
          unsigned num_lt = list_length(&loop->info->loop_terminator_list);
          if (num_lt == 2 &&

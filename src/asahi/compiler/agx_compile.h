@@ -693,6 +693,7 @@ static const nir_shader_compiler_options agx_nir_options = {
    .has_load_global_bounded = true,
    .support_16bit_alu = true,
    .max_unroll_iterations = 32,
+   .no_inexact_loop_unroll = true,
    .lower_uniforms_to_ubo = true,
    .late_lower_int64 = true,
    .lower_int64_options =

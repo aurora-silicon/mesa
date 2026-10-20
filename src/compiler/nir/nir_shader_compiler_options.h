@@ -786,6 +786,11 @@ typedef struct nir_shader_compiler_options {
    unsigned max_unroll_iterations_aggressive;
    unsigned max_unroll_iterations_fp64;
 
+   /** Do not unroll loops whose trip count is only bounded, not exact.
+    * Complex unrolling produces a nested if-ladder, which is a poor fit for
+    * predicate-stack ISAs where every level issues instructions. */
+   bool no_inexact_loop_unroll;
+
    /** Register pressure a loop can be under before nir_opt_gcm stops moving
     * instructions out of it for free.
     *
