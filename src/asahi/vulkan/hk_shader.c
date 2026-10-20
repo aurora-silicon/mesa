@@ -804,23 +804,176 @@ bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
    return nir_bcsel(b, valid, def, nir_imm_int(b, 0));
 }
 
+/* Try to decompose a bounded load's offset into a shared "common" scalar and
+ * a constant byte delta, so the emitted addresses differ only by a constant
+ * and nir_opt_load_store_vectorize can merge neighbouring loads.
+ *
+ * We only distribute the constant through amul: amul(x + k, s) is exactly
+ * amul(x, s) + k * s because amul's operand and product are defined to fit in
+ * 32 bits, so the rewritten sum cannot wrap either.  Anything else is returned
+ * whole as the common scalar with no delta; such loads are still correct, they
+ * just do not vectorize.
+ */
+static nir_scalar
+hk_bounded_offset_common(nir_builder *b, nir_scalar off, uint32_t *delta,
+                         unsigned depth)
+{
+   off = nir_scalar_chase_movs(off);
+   if (depth > 8 || !nir_scalar_is_alu(off))
+      return off;
+   depth++;
+
+   /* iadd marked no_unsigned_wrap may have a constant folded out exactly. */
+   if (nir_scalar_alu_op(off) == nir_op_iadd &&
+       nir_def_as_alu(off.def)->no_unsigned_wrap) {
+      nir_scalar x = nir_scalar_chase_alu_src(off, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(off, 1);
+      if (nir_scalar_is_const(y)) {
+         *delta += nir_scalar_as_uint(y);
+         return hk_bounded_offset_common(b, x, delta, depth);
+      }
+      if (nir_scalar_is_const(x)) {
+         *delta += nir_scalar_as_uint(x);
+         return hk_bounded_offset_common(b, y, delta, depth);
+      }
+      return off;
+   }
+
+   if (nir_scalar_alu_op(off) != nir_op_amul)
+      return off;
+
+   nir_scalar a = nir_scalar_chase_alu_src(off, 0);
+   nir_scalar s = nir_scalar_chase_alu_src(off, 1);
+   if (!nir_scalar_is_const(s)) {
+      if (!nir_scalar_is_const(a))
+         return off;
+      nir_scalar t = a;
+      a = s;
+      s = t;
+   }
+
+   uint32_t mul = nir_scalar_as_uint(s);
+
+   /* Strip constant adds out of the multiplicand.  As above this is exact
+    * because the amul product is defined not to overflow.
+    */
+   uint32_t add = 0;
+   while (nir_scalar_is_alu(a) && nir_scalar_alu_op(a) == nir_op_iadd &&
+          depth++ < 8) {
+      nir_scalar x = nir_scalar_chase_alu_src(a, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(a, 1);
+      if (nir_scalar_is_const(y)) {
+         add += nir_scalar_as_uint(y);
+         a = x;
+      } else if (nir_scalar_is_const(x)) {
+         add += nir_scalar_as_uint(x);
+         a = y;
+      } else {
+         break;
+      }
+   }
+
+   if (!add)
+      return off;
+
+   *delta += add * mul;
+   return nir_get_scalar(
+      nir_amul(b, nir_mov_scalar(b, a), nir_imm_int(b, mul)), 0);
+}
+
 static void
-lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
+lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
+                          bool soft_fault)
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *base = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
-
-   /* Bounds check compatibly with the hardware address mode */
-   nir_def *valid = check_in_bounds(b, intr);
-   base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
-   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
+   nir_def *bound = intr->src[2].ssa;
 
    enum gl_access_qualifier access = nir_intrinsic_access(intr);
 
    if (intr->intrinsic == nir_intrinsic_load_global_constant_bounded) {
       access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
    }
+
+   unsigned bit_size = intr->def.bit_size;
+   assert(bit_size >= 8 && bit_size % 8 == 0);
+   unsigned load_size = (bit_size / 8) * intr->num_components;
+
+   if (soft_fault) {
+      /* With soft faults an out-of-bounds device load cannot hang the GPU, so
+       * issue the load at its real address and mask the result instead of
+       * clamping the address to the zero page.  The per-lane mask preserves
+       * the partial-out-of-bounds semantics exactly: a lane whose access is
+       * in bounds still returns real data when a neighbour is out of bounds.
+       * Splitting a constant delta out of the offset lets
+       * nir_opt_load_store_vectorize merge adjacent loads into vectors.
+       */
+      uint32_t delta = 0;
+      nir_scalar common = hk_bounded_offset_common(
+         b, nir_scalar_resolved(offset, 0), &delta, 0);
+      nir_def *off32 = nir_mov_scalar(b, common);
+      if (delta) {
+         /* common + delta is exactly the original offset, which fits in
+          * 32 bits by construction of the split (amul products and nuw adds
+          * do not overflow), so flagging the add nuw is honest.  Keeping the
+          * delta in the index both avoids a 64-bit carry chain and lets the
+          * vectoriser parse it as a constant offset difference.
+          */
+         off32 = nir_iadd_imm(b, off32, delta);
+         if (nir_def_is_alu(off32))
+            nir_def_as_alu(off32)->no_unsigned_wrap = true;
+      }
+      nir_def *addr = nir_iadd(b, base, nir_u2u64(b, off32));
+
+      nir_def *val;
+      if (intr->intrinsic == nir_intrinsic_load_global_constant_bounded) {
+         val = nir_load_global_constant(
+            b, intr->def.num_components, intr->def.bit_size, addr,
+            .align_mul = nir_intrinsic_align_mul(intr),
+            .align_offset = nir_intrinsic_align_offset(intr),
+            .access = access);
+      } else {
+         val = nir_load_global(
+            b, intr->def.num_components, intr->def.bit_size, addr,
+            .align_mul = nir_intrinsic_align_mul(intr),
+            .align_offset = nir_intrinsic_align_offset(intr),
+            .access = access);
+      }
+
+      nir_scalar offs = nir_scalar_resolved(offset, 0);
+      if (nir_scalar_is_const(offs)) {
+         /* Compare the exclusive end against the descriptor's byte size.
+          * Do not round the access down: a descriptor ending exactly where
+          * this load begins must return zero with robustBufferAccess2. */
+         uint64_t end = (uint64_t)nir_scalar_as_uint(offs) + load_size;
+         val = end <= UINT32_MAX
+                  ? bounds_check(b, val, nir_imm_int(b, end), bound)
+                  : nir_imm_zero(b, val->num_components, val->bit_size);
+      } else {
+         /* Saturation makes a wrapping address fail the unsigned check.
+          * The exclusive end is common + delta + load_size, which cannot
+          * wrap for a split offset, so it is computed from the shared
+          * common scalar directly.  Each lane keeps its own bounds check,
+          * so a lane whose access is in bounds still returns real data when
+          * a neighbour is out of bounds. */
+         uint64_t end_delta = (uint64_t)delta + load_size;
+         nir_def *end =
+            end_delta > UINT32_MAX
+               ? nir_imm_int(b, UINT32_MAX)
+               : nir_uadd_sat(b, nir_mov_scalar(b, common),
+                              nir_imm_int(b, end_delta));
+         val = bounds_check(b, val, end, bound);
+      }
+
+      nir_def_replace(&intr->def, val);
+      return;
+   }
+
+   /* Bounds check compatibly with the hardware address mode */
+   nir_def *valid = check_in_bounds(b, intr);
+   base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
 
    nir_def *val = nir_load_global(
       b, intr->def.num_components, intr->def.bit_size,
@@ -838,31 +991,19 @@ lower_load_global_constant_offset_instr(nir_builder *b,
    bool *has_soft_fault = data;
 
    if (intrin->intrinsic == nir_intrinsic_load_global_bounded ||
-       (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
-        !(*has_soft_fault))) {
+       intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
 
-      lower_load_global_bounded(b, intrin);
+      lower_load_global_bounded(b, intrin, *has_soft_fault);
       return true;
    }
 
-   if (intrin->intrinsic != nir_intrinsic_load_global_constant_offset &&
-       intrin->intrinsic != nir_intrinsic_load_global_constant_bounded)
+   if (intrin->intrinsic != nir_intrinsic_load_global_constant_offset)
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
 
    nir_def *base_addr = intrin->src[0].ssa;
    nir_def *offset = intrin->src[1].ssa;
-   nir_def *bound = NULL;
-
-   unsigned bit_size = intrin->def.bit_size;
-   assert(bit_size >= 8 && bit_size % 8 == 0);
-   unsigned byte_size = bit_size / 8;
-   unsigned load_size = byte_size * intrin->num_components;
-
-   if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
-      bound = intrin->src[2].ssa;
-   }
 
    unsigned align_mul = nir_intrinsic_align_mul(intrin);
    unsigned align_offset = nir_intrinsic_align_offset(intrin);
@@ -871,23 +1012,6 @@ lower_load_global_constant_offset_instr(nir_builder *b,
       b, intrin->def.num_components, intrin->def.bit_size,
       nir_iadd(b, base_addr, nir_u2u64(b, offset)), .align_mul = align_mul,
       .align_offset = align_offset, .access = nir_intrinsic_access(intrin));
-
-   if (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded) {
-      nir_scalar offs = nir_scalar_resolved(offset, 0);
-      if (nir_scalar_is_const(offs)) {
-         /* Compare the exclusive end against the descriptor's byte size.
-          * Do not round the access down: a descriptor ending exactly where
-          * this load begins must return zero with robustBufferAccess2. */
-         uint64_t end = (uint64_t)nir_scalar_as_uint(offs) + load_size;
-         val = end <= UINT32_MAX
-                  ? bounds_check(b, val, nir_imm_int(b, end), bound)
-                  : nir_imm_zero(b, val->num_components, val->bit_size);
-      } else {
-         /* Saturation makes a wrapping address fail the unsigned check. */
-         offset = nir_uadd_sat(b, offset, nir_imm_int(b, load_size));
-         val = bounds_check(b, val, offset, bound);
-      }
-   }
 
    nir_def_replace(&intrin->def, val);
    return true;
