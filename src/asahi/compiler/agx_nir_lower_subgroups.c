@@ -248,7 +248,7 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
       .lower_read_first_invocation = true,
       .lower_inverse_ballot = true,
       .lower_to_scalar = true,
-      .lower_relative_shuffle = true,
+      .lower_relative_shuffle = false,
       .lower_rotate_to_shuffle = true,
       .lower_subgroup_masks = true,
       .lower_reduce = true,

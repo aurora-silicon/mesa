@@ -3342,6 +3342,37 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       return agx_shuffle_to(b, dst, agx_src_index(&instr->src[0]), lane);
    }
 
+   case nir_intrinsic_shuffle_xor:
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down: {
+      b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;
+
+      agx_index data = agx_src_index(&instr->src[0]);
+      agx_index lane = agx_src_index(&instr->src[1]);
+
+      /*
+       * 16-bit shift shuffles have no immediate-lane encoding; only the
+       * register-lane form is admitted for them. The XOR form is fine either
+       * way.
+       */
+      if (data.size == AGX_SIZE_16 &&
+          instr->intrinsic != nir_intrinsic_shuffle_xor &&
+          lane.type == AGX_INDEX_IMMEDIATE) {
+         agx_index reg = agx_temp(b->shader, AGX_SIZE_32);
+         agx_mov_imm_to(b, reg, lane.value);
+         lane = reg;
+      }
+
+      switch (instr->intrinsic) {
+      case nir_intrinsic_shuffle_xor:
+         return agx_shuffle_xor_to(b, dst, data, lane);
+      case nir_intrinsic_shuffle_up:
+         return agx_shuffle_up_to(b, dst, data, lane);
+      default:
+         return agx_shuffle_down_to(b, dst, data, lane);
+      }
+   }
+
    case nir_intrinsic_quad_broadcast: {
       /* TODO: Check if we're actually inside divergent control flow */
       b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;
