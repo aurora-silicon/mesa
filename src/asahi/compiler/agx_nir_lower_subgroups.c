@@ -162,6 +162,69 @@ agx_clustered_reduce_eligible(const nir_intrinsic_instr *intr)
           (intr->def.bit_size == 16 || intr->def.bit_size == 32);
 }
 
+/* Whether a 64-bit min/max reduction takes the two-phase hi/lo lowering
+ * in lower(): a scalar reduce over a subgroup shape the hardware reduce
+ * covers natively (whole subgroup or quad cluster -- the clustered
+ * lowering above owns 8/16, and those are the only shapes isel admits).
+ * A 64-bit minmax is decided by the high word first; only lanes whose
+ * high word ties the winner put their low word into the second reduce:
+ *
+ *    w_hi = reduce(hi, op)
+ *    lo'  = bcsel(ieq(hi, w_hi), lo, identity)
+ *    w_lo = reduce(lo', unsigned op)
+ *    res  = pack64(w_hi, w_lo)
+ *
+ * The low word always compares unsigned, so the identity masking losing
+ * lanes is the unsigned one -- ~0 for a min, 0 for a max -- regardless of
+ * the signedness the high-word reduce used.  Masking is purely lane-local;
+ * inactive lanes contribute nothing because the hardware reduce skips
+ * them, the same assumption the native 32-bit reduce path makes.
+ */
+static bool
+agx_minmax64_reduce_eligible(const nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_reduce ||
+       !nir_intrinsic_has_cluster_size(intr))
+      return false;
+
+   unsigned cluster = nir_intrinsic_cluster_size(intr);
+   if (cluster != 0 && cluster != 4 && cluster < 32)
+      return false;
+
+   if (intr->def.num_components != 1 || intr->def.bit_size != 64)
+      return false;
+
+   switch (nir_intrinsic_reduction_op(intr)) {
+   case nir_op_umin:
+   case nir_op_umax:
+   case nir_op_imin:
+   case nir_op_imax:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Emit a scalar reduce intrinsic over `data`, preserving the cluster
+ * shape so isel picks the same quad/full-subgroup form it would for a
+ * native-width reduce.
+ */
+static nir_def *
+agx_subgroup_reduce(nir_builder *b, nir_op op, unsigned cluster,
+                    nir_def *data)
+{
+   nir_intrinsic_instr *red =
+      nir_intrinsic_instr_create(b->shader, nir_intrinsic_reduce);
+   red->num_components = data->num_components;
+   red->src[0] = nir_src_for_ssa(data);
+   nir_intrinsic_set_reduction_op(red, op);
+   nir_intrinsic_set_cluster_size(red, cluster);
+   nir_def_init(&red->instr, &red->def, data->num_components,
+                data->bit_size);
+   nir_builder_instr_insert(b, &red->instr);
+   return &red->def;
+}
+
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -278,6 +341,33 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_reduce: {
+      if (agx_minmax64_reduce_eligible(intr)) {
+         nir_op red_op = nir_intrinsic_reduction_op(intr);
+         unsigned cluster = nir_intrinsic_cluster_size(intr);
+         nir_def *x = intr->src[0].ssa;
+
+         nir_def *lo = nir_unpack_64_2x32_split_x(b, x);
+         nir_def *hi = nir_unpack_64_2x32_split_y(b, x);
+
+         /* The high word decides with the source signedness. */
+         nir_def *w_hi = agx_subgroup_reduce(b, red_op, cluster, hi);
+
+         /* Only lanes tied on the high word put their low word into the
+          * second reduce; the rest supply the identity of the low-word
+          * op, which always compares unsigned. */
+         nir_op lo_op = (red_op == nir_op_umin || red_op == nir_op_imin)
+                           ? nir_op_umin
+                           : nir_op_umax;
+         nir_const_value ident = nir_alu_binop_identity(lo_op, 32);
+         nir_def *identity = nir_build_imm(b, 1, 32, &ident);
+         nir_def *tied = nir_bcsel(b, nir_ieq(b, hi, w_hi), lo, identity);
+
+         nir_def *w_lo = agx_subgroup_reduce(b, lo_op, cluster, tied);
+         nir_def_rewrite_uses(&intr->def,
+                              nir_pack_64_2x32_split(b, w_lo, w_hi));
+         return true;
+      }
+
       if (!agx_clustered_reduce_eligible(intr))
          return false;
 
@@ -407,7 +497,8 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    /* Scans and clustered reductions handled by the guarded lowerings in
     * lower() stay intrinsics and reach it untouched.
     */
-   if (agx_scan_eligible(intr) || agx_clustered_reduce_eligible(intr))
+   if (agx_scan_eligible(intr) || agx_clustered_reduce_eligible(intr) ||
+       agx_minmax64_reduce_eligible(intr))
       return false;
 
    /* Hardware supports quad ops but no other support clustered reductions. */
