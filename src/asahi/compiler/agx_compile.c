@@ -5661,11 +5661,11 @@ agx_emit_g17p_interleave(agx_builder *b, agx_index dst,
 static agx_instr *
 agx_emit_g17p_bitrev(agx_builder *b, agx_index dst, agx_index value)
 {
-   /* AGX3's BITREV opcode is not grounded. Express GLSL
-    * bitfieldReverse() with the ordinary G17P shifts and bitwise operations
-    * instead. Every shift below is a compile-time constant and every mask is
-    * exact, so this is the conventional five-stage 32-bit permutation rather
-    * than an approximation of an unknown native instruction. */
+   /* Composed-shift fallback for bit reversals the native AGX3 REV does not
+    * cover -- only the 32-bit register form is grounded. Every shift below is
+    * a compile-time constant and every mask is exact, so this is the
+    * conventional five-stage 32-bit permutation rather than an approximation
+    * of an unknown native instruction. */
    static const struct {
       uint8_t shift;
       uint32_t mask;
@@ -5772,8 +5772,12 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
       }
       return agx_mov_to(b, dst, s0);
    case nir_op_bitfield_reverse:
+      /* AGX3B has a grounded native 32-bit register bit reversal; the
+       * composed-shift sequence remains for widths it does not cover. */
       if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           src_sz == 32)
+         return agx_bitrev_to(b, dst, s0);
+      if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
          return agx_emit_g17p_bitrev(b, dst, s0);
       return agx_bitrev_to(b, dst, s0);
    case nir_op_bit_count:

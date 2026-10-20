@@ -15251,6 +15251,33 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
+         /* The native 32-bit register bit reversal. Only word-wide
+          * operands reach this point; narrower sources are widened before
+          * register allocation. */
+         if (enc == AGX_ISA_ENCODING_AGX3B &&
+             I->op == AGX_OPCODE_BITREV && I->nr_dests == 1 &&
+             I->nr_srcs == 1) {
+            const agx_index dest = I->dest[0], src = I->src[0];
+            if (dest.size != AGX_SIZE_32 || src.size != AGX_SIZE_32 ||
+                !agx3_src_is_register(dest) || dest.memory ||
+                agx_channels(dest) != 1 ||
+                !agx3_src_is_register(src) || src.memory ||
+                agx_channels(src) != 1 || src.abs || src.neg)
+               AGX3_REFUSE(I);
+
+            uint8_t bytes[AGX3_ALU_MAX_LENGTH], length;
+            enum agx3_alu_hint hint = agx3_post_ra_hint(src);
+            /* An in-place reversal consumes the old register value and then
+             * overwrites it, the witnessed discard form. */
+            if (hint == AGX3_ALU_HINT_NONE && dest.value == src.value)
+               hint = AGX3_ALU_HINT_DISCARD;
+            if (!agx3_alu_rev(enc, dest.value, src.value, hint, dest.cache,
+                              wait, bytes, &length) ||
+                !agx3_append(emission, bytes, length))
+               AGX3_REFUSE(I);
+            continue;
+         }
+
          /* ~(a | b) (truth table 0x1), a & ~b (0x2), ~a & b (0x4),
           * ~(a & b) (0x7), ~(a ^ b) (0x9), a | ~b (0xB) and ~a | b (0xD) are
           * their own two-register instructions; the one-sided forms take

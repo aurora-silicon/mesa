@@ -39,6 +39,13 @@ bool agx3_alu_popcount(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                        uint16_t wait_mask,
                        uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
+/* Native G17P 32-bit register bit reversal (rev), with post-RA source
+ * lifetime, destination caching and producer waits. */
+bool agx3_alu_rev(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
+                  enum agx3_alu_hint hint, bool dest_cache,
+                  uint16_t wait_mask,
+                  uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
+
 /* Whether agx3_alu_compose()'s form for `op` marks source `i` (in
  * f_src0/f_src1/f_src2 order) dead. */
 bool agx3_alu_form_ends_source(enum agx_isa_encoding enc, enum agx3_alu_op op,
