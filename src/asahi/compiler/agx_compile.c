@@ -11943,7 +11943,9 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * the body). Rotate single-exit counted loops the same way before the
     * main optimization loop, so the copied test is optimized with the rest. */
    if (is_g17p) {
-      /* Uniform loops only (bw_copy regression, see nir_opt_loop.c). */
+      /* Rotate uniform-exit loops, and divergent-exit loops whose bodies
+       * are memory-free; a memory-streaming divergent loop keeps its top
+       * test (bw_copy regression, see nir_opt_loop.c). */
       nir_divergence_analysis(nir);
       bool rotated = false;
       NIR_PASS(rotated, nir, nir_opt_loop_rotate, true);

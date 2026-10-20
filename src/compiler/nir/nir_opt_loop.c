@@ -468,8 +468,33 @@ rotate_counted_loop_ok(nir_loop *loop, nir_block *header_block,
    return breaks == 1;
 }
 
+/* A loop body whose boundary state stays small when the rotated form wraps
+ * it in a guard `if`: no memory ops at all (any intrinsic carrying an
+ * ACCESS index -- loads, stores, atomics, image ops), nothing else that
+ * cannot be reordered freely (barriers, volatile ops), and no texture
+ * samples whose multi-component results would all stay live across the
+ * guard edge. */
 static bool
-opt_loop_peel_initial_break(nir_loop *loop, bool rotate_counted)
+loop_body_memory_free(nir_loop *loop)
+{
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_tex)
+            return false;
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (nir_intrinsic_has_access(intr) ||
+                !nir_intrinsic_can_reorder(intr))
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+opt_loop_peel_initial_break(nir_loop *loop, bool rotate_counted,
+                            bool require_uniform_exit)
 {
    nir_block *header_block = nir_loop_first_block(loop);
    nir_block *prev_block = nir_cf_node_cf_tree_prev(&loop->cf_node);
@@ -498,6 +523,21 @@ opt_loop_peel_initial_break(nir_loop *loop, bool rotate_counted)
        !nir_is_trivial_loop_if(nif, last_then)) {
       return false;
    }
+
+   /* The rotated shape copies the exit test into a guard `if` wrapping the
+    * loop, which always costs the duplicated compare plus the guard's
+    * cndst/cndef/cndend predicate stack ops and the boundary register
+    * copies.  For a divergent exit the guard is a predicated region that
+    * additionally holds every loop-carried value live across the guard
+    * edge; when the body streams memory the inflated live state is large --
+    * on G17P rotating the crossos bw_copy kernel's two divergent-exit
+    * load->store loops grew it from 46 to 60 instructions and 23 to 39 GPR
+    * halves.  Divergent-exit loops therefore rotate only when the body is
+    * pure compute, where the cost is the same small guard overhead the
+    * uniform-rotation case already pays. */
+   if (require_uniform_exit && nif->condition.ssa->divergent &&
+       !loop_body_memory_free(loop))
+      return false;
 
    /* If do_work_2() ends in a break or other kind of jump then we can't move
     * it to the top of the loop ahead of do_work_1().
@@ -806,7 +846,7 @@ opt_loop_cf_list(nir_builder *b, struct exec_list *cf_list,
          assert(!nir_loop_has_continue_construct(loop));
          progress |= opt_loop_cf_list(b, &loop->body, loop);
          progress |= opt_loop_last_block(nir_loop_last_block(loop), true, false);
-         progress |= opt_loop_peel_initial_break(loop, false);
+         progress |= opt_loop_peel_initial_break(loop, false, false);
          break;
       }
 
@@ -832,13 +872,16 @@ rotate_loops_cf_list(struct exec_list *cf_list, bool uniform_only)
          if (nir_loop_has_continue_construct(loop))
             continue;
          progress |= rotate_loops_cf_list(&loop->body, uniform_only);
-         /* uniform_only: the caller ran nir_divergence_analysis. A loop whose
-          * exit differs between invocations (a grid-stride loop) keeps its
-          * top test. On G17P, rotating the crossos bw_copy kernel's two such
-          * loops grew it from 46 to 60 instructions and 23 to 39 GPR halves. */
-         if (uniform_only && nir_loop_is_divergent(loop))
-            continue;
-         progress |= opt_loop_peel_initial_break(loop, true);
+         /* uniform_only: the caller ran nir_divergence_analysis. The exit
+          * test is what matters -- a loop whose exit differs between
+          * invocations (a grid-stride loop) only rotates when its body is
+          * memory-free, because rotating it duplicates that divergent test
+          * into the guard (the bw_copy regression; see
+          * opt_loop_peel_initial_break for the mechanism).  The per-exit
+          * check is finer than nir_loop_is_divergent: a loop marked
+          * divergent for another reason still rotates when its exit is
+          * uniform or its body is pure compute. */
+         progress |= opt_loop_peel_initial_break(loop, true, uniform_only);
       }
    }
    return progress;
