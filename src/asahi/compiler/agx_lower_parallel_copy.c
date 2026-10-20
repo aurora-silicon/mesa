@@ -169,9 +169,176 @@ split_32bit_copy(struct copy_ctx *ctx, struct agx_copy *entry)
    ctx->physreg_dest[entry->dest + 1] = new_entry;
 }
 
+/* Whether swapping entry's destination with its source resolves the whole
+ * component: every pending copy reading the destination must read back
+ * exactly its own new home afterwards, i.e. this is a two-cycle (possibly
+ * split across the halves of a wider entry). Rotating a two-cycle through
+ * the scratch register costs a save plus two moves, never less than the
+ * three XORs of a single swap, so those keep the swap path.
+ */
+static bool
+swap_resolves_component(struct copy_ctx *ctx, struct agx_copy *entry)
+{
+   const unsigned width = agx_size_align_16(entry->src.size);
+
+   for (unsigned j = 0; j < ctx->entry_count; j++) {
+      const struct agx_copy *blocking = &ctx->entries[j];
+
+      if (blocking->done || !is_real(blocking))
+         continue;
+
+      unsigned src = blocking->src.value;
+      unsigned n = agx_size_align_16(blocking->src.size);
+
+      if (src + n <= entry->dest || src >= entry->dest + width)
+         continue;
+
+      /* After the swap a source half inside the destination window would be
+       * read back from src + offset. The copy ends trivial only when the
+       * whole window is covered and lands exactly on its destination.
+       */
+      if (src < entry->dest || src + n > entry->dest + width ||
+          blocking->dest != entry->src.value + (src - entry->dest))
+         return false;
+   }
+
+   return true;
+}
+
+/*
+ * Emit a copy saving `entry`'s destination into the scratch register, then
+ * retarget every pending copy that read the destination to read the scratch
+ * instead. The cycle through that destination becomes a path the ordinary
+ * copy machinery drains, resolving an n-entry cycle in n+1 moves instead of
+ * the 3(n-1) XORs that repeated swapping costs.
+ *
+ * `scratch` is the 16-bit index of an aligned register pair (two halves)
+ * holding no live value at the emission point; the caller proves it dead.
+ * Only used for GPR cycles: memory cycles already swap through r4/r6.
+ */
+static void
+break_cycle_scratch(agx_builder *b, struct copy_ctx *ctx,
+                    struct agx_copy *entry, unsigned scratch)
+{
+   assert(is_real(entry) && !entry->dest_mem && !entry->src.memory);
+   const unsigned width = agx_size_align_16(entry->src.size);
+
+   agx_mov_to(b, agx_register(scratch, entry->src.size),
+              agx_register(entry->dest, entry->src.size));
+
+   /* Split any blocking copies whose sources are only partially contained
+    * within our destination, as in the swap path below. With an aligned
+    * destination window this can only happen for a 16-bit destination inside
+    * a 32-bit source.
+    */
+   if (width == 1) {
+      for (unsigned j = 0; j < ctx->entry_count; j++) {
+         struct agx_copy *blocking = &ctx->entries[j];
+
+         if (blocking->done)
+            continue;
+
+         if (blocking->src.value <= entry->dest &&
+             blocking->src.value + 1 >= entry->dest &&
+             agx_size_align_16(blocking->src.size) == 2) {
+            split_32bit_copy(ctx, blocking);
+         }
+      }
+   }
+
+   /* Every pending copy reading the saved destination now reads the
+    * temporary. The destination is no longer a source, so the copy writing
+    * it unblocks and the cycle drains one move at a time.
+    */
+   for (unsigned j = 0; j < ctx->entry_count; j++) {
+      struct agx_copy *blocking = &ctx->entries[j];
+
+      if (blocking->done || !is_real(blocking))
+         continue;
+
+      if (blocking->src.value < entry->dest ||
+          blocking->src.value >= entry->dest + width)
+         continue;
+
+      unsigned offset = blocking->src.value - entry->dest;
+      unsigned n = agx_size_align_16(blocking->src.size);
+
+      for (unsigned k = 0; k < n; ++k) {
+         assert(ctx->physreg_use_count[blocking->src.value + k] > 0);
+         ctx->physreg_use_count[blocking->src.value + k]--;
+         ctx->physreg_use_count[scratch + offset + k]++;
+      }
+
+      blocking->src.value = scratch + offset;
+   }
+}
+
+/* Steps 1 and 2 of parallel copy lowering: emit every copy whose destination
+ * is not the pending source of another, splitting partially blocked 32-bit
+ * copies, until only cycles remain.
+ */
+static void
+drain_copies(agx_builder *b, struct copy_ctx *ctx)
+{
+   bool progress = true;
+   while (progress) {
+      progress = false;
+
+      /* Step 1: resolve paths in the transfer graph. This means finding
+       * copies whose destination aren't blocked by something else and then
+       * emitting them, continuing this process until every copy is blocked
+       * and there are only cycles left.
+       *
+       * TODO: We should note that src is also available in dest to unblock
+       * cycles that src is involved in.
+       */
+
+      for (unsigned i = 0; i < ctx->entry_count; i++) {
+         struct agx_copy *entry = &ctx->entries[i];
+         if (!entry->done && !entry_blocked(entry, ctx)) {
+            entry->done = true;
+            progress = true;
+            do_copy(b, entry);
+            for (unsigned j = 0; j < agx_size_align_16(entry->src.size); j++) {
+               if (is_real(entry))
+                  ctx->physreg_use_count[entry->src.value + j]--;
+               ctx->physreg_dest[entry->dest + j] = NULL;
+            }
+         }
+      }
+
+      if (progress)
+         continue;
+
+      /* Step 2: Find partially blocked copies and split them. In the
+       * mergedregs case, we can 32-bit copies which are only blocked on one
+       * 16-bit half, and splitting them helps get things moving.
+       *
+       * We can skip splitting copies if the source isn't a register,
+       * however, because it does not unblock anything and therefore doesn't
+       * contribute to making forward progress with step 1. These copies
+       * should still be resolved eventually in step 1 because they can't be
+       * part of a cycle.
+       */
+      for (unsigned i = 0; i < ctx->entry_count; i++) {
+         struct agx_copy *entry = &ctx->entries[i];
+         if (entry->done || (agx_size_align_16(entry->src.size) != 2))
+            continue;
+
+         if (((ctx->physreg_use_count[entry->dest] == 0 ||
+               ctx->physreg_use_count[entry->dest + 1] == 0)) &&
+             is_real(entry)) {
+            split_32bit_copy(ctx, entry);
+            progress = true;
+         }
+      }
+   }
+}
+
 static void
 agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
-                                   unsigned num_copies, bool cls)
+                                   unsigned num_copies, bool cls,
+                                   unsigned scratch)
 {
    /* First, lower away 64-bit copies to smaller chunks, since we don't have
     * 64-bit ALU so we always want to split.
@@ -281,59 +448,8 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
       next_copy->done = true;
    }
 
-   bool progress = true;
-   while (progress) {
-      progress = false;
-
-      /* Step 1: resolve paths in the transfer graph. This means finding
-       * copies whose destination aren't blocked by something else and then
-       * emitting them, continuing this process until every copy is blocked
-       * and there are only cycles left.
-       *
-       * TODO: We should note that src is also available in dest to unblock
-       * cycles that src is involved in.
-       */
-
-      for (unsigned i = 0; i < ctx->entry_count; i++) {
-         struct agx_copy *entry = &ctx->entries[i];
-         if (!entry->done && !entry_blocked(entry, ctx)) {
-            entry->done = true;
-            progress = true;
-            do_copy(b, entry);
-            for (unsigned j = 0; j < agx_size_align_16(entry->src.size); j++) {
-               if (is_real(entry))
-                  ctx->physreg_use_count[entry->src.value + j]--;
-               ctx->physreg_dest[entry->dest + j] = NULL;
-            }
-         }
-      }
-
-      if (progress)
-         continue;
-
-      /* Step 2: Find partially blocked copies and split them. In the
-       * mergedregs case, we can 32-bit copies which are only blocked on one
-       * 16-bit half, and splitting them helps get things moving.
-       *
-       * We can skip splitting copies if the source isn't a register,
-       * however, because it does not unblock anything and therefore doesn't
-       * contribute to making forward progress with step 1. These copies
-       * should still be resolved eventually in step 1 because they can't be
-       * part of a cycle.
-       */
-      for (unsigned i = 0; i < ctx->entry_count; i++) {
-         struct agx_copy *entry = &ctx->entries[i];
-         if (entry->done || (agx_size_align_16(entry->src.size) != 2))
-            continue;
-
-         if (((ctx->physreg_use_count[entry->dest] == 0 ||
-               ctx->physreg_use_count[entry->dest + 1] == 0)) &&
-             is_real(entry)) {
-            split_32bit_copy(ctx, entry);
-            progress = true;
-         }
-      }
-   }
+   /* Steps 1 and 2: resolve paths, leaving only cycles. */
+   drain_copies(b, ctx);
 
    /* Step 3: resolve cycles through swapping.
     *
@@ -384,6 +500,19 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
          continue;
       }
 
+      /* With a dead scratch register, break the cycle by saving this
+       * destination to it: the cycle becomes a path that drains with one
+       * move per copy instead of three XORs per swap. Components a single
+       * swap resolves outright -- two-cycles, including ones split across
+       * the halves of a wider entry -- keep the cheaper XOR swap.
+       */
+      if (scratch != AGX_PCOPY_NO_SCRATCH &&
+          !swap_resolves_component(ctx, entry)) {
+         break_cycle_scratch(b, ctx, entry, scratch);
+         drain_copies(b, ctx);
+         continue;
+      }
+
       do_swap(b, entry);
 
       /* Split any blocking copies whose sources are only partially
@@ -428,7 +557,7 @@ agx_emit_parallel_copies_for_class(agx_builder *b, struct agx_copy *copies,
 
 void
 agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
-                         unsigned num_copies)
+                         unsigned num_copies, unsigned scratch)
 {
    /* Emit copies fo reach register class separately because we don't have
     * register class awareness in the parallel copy lowering data structure.
@@ -436,6 +565,10 @@ agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
    if (num_copies == 0)
       return;
 
-   agx_emit_parallel_copies_for_class(b, copies, num_copies, false);
-   agx_emit_parallel_copies_for_class(b, copies, num_copies, true);
+   /* The scratch register only exists in the GPR file; memory cycles keep
+    * using the swap path, which has its own temporaries.
+    */
+   agx_emit_parallel_copies_for_class(b, copies, num_copies, false, scratch);
+   agx_emit_parallel_copies_for_class(b, copies, num_copies, true,
+                                      AGX_PCOPY_NO_SCRATCH);
 }
