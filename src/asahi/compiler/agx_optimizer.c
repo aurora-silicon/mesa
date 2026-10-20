@@ -718,7 +718,9 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
       /* AGX2 can carry the zero-extension modifier on integer arithmetic and
        * compare-select, but the grounded G17P forms are width-matched.
        * Preserve the explicit 16-to-32 move so the AGX3 packer emits its
-       * witnessed COPY-low plus CLR-high sequence first. */
+       * witnessed COPY-low plus CLR-high sequence first. ft1 belongs too: its
+       * encoder admits a 32-bit register operand only, so the extension must
+       * stay materialized. */
       if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           def->src[0].size == AGX_SIZE_16 && src.size == AGX_SIZE_32 &&
           (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD ||
@@ -728,7 +730,8 @@ agx_optimizer_copyprop(agx_context *ctx, agx_instr **defs, agx_instr *I)
            I->op == AGX_OPCODE_BITOP || I->op == AGX_OPCODE_BALLOT ||
            I->op == AGX_OPCODE_QUAD_BALLOT ||
            I->op == AGX_OPCODE_ICMP_BALLOT ||
-           I->op == AGX_OPCODE_ICMP_QUAD_BALLOT))
+           I->op == AGX_OPCODE_ICMP_QUAD_BALLOT ||
+           I->op == AGX_OPCODE_FFS))
          continue;
 
       /* Optimize split(64-bit uniform) so we can get better copyprop of the
