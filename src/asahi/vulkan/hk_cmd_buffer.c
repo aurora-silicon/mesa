@@ -1916,15 +1916,14 @@ hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
 }
 
 /* The buffer descriptor an AGX3_UNIFORM_DMA_BUFFER span names, as the root
- * this draw publishes (set < 0) or the descriptor set bound or pushed at
- * `set` holds it. The shader was compiled for a static layout of that set
- * (agx_shader_key::g17p_dma_static_set_mask), so its contents cannot change
- * before the launch runs. An unbound set reads as a null buffer. */
-static bool
-hk_g17p_dma_buffer(const struct hk_cmd_buffer *cmd, int set,
+ * this launch publishes (set < 0) or the descriptor set bound or pushed at
+ * `set` in `desc` holds it. The shader was compiled for a static layout of
+ * that set (agx_shader_key::g17p_dma_static_set_mask), so its contents cannot
+ * change before the launch runs. An unbound set reads as a null buffer. */
+bool
+hk_g17p_dma_buffer(const struct hk_descriptor_state *desc, int set,
                    unsigned descriptor_B, struct hk_buffer_address *buffer)
 {
-   const struct hk_descriptor_state *desc = &cmd->state.gfx.descriptors;
    const void *table;
    size_t table_B;
    if (set < 0) {
@@ -2261,7 +2260,8 @@ hk_g17p_graphics_uniform_ranges(
 
       if (span->source == AGX3_UNIFORM_DMA_BUFFER) {
          struct hk_buffer_address buffer;
-         if (!hk_g17p_dma_buffer(cmd, set, span->descriptor_B, &buffer))
+         if (!hk_g17p_dma_buffer(&cmd->state.gfx.descriptors, set,
+                                 span->descriptor_B, &buffer))
             return hk_g17p_graphics_ranges_refused(range_count, count);
 
          /* Dwords below the size rounded up to 4 bytes come from the buffer,
@@ -2648,7 +2648,7 @@ hk_g17p_launch_replay(struct hk_cmd_buffer *cmd,
          /* As hk_g17p_graphics_uniform_ranges(), for a buffer that still
           * covers the whole span; otherwise the span splits differently. */
          struct hk_buffer_address buffer;
-         if (!hk_g17p_dma_buffer(cmd,
+         if (!hk_g17p_dma_buffer(&gfx->descriptors,
                                  launch->set[i] == HK_G17P_LAUNCH_ROOT_SET
                                     ? -1 : launch->set[i],
                                  launch->descriptor_B[i], &buffer) ||
