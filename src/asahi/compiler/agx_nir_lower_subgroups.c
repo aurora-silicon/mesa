@@ -423,11 +423,15 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 
    case nir_op_fmin:
    case nir_op_fmax:
-      /* Fresh G17P witnesses pin the native qRedfmin/qRedfmax forms. Keep
-       * every other target and non-quad shape on the established common
-       * lowering path. */
-      if (agx_options->g17p_clustered_float && cluster == 4 &&
-          intr->def.bit_size == 32)
+      /* Fresh G17P witnesses pin the native qRedfmin/qRedfmax forms, and the
+       * same captures show sRedfmin/sRedfmax for full-subgroup reduces. Keep
+       * every other target and non-quad clustered shape on the established
+       * common lowering path. Scans of float min/max have no prefix
+       * encoding and must always take the common lowering. */
+      if (agx_options->g17p_clustered_float &&
+          intr->def.bit_size == 32 &&
+          intr->intrinsic == nir_intrinsic_reduce &&
+          (cluster == 4 || cluster == 0 || cluster >= 32))
          return false;
       return true;
 
