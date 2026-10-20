@@ -524,20 +524,35 @@ agx3_alu_float_reg(enum agx_isa_encoding enc, enum agx3_alu_op op,
    return false;
 }
 
-bool
-agx3_alu_fadd_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
-                    uint8_t staging_slot, const uint16_t src[2],
-                    const enum agx3_alu_hint hints[2], uint16_t wait_mask,
-                    uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
+static bool
+agx3_alu_stage_arith(enum agx_isa_encoding enc, enum agx3_alu_op op,
+                     uint16_t staging_dest, uint8_t staging_slot,
+                     const enum agx3_alu_stage_src classes[2],
+                     const uint16_t src[2],
+                     const enum agx3_alu_hint hints[2], uint16_t wait_mask,
+                     uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
-   if (enc != AGX_ISA_ENCODING_AGX3B || !src || !hints || !out || !len ||
-       (staging_dest & 1) || staging_dest >= 256 || staging_slot < 1 ||
-       staging_slot > 6 || (wait_mask & ~UINT16_C(0x3f)))
+   if (enc != AGX_ISA_ENCODING_AGX3B || !classes || !src || !hints || !out ||
+       !len || (staging_dest & 1) || staging_dest >= 256 ||
+       staging_slot < 1 || staging_slot > 6 ||
+       (op != AGX3_ALU_FADD && op != AGX3_ALU_FMUL) ||
+       (wait_mask & ~UINT16_C(0x3f)))
+      return false;
+
+   /* Witnessed routings only: the uniform sits in the first operand's
+    * f42=3/f36 slot and the minifloat immediate in the second operand's
+    * f25=1/f17 slot.  Neither special source carries liveness hints. */
+   if (classes[0] > AGX3_ALU_STAGE_IMMEDIATE ||
+       classes[1] > AGX3_ALU_STAGE_IMMEDIATE ||
+       classes[0] == AGX3_ALU_STAGE_IMMEDIATE ||
+       classes[1] == AGX3_ALU_STAGE_UNIFORM)
       return false;
 
    for (unsigned i = 0; i < 2; ++i) {
-      if ((src[i] & 1) || src[i] >= 256 ||
-          (unsigned)hints[i] > AGX3_ALU_HINT_CACHE)
+      if (src[i] >= 256 || (unsigned)hints[i] > AGX3_ALU_HINT_CACHE ||
+          (classes[i] == AGX3_ALU_STAGE_REGISTER && (src[i] & 1)) ||
+          (classes[i] != AGX3_ALU_STAGE_REGISTER &&
+           hints[i] != AGX3_ALU_HINT_NONE))
          return false;
    }
 
@@ -545,33 +560,84 @@ agx3_alu_fadd_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
     *
     *   09 01 3c 09 40 c0   stage[0] = r4 + r0, slot1, wait6
     *   19 03 3c 05 40 00   stage[2] = r2 + r1, slot1
+    *   09 83 25 0c 40 02   stage[0] = u12 * r1, slot1   (f42=3/f36)
+    *   59 81 25 81 c9 00 00 08
+    *                       stage[10] = r0 * 1/64, slot3 (f25=1/f17)
     *
     * f9=5 changes the destination from a GPR (f2) to staging (f5), while
-    * f12 names the shared coordinate transaction.  Source operands and
-    * dependency waits retain the ordinary f32add fields. */
-   const struct agx3_field_kv base[] = {
-      {9, 5}, {10, 2}, {25, 2}, {26, 2}, {42, 2}, {43, 2},
+    * f12 names the shared coordinate transaction.  f42/f25 select the two
+    * operand classes, retaining the ordinary f32add/f32mul fields. */
+   struct agx3_field_kv base[10] = {
+      {9, 5}, {10, 2}, {26, 2}, {43, 2},
+      {42, classes[0] == AGX3_ALU_STAGE_UNIFORM ? 3 : 2},
+      {25, classes[1] == AGX3_ALU_STAGE_IMMEDIATE ? 1 : 2},
    };
-   struct agx3_field_kv fields[16] = {
-      {5, staging_dest}, {12, staging_slot}, {13, 0},
-      {35, src[0]}, {18, src[1]},
-      {44, hints[0] == AGX3_ALU_HINT_CACHE},
-      {46, hints[0] == AGX3_ALU_HINT_DISCARD},
-      {27, hints[1] == AGX3_ALU_HINT_CACHE},
-      {29, hints[1] == AGX3_ALU_HINT_DISCARD},
-   };
-   unsigned n = 9;
-   for (unsigned slot = 0; slot < 6; ++slot) {
-      if (wait_mask & (1u << slot))
-         fields[n++] = (struct agx3_field_kv){(uint16_t)(52 + slot), 1};
+   unsigned nb = 6;
+   const unsigned wait0 = op == AGX3_ALU_FMUL ? 80 : 52;
+   if (op == AGX3_ALU_FMUL) {
+      base[nb++] = (struct agx3_field_kv){60, 2};
+      base[nb++] = (struct agx3_field_kv){74, 2};
    }
 
-   for (unsigned ep = 0; ep <= 3; ++ep) {
-      if (agx3_bind_compose(enc, "f32add", ep, base, 6, fields, n, out, len))
+   struct agx3_field_kv fields[16] = {
+      {5, staging_dest}, {12, staging_slot}, {13, 0},
+   };
+   unsigned n = 3;
+   if (classes[0] == AGX3_ALU_STAGE_UNIFORM) {
+      fields[n++] = (struct agx3_field_kv){36, src[0]};
+   } else {
+      fields[n++] = (struct agx3_field_kv){35, src[0]};
+      fields[n++] =
+         (struct agx3_field_kv){44, hints[0] == AGX3_ALU_HINT_CACHE};
+      fields[n++] =
+         (struct agx3_field_kv){46, hints[0] == AGX3_ALU_HINT_DISCARD};
+   }
+   if (classes[1] == AGX3_ALU_STAGE_IMMEDIATE) {
+      fields[n++] = (struct agx3_field_kv){17, src[1]};
+   } else {
+      fields[n++] = (struct agx3_field_kv){18, src[1]};
+      fields[n++] =
+         (struct agx3_field_kv){27, hints[1] == AGX3_ALU_HINT_CACHE};
+      fields[n++] =
+         (struct agx3_field_kv){29, hints[1] == AGX3_ALU_HINT_DISCARD};
+   }
+   for (unsigned slot = 0; slot < 6; ++slot) {
+      if (wait_mask & (1u << slot))
+         fields[n++] = (struct agx3_field_kv){(uint16_t)(wait0 + slot), 1};
+   }
+
+   const char *mnemonic = op == AGX3_ALU_FMUL ? "f32mul" : "f32add";
+   const unsigned last_ep = op == AGX3_ALU_FMUL ? 5 : 3;
+   for (unsigned ep = 0; ep <= last_ep; ++ep) {
+      if (agx3_bind_compose(enc, mnemonic, ep, base, nb, fields, n, out, len))
          return true;
    }
 
    return false;
+}
+
+bool
+agx3_alu_fadd_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
+                    uint8_t staging_slot,
+                    const enum agx3_alu_stage_src classes[2],
+                    const uint16_t src[2],
+                    const enum agx3_alu_hint hints[2], uint16_t wait_mask,
+                    uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
+{
+   return agx3_alu_stage_arith(enc, AGX3_ALU_FADD, staging_dest, staging_slot,
+                               classes, src, hints, wait_mask, out, len);
+}
+
+bool
+agx3_alu_fmul_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
+                    uint8_t staging_slot,
+                    const enum agx3_alu_stage_src classes[2],
+                    const uint16_t src[2],
+                    const enum agx3_alu_hint hints[2], uint16_t wait_mask,
+                    uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
+{
+   return agx3_alu_stage_arith(enc, AGX3_ALU_FMUL, staging_dest, staging_slot,
+                               classes, src, hints, wait_mask, out, len);
 }
 
 bool

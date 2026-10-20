@@ -9061,19 +9061,38 @@ agx3_implicit_coord_stage_producer(const agx_instr *I)
        I->saturate)
       return false;
 
-   /* These are the two native terminal-coordinate forms needed by ordinary
-    * smooth sampling and compositor UV+offset sampling. Other arithmetic
-    * stays on the established GPR plus COPY path until its staging destination
-    * form is grounded independently. */
-   return I->op == AGX_OPCODE_PERSP_MUL_AGX3 ||
-          (I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 &&
-           I->src[0].type == AGX_INDEX_NORMAL &&
-           I->src[1].type == AGX_INDEX_NORMAL &&
-           I->src[0].size == AGX_SIZE_32 &&
-           I->src[1].size == AGX_SIZE_32 &&
-           agx_channels(I->src[0]) == 1 &&
-           agx_channels(I->src[1]) == 1 && !I->src[0].abs &&
-           !I->src[0].neg && !I->src[1].abs && !I->src[1].neg);
+   /* These are the native terminal-coordinate forms needed by smooth
+    * sampling, compositor UV+offset sampling and coordinate scaling. Other
+    * arithmetic stays on the established GPR plus COPY path until its staging
+    * destination form is grounded independently. */
+   if (I->op == AGX_OPCODE_PERSP_MUL_AGX3)
+      return true;
+
+   if ((I->op != AGX_OPCODE_FADD && I->op != AGX_OPCODE_FMUL) ||
+       I->nr_srcs != 2)
+      return false;
+
+   /* The staged add/multiply publish keeps one f32 register operand; its peer
+    * is a second register, a minifloat immediate, or (add only) a uniform. */
+   unsigned reg = 0, special = 0;
+   for (unsigned s = 0; s < 2; ++s) {
+      const agx_index src = I->src[s];
+      if (src.memory || src.abs || src.neg || agx_channels(src) != 1)
+         return false;
+      if (src.type == AGX_INDEX_NORMAL && src.size == AGX_SIZE_32) {
+         reg++;
+      } else if (src.type == AGX_INDEX_IMMEDIATE &&
+                 src.size == AGX_SIZE_16 && src.value < 256) {
+         special++;
+      } else if (I->op == AGX_OPCODE_FADD &&
+                 src.type == AGX_INDEX_UNIFORM &&
+                 src.size == AGX_SIZE_32 && src.value < 256) {
+         special++;
+      } else {
+         return false;
+      }
+   }
+   return reg >= 1 && reg + special == 2;
 }
 
 /* Mark the last two scalar coordinate operations of a straight-line implicit
@@ -9110,13 +9129,18 @@ agx3_mark_implicit_tex_coord_staging(agx_context *ctx)
    }
 
    bool progress = false;
+   /* The sampler consumes each staged coordinate pair as one scoreboard
+    * transaction, and the packer models a single open transaction at a time:
+    * a second one may only open after the previous sample closed. Producer
+    * sinks land just before the COLLECT, so that collect has to sit after the
+    * last staged sample for the two transactions not to overlap. */
+   const agx_instr *last_staged = NULL;
    agx_foreach_instr_global(ctx, sample) {
       const bool plain_implicit =
          sample->op == AGX_OPCODE_TEXTURE_SAMPLE && sample->nr_srcs == 6 &&
          sample->lod_mode == AGX_LOD_MODE_AUTO_LOD &&
          sample->dim == AGX_DIM_2D && !sample->shadow && !sample->offset &&
-         !sample->sparse &&
-         sample->gather == AGX_GATHER_NONE;
+         !sample->sparse;
       if (!plain_implicit || sample->src[0].type != AGX_INDEX_NORMAL ||
           sample->src[0].size != AGX_SIZE_32 ||
           agx_channels(sample->src[0]) != 2 ||
@@ -9149,6 +9173,23 @@ agx3_mark_implicit_tex_coord_staging(agx_context *ctx)
       if (!valid || producer[0] == producer[1])
          continue;
 
+      /* A second coordinate transaction may only open after the previous
+       * sample closed.  The producers sink to just before the collect, so
+       * reject any collect that still sits at or before the last staged
+       * sample; the packer fails outright on overlapping transactions. */
+      if (last_staged != NULL) {
+         bool overlaps = false;
+         for (struct list_head *l = collect->link.next; l != &sample->link;
+              l = l->next) {
+            if (l == &last_staged->link) {
+               overlaps = true;
+               break;
+            }
+         }
+         if (overlaps)
+            continue;
+      }
+
       /* Apple's G17P implicit fragment emits every coefficient interpolation
        * before it opens the coordinate-staging transaction, then publishes X
        * and Y consecutively. Keep an unrelated interpolation out of that
@@ -9169,10 +9210,7 @@ agx3_mark_implicit_tex_coord_staging(agx_context *ctx)
       producer[0]->agx3_tex_coord_start = true;
       sample->agx3_tex_coords_staged = true;
       progress = true;
-      /* One synthetic staging token is modeled by the slot planner. A later
-       * sample retains the existing immediate COPY path; broad overlapping
-       * staging groups need distinct native lifetime evidence. */
-      break;
+      last_staged = sample;
    }
 
    return progress;

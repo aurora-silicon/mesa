@@ -422,12 +422,36 @@ bool agx3_alu_float_reg(enum agx_isa_encoding enc, enum agx3_alu_op op,
                          const enum agx3_alu_hint hints[3], uint16_t wait_mask,
                          uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
+/* Source classes witnessed on the staging-destination f32 add/multiply.
+ * A register source carries the usual cache/discard hints; a uniform or
+ * minifloat-immediate source takes none.  In the native witnesses the uniform
+ * only ever occupies the first operand's f42=3/f36 slot and the minifloat
+ * only the second operand's f25=1/f17 slot; other routings stay refused. */
+enum agx3_alu_stage_src {
+   AGX3_ALU_STAGE_REGISTER,
+   AGX3_ALU_STAGE_UNIFORM,
+   AGX3_ALU_STAGE_IMMEDIATE,
+};
+
 /* Write a scalar f32 add directly to the texture staging file.  Native
  * fragment shaders use this destination class for the last coordinate
  * arithmetic before an implicit sample; a later GPR-to-staging COPY loses
  * helper-lane derivative provenance at an odd hardware-scissor edge. */
 bool agx3_alu_fadd_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
-                         uint8_t staging_slot, const uint16_t src[2],
+                         uint8_t staging_slot,
+                         const enum agx3_alu_stage_src classes[2],
+                         const uint16_t src[2],
+                         const enum agx3_alu_hint hints[2],
+                         uint16_t wait_mask,
+                         uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
+
+/* The f32 multiply writes staging on the same f9=5 destination class; the
+ * coordinate scale publish is witnessed for register, uniform and minifloat
+ * sources (e.g. `59812581c9000008`, `798525114002`). */
+bool agx3_alu_fmul_stage(enum agx_isa_encoding enc, uint16_t staging_dest,
+                         uint8_t staging_slot,
+                         const enum agx3_alu_stage_src classes[2],
+                         const uint16_t src[2],
                          const enum agx3_alu_hint hints[2],
                          uint16_t wait_mask,
                          uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);

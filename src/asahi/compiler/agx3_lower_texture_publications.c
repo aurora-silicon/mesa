@@ -486,12 +486,20 @@ staging_without_resource(const agx_instr *I)
 static bool
 fma_staging_producer(const agx_instr *I, bool immutable_uniforms)
 {
-   if (!I || I->op != AGX_OPCODE_FFMA || I->nr_srcs != 3 || I->nr_dests != 1 ||
+   if (!I || I->nr_dests != 1 ||
        I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].size != AGX_SIZE_32 ||
        agx_channels(I->dest[0]) != 1 || I->saturate || I->agx3_tex_coord_stage)
       return false;
+   /* The staged FMA is established; the staged add and multiply publish a
+    * coordinate the same way for the witnessed (register, register),
+    * (register, minifloat) and (uniform, register) routings. */
+   const unsigned nsrc =
+      I->op == AGX_OPCODE_FFMA   ? 3 :
+      I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ? 2 : 0;
+   if (!nsrc || I->nr_srcs != nsrc)
+      return false;
    unsigned special = 0;
-   for (unsigned i = 0; i < 3; ++i) {
+   for (unsigned i = 0; i < nsrc; ++i) {
       const agx_index src = I->src[i];
       const bool immediate = src.type == AGX_INDEX_IMMEDIATE;
       if (src.size != (immediate ? AGX_SIZE_16 : AGX_SIZE_32) ||
