@@ -50,6 +50,35 @@ agx_scan_eligible(const nir_intrinsic_instr *intr)
    }
 }
 
+/* Shuffle read of data[index] for a per-lane index.
+ *
+ * The hardware shuffle instruction chooses a single index within the
+ * target quad to shuffle each source quad with: the low two index bits
+ * are accumulated across the quad, so they must not be quad divergent.
+ * A raw read_invocation with an arbitrary per-lane index therefore reads
+ * the wrong lane -- this is what broke the first version of the scan
+ * lowering on hardware.  To implement an arbitrary index, pull each low
+ * 2-bits index in the quad separately, as with nir_intrinsic_shuffle.
+ */
+static nir_def *
+agx_subgroup_read(nir_builder *b, nir_def *data, nir_def *index)
+{
+   nir_def *quad_start = nir_iand_imm(b, index, 0x1c);
+   nir_def *result = NULL;
+
+   for (unsigned i = 0; i < 4; ++i) {
+      nir_def *target_i = nir_iadd_imm(b, quad_start, i);
+      nir_def *shuf = nir_read_invocation(b, data, target_i);
+
+      if (result)
+         result = nir_bcsel(b, nir_ieq(b, index, target_i), shuf, result);
+      else
+         result = shuf;
+   }
+
+   return result;
+}
+
 /* Subgroup scan over the active-lane predecessor chain.
  *
  * The common lowering guards a full-subgroup Kogge-Stone sweep with a
@@ -92,9 +121,9 @@ agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
    for (unsigned i = 0; i < 5; ++i) {
       nir_def *ok = nir_ult_imm(b, f, 32);
       nir_def *idx = nir_umin_imm(b, f, 31);
-      nir_def *buddy = nir_read_invocation(b, v, idx);
+      nir_def *buddy = agx_subgroup_read(b, v, idx);
       v = nir_bcsel(b, ok, nir_build_alu2(b, red_op, v, buddy), v);
-      nir_def *next = nir_read_invocation(b, f, idx);
+      nir_def *next = agx_subgroup_read(b, f, idx);
       f = nir_bcsel(b, ok, next, f);
    }
 
@@ -106,7 +135,7 @@ agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
     */
    nir_def *ok = nir_ult_imm(b, prev, 32);
    nir_def *idx = nir_umin_imm(b, prev, 31);
-   nir_def *buddy = nir_read_invocation(b, v, idx);
+   nir_def *buddy = agx_subgroup_read(b, v, idx);
    nir_const_value ident = nir_alu_binop_identity(red_op, data->bit_size);
    nir_def *identity = nir_build_imm(b, 1, data->bit_size, &ident);
    return nir_bcsel(b, ok, buddy, identity);
@@ -196,27 +225,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_shuffle: {
-      nir_def *data = intr->src[0].ssa;
-      nir_def *target = intr->src[1].ssa;
-
-      /* The hardware shuffle instruction chooses a single index within the
-       * target quad to shuffle each source quad with. Consequently, the low
-       * 2-bits of shuffle indices should not be quad divergent.  To implement
-       * arbitrary shuffle, pull each low 2-bits index in the quad separately.
-       */
-      nir_def *quad_start = nir_iand_imm(b, target, 0x1c);
-      nir_def *result = NULL;
-
-      for (unsigned i = 0; i < 4; ++i) {
-         nir_def *target_i = nir_iadd_imm(b, quad_start, i);
-         nir_def *shuf = nir_read_invocation(b, data, target_i);
-
-         if (result)
-            result = nir_bcsel(b, nir_ieq(b, target, target_i), shuf, result);
-         else
-            result = shuf;
-      }
-
+      nir_def *result =
+         agx_subgroup_read(b, intr->src[0].ssa, intr->src[1].ssa);
       nir_def_rewrite_uses(&intr->def, result);
       return true;
    }
