@@ -164,6 +164,97 @@ TEST(FminmaxConstantDenorm, DeepSelectorsKeepConservativeFlush)
    ralloc_free(b.shader);
 }
 
+TEST(FminmaxConstantDenorm, MinmaxChainFlushesOnlyAtExit)
+{
+   /* Each intermediate result stays inside the min/max algebra, so only the
+    * final result that leaves it gets the canonicalizing fadd.
+    */
+   for (bool is_max : {false, true}) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "chain ftz");
+      nir_def *a = agx_test_load_preamble(&b, 1, 32, 0);
+      nir_def *c = agx_test_load_preamble(&b, 1, 32, 4);
+      nir_def *d = agx_test_load_preamble(&b, 1, 32, 8);
+      nir_def *inner = is_max ? nir_fmax(&b, a, c) : nir_fmin(&b, a, c);
+      nir_def *mid = is_max ? nir_fmax(&b, inner, d) : nir_fmin(&b, inner, d);
+      nir_def *out = is_max ? nir_fmin(&b, mid, a) : nir_fmax(&b, mid, a);
+      agx_test_store_output(&b, out, nir_imm_int(&b, 0), nir_type_float32,
+                            FRAG_RESULT_DATA0);
+      ASSERT_TRUE(agx_nir_lower_fminmax(b.shader));
+      EXPECT_EQ(fadds(b.shader), 1u);
+      nir_validate_shader(b.shader, "chain ftz");
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(FminmaxConstantDenorm, MinmaxChainThroughPhiFlushesOnce)
+{
+   /* Copies, selects and phis plumb the edge through to the next min/max
+    * without observing it, so they do not defeat the elision.
+    */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "chain phi ftz");
+   nir_def *a = agx_test_load_preamble(&b, 1, 32, 0);
+   nir_def *c = agx_test_load_preamble(&b, 1, 32, 4);
+   nir_def *d = agx_test_load_preamble(&b, 1, 32, 8);
+   nir_def *condition = nir_ieq_imm(&b, nir_load_sample_id(&b), 0);
+   nir_push_if(&b, condition);
+   nir_def *then_min = nir_fmin(&b, a, c);
+   nir_push_else(&b, NULL);
+   nir_def *else_min = nir_fmax(&b, d, a);
+   nir_pop_if(&b, NULL);
+   nir_def *value = nir_if_phi(&b, then_min, else_min);
+   nir_def *out = nir_fmin(&b, value, d);
+   agx_test_store_output(&b, out, nir_imm_int(&b, 0), nir_type_float32,
+                         FRAG_RESULT_DATA0);
+   ASSERT_TRUE(agx_nir_lower_fminmax(b.shader));
+   EXPECT_EQ(fadds(b.shader), 1u);
+   nir_validate_shader(b.shader, "chain phi ftz");
+   ralloc_free(b.shader);
+}
+
+TEST(FminmaxConstantDenorm, LeavingUseKeepsFlush)
+{
+   /* A result that leaves the min/max algebra still flushes; the downstream
+    * min/max then sees the canonicalized edge.
+    */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "fanout ftz");
+   nir_def *a = agx_test_load_preamble(&b, 1, 32, 0);
+   nir_def *c = agx_test_load_preamble(&b, 1, 32, 4);
+   nir_def *d = agx_test_load_preamble(&b, 1, 32, 8);
+   nir_def *inner = nir_fmin(&b, a, c);
+   agx_test_store_output(&b, inner, nir_imm_int(&b, 0), nir_type_float32,
+                         FRAG_RESULT_DATA0);
+   nir_def *out = nir_fmin(&b, inner, d);
+   agx_test_store_output(&b, out, nir_imm_int(&b, 1), nir_type_float32,
+                         FRAG_RESULT_DATA0);
+   ASSERT_TRUE(agx_nir_lower_fminmax(b.shader));
+   EXPECT_EQ(fadds(b.shader), 2u);
+   nir_validate_shader(b.shader, "fanout ftz");
+   ralloc_free(b.shader);
+}
+
+TEST(FminmaxConstantDenorm, LoweredMinmaxConsumerKeepsFlush)
+{
+   /* An already-lowered fmin_agx decided canonicalization while our result
+    * still claimed to flush; it cannot absorb the edge, so the flush stays.
+    */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &agx_nir_options, "lowered consumer ftz");
+   nir_def *a = agx_test_load_preamble(&b, 1, 32, 0);
+   nir_def *c = agx_test_load_preamble(&b, 1, 32, 4);
+   nir_def *d = agx_test_load_preamble(&b, 1, 32, 8);
+   nir_def *inner = nir_fmin(&b, a, c);
+   nir_def *out = nir_fmin_agx(&b, inner, d);
+   agx_test_store_output(&b, out, nir_imm_int(&b, 0), nir_type_float32,
+                         FRAG_RESULT_DATA0);
+   ASSERT_TRUE(agx_nir_lower_fminmax(b.shader));
+   EXPECT_EQ(fadds(b.shader), 1u);
+   nir_validate_shader(b.shader, "lowered consumer ftz");
+   ralloc_free(b.shader);
+}
+
 TEST(FminmaxConstantDenorm, RawMinmaxDoesNotProveCanonicalization)
 {
    for (bool phi : {false, true}) {
