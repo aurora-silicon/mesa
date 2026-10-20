@@ -14,7 +14,8 @@
       agx_builder *A = agx_test_builder(mem_ctx);                              \
       agx_builder *B = agx_test_builder(mem_ctx);                              \
                                                                                \
-      agx_emit_parallel_copies(A, copies, ARRAY_SIZE(copies));                 \
+      agx_emit_parallel_copies(A, copies, ARRAY_SIZE(copies),              \
+                               AGX_PCOPY_NO_SCRATCH);                      \
                                                                                \
       {                                                                        \
          agx_builder *b = B;                                                   \
@@ -174,6 +175,76 @@ TEST_F(LowerParallelCopy, Cycle3)
    });
 }
 
+TEST_F(LowerParallelCopy, Cycle3WithScratch)
+{
+   struct agx_copy test[] = {
+      {.dest = 0, .src = agx_register(1, AGX_SIZE_16)},
+      {.dest = 1, .src = agx_register(2, AGX_SIZE_16)},
+      {.dest = 2, .src = agx_register(0, AGX_SIZE_16)},
+   };
+
+   agx_builder *A = agx_test_builder(mem_ctx);
+   agx_builder *B = agx_test_builder(mem_ctx);
+
+   agx_emit_parallel_copies(A, test, ARRAY_SIZE(test), 4);
+
+   agx_mov_to(B, agx_register(4, AGX_SIZE_16), agx_register(0, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(0, AGX_SIZE_16), agx_register(1, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(1, AGX_SIZE_16), agx_register(2, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(2, AGX_SIZE_16), agx_register(4, AGX_SIZE_16));
+
+   ASSERT_SHADER_EQUAL(A->shader, B->shader);
+}
+
+TEST_F(LowerParallelCopy, SwapWithScratch)
+{
+   struct agx_copy test[] = {
+      {.dest = 0, .src = agx_register(2, AGX_SIZE_32)},
+      {.dest = 2, .src = agx_register(0, AGX_SIZE_32)},
+   };
+
+   agx_builder *A = agx_test_builder(mem_ctx);
+   agx_builder *B = agx_test_builder(mem_ctx);
+
+   /* A 2-cycle costs the same three moves through a scratch as the XOR
+    * swap, so it keeps the swap path even with a scratch available.
+    */
+   agx_emit_parallel_copies(A, test, ARRAY_SIZE(test), 8);
+
+   agx_swap(B, agx_register(0, AGX_SIZE_32), agx_register(2, AGX_SIZE_32));
+
+   ASSERT_SHADER_EQUAL(A->shader, B->shader);
+}
+
+TEST_F(LowerParallelCopy, TwoCyclesWithScratch)
+{
+   /* Two disjoint cycles must each get their own break. */
+   struct agx_copy test[] = {
+      {.dest = 0, .src = agx_register(1, AGX_SIZE_16)},
+      {.dest = 1, .src = agx_register(2, AGX_SIZE_16)},
+      {.dest = 2, .src = agx_register(0, AGX_SIZE_16)},
+      {.dest = 10, .src = agx_register(11, AGX_SIZE_16)},
+      {.dest = 11, .src = agx_register(12, AGX_SIZE_16)},
+      {.dest = 12, .src = agx_register(10, AGX_SIZE_16)},
+   };
+
+   agx_builder *A = agx_test_builder(mem_ctx);
+   agx_builder *B = agx_test_builder(mem_ctx);
+
+   agx_emit_parallel_copies(A, test, ARRAY_SIZE(test), 4);
+
+   agx_mov_to(B, agx_register(4, AGX_SIZE_16), agx_register(0, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(0, AGX_SIZE_16), agx_register(1, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(1, AGX_SIZE_16), agx_register(2, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(2, AGX_SIZE_16), agx_register(4, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(4, AGX_SIZE_16), agx_register(10, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(10, AGX_SIZE_16), agx_register(11, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(11, AGX_SIZE_16), agx_register(12, AGX_SIZE_16));
+   agx_mov_to(B, agx_register(12, AGX_SIZE_16), agx_register(4, AGX_SIZE_16));
+
+   ASSERT_SHADER_EQUAL(A->shader, B->shader);
+}
+
 TEST_F(LowerParallelCopy, Immediate64)
 {
    agx_index imm = agx_immediate(10);
@@ -300,7 +371,8 @@ TEST_F(LowerParallelCopy, G17PStackCopiesAvoidDivergentShuffleScratch)
    actual->shader->key = &key;
    actual->shader->any_quad_divergent_shuffle = true;
 
-   agx_emit_parallel_copies(actual, copies, ARRAY_SIZE(copies));
+   agx_emit_parallel_copies(actual, copies, ARRAY_SIZE(copies),
+                                 AGX_PCOPY_NO_SCRATCH);
    agx_mov_to(expected, agx_register(4, AGX_SIZE_32),
               agx_memory_register(12, AGX_SIZE_32));
    agx_mov_to(expected, agx_memory_register(0, AGX_SIZE_32),
@@ -330,7 +402,7 @@ TEST_F(LowerParallelCopy, EmptyCopies)
    agx_builder *actual = agx_test_builder(mem_ctx);
    agx_builder *expected = agx_test_builder(mem_ctx);
 
-   agx_emit_parallel_copies(actual, NULL, 0);
+   agx_emit_parallel_copies(actual, NULL, 0, AGX_PCOPY_NO_SCRATCH);
    ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
 }
 

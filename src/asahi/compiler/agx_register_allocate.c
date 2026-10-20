@@ -151,6 +151,142 @@ reserved_size(agx_context *ctx)
    return agx_reserved_registers(ctx);
 }
 
+/* The even-aligned half pair parallel-copy lowering may use to break GPR
+ * copy cycles with moves instead of XOR swaps. ~0u when no register is
+ * provably dead at the point the copies are emitted.
+ *
+ * When the spiller ran, RA kept the whole low bank reserved as parallel-copy
+ * temporaries; halves 4..7 are exactly what the memory swap path already
+ * uses (halves 0..1 hold the nesting counter and the register-base SCS
+ * operand, halves 2..3 the AGX3 divergent-shuffle zero register).
+ */
+static unsigned
+spill_pcopy_scratch(agx_context *ctx)
+{
+   if (!ctx->has_spill_pcopy_reserved)
+      return AGX_PCOPY_NO_SCRATCH;
+
+   const bool agx3_shuffle =
+      ctx->any_quad_divergent_shuffle &&
+      ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
+
+   /* The reserved temporaries overlap the low ABI preloads (r1l, and the
+    * tessellation coordinates at r2/r3). A preload is only written when its
+    * value is used, so a recorded one means the halves may be live.
+    */
+   static const unsigned candidates[] = {4, 6, 2};
+   for (unsigned i = 0; i < ARRAY_SIZE(candidates); ++i) {
+      unsigned h = candidates[i];
+      if (agx3_shuffle && h == 2)
+         continue;
+      if (!agx_is_null(ctx->preloaded[h]) ||
+          !agx_is_null(ctx->preloaded[h + 1]))
+         continue;
+      return h;
+   }
+
+   return AGX_PCOPY_NO_SCRATCH;
+}
+
+/* Scratch pair for copies emitted while assigning registers: any aligned
+ * pair below the allocation bound holding no live value works. Restricted
+ * below the 16-bit copy destination bound so a half-width save stays
+ * encodable.
+ *
+ * Eviction clears the halves a relocated value used to occupy, but the value
+ * still lives there until the emitted copies run, so operands of the copies
+ * themselves are excluded even where used_regs no longer marks them.
+ */
+static unsigned
+pcopy_cycle_scratch(struct ra_ctx *rctx, const struct agx_copy *copies,
+                    unsigned nr_copies)
+{
+   unsigned scratch = spill_pcopy_scratch(rctx->shader);
+   if (scratch != AGX_PCOPY_NO_SCRATCH)
+      return scratch;
+
+   const unsigned bound =
+      MIN2(rctx->bound[RA_GPR], AGX3_COPY_REG16_DEST_HALVES);
+
+   for (unsigned h = 2; h + 1 < bound; h += 2) {
+      if (BITSET_TEST(rctx->used_regs[RA_GPR], h) ||
+          BITSET_TEST(rctx->used_regs[RA_GPR], h + 1))
+         continue;
+
+      bool taken = false;
+      for (unsigned i = 0; i < nr_copies; ++i) {
+         const struct agx_copy *c = &copies[i];
+         unsigned w = agx_size_align_16(c->src.size);
+
+         if (!c->dest_mem && h + 1 >= c->dest && h < c->dest + w)
+            taken = true;
+         if (c->src.type == AGX_INDEX_REGISTER && !c->src.memory &&
+             h + 1 >= c->src.value && h < c->src.value + w)
+            taken = true;
+      }
+
+      if (!taken)
+         return h;
+   }
+
+   return AGX_PCOPY_NO_SCRATCH;
+}
+
+/* Scratch pair for copies emitted after SSA lowering: with every operand
+ * physical, a physreg pair no instruction references is dead at every point.
+ * Only holes inside the reported register footprint are taken so the
+ * temporary can never raise the register count.
+ */
+static unsigned
+pcopy_cycle_scratch_postra(agx_context *ctx)
+{
+   BITSET_DECLARE(referenced, AGX_NUM_MODELED_REGS) = {0};
+
+   /* r0's halves are never available: the register-base SCS addressing mode
+    * reads r0 implicitly at pack time, and r0l is the control-flow nesting
+    * counter. When the spiller reserved the low bank, halves 2..7 are its
+    * parallel-copy temporaries -- usable here unless a low ABI preload
+    * (marked by the operand scan below) lives there -- except r1 while it is
+    * the divergent-shuffle zero register.
+    */
+   unsigned lo_mark = MAX2(reserved_size(ctx), 2);
+   if (ctx->has_spill_pcopy_reserved) {
+      const bool agx3_shuffle =
+         ctx->any_quad_divergent_shuffle &&
+         ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2;
+      lo_mark = agx3_shuffle ? 4 : 2;
+   }
+   BITSET_SET_COUNT(referenced, 0, lo_mark);
+
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_dest(I, d) {
+         if (I->dest[d].type == AGX_INDEX_REGISTER && !I->dest[d].memory)
+            BITSET_SET_COUNT(referenced, I->dest[d].value,
+                             agx_index_size_16(I->dest[d]));
+      }
+      agx_foreach_src(I, s) {
+         if (I->src[s].type == AGX_INDEX_REGISTER && !I->src[s].memory)
+            BITSET_SET_COUNT(referenced, I->src[s].value,
+                             agx_index_size_16(I->src[s]));
+      }
+
+      /* The export's destination lives in I->imm rather than an operand. */
+      if (I->op == AGX_OPCODE_EXPORT)
+         BITSET_SET_COUNT(referenced, I->imm,
+                          agx_index_size_16(I->src[0]));
+   }
+
+   const unsigned top =
+      MIN3(ctx->max_reg, AGX3_COPY_REG16_DEST_HALVES - 1, AGX_NUM_REGS - 1);
+
+   for (unsigned h = 2; h + 1 <= top; h += 2) {
+      if (!BITSET_TEST(referenced, h) && !BITSET_TEST(referenced, h + 1))
+         return h;
+   }
+
+   return AGX_PCOPY_NO_SCRATCH;
+}
+
 UNUSED static void
 print_reg_file(struct ra_ctx *rctx, FILE *fp)
 {
@@ -984,10 +1120,10 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
             rctx, rctx->block, copies.data,
             util_dynarray_num_elements(&copies, struct agx_copy));
       } else {
+         unsigned nr = util_dynarray_num_elements(&copies, struct agx_copy);
          agx_builder b = agx_init_builder(rctx->shader, agx_before_instr(I));
-         agx_emit_parallel_copies(
-            &b, copies.data,
-            util_dynarray_num_elements(&copies, struct agx_copy));
+         agx_emit_parallel_copies(&b, copies.data, nr,
+                                  pcopy_cycle_scratch(rctx, copies.data, nr));
       }
 
       util_dynarray_fini(&copies);
@@ -2197,7 +2333,8 @@ agx_ra_assign_local(struct ra_ctx *rctx)
  * have only a single successor.
  */
 static void
-agx_insert_parallel_copies(agx_context *ctx, agx_block *block)
+agx_insert_parallel_copies(agx_context *ctx, agx_block *block,
+                           unsigned scratch)
 {
    bool any_succ = false;
    unsigned nr_phi = 0;
@@ -2261,14 +2398,14 @@ agx_insert_parallel_copies(agx_context *ctx, agx_block *block)
          }
       }
 
-      agx_emit_parallel_copies(&b, copies, nr_phi);
+      agx_emit_parallel_copies(&b, copies, nr_phi, scratch);
 
       free(copies);
    }
 }
 
 static void
-lower_exports(agx_context *ctx)
+lower_exports(agx_context *ctx, unsigned scratch)
 {
    struct agx_copy copies[AGX_NUM_REGS];
    unsigned nr = 0;
@@ -2297,7 +2434,7 @@ lower_exports(agx_context *ctx)
    }
 
    agx_builder b = agx_init_builder(ctx, agx_after_block_logical(block));
-   agx_emit_parallel_copies(&b, copies, nr);
+   agx_emit_parallel_copies(&b, copies, nr, scratch);
 }
 
 /* AGX3b device atomics return the old value by overwriting the value operand.
@@ -3048,7 +3185,15 @@ agx_ra(agx_context *ctx)
           ins->atomic_opc != AGX_ATOMIC_OPC_UMAX &&
           ins->atomic_opc != AGX_ATOMIC_OPC_IMAX)
          ins->src[0].discard = true;
+   }
 
+   /* With SSA lowered every operand is physical, so choose a provably dead
+    * register pair parallel-copy lowering can use to break GPR cycles with
+    * moves instead of XOR swaps.
+    */
+   const unsigned pcopy_scratch = pcopy_cycle_scratch_postra(ctx);
+
+   agx_foreach_instr_global_safe(ctx, ins) {
       /* Lower away RA pseudo-instructions */
       agx_builder b = agx_init_builder(ctx, agx_after_instr(ins));
 
@@ -3075,7 +3220,7 @@ agx_ra(agx_context *ctx)
             };
          }
 
-         agx_emit_parallel_copies(&b, copies, n);
+         agx_emit_parallel_copies(&b, copies, n, pcopy_scratch);
          agx_remove_instruction(ins);
          continue;
       } else if (ins->op == AGX_OPCODE_SPLIT) {
@@ -3109,7 +3254,7 @@ agx_ra(agx_context *ctx)
 
          /* Lower away */
          agx_builder b = agx_init_builder(ctx, agx_after_instr(ins));
-         agx_emit_parallel_copies(&b, copies, n);
+         agx_emit_parallel_copies(&b, copies, n, pcopy_scratch);
          agx_remove_instruction(ins);
          continue;
       }
@@ -3117,10 +3262,10 @@ agx_ra(agx_context *ctx)
 
    /* Insert parallel copies lowering phi nodes and exports */
    agx_foreach_block(ctx, block) {
-      agx_insert_parallel_copies(ctx, block);
+      agx_insert_parallel_copies(ctx, block, pcopy_scratch);
    }
 
-   lower_exports(ctx);
+   lower_exports(ctx, pcopy_scratch);
 
    agx_foreach_instr_global_safe(ctx, I) {
       switch (I->op) {

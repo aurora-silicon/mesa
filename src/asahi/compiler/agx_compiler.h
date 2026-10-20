@@ -1307,8 +1307,15 @@ struct agx_copy {
    bool done;
 };
 
+/* For agx_emit_parallel_copies: the 16-bit index of an aligned GPR pair the
+ * caller has proved dead at the emission point, used to break copy cycles
+ * with moves instead of XOR swaps. Pass AGX_PCOPY_NO_SCRATCH when no such
+ * register exists.
+ */
+#define AGX_PCOPY_NO_SCRATCH (~0u)
+
 void agx_emit_parallel_copies(agx_builder *b, struct agx_copy *copies,
-                              unsigned n);
+                              unsigned n, unsigned scratch);
 
 void agx_compute_liveness(agx_context *ctx);
 void agx_liveness_ins_update(struct u_sparse_bitset *live, agx_instr *I);
