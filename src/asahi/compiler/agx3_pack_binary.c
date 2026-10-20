@@ -9461,23 +9461,62 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                };
                if (!agx3_persp_mul_encode(enc, &desc, bytes, &len))
                   AGX3_REFUSE(I);
-            } else if (I->op == AGX_OPCODE_FADD) {
+            } else if (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL) {
                if (I->nr_srcs != 2 || I->saturate)
                   AGX3_REFUSE(I);
+               enum agx3_alu_stage_src classes[2];
                uint16_t src[2];
-               enum agx3_alu_hint hints[2];
+               enum agx3_alu_hint hints[2] = {AGX3_ALU_HINT_NONE,
+                                              AGX3_ALU_HINT_NONE};
                for (unsigned s = 0; s < 2; ++s) {
-                  if (!agx3_vary_reg32(I->src[s]) ||
-                      agx_channels(I->src[s]) != 1 || I->src[s].abs ||
-                      I->src[s].neg || I->src[s].kill ||
-                      (I->src[s].cache && I->src[s].discard))
+                  const agx_index v = I->src[s];
+                  if (v.abs || v.neg || v.kill || v.memory ||
+                      (v.cache && v.discard))
                      AGX3_REFUSE(I);
-                  src[s] = I->src[s].value;
-                  hints[s] = agx3_post_ra_hint(I->src[s]);
+                  if (agx3_vary_reg32(v) && agx_channels(v) == 1) {
+                     classes[s] = AGX3_ALU_STAGE_REGISTER;
+                     src[s] = v.value;
+                     hints[s] = agx3_post_ra_hint(v);
+                  } else if (v.type == AGX_INDEX_UNIFORM &&
+                             v.size == AGX_SIZE_32 &&
+                             agx_channels(v) == 1 && v.value < 256 &&
+                             !v.cache && !v.discard) {
+                     classes[s] = AGX3_ALU_STAGE_UNIFORM;
+                     src[s] = v.value;
+                  } else if (v.type == AGX_INDEX_IMMEDIATE &&
+                             v.size == AGX_SIZE_16 && v.value < 256 &&
+                             !v.cache && !v.discard) {
+                     classes[s] = AGX3_ALU_STAGE_IMMEDIATE;
+                     src[s] = v.value;
+                  } else {
+                     AGX3_REFUSE(I);
+                  }
                }
-               if (!agx3_alu_fadd_stage(enc, staging_dest,
-                                        native_coord_slot, src, hints, wait,
-                                        bytes, &len))
+               /* The witnessed routings keep the uniform on the first
+                * operand's f36 slot and the minifloat on the second's f17;
+                * these publishes commute. */
+               if (classes[0] == AGX3_ALU_STAGE_IMMEDIATE ||
+                   (classes[0] == AGX3_ALU_STAGE_REGISTER &&
+                    classes[1] == AGX3_ALU_STAGE_UNIFORM)) {
+                  enum agx3_alu_stage_src c0 = classes[0];
+                  classes[0] = classes[1];
+                  classes[1] = c0;
+                  uint16_t s0 = src[0];
+                  src[0] = src[1];
+                  src[1] = s0;
+                  enum agx3_alu_hint h0 = hints[0];
+                  hints[0] = hints[1];
+                  hints[1] = h0;
+               }
+               const bool ok =
+                  I->op == AGX_OPCODE_FMUL
+                     ? agx3_alu_fmul_stage(enc, staging_dest,
+                                           native_coord_slot, classes, src,
+                                           hints, wait, bytes, &len)
+                     : agx3_alu_fadd_stage(enc, staging_dest,
+                                           native_coord_slot, classes, src,
+                                           hints, wait, bytes, &len);
+               if (!ok)
                   AGX3_REFUSE(I);
             } else if (I->op == AGX_OPCODE_FFMA) {
                if (I->nr_srcs != 3 || I->saturate)
