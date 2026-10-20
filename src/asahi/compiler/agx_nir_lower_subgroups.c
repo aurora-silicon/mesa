@@ -111,6 +111,49 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *data = intr->src[0].ssa;
       nir_def *target = intr->src[1].ssa;
 
+      /* Recognise lane-relative shuffle indices and use the dedicated
+       * hardware forms instead of the quad-split below:
+       *
+       *    lane ^ x  ->  shuffle_xor
+       *    lane - x  ->  shuffle_up
+       *    lane + x  ->  shuffle_down
+       */
+      nir_scalar target_s = nir_scalar_resolved(target, 0);
+      if (nir_scalar_is_alu(target_s)) {
+         nir_op op = nir_scalar_alu_op(target_s);
+         nir_intrinsic_op rel = nir_num_intrinsics;
+
+         if (op == nir_op_ixor)
+            rel = nir_intrinsic_shuffle_xor;
+         else if (op == nir_op_isub)
+            rel = nir_intrinsic_shuffle_up;
+         else if (op == nir_op_iadd)
+            rel = nir_intrinsic_shuffle_down;
+
+         if (rel != nir_num_intrinsics) {
+            for (unsigned i = 0; i < 2; ++i) {
+               nir_scalar side = nir_scalar_chase_alu_src(target_s, i);
+               bool is_lane =
+                  nir_scalar_is_intrinsic(side) &&
+                  nir_scalar_intrinsic_op(side) ==
+                     nir_intrinsic_load_subgroup_invocation;
+
+               if (is_lane && !(op == nir_op_isub && i == 1)) {
+                  nir_def *res = NULL;
+                  nir_def *delta = nir_scalar_chase_alu_src(target_s, 1 - i).def;
+                  if (rel == nir_intrinsic_shuffle_xor)
+                     res = nir_shuffle_xor(b, data, delta);
+                  else if (rel == nir_intrinsic_shuffle_up)
+                     res = nir_shuffle_up(b, data, delta);
+                  else
+                     res = nir_shuffle_down(b, data, delta);
+                  nir_def_rewrite_uses(&intr->def, res);
+                  return true;
+               }
+            }
+         }
+      }
+
       /* The hardware shuffle instruction chooses a single index within the
        * target quad to shuffle each source quad with. Consequently, the low
        * 2-bits of shuffle indices should not be quad divergent.  To implement
