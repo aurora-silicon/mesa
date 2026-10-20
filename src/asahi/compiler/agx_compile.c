@@ -5590,7 +5590,9 @@ agx_g17p_shift_boundary(agx_builder *b, unsigned shift)
 static agx_index
 agx_g17p_ushr_imm(agx_builder *b, agx_index value, unsigned shift)
 {
-   return agx_ushr(b, value, agx_g17p_shift_boundary(b, shift));
+   /* The immediate-count SRL form consumes the literal directly; no need to
+    * materialise a boundary register. */
+   return agx_ushr(b, value, agx_immediate(shift));
 }
 
 static agx_index
