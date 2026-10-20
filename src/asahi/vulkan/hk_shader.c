@@ -3113,6 +3113,105 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
    return false;
 }
 
+/*
+ * The compute constant program is admitted by the same bounded native
+ * protocol as the vertex and fragment ones (hk_g17p_native_cprog_qualified()),
+ * with the compile deciding launchability once, here: clone the NIR, flip the
+ * clone key's no_preamble and ask for the native constant-program lowering,
+ * and keep the clone only when the result is launchable. Compute compiles
+ * with no_preamble in the ordinary key, so a decline needs no key fixup --
+ * the plain compile produces the no-preamble + uniform-DMA binary.
+ *
+ * The attempt is self-qualifying: when nothing is hoistable the kept compile
+ * simply emits no preamble. A candidate whose constant program is outside
+ * the bounded protocol -- a TPS frame that does not match its imported
+ * inputs, texture/sampler state registers, or a thread-invariant resource
+ * mix the CDM launch template cannot yet encode -- is reported and compiled
+ * without the preamble rather than failing pipeline creation.
+ *
+ * On success the clone replaces `*nir`. Otherwise `shader->b` is cleared and
+ * `*nir` is untouched.
+ */
+static bool
+hk_g17p_compile_cs_cprog(nir_shader **nir, const struct agx_shader_key *key,
+                         struct hk_shader *shader)
+{
+   nir_shader *attempt = nir_shader_clone(NULL, *nir);
+   if (!attempt)
+      return false;
+
+   struct agx_shader_key cprog_key = *key;
+   cprog_key.no_preamble = false;
+   cprog_key.agx3_native_cprog = true;
+   /* g17p_uniform_dma and the dma_* fields ride along from *key: the constant
+    * program keeps the loads it can hoist, and the launch copies the rest
+    * into the uniforms the constant program leaves free. */
+
+   const char *declined = "compile";
+   if (agx_compile_shader_nir(attempt, &cprog_key, &shader->b)) {
+      const struct agx_shader_info *info = &shader->b.info;
+      const bool tabled_sampler =
+         (shader->info.agx3_txf_texture_valid ||
+          shader->info.agx3_storage_image_valid ||
+          shader->info.agx3_sampled_storage_valid ||
+          shader->info.agx3_indexed_storage_valid ||
+          shader->info.agx3_indexed_sampler_valid) &&
+         info->sampler_state_count == 1;
+
+      if (!info->has_preamble)
+         declined = NULL;
+      else if (!hk_g17p_native_cprog_qualified(info))
+         declined = "cprog-shape";
+      else if (info->texture_state_count != 0 || info->uses_sampler_heap ||
+               (info->sampler_state_count != 0 && !tabled_sampler))
+         declined = "texture-state";
+      else if (info->uses_resource_info_query || info->uses_ray_traversal)
+         /* Whether a kernel's own TI reservation and a constant program's
+          * TPS import frame combine by sum or max is unwitnessed; decline
+          * rather than guess. */
+         declined = "ti-mix";
+      else
+         declined = NULL;
+
+      if (agx_get_compiler_debug() & AGX_DBG_SHADERDB) {
+         fprintf(stderr,
+                 "HK G17P CS CProg: %s%s preamble=%uB inputs=%u tps=%uB "
+                 "gprs=%u staging=%u uniforms=%u main=%uB\n",
+                 declined ? "declined:"
+                 : info->has_preamble ? "admitted" : "none",
+                 declined ? declined : "",
+                 info->preamble_size, info->agx3_preamble_inputs.count,
+                 info->preamble_scratch_size, info->nr_preamble_gprs,
+                 info->agx3_preamble_staging_halfs, info->push_count,
+                 info->main_size);
+      }
+
+      if (!declined) {
+         ralloc_free(*nir);
+         *nir = attempt;
+         return true;
+      }
+
+      mesa_logw("G17P compute constant program not launchable (%s): "
+                "preamble=%uB tps=%uB inputs=%uB gprs=%u staging_known=%u "
+                "textures=%u samplers=%u; compiling without it",
+                declined, info->preamble_size, info->preamble_scratch_size,
+                info->agx3_preamble_inputs.storage_bytes,
+                info->nr_preamble_gprs, info->agx3_preamble_staging_known,
+                info->texture_state_count, info->sampler_state_count);
+      free(shader->b.binary);
+   } else {
+      if (agx_get_compiler_debug() & AGX_DBG_SHADERDB)
+         fprintf(stderr, "HK G17P CS CProg: declined:%s\n", declined);
+      mesa_logw("G17P compute constant program failed to compile; "
+                "compiling without it");
+   }
+
+   memset(&shader->b, 0, sizeof(shader->b));
+   ralloc_free(attempt);
+   return false;
+}
+
 /* The descriptor sets whose buffer descriptors a draw's launch may copy
  * from when it is recorded (AGX3_UNIFORM_DMA_BUFFER): sets no binding of
  * which may be updated after it is bound or while a command buffer using it
@@ -3651,14 +3750,23 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    /* Uniform DMA: the root table, every descriptor set pointer, the dynamic
     * buffers and the buffers of static sets are driver-resolvable
-    * (hk_g17p_graphics_uniform_ranges publishes the spans). A hardware vertex
+    * (hk_g17p_graphics_uniform_ranges publishes the spans for a draw,
+    * hk_g17p_compute_uniform_ranges for a dispatch). A hardware vertex
     * program copies into the uniforms its constant program leaves free; a
-    * fragment program copies only when it forms none. */
+    * compute program does the same, and a fragment program copies only when
+    * it forms none. */
    const bool vs_dma = sw_stage == MESA_SHADER_VERTEX && hw &&
                        nir->info.stage == MESA_SHADER_VERTEX;
+   /* An API compute pipeline, not a software graphics variant: those reach
+    * here with a graphics sw_stage and a compute NIR stage, and their VUNI
+    * layout is not the compute root ABI. Internal (meta) compute shaders do
+    * get DMA -- they bind ordinary compute descriptor state -- only the
+    * constant-program attempt below excludes them. */
+   const bool cs_dma = sw_stage == MESA_SHADER_COMPUTE &&
+                       nir->info.stage == MESA_SHADER_COMPUTE;
    if (agx_native_graphics(&dev->dev) &&
        ((backend_key.no_preamble && sw_stage == MESA_SHADER_FRAGMENT &&
-         nir->info.stage == MESA_SHADER_FRAGMENT) || vs_dma)) {
+         nir->info.stage == MESA_SHADER_FRAGMENT) || vs_dma || cs_dma)) {
       backend_key.g17p_uniform_dma = true;
       backend_key.g17p_dma_root = root;
       backend_key.g17p_dma_set_mask =
@@ -3723,8 +3831,20 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                          nir->info.stage == MESA_SHADER_VERTEX &&
                          (!shader->info.agx3_gen1_fragment_rq ||
                           debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_CPROG_DIAGNOSTIC", false));
+   /* API compute pipelines get the same once-per-dispatch constant program.
+    * The sw_stage check keeps the poly software-VS/GS/TCS compute kernels
+    * out (their launch goes through the internal-graphics VUNI layout), and
+    * internal keeps the NIR-built meta/helper kernels preamble-free -- their
+    * TPS story is already special (has_scratch = !internal). */
+   const bool cs_cprog = agx_chip_native_preamble(dev->dev.chip) &&
+                         sw_stage == MESA_SHADER_COMPUTE &&
+                         nir->info.stage == MESA_SHADER_COMPUTE &&
+                         !nir->info.internal;
    bool compiled = vs_cprog &&
       hk_g17p_compile_vs_cprog(dev, &nir, &backend_key, shader);
+   if (!compiled && cs_cprog &&
+       debug_get_bool_option("ASAHI_CS_CPROG", true))
+      compiled = hk_g17p_compile_cs_cprog(&nir, &backend_key, shader);
    if (!compiled && agx_native_graphics(&dev->dev) &&
        nir->info.stage == MESA_SHADER_FRAGMENT && !backend_key.no_preamble)
       compiled = hk_g17p_compile_fs_cprog(&nir, &backend_key, shader);

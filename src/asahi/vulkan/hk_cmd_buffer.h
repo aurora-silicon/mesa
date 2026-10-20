@@ -1957,6 +1957,13 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 uint64_t hk_g17p_dma_set_base(const struct hk_cmd_buffer *cmd,
                               const struct hk_shader *s);
 
+/* The buffer descriptor an AGX3_UNIFORM_DMA_BUFFER span names in `desc`
+ * (hk_cmd_buffer.c); shared by the draw and dispatch uniform-range
+ * collectors. */
+bool hk_g17p_dma_buffer(const struct hk_descriptor_state *desc, int set,
+                        unsigned descriptor_B,
+                        struct hk_buffer_address *buffer);
+
 uint64_t hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd,
                                       struct hk_shader *s,
                                       struct hk_linked_shader *linked, bool object);

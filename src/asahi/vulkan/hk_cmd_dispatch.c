@@ -46,10 +46,15 @@ static const uint8_t hk_g17p_native_write_control[32] = {
    0x08, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
 };
 
-#define HK_G17P_COMPUTE_MAX_RANGES 8u
+/* Compute worst case: 1 root + 1 texture-pointers + 1 rodata + 1 gen1-RQ +
+ * 2 * AGX3_UNIFORM_DMA_MAX_SPANS uniform-DMA spans (each buffer span may
+ * split into a buffer part and a zero-page part). Sized to the patch plan
+ * capacity so every legal layout is composable. */
+#define HK_G17P_COMPUTE_MAX_RANGES HK_G17P_PATCH_MAX_RANGES
 #define HK_G17P_LOADER_MAX_SHAPES  4u
-static_assert(HK_G17P_COMPUTE_MAX_RANGES <= HK_G17P_PATCH_MAX_RANGES,
-              "patch plan capacity");
+static_assert(HK_G17P_COMPUTE_MAX_RANGES >=
+                 4 + 2 * AGX3_UNIFORM_DMA_MAX_SPANS,
+              "compute range budget covers every legal layout");
 
 /* The uniform loader of a G17P launch, composed once per program, uniform
  * layout and address shape (hk_g17p_patch.h); each launch copies it with its
@@ -543,6 +548,15 @@ static bool
 hk_g17p_compute_shader_supported(struct hk_shader *s,
                                  struct hk_linked_shader *linked)
 {
+   /* An API compute pipeline may carry its native constant program when it
+    * is inside the bounded protocol -- the compile keeps only that shape
+    * (hk_g17p_compile_cs_cprog()). Software graphics variants launched
+    * through CDM keep running preamble-free: their compiled stage is
+    * compute-adjacent but their VUNI layout is not a cprog contract. */
+   const bool native_preamble =
+      s && s->info.stage == MESA_SHADER_COMPUTE &&
+      hk_g17p_native_cprog_qualified(&s->b.info);
+
    /* poly_nir_lower_gs preserves the API geometry stage on the main kernel,
     * even though Honeykrisp has always launched that binary through CDM. */
    return s && linked &&
@@ -551,7 +565,8 @@ hk_g17p_compute_shader_supported(struct hk_shader *s,
            s->info.stage == MESA_SHADER_TESS_CTRL) &&
           linked->b.bo && linked->b.bo->va && linked->b.size != 0 &&
           linked->b.size <= UINT32_MAX && linked->b.nr_gprs != 0 &&
-          !s->b.info.has_preamble && s->b.info.preamble_scratch_size == 0 &&
+          ((!s->b.info.has_preamble &&
+            s->b.info.preamble_scratch_size == 0) || native_preamble) &&
           s->b.info.scratch_size <= AGX3_G17P_MAX_COMPUTE_SPILL_B &&
           linked->b.scratch_size <= AGX3_G17P_MAX_COMPUTE_SPILL_B &&
           s->b.info.agx3_staging_known &&
@@ -584,8 +599,11 @@ hk_g17p_compute_shader_supported(struct hk_shader *s,
  * the uniform file before launching the compute-stage binary. */
 static bool
 hk_g17p_compute_uniform_ranges(
-   struct hk_shader *s, uint64_t root_ptr, uint64_t texture_pointers,
-   struct agx3_ioto_uniform_range ranges[3], size_t *range_count);
+   struct hk_shader *s, const struct hk_descriptor_state *desc_state,
+   uint64_t root_ptr, uint64_t texture_pointers,
+   struct agx3_ioto_uniform_range
+      ranges[HK_G17P_COMPUTE_MAX_RANGES],
+   size_t *range_count);
 
 static bool
 hk_g17p_internal_graphics_uniform_ranges(
@@ -602,8 +620,9 @@ hk_g17p_internal_graphics_uniform_ranges(
       return false;
 
    if (s->info.stage != MESA_SHADER_VERTEX)
-      return hk_g17p_compute_uniform_ranges(s, root_ptr, texture_pointers,
-                                             ranges, range_count);
+      return hk_g17p_compute_uniform_ranges(
+         s, cmd ? &cmd->state.gfx.descriptors : NULL, root_ptr,
+         texture_pointers, ranges, range_count);
 
    if (!!texture_pointers != s->info.agx3_indexed_sampler_valid)
       return false;
@@ -684,8 +703,11 @@ hk_g17p_internal_graphics_uniform_ranges(
 
 static bool
 hk_g17p_compute_uniform_ranges(
-   struct hk_shader *s, uint64_t root_ptr, uint64_t texture_pointers,
-   struct agx3_ioto_uniform_range ranges[3], size_t *range_count)
+   struct hk_shader *s, const struct hk_descriptor_state *desc_state,
+   uint64_t root_ptr, uint64_t texture_pointers,
+   struct agx3_ioto_uniform_range
+      ranges[HK_G17P_COMPUTE_MAX_RANGES],
+   size_t *range_count)
 {
    if (!s || !ranges || !range_count ||
        (!!texture_pointers != (s->info.agx3_txf_texture_valid ||
@@ -699,13 +721,9 @@ hk_g17p_compute_uniform_ranges(
     * needs no preamble loads at all: agx3_uses_root records whether the
     * compiler emitted load_root_agx, and the program generator composes a
     * no-resource program when range_count == 0. */
-   /* Uniform DMA is never enabled for compute (see hk_shader.c). */
-   if (s->b.info.agx3_uniform_dma_count)
-      return false;
-
    const struct agx_rodata *rodata_probe = &s->b.info.rodata;
    if (!texture_pointers && !s->info.agx3_uses_root && s->info.set_count == 0 &&
-       rodata_probe->size_16 == 0) {
+       rodata_probe->size_16 == 0 && s->b.info.agx3_uniform_dma_count == 0) {
       *range_count = 0;
       return true;
    }
@@ -733,6 +751,98 @@ hk_g17p_compute_uniform_ranges(
       count++;
    }
 
+   /* Uniform DMA: the compiler replaced constant-index loads with reads of
+    * uniform spans (agx_shader_info::agx3_uniform_dma). Publish each from the
+    * address this dispatch gives it; the launch reads the memory when it
+    * runs, as the loads did. Compute re-collects its ranges for every
+    * dispatch, so a set pointer's value needs none of the staleness tracking
+    * hk_g17p_dma_set_base() gives the graphics record-ahead caches. */
+   for (unsigned i = 0; i < s->b.info.agx3_uniform_dma_count; ++i) {
+      const struct agx3_uniform_dma_span *span =
+         &s->b.info.agx3_uniform_dma[i];
+      const unsigned pointer = span->pointer;
+      const int set = pointer == root_uniform ? -1
+                      : pointer >= root_uniform + 4 &&
+                            (pointer - root_uniform - 4) % 4 == 0 &&
+                            (pointer - root_uniform - 4) / 4 < HK_MAX_SETS
+                         ? (int)(pointer - root_uniform - 4) / 4
+                         : -2;
+      if (count >= HK_G17P_COMPUTE_MAX_RANGES || set == -2 ||
+          (span->dest & 1) || (span->halfs & 1) || (span->offset_B & 3))
+         return false;
+
+      /* Prewarm has no descriptor state: publish each span at its full
+       * halfs with a dummy aligned address. A buffer span's buffer/zero-page
+       * split depends on the bound buffer's runtime size, which only a
+       * dispatch knows; every mismatch just composes a new loader. */
+      if (!desc_state) {
+         ranges[count++] = (struct agx3_ioto_uniform_range){
+            .start_halfs = span->dest,
+            .size_halfs = span->halfs,
+            .address = root_ptr + 0x4000,
+         };
+         continue;
+      }
+
+      if (span->source == AGX3_UNIFORM_DMA_BUFFER) {
+         struct hk_buffer_address buffer;
+         if (!hk_g17p_dma_buffer(desc_state, set, span->descriptor_B,
+                                 &buffer))
+            return false;
+
+         /* Dwords below the size rounded up to 4 bytes come from the buffer,
+          * later ones from the zero page (AGX3_UNIFORM_DMA_BUFFER). A buffer
+          * holding none of the span, such as a null one, is all zero page. */
+         const uint64_t size_B = ALIGN_POT((uint64_t)buffer.size, 4);
+         const unsigned buffer_halfs =
+            size_B > span->offset_B
+               ? MIN2(span->halfs, (size_B - span->offset_B) / 2)
+               : 0;
+         if (buffer_halfs) {
+            const uint64_t address = buffer.base_addr + span->offset_B;
+            if (address & 3)
+               return false;
+            ranges[count++] = (struct agx3_ioto_uniform_range){
+               .start_halfs = span->dest,
+               .size_halfs = buffer_halfs,
+               .address = address,
+            };
+         }
+         if (buffer_halfs < span->halfs) {
+            if (count >= HK_G17P_COMPUTE_MAX_RANGES)
+               return false;
+            ranges[count++] = (struct agx3_ioto_uniform_range){
+               .start_halfs = span->dest + buffer_halfs,
+               .size_halfs = span->halfs - buffer_halfs,
+               .address = AGX_ZERO_PAGE_ADDRESS,
+            };
+         }
+         continue;
+      }
+
+      uint64_t base;
+      if (set < 0) {
+         base = root_ptr;
+         if (!base)
+            return false;
+      } else {
+         base = desc_state->root.sets[set];
+      }
+      /* A set the dispatch never binds is only read on statically dead paths
+       * (reading it is invalid usage); give the launch a mapped zero page
+       * instead of a fault. */
+      const uint64_t address =
+         base ? base + span->offset_B : AGX_ZERO_PAGE_ADDRESS;
+      if (address & 3)
+         return false;
+
+      ranges[count++] = (struct agx3_ioto_uniform_range){
+         .start_halfs = span->dest,
+         .size_halfs = span->halfs,
+         .address = address,
+      };
+   }
+
    *range_count = count;
    return true;
 }
@@ -752,6 +862,17 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
           s->b.info.ray_traversal_depth_nonzero, &launch_sources))
       return false;
 
+   /* The constant program's TPS import frame is a thread-invariant resource
+    * of the launch template (ti_spill_bytes), as is its staging footprint
+    * (ti_largest_ipr_bytes) -- the compute analogue of the FS PPP record's
+    * TI fields. assignment, not a max: the compile declines a kernel whose
+    * own TI reservation would mix with a preamble's. */
+   if (s->b.info.has_preamble) {
+      launch_sources.ti_spill_bytes = s->b.info.preamble_scratch_size;
+      launch_sources.ti_largest_ipr_bytes =
+         (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2;
+   }
+
    *desc = (struct agx3_g17p_compute_program_desc){
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges,
@@ -768,6 +889,27 @@ hk_g17p_linked_program_desc(struct hk_shader *s,
       .launch_sources = launch_sources,
       .ldshdr_f1 = kind,
    };
+
+   /* The constant program executes out of the shader's own BO (the linked
+    * executable copies only the main part), addressed absolutely from
+    * hk_shader_code_va() + preamble_offset. */
+   if (s->b.info.has_preamble &&
+       (!s->bo || !s->bo->va || s->code_size != s->b.info.binary_size ||
+        !hk_agx3_g17p_constant_program_from_binary(
+           s->code_ptr, s->code_size, s->b.info.preamble_offset,
+           s->b.info.preamble_size, hk_shader_code_va(s),
+           s->b.info.binary_size, &desc->constant_program)))
+      return false;
+
+   desc->constant_program.request_prelude =
+      s->b.info.agx3_preamble_uniform_inputs;
+   if (s->b.info.agx3_preamble_tps_inputs) {
+      if (!s->b.info.has_preamble ||
+          s->b.info.preamble_scratch_size <
+             s->b.info.agx3_preamble_inputs.storage_bytes)
+         return false;
+      desc->cprog_inputs = &s->b.info.agx3_preamble_inputs;
+   }
    return true;
 }
 
@@ -810,7 +952,8 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool ranges_ok = internal_graphics
       ? hk_g17p_internal_graphics_uniform_ranges(
            cmd, s, linked, root_ptr, texture_pointers, ranges, &range_count)
-      : hk_g17p_compute_uniform_ranges(s, root_ptr, texture_pointers, ranges,
+      : hk_g17p_compute_uniform_ranges(s, &cmd->state.cs.descriptors,
+                                        root_ptr, texture_pointers, ranges,
                                         &range_count);
    if (!ranges_ok) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -908,7 +1051,7 @@ hk_g17p_build_compute_program(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * after vkQueueSubmit returns. Their originating pipeline need not remain
     * alive after command recording, so the command buffer owns references. */
    hk_cmd_buffer_retain_bo(cmd, linked->b.bo);
-   if (s->b.info.rodata.size_16 != 0)
+   if (s->b.info.rodata.size_16 != 0 || s->b.info.has_preamble)
       hk_cmd_buffer_retain_bo(cmd, s->bo);
 
    const bool ok = hk_g17p_build_compute_program_raw(
@@ -953,9 +1096,10 @@ hk_g17p_prewarm_linked_compute_program_kind(
       ? hk_g17p_internal_graphics_uniform_ranges(
            cmd, s, linked, dummy_root, dummy_texture_pointers, ranges,
            &range_count)
-      : hk_g17p_compute_uniform_ranges(s, dummy_root,
-                                        dummy_texture_pointers, ranges,
-                                        &range_count);
+      : hk_g17p_compute_uniform_ranges(s, cmd ? &cmd->state.cs.descriptors
+                                              : NULL,
+                                        dummy_root, dummy_texture_pointers,
+                                        ranges, &range_count);
    struct agx3_g17p_compute_program_desc desc;
    if (!ranges_ok ||
        !hk_g17p_linked_program_desc(s, linked, kind, ranges, range_count,
