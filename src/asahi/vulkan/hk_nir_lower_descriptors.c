@@ -1215,7 +1215,12 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
    nir_def *binding_addr;
    uint8_t binding_stride;
    switch (binding_layout->type) {
+   /* A legacy (BufferBlock + Uniform storage class) SSBO reaches this
+    * lowering as a storage_buffer resource index even when the descriptor
+    * set layout declares the binding as a uniform buffer.  Both descriptor
+    * types store a struct hk_buffer_address, so lower them identically. */
    case VK_DESCRIPTOR_TYPE_MUTABLE_EXT:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
       nir_def *set_addr = nir_load_descriptor_set_agx(b, set);
       binding_addr = nir_iadd_imm(b, set_addr, binding_layout->offset);
@@ -1223,6 +1228,7 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
       break;
    }
 
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC: {
       const uint32_t root_desc_addr_offset =
          hk_root_descriptor_offset(root_desc_addr);

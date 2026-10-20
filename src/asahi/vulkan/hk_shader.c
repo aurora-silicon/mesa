@@ -1027,11 +1027,17 @@ lookup_ycbcr_sampler(const void *_state, uint32_t set, uint32_t binding,
                      uint32_t array_index)
 {
    const struct lower_ycbcr_state *state = _state;
-   assert(set < state->set_layout_count);
-   assert(state->set_layouts[set] != NULL);
+   /* A shader may reference a set or binding the layout does not declare
+    * (shader objects are compiled against layouts supplied per shader, and
+    * a layout can under-declare them).  There is then no immutable sampler
+    * to look up; report none rather than indexing out of bounds. */
+   if (set >= state->set_layout_count || state->set_layouts[set] == NULL)
+      return NULL;
+
    const struct hk_descriptor_set_layout *set_layout =
       vk_to_hk_descriptor_set_layout(state->set_layouts[set]);
-   assert(binding < set_layout->binding_count);
+   if (binding >= set_layout->binding_count)
+      return NULL;
 
    const struct hk_descriptor_set_binding_layout *bind_layout =
       &set_layout->binding[binding];
