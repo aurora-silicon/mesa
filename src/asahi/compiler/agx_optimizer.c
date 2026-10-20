@@ -1425,6 +1425,424 @@ agx_optimizer_signext(agx_instr **defs, agx_instr *I)
    }
 }
 
+/* ====== AGX3B peepholes ====== */
+
+static bool
+agx3_imm_value(agx_index x, uint64_t *out)
+{
+   if (x.type != AGX_INDEX_IMMEDIATE || x.abs || x.neg || x.kill)
+      return false;
+   *out = x.value;
+   return true;
+}
+
+/* x << s with a zero base and a zero insert mask is the NIR ishl spelling on
+ * this backend. Returns the 32-bit value and the immediate shift. */
+static bool
+agx3_match_shl(agx_instr *D, agx_index *value, unsigned *shift)
+{
+   uint64_t base, s;
+   if (!D || D->op != AGX_OPCODE_BFI || D->nr_srcs != 3 || D->bfi_mask != 0 ||
+       D->saturate || !agx3_imm_value(D->src[0], &base) || base != 0 ||
+       !agx3_imm_value(D->src[2], &s) || s >= 32 ||
+       D->src[1].type != AGX_INDEX_NORMAL ||
+       D->src[1].size != AGX_SIZE_32 || D->src[1].abs || D->src[1].neg)
+      return false;
+   *value = D->src[1];
+   *shift = s;
+   return true;
+}
+
+static agx_index agx3_peel_copy(agx_instr **defs, agx_index x);
+
+/* (v >> s) or the masked extract (v >> s) & ((1 << m) - 1): a bfeil with a
+ * zero base and an immediate offset. */
+static bool
+agx3_match_srl(agx_instr *D, agx_index *value, unsigned *shift,
+               unsigned *width)
+{
+   uint64_t base, s;
+   if (!D || D->op != AGX_OPCODE_BFEIL || D->nr_srcs != 3 || D->saturate ||
+       !agx3_imm_value(D->src[0], &base) || base != 0 ||
+       !agx3_imm_value(D->src[2], &s) || s >= 32 ||
+       D->src[1].type != AGX_INDEX_NORMAL ||
+       D->src[1].size != AGX_SIZE_32 || D->src[1].abs || D->src[1].neg)
+      return false;
+   *value = D->src[1];
+   *shift = s;
+   *width = D->bfi_mask;
+   return true;
+}
+
+/* iadd(0, x) and mov(x) are the plain 32-bit copies this backend emits when a
+ * later instruction's operand slot needs a bare register (shift boundaries,
+ * select sources). Chase through them when looking for a value's producer. */
+static agx_index
+agx3_peel_copy(agx_instr **defs, agx_index x)
+{
+   for (unsigned i = 0; i < 8 && x.type == AGX_INDEX_NORMAL; ++i) {
+      agx_instr *D = defs[x.value];
+      if (!D || D->nr_dests != 1 || D->saturate)
+         break;
+      if (D->op == AGX_OPCODE_MOV && D->nr_srcs == 1 &&
+          D->src[0].type == AGX_INDEX_NORMAL &&
+          D->src[0].size == x.size && !D->src[0].abs && !D->src[0].neg) {
+         x = D->src[0];
+         continue;
+      }
+      if (D->op == AGX_OPCODE_IADD && D->nr_srcs == 2 && D->shift == 0 &&
+          D->src[0].type == AGX_INDEX_IMMEDIATE && D->src[0].value == 0 &&
+          !D->src[0].abs && !D->src[0].neg &&
+          D->src[1].type == AGX_INDEX_NORMAL &&
+          D->src[1].size == x.size && !D->src[1].abs && !D->src[1].neg) {
+         x = D->src[1];
+         continue;
+      }
+      break;
+   }
+   return x;
+}
+
+/* Where a narrow field lives inside a packed 32-bit word. */
+struct agx3_field {
+   /* The packed word, or the 16-bit value itself when `direct`. */
+   agx_index base;
+   unsigned bitpos; /* bit offset of the field's low bit in `base` */
+   unsigned width;  /* 8 or 16 */
+   bool direct;     /* base is already the 16-bit narrow value */
+};
+
+/* If the 32-bit SSA value `x` is a zero- or sign-extension of a byte or
+ * halfword lane of a packed 32-bit value, describe where the field sits so
+ * the caller can feed the narrow value to a native narrow convert instead.
+ * The narrow converter reads only the low 8/16 bits of a half register, so
+ * no masking is needed at the new operand.
+ */
+static bool
+agx3_match_field_extract(agx_instr **defs, agx_index x, bool is_signed,
+                         struct agx3_field *out)
+{
+   agx_instr *D = defs[x.value];
+   if (!D || D->nr_dests != 1 || D->saturate)
+      return false;
+
+   /* i2i32 / u2u32 of a half is already the narrow value. */
+   if (is_signed && D->op == AGX_OPCODE_SIGNEXT &&
+       D->src[0].type == AGX_INDEX_NORMAL &&
+       D->src[0].size == AGX_SIZE_16 && !D->src[0].abs && !D->src[0].neg) {
+      *out = (struct agx3_field){0};
+      out->base = D->src[0];
+      out->width = 16;
+      out->direct = true;
+      return true;
+   }
+   if (!is_signed && D->op == AGX_OPCODE_MOV &&
+       D->src[0].type == AGX_INDEX_NORMAL &&
+       D->src[0].size == AGX_SIZE_16 && !D->src[0].abs && !D->src[0].neg) {
+      *out = (struct agx3_field){0};
+      out->base = D->src[0];
+      out->width = 16;
+      out->direct = true;
+      return true;
+   }
+
+   if (x.size != AGX_SIZE_32)
+      return false;
+
+   /* (v << s) >>a 24 sign-extends byte (24 - s) / 8; (v << 16) >>a 16 and
+    * v >>a 16 sign-extend a halfword lane. These are how extract_i8/i16
+    * arrive. */
+   if (is_signed && D->op == AGX_OPCODE_ASR) {
+      uint64_t count;
+      if (!agx3_imm_value(D->src[1], &count) ||
+          D->src[0].type != AGX_INDEX_NORMAL ||
+          D->src[0].size != AGX_SIZE_32 || D->src[0].abs || D->src[0].neg)
+         return false;
+      agx_index v = agx3_peel_copy(defs, D->src[0]), w;
+      unsigned s;
+      agx_instr *E = defs[v.value];
+      if (count == 24) {
+         if (agx3_match_shl(E, &w, &s) && s <= 24 && (s % 8) == 0)
+            *out = (struct agx3_field){.base = agx3_peel_copy(defs, w),
+                                       .bitpos = 24 - s, .width = 8};
+         else
+            *out = (struct agx3_field){.base = v, .bitpos = 24, .width = 8};
+         return true;
+      }
+      if (count == 16) {
+         if (agx3_match_shl(E, &w, &s) && s == 16)
+            *out = (struct agx3_field){.base = agx3_peel_copy(defs, w),
+                                       .bitpos = 0, .width = 16};
+         else
+            *out = (struct agx3_field){.base = v, .bitpos = 16, .width = 16};
+         return true;
+      }
+      return false;
+   }
+
+   if (is_signed)
+      return false;
+
+   /* Unsigned lanes: (v >> lsb) [& mask] produced by bfeil, with or without a
+    * width mask. The convert reads only the low bits of the half it is
+    * handed, so an unmasked srl is still an extract of its low lane. */
+   agx_index v;
+   unsigned lsb, width;
+   if (agx3_match_srl(D, &v, &lsb, &width)) {
+      v = agx3_peel_copy(defs, v);
+      if ((lsb % 8) == 0 && lsb <= 24 &&
+          (width == 0 || width == 8 || lsb == 0)) {
+         /* masked byte extract, or a plain shift whose low byte is a lane */
+         *out = (struct agx3_field){.base = v, .bitpos = lsb, .width = 8};
+         return true;
+      }
+      if (width == 16 && (lsb == 0 || lsb == 16)) {
+         *out = (struct agx3_field){.base = v, .bitpos = lsb, .width = 16};
+         return true;
+      }
+      if (width == 0 && lsb == 16) {
+         *out = (struct agx3_field){.base = v, .bitpos = 16, .width = 16};
+         return true;
+      }
+      return false;
+   }
+
+   /* and(y, 0xff) / and(y, 0xffff), where y itself may be a shift. */
+   if (D->op == AGX_OPCODE_BITOP && D->nr_srcs == 2 &&
+       D->truth_table == AGX3_SEL_TT_AND &&
+       D->dest[0].size == AGX_SIZE_32) {
+      for (unsigned i = 0; i < 2; ++i) {
+         agx_index a = D->src[i], y = D->src[i ^ 1];
+         uint64_t mask;
+         if (!agx3_imm_value(a, &mask) || y.type != AGX_INDEX_NORMAL ||
+             y.size != AGX_SIZE_32 || y.abs || y.neg)
+            continue;
+
+         y = agx3_peel_copy(defs, y);
+         agx_instr *E = defs[y.value];
+         agx_index v2;
+         unsigned lsb2, w2;
+         if (mask == 0xff) {
+            if (agx3_match_srl(E, &v2, &lsb2, &w2) && lsb2 <= 24 &&
+                (lsb2 % 8) == 0)
+               *out = (struct agx3_field){.base = agx3_peel_copy(defs, v2),
+                                          .bitpos = lsb2, .width = 8};
+            else
+               *out = (struct agx3_field){.base = y, .bitpos = 0, .width = 8};
+            return true;
+         }
+         if (mask == 0xffff) {
+            if (agx3_match_srl(E, &v2, &lsb2, &w2) && lsb2 == 16)
+               *out = (struct agx3_field){.base = agx3_peel_copy(defs, v2),
+                                          .bitpos = 16, .width = 16};
+            else
+               *out = (struct agx3_field){.base = y, .bitpos = 0,
+                                          .width = 16};
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+/* u8/s8/u16/s16 -> f16/f32 conversions lower in NIR to a byte/halfword
+ * extract followed by a 32-bit convert: `(v << 16) >>a 24` plus convert, or
+ * `(v >> 8) & 0xff` plus convert. G17P's int2flt reads the low 8 or 16 bits
+ * of a half register directly, so the field only has to reach the low bits
+ * of a half -- a single logical shift plus the (free) subdivide, or nothing
+ * at all when the value already lives in a half. */
+static void
+agx_optimizer_narrow_convert(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->nr_srcs != 2 || I->nr_dests != 1 || I->saturate ||
+       I->round != AGX_ROUND_RTE ||
+       I->src[0].type != AGX_INDEX_IMMEDIATE ||
+       (I->src[0].value != AGX_CONVERT_S32_TO_F &&
+        I->src[0].value != AGX_CONVERT_U32_TO_F) ||
+       I->src[1].type != AGX_INDEX_NORMAL ||
+       I->src[1].size != AGX_SIZE_32 || I->src[1].abs || I->src[1].neg)
+      return;
+
+   const bool is_signed = I->src[0].value == AGX_CONVERT_S32_TO_F;
+   struct agx3_field f;
+   if (!agx3_match_field_extract(defs, I->src[1], is_signed, &f))
+      return;
+
+   agx_index half = f.base;
+   if (!f.direct) {
+      agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+      agx_index w = f.base;
+      if (f.bitpos) {
+         w = agx_temp(ctx, AGX_SIZE_32);
+         agx_bfeil_to(&b, w, agx_zero(), f.base, agx_immediate(f.bitpos), 0);
+      }
+      half = agx_temp(ctx, AGX_SIZE_16);
+      agx_instr *split = agx_split(&b, 2, w);
+      split->dest[0] = half;
+      split->dest[1] = agx_temp(ctx, AGX_SIZE_16);
+   }
+
+   I->src[0] = agx_immediate(f.width == 8
+                                ? (is_signed ? AGX_CONVERT_S8_TO_F
+                                             : AGX_CONVERT_U8_TO_F)
+                                : (is_signed ? AGX_CONVERT_S16_TO_F
+                                             : AGX_CONVERT_U16_TO_F));
+   I->src[1] = half;
+}
+
+/* iadd #0, x is how this backend materialises a 32-bit register copy for the
+ * G17P shift/compare boundary forms. Fold copy-of-copy chains the helpers
+ * leave behind: iadd(0, iadd(0, x)) and iadd(0, mov x) are just iadd(0, x). */
+static void
+agx_optimizer_iadd_copy(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_IADD || I->nr_srcs != 2 || I->nr_dests != 1 ||
+       I->shift != 0 || I->saturate ||
+       I->src[0].type != AGX_INDEX_IMMEDIATE || I->src[0].value != 0 ||
+       I->src[0].abs || I->src[0].neg ||
+       I->src[1].type != AGX_INDEX_NORMAL || I->src[1].abs ||
+       I->src[1].neg || I->src[1].size != I->dest[0].size)
+      return;
+
+   agx_instr *D = defs[I->src[1].value];
+   if (!D || D->nr_dests != 1 || D->saturate)
+      return;
+
+   if (D->op == AGX_OPCODE_IADD && D->nr_srcs == 2 && D->shift == 0 &&
+       D->src[0].type == AGX_INDEX_IMMEDIATE && D->src[0].value == 0 &&
+       !D->src[0].abs && !D->src[0].neg &&
+       D->src[1].type == AGX_INDEX_NORMAL && !D->src[1].abs &&
+       !D->src[1].neg && D->src[1].size == I->src[1].size) {
+      I->src[1] = D->src[1];
+   } else if (D->op == AGX_OPCODE_MOV && D->nr_srcs == 1 &&
+              D->src[0].type == AGX_INDEX_NORMAL &&
+              D->src[0].size == I->src[1].size && !D->src[0].abs &&
+              !D->src[0].neg) {
+      I->src[1] = D->src[0];
+   }
+}
+
+/* Drop masks that a fixed left shift makes redundant:
+ *
+ *    bfi(0, and(x, M), s) == bfi(0, x, s)  when M covers [0, 32 - s)
+ *    and(bfi(0, x, s), M) == bfi(0, x, s)  when M covers [s, 32)
+ */
+static void
+agx_optimizer_pack_mask(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->nr_dests != 1 || I->dest[0].size != AGX_SIZE_32 || I->saturate)
+      return;
+
+   if (I->op == AGX_OPCODE_BFI && I->nr_srcs == 3 && I->bfi_mask == 0 &&
+       I->src[1].type == AGX_INDEX_NORMAL &&
+       I->src[2].type == AGX_INDEX_IMMEDIATE) {
+      const unsigned s = I->src[2].value;
+      if (s == 0 || s >= 32)
+         return;
+      agx_instr *D = defs[I->src[1].value];
+      if (!D || D->op != AGX_OPCODE_BITOP || D->nr_srcs != 2 ||
+          D->truth_table != AGX3_SEL_TT_AND ||
+          D->dest[0].size != AGX_SIZE_32 || D->saturate)
+         return;
+      const uint64_t need = BITFIELD64_MASK(32 - s);
+      for (unsigned i = 0; i < 2; ++i) {
+         agx_index a = D->src[i], b = D->src[i ^ 1];
+         uint64_t mask;
+         if (!agx3_imm_value(a, &mask) || (mask & need) != need ||
+             b.type != AGX_INDEX_NORMAL || b.size != AGX_SIZE_32 || b.abs ||
+             b.neg)
+            continue;
+         I->src[1] = b;
+         return;
+      }
+      return;
+   }
+
+   if (I->op == AGX_OPCODE_BITOP && I->nr_srcs == 2 &&
+       I->truth_table == AGX3_SEL_TT_AND) {
+      for (unsigned i = 0; i < 2; ++i) {
+         agx_index a = I->src[i], b = I->src[i ^ 1];
+         uint64_t mask;
+         if (!agx3_imm_value(a, &mask) || b.type != AGX_INDEX_NORMAL ||
+             b.size != AGX_SIZE_32 || b.abs || b.neg)
+            continue;
+         agx_instr *D = defs[b.value];
+         if (!D || D->op != AGX_OPCODE_BFI || D->nr_srcs != 3 ||
+             D->bfi_mask != 0 || D->saturate)
+            continue;
+         uint64_t base, sh;
+         if (!agx3_imm_value(D->src[0], &base) || base != 0 ||
+             !agx3_imm_value(D->src[2], &sh) || sh == 0 || sh >= 32)
+            continue;
+         const uint64_t keep = ~BITFIELD64_MASK(sh) & UINT32_C(0xffffffff);
+         if ((mask & keep) != keep)
+            continue;
+         I->op = AGX_OPCODE_MOV;
+         I->nr_srcs = 1;
+         I->src[0] = b;
+         return;
+      }
+   }
+}
+
+/* and(x, 0x7fffffff) feeding a float compare is exactly fabs(x); likewise
+ * xor(x, 0x80000000) is fneg(x). The G17P compare-select carries .abs and
+ * .neg on the compared operands (agx3_fsel_desc's cmp{0,1}_abs/neg), so the
+ * separate bitop is dead. Half compares use the corresponding 16-bit masks. */
+static void
+agx_optimizer_fcmp_mods(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       (I->op != AGX_OPCODE_FCMPSEL && I->op != AGX_OPCODE_FCMP) ||
+       I->saturate || I->nr_srcs < 2)
+      return;
+
+   /* The .abs form is grounded for eq/lt/gt, and for ge/le with exactly one
+    * absolute comparator; ltn/gtn compare select has no modifier form. */
+   if (I->fcond != AGX_FCOND_EQ && I->fcond != AGX_FCOND_LT &&
+       I->fcond != AGX_FCOND_GT && I->fcond != AGX_FCOND_GE &&
+       I->fcond != AGX_FCOND_LE)
+      return;
+
+   const uint64_t sign = I->src[0].size == AGX_SIZE_16 ? 0x8000 : 0x80000000;
+   const uint64_t notsign = sign - 1;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      agx_index src = I->src[s];
+      if (src.type != AGX_INDEX_NORMAL || src.abs || src.neg ||
+          (src.size != AGX_SIZE_32 && src.size != AGX_SIZE_16))
+         continue;
+      agx_instr *D = defs[src.value];
+      if (!D || D->op != AGX_OPCODE_BITOP || D->nr_srcs != 2 ||
+          D->dest[0].size != src.size || D->saturate)
+         continue;
+
+      for (unsigned i = 0; i < 2; ++i) {
+         agx_index a = D->src[i], b = D->src[i ^ 1];
+         if (a.type != AGX_INDEX_IMMEDIATE || a.abs || a.neg ||
+             b.type != AGX_INDEX_NORMAL || b.size != src.size || b.abs ||
+             b.neg)
+            continue;
+
+         if (D->truth_table == AGX3_SEL_TT_AND && a.value == notsign) {
+            /* ge/le take only one absolute comparator */
+            if ((I->fcond == AGX_FCOND_GE || I->fcond == AGX_FCOND_LE) &&
+                I->src[s ^ 1].abs)
+               continue;
+            I->src[s] = agx_abs(b);
+            break;
+         }
+         if (D->truth_table == AGX3_SEL_TT_XOR && a.value == sign) {
+            I->src[s] = agx_neg(b);
+            break;
+         }
+      }
+   }
+}
+
 
 void
 agx_optimizer_forward(agx_context *ctx)
@@ -1492,8 +1910,16 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_ballot(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_BITOP) {
          agx_optimizer_bitop(ctx, defs, I);
+         if (0) agx_optimizer_pack_mask(ctx, defs, I);
+      } else if (I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL) {
+         if (0) agx_optimizer_pack_mask(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(defs, I);
+         if (0) agx_optimizer_iadd_copy(ctx, defs, I);
+      } else if (I->op == AGX_OPCODE_CONVERT) {
+         agx_optimizer_narrow_convert(ctx, defs, I);
+      } else if (I->op == AGX_OPCODE_FCMPSEL || I->op == AGX_OPCODE_FCMP) {
+         if (0) agx_optimizer_fcmp_mods(ctx, defs, I);
       }
    }
 

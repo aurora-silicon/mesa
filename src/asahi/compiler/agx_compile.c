@@ -3680,8 +3680,18 @@ agx_lower_agx3_half_converts(agx_context *ctx)
           I->src[0].type != AGX_INDEX_IMMEDIATE || I->saturate)
          continue;
 
+      /* The packer encodes a clean half-register byte source with the native
+       * int2flt byte selector: unsigned byte to float32 and signed byte to
+       * either float width. Only the manual expansion below can rescue a
+       * source that is not such a register, so leave clean sources alone. */
+      const bool clean_half =
+         I->src[1].type == AGX_INDEX_NORMAL &&
+         I->src[1].size == AGX_SIZE_16 && agx_channels(I->src[1]) == 1 &&
+         !I->src[1].abs && !I->src[1].neg && !I->src[1].kill;
+
       if (I->src[0].value == AGX_CONVERT_U8_TO_F &&
-          I->round == AGX_ROUND_RTE) {
+          I->round == AGX_ROUND_RTE &&
+          !(clean_half && I->dest[0].size == AGX_SIZE_32)) {
          /* Byte integers occupy a half register; discard the other byte
           * before using the native unsigned-half conversion. */
          agx_builder before = agx_init_builder(ctx, agx_before_instr(I));
@@ -3691,7 +3701,7 @@ agx_lower_agx3_half_converts(agx_context *ctx)
          I->src[0].value = AGX_CONVERT_U16_TO_F;
       }
       if (I->src[0].value == AGX_CONVERT_S8_TO_F &&
-          I->round == AGX_ROUND_RTE) {
+          I->round == AGX_ROUND_RTE && !clean_half) {
          /* Sign-extend the byte inside its half register with the grounded
           * half bit operations and add (x ^ 0x80) - 0x80, then use the
           * native signed-half conversion
