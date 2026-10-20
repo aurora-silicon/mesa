@@ -14144,7 +14144,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 I->dest[0].size == AGX_SIZE_32)) ||
               ((I->src[0].value == AGX_CONVERT_S16_TO_F ||
                 I->src[0].value == AGX_CONVERT_U16_TO_F) &&
-               I->dest[0].size == AGX_SIZE_16))) {
+               (I->dest[0].size == AGX_SIZE_16 ||
+                I->dest[0].size == AGX_SIZE_32)))) {
             const agx_index dest = I->dest[0], src = I->src[1];
             if (!agx3_src_is_register(dest) || dest.memory ||
                 agx_channels(dest) != 1 || !agx3_src_is_register(src) ||
