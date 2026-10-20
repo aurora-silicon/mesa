@@ -14,6 +14,105 @@
  * this pass tries to be clever and elide flushes when possible.
  *
  */
+/*
+ * A consumer in the min/max algebra absorbs a possibly-denormal or NaN edge
+ * only if it will inspect that edge itself. That means it must still be an
+ * unlowered fmin/fmax: when it is lowered later in this same pass (or a later
+ * invocation), could_be_denorm() sees through our raw fmin_agx/fmax_agx def
+ * and it canonicalizes its own output where the edge can actually escape.
+ *
+ * An already-lowered fmin_agx/fmax_agx made its canonicalize decision while
+ * our def was still a plain NIR fmin/fmax, which could_be_denorm() treats as
+ * flushed. Eliding our flush would break that assumption, so it does not
+ * count as absorbing.
+ */
+static bool
+absorbs_edge(const nir_alu_instr *user)
+{
+   if (user->op != nir_op_fmin && user->op != nir_op_fmax)
+      return false;
+
+   /* A signed-zero-preserving min/max expands into compares and selects
+    * that observe the raw edge, and a NaN-preserving one forwards a NaN
+    * payload our fadd would otherwise canonicalize, so neither absorbs.
+    */
+   return !nir_alu_instr_is_signed_zero_preserve(user) &&
+          !nir_alu_instr_is_nan_preserve(user);
+}
+
+/*
+ * A denormal or NaN result edge only needs flushing where it leaves the
+ * min/max algebra. fmin_agx/fmax_agx select between their two operand bit
+ * patterns (IEEE minNum/maxNum): a denormal edge either wins and is flushed
+ * by the consumer's own output canonicalize, or loses and never reaches the
+ * output, and the consumer's could_be_denorm() recursion already sees through
+ * a raw fmin_agx/fmax_agx def to decide. NaN edges are discarded by the same
+ * selection, or forwarded to the same output canonicalize. Either way an
+ * intermediate fadd(x, -0.0) is redundant when every use feeds another
+ * fp32 min/max through value-preserving plumbing (copies, vector packs,
+ * selects and phi nodes), which cannot observe the edge's bit pattern.
+ *
+ * Returns true when every use of def is absorbed by the min/max algebra.
+ */
+static bool
+all_uses_in_minmax(nir_def *def, unsigned *budget)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (!*budget)
+         return false;
+      --*budget;
+
+      /* An if condition tests the raw bits, it does not plumb them. */
+      if (nir_src_is_if(src))
+         return false;
+
+      nir_instr *parent = nir_src_use_instr(src);
+      if (parent->type == nir_instr_type_phi) {
+         if (!all_uses_in_minmax(&nir_instr_as_phi(parent)->def, budget))
+            return false;
+         continue;
+      }
+      if (parent->type != nir_instr_type_alu)
+         return false;
+
+      nir_alu_instr *user = nir_instr_as_alu(parent);
+      if (absorbs_edge(user))
+         continue;
+
+      switch (user->op) {
+      /* fcanonicalize flushes the edge itself, like our fadd would. */
+      case nir_op_fcanonicalize:
+         continue;
+
+      /* The rest forward the edge's bit pattern (denormality and NaN-hood
+       * included) to their own uses.
+       */
+      case nir_op_mov:
+      case nir_op_vec2:
+      case nir_op_vec3:
+      case nir_op_vec4:
+      case nir_op_vec5:
+      case nir_op_vec8:
+      case nir_op_vec16:
+         if (!all_uses_in_minmax(&user->def, budget))
+            return false;
+         continue;
+      case nir_op_bcsel:
+         /* The condition observes the raw bits; only the two value edges
+          * forward them.
+          */
+         if (src == &user->src[0].src)
+            return false;
+         if (!all_uses_in_minmax(&user->def, budget))
+            return false;
+         continue;
+      default:
+         return false;
+      }
+   }
+   return true;
+}
+
 static bool
 normal_bound(nir_scalar value, bool is_max)
 {
@@ -105,11 +204,21 @@ lower(nir_builder *b, nir_alu_instr *alu, void *data)
    }
 
    if (canonicalize) {
-      b->cursor = nir_after_instr(&alu->instr);
-      b->fp_math_ctrl = nir_fp_no_fast_math;
+      /* If every use of the result stays inside the min/max algebra, each
+       * denormal or NaN edge is absorbed downstream (see all_uses_in_minmax)
+       * and this flush is redundant. Consumers inspect our raw fmin_agx/
+       * fmax_agx def through could_be_denorm() and canonicalize their own
+       * output only where it actually leaves the chain, so a chain of
+       * min/max collapses to a single flush at the last escaping use.
+       */
+      unsigned budget = 64;
+      if (!all_uses_in_minmax(&alu->def, &budget)) {
+         b->cursor = nir_after_instr(&alu->instr);
+         b->fp_math_ctrl = nir_fp_no_fast_math;
 
-      nir_def *canonicalized = nir_fadd_imm(b, &alu->def, -0.0);
-      nir_def_rewrite_uses_after(&alu->def, canonicalized);
+         nir_def *canonicalized = nir_fadd_imm(b, &alu->def, -0.0);
+         nir_def_rewrite_uses_after(&alu->def, canonicalized);
+      }
    }
 
    return true;
