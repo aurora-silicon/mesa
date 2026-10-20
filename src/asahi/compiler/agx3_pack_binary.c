@@ -658,19 +658,25 @@ agx3_try_float_modifier(struct util_dynarray *emission,
    if (!is_add && !is_mul && !is_fma)
       return 0;
 
-   bool has_mod = I->saturate;
+   bool has_mod = I->saturate || I->dest[0].size == AGX_SIZE_16;
    for (unsigned s = 0; s < I->nr_srcs; ++s)
-      has_mod |= I->src[s].abs || I->src[s].neg;
+      has_mod |= I->src[s].abs || I->src[s].neg ||
+                 I->src[s].size == AGX_SIZE_16;
    if (!has_mod)
       return 0; /* the compact no-modifier packer handles it */
 
    const unsigned want = is_fma ? 3 : 2;
    /* Check the destination itself: a narrow source is admitted, so a vector
-    * or spilled destination is no longer excluded by the source checks. */
+    * or spilled destination is no longer excluded by the source checks. A
+    * 16-bit destination is the witnessed narrow output (f10); only AGX3B
+    * composes it. */
+   const bool dest16 = I->dest[0].size == AGX_SIZE_16;
    if (I->nr_dests < 1 || I->dest[0].type == AGX_INDEX_NULL ||
        !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||
        agx_channels(I->dest[0]) != 1 ||
-       I->dest[0].size != AGX_SIZE_32 || (I->dest[0].value & 1) != 0 ||
+       (I->dest[0].size != AGX_SIZE_32 && !dest16) ||
+       (dest16 && (enc != AGX_ISA_ENCODING_AGX3B || is_mul)) ||
+       (!dest16 && (I->dest[0].value & 1) != 0) ||
        I->dest[0].value >= 256 || I->nr_srcs != want)
       return -1;
    for (unsigned s = 0; s < want; ++s)
@@ -685,6 +691,7 @@ agx3_try_float_modifier(struct util_dynarray *emission,
       .src1_neg = I->src[1].neg,
       .src1_16 = I->src[1].size == AGX_SIZE_16,
       .saturate = I->saturate,
+      .dest_16 = dest16,
    };
 
    uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH];
@@ -13969,6 +13976,47 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          if (enc == AGX_ISA_ENCODING_AGX3B && I->op == AGX_OPCODE_HFMA &&
              I->nr_dests == 1 && I->nr_srcs == 3 && !I->saturate) {
+            /* A lone minifloat multiplicand uses the f33/f41 immediate
+             * slot (w06b/w16/w17); its sign is folded into the immediate
+             * byte. The register multiplicand and the register addend
+             * keep their lifetime hints. */
+            const bool imm_mult0 =
+               I->src[0].type == AGX_INDEX_IMMEDIATE;
+            const bool imm_mult1 =
+               I->src[1].type == AGX_INDEX_IMMEDIATE;
+            if (imm_mult0 != imm_mult1 &&
+                I->src[2].type != AGX_INDEX_IMMEDIATE) {
+               const agx_index dst = I->dest[0];
+               const agx_index imm = I->src[imm_mult0 ? 0 : 1];
+               const agx_index reg = I->src[imm_mult0 ? 1 : 0];
+               const agx_index add = I->src[2];
+               uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+               uint32_t multiplier = imm.value;
+               if (imm.abs)
+                  multiplier &= 0x7f;
+               if (imm.neg)
+                  multiplier ^= 0x80;
+               if (multiplier > UINT8_MAX ||
+                   !agx3_src_is_register(dst) || dst.memory ||
+                   dst.size != AGX_SIZE_16 || agx_channels(dst) != 1 ||
+                   imm.memory || imm.kill || imm.cache || imm.discard ||
+                   !agx3_src_is_register(reg) || reg.memory ||
+                   reg.size != AGX_SIZE_16 || agx_channels(reg) != 1 ||
+                   reg.abs || reg.neg || reg.kill ||
+                   (reg.cache && reg.discard) ||
+                   !agx3_src_is_register(add) || add.memory ||
+                   add.size != AGX_SIZE_16 || agx_channels(add) != 1 ||
+                   add.abs || add.neg || add.kill ||
+                   (add.cache && add.discard) ||
+                   !agx3_alu_hfma_mul_minifloat(
+                      enc, dst.value, reg.value, multiplier, add.value,
+                      agx3_post_ra_hint(reg), agx3_post_ra_hint(add),
+                      dst.cache, wait, bytes, &len) ||
+                   !agx3_append(emission, bytes, len))
+                  AGX3_REFUSE(I);
+               continue;
+            }
+
             const bool immediate_addend =
                I->src[2].type == AGX_INDEX_IMMEDIATE;
             if (immediate_addend) {
@@ -14048,7 +14096,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              agx3_src_is_register(I->dest[0]) &&
              !I->dest[0].memory &&
              I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1 &&
-             (I->src[0].size == AGX_SIZE_16 || I->src[1].size == AGX_SIZE_16) &&
+             ((I->src[0].size == AGX_SIZE_16) !=
+              (I->src[1].size == AGX_SIZE_16)) &&
              agx3_src_is_register(I->src[0]) && agx3_src_is_register(I->src[1])) {
             const bool half_first = I->src[0].size == AGX_SIZE_16;
             const agx_index f32 = I->src[half_first ? 1 : 0];

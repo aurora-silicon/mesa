@@ -45,6 +45,10 @@ common_mods(uint16_t dest, uint16_t src0, uint16_t src1,
    ov[n++] = (struct agx3_field_kv)KV(2, dest);
    ov[n++] = (struct agx3_field_kv)KV(35, src0);
    ov[n++] = (struct agx3_field_kv)KV(18, src1);
+   /* f10 selects the destination width; the baselines pin the 32-bit
+    * default, the override narrows it where a half destination is
+    * grounded (w04/w05/w14/w23/w26). */
+   ov[n++] = (struct agx3_field_kv)KV(10, m->dest_16 ? 1 : 2);
    ov[n++] = (struct agx3_field_kv)KV(47, m->src0_abs ? 1 : 0);
    ov[n++] = (struct agx3_field_kv)KV(48, m->src0_neg ? 1 : 0);
    ov[n++] = (struct agx3_field_kv)KV(43, m->src0_16 ? 1 : 2);
@@ -75,7 +79,7 @@ agx3_falu_add_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
                   uint16_t src1, const struct agx3_falu_mods *m,
                   uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len)
 {
-   if (m == NULL || (dest & 1) || dest >= 256 ||
+   if (m == NULL || (dest & 1) || dest >= 256 || m->dest_16 ||
        !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
        m->addend_abs || m->addend_neg)
       return false;
@@ -88,6 +92,42 @@ agx3_falu_add_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
 /* Keep subtraction and other modified adds fused while preserving both live
  * operands and their producer slots. The native forms grow from4 to10bytes
  * only when modifiers or wait combinations require it. */
+/* A 16-bit source beside a saturated f32add is grounded only as the
+ * unmodified half in the f35 slot (f14 + f43, the ep2 w25 form), so
+ * saturation refuses every other width combination. */
+static bool
+add_sat_width_ok(const struct agx3_falu_mods *m)
+{
+   return !m->saturate || !(m->src0_16 || m->src1_16) ||
+          (!(m->src0_16 && m->src1_16) && !m->src0_abs && !m->src0_neg &&
+           !m->src1_abs && !m->src1_neg);
+}
+
+/* A narrow f32add destination is grounded plain (w04), beside a 16-bit
+ * f35 source (w23) or beside a single f35-side negate (w26). Everything
+ * else -- saturation, an absolute modifier, an f18-side source, two
+ * negated inputs, or a negate next to a 16-bit source -- is unwitnessed
+ * and refused up front. */
+static bool
+add_narrow_ok(const struct agx3_falu_mods *m)
+{
+   return !m->dest_16 ||
+          !(m->saturate || m->src0_abs || m->src1_abs || m->src1_16 ||
+            (m->src0_neg && m->src1_neg) ||
+            (m->src0_16 && (m->src0_neg || m->src1_neg)));
+}
+
+/* Under a narrow destination every operand property has to sit where the
+ * witnesses put it: nothing but a register or a plain negate is allowed
+ * on the f18 side, and no absolute modifier at all. */
+static bool
+add_order_narrow_ok(const struct agx3_falu_mods *placed)
+{
+   return !placed->dest_16 ||
+          !(placed->src0_abs || placed->src1_abs || placed->src1_neg ||
+            placed->src1_16);
+}
+
 bool
 agx3_falu_add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                          uint16_t src0, uint16_t src1,
@@ -96,18 +136,26 @@ agx3_falu_add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                          uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len)
 {
    if (enc != AGX_ISA_ENCODING_AGX3B || !m || !runtime || !out || !len ||
-       (dest & 1) || dest >= 256 || !slot_ok(src0, m->src0_16) ||
-       !slot_ok(src1, m->src1_16) || m->addend_abs || m->addend_neg ||
-       runtime->wait_mask > 0x3f)
+       dest >= 256 || (!m->dest_16 && (dest & 1)) ||
+       !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
+       m->addend_abs || m->addend_neg || m->addend_16 ||
+       runtime->wait_mask > 0x3f ||
+       (m->src0_16 && m->src1_16) ||
+       !add_sat_width_ok(m) || !add_narrow_ok(m))
       return false;
    for (unsigned i = 0; i < 2; ++i)
       if (runtime->cache[i] && runtime->discard[i])
          return false;
 
    uint8_t best[AGX3_FALU_MOD_MAX_LENGTH], best_size = 0;
+   int best_score = 0;
    /* Addition is commutative, but the compact form gives the first source
-    * the cheap negate modifier. Native subtraction places its negated input
-    * there. Swap both modifiers and lifetime hints when this saves bytes. */
+    * the cheap negate modifier. Apple places a negated source in f35
+    * (`b - a`, including a 16-bit one as f48+f43 in `a - b`), then a bare
+    * 16-bit source in f35 when nothing is negated (w01/w21); the f18
+    * width field f26 is the fallback for when f35 is taken. Try both
+    * orders, score the canonical placement, and keep the shortest legal
+    * encoding. */
    for (unsigned swap = 0; swap < 2; ++swap) {
       struct agx3_falu_mods mods = *m;
       if (swap) {
@@ -118,6 +166,18 @@ agx3_falu_add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
          mods.src1_neg = m->src0_neg;
          mods.src1_16 = m->src0_16;
       }
+      if (!add_order_narrow_ok(&mods) || (m->saturate && mods.src1_16))
+         continue;
+
+      int score = 0;
+      if (mods.src0_16 && !mods.src0_neg && !mods.src0_abs)
+         score -= 1;
+      if (!mods.src0_neg && mods.src1_neg)
+         score += 2;
+      if (mods.src1_16 && !mods.src1_neg && !mods.src1_abs &&
+          !mods.src0_neg && !mods.src0_abs)
+         score += 1;
+
       struct agx3_field_kv ov[32];
       unsigned n = common_mods(dest, swap ? src1 : src0, swap ? src0 : src1,
                                &mods, ov);
@@ -132,10 +192,12 @@ agx3_falu_add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
       for (unsigned ep = 0; ep <= 3; ++ep) {
          uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], size;
          if (agx3_bind_compose(enc, "f32add", ep, add_b, 9, ov, n, bytes, &size)) {
-            if (!best_size || size < best_size) {
+            if (!best_size || score < best_score ||
+                (score == best_score && size < best_size)) {
                for (unsigned i = 0; i < size; ++i)
                   best[i] = bytes[i];
                best_size = size;
+               best_score = score;
             }
             break;
          }
@@ -225,7 +287,7 @@ agx3_falu_mul_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
                   uint16_t src1, const struct agx3_falu_mods *m,
                   uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len)
 {
-   if (m == NULL || (dest & 1) || dest >= 256 ||
+   if (m == NULL || (dest & 1) || dest >= 256 || m->dest_16 ||
        !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
        m->addend_abs || m->addend_neg)
       return false;
@@ -245,22 +307,44 @@ agx3_falu_mul_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                           const struct agx3_falu_runtime *runtime,
                           uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len)
 {
+   /* The multiply has no witnessed narrow-dest, saturated or modified
+    * 16-bit form at this endpoint: w02/w07 are plain width, w14 is a
+    * plain narrow destination handled by its own encoder. */
    if (enc != AGX_ISA_ENCODING_AGX3B || !m || !runtime || !out || !len ||
-       (dest & 1) || dest >= 256 || !slot_ok(src0, m->src0_16) ||
-       !slot_ok(src1, m->src1_16) || m->addend_abs || m->addend_neg ||
-       runtime->wait_mask > 0x3f)
+       (dest & 1) || dest >= 256 || m->dest_16 ||
+       !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
+       m->addend_abs || m->addend_neg || m->addend_16 ||
+       runtime->wait_mask > 0x3f ||
+       (m->src0_16 && (m->src0_abs || m->src0_neg)) ||
+       (m->src1_16 && (m->src1_abs || m->src1_neg)) ||
+       (m->saturate && (m->src0_16 || m->src1_16)))
       return false;
    for (unsigned i = 0; i < 2; ++i)
       if (runtime->cache[i] && runtime->discard[i])
          return false;
 
+   /* Multiplication commutes: a lone 16-bit source belongs to the f35
+    * slot (w07); f26 beside a 32-bit f35 is unwitnessed on f32mul, so
+    * move the narrow operand over, carrying its lifetime hints. */
+   const bool swap = m->src1_16 && !m->src0_16;
+   struct agx3_falu_mods mods = *m;
+   if (swap) {
+      mods.src0_abs = m->src1_abs;
+      mods.src0_neg = m->src1_neg;
+      mods.src0_16 = m->src1_16;
+      mods.src1_abs = m->src0_abs;
+      mods.src1_neg = m->src0_neg;
+      mods.src1_16 = m->src0_16;
+   }
+
    struct agx3_field_kv ov[32];
-   unsigned n = common_mods(dest, src0, src1, m, ov);
+   unsigned n = common_mods(dest, swap ? src1 : src0, swap ? src0 : src1,
+                            &mods, ov);
    ov[n++] = (struct agx3_field_kv)KV(11, runtime->dest_cache);
-   ov[n++] = (struct agx3_field_kv)KV(44, runtime->cache[0]);
-   ov[n++] = (struct agx3_field_kv)KV(46, runtime->discard[0]);
-   ov[n++] = (struct agx3_field_kv)KV(27, runtime->cache[1]);
-   ov[n++] = (struct agx3_field_kv)KV(29, runtime->discard[1]);
+   ov[n++] = (struct agx3_field_kv)KV(44, runtime->cache[swap]);
+   ov[n++] = (struct agx3_field_kv)KV(46, runtime->discard[swap]);
+   ov[n++] = (struct agx3_field_kv)KV(27, runtime->cache[1 - swap]);
+   ov[n++] = (struct agx3_field_kv)KV(29, runtime->discard[1 - swap]);
    for (unsigned i = 0; i < 6; ++i)
       ov[n++] = (struct agx3_field_kv)KV(80 + i,
                                        (runtime->wait_mask >> i) & 1);
@@ -276,13 +360,47 @@ agx3_falu_mul_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
    return false;
 }
 
+/* The witnessed width compositions on f32fma.ep3 are h*h+f (w03), h*f+f
+ * (w08), f*f+h (w09) and the immediate-multiplier pairing of f26 with
+ * f42=1 (w22, encoded elsewhere). A lone f26 multiplicand, a 16-bit
+ * addend beside any narrow multiplicand, or a modifier or saturate on a
+ * narrow operand are unwitnessed. */
+static bool
+fma_width_ok(const struct agx3_falu_mods *m)
+{
+   if (m->src1_16 && !m->src0_16)
+      return false;
+   if (m->addend_16 && (m->src0_16 || m->src1_16))
+      return false;
+   if (m->src0_16 && (m->src0_abs || m->src0_neg))
+      return false;
+   if (m->src1_16 && (m->src1_abs || m->src1_neg))
+      return false;
+   if (m->addend_16 && m->addend_abs)
+      return false;
+   if (m->saturate && (m->src0_16 || m->src1_16 || m->addend_16))
+      return false;
+   return true;
+}
+
+/* A narrow f32fma destination exists only as the plain three-register
+ * form (w05): no width, modifier or saturate beside it. */
+static bool
+fma_narrow_ok(const struct agx3_falu_mods *m)
+{
+   return !m->dest_16 ||
+          !(m->saturate || m->src0_abs || m->src0_neg || m->src1_abs ||
+            m->src1_neg || m->addend_abs || m->addend_neg || m->src0_16 ||
+            m->src1_16 || m->addend_16);
+}
+
 bool
 agx3_falu_fma_mod(enum agx_isa_encoding enc, uint16_t dest, uint16_t src0,
                   uint16_t src1, uint16_t addend,
                   const struct agx3_falu_mods *m,
                   uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len)
 {
-   if (m == NULL || (dest & 1) || dest >= 256 ||
+   if (m == NULL || (dest & 1) || dest >= 256 || m->dest_16 ||
        !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
        !slot_ok(addend, m->addend_16))
       return false;
@@ -309,9 +427,11 @@ agx3_falu_fma_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
                           uint8_t out[AGX3_FALU_MOD_MAX_LENGTH], uint8_t *len)
 {
    if (enc != AGX_ISA_ENCODING_AGX3B || m == NULL || runtime == NULL ||
-       out == NULL || len == NULL || (dest & 1) || dest >= 256 ||
+       out == NULL || len == NULL || dest >= 256 ||
+       (!m->dest_16 && (dest & 1)) ||
        !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
-       !slot_ok(addend, m->addend_16) || runtime->wait_mask > 0x3f)
+       !slot_ok(addend, m->addend_16) || runtime->wait_mask > 0x3f ||
+       !fma_width_ok(m) || !fma_narrow_ok(m))
       return false;
    for (unsigned i = 0; i < 3; ++i)
       if (runtime->cache[i] && runtime->discard[i])

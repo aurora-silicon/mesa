@@ -3969,6 +3969,33 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
              half_uniforms == 1 && I->src[s].type == AGX_INDEX_UNIFORM)
             continue;
 
+         /* AGX3B composes a 16-bit register onto the f32fma slots: src0
+          * (f43, w03/w08), src1 beside a 16-bit src0 or a minifloat
+          * multiplier (f26, w03/w22), and the addend beside two 32-bit
+          * multiplicands (f60, w09). Keep a source on the grounded
+          * combinations and widen the rest. */
+         const agx_index s0 = I->src[0], s1 = I->src[1], s2 = I->src[2];
+         const bool reg32_s2 =
+            s2.size == AGX_SIZE_32 &&
+            (s2.type == AGX_INDEX_NORMAL || s2.type == AGX_INDEX_REGISTER);
+         bool keep = false;
+         if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+             reg32_s2) {
+            if (s == 0)
+               keep = s1.type == AGX_INDEX_NORMAL ||
+                      s1.type == AGX_INDEX_REGISTER ||
+                      s1.type == AGX_INDEX_IMMEDIATE;
+            else if (s == 1)
+               keep = s0.size == AGX_SIZE_16 ||
+                      s0.type == AGX_INDEX_IMMEDIATE;
+            else
+               keep = s0.size == AGX_SIZE_32 && s1.size == AGX_SIZE_32 &&
+                      s0.type != AGX_INDEX_UNIFORM &&
+                      s1.type != AGX_INDEX_UNIFORM;
+         }
+         if (keep)
+            continue;
+
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);
          agx_fmov_to(&b, widened, I->src[s]);
          I->src[s] = widened;
@@ -4972,27 +4999,22 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
       }
 
-      /* Hyprland's colour-management shaders add a highp accumulator to a
-       * mediump matrix term. There is no grounded plain mixed-width FADD on
-       * G17P, so widen the half input explicitly and use the ordinary f32
-       * register form. Keep the separately witnessed abs(f32) + f16 endpoint
-       * available for its exact modifier shape. */
+      /* AGX3B composes one 16-bit register onto the f32add source slots
+       * natively (w01/w19/w21), so a lone half stays narrow. Two 16-bit
+       * add sources are unwitnessed; break such a pair with a single
+       * exact widening of the first operand, leaving the result on the
+       * mixed-width form again. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
-          I->dest[0].size == AGX_SIZE_32) {
-         for (unsigned s = 0; s < 2; ++s) {
-            const unsigned other = s ^ 1;
-            if (I->src[s].type == AGX_INDEX_IMMEDIATE ||
-                I->src[s].size != AGX_SIZE_16 || I->src[s].abs ||
-                I->src[s].neg || I->src[other].type == AGX_INDEX_IMMEDIATE ||
-                I->src[other].size != AGX_SIZE_32 ||
-                I->src[other].abs || I->src[other].neg)
-               continue;
-
-            agx_index widened = agx_temp(ctx, AGX_SIZE_32);
-            agx_fmov_to(&b, widened, I->src[s]);
-            I->src[s] = widened;
-         }
+          I->dest[0].size == AGX_SIZE_32 &&
+          I->src[0].size == AGX_SIZE_16 &&
+          I->src[1].size == AGX_SIZE_16 &&
+          I->src[0].type != AGX_INDEX_IMMEDIATE &&
+          I->src[1].type != AGX_INDEX_IMMEDIATE) {
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_index widened = agx_temp(ctx, AGX_SIZE_32);
+         agx_fmov_to(&b, widened, I->src[0]);
+         I->src[0] = widened;
       }
 
       /* Native half FMA can carry a minifloat addend, but both multiplier

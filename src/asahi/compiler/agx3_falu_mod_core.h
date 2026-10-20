@@ -62,6 +62,7 @@ struct agx3_falu_mods {
    bool addend_neg; /* f65, ffma only */
    bool addend_16;  /* f60, ffma only */
    bool saturate;   /* f14 */
+   bool dest_16;    /* f10: the destination is a single half register */
 };
 
 #define AGX3_FALU_MOD_MAX_LENGTH 16u
