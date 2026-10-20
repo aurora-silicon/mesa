@@ -11710,7 +11710,6 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
    /* Record API/source arithmetic before backend lowering introduces its own
     * 64-bit address and invocation-ID calculations. */
-   const bool source_iadd64 = agx_nir_has_alu64(nir, nir_op_iadd);
    const bool source_imul64 = agx_nir_has_alu64(nir, nir_op_imul) ||
                               agx_nir_has_alu64(nir, nir_op_umul_2x32_64) ||
                               agx_nir_has_alu64(nir, nir_op_imul_2x32_64);
@@ -11869,8 +11868,14 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
        * each resulting operation already has an Apple-exact encoding.  XFB
        * uses this for bounds-safe counter arithmetic. */
       agx3_options.lower_usub_sat = true;
-      if (source_iadd64)
-         agx3_options.lower_int64_options |= nir_lower_iadd64;
+      /* Lower every 64-bit add, not only the ones present on entry:
+       * nir_lower_int64 itself produces iadd@64 when it lowers a 64-bit
+       * subgroup reduce/scan (lower_scan_iadd64 recombines the three 24-bit
+       * scans with two of them).  Those do not exist yet when the incoming
+       * shader is inspected, so gating on a source-level scan lets them
+       * reach the G17P packer, which has no grounded iadd@64 and refuses
+       * the shader. */
+      agx3_options.lower_int64_options |= nir_lower_iadd64;
       if (source_imul64)
          agx3_options.lower_int64_options &= ~nir_lower_imul64;
       nir->options = &agx3_options;
