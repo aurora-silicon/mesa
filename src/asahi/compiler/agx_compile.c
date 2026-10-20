@@ -52,6 +52,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"spill",     AGX_DBG_SPILL,     "Spill (almost) everything"},
    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
    {"noilp",     AGX_DBG_NOILP,     "Do not latency-schedule the shader"},
+   {"uatomics",  AGX_DBG_UATOMICS,  "Enable uniform atomics on G17P"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -11715,6 +11716,31 @@ agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
    return true;
 }
 
+/* Whether any atomic produces a 64-bit value.  The uniform-atomics rewrite
+ * emits a subgroup reduce (and a scan when the result is read) over the
+ * atomic's width, and G17P instruction selection has no 64-bit form for
+ * either (the bit_size asserts at the reduce/exclusive_scan cases), so the
+ * pass must stay off while any 64-bit atomic is present. */
+static bool
+agx_nir_has_atomic64(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intrin =
+                  nir_instr_as_intrinsic(instr);
+               if (nir_intrinsic_has_atomic_op(intrin) &&
+                   intrin->def.bit_size == 64)
+                  return true;
+            }
+         }
+      }
+   }
+
+   return false;
+}
+
 bool
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
@@ -11935,7 +11961,23 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(_, nir, agx_nir_lower_imul64);
    }
 
-   const bool uniform_atomics = !is_agx3;
+   /* The uniform-atomics rewrite replaces a uniform-address atomic with one
+    * atomic per subgroup plus a scan, which reads the subgroup coverage
+    * registers the G17P packer admits only in compute, vertex,
+    * tessellation-control and fragment (GET_SR_COVERAGE in
+    * agx3_pack_binary.c).  Enable it on G17P only, behind AGX_DBG_UATOMICS,
+    * until a CTS campaign validates it; AGX3C is left out entirely.  A
+    * 64-bit atomic would need a 64-bit reduce/scan the selector has no form
+    * for, so the pass is skipped while any is present. */
+   const bool g17p_uatomic_stage =
+      nir->info.stage == MESA_SHADER_COMPUTE ||
+      nir->info.stage == MESA_SHADER_VERTEX ||
+      nir->info.stage == MESA_SHADER_TESS_CTRL ||
+      nir->info.stage == MESA_SHADER_FRAGMENT;
+   const bool uniform_atomics =
+      !is_agx3 || (is_g17p && g17p_uatomic_stage &&
+                   (agx_compiler_debug & AGX_DBG_UATOMICS) &&
+                   !agx_nir_has_atomic64(nir));
 
    /* Apple's G17P loops are a
     * guard plus a bottom-tested body (fs/cs-apple.bin: the backedge target

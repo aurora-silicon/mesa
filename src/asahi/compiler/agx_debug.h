@@ -30,6 +30,7 @@ enum agx_compiler_dbg {
    AGX_DBG_SPILL       = BITFIELD_BIT(11),
    AGX_DBG_NOPROMOTE   = BITFIELD_BIT(12),
    AGX_DBG_NOILP       = BITFIELD_BIT(13),
+   AGX_DBG_UATOMICS    = BITFIELD_BIT(14),
 };
 /* clang-format on */
 
