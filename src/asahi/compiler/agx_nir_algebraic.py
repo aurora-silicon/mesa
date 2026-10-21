@@ -122,6 +122,17 @@ fold_pack_rt = [
      '!nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
 ]
 
+# An inexact widening of an fp16 product feeding an f32 add may keep the
+# unrounded product: one f32fma computes a*b + c with the multiplicands on
+# the grounded 16-bit source slots (w03/w08) and the widenings folded into
+# them. An exact (pinned) float(f16(x)) is not matched -- its rounding is
+# mandatory -- so this never fights agx_nir_pin_fp16_widen for the f60
+# addend slot.
+fuse_fp16_fma = [
+    (('fadd', ('~f2f32', ('fmul@16', a, b)), 'c@32'),
+     ('ffma', ('f2f32', a), ('f2f32', b), c)),
+]
+
 # Rewriting bcsel(a || b, ...) in terms of bcsel(a, ...) and bcsel(b, ...) lets
 # our rules to fuse compare-and-select do a better job, assuming that a and b
 # are comparisons themselves.
@@ -471,6 +482,8 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       lower_selects).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_pack_roundtrip",
                                       fold_pack_rt).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fuse_fp16_fma",
+                                      fuse_fp16_fma).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_selects",
                                       opt_selects).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_pixel_coord",
