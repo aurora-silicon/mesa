@@ -1108,6 +1108,28 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
  * out-of-bounds lanes entirely.
  */
 
+/* Defined after the offset-decomposition helpers below; proves a guard is
+ * this write's own bounds check and returns the descriptor bound. */
+static bool hk_null_bounded_bound(nir_if *nif, nir_intrinsic_instr *write,
+                                  unsigned addr_src, nir_scalar *bound_out);
+
+/* The uniform null-descriptor test ine(bound, 0) and its base redirect to
+ * the scratch page cost a handful of uniform instructions and preamble
+ * staging words per descriptor -- worth paying only when enough divergent
+ * writes share the descriptor.  Scoring per bound def: an atomic whose
+ * result is read sheds its if_phi plumbing too (4), other writes 1. */
+struct hk_nb_count {
+   const nir_def *def;
+   unsigned score;
+};
+
+#define HK_NB_MAX_COUNTS 24
+#define HK_NB_SCORE_USED_ATOMIC 4
+#define HK_NB_SCORE_FIRE 6
+
+static unsigned hk_nb_score(const struct hk_nb_count *counts, unsigned nc,
+                            const nir_def *def);
+
 /* Matches the shape explicit-io emits for a bounded global write: a
  * single then block of side-effect-free instructions ending in the store
  * or atomic, and a single empty else block.  Returns the write
@@ -1235,7 +1257,8 @@ hk_bound_write_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
 }
 
 static bool
-hk_redirect_bounded_write(nir_if *nif)
+hk_redirect_bounded_write(nir_if *nif, const struct hk_nb_count *counts,
+                          unsigned nc)
 {
    nir_intrinsic_instr *write = hk_bounded_write_guarded(nif);
    if (!write)
@@ -1289,19 +1312,30 @@ hk_redirect_bounded_write(nir_if *nif)
    /* The redirect only pays off when the guard and the address are
     * uniform: the bounds check and the address select then lift into the
     * preamble with the rest of the uniform code, leaving the kernel with
-    * a bare write.  A divergent select costs more instructions in the
-    * kernel than the cndst/cndend split it replaces. */
-   /* The redirect only pays off when the guard and the address are
-    * uniform: the bounds check and the address select then lift into the
-    * preamble with the rest of the uniform code, leaving the kernel with
-    * a bare write.  A divergent select costs more instructions in the
-    * kernel than the cndst/cndend split it replaces -- measured +1..+5 on
-    * every mem-atom-* shader whether or not the atomic's old value is
-    * used. */
-   if (nif->condition.ssa->divergent || write->src[addr_src].ssa->divergent)
-      return false;
-
+    * a bare write.  A divergent select on the per-lane check costs more
+    * instructions in the kernel than the cndst/cndend split it replaces
+    * -- measured +1..+5 on every mem-atom-* shader whether or not the
+    * atomic's old value is used.
+    *
+    * With storage-buffer robustness DISABLED, though, the bound exists
+    * only to give a null descriptor its zero range: bound != 0 already
+    * identifies every real buffer, so the divergent per-lane check
+    * collapses to the shared uniform null test. */
    nir_def *valid = nif->condition.ssa;
+   bool null_test = false;
+
+   if (valid->divergent || write->src[addr_src].ssa->divergent) {
+      nir_scalar bound;
+      if (!counts ||
+          !hk_null_bounded_bound(nif, write, addr_src, &bound) ||
+          hk_nb_score(counts, nc, bound.def) < HK_NB_SCORE_FIRE)
+         return false;
+
+      nir_builder nb = nir_builder_at(nir_before_cf_node(&nif->cf_node));
+      valid = nir_ine(&nb, nir_mov_scalar(&nb, bound),
+                      nir_imm_int(&nb, 0));
+      null_test = true;
+   }
 
    /* Lift the then-block instructions out of the if, in order, to the end
     * of the block that precedes it.  The bounds check that produced the
@@ -1313,7 +1347,9 @@ hk_redirect_bounded_write(nir_if *nif)
     * iadd(base64, u2u64(offset32)) decomposition so agx_nir_lower_address
     * recovers the base+index addressing mode; selecting the whole address
     * would force a 64-bit carry chain.  Scratch+0 is inside the 16 KiB
-    * scratch page, so the offset is clamped to zero. */
+    * scratch page, so the offset is clamped to zero.  The same selects
+    * serve the null-descriptor test, whose uniform condition lets the
+    * base select hoist out of the kernel entirely. */
    nir_def *addr = write->src[addr_src].ssa;
    nir_builder b = nir_builder_at(nir_before_instr(&write->instr));
 
@@ -1348,13 +1384,19 @@ hk_redirect_bounded_write(nir_if *nif)
 
    if (atomic) {
       /* Mask the atomic's old value to zero for out-of-bounds lanes,
-       * refining the undef else-branch value. */
-      b.cursor = nir_after_instr(&write->instr);
-      nir_def *res =
-         nir_bcsel(&b, valid, &write->def,
-                   nir_imm_zero(&b, write->def.num_components,
-                                write->def.bit_size));
-      nir_def_rewrite_uses(&result_phi->def, res);
+       * refining the undef else-branch value.  The null-descriptor test
+       * needs no mask at all: the atomic always executes, so its result
+       * is itself a refinement of the undef. */
+      if (null_test) {
+         nir_def_rewrite_uses(&result_phi->def, &write->def);
+      } else {
+         b.cursor = nir_after_instr(&write->instr);
+         nir_def *res =
+            nir_bcsel(&b, valid, &write->def,
+                      nir_imm_zero(&b, write->def.num_components,
+                                   write->def.bit_size));
+         nir_def_rewrite_uses(&result_phi->def, res);
+      }
    }
 
    /* Deletes the now-empty then block, the else block and the merge phis;
@@ -1363,8 +1405,91 @@ hk_redirect_bounded_write(nir_if *nif)
    return true;
 }
 
+/* Does the guarded atomic's return value reach real consumers?  The
+ * merge-block if_phi(result, undef) is the only direct user; check its
+ * own uses. */
 static bool
-hk_redirect_bounded_writes_cf_list(struct exec_list *cf_list)
+hk_bounded_write_result_used(nir_if *nif, nir_intrinsic_instr *write)
+{
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *merge = then_block->successors[0];
+   if (!merge)
+      return false;
+
+   nir_foreach_phi(phi, merge) {
+      bool has_def_src = false;
+      nir_foreach_phi_src(src, phi)
+         has_def_src |= src->src.ssa == &write->def;
+      if (has_def_src)
+         return !list_is_empty(&phi->def.uses);
+   }
+   return false;
+}
+
+static unsigned
+hk_nb_score(const struct hk_nb_count *counts, unsigned nc,
+            const nir_def *def)
+{
+   for (unsigned i = 0; i < nc; i++) {
+      if (counts[i].def == def)
+         return counts[i].score;
+   }
+   return 0;
+}
+
+/* Score every divergent bounded-write guard the redirect could cover,
+ * keyed on the descriptor bound, before any rewrite runs. */
+static void
+hk_nb_count_cf_list(struct exec_list *cf_list, struct hk_nb_count *counts,
+                    unsigned *nc)
+{
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         hk_nb_count_cf_list(&nif->then_list, counts, nc);
+         hk_nb_count_cf_list(&nif->else_list, counts, nc);
+
+         nir_intrinsic_instr *write = hk_bounded_write_guarded(nif);
+         if (!write)
+            continue;
+
+         unsigned addr_src =
+            write->intrinsic == nir_intrinsic_store_global ? 1 : 0;
+         if (!nif->condition.ssa->divergent &&
+             !write->src[addr_src].ssa->divergent)
+            continue;
+
+         nir_scalar bound;
+         if (!hk_null_bounded_bound(nif, write, addr_src, &bound))
+            continue;
+
+         unsigned score = 1;
+         if (write->intrinsic != nir_intrinsic_store_global &&
+             hk_bounded_write_result_used(nif, write))
+            score = HK_NB_SCORE_USED_ATOMIC;
+
+         unsigned i;
+         for (i = 0; i < *nc; i++) {
+            if (counts[i].def == bound.def)
+               break;
+         }
+         if (i == *nc) {
+            if (*nc >= HK_NB_MAX_COUNTS)
+               continue;
+            counts[(*nc)++] = (struct hk_nb_count){.def = bound.def,
+                                                  .score = 0};
+         }
+         counts[i].score += score;
+      } else if (node->type == nir_cf_node_loop) {
+         hk_nb_count_cf_list(&nir_cf_node_as_loop(node)->body, counts, nc);
+      }
+   }
+}
+
+static bool
+hk_redirect_bounded_writes_cf_list(struct exec_list *cf_list,
+                                   const struct hk_nb_count *counts,
+                                   unsigned nc)
 {
    bool progress = false;
    bool restart;
@@ -1375,20 +1500,22 @@ hk_redirect_bounded_writes_cf_list(struct exec_list *cf_list)
          switch (node->type) {
          case nir_cf_node_if: {
             nir_if *nif = nir_cf_node_as_if(node);
-            progress |= hk_redirect_bounded_writes_cf_list(&nif->then_list);
-            progress |= hk_redirect_bounded_writes_cf_list(&nif->else_list);
+            progress |= hk_redirect_bounded_writes_cf_list(&nif->then_list,
+                                                         counts, nc);
+            progress |= hk_redirect_bounded_writes_cf_list(&nif->else_list,
+                                                         counts, nc);
 
             /* Removing the if stitches its merge block into the preceding
              * block, unlinking the merge block's cf node -- which is the
              * iterator's cached successor.  Restart this list's scan rather
              * than chase a stale link. */
-            if (hk_redirect_bounded_write(nif))
+            if (hk_redirect_bounded_write(nif, counts, nc))
                progress = restart = true;
             break;
          }
          case nir_cf_node_loop:
             progress |= hk_redirect_bounded_writes_cf_list(
-               &nir_cf_node_as_loop(node)->body);
+               &nir_cf_node_as_loop(node)->body, counts, nc);
             break;
          default:
             break;
@@ -1403,12 +1530,24 @@ hk_redirect_bounded_writes_cf_list(struct exec_list *cf_list)
 }
 
 static bool
-hk_nir_redirect_bounded_writes(nir_shader *nir)
+hk_nir_redirect_bounded_writes(nir_shader *nir, bool null_bounded)
 {
    bool progress = false;
    nir_divergence_analysis(nir);
-   nir_foreach_function_impl(impl, nir)
-      progress |= hk_redirect_bounded_writes_cf_list(&impl->body);
+   nir_foreach_function_impl(impl, nir) {
+      /* Count the divergent writes per descriptor bound first: the
+       * uniform null test plus base redirect only amortizes when enough
+       * writes share the descriptor. */
+      struct hk_nb_count counts[HK_NB_MAX_COUNTS];
+      unsigned nc = 0;
+      if (null_bounded)
+         hk_nb_count_cf_list(&impl->body, counts, &nc);
+
+      progress |= hk_redirect_bounded_writes_cf_list(&impl->body,
+                                                     null_bounded ? counts
+                                                                  : NULL,
+                                                     nc);
+   }
    return progress;
 }
 
@@ -1972,6 +2111,97 @@ hk_off_decomp_equal(const struct hk_off_decomp *a,
    return true;
 }
 
+static void hk_bload_base_leaves(nir_def *base, nir_scalar *lo,
+                                 nir_scalar *hi);
+
+/* With storage-buffer robustness DISABLED the bounded-global address
+ * format exists only so a null descriptor's zero range keeps null loads
+ * at zero and null writes inside the discard page.  bound != 0 then
+ * identifies every real buffer, so a divergent per-access bounds guard
+ * reduces to a uniform null test -- provided the guard really is the
+ * bounds check explicit-io emitted for *this* write:
+ *
+ *    ult(off + (size - 1), bound)           -- literal form, or
+ *    ult(off, usub_sat(bound, size - 1))    -- slackened form
+ *
+ * where off decomposes to the write's own 32-bit offset and bound is a
+ * component of the same descriptor word that supplies the base.  A user
+ * ult() wrapped around a write matches neither half: its checked operand
+ * does not track the write offset, or its bound is not descriptor state,
+ * so an unrelated predicate never collapses to the null test.
+ *
+ * On a match returns the bound scalar through bound_out for
+ * ine(bound, 0); NULL/false for any other shape. */
+static bool
+hk_null_bounded_bound(nir_if *nif, nir_intrinsic_instr *write,
+                      unsigned addr_src, nir_scalar *bound_out)
+{
+   nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
+   if (!is_op(cond, nir_op_ult))
+      return false;
+
+   /* The write's 32-bit offset half, from iadd(base64, u2u64(off32)). */
+   nir_scalar base, offset;
+   if (!hk_split_global_addr(write->src[addr_src].ssa, &base, &offset))
+      return false;
+
+   const unsigned size =
+      write->intrinsic == nir_intrinsic_store_global
+         ? 4 * util_last_bit(nir_intrinsic_write_mask(write))
+         : write->def.bit_size / 8;
+
+   struct hk_off_decomp off_dec;
+   hk_offset_decomp_init(offset, &off_dec);
+   if (!off_dec.valid)
+      return false;
+
+   nir_scalar x = nir_scalar_chase_alu_src(cond, 0);
+   nir_scalar y = nir_scalar_chase_alu_src(cond, 1);
+
+   nir_scalar bound;
+   if (is_op(y, nir_op_usub_sat)) {
+      /* Slackened form: the checked operand is the bare offset and the
+       * subtract is by exactly size - 1. */
+      struct hk_off_decomp x_dec;
+      hk_offset_decomp_init(x, &x_dec);
+      if (!x_dec.valid || !hk_off_decomp_equal(&x_dec, &off_dec) ||
+          x_dec.delta != off_dec.delta)
+         return false;
+
+      nir_scalar sub = nir_scalar_chase_alu_src(y, 1);
+      if (!nir_scalar_is_const(sub) ||
+          nir_scalar_as_uint(sub) != size - 1)
+         return false;
+
+      bound = hk_scalar_leaf(nir_scalar_chase_alu_src(y, 0), 0);
+   } else {
+      /* Literal form: the checked end is the offset plus size - 1. */
+      struct hk_off_decomp x_dec;
+      hk_offset_decomp_init(x, &x_dec);
+      if (!x_dec.valid || !hk_off_decomp_equal(&x_dec, &off_dec) ||
+          x_dec.delta - off_dec.delta != (int64_t)size - 1)
+         return false;
+
+      bound = hk_scalar_leaf(y, 0);
+   }
+
+   if (!bound.def || bound.def->bit_size != 32 ||
+       nir_scalar_is_const(bound))
+      return false;
+
+   /* The bound must come out of the same descriptor that supplies the
+    * base -- like the flatten group's keying, two buffers never share a
+    * redirect, and a bound that is not descriptor state is not the null
+    * test this rewrite needs. */
+   nir_scalar lo, hi;
+   hk_bload_base_leaves(base.def, &lo, &hi);
+   if (lo.def != bound.def)
+      return false;
+
+   *bound_out = bound;
+   return true;
+}
+
 /* Match one bounded-store guard and record the pieces needed to merge it
  * with its neighbours.  The check must cover exactly this store:
  * end == off + size - 1 where end is the checked offset. */
@@ -2441,9 +2671,6 @@ hk_nir_merge_bounded_stores(nir_shader *nir)
 #define HK_FLAT_MAX_MEMBERS 64
 /* Redirected members write or read inside one sink page. */
 #define HK_FLAT_MAX_SPAN 16384
-
-static void hk_bload_base_leaves(nir_def *base, nir_scalar *lo,
-                                 nir_scalar *hi);
 
 struct hk_flat_group_key {
    nir_scalar bound;
@@ -4685,11 +4912,16 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
        * are uniform, redirect those writes at the mapped scratch page
        * instead: bcsel the address and mask the atomic's result, no
        * control-flow split, and the uniform select lifts into the
-       * preamble.  Divergent accesses keep the guard -- adding select
-       * instructions to the kernel costs more than the cndst/cndend
-       * split it replaces. */
+       * preamble.  With robustness disabled the bound only encodes the
+       * null descriptor's zero range, so a divergent guard collapses to
+       * the shared uniform bound != 0 test and redirects the same way;
+       * with per-access robustness the divergent guard stays -- adding
+       * select instructions to the kernel costs more than the
+       * cndst/cndend split it replaces. */
       NIR_PASS(_, nir, hk_nir_slacken_bounded_checks);
-      NIR_PASS(_, nir, hk_nir_redirect_bounded_writes);
+      NIR_PASS(_, nir, hk_nir_redirect_bounded_writes,
+               rs->storage_buffers ==
+                  VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT);
    }
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
