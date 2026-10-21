@@ -7192,6 +7192,16 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
                .gpu;
          batch->geom_index = params.output_index_buffer;
       }
+
+      if (gsi->output_record_B) {
+         params.output_records = agx_pool_alloc_aligned(
+            &batch->pool,
+            poly_gs_output_records_size(gsi->shape, params.input_primitives,
+                                        info->instance_count,
+                                        params.primitives_log2,
+                                        gsi->output_record_B),
+            16).gpu;
+      }
    }
 
    batch->uniforms.vertex_params =
@@ -7271,6 +7281,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
          .is_prefix_summing = gs->gs.prefix_sum,
          .max_indices = gs->gs.max_indices,
          .shape = gs->gs.shape,
+         .output_record_B = gs->gs.output_record_B,
       };
 
       libagx_gs_setup_indirect_struct(batch, agx_1d(1), AGX_BARRIER_ALL, gsi);

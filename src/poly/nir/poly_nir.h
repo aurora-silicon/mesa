@@ -41,6 +41,13 @@ struct poly_gs_info {
    /* Whether the GS writes to a stream other than stream #0 */
    bool multistream;
 
+   /* Bytes of emitted-vertex output records per index-space unit (padded
+    * unrolled primitive for a dynamic shape, dense unrolled primitive for a
+    * static shape), or 0 when the raster copy replays the shader body. See
+    * poly_gs_output_records_size().
+    */
+   unsigned output_record_B;
+
    /* Shape of the rasterization draw, named by the instance ID */
    enum poly_gs_shape shape;
 

@@ -1594,7 +1594,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
                               : agx_vec_temp(b->shader, AGX_SIZE_16, nr);
       agx_instr *load = agx_device_load_to(
          b, packed, addr, offset, norm8 ? AGX_FORMAT_I8 : AGX_FORMAT_I16,
-         BITFIELD_MASK(nr), shift, nir_is_coherent(instr));
+         BITFIELD_MASK(nr), shift, nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
       load->memory_is_packed = norm8 && nr > 1;
 
@@ -1626,7 +1626,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       assert(packed_count == 0);
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, packed, addr, offset,
-         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr));
+         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
       agx_unpack_rgb10a2_agx3_to(b, dest, packed);
       agx_emit_cached_split(b, dest, 4);
@@ -1641,7 +1641,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       assert(packed_count == 0);
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, packed, addr, offset,
-         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr));
+         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
       agx_unpack_rgb10a2_agx3_to(b, dest, packed)->format = fmt;
       agx_emit_cached_split(b, dest, 3);
@@ -1656,7 +1656,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       agx_index payload = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, payload, addr, offset, fmt,
                                            BITFIELD_MASK(nr), shift,
-                                           nir_is_coherent(instr));
+                                           nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
 
       if (nr == 1) {
@@ -1670,7 +1670,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
 
    agx_instr *load = agx_device_load_to(b, dest, addr, offset, fmt,
                       BITFIELD_MASK(packed_count ? packed_count : instr->def.num_components), shift,
-                      nir_is_coherent(instr));
+                      nir_is_coherent(instr), 0);
    load->memory_index_is_bytes = index_bytes;
    load->memory_is_packed = packed_count != 0;
    agx_emit_cached_split(b, dest, instr->def.num_components);
@@ -1728,7 +1728,7 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
       mask = BITFIELD_MASK(nir_src_num_components(instr->src[0]));
    }
    agx_instr *store = agx_device_store(b, value, addr, offset, fmt, mask,
-                                      shift, nir_is_coherent(instr));
+                                      shift, nir_is_coherent(instr), 0);
    store->memory_index_is_bytes = index_bytes;
    store->memory_is_packed =
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
@@ -3972,16 +3972,16 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
 
          /* AGX3B composes a 16-bit register onto the f32fma slots: src0
           * (f43, w03/w08), src1 beside a 16-bit src0 or a minifloat
-          * multiplier (f26, w03/w22), and the addend beside two 32-bit
-          * multiplicands (f60, w09). Keep a source on the grounded
+          * multiplier (f26, w03/w22), and the addend beside 32-bit
+          * multiplicands (f60, w09) or beside a 16-bit src0 (f43+f60
+          * and f43+f26+f60, fp16 corpus). Keep a source on the grounded
           * combinations and widen the rest. */
          const agx_index s0 = I->src[0], s1 = I->src[1], s2 = I->src[2];
-         const bool reg32_s2 =
-            s2.size == AGX_SIZE_32 &&
+         const bool reg_s2 =
             (s2.type == AGX_INDEX_NORMAL || s2.type == AGX_INDEX_REGISTER);
          bool keep = false;
          if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
-             reg32_s2) {
+             reg_s2) {
             if (s == 0)
                keep = s1.type == AGX_INDEX_NORMAL ||
                       s1.type == AGX_INDEX_REGISTER ||
@@ -3990,9 +3990,13 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
                keep = s0.size == AGX_SIZE_16 ||
                       s0.type == AGX_INDEX_IMMEDIATE;
             else
-               keep = s0.size == AGX_SIZE_32 && s1.size == AGX_SIZE_32 &&
-                      s0.type != AGX_INDEX_UNIFORM &&
-                      s1.type != AGX_INDEX_UNIFORM;
+               keep = (s2.size == AGX_SIZE_32 || s2.size == AGX_SIZE_16) &&
+                      ((s0.size == AGX_SIZE_32 && s1.size == AGX_SIZE_32 &&
+                        s0.type != AGX_INDEX_UNIFORM &&
+                        s1.type != AGX_INDEX_UNIFORM) ||
+                       (s0.size == AGX_SIZE_16 &&
+                        !s0.abs && !s0.neg && !s1.abs && !s1.neg &&
+                        !s2.abs && !s2.neg));
          }
          if (keep)
             continue;
@@ -5005,17 +5009,21 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* AGX3B composes one 16-bit register onto the f32add source slots
-       * natively (w01/w19/w21), so a lone half stays narrow. Two 16-bit
-       * add sources are unwitnessed; break such a pair with a single
-       * exact widening of the first operand, leaving the result on the
-       * mixed-width form again. */
+       * natively (w01/w19/w21), so a lone half stays narrow, and a plain
+       * pair of 16-bit sources is grounded too (fp16 corpus:
+       * f32add.ep0 f43+f26, e.g. 09001804). A modified two-half add is
+       * unwitnessed; break such a pair with a single exact widening of
+       * the first operand, leaving the result on the mixed-width form
+       * again. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
           I->dest[0].size == AGX_SIZE_32 &&
           I->src[0].size == AGX_SIZE_16 &&
           I->src[1].size == AGX_SIZE_16 &&
           I->src[0].type != AGX_INDEX_IMMEDIATE &&
-          I->src[1].type != AGX_INDEX_IMMEDIATE) {
+          I->src[1].type != AGX_INDEX_IMMEDIATE &&
+          (I->src[0].abs || I->src[0].neg || I->src[1].abs ||
+           I->src[1].neg)) {
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);
          agx_fmov_to(&b, widened, I->src[0]);
@@ -5830,6 +5838,32 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
          if (src_sz == 32 &&
              debug_get_bool_option("ASAHI_G17P_FT1", false))
             return agx_ffs_to(b, dst, s0);
+
+         /* ufind_msb(x & -x) is the position of the lowest set bit: for a
+          * single-bit mask the decrement holds exactly that many set bits,
+          * so isub + popcount replaces the five-stage smear. The fused
+          * signed select restores the -1-on-zero contract an empty mask
+          * would otherwise lose (0 - 1 counts to 32, not -1). */
+         if (src_sz == 32) {
+            nir_alu_instr *and_def = nir_src_as_alu(instr->src[0].src);
+            bool lowest_bit = false;
+            if (and_def && and_def->op == nir_op_iand) {
+               for (unsigned i = 0; i < 2 && !lowest_bit; ++i) {
+                  nir_alu_instr *neg =
+                     nir_src_as_alu(and_def->src[i].src);
+                  lowest_bit = neg && neg->op == nir_op_ineg &&
+                     nir_srcs_equal(and_def->src[i ^ 1].src,
+                                    neg->src[0].src);
+               }
+            }
+            if (lowest_bit) {
+               agx_index dec = agx_iadd(b, s0, agx_neg(i1), 0);
+               agx_index cnt = agx_popcount(b, dec);
+               agx_index neg_one = agx_mov_imm(b, 32, UINT32_C(0xffffffff));
+               return agx_icmpsel_to(b, dst, dec, i0, neg_one, cnt,
+                                     AGX_ICOND_SLT);
+            }
+         }
 
          /* The ft1 encoder admits 32-bit words only. Zero-extending a
           * narrower source can neither move its top bit nor alter the
@@ -7714,6 +7748,21 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    agx_optimize_loop_nir(nir);
 
+   /* Fragment helper-invocation reads agree until the next coverage write.
+    * The double agx_preprocess_nir run wraps memory writes in nested helper
+    * guards seeded by separate reads; deduplicate them so identical nested
+    * conditions collapse to one region. */
+   bool helper_dedup = false;
+   NIR_PASS(helper_dedup, nir, agx_nir_dedup_helper_loads);
+   if (helper_dedup) {
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_if,
+               nir_opt_if_optimize_phi_true_false |
+               nir_opt_if_avoid_64bit_phis);
+      NIR_PASS(_, nir, nir_opt_dead_cf);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
     */
@@ -7973,6 +8022,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
    NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
    NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
+   /* The pack lowering above mints f2f16(f2f32) round-trips; fold them. */
+   NIR_PASS(_, nir, agx_nir_fold_pack_roundtrip);
    NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
    NIR_PASS(_, nir, agx_nir_fuse_selects);
    NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -11901,6 +11952,26 @@ agx_g17p_discard_word(nir_shader *nir)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* A coverage update that targets no sample cannot change coverage, run a
+ * test or alter the deferred-kill contract: on G17P it still costs the
+ * staged MOVMSK plus the whole word synthesis (coverage read, nibble
+ * shifts, 16x16 select multiply).  Constant-folded masks do reach this
+ * form -- a deferred `sample_mask killed, 0` whose kill mask proved
+ * statically empty lowers to sample_mask(0, 0).  Drop it outright; Apple's
+ * side-effect fragments carry no such terminal MOVMSK. */
+static bool
+agx_nir_drop_noop_sample_mask(nir_builder *b, nir_intrinsic_instr *intr,
+                              UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_sample_mask_agx ||
+       !nir_src_is_const(intr->src[0]) ||
+       nir_src_as_uint(intr->src[0]) != 0)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 unsigned
 agx_max_vertex_attribs(const struct agx_device_key *dev)
 {
@@ -12398,6 +12469,14 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                &push_count);
       info->push_count = push_count;
    }
+
+   /* Constant-folded kill masks leave sample_mask(0, live) no-ops behind;
+    * a zero target affects no sample and must not pay the MOVMSK.  Run
+    * after preamble optimization, where the deferred-kill mask finishes
+    * folding. */
+   if (is_g17p && nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               agx_nir_drop_noop_sample_mask, nir_metadata_none, NULL);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       info->varyings.fs.nr_cf = key->fs.cf_base;

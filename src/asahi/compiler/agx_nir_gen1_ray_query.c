@@ -190,7 +190,7 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
       nir_ugt_imm(b,refill,AGX_GEN1_CANDIDATE_REFILL_BOUND)));
    nir_store_deref(b,active,nir_imm_false(b),1);nir_jump(b,nir_jump_break);
    nir_pop_if(b,NULL);
-   nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
+   nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,control,nir_channel(b,nir_load_deref(b,result[1]),2));
    nir_store_deref(b,active,completed,1);
    nir_break_if(b,nir_inot(b,completed));
    nir_store_deref(b,cursor,nir_imm_int(b,0),1);
@@ -811,14 +811,17 @@ agx_nir_gen1_load_candidate(nir_builder *b, nir_def *query,
     * query in slot A and lane/cursor offset in slot B. */
    nir_def *offset = nir_iadd(b, nir_imul_imm(b, lane, 200),
                                 nir_imul_imm(b, index, 20));
-   nir_def *prefix = nir_load_scs_indexed_agx(b, 2, 32, offset, query,
+   /* The 20-byte candidate record is contiguous: fetch its first four words
+    * (compressed address pair + barycentrics) with one vector load. */
+   nir_def *head = nir_load_scs_indexed_agx(b, 4, 32, offset, query,
       .base=1920, .component=0);
    return (struct agx_gen1_ray_candidate){
-      .compressed_address = nir_iand_imm(b, nir_pack_64_2x32(b, prefix),
-                                         UINT64_C(0xffffffffffff)),
-      .flags = nir_ushr_imm(b, nir_channel(b, prefix, 1), 16),
-      .barycentrics = nir_load_scs_indexed_agx(b, 2, 32, offset, query,
-         .base=1928, .component=0),
+      .compressed_address = nir_iand_imm(b,
+         nir_pack_64_2x32(b, nir_channels(b, head, 0x3)),
+         UINT64_C(0xffffffffffff)),
+      .flags = nir_ushr_imm(b, nir_channel(b, head, 1), 16),
+      .barycentrics = nir_vec2(b, nir_channel(b, head, 2),
+                               nir_channel(b, head, 3)),
       .distance = nir_load_scs_indexed_agx(b, 1, 32, offset, query,
          .base=1936, .component=0),
    };
@@ -841,11 +844,12 @@ agx_nir_gen1_candidate_instance_pointer(nir_builder *b, nir_def *query,
 
 nir_def *
 agx_nir_gen1_refill_candidate_queue(nir_builder *b, nir_def *query,
-                                   nir_def *lane, nir_def *id,
+                                   nir_def *lane, nir_def *id, nir_def *control,
                                    nir_def *best_distance)
 {
-   nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, query, lane,
-      .base = 1792, .component = 2);
+   /* The queue control word is stable between the wait that drained the
+    * last traversal and the next continue_ray, so the caller's copy of it
+    * is still the value to mask. */
    nir_store_scs_indexed_agx(b, nir_iand_imm(b, control, ~0x1e00001u),
       query, lane, .base = 1792, .component = 2);
    nir_store_scs_uniform_agx(b, best_distance,

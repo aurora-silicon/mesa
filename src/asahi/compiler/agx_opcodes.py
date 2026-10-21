@@ -104,6 +104,7 @@ GATHER = enum("gather", {
 })
 
 OFFSET = immediate("offset", "bool")
+MEM_OFFSET = immediate("mem_offset", "int32_t")
 SHADOW = immediate("shadow", "bool")
 SPARSE = immediate("sparse", "bool")
 QUERY_LOD = immediate("query_lod", "bool")
@@ -325,7 +326,8 @@ for memory, can_reorder in [("texture", True), ("image", False)]:
 # sources are base, index
 op("device_load",
       encoding = (0x05, 6, 8),
-      srcs = 2, imms = [FORMAT, MASK, SHIFT, SCOREBOARD, COHERENT], can_reorder = False,
+      srcs = 2, imms = [FORMAT, MASK, SHIFT, SCOREBOARD, COHERENT, MEM_OFFSET],
+      can_reorder = False,
       schedule_class = "load")
 
 # sources are base (relative to workgroup memory), index
@@ -338,7 +340,8 @@ op("local_load",
 # TODO: Consider permitting the short form
 op("device_store",
       encoding = (0x45 | (1 << 47), 8, _),
-      dests = 0, srcs = 3, imms = [FORMAT, MASK, SHIFT, SCOREBOARD, COHERENT], can_eliminate = False,
+      dests = 0, srcs = 3, imms = [FORMAT, MASK, SHIFT, SCOREBOARD, COHERENT, MEM_OFFSET],
+      can_eliminate = False,
       schedule_class = "store")
 
 # sources are value, base, index

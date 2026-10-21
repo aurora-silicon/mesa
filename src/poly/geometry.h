@@ -342,9 +342,35 @@ struct poly_geometry_params {
     * layout() declared input class.
     */
    uint32_t input_topology;
+
+   uint32_t _pad;
+
+   /* Emitted-vertex output records, materialized by the main geometry
+    * program and indexed-loaded by the rasterization vertex program.
+    */
+   DEVICE(uchar) output_records;
 } PACKED;
-static_assert(sizeof(struct poly_geometry_params) == 79 * 4,
-              "struct poly_geometry_params must be 79 words");
+static_assert(sizeof(struct poly_geometry_params) == 82 * 4,
+              "struct poly_geometry_params must be 82 words");
+
+/* Size of the emitted-vertex record space for a draw: one slot per
+ * padded unrolled primitive for a dynamic shape, one per dense unrolled
+ * primitive for a static shape. 0-sized space means the raster shader
+ * replays the geometry program instead of reading records.
+ */
+static inline uint64_t
+poly_gs_output_records_size(enum poly_gs_shape shape, uint32_t input_primitives,
+                            uint32_t instance_count, uint32_t primitives_log2,
+                            uint32_t record_chunk_B)
+{
+   if (!record_chunk_B)
+      return 0;
+
+   uint64_t units = shape == POLY_GS_SHAPE_DYNAMIC_INDEXED
+                       ? ((uint64_t)instance_count << primitives_log2)
+                       : input_primitives;
+   return units * record_chunk_B;
+}
 
 static inline void
 poly_geometry_params_init(struct poly_geometry_params *p,
@@ -680,7 +706,8 @@ poly_gs_setup_indirect_inner(uint64_t index_buffer, uint vertex_count,
                              /* Input primitive type, enum mesa_prim */
                              uint32_t prim,
                              int is_prefix_summing, uint max_indices,
-                             enum poly_gs_shape shape)
+                             enum poly_gs_shape shape,
+                             uint32_t output_record_B)
 {
    poly_vertex_params_set_draw(vp, vertex_count, instance_count);
    poly_geometry_params_set_draw(p, prim, shape, max_indices,
@@ -707,7 +734,7 @@ poly_gs_setup_indirect_inner(uint64_t index_buffer, uint vertex_count,
     * be precompiled for AGX3; see poly_heap_try_alloc_offs(). An exhausted
     * heap draws nothing: the counts are zeroed and each buffer is left at the
     * heap base, in bounds and unread. */
-   uint count_offs = 0, vertex_offs = 0, index_offs = 0;
+   uint count_offs = 0, vertex_offs = 0, index_offs = 0, record_offs = 0;
    bool allocated = true;
 
    if (is_prefix_summing) {
@@ -723,8 +750,20 @@ poly_gs_setup_indirect_inner(uint64_t index_buffer, uint vertex_count,
          poly_heap_try_alloc_offs(heap, p->draw.index_count * 4, &index_offs);
    }
 
+   if (output_record_B) {
+      uint64_t record_size = poly_gs_output_records_size(
+         shape, p->input_primitives, instance_count, p->primitives_log2,
+         output_record_B);
+
+      /* Saturate rather than wrap: an overflowing record space fails the
+       * allocation like any other oversized draw buffer. */
+      allocated &= poly_heap_try_alloc_offs(
+         heap, record_size > heap->size ? heap->size : (uint)record_size,
+         &record_offs);
+   }
+
    if (!allocated) {
-      count_offs = vertex_offs = index_offs = 0;
+      count_offs = vertex_offs = index_offs = record_offs = 0;
       p->draw.index_count = 0;
       poly_vertex_params_set_draw(vp, 0, 0);
       poly_geometry_params_set_draw(p, prim, shape, max_indices, 0, 0);
@@ -736,6 +775,8 @@ poly_gs_setup_indirect_inner(uint64_t index_buffer, uint vertex_count,
    vp->output_buffer = (uintptr_t)(heap->base + vertex_offs);
 
    vp->outputs = vs_outputs;
+
+   p->output_records = (global uchar *)(heap->base + record_offs);
 
    if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
       p->draw.first_index = index_offs / 4;
@@ -754,7 +795,7 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
                        uint32_t index_buffer_range_el,
                        uint32_t prim /* Input primitive type, enum mesa_prim */,
                        int is_prefix_summing, uint max_indices,
-                       enum poly_gs_shape shape)
+                       enum poly_gs_shape shape, uint32_t output_record_B)
 {
    uint vertex_count = draw[0];
    uint instance_count = draw[1];
@@ -763,7 +804,8 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
    poly_gs_setup_indirect_inner(index_buffer, vertex_count,  instance_count,
                                 first_vertex, vp, p, heap, vs_outputs,
                                 index_size_B, index_buffer_range_el, prim,
-                                is_prefix_summing, max_indices, shape);
+                                is_prefix_summing, max_indices, shape,
+                                output_record_B);
 }
 
 static inline void
@@ -789,7 +831,7 @@ poly_gs_setup_indirect_byte_count(constant uint32_t *byte_count,
 
    poly_gs_setup_indirect_inner(0, vertex_count, instance_count, first_vertex,
                                 vp, p, heap, vs_outputs, 0, 0, prim,
-                                is_prefix_summing, max_indices, shape);
+                                is_prefix_summing, max_indices, shape, 0);
 }
 
 static uint

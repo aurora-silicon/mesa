@@ -21,6 +21,7 @@ struct nir_def;
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices);
 bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_algebraic_late(struct nir_shader *shader);
+bool agx_nir_fold_pack_roundtrip(struct nir_shader *shader);
 bool agx_nir_fold_pixel_coord(struct nir_shader *shader);
 bool agx_nir_fold_extract16_bfe(struct nir_shader *shader);
 bool agx_nir_cleanup_amul(struct nir_shader *shader);

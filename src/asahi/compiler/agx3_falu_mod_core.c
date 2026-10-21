@@ -140,7 +140,12 @@ agx3_falu_add_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
        !slot_ok(src0, m->src0_16) || !slot_ok(src1, m->src1_16) ||
        m->addend_abs || m->addend_neg || m->addend_16 ||
        runtime->wait_mask > 0x3f ||
-       (m->src0_16 && m->src1_16) ||
+       /* Two 16-bit sources are grounded only in the plain form
+        * (fp16 corpus: f32add.ep0 f43+f26, e.g. 09001804); a modifier,
+        * saturation, or a narrow destination beside them is not. */
+       (m->src0_16 && m->src1_16 &&
+        (m->dest_16 || m->saturate || m->src0_abs || m->src0_neg ||
+         m->src1_abs || m->src1_neg)) ||
        !add_sat_width_ok(m) || !add_narrow_ok(m))
       return false;
    for (unsigned i = 0; i < 2; ++i)
@@ -361,16 +366,21 @@ agx3_falu_mul_mod_runtime(enum agx_isa_encoding enc, uint16_t dest,
 }
 
 /* The witnessed width compositions on f32fma.ep3 are h*h+f (w03), h*f+f
- * (w08), f*f+h (w09) and the immediate-multiplier pairing of f26 with
- * f42=1 (w22, encoded elsewhere). A lone f26 multiplicand, a 16-bit
- * addend beside any narrow multiplicand, or a modifier or saturate on a
- * narrow operand are unwitnessed. */
+ * (w08), f*f+h (w09), the immediate-multiplier pairing of f26 with f42=1
+ * (w22, encoded elsewhere), and the fp16 corpus' 16-bit-addend forms
+ * beside a 16-bit multiplicand: h*f+h (09012e8881040000) and h*h+h
+ * (09001e0481060800). A lone f26 multiplicand, or a negated/abs'd or
+ * saturated operand beside a narrow one, are unwitnessed. */
 static bool
 fma_width_ok(const struct agx3_falu_mods *m)
 {
    if (m->src1_16 && !m->src0_16)
       return false;
-   if (m->addend_16 && (m->src0_16 || m->src1_16))
+   /* A 16-bit addend beside a 16-bit multiplicand is grounded only in
+    * the plain form: no modifier may ride along. */
+   if (m->addend_16 && (m->src0_16 || m->src1_16) &&
+       (m->addend_neg || m->src0_neg || m->src0_abs || m->src1_neg ||
+        m->src1_abs))
       return false;
    if (m->src0_16 && (m->src0_abs || m->src0_neg))
       return false;

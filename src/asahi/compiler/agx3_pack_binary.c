@@ -3351,6 +3351,11 @@ agx3_translate_mem(const agx_instr *I, bool is_store, uint8_t slot,
       if (total_shift > 4)
          return false;
       d->shift = (uint8_t)total_shift;
+
+      /* The f76 (load) / f74 (store) byte offset applies in the
+       * register-index form too: the hardware adds it to
+       * base + (index << shift). */
+      d->byte_off = I->mem_offset;
    } else {
       return false;
    }
@@ -10885,8 +10890,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                if (d.data != 0 || d.width != AGX3_MEM_W32 || d.mask != 3 ||
                    d.shift != 3 || !d.base_is_uniform || d.base != 0 ||
                    d.idx_kind != AGX3_MEM_IDX_REG || d.idx_reg != 0 ||
-                   d.idx_signed || d.slot != 6 || d.wait_mask != 1 ||
-                   !d.agx3b_last_load)
+                   d.idx_signed || d.byte_off != 0 || d.slot != 6 ||
+                   d.wait_mask != 1 || !d.agx3b_last_load)
                   AGX3_REFUSE(I);
                d.idx_kill = true;
             }

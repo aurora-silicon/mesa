@@ -382,6 +382,10 @@ typedef struct {
       uint16_t pixel_offset;
       uint16_t zs;
       int16_t stack_size;
+      /* Signed byte offset a device load/store adds on top of
+       * base + (index << shift) -- the f76/f74 immediate, which the G17P
+       * hardware adds in the register-index form too. */
+      int32_t mem_offset;
       enum agx_sr sr;
       enum agx_round round;
       enum agx_atomic_opc atomic_opc;
@@ -1341,6 +1345,7 @@ bool agx_nir_lower_load_mask(nir_shader *shader);
 bool agx_nir_lower_ubo(nir_shader *shader);
 bool agx_nir_lower_shared_bitsize(nir_shader *shader, bool element_indices);
 bool agx_nir_lower_frag_sidefx(nir_shader *s, bool g17p);
+bool agx_nir_dedup_helper_loads(nir_shader *s);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
 

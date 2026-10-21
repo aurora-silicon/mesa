@@ -271,7 +271,11 @@ agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
    case AGX_OPCODE_FADD: {
       const agx_index other = ins->src[1 - s];
       if (other.size == AGX_SIZE_16)
-         return false; /* two 16-bit add sources are unwitnessed */
+         /* Two plain 16-bit add sources into a 32-bit destination are
+          * witnessed (fp16-heavy-10 tail, f32add.ep0 f43+f26); any
+          * modifier or a narrow destination on top is not. */
+         return !narrow && !ins->saturate && !neg && !other.neg &&
+                !other.abs;
       if (narrow)
          /* w23: a clean 16-bit f35-side source under a narrow dest. */
          return s == 0 && !neg && !other.neg && !other.abs &&
@@ -295,10 +299,18 @@ agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
       if (ins->saturate || narrow)
          return false;
       if (s == 2) {
-         /* w09: a 16-bit addend, including negated (f65+f60), only
-          * beside two 32-bit register multiplicands. */
-         return ins->src[0].size == AGX_SIZE_32 &&
-                ins->src[1].size == AGX_SIZE_32;
+         /* w09: a 16-bit addend, including negated (f65+f60), beside two
+          * 32-bit register multiplicands. The fp16 corpus additionally
+          * grounds the plain form beside a 16-bit src0 (f43+f60) and
+          * beside two 16-bit multiplicands (f43+f26+f60). */
+         if (ins->src[1].size != AGX_SIZE_32 &&
+             !(ins->src[0].size == AGX_SIZE_16 &&
+               ins->src[1].size == AGX_SIZE_16))
+            return false;
+         if (ins->src[0].size == AGX_SIZE_16)
+            return !neg && !ins->src[0].neg && !ins->src[0].abs &&
+                   !ins->src[1].neg && !ins->src[1].abs;
+         return ins->src[0].size == AGX_SIZE_32;
       }
       if (ins->src[2].type != AGX_INDEX_NORMAL &&
           ins->src[2].type != AGX_INDEX_REGISTER)
@@ -1540,12 +1552,21 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     * the fused form whenever the second operand is register or immediate;
     * the packer refuses modified/memory operands, which keep the
     * opposite-compare fallback below. */
+   /* Only EQ with a register second operand is byte-verified against
+    * hardware output (the allequal witness); the immediate-operand and
+    * non-EQ register forms are encoder-table derived and miscompile on
+    * real G17P (sg-vote-3 all-lanes-equal bug). ASAHI_G17P_FBALLOT
+    * re-enables the unwitnessed fused forms for probing. */
    const bool fused_fballot =
       !quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
       def->op == AGX_OPCODE_FCMP &&
       (def->fcond == AGX_FCOND_EQ || def->fcond == AGX_FCOND_LT ||
        def->fcond == AGX_FCOND_GT || def->fcond == AGX_FCOND_GE ||
        def->fcond == AGX_FCOND_LE) &&
+      ((def->fcond == AGX_FCOND_EQ &&
+        def->src[0].type == AGX_INDEX_NORMAL &&
+        def->src[1].type == AGX_INDEX_NORMAL) ||
+       debug_get_bool_option("ASAHI_G17P_FBALLOT", false)) &&
       /* src0 may be an immediate: it swaps into the second-operand slot
        * with the reversed condition below. */
       ((def->src[0].type == AGX_INDEX_NORMAL &&
@@ -1639,8 +1660,25 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
             def->src[0].size == AGX_SIZE_32 &&
             (def->src[0].type == AGX_INDEX_UNIFORM ||
              other.type == AGX_INDEX_UNIFORM);
+
+         /* The two-register truth tables the AGX3B packer encodes as their
+          * own instructions: bit_nor (0x1), bit_andc either side (0x2/0x4),
+          * bit_nand (0x7), bit_xnor (0x9) and bit_orc either side (0xb/0xd).
+          * They take register operands only, so require a 32-bit register on
+          * both sides after the fuse. */
+         const bool named_reg_word =
+            I->dest[0].size == AGX_SIZE_32 &&
+            I->src[0].size == AGX_SIZE_32 &&
+            I->src[1].size == AGX_SIZE_32 &&
+            def->src[0].size == AGX_SIZE_32 &&
+            def->src[0].type == AGX_INDEX_NORMAL &&
+            I->src[1 - s].type == AGX_INDEX_NORMAL &&
+            (truth_table == 0x1 || truth_table == 0x2 ||
+             truth_table == 0x4 || truth_table == 0x7 ||
+             truth_table == 0x9 || truth_table == 0xb ||
+             truth_table == 0xd);
          if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-             !native_uniform_word &&
+             !native_uniform_word && !named_reg_word &&
              truth_table != AGX3_SEL_TT_AND &&
              truth_table != AGX3_SEL_TT_OR &&
              truth_table != AGX3_SEL_TT_XOR &&
@@ -2034,6 +2072,102 @@ agx_optimizer_pack_mask(agx_context *ctx, agx_instr **defs, agx_instr *I)
    }
 }
 
+/* G17P's lddev/stdev add a sign-extended 16-bit byte offset on top of
+ * base + (index << shift) in the register-index form too (lddev f76,
+ * stdev f74). An index materialized as `iadd reg, #delta` therefore folds
+ * into the access itself: the load/store keeps the register operand and
+ * carries delta << scale in I->mem_offset. The offset is signed, so this
+ * also covers index subtraction emitted as add of a wrapped immediate.
+ */
+static void
+agx_optimizer_device_index_offset(agx_context *ctx, agx_instr **defs,
+                                  agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       (I->op != AGX_OPCODE_DEVICE_LOAD && I->op != AGX_OPCODE_DEVICE_STORE))
+      return;
+
+   const unsigned is = (I->op == AGX_OPCODE_DEVICE_STORE) ? 2 : 1;
+
+   /* The index counts elements of `1 << total_shift` bytes; same
+    * width table as agx3_pack_binary's agx3_fmt_to_width(). */
+   unsigned w;
+   switch (I->format) {
+   case AGX_FORMAT_I8:
+      w = 0;
+      break;
+   case AGX_FORMAT_I16:
+   case AGX_FORMAT_F16:
+      w = 1;
+      break;
+   case AGX_FORMAT_I32:
+      w = 2;
+      break;
+   default:
+      return; /* norm/packed formats have no AGX3 device-op witness */
+   }
+   const unsigned total_shift =
+      I->shift + (I->memory_index_is_bytes ? 0 : w);
+   if (total_shift > 15)
+      return;
+
+   /* Chase a chain of constant addends: iadd(iadd(reg, #a), #b) carries
+    * (a + b) in the same field. Dead iadds are removed by DCE. */
+   for (;;) {
+      const agx_index idx = I->src[is];
+      if (idx.type != AGX_INDEX_NORMAL || idx.memory || idx.neg ||
+          idx.size != AGX_SIZE_32)
+         return;
+
+      agx_instr *D = defs[idx.value];
+      if (!D || D->op != AGX_OPCODE_IADD || D->nr_srcs != 2 ||
+          D->nr_dests != 1 || D->saturate || D->shift != 0 ||
+          D->dest[0].size != AGX_SIZE_32)
+         return;
+
+      bool folded = false;
+      for (unsigned i = 0; i < 2; ++i) {
+         const agx_index imm = D->src[i];
+         const agx_index reg = D->src[i ^ 1];
+         if (reg.type != AGX_INDEX_NORMAL || reg.abs || reg.neg ||
+             reg.memory || reg.size != AGX_SIZE_32)
+            continue;
+
+         /* The addend is either an inline immediate or a materialized
+          * mov_imm (the shape a delta too large for the iadd field takes).
+          * Interpret it signed so wrapped deltas (index - k) land in the
+          * signed field as well. */
+         int64_t delta;
+         if (imm.type == AGX_INDEX_IMMEDIATE && !imm.abs && !imm.neg) {
+            delta = (int32_t)imm.value;
+         } else if (imm.type == AGX_INDEX_NORMAL && !imm.abs && !imm.neg &&
+                    !imm.memory && imm.size == AGX_SIZE_32) {
+            const agx_instr *M = defs[imm.value];
+            if (!M || M->op != AGX_OPCODE_MOV_IMM || M->nr_dests != 1 ||
+                M->saturate || M->dest[0].size != AGX_SIZE_32)
+               continue;
+            delta = (int32_t)M->imm;
+         } else {
+            continue;
+         }
+
+         const int64_t bytes = delta << total_shift;
+         const int64_t merged = (int64_t)I->mem_offset + bytes;
+         if (merged < -32768 || merged > 32767)
+            continue;
+
+         I->src[is] = reg;
+         I->src[is].abs = idx.abs;
+         I->src[is].kill = idx.kill;
+         I->mem_offset = (int32_t)merged;
+         folded = true;
+         break;
+      }
+      if (!folded)
+         return;
+   }
+}
+
 /* and(x, 0x7fffffff) feeding a float compare is exactly fabs(x); likewise
  * xor(x, 0x80000000) is fneg(x). The G17P compare-select carries .abs and
  * .neg on the compared operands (agx3_fsel_desc's cmp{0,1}_abs/neg), so the
@@ -2166,6 +2300,9 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_narrow_convert(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_FCMPSEL || I->op == AGX_OPCODE_FCMP) {
          agx_optimizer_fcmp_mods(ctx, defs, I);
+      } else if (I->op == AGX_OPCODE_DEVICE_LOAD ||
+                 I->op == AGX_OPCODE_DEVICE_STORE) {
+         agx_optimizer_device_index_offset(ctx, defs, I);
       }
    }
 
