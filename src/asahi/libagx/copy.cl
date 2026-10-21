@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "compiler/libcl/libcl.h"
+#include "libagx_intrinsics.h"
 
 KERNEL(32)
 libagx_fill(global uint32_t *address, uint32_t value)
@@ -25,24 +26,6 @@ KERNEL(16)
 libagx_copy_uchar(global uint8_t *dest, global uint8_t *src)
 {
    dest[cl_global_id.x] = src[cl_global_id.x];
-}
-
-static uint
-libagx_space_bits(uint x)
-{
-   uint accum = 0;
-   for (uint i = 0; i < 14; ++i)
-      accum |= (x & (1u << i)) << i;
-   return accum;
-}
-
-static uint
-libagx_space_bits_7(uint x)
-{
-   uint accum = 0;
-   for (uint i = 0; i < 7; ++i)
-      accum |= (x & (1u << i)) << i;
-   return accum;
 }
 
 /*
@@ -68,15 +51,15 @@ libagx_copy_image_offset(uint x, uint y, uint pitch_B, uint stride_el,
    uint tile_idx = (y / tile_height_el) * tiles_per_row +
                    (x / tile_width_el);
    uint tile_area_el = tile_width_el * tile_height_el;
-   uint morton_el = libagx_space_bits(x & (tile_width_el - 1)) |
-                    (libagx_space_bits(y & (tile_height_el - 1)) << 1);
+   uint morton_el = nir_interleave((uint16_t)(x & (tile_width_el - 1)),
+                                   (uint16_t)(y & (tile_height_el - 1)));
 
    return (tile_idx * tile_area_el + morton_el) * blocksize_B;
 }
 
-/* Reduce power-of-two tile geometry on the CPU. Small tiles can use the
- * seven-bit encoder, but legacy AIL mip tails may use larger square tiles.
- * Keep their high coordinate bits just as the generic helper does. */
+/* Reduce power-of-two tile geometry on the CPU. The sixteen-bit interleave
+ * covers both small tiles and the larger square tiles legacy AIL mip tails
+ * may use. */
 static uint
 libagx_copy_image_offset_pow2(uint x, uint y, uint pitch_B,
                               uint tiles_per_row, uint tile_width_log2,
@@ -93,9 +76,7 @@ libagx_copy_image_offset_pow2(uint x, uint y, uint pitch_B,
    uint tile_area_el = 1u << (tile_width_log2 + tile_height_log2);
    uint tile_x = x & (tile_width_el - 1);
    uint tile_y = y & (tile_height_el - 1);
-   uint morton_el = tile_width_log2 <= 7 && tile_height_log2 <= 7
-      ? libagx_space_bits_7(tile_x) | (libagx_space_bits_7(tile_y) << 1)
-      : libagx_space_bits(tile_x) | (libagx_space_bits(tile_y) << 1);
+   uint morton_el = nir_interleave((uint16_t)tile_x, (uint16_t)tile_y);
 
    return (tile_idx * tile_area_el + morton_el) * blocksize_B;
 }
@@ -123,8 +104,20 @@ libagx_copy_image(global uint8_t *dest, global uint8_t *src,
       src_x_el + x, src_y_el + y, src_pitch_B, src_tiles_per_row,
       src_tile_width_log2, src_tile_height_log2, blocksize_B, src_tiled);
 
-   for (uint b = 0; b < blocksize_B; ++b)
-      dest[dest_offset_B + b] = src[src_offset_B + b];
+   global uint8_t *d = dest + dest_offset_B;
+   global uint8_t *s = src + src_offset_B;
+   uintptr_t ptr_align = (uintptr_t)d | (uintptr_t)s;
+
+   if ((blocksize_B & 15) == 0 && (ptr_align & 15) == 0) {
+      for (uint b = 0; b < blocksize_B / 16; ++b)
+         ((global uint4 *)d)[b] = ((global uint4 *)s)[b];
+   } else if ((blocksize_B & 3) == 0 && (ptr_align & 3) == 0) {
+      for (uint b = 0; b < blocksize_B / 4; ++b)
+         ((global uint *)d)[b] = ((global uint *)s)[b];
+   } else {
+      for (uint b = 0; b < blocksize_B; ++b)
+         d[b] = s[b];
+   }
 }
 
 /* Round an unsigned four-sample average like G17P's linear sampler followed
@@ -274,14 +267,15 @@ libagx_resolve_unorm8x4(global uint8_t *dest, global uint8_t *src,
       dest_x_px + x, dest_y_px + y, dest_pitch_B, dest_stride_el,
       dest_tile_width_el, dest_tile_height_el, 4, dest_tiled);
 
+   uint src_offset_B = libagx_copy_image_offset(
+      src_x_px + x, src_y_px + y, 0, src_stride_el,
+      src_tile_width_el, src_tile_height_el,
+      4 * sample_count, src_tiled);
+
    for (uint b = 0; b < 4; ++b) {
       uint sum = 0;
       uint extrema = resolve_mode == 1 ? 255 : 0;
       for (uint s = 0; s < sample_count; ++s) {
-         uint src_offset_B = libagx_copy_image_offset(
-            src_x_px + x, src_y_px + y, 0, src_stride_el,
-            src_tile_width_el, src_tile_height_el,
-            4 * sample_count, src_tiled);
          uint value = src[src_offset_B + s * 4 + b];
          sum += value;
          extrema = resolve_mode == 1 ? min(extrema, value)
