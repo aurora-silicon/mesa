@@ -36,6 +36,11 @@ struct agx_subgroup_lower_options {
  * a prefix form through 32 bits and stays an intrinsic below 64; iadd
  * and the bitwise ops keep their dedicated 64-bit splittings, which are
  * cheaper than a dense sweep.
+ *
+ * 32-bit float min/max stays listed here so the common lowering leaves
+ * it an intrinsic; on G17P lower() then scans the order-equivalent
+ * integer key with the signed min/max prefix op instead (see
+ * agx_f32_minmax_key), which is far cheaper than the dense sweep.
  */
 static bool
 agx_scan_eligible(const nir_intrinsic_instr *intr)
@@ -61,6 +66,36 @@ agx_scan_eligible(const nir_intrinsic_instr *intr)
    default:
       return false;
    }
+}
+
+/* Order isomorphism between a float's bit pattern and signed integers,
+ * and its own inverse: fold the sign bit into a magnitude mask so that
+ * negative values sort below non-negative ones in signed order:
+ *
+ *    key = bits ^ ((bits >>s 31) & 0x7fffffff)
+ *
+ * Non-negative inputs (b < 0x80000000) keep their bits and stay positive
+ * keys; negative inputs get their low 31 bits flipped and stay negative
+ * keys, with -NaN at INT_MIN and -0.0 at -1, so signed min/max on the
+ * keys is float min/max on the values.
+ *
+ * G17P's hardware prefix op covers sums and products only -- Apple's
+ * compiler lowers float min/max scans to a shift-up sweep, whose fixed
+ * distances read stale registers in inactive lanes (measured on M2 Pro:
+ * simdshftup indexes raw lanes, not the active-lane ordering).  But the
+ * signed integer min/max DOES have the prefix form (f53, the same
+ * operand the witnessed integer-add prefix carries), so a float min/max
+ * scan becomes three ALU ops to key, one prefix op, and three to
+ * decode -- ~10 instructions where the dense pointer-doubling sweep
+ * costs ~80.  Hardware-verified on G14S that the integer min/max prefix
+ * scans the active-lane ordering under a partial mask and reports the
+ * per-op identity for lanes with no active predecessor.
+ */
+static nir_def *
+agx_f32_minmax_key(nir_builder *b, nir_def *x)
+{
+   return nir_ixor(b, x,
+                   nir_iand_imm(b, nir_ishr_imm(b, x, 31), 0x7fffffff));
 }
 
 /* Shuffle read of data[index] for a per-lane index.
@@ -241,6 +276,7 @@ agx_subgroup_reduce(nir_builder *b, nir_op op, unsigned cluster,
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   const struct agx_subgroup_lower_options *options = data;
    b->cursor = nir_before_instr(&intr->instr);
 
    switch (intr->intrinsic) {
@@ -332,6 +368,52 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_exclusive_scan: {
       nir_op red_op = nir_intrinsic_reduction_op(intr);
       nir_def *data = intr->src[0].ssa;
+
+      /* G17P: scan the order-equivalent signed key with the integer
+       * min/max prefix op (agx_f32_minmax_key), since float min/max has
+       * no prefix encoding.  The intrinsic keeps its place and becomes
+       * the exclusive integer scan on the keyed source.
+       */
+      if (options->g17p && intr->def.num_components == 1 &&
+          intr->def.bit_size == 32 &&
+          (red_op == nir_op_fmin || red_op == nir_op_fmax)) {
+         const bool inclusive =
+            intr->intrinsic == nir_intrinsic_inclusive_scan;
+         const nir_op int_op =
+            red_op == nir_op_fmin ? nir_op_imin : nir_op_imax;
+
+         nir_def *key = agx_f32_minmax_key(b, data);
+         intr->intrinsic = nir_intrinsic_exclusive_scan;
+         nir_src_rewrite(&intr->src[0], key);
+         nir_intrinsic_set_reduction_op(intr, int_op);
+
+         b->cursor = nir_after_instr(&intr->instr);
+
+         if (inclusive) {
+            /* Fold the lane's own key in; the prefix reports the
+             * signed-min/max identity where there is no active
+             * predecessor, which folds away cleanly. */
+            nir_def *res = agx_f32_minmax_key(
+               b, nir_build_alu2(b, int_op, &intr->def, key));
+            nir_def_rewrite_uses_after(&intr->def, res);
+         } else {
+            /* The exclusive prefix reports the integer identity
+             * (INT_MAX / INT_MIN) for a lane with no active predecessor,
+             * which decodes to a NaN.  The float identity is +-inf, so
+             * select it explicitly from the ballot. */
+            nir_def *m = nir_ballot(b, 1, 32, nir_imm_true(b));
+            nir_def *lane = nir_load_subgroup_invocation(b);
+            nir_def *below =
+               nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), lane), -1);
+            nir_def *has_pred = nir_ine_imm(b, nir_iand(b, m, below), 0);
+            nir_def *res = nir_bcsel(
+               b, has_pred, agx_f32_minmax_key(b, &intr->def),
+               nir_imm_int(b, red_op == nir_op_fmin ? 0x7f800000
+                                                  : 0xff800000));
+            nir_def_rewrite_uses_after(&intr->def, res);
+         }
+         return true;
+      }
 
       if (agx_scan_eligible(intr)) {
          nir_def *res = agx_subgroup_scan(b, red_op, data,
@@ -530,8 +612,9 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
       /* Fresh G17P witnesses pin the native qRedfmin/qRedfmax forms, and the
        * same captures show sRedfmin/sRedfmax for full-subgroup reduces. Keep
        * every other target and non-quad clustered shape on the established
-       * common lowering path. Scans of float min/max have no prefix
-       * encoding and must always take the common lowering. */
+       * common lowering path. Float min/max scans have no prefix encoding;
+       * G17P reroutes them through the signed-integer key prefix in lower(),
+       * and anything else stays on the common lowering. */
       if (agx_options->g17p_clustered_float &&
           intr->def.bit_size == 32 &&
           intr->intrinsic == nir_intrinsic_reduce &&
