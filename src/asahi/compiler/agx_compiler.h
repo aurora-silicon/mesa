@@ -382,6 +382,10 @@ typedef struct {
       uint16_t pixel_offset;
       uint16_t zs;
       int16_t stack_size;
+      /* Signed byte offset a device load/store adds on top of
+       * base + (index << shift) -- the f76/f74 immediate, which the G17P
+       * hardware adds in the register-index form too. */
+      int32_t mem_offset;
       enum agx_sr sr;
       enum agx_round round;
       enum agx_atomic_opc atomic_opc;

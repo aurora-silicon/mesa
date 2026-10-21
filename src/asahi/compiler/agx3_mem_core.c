@@ -25,7 +25,8 @@ common_ok(const struct agx3_mem_desc *d)
       return false;
    }
    if (d->idx_kind == AGX3_MEM_IDX_REG &&
-       ((d->idx_reg & 1) != 0 || d->idx_reg > 191))
+       ((d->idx_reg & 1) != 0 || d->idx_reg > 191 ||
+        d->byte_off < -32768 || d->byte_off > 32767))
       return false;
    if (d->idx_kind == AGX3_MEM_IDX_IMM) {
       if (d->idx_scaled) {
@@ -70,6 +71,11 @@ common_overrides(const struct agx3_mem_desc *d, uint16_t off_field,
       ov[n++] = (struct agx3_field_kv)KV(27, d->idx_kill ? 1 : 0);
       ov[n++] = (struct agx3_field_kv)KV(28, d->idx_signed ? 1 : 0);
       ov[n++] = (struct agx3_field_kv)KV(shift_field, d->shift);
+      /* The byte offset field (f76 load / f74 store) is deposited
+       * unconditionally by the encoder node and is added on top of
+       * base + (index << shift) in the register-index form too. */
+      ov[n++] =
+         (struct agx3_field_kv)KV(off_field, (uint16_t)d->byte_off);
    }
 
    /* Base. */
