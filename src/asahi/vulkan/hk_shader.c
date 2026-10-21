@@ -1371,9 +1371,43 @@ hk_nir_redirect_bounded_writes(nir_shader *nir)
  * only the compare.  The saturating subtract is at least as conservative
  * as the original: for any offset the new check passes, off + (size - 1)
  * cannot wrap, and a bound smaller than the access rejects every offset
- * the wrapping compare could have passed near 2^32. */
+ * the wrapping compare could have passed near 2^32.
+ *
+ * The hoist only pays when the slack actually replaces work.  Staging one
+ * usub_sat through the preamble costs roughly SLACK_COST instructions
+ * (an input word read, isub+isel, and the staging stores), while each
+ * rewritten check saves at most its end add -- a lone check grows the
+ * shader by ~3 instructions, which regressed most of the corpus in the
+ * v7 sweep where one check per buffer is the common case.  A slack earns
+ * its keep in two situations:
+ *
+ * - several checks share one (bound, size - 1) pair, so one preamble
+ *   slack replaces that many end adds;
+ * - every use of the bound component is a candidate check, so the
+ *   rewritten sites free the staging slot the raw bound would otherwise
+ *   need -- the slack output effectively replaces it.
+ *
+ * Only sites whose end add dies with the check count toward sharing: an
+ * add with other users survives the rewrite and saves nothing.
+ *
+ * Measured on the v7 corpus: the staged slack costs 4-7 instructions once
+ * the extra input word and staging copies land, so shared groups only
+ * break even past a handful of sites. */
+#define HK_SLACK_COST    4
+#define HK_SLACK_BONUS   4
+#define HK_SLACK_SHARED  8
+
+struct hk_slack_site {
+   nir_alu_instr *ult;
+   nir_src *bound_src;    /* the ult operand reading the bound */
+   nir_scalar bound;      /* literal bound operand {def, comp} */
+   nir_scalar off;
+   uint32_t c;            /* size - 1 */
+   bool dead_add;         /* the exclusive-end add has no other users */
+};
+
 static bool
-hk_slacken_bounds_check_instr(nir_builder *b, nir_instr *instr, void *data)
+hk_slacken_bounds_check_match(nir_instr *instr, struct hk_slack_site *site)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
@@ -1393,26 +1427,243 @@ hk_slacken_bounds_check_instr(nir_builder *b, nir_instr *instr, void *data)
        nir_scalar_alu_op(end) != nir_op_iadd)
       return false;
 
+   nir_scalar bound_s = nir_scalar_chase_movs(
+      nir_scalar_resolved(bound, alu->src[1].swizzle[0]));
+
    nir_scalar x = nir_scalar_chase_alu_src(end, 0);
    nir_scalar y = nir_scalar_chase_alu_src(end, 1);
    nir_scalar c = nir_scalar_is_const(x) ? x : y;
    nir_scalar off = nir_scalar_is_const(x) ? y : x;
-   if (!nir_scalar_is_const(c) || nir_scalar_as_uint(c) == 0 ||
+
+   /* This is only the explicit-io bounds-check shape when the bound is a
+    * runtime descriptor word and the end constant is an access size.
+    * With a constant bound or a large/wrapping end constant the rewritten
+    * compare is no longer a stricter form of the original -- a user's
+    * `x - 17 < 32` would fold the slack to zero and drop live work. */
+   if (nir_scalar_is_const(bound_s) || !nir_scalar_is_const(c) ||
+       nir_scalar_as_uint(c) == 0 || nir_scalar_as_uint(c) >= 1024 ||
        off.def->bit_size != 32)
       return false;
 
-   b->cursor = nir_before_instr(instr);
-   nir_def *slack =
-      nir_usub_sat(b, bound, nir_imm_int(b, nir_scalar_as_uint(c)));
-   nir_def_replace(&alu->def, nir_ult(b, nir_mov_scalar(b, off), slack));
+   site->ult = alu;
+   site->bound_src = &alu->src[1].src;
+   site->bound = nir_scalar_resolved(bound, alu->src[1].swizzle[0]);
+   site->off = off;
+   site->c = nir_scalar_as_uint(c);
+   site->dead_add = list_is_singular(&alu->src[0].src.ssa->uses) &&
+                    list_is_singular(&end.def->uses);
+   return true;
+}
+
+struct hk_slack_key {
+   const nir_def *bound;
+   uint32_t comp;
+   uint32_t c;
+};
+
+static uint32_t
+hk_slack_key_hash(const void *vkey)
+{
+   const struct hk_slack_key *key = vkey;
+
+   return _mesa_hash_pointer(key->bound) ^ key->comp * 0x9e3779b9u ^
+          key->c * 0x85ebca6bu;
+}
+
+static bool
+hk_slack_key_equal(const void *va, const void *vb)
+{
+   const struct hk_slack_key *a = va;
+   const struct hk_slack_key *b = vb;
+
+   return a->bound == b->bound && a->comp == b->comp && a->c == b->c;
+}
+
+/* A slack group per (bound operand, size - 1); the count is the number of
+ * sites whose end add dies with the rewrite. */
+struct hk_slack_group {
+   struct hk_slack_key key;
+   unsigned n_dead;
+};
+
+/* One bound operand's worth of checks: whether every use of the component
+ * is a candidate site (the slack output then replaces the bound's own
+ * staging slot), and the group/dead-add totals over the whole operand. */
+struct hk_slack_bound {
+   const nir_def *def;
+   unsigned comp;
+   bool consumed;
+   unsigned n_groups;
+   unsigned n_dead;
+   bool rewrite_all;
+};
+
+/* Every use that reads the bound component has to be a candidate check's
+ * bound operand, or rewriting a subset keeps the bound staged anyway. */
+static bool
+hk_slack_bound_consumed(const nir_def *bound, unsigned comp,
+                        const struct util_dynarray *sites)
+{
+   nir_foreach_use_including_if(src, bound) {
+      /* An if use is a divergent consumer of whatever component it
+         reads; play it safe and treat it as touching ours. */
+      unsigned mask = nir_src_is_if(src) ? 1u : nir_src_components_read(src);
+      if (!(mask & BITFIELD_BIT(comp)))
+         continue;
+
+      bool ours = false;
+      util_dynarray_foreach(sites, struct hk_slack_site, site) {
+         if (site->bound_src == src) {
+            ours = true;
+            break;
+         }
+      }
+      if (!ours)
+         return false;
+   }
    return true;
 }
 
 static bool
 hk_nir_slacken_bounded_checks(nir_shader *nir)
 {
-   return nir_shader_instructions_pass(
-      nir, hk_slacken_bounds_check_instr, nir_metadata_control_flow, NULL);
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      /* Collect the candidate checks first: whether a preamble slack pays
+       * for itself depends on how the sites cluster on each bound. */
+      struct util_dynarray sites;
+      util_dynarray_init(&sites, NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            struct hk_slack_site site;
+
+            if (hk_slacken_bounds_check_match(instr, &site))
+               util_dynarray_append(&sites, site);
+         }
+      }
+
+      unsigned n_sites = util_dynarray_num_elements(&sites,
+                                                  struct hk_slack_site);
+      if (!n_sites) {
+         util_dynarray_fini(&sites);
+         continue;
+      }
+
+      void *mem_ctx = ralloc_context(NULL);
+
+      /* Dead end adds per (bound, size - 1) slack group. */
+      struct hash_table *groups =
+         _mesa_hash_table_create(mem_ctx, hk_slack_key_hash,
+                                 hk_slack_key_equal);
+      /* Bound operands present in the candidate set. */
+      struct util_dynarray bounds;
+      util_dynarray_init(&bounds, mem_ctx);
+
+      util_dynarray_foreach(&sites, struct hk_slack_site, site) {
+         struct hk_slack_key probe = {site->bound.def, site->bound.comp,
+                                      site->c};
+         struct hash_entry *e = _mesa_hash_table_search(groups, &probe);
+         if (e) {
+            struct hk_slack_group *group = e->data;
+            group->n_dead += site->dead_add;
+         } else {
+            struct hk_slack_key *key =
+               ralloc(mem_ctx, struct hk_slack_key);
+            struct hk_slack_group *group =
+               ralloc(mem_ctx, struct hk_slack_group);
+            *key = probe;
+            *group = (struct hk_slack_group){.key = probe,
+                                             .n_dead = site->dead_add};
+            _mesa_hash_table_insert(groups, key, group);
+         }
+
+         bool seen = false;
+         util_dynarray_foreach(&bounds, struct hk_slack_bound, b) {
+            if (b->def == site->bound.def && b->comp == site->bound.comp) {
+               seen = true;
+               break;
+            }
+         }
+         if (!seen) {
+            struct hk_slack_bound nb = {
+               .def = site->bound.def,
+               .comp = site->bound.comp,
+               .consumed = false,
+               .n_groups = 0,
+               .n_dead = 0,
+               .rewrite_all = false,
+            };
+            util_dynarray_append(&bounds, nb);
+         }
+      }
+
+      /* Group multiplicity and dead adds per bound, plus whether the
+       * bound's component is read by anything but the candidate checks. */
+      util_dynarray_foreach(&bounds, struct hk_slack_bound, b) {
+         b->consumed = hk_slack_bound_consumed(b->def, b->comp, &sites);
+
+         hash_table_foreach(groups, e) {
+            const struct hk_slack_key *k = e->key;
+            const struct hk_slack_group *group = e->data;
+            if (k->bound == b->def && k->comp == b->comp) {
+               b->n_groups++;
+               b->n_dead += group->n_dead;
+            }
+         }
+
+         /* Rewriting every check on a consumed bound trades the bound's
+          * staging slot for the slack groups'; each extra group still has
+          * to pay for its own slack out of the adds it removes. */
+         b->rewrite_all =
+            b->consumed &&
+            b->n_dead + HK_SLACK_BONUS >= HK_SLACK_COST * b->n_groups;
+      }
+
+      bool impl_progress = false;
+      util_dynarray_foreach(&sites, struct hk_slack_site, site) {
+         const struct hk_slack_bound *b = NULL;
+         util_dynarray_foreach(&bounds, struct hk_slack_bound, it) {
+            if (it->def == site->bound.def && it->comp == site->bound.comp) {
+               b = it;
+               break;
+            }
+         }
+
+         /* Otherwise the slack group stands alone: profitable once it
+          * replaces enough end adds to clear its preamble cost with
+          * margin. */
+         bool rewrite = b->rewrite_all;
+         if (!rewrite) {
+            struct hk_slack_key probe = {site->bound.def,
+                                         site->bound.comp, site->c};
+            struct hash_entry *e = _mesa_hash_table_search(groups, &probe);
+            assert(e);
+            rewrite = ((const struct hk_slack_group *)e->data)->n_dead >=
+                      HK_SLACK_SHARED;
+         }
+         if (!rewrite)
+            continue;
+
+         nir_builder bld =
+            nir_builder_at(nir_before_instr(&site->ult->instr));
+         nir_def *slack = nir_usub_sat(&bld, site->ult->src[1].src.ssa,
+                                       nir_imm_int(&bld, site->c));
+         nir_def_replace(&site->ult->def,
+                         nir_ult(&bld, nir_mov_scalar(&bld, site->off),
+                                 slack));
+         impl_progress = true;
+      }
+
+      _mesa_hash_table_destroy(groups, NULL);
+      util_dynarray_fini(&bounds);
+      ralloc_free(mem_ctx);
+      util_dynarray_fini(&sites);
+      progress |= nir_progress(impl_progress, impl,
+                               nir_metadata_control_flow);
+   }
+
+   return progress;
 }
 
 static bool
