@@ -7237,7 +7237,8 @@ typedef bool (*nir_lower_undef_to_zero_filter)(nir_undef_instr *);
 bool nir_lower_undef_to_zero(nir_shader *shader,
                              nir_lower_undef_to_zero_filter filter);
 
-bool nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated);
+bool nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated,
+                             bool only_unused_result);
 
 bool nir_opt_uniform_subgroup(nir_shader *shader,
                               const nir_lower_subgroups_options *);

@@ -293,7 +293,8 @@ optimize_and_rewrite_atomic(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 static bool
-opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated)
+opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated,
+                    bool only_unused_result)
 {
    bool progress = false;
    nir_builder b = nir_builder_create(impl);
@@ -321,6 +322,16 @@ opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated)
          if (nir_src_is_divergent(&intrin->src[offset2_src]))
             continue;
 
+         /* A result-used atomic additionally needs a broadcast of the
+          * elected lane's result plus an exclusive scan to reconstruct each
+          * lane's value. On targets without a native subgroup scan that
+          * costs far more than the elect+single-atomic form emitted for a
+          * fire-and-forget atomic, so a driver may restrict the rewrite to
+          * atomics whose result is unused.
+          */
+         if (only_unused_result && !nir_def_is_unused(&intrin->def))
+            continue;
+
          if (is_atomic_already_optimized(b.shader, intrin))
             continue;
 
@@ -334,7 +345,8 @@ opt_uniform_atomics(nir_function_impl *impl, bool fs_atomics_predicated)
 }
 
 bool
-nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated)
+nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated,
+                        bool only_unused_result)
 {
    bool progress = false;
 
@@ -350,7 +362,8 @@ nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated)
    nir_foreach_function_impl(impl, shader) {
       nir_metadata_require(impl, nir_metadata_block_index | nir_metadata_divergence);
 
-      bool impl_progress = opt_uniform_atomics(impl, fs_atomics_predicated);
+      bool impl_progress = opt_uniform_atomics(impl, fs_atomics_predicated,
+                                               only_unused_result);
       progress |= nir_progress(impl_progress, impl,
                                nir_metadata_none);
    }

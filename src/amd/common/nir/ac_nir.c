@@ -484,7 +484,7 @@ ac_nir_optimize_uniform_atomics(nir_shader *nir)
 {
    bool progress = false;
    NIR_PASS(progress, nir, ac_nir_opt_shared_append);
-   NIR_PASS(progress, nir, nir_opt_uniform_atomics, false);
+   NIR_PASS(progress, nir, nir_opt_uniform_atomics, false, false);
 
    return progress;
 }
