@@ -1247,6 +1247,7 @@ agx_reserved_registers(const agx_context *ctx)
 }
 
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
+unsigned agx_hoist_loop_remat(agx_context *ctx, unsigned budget);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
