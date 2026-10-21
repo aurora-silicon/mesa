@@ -11942,6 +11942,26 @@ agx_g17p_discard_word(nir_shader *nir)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* A coverage update that targets no sample cannot change coverage, run a
+ * test or alter the deferred-kill contract: on G17P it still costs the
+ * staged MOVMSK plus the whole word synthesis (coverage read, nibble
+ * shifts, 16x16 select multiply).  Constant-folded masks do reach this
+ * form -- a deferred `sample_mask killed, 0` whose kill mask proved
+ * statically empty lowers to sample_mask(0, 0).  Drop it outright; Apple's
+ * side-effect fragments carry no such terminal MOVMSK. */
+static bool
+agx_nir_drop_noop_sample_mask(nir_builder *b, nir_intrinsic_instr *intr,
+                              UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_sample_mask_agx ||
+       !nir_src_is_const(intr->src[0]) ||
+       nir_src_as_uint(intr->src[0]) != 0)
+      return false;
+
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 unsigned
 agx_max_vertex_attribs(const struct agx_device_key *dev)
 {
@@ -12439,6 +12459,14 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                &push_count);
       info->push_count = push_count;
    }
+
+   /* Constant-folded kill masks leave sample_mask(0, live) no-ops behind;
+    * a zero target affects no sample and must not pay the MOVMSK.  Run
+    * after preamble optimization, where the deferred-kill mask finishes
+    * folding. */
+   if (is_g17p && nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               agx_nir_drop_noop_sample_mask, nir_metadata_none, NULL);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       info->varyings.fs.nr_cf = key->fs.cf_base;
