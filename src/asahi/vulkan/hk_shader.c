@@ -1499,7 +1499,21 @@ struct hk_slack_bound {
 };
 
 /* Every use that reads the bound component has to be a candidate check's
- * bound operand, or rewriting a subset keeps the bound staged anyway. */
+ * bound operand, or rewriting a subset keeps the bound staged anyway.
+ *
+ * Do not extend this to look through mov/vec passthroughs of the bound
+ * component: the bounded-address vec4 reassembly only carries .z to the
+ * check, but whether that admission wins is decided downstream, not here.
+ * The bonus pays for a freed staging slot, which exists only when the
+ * bound's producer needs a store_preamble to reach the main program -- a
+ * descriptor record that falls outside the uniform-DMA windows.  When the
+ * record lands in a DMA window its bound word is a free input read, the
+ * staging never existed, and the preamble slack is a pure +3..+4 cost.
+ * Measured: chasing the vec4 chain admits vkq-CmLuminanceHistogram (+3,
+ * whose oversized set-2 table keeps the descriptor a device load) but
+ * regresses every corpus shader whose single static set fits a window
+ * (+3..+4 each on 12 of 254).  The same economics apply to a fully uniform
+ * check -- it hoists into the preamble where there is no slot to free. */
 static bool
 hk_slack_bound_consumed(const nir_def *bound, unsigned comp,
                         const struct util_dynarray *sites)
