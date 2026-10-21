@@ -98,6 +98,213 @@ emulate_depth_never(nir_shader *s)
    nir_progress(true, impl, nir_metadata_none);
 }
 
+/*
+ * load_helper_invocation reads the lane's helper state.  Between two reads,
+ * the state can change for a lane that keeps executing only at a demote or a
+ * coverage write: on G17P's deferred-kill model, discard, terminate, sample
+ * mask and Z/S feedback all leave rejected lanes running as helpers.  The
+ * pipeline wraps every fragment memory write in a helper guard and runs
+ * agx_preprocess_nir twice (shader creation, then variant lowering), so each
+ * guard region seeds its own coverage read and the regions nest.  Reads with
+ * no helper-state writer on any path between them always agree: reuse the
+ * earlier read so nir_opt_if can collapse the duplicate guards.
+ */
+static bool
+helper_load_instr(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+   return op == nir_intrinsic_load_helper_invocation ||
+          op == nir_intrinsic_is_helper_invocation;
+}
+
+static bool
+helper_barrier_instr(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_demote:
+   case nir_intrinsic_demote_if:
+   case nir_intrinsic_demote_samples:
+   case nir_intrinsic_terminate:
+   case nir_intrinsic_terminate_if:
+   case nir_intrinsic_terminate_ray:
+   case nir_intrinsic_rq_terminate:
+   case nir_intrinsic_sample_mask_agx:
+   case nir_intrinsic_store_zs_agx:
+      return true;
+   case nir_intrinsic_store_output: {
+      if (!nir_intrinsic_has_io_semantics(intr))
+         return false;
+      const unsigned location = nir_intrinsic_io_semantics(intr).location;
+      return location == FRAG_RESULT_DEPTH ||
+             location == FRAG_RESULT_STENCIL ||
+             location == FRAG_RESULT_SAMPLE_MASK;
+   }
+   default:
+      return false;
+   }
+}
+
+/* CFG reachability over block successors, optionally skipping a block.
+ * `from` reaches `to` when a path exists; a block reaches itself only
+ * through a real cycle that avoids `avoid`. */
+static bool
+cfg_block_reaches_avoiding(nir_function_impl *impl, nir_block *from,
+                           nir_block *to, const nir_block *avoid)
+{
+   if (from == avoid)
+      return false;
+
+   const unsigned n = impl->num_blocks;
+   bool *seen = rzalloc_array(NULL, bool, n);
+   nir_block **stack = ralloc_array(NULL, nir_block *, n);
+   unsigned sp = 0;
+   bool found = false;
+
+   stack[sp++] = from;
+   while (sp && !found) {
+      nir_block *block = stack[--sp];
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_block *succ = block->successors[i];
+         if (!succ || succ == avoid || seen[succ->index])
+            continue;
+         if (succ == to) {
+            found = true;
+            break;
+         }
+         seen[succ->index] = true;
+         stack[sp++] = succ;
+      }
+   }
+
+   ralloc_free(stack);
+   ralloc_free(seen);
+   return found;
+}
+
+/* Whether a helper-state writer can come between two reads on any path: it
+ * must run after the first read's point and before the second read's point.
+ * A path that re-enters the first read's block re-evaluates it, so writers
+ * reaching the second read only through the first block do not split the
+ * pair; neither do writers reachable from the first read only through the
+ * second read's block (those always follow a second-read evaluation). */
+static bool
+helper_barrier_between(nir_block *l1b, unsigned l1i, nir_block *l2b,
+                       unsigned l2i, nir_block *bb, unsigned bi,
+                       nir_function_impl *impl)
+{
+   if (bb == l1b && bi <= l1i)
+      return false;
+   if (bb == l2b && bi >= l2i)
+      return cfg_block_reaches_avoiding(impl, l2b, l2b, l1b);
+   if (bb == l1b || bb == l2b)
+      return true;
+
+   return cfg_block_reaches_avoiding(impl, l1b, bb, l2b) &&
+          cfg_block_reaches_avoiding(impl, bb, l2b, l1b);
+}
+
+static bool
+helper_load_dominates(nir_intrinsic_instr *a, unsigned ai,
+                      nir_intrinsic_instr *b, unsigned bi)
+{
+   if (a->instr.block == b->instr.block)
+      return ai < bi;
+   return nir_block_dominates(a->instr.block, b->instr.block);
+}
+
+static bool
+dedup_helper_loads_impl(nir_function_impl *impl)
+{
+   unsigned nr_loads = 0, nr_bars = 0;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         nr_loads += helper_load_instr(instr);
+         nr_bars += helper_barrier_instr(instr);
+      }
+   }
+
+   if (nr_loads < 2)
+      return false;
+
+   nir_intrinsic_instr **loads =
+      ralloc_array(NULL, nir_intrinsic_instr *, nr_loads);
+   unsigned *load_pos = ralloc_array(NULL, unsigned, nr_loads);
+   nir_instr **bars = ralloc_array(NULL, nir_instr *, nr_bars);
+   unsigned *bar_pos = ralloc_array(NULL, unsigned, nr_bars);
+
+   unsigned l = 0, b = 0;
+   nir_foreach_block(block, impl) {
+      unsigned pos = 0;
+      nir_foreach_instr(instr, block) {
+         if (helper_load_instr(instr)) {
+            loads[l] = nir_instr_as_intrinsic(instr);
+            load_pos[l++] = pos;
+         }
+         if (helper_barrier_instr(instr)) {
+            bars[b] = instr;
+            bar_pos[b++] = pos;
+         }
+         pos++;
+      }
+   }
+   assert(l == nr_loads && b == nr_bars);
+
+   nir_metadata_require(impl, nir_metadata_dominance |
+                                 nir_metadata_block_index);
+
+   bool progress = false;
+   for (unsigned i = 1; i < nr_loads; ++i) {
+      for (unsigned j = 0; j < i; ++j) {
+         if (!loads[j] || loads[j]->intrinsic != loads[i]->intrinsic ||
+             !helper_load_dominates(loads[j], load_pos[j],
+                                    loads[i], load_pos[i]) ||
+             loads[j]->def.bit_size != loads[i]->def.bit_size)
+            continue;
+
+         bool barrier = false;
+         for (unsigned k = 0; k < nr_bars && !barrier; ++k) {
+            barrier = helper_barrier_between(
+               loads[j]->instr.block, load_pos[j], loads[i]->instr.block,
+               load_pos[i], bars[k]->block, bar_pos[k], impl);
+         }
+         if (barrier)
+            continue;
+
+         nir_def_rewrite_uses(&loads[i]->def, &loads[j]->def);
+         nir_instr_remove(&loads[i]->instr);
+         loads[i] = NULL;
+         progress = true;
+         break;
+      }
+   }
+
+   ralloc_free(loads);
+   ralloc_free(load_pos);
+   ralloc_free(bars);
+   ralloc_free(bar_pos);
+   return nir_progress(progress, impl, nir_metadata_none);
+}
+
+bool
+agx_nir_dedup_helper_loads(nir_shader *s)
+{
+   if (s->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, s)
+      progress |= dedup_helper_loads_impl(impl);
+
+   return progress;
+}
+
 struct sidefx_state {
    bool done;
    bool g17p;

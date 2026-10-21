@@ -55,10 +55,8 @@ load_buffer_metadata(nir_builder *b, nir_def *descriptor, unsigned offset,
 #define AGX_RESIDENT (0)
 
 static bool
-fence_image(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+image_fence_writer(const nir_intrinsic_instr *intr)
 {
-   b->cursor = nir_after_instr(&intr->instr);
-
    /* If the image is write-only, there is no fencing needed */
    if (nir_intrinsic_has_access(intr) &&
        (nir_intrinsic_access(intr) & ACCESS_NON_READABLE)) {
@@ -68,19 +66,192 @@ fence_image(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    switch (intr->intrinsic) {
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_store:
-      nir_fence_pbe_to_tex_agx(b);
-      return true;
-
    case nir_intrinsic_image_atomic:
    case nir_intrinsic_bindless_image_atomic:
    case nir_intrinsic_image_atomic_swap:
    case nir_intrinsic_bindless_image_atomic_swap:
-      nir_fence_mem_to_tex_agx(b);
       return true;
 
    default:
       return false;
    }
+}
+
+/* Instructions that can observe an earlier image write and therefore need
+ * the pending fence ordered before them: anything that reads or orders
+ * memory the write could alias, including the write-write ordering of a
+ * later store and a memory barrier that publishes the write.  Texture
+ * samples can observe image stores through an aliased view. */
+static bool
+image_fence_observer(const nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_tex)
+      return true;
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   case nir_intrinsic_image_load:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load:
+   case nir_intrinsic_image_sparse_load:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_bindless_image_atomic_swap:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_heap_load:
+   case nir_intrinsic_image_heap_store:
+   case nir_intrinsic_image_heap_atomic:
+   case nir_intrinsic_image_heap_atomic_swap:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_store_global:
+   case nir_intrinsic_global_atomic:
+   case nir_intrinsic_global_atomic_swap:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_barrier:
+   case nir_intrinsic_begin_invocation_interlock:
+   case nir_intrinsic_end_invocation_interlock:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* CFG reachability over block successors: whether `to` can execute after
+ * `from` on some path.  A block reaches itself only through a real cycle. */
+static bool
+image_cfg_reaches(nir_function_impl *impl, nir_block *from, nir_block *to)
+{
+   const unsigned n = impl->num_blocks;
+   bool *seen = rzalloc_array(NULL, bool, n);
+   nir_block **stack = ralloc_array(NULL, nir_block *, n);
+   unsigned sp = 0;
+   bool found = false;
+
+   stack[sp++] = from;
+   while (sp && !found) {
+      nir_block *block = stack[--sp];
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_block *succ = block->successors[i];
+         if (!succ || seen[succ->index])
+            continue;
+         if (succ == to) {
+            found = true;
+            break;
+         }
+         seen[succ->index] = true;
+         stack[sp++] = succ;
+      }
+   }
+
+   ralloc_free(stack);
+   ralloc_free(seen);
+   return found;
+}
+
+static bool
+fence_image(nir_shader *s)
+{
+   /* The fences order a shader's image writes for its own later accesses;
+    * write-only images skip them entirely, so nothing downstream of the
+    * shader needs them for the write to land.  Emit a store's fence only
+    * when some later access can actually observe it on some path, and drop
+    * the rest (most notably the device->texture fence after a final atomic). */
+   bool progress = false;
+
+   /* An observer in a different function cannot be ordered against a
+    * writer here; count them conservatively. */
+   unsigned total_reads = 0;
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            total_reads += image_fence_observer(instr);
+      }
+   }
+
+   nir_foreach_function_impl(impl, s) {
+      unsigned nr_writes = 0, nr_reads = 0;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            nr_reads += image_fence_observer(instr);
+            if (instr->type == nir_instr_type_intrinsic &&
+                image_fence_writer(nir_instr_as_intrinsic(instr)))
+               nr_writes++;
+         }
+      }
+      if (!nr_writes || !(nr_reads || total_reads > nr_reads))
+         continue;
+
+      nir_intrinsic_instr **writes =
+         ralloc_array(NULL, nir_intrinsic_instr *, nr_writes);
+      unsigned *write_pos = ralloc_array(NULL, unsigned, nr_writes);
+      nir_instr **reads = ralloc_array(NULL, nir_instr *, nr_reads);
+      unsigned *read_pos = ralloc_array(NULL, unsigned, nr_reads);
+      unsigned w = 0, r = 0;
+      nir_foreach_block(block, impl) {
+         unsigned pos = 0;
+         nir_foreach_instr(instr, block) {
+            if (image_fence_observer(instr)) {
+               reads[r] = instr;
+               read_pos[r++] = pos;
+            }
+            if (instr->type == nir_instr_type_intrinsic &&
+                image_fence_writer(nir_instr_as_intrinsic(instr))) {
+               writes[w] = nir_instr_as_intrinsic(instr);
+               write_pos[w++] = pos;
+            }
+            pos++;
+         }
+      }
+
+      nir_metadata_require(impl, nir_metadata_block_index);
+
+      const bool foreign_reads = total_reads > nr_reads;
+      for (unsigned i = 0; i < nr_writes; ++i) {
+         nir_intrinsic_instr *intr = writes[i];
+         bool needed = foreign_reads;
+         for (unsigned j = 0; j < nr_reads && !needed; ++j) {
+            if (reads[j]->block == intr->instr.block)
+               needed = read_pos[j] > write_pos[i];
+            else
+               needed = image_cfg_reaches(impl, intr->instr.block,
+                                          reads[j]->block);
+         }
+
+         if (!needed)
+            continue;
+
+         nir_builder b = nir_builder_at(nir_after_instr(&intr->instr));
+         switch (intr->intrinsic) {
+         case nir_intrinsic_image_store:
+         case nir_intrinsic_bindless_image_store:
+            nir_fence_pbe_to_tex_agx(&b);
+            break;
+         default:
+            nir_fence_mem_to_tex_agx(&b);
+            break;
+         }
+         progress = true;
+      }
+
+      ralloc_free(writes);
+      ralloc_free(write_pos);
+      ralloc_free(reads);
+      ralloc_free(read_pos);
+      nir_progress(progress, impl, nir_metadata_none);
+   }
+
+   return progress;
 }
 
 static nir_def *
@@ -1859,8 +2030,7 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
    /* Insert fences before lowering image atomics, since image atomics need
     * different fencing than other image operations.
     */
-   NIR_PASS(progress, s, nir_shader_intrinsics_pass, fence_image,
-            nir_metadata_control_flow, NULL);
+   NIR_PASS(progress, s, fence_image);
 
    NIR_PASS(progress, s, nir_lower_image_atomics_to_global, NULL, NULL);
 

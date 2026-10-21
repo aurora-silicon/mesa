@@ -183,8 +183,10 @@ libagx_twiddle_coordinates_gen9(ushort2 coord, uint16_t tile_w_px,
    const uint32_t tile_mask = upsample(tile_mask_vec.y, tile_mask_vec.x);
    const uint32_t coord_xy = upsample(coord.y, coord.x);
    const ushort2 offs_px = as_ushort2(coord_xy & tile_mask);
+   /* The spreads hold only even and only odd bits, so the combine adds
+    * cleanly and the shl folds into the shifted iadd. */
    const uint32_t offset_within_tile_px =
-      libagx_spread_morton_16_gen9(offs_px.x) |
+      libagx_spread_morton_16_gen9(offs_px.x) +
       (libagx_spread_morton_16_gen9(offs_px.y) << 1);
    const ushort2 tile_px = as_ushort2(coord_xy & ~tile_mask);
 

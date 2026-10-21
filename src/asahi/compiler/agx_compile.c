@@ -7714,6 +7714,21 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    agx_optimize_loop_nir(nir);
 
+   /* Fragment helper-invocation reads agree until the next coverage write.
+    * The double agx_preprocess_nir run wraps memory writes in nested helper
+    * guards seeded by separate reads; deduplicate them so identical nested
+    * conditions collapse to one region. */
+   bool helper_dedup = false;
+   NIR_PASS(helper_dedup, nir, agx_nir_dedup_helper_loads);
+   if (helper_dedup) {
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_if,
+               nir_opt_if_optimize_phi_true_false |
+               nir_opt_if_avoid_64bit_phis);
+      NIR_PASS(_, nir, nir_opt_dead_cf);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
     */
