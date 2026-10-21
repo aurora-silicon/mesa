@@ -95,6 +95,16 @@ struct agx3_subgroup_ballot_desc {
    uint8_t condition;
    bool invert;
    uint16_t wait_mask;
+
+   /* FLOAT ballots compare the source against a second operand.  Apple's
+    * G17P kernels carry either a minifloat immediate (f40 = 1, the encoded
+    * byte in f32 -- f32 = 0 is +0.0) or another 32-bit register (f40 = 2,
+    * the half-unit index in f33, with the f42/f44 live/discard pair).
+    * Ignored for integer ballots, whose second operand is the
+    * compare_immediate field above. */
+   bool src2_register;
+   uint16_t src2;
+   bool src2_live;
 };
 
 enum agx3_subgroup_reduce_op {

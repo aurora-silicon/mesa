@@ -4428,10 +4428,18 @@ agx3_emit_subgroup_ballot(struct util_dynarray *emission,
       !is_float && src.type == AGX_INDEX_REGISTER && !src.memory &&
       src.size == AGX_SIZE_16 && agx_channels(src) == 1 && !src.abs &&
       !src.neg && !src.kill && !(src.cache && src.discard);
+
+   /* A float ballot's second operand is a minifloat immediate or -- on the
+    * witnessed register form -- another 32-bit register.  Integer ballots
+    * stay immediate-only. */
+   const bool src2_reg = I->src[1].type != AGX_INDEX_IMMEDIATE;
    if (I->nr_dests != 1 || I->nr_srcs != 2 || I->saturate ||
-       I->src[1].type != AGX_INDEX_IMMEDIATE ||
-       I->src[1].memory || I->src[1].abs || I->src[1].neg ||
-       I->src[1].cache || I->src[1].discard || I->src[1].kill)
+       (src2_reg &&
+        (!is_float || quad || !agx3_subgroup_plain(I->src[1],
+                                                  AGX_INDEX_REGISTER))) ||
+       (!src2_reg &&
+        (I->src[1].memory || I->src[1].abs || I->src[1].neg ||
+         I->src[1].cache || I->src[1].discard || I->src[1].kill)))
       return false;
 
    /* The 16-bit quad ballot against zero carries its own wait. */
@@ -4467,7 +4475,9 @@ agx3_emit_subgroup_ballot(struct util_dynarray *emission,
    uint32_t compare_value = I->src[1].value;
    uint8_t condition;
    if (is_float) {
-      if (compare_value != 0)
+      /* src[1] is the minifloat encoding of the compare operand -- every
+       * immediate byte is encodable in f32 -- or a second register. */
+      if (!src2_reg && compare_value > 0xff)
          return false;
       condition = I->fcond;
    } else {
@@ -4572,6 +4582,9 @@ agx3_emit_subgroup_ballot(struct util_dynarray *emission,
       .condition = condition,
       .invert = compare_immediate ? false : I->invert_cond,
       .wait_mask = 0,
+      .src2_register = is_float && src2_reg,
+      .src2 = (uint16_t)compare_value,
+      .src2_live = !I->src[1].discard,
    };
    uint8_t bytes[AGX3_SUBGROUP_MAX_LENGTH], length = 0;
    return agx3_subgroup_encode_ballot(enc, &d, bytes, &length) &&
