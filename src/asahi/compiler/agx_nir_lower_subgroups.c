@@ -189,11 +189,11 @@ agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
    return nir_bcsel(b, ok, buddy, identity);
 }
 
-/* Whether a clustered reduction takes the per-cluster branch in lower()
- * (full-cluster xor butterfly, partial-cluster serial gather): a scalar
- * reduce at a width the shuffles cover, over an aligned 8- or 16-lane
- * cluster.  The filter below must return false for exactly these so they
- * survive nir_lower_subgroups as intrinsics.
+/* Whether a clustered reduction takes the representative-read lowering
+ * in lower() (quad base plus per-block sibling reads): a scalar reduce
+ * at a width the shuffles cover, over an aligned 8- or 16-lane cluster.
+ * The filter below must return false for exactly these so they survive
+ * nir_lower_subgroups as intrinsics.
  */
 static bool
 agx_clustered_reduce_eligible(const nir_intrinsic_instr *intr)
@@ -208,6 +208,35 @@ agx_clustered_reduce_eligible(const nir_intrinsic_instr *intr)
 
    return intr->def.num_components == 1 &&
           (intr->def.bit_size == 16 || intr->def.bit_size == 32);
+}
+
+/* Whether the hardware quad reduce implements `op` at `bit_size` -- the
+ * same shapes the subgroup filter admits to isel: everything but integer
+ * multiply has a quad form, and the float min/max encodings are only
+ * witnessed on G17P.  Ops without a quad form take the explicit
+ * intra-quad combine steps in lower(), which work for any reduction op.
+ */
+static bool
+agx_quad_reduce_supported(nir_op op, unsigned bit_size, bool g17p)
+{
+   switch (op) {
+   case nir_op_iadd:
+   case nir_op_fadd:
+   case nir_op_fmul:
+   case nir_op_imin:
+   case nir_op_imax:
+   case nir_op_umin:
+   case nir_op_umax:
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_ixor:
+      return true;
+   case nir_op_fmin:
+   case nir_op_fmax:
+      return g17p && bit_size == 32;
+   default:
+      return false;
+   }
 }
 
 /* Whether a 64-bit min/max reduction takes the two-phase hi/lo lowering
@@ -524,29 +553,27 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       if (!agx_clustered_reduce_eligible(intr))
          return false;
 
-      /* The common lowering wraps a full-subgroup butterfly in a
-       * ballot==full branch whose partial-mask side walks the ballot one
-       * buddy at a time; that masked walk costs hundreds of instructions
-       * and dominates the binary.  An XOR with a delta below the cluster
-       * size keeps the buddy inside the same aligned cluster, so a fixed
-       * log2(cluster) butterfly covers the group whenever every lane in it
-       * is active:
+      /* Reduce over the active lanes of an aligned cluster, without
+       * branching on the mask.  The hardware quad reduce skips inactive
+       * lanes, so it is a valid 4-lane base under any activity mask.
+       * Wider steps then fold each lane's accumulated d-block total
+       * together with the sibling d-block's, which every live lane of
+       * that block holds.  A fixed XOR buddy can be inactive -- the hole
+       * that breaks a plain butterfly -- so the read must go through a
+       * live lane of the sibling block instead.
        *
-       *    for i in {1 .. cluster / 2}:
-       *       data = op(data, shuffle_xor(data, i))
+       * The register-lane shuffle does not take a fully per-lane index:
+       * for a read of source quad Q the hardware merges the low two
+       * index bits of Q's own lanes (see agx_subgroup_read), so the
+       * effective lane is (idx & ~3) + p where p is whatever low bits
+       * Q's active lanes present.  Publish p = the position of the last
+       * live lane of each lane's own quad; every read of a quad then
+       * lands on a live lane, which by induction holds that quad's
+       * accumulated block total.
        *
-       * A partially active cluster cannot use it.  Inactive lanes execute
-       * nothing, so their registers are stale and cannot be pre-charged
-       * with the identity on the source side; guarding each merge on the
-       * buddy's activity still loses values across mid-cluster holes
-       * (active {0,1,2} of 8: lane 1 can only be reached by lane 2's data
-       * through lane 0 with deltas 2-then-1, after step 1 already ran);
-       * and sparse masks like {0,3} or {1,2,4} have no XOR path between
-       * active lanes at all.  So branch per cluster -- the condition is
-       * uniform within a cluster: full clusters take the butterfly and
-       * partial ones gather the live lanes serially.  The gathers index
-       * base+k with a constant k, whose low 2 bits are quad-uniform, so a
-       * single read_invocation per lane suffices.
+       * An empty sibling block leaves the accumulated value untouched --
+       * no identity element is ever materialised, which also keeps
+       * fadd's -0.0 sign exact.
        */
       nir_op red_op = nir_intrinsic_reduction_op(intr);
       unsigned cluster = nir_intrinsic_cluster_size(intr);
@@ -554,46 +581,72 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       nir_def *m = nir_ballot(b, 1, 32, nir_imm_true(b));
       nir_def *lane = nir_load_subgroup_invocation(b);
-      nir_def *base = nir_iand_imm(b, lane, ~(cluster - 1));
-      unsigned cmask_bits = BITFIELD_MASK(cluster);
-      nir_def *cmask =
-         nir_iand_imm(b, nir_ushr(b, m, base), cmask_bits);
 
-      nir_if *nif = nir_push_if(b, nir_ieq_imm(b, cmask, cmask_bits));
+      /* p: the position of the last live lane of this lane's own quad.
+       * The lane itself is active, so its quad always has one. */
+      nir_def *qb = nir_iand_imm(b, lane, ~3u);
+      nir_def *p = nir_ufind_msb(
+         b, nir_iand_imm(b, nir_ushr(b, m, qb), 0xf));
 
-      nir_def *acc = data;
-      for (unsigned i = 1; i < cluster; i *= 2) {
-         acc = nir_build_alu2(b, red_op, acc,
-                              nir_shuffle_xor(b, acc, nir_imm_int(b, i)));
+      nir_def *acc;
+
+      if (agx_quad_reduce_supported(red_op, data->bit_size,
+                                    options->g17p_clustered_float)) {
+         acc = agx_subgroup_reduce(b, red_op, 4, data);
+      } else {
+         /* No quad form (imul; fmin/fmax off G17P): run the two
+          * intra-quad combine steps explicitly.  d = 1 folds in the
+          * buddy lane itself through a guarded butterfly; d = 2 reads
+          * the sibling pair through whichever of its lanes is live --
+          * lane^2 when active, else lane^3, its pair-mate.
+          */
+         nir_def *ok1 = nir_ine_imm(
+            b, nir_iand_imm(b,
+                            nir_ushr(b, m, nir_ixor(b, lane, nir_imm_int(b, 1))), 1),
+            0);
+         acc = nir_bcsel(
+            b, ok1,
+            nir_build_alu2(b, red_op, data,
+                           nir_shuffle_xor(b, data, nir_imm_int(b, 1))),
+            data);
+
+         nir_def *live2 = nir_ine_imm(
+            b, nir_iand_imm(b,
+                            nir_ushr(b, m, nir_ixor(b, lane, nir_imm_int(b, 2))), 1),
+            0);
+         nir_def *b2 = nir_bcsel(b, live2,
+                                 nir_shuffle_xor(b, acc, nir_imm_int(b, 2)),
+                                 nir_shuffle_xor(b, acc, nir_imm_int(b, 3)));
+         nir_def *pair = nir_iand_imm(b, nir_ixor(b, lane, nir_imm_int(b, 2)), ~1u);
+         nir_def *ok2 = nir_ine_imm(
+            b, nir_iand_imm(b, nir_ushr(b, m, pair), 3), 0);
+         acc = nir_bcsel(b, ok2, nir_build_alu2(b, red_op, acc, b2), acc);
       }
-      nir_def *fast = acc;
 
-      nir_push_else(b, nif);
+      /* d = 4: the sibling block is exactly one quad.  Reading it lands
+       * on its last live lane, which holds its total. */
+      nir_def *q4 =
+         nir_iand_imm(b, nir_ixor(b, lane, nir_imm_int(b, 4)), ~3u);
+      nir_def *bits4 = nir_iand_imm(b, nir_ushr(b, m, q4), 0xf);
+      nir_def *buddy4 = nir_read_invocation(b, acc, nir_ior(b, q4, p));
+      acc = nir_bcsel(b, nir_ine_imm(b, bits4, 0),
+                      nir_build_alu2(b, red_op, acc, buddy4), acc);
 
-      /* -0.0 is the true identity for IEEE addition: x + -0.0 == x for
-       * every x, whereas +0.0 would flip an all-(-0.0) cluster to +0.0.
-       */
-      nir_const_value ident = nir_alu_binop_identity(red_op, data->bit_size);
-      if (red_op == nir_op_fadd) {
-         assert(data->bit_size == 16 || data->bit_size == 32);
-         if (data->bit_size == 16)
-            ident.u16 = 0x8000;
-         else
-            ident.f32 = -0.0f;
+      /* d = 8: the sibling block spans two quads.  Read the quad holding
+       * the block's last live lane, itself live and holding the total. */
+      for (unsigned d = 8; d < cluster; d *= 2) {
+         nir_def *base =
+            nir_iand_imm(b, nir_ixor(b, lane, nir_imm_int(b, d)), ~(d - 1));
+         nir_def *sib = nir_iand(
+            b, m, nir_ishl(b, nir_imm_int(b, BITFIELD_MASK(d)), base));
+         nir_def *rep = nir_umin_imm(b, nir_ufind_msb(b, sib), 31);
+         nir_def *buddy = nir_read_invocation(
+            b, acc, nir_ior(b, nir_iand_imm(b, rep, ~3u), p));
+         acc = nir_bcsel(b, nir_ine_imm(b, sib, 0),
+                         nir_build_alu2(b, red_op, acc, buddy), acc);
       }
 
-      acc = nir_build_imm(b, 1, data->bit_size, &ident);
-      for (unsigned k = 0; k < cluster; ++k) {
-         nir_def *j = nir_iadd_imm(b, base, k);
-         nir_def *ok = nir_ine_imm(
-            b, nir_iand_imm(b, nir_ushr(b, m, j), 1), 0);
-         nir_def *v = nir_read_invocation(b, data, j);
-         nir_def *add = nir_build_alu2(b, red_op, acc, v);
-         acc = nir_bcsel(b, ok, add, acc);
-      }
-
-      nir_pop_if(b, nif);
-      nir_def_rewrite_uses(&intr->def, nir_if_phi(b, fast, acc));
+      nir_def_rewrite_uses(&intr->def, acc);
       return true;
    }
 
@@ -725,10 +778,7 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
 
    bool progress = nir_lower_subgroups(s, &opts);
 
-   /* Then do AGX-only lowerings on top.  The clustered-reduce lowering may
-    * wrap its butterfly in a per-cluster branch, so control flow metadata
-    * cannot be preserved.
-    */
+   /* Then do AGX-only lowerings on top. */
    progress |= nir_shader_intrinsics_pass(s, lower, nir_metadata_none,
                                           (void *)&agx_options);
 
