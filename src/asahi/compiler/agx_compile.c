@@ -7154,6 +7154,148 @@ agx_nir_lower_imul64(nir_shader *nir)
       nir, agx_nir_lower_imul64_filter, agx_nir_lower_imul64_instr, NULL);
 }
 
+/* Whether instruction A's SSA result may be used at instruction B: same
+ * block requires A earlier; otherwise A's block must dominate B's. */
+static bool
+agx_nir_instr_dominates(nir_instr *a, nir_instr *b)
+{
+   if (a->block == b->block) {
+      nir_foreach_instr(instr, a->block) {
+         if (instr == a)
+            return true;
+         if (instr == b)
+            return false;
+      }
+      return false;
+   }
+
+   return nir_block_dominates(a->block, b->block);
+}
+
+/* A division and a remainder over the same operands are expanded
+ * independently by both integer-division lowerings: nir_lower_idiv emits a
+ * full reciprocal sequence for each 32-bit op, and nir_lower_int64 emits an
+ * unrolled subtract-and-select loop (over 600 instructions) for each 64-bit
+ * op.  The paired expansions land in separate control-flow regions, so no
+ * later pass can merge the duplicated work.  While both are still single
+ * ALU instructions, rewrite a remainder whose quotient is already computed:
+ *
+ *    n % d --> n - (n / d) * d
+ *
+ * with the floored-mod sign fixup on top for imod, leaving one expansion.
+ * For a 64-bit pair this also plants an imul@64, which marks the shader for
+ * the widening-imad lowering (source_imul64). */
+static bool
+agx_nir_dedup_divmod(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function(func, nir) {
+      if (!func->impl)
+         continue;
+
+      nir_function_impl *impl = func->impl;
+
+      /* Collect divisions and remainders in one sweep; a remainder may
+       * pair with a division that textually precedes OR follows it, as long
+       * as the quotient dominates the remainder's use. */
+      struct util_dynarray divs, rems;
+      util_dynarray_init(&divs, impl);
+      util_dynarray_init(&rems, impl);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            switch (alu->op) {
+            case nir_op_udiv:
+            case nir_op_idiv:
+               util_dynarray_append_typed(&divs, nir_alu_instr *, alu);
+               break;
+            case nir_op_umod:
+            case nir_op_imod:
+            case nir_op_irem:
+               util_dynarray_append_typed(&rems, nir_alu_instr *, alu);
+               break;
+            default:
+               break;
+            }
+         }
+      }
+
+      if (!util_dynarray_num_elements(&divs, nir_alu_instr *) ||
+          !util_dynarray_num_elements(&rems, nir_alu_instr *)) {
+         util_dynarray_fini(&divs);
+         util_dynarray_fini(&rems);
+         continue;
+      }
+
+      nir_calc_dominance_impl(impl);
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+
+      util_dynarray_foreach(&rems, nir_alu_instr *, remp) {
+         nir_alu_instr *rem = *remp;
+         const nir_op div_op = rem->op == nir_op_umod ? nir_op_udiv
+                                                      : nir_op_idiv;
+
+         nir_alu_instr *div = NULL;
+         util_dynarray_foreach(&divs, nir_alu_instr *, divp) {
+            if ((*divp)->op != div_op)
+               continue;
+            if (!nir_srcs_equal(rem->src[0].src, (*divp)->src[0].src) ||
+                !nir_srcs_equal(rem->src[1].src, (*divp)->src[1].src))
+               continue;
+            if (agx_nir_instr_dominates(&(*divp)->instr, &rem->instr)) {
+               div = *divp;
+               break;
+            }
+         }
+         if (!div)
+            continue;
+
+         b.cursor = nir_before_instr(&rem->instr);
+         nir_def *n = nir_ssa_for_alu_src(&b, rem, 0);
+         nir_def *d = nir_ssa_for_alu_src(&b, rem, 1);
+
+         /* The truncated remainder carries the dividend's sign; umod and
+          * irem are exactly that value. */
+         nir_def *r = nir_isub(&b, n, nir_imul(&b, &div->def, d));
+
+         nir_def *res = r;
+         if (rem->op == nir_op_imod) {
+            /* OpSMod takes the divisor's sign: a nonzero truncated
+             * remainder whose sign differs from the divisor's gains one
+             * more divisor. */
+            nir_def *adjust =
+               nir_iand(&b,
+                        nir_ine(&b, nir_ilt_imm(&b, n, 0),
+                                nir_ilt_imm(&b, d, 0)),
+                        nir_ine_imm(&b, r, 0));
+            res = nir_bcsel(&b, adjust, nir_iadd(&b, r, d), r);
+         }
+
+         /* nir_def_replace removes the replaced instruction itself. */
+         nir_def_replace(&rem->def, res);
+         impl_progress = true;
+      }
+
+      util_dynarray_fini(&divs);
+      util_dynarray_fini(&rems);
+
+      /* Only ALU instructions were added inside existing blocks and dead
+       * remainder instructions removed; control flow is untouched. */
+      if (impl_progress) {
+         nir_progress(true, impl, nir_metadata_control_flow);
+         progress = true;
+      }
+   }
+
+   return progress;
+}
+
 static bool
 agx_nir_has_alu64(const nir_shader *nir, nir_op opcode)
 {
@@ -10086,6 +10228,11 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p)
     * nir_opt_idiv_const.
     */
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
+
+   /* A remainder whose quotient is also needed is rewritten through that
+    * quotient, saving the second expansion nir_lower_idiv /
+    * nir_lower_int64 would otherwise emit for it. */
+   NIR_PASS(_, nir, agx_nir_dedup_divmod);
 
    nir_lower_idiv_options idiv_options = {
       .allow_fp16 = true,
