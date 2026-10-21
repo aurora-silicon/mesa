@@ -3987,6 +3987,32 @@ agx_ra(agx_context *ctx)
     */
    agx_compute_liveness(ctx);
    unsigned effective_demand = agx_calc_register_demand(ctx, false);
+
+   /* Loop-invariant rematerializable constants (mov_imm, get_sr, uniform
+    * copies) defined inside a loop body are re-executed every iteration;
+    * Apple materializes them once in the preheader. Hoist them within the
+    * register headroom up to the next occupancy wave: a hoisted constant
+    * holds a register live across the whole loop. When the shader already
+    * needs spilling, the spiller's loop pinning keeps these values out of
+    * the loop whenever the budget allows instead.
+    */
+   {
+      unsigned headroom = 0;
+
+      if (effective_demand <= max_possible_regs) {
+         unsigned rounded =
+            MIN2(agx_round_registers(&ctx->key->dev, effective_demand),
+                 max_possible_regs);
+         headroom =
+            rounded > effective_demand ? rounded - effective_demand : 0;
+      }
+
+      if (headroom > 0 && agx_hoist_loop_remat(ctx, headroom) > 0) {
+         agx_compute_liveness(ctx);
+         effective_demand = agx_calc_register_demand(ctx, false);
+      }
+   }
+
    bool spilling = (effective_demand > max_possible_regs);
    bool remat = false;
    const unsigned full_budget = max_possible_regs;

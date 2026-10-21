@@ -200,6 +200,17 @@ struct spill_ctx {
 
    /* If true, we cannot use scratch and must only rematerialize. */
    bool remat_only;
+
+   /* Loop structure, used to keep loop-invariant rematerializable constants
+    * in a register across a loop instead of rematerializing them every
+    * iteration (matching Apple's placement in the preheader).
+    *
+    * pin_loop[v] is the index of the header of the outermost loop containing
+    * all of v's in-loop uses, or negative if there are none. loop_end[h] is
+    * the source-order index of the last block in the loop headed by block h.
+    */
+   const int32_t *pin_loop;
+   const int32_t *loop_end;
 };
 
 static inline struct spill_block *
@@ -407,6 +418,50 @@ struct candidate {
    dist_t dist;
 };
 
+/* Is this rematerializable node pinned for this block? A node is pinned when
+ * all of its in-loop uses live in a single (family of nested) loop(s): keeping
+ * it in a register across that loop amortizes what would otherwise be a
+ * materialization per iteration. The block participates either by being inside
+ * the pinned loop, or by heading a loop containing the pinned loop (where
+ * pinning materializes the constant on the outer preheader edge).
+ */
+static bool
+remat_pinned_here(const struct spill_ctx *ctx, unsigned node)
+{
+   int32_t pl = ctx->pin_loop[node];
+   if (pl < 0)
+      return false;
+
+   unsigned b = ctx->block->index;
+   if (b >= (unsigned)pl && b <= (unsigned)ctx->loop_end[pl])
+      return true;
+
+   return ctx->block->loop_header && b <= (unsigned)pl &&
+          (unsigned)pl <= (unsigned)ctx->loop_end[b];
+}
+
+/* Eviction preference classes, lowest kept longest:
+ *
+ *    0. not rematerializable (or dead-on-arrival)
+ *    1. rematerializable, pinned to a containing loop
+ *    2. rematerializable, ordinary
+ *    3. rematerializable, pinned but already dead
+ *
+ * Non-rematerializable nodes still go to scratch last, preserving the
+ * remat-only pass's fallback behaviour; pinned constants trade a register
+ * across the loop for the per-iteration materializations they replace; dead
+ * pinned values are still the first thing to go when pressure demands it.
+ */
+static int
+remat_class(const struct spill_ctx *ctx, unsigned node, dist_t dist)
+{
+   if (!ctx->remat[node] || dist == 0)
+      return 0;
+   if (remat_pinned_here(ctx, node))
+      return dist == DIST_INFINITY ? 3 : 1;
+   return 2;
+}
+
 static int
 cmp_dist(const void *left_, const void *right_, void *ctx_)
 {
@@ -416,14 +471,16 @@ cmp_dist(const void *left_, const void *right_, void *ctx_)
 
    /* We assume that rematerializing - even before every instruction - is
     * cheaper than spilling. As long as one of the nodes is rematerializable
-    * (with distance > 0), we choose it over spilling. Within a class of nodes
-    * (rematerializable or not), compare by next-use-distance.
+    * (with distance > 0), we choose it over spilling, except for loop-pinned
+    * constants which are cheaper kept live across the loop than
+    * rematerialized every iteration. Within a class of nodes, compare by
+    * next-use-distance.
     */
-   bool remat_left = ctx->remat[left->node] != NULL && left->dist > 0;
-   bool remat_right = ctx->remat[right->node] != NULL && right->dist > 0;
+   int class_left = remat_class(ctx, left->node, left->dist);
+   int class_right = remat_class(ctx, right->node, right->dist);
 
-   if (remat_left != remat_right)
-      return remat_left ? 1 : -1;
+   if (class_left != class_right)
+      return class_left - class_right;
    else
       return (left->dist > right->dist) - (left->dist < right->dist);
 }
@@ -801,7 +858,8 @@ min_algorithm(struct spill_ctx *ctx)
          assert(next_use_cursor >= 1);
          unsigned next_ip = next_ips[--next_use_cursor];
 
-         if (next_ip == DIST_INFINITY)
+         if (next_ip == DIST_INFINITY &&
+             !remat_pinned_here(ctx, I->dest[d].value))
             remove_W_if_present(ctx, I->dest[d].value);
          else
             ctx->next_uses[I->dest[d].value] = next_ip;
@@ -838,7 +896,14 @@ min_algorithm(struct spill_ctx *ctx)
          assert((next_ip == DIST_INFINITY) == I->src[s].kill);
 
          if (I->src[s].kill) {
-            remove_W_if_present(ctx, I->src[s].value);
+            /* Loop-pinned remat constants stay in W until the end of the
+             * loop so they are still in the register file on the back edge:
+             * dropping them here would make the coupling code rematerialize
+             * them on the latch edge every iteration. They are still free to
+             * be evicted by limit() under real pressure.
+             */
+            if (!remat_pinned_here(ctx, I->src[s].value))
+               remove_W_if_present(ctx, I->src[s].value);
          } else {
             ctx->next_uses[I->src[s].value] = next_ip;
          }
@@ -874,6 +939,154 @@ min_algorithm(struct spill_ctx *ctx)
 
    assert(nS == sblock->nS_exit);
    util_dynarray_fini(&local_next_ip);
+}
+
+/*
+ * Identify loops by their back edges: a successor loop header that does not
+ * follow the block in source order. In structured AGX control flow a loop is
+ * the source-order interval from its header to the block holding the back
+ * edge. Returns (allocated on memctx):
+ *
+ *    loop_end[h]   = source-order index of the last block in the loop headed
+ *                    by block h, or -1 if h is not a loop header
+ *    outer_loop[b] = index of the header of the outermost loop containing
+ *                    block b, or -1
+ */
+static void
+compute_loop_intervals(agx_context *ctx, void *memctx, int32_t **loop_end_out,
+                       int32_t **outer_loop_out)
+{
+   int32_t *loop_end = rzalloc_array(memctx, int32_t, ctx->num_blocks);
+   int32_t *outer_loop = rzalloc_array(memctx, int32_t, ctx->num_blocks);
+
+   agx_foreach_block(ctx, block) {
+      loop_end[block->index] = -1;
+      outer_loop[block->index] = -1;
+   }
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_successor(block, succ) {
+         if (succ->loop_header && succ->index <= block->index)
+            loop_end[succ->index] =
+               MAX2(loop_end[succ->index], (int32_t)block->index);
+      }
+   }
+
+   agx_foreach_block(ctx, header) {
+      if (!header->loop_header || loop_end[header->index] < 0)
+         continue;
+
+      /* Blocks are visited in source order, so the first (outermost) header
+       * to claim an interval wins.
+       */
+      for (unsigned i = header->index;
+           i <= (unsigned)loop_end[header->index]; ++i) {
+         if (outer_loop[i] < 0)
+            outer_loop[i] = header->index;
+      }
+   }
+
+   *loop_end_out = loop_end;
+   *outer_loop_out = outer_loop;
+}
+
+/* Map block indices to blocks */
+static agx_block **
+blocks_by_index(agx_context *ctx, void *memctx)
+{
+   agx_block **by_index =
+      rzalloc_array(memctx, agx_block *, MAX2(ctx->num_blocks, 1));
+
+   agx_foreach_block(ctx, block)
+      by_index[block->index] = block;
+
+   return by_index;
+}
+
+/*
+ * Hoist loop-invariant rematerializable definitions (mov_imm, get_sr, uniform
+ * copies) out of loop bodies into the loop preheader, matching Apple's
+ * placement. Executing a constant materialization once per loop entry instead
+ * of once per iteration is a straight dynamic win; the cost is a register held
+ * live across the loop, so the caller bounds the total hoisted width by
+ * register headroom.
+ *
+ * budget gives the number of 16-bit registers worth of hoisted live ranges
+ * allowed; UINT_MAX hoists everything subject to a per-loop cap, since a
+ * hoisted constant holds a register live across the whole loop and enough of
+ * them would trade materializations for pressure-driven copies. Returns the
+ * number of moved instructions. Requires liveness to be recomputed
+ * afterwards.
+ */
+#define AGX_HOIST_REMAT_LOOP_HALVES 8
+
+unsigned
+agx_hoist_loop_remat(agx_context *ctx, unsigned budget)
+{
+   void *memctx = ralloc_context(NULL);
+   int32_t *loop_end, *outer_loop;
+   compute_loop_intervals(ctx, memctx, &loop_end, &outer_loop);
+   agx_block **by_index = blocks_by_index(ctx, memctx);
+
+   /* Widths of the candidate destinations, for the headroom budget, and the
+    * per-loop running totals of hoisted width.
+    */
+   uint8_t *widths = rzalloc_array(memctx, uint8_t, ctx->alloc);
+   uint8_t *loop_spent = rzalloc_array(memctx, uint8_t, ctx->num_blocks);
+
+   unsigned moved = 0;
+
+   agx_foreach_block(ctx, block) {
+      int32_t h = outer_loop[block->index];
+      if (h < 0)
+         continue;
+
+      /* Hoist to the preheader of the outermost enclosing loop. That
+       * requires a unique forward predecessor; if the header has several
+       * forward edges there is no single insertion point dominating the
+       * loop, so leave the definitions in place.
+       */
+      agx_block *header = by_index[h];
+      agx_block *preheader = NULL;
+      unsigned forward = 0;
+
+      agx_foreach_predecessor(header, pred) {
+         if ((*pred)->index < header->index) {
+            preheader = *pred;
+            forward++;
+         }
+      }
+
+      if (forward != 1)
+         continue;
+
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (!can_remat(ctx, I))
+            continue;
+
+         unsigned w = 0;
+         agx_foreach_ssa_dest(I, d) {
+            unsigned v = I->dest[d].value;
+            if (!widths[v])
+               widths[v] = util_next_power_of_two(agx_index_size_16(I->dest[d]));
+            w += widths[v];
+         }
+
+         if (w > budget || loop_spent[h] + w > AGX_HOIST_REMAT_LOOP_HALVES)
+            continue;
+
+         budget -= w;
+         loop_spent[h] += w;
+         list_del(&I->link);
+
+         agx_cursor cursor = agx_after_block_logical(preheader);
+         agx_builder_insert(&cursor, I);
+         moved++;
+      }
+   }
+
+   ralloc_free(memctx);
+   return moved;
 }
 
 /*
@@ -1234,6 +1447,62 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
    struct spill_block *blocks =
       rzalloc_array(memctx, struct spill_block, ctx->num_blocks);
 
+   int32_t *loop_end, *outer_loop;
+   compute_loop_intervals(ctx, memctx, &loop_end, &outer_loop);
+
+   int32_t *pin_loop = rzalloc_array(memctx, int32_t, ctx->alloc);
+
+   /* For every rematerializable node, find the single outermost loop that
+    * contains all of its uses inside loops. Such a value can be kept in a
+    * register across that loop -- materialized once on the preheader edge --
+    * instead of being rematerialized every iteration. -2 marks nodes whose
+    * uses span disjoint loops, which we leave alone.
+    */
+   for (unsigned v = 0; v < ctx->alloc; ++v)
+      pin_loop[v] = -1;
+
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_PHI) {
+            /* Phi sources are used along the edge from the predecessor */
+            agx_foreach_predecessor(block, pred) {
+               int32_t loop = outer_loop[(*pred)->index];
+               if (loop < 0)
+                  continue;
+
+               agx_index src = I->src[agx_predecessor_index(block, *pred)];
+               if (src.type != AGX_INDEX_NORMAL)
+                  continue;
+
+               unsigned v = src.value;
+               if (!remat[v])
+                  continue;
+
+               if (pin_loop[v] == -1)
+                  pin_loop[v] = loop;
+               else if (pin_loop[v] != loop)
+                  pin_loop[v] = -2;
+            }
+            continue;
+         }
+
+         int32_t loop = outer_loop[block->index];
+         if (loop < 0)
+            continue;
+
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (!remat[v])
+               continue;
+
+            if (pin_loop[v] == -1)
+               pin_loop[v] = loop;
+            else if (pin_loop[v] != loop)
+               pin_loop[v] = -2;
+         }
+      }
+   }
+
    /* Step 1. Compute global next-use distances */
    global_next_use_distances(ctx, memctx, blocks);
    validate_next_use_info(ctx, blocks);
@@ -1264,6 +1533,8 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .S = S,
          .spill_base = n,
          .remat_only = remat_only,
+         .pin_loop = pin_loop,
+         .loop_end = loop_end,
       };
 
       compute_w_entry(&sctx);
@@ -1287,6 +1558,8 @@ agx_spill(agx_context *ctx, unsigned k, bool remat_only)
          .S = S,
          .spill_base = n,
          .remat_only = remat_only,
+         .pin_loop = pin_loop,
+         .loop_end = loop_end,
       };
 
       agx_foreach_predecessor(block, pred) {
