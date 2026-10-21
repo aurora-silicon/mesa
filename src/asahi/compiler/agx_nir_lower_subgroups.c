@@ -28,6 +28,14 @@ struct agx_subgroup_lower_options {
  * scalar scan at a width the shuffles cover, for an operation the
  * hardware prefix op does not implement over a partial subgroup.  The
  * filter below must return false for exactly these.
+ *
+ * 64-bit scans emit 64-bit combines and indexed reads; nir_lower_int64
+ * (which runs after this pass and admits the 64-bit shuffle/intrinsic
+ * splits in AGX's option mask) expands them into 32-bit pieces, so the
+ * pointer-doubling chain itself needs no widening.  Integer min/max has
+ * a prefix form through 32 bits and stays an intrinsic below 64; iadd
+ * and the bitwise ops keep their dedicated 64-bit splittings, which are
+ * cheaper than a dense sweep.
  */
 static bool
 agx_scan_eligible(const nir_intrinsic_instr *intr)
@@ -36,15 +44,20 @@ agx_scan_eligible(const nir_intrinsic_instr *intr)
        intr->intrinsic != nir_intrinsic_inclusive_scan)
       return false;
 
-   if (intr->def.num_components != 1 ||
-       (intr->def.bit_size != 16 && intr->def.bit_size != 32))
+   if (intr->def.num_components != 1)
       return false;
 
    switch (nir_intrinsic_reduction_op(intr)) {
    case nir_op_imul:
    case nir_op_fmin:
    case nir_op_fmax:
-      return true;
+      return intr->def.bit_size == 16 || intr->def.bit_size == 32 ||
+             intr->def.bit_size == 64;
+   case nir_op_umin:
+   case nir_op_umax:
+   case nir_op_imin:
+   case nir_op_imax:
+      return intr->def.bit_size == 64;
    default:
       return false;
    }
