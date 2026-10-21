@@ -2426,6 +2426,9 @@ optimizations.extend([
    (('~fadd', '#a', ('fneg', ('fadd', b, '#c'))), ('fadd', ('fadd', a, ('fneg', c)), ('fneg', b))),
    (('iadd', '#a', ('iadd', b, '#c')), ('iadd', ('iadd', a, c), b)),
    (('iand', '#a', ('iand', b, '#c')), ('iand', ('iand', a, c), b)),
+   # (x & mask1) & mask2 -> x & (mask1 & mask2): drops a dead second mask
+   # when mask2 covers mask1, and otherwise feeds constant folding.
+   (('iand', ('iand', a, '#b'), '#c'), ('iand', a, ('iand', b, c))),
    (('ior',  '#a', ('ior',  b, '#c')), ('ior',  ('ior',  a, c), b)),
    (('ixor', '#a', ('ixor', b, '#c')), ('ixor', ('ixor', a, c), b)),
    (('ior', ('iand', a, '#c'), ('ior', b, ('iand', a, '#d'))), ('ior', b, ('iand', a, ('ior', c, d)))),
