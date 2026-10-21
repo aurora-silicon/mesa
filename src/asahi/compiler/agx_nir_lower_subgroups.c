@@ -273,6 +273,64 @@ agx_subgroup_reduce(nir_builder *b, nir_op op, unsigned cluster,
    return &red->def;
 }
 
+/* The float compare whose complement is another float compare, for folding
+ * a boolean not into a ballot's fused compare condition. */
+static nir_op
+agx_fcmp_complement(nir_op op)
+{
+   switch (op) {
+   case nir_op_flt:  return nir_op_fge;
+   case nir_op_fge:  return nir_op_flt;
+   case nir_op_feq:  return nir_op_fneu;
+   case nir_op_fneu: return nir_op_feq;
+   default:          return nir_num_opcodes;
+   }
+}
+
+/* Shape a ballot's predicate for G17P's fused float ballot, which compares
+ * a register against a minifloat immediate or a second register: fold a
+ * boolean not into the compare's condition and put a constant operand
+ * second.  Each rewrite saves the predicate materialization (fcmpsel, the
+ * not itself, and the widen) that an integer ballot of a 16-bit boolean
+ * would otherwise need.
+ */
+static bool
+agx_g17p_normalize_ballot_src(nir_builder *b, nir_intrinsic_instr *ballot)
+{
+   nir_def *pred = ballot->src[0].ssa;
+   nir_instr *pred_instr = nir_def_instr(pred);
+   if (pred_instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(pred_instr);
+
+   bool changed = false;
+   nir_op op = alu->op;
+   if (op == nir_op_inot) {
+      nir_def *x = alu->src[0].src.ssa;
+      nir_instr *x_instr = nir_def_instr(x);
+      if (x_instr->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *cmp = nir_instr_as_alu(x_instr);
+      nir_op complement = agx_fcmp_complement(cmp->op);
+      if (complement == nir_num_opcodes)
+         return false;
+      op = complement;
+      alu = cmp;
+      changed = true;
+   } else if (agx_fcmp_complement(op) == nir_num_opcodes) {
+      return false;
+   }
+
+   if (!changed)
+      return false;
+
+   nir_def *x = alu->src[0].src.ssa;
+   nir_def *y = alu->src[1].src.ssa;
+
+   nir_src_rewrite(&ballot->src[0], nir_build_alu2(b, op, x, y));
+   return true;
+}
+
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -548,7 +606,10 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        * lane membership every other subgroup operation shares.
        */
       const struct agx_subgroup_lower_options *agx_options = data;
-      if (agx_options->g17p || !nir_src_is_const(intr->src[0]) ||
+      if (agx_options->g17p)
+         return agx_g17p_normalize_ballot_src(b, intr);
+
+      if (!nir_src_is_const(intr->src[0]) ||
           !nir_src_as_bool(intr->src[0]) ||
           !list_is_singular(&intr->def.uses))
          return false;

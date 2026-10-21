@@ -1534,7 +1534,31 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
       (def->icond == AGX_ICOND_UEQ || def->icond == AGX_ICOND_SEQ) &&
       def->src[1].type == AGX_INDEX_IMMEDIATE && def->src[1].value != 0;
 
+   /* G17P's fused float ballot compares the register in f16 against a
+    * second operand -- a minifloat immediate, or another register (the
+    * simd_broadcast_first() allequal witness compares two registers). Take
+    * the fused form whenever the second operand is register or immediate;
+    * the packer refuses modified/memory operands, which keep the
+    * opposite-compare fallback below. */
+   const bool fused_fballot =
+      !quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+      def->op == AGX_OPCODE_FCMP &&
+      (def->fcond == AGX_FCOND_EQ || def->fcond == AGX_FCOND_LT ||
+       def->fcond == AGX_FCOND_GT || def->fcond == AGX_FCOND_GE ||
+       def->fcond == AGX_FCOND_LE) &&
+      /* src0 may be an immediate: it swaps into the second-operand slot
+       * with the reversed condition below. */
+      ((def->src[0].type == AGX_INDEX_NORMAL &&
+        (def->src[1].type == AGX_INDEX_NORMAL ||
+         def->src[1].type == AGX_INDEX_IMMEDIATE)) ||
+       (def->src[0].type == AGX_INDEX_IMMEDIATE &&
+        def->src[1].type == AGX_INDEX_NORMAL)) &&
+      !def->src[1].memory && !def->src[1].abs && !def->src[1].neg &&
+      !def->src[1].kill && !def->src[0].memory && !def->src[0].abs &&
+      !def->src[0].neg && !def->src[0].kill;
+
    if (!quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       !fused_fballot &&
        (def->src[1].type != AGX_INDEX_IMMEDIATE || agx3_inverted_eq_imm)) {
       agx_index opposite = agx_temp(ctx, AGX_SIZE_16);
 
@@ -1552,13 +1576,32 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
       return;
    }
 
+   /* A float compare with the immediate first exchanges its operands so the
+    * register lands in the ballot's f16 source; the reversed condition keeps
+    * the comparison's meaning. */
+   agx_index bs0 = def->src[0], bs1 = def->src[1];
+   enum agx_fcond fcond = def->fcond;
+   if (def->op == AGX_OPCODE_FCMP &&
+       def->src[0].type == AGX_INDEX_IMMEDIATE) {
+      bs0 = def->src[1];
+      bs1 = def->src[0];
+      switch (fcond) {
+      case AGX_FCOND_LT: fcond = AGX_FCOND_GT; break;
+      case AGX_FCOND_GT: fcond = AGX_FCOND_LT; break;
+      case AGX_FCOND_LE: fcond = AGX_FCOND_GE; break;
+      case AGX_FCOND_GE: fcond = AGX_FCOND_LE; break;
+      default: break;
+      }
+   }
+
    agx_instr *fused = agx_icmp_ballot_to(
-      &b, I->dest[0], def->src[0], def->src[1], def->icond, def->invert_cond);
+      &b, I->dest[0], bs0, bs1, def->icond, def->invert_cond);
 
    if (def->op == AGX_OPCODE_ICMP) {
       fused->op = quad ? AGX_OPCODE_ICMP_QUAD_BALLOT : AGX_OPCODE_ICMP_BALLOT;
    } else {
       fused->op = quad ? AGX_OPCODE_FCMP_QUAD_BALLOT : AGX_OPCODE_FCMP_BALLOT;
+      fused->fcond = fcond;
    }
 
    agx_remove_instruction(I);

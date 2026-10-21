@@ -409,8 +409,16 @@ agx3_subgroup_encode_ballot(enum agx_isa_encoding enc,
          ADD_FIELD(45, d->quad ? 139 : 157);
       }
    } else {
+      /* The register second operand is only witnessed on the SIMD form,
+       * where f44 marks the last read of that register -- the same position
+       * relative to f33 that f27 occupies for the source's f16.  The
+       * quad/minifloat forms keep f40 = 1 with the immediate in f32. */
+      if (d->src2_register &&
+          (d->quad || !valid_reg(enc, d->src2)))
+         return false;
+
       mnemonic = d->quad ? "quadfballot" : "simdfballot";
-      ADD_FIELD(40, 1);
+      ADD_FIELD(40, d->src2_register ? 2 : 1);
       ADD_FIELD(41, 2);
       cond_field = 58;
       invert_field = 59;
@@ -420,7 +428,7 @@ agx3_subgroup_encode_ballot(enum agx_isa_encoding enc,
       }
    }
 
-   struct agx3_field_kv ov[5] = {
+   struct agx3_field_kv ov[8] = {
       {2, d->dest},
       {16, d->src},
       {cond_field, d->condition},
@@ -429,6 +437,12 @@ agx3_subgroup_encode_ballot(enum agx_isa_encoding enc,
    unsigned no = 4;
    if (d->compare_immediate)
       ov[no++] = (struct agx3_field_kv){30, d->compare_value};
+   else if (d->type == AGX3_SUBGROUP_BALLOT_FLOAT && d->src2_register) {
+      ov[no++] = (struct agx3_field_kv){33, d->src2};
+      ov[no++] = (struct agx3_field_kv){42, d->src2_live ? 1u : 0u};
+      ov[no++] = (struct agx3_field_kv){44, d->src2_live ? 0u : 1u};
+   } else if (d->type == AGX3_SUBGROUP_BALLOT_FLOAT && d->src2)
+      ov[no++] = (struct agx3_field_kv){32, d->src2};
    return agx3_bind_compose(enc, mnemonic, 0, base, nb, ov, no, out, length);
 }
 
