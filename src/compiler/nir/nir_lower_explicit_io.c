@@ -1047,8 +1047,21 @@ build_explicit_io_store(nir_builder *b, nir_intrinsic_instr *intrin,
 
    if (addr_format_needs_bounds_check(addr_format)) {
       /* TODO: Better handle block_intel. */
-      assert(store->num_components == 1);
-      const unsigned store_size = value->bit_size / 8;
+      /* The written span ends at the highest masked component, and the
+       * descriptor bound is a flat byte limit, so
+       * ult(offset + top_byte - 1, bound) is the exact in-bounds test
+       * for every masked lane at once.  An access with any part out of
+       * bounds is out of bounds and its store is dropped wholesale, so
+       * this whole-access check is the same bounds granularity an
+       * unscalarized store gets -- the per-component guard ladder is
+       * only a consequence of scalarizing for the check, not a spec
+       * requirement. */
+      const unsigned store_size =
+         write_mask
+            ? util_last_bit(write_mask &
+                            BITFIELD_MASK(store->num_components)) *
+                 (store->src[0].ssa->bit_size / 8)
+            : store->src[0].ssa->bit_size / 8;
       nir_push_if(b, addr_is_in_bounds(b, addr, addr_format, store_size));
 
       nir_builder_instr_insert(b, &store->instr);
@@ -1526,7 +1539,17 @@ nir_lower_explicit_io_instr(nir_builder *b,
    case nir_intrinsic_store_deref: {
       nir_def *value = intrin->src[1].ssa;
       nir_component_mask_t write_mask = nir_intrinsic_write_mask(intrin);
-      if (scalarize) {
+
+      /* A bounded store needs per-component guards only when the values
+       * it writes do not cover contiguous bytes.  A contiguous vector
+       * store is a single access: keeping it whole lets
+       * build_explicit_io_store bounds-check the written span once,
+       * instead of splitting one access into a guard per dword. */
+      const bool whole_span =
+         addr_format_needs_bounds_check(addr_format) &&
+         vec_stride == scalar_size &&
+         value->num_components == intrin->num_components;
+      if (scalarize && !whole_span) {
          for (unsigned i = 0; i < intrin->num_components; i++) {
             if (!(write_mask & (1 << i)))
                continue;

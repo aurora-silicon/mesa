@@ -7,6 +7,10 @@
 #include "agx_compiler.h"
 #include "agx_nir.h"
 
+static nir_def *divide_exact(nir_builder *b, nir_scalar s, unsigned shift,
+                             unsigned depth);
+static nir_def *divide_masked(nir_builder *b, nir_scalar s, unsigned shift);
+
 /* Local memory instructions require 16-bit offsets, so we add conversions. */
 static bool
 pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -30,7 +34,11 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
             ? intr->def.bit_size
             : nir_src_bit_size(intr->src[0]);
       const unsigned shift = util_logbase2(bit_size / 8);
-      address = nir_ushr_imm(b, address, shift);
+      nir_scalar s = nir_scalar_resolved(address, 0);
+      nir_def *elements = divide_exact(b, s, shift, 4);
+      if (!elements)
+         elements = divide_masked(b, s, shift);
+      address = elements ? elements : nir_ushr_imm(b, address, shift);
    }
 
    if (address->bit_size != 16)
@@ -88,7 +96,9 @@ divide_exact(nir_builder *b, nir_scalar s, unsigned shift, unsigned depth)
       return k == shift ? kept : nir_ishl_imm(b, kept, k - shift);
    }
 
-   case nir_op_imul: {
+   case nir_op_imul:
+   case nir_op_amul: {
+      const nir_op op = nir_scalar_alu_op(s);
       for (unsigned i = 0; i < 2; ++i) {
          const nir_scalar factor = nir_scalar_chase_alu_src(s, i);
          if (!nir_scalar_is_const(factor))
@@ -97,8 +107,9 @@ divide_exact(nir_builder *b, nir_scalar s, unsigned shift, unsigned depth)
          if (f & mask)
             return NULL;
          const nir_scalar value = nir_scalar_chase_alu_src(s, 1 - i);
-         return nir_imul_imm(b, nir_channel(b, value.def, value.comp),
-                             f >> shift);
+         nir_def *kept = nir_channel(b, value.def, value.comp);
+         return op == nir_op_amul ? nir_amul_imm(b, kept, f >> shift)
+                                 : nir_imul_imm(b, kept, f >> shift);
       }
       return NULL;
    }
@@ -116,6 +127,91 @@ divide_exact(nir_builder *b, nir_scalar s, unsigned shift, unsigned depth)
    default:
       return NULL;
    }
+}
+
+/*
+ * Fold the byte-offset masks shared-opt produces through the element
+ * divide: with the mask's low `shift` bits clear,
+ * ushr(iand(x, m), s) == iand(ushr(x, s), m >> s), which the optimizer
+ * folds into the shift it masks -- iand(ishl(x, k - s), m >> s) --
+ * instead of materializing shift + mask + divide.  Every lane of the
+ * rewrite is exact for every input value. */
+static nir_def *
+divide_masked(nir_builder *b, nir_scalar s, unsigned shift)
+{
+   s = nir_scalar_chase_movs(s);
+   if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_iand)
+      return NULL;
+
+   nir_scalar x = nir_scalar_chase_alu_src(s, 0);
+   nir_scalar m = nir_scalar_chase_alu_src(s, 1);
+   if (nir_scalar_is_const(x)) {
+      nir_scalar t = x;
+      x = m;
+      m = t;
+   }
+   if (!nir_scalar_is_const(m))
+      return NULL;
+
+   const uint64_t mask = nir_scalar_as_uint(m);
+   if (mask & ((UINT64_C(1) << shift) - 1))
+      return NULL;
+
+   /* Only fold where the iand dies with the rewrite: reissuing the mask
+    * next to a surviving one costs more than the ushr it replaces.  The
+    * inner scale may stay shared -- the folded form it emits is the same
+    * value the other consumers' own divides fold to, so it still
+    * breaks even and often CSEs. */
+   if (!list_is_singular(&s.def->uses))
+      return NULL;
+
+   /* The divide also folds into the masked value's own scale: chase the
+    * ishl/imul producing x and drop the covered low factor, emitting
+    * iand(ishl(v, k - s), m >> s) directly so the win does not depend on
+    * a later optimizer visit. */
+   nir_scalar inner = nir_scalar_chase_movs(x);
+   if (!nir_scalar_is_alu(inner))
+      return NULL;
+
+   nir_op op = nir_scalar_alu_op(inner);
+   nir_scalar v = {NULL, 0};
+   uint64_t k = 0;
+   if (op == nir_op_ishl) {
+      nir_scalar a = nir_scalar_chase_alu_src(inner, 1);
+      if (!nir_scalar_is_const(a))
+         return NULL;
+      k = nir_scalar_as_uint(a);
+      if (k < shift)
+         return NULL;
+      v = nir_scalar_chase_alu_src(inner, 0);
+   } else if (op == nir_op_imul || op == nir_op_amul) {
+      nir_scalar a = nir_scalar_chase_alu_src(inner, 0);
+      nir_scalar c = nir_scalar_chase_alu_src(inner, 1);
+      if (!nir_scalar_is_const(c)) {
+         nir_scalar t = a;
+         a = c;
+         c = t;
+      }
+      if (!nir_scalar_is_const(c))
+         return NULL;
+      uint64_t f = nir_scalar_as_uint(c);
+      if (!f || (f & ((UINT64_C(1) << shift) - 1)))
+         return NULL;
+      k = f;
+      v = a;
+   } else {
+      return NULL;
+   }
+
+   nir_def *base = nir_channel(b, v.def, v.comp);
+   nir_def *scaled = base;
+   if (op == nir_op_ishl) {
+      if (k != shift)
+         scaled = nir_ishl_imm(b, base, k - shift);
+   } else {
+      scaled = nir_imul_imm(b, base, k >> shift);
+   }
+   return nir_iand_imm(b, scaled, mask >> shift);
 }
 
 /*
@@ -165,6 +261,8 @@ element_index(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (nir_scalar_is_alu(narrow) && nir_scalar_alu_op(narrow) == nir_op_u2u16) {
       const nir_scalar wide = nir_scalar_chase_alu_src(narrow, 0);
       nir_def *elements = divide_exact(b, wide, shift, 4);
+      if (!elements)
+         elements = divide_masked(b, wide, shift);
       if (!elements) {
          elements =
             nir_ushr_imm(b, nir_channel(b, wide.def, wide.comp), shift);
@@ -174,6 +272,8 @@ element_index(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    nir_def *elements = divide_exact(b, narrow, shift, 4);
+   if (!elements)
+      elements = divide_masked(b, narrow, shift);
    nir_src_rewrite(offset, elements ? elements
                                     : nir_ushr_imm(b, address, shift));
    return true;
