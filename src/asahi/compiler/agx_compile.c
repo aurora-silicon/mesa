@@ -5831,6 +5831,32 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
              debug_get_bool_option("ASAHI_G17P_FT1", false))
             return agx_ffs_to(b, dst, s0);
 
+         /* ufind_msb(x & -x) is the position of the lowest set bit: for a
+          * single-bit mask the decrement holds exactly that many set bits,
+          * so isub + popcount replaces the five-stage smear. The fused
+          * signed select restores the -1-on-zero contract an empty mask
+          * would otherwise lose (0 - 1 counts to 32, not -1). */
+         if (src_sz == 32) {
+            nir_alu_instr *and_def = nir_src_as_alu(instr->src[0].src);
+            bool lowest_bit = false;
+            if (and_def && and_def->op == nir_op_iand) {
+               for (unsigned i = 0; i < 2 && !lowest_bit; ++i) {
+                  nir_alu_instr *neg =
+                     nir_src_as_alu(and_def->src[i].src);
+                  lowest_bit = neg && neg->op == nir_op_ineg &&
+                     nir_srcs_equal(and_def->src[i ^ 1].src,
+                                    neg->src[0].src);
+               }
+            }
+            if (lowest_bit) {
+               agx_index dec = agx_iadd(b, s0, agx_neg(i1), 0);
+               agx_index cnt = agx_popcount(b, dec);
+               agx_index neg_one = agx_mov_imm(b, 32, UINT32_C(0xffffffff));
+               return agx_icmpsel_to(b, dst, dec, i0, neg_one, cnt,
+                                     AGX_ICOND_SLT);
+            }
+         }
+
          /* The ft1 encoder admits 32-bit words only. Zero-extending a
           * narrower source can neither move its top bit nor alter the
           * -1-on-zero result, so keep the integer smear+popcount sequence on

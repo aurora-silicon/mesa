@@ -1639,8 +1639,25 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
             def->src[0].size == AGX_SIZE_32 &&
             (def->src[0].type == AGX_INDEX_UNIFORM ||
              other.type == AGX_INDEX_UNIFORM);
+
+         /* The two-register truth tables the AGX3B packer encodes as their
+          * own instructions: bit_nor (0x1), bit_andc either side (0x2/0x4),
+          * bit_nand (0x7), bit_xnor (0x9) and bit_orc either side (0xb/0xd).
+          * They take register operands only, so require a 32-bit register on
+          * both sides after the fuse. */
+         const bool named_reg_word =
+            I->dest[0].size == AGX_SIZE_32 &&
+            I->src[0].size == AGX_SIZE_32 &&
+            I->src[1].size == AGX_SIZE_32 &&
+            def->src[0].size == AGX_SIZE_32 &&
+            def->src[0].type == AGX_INDEX_NORMAL &&
+            I->src[1 - s].type == AGX_INDEX_NORMAL &&
+            (truth_table == 0x1 || truth_table == 0x2 ||
+             truth_table == 0x4 || truth_table == 0x7 ||
+             truth_table == 0x9 || truth_table == 0xb ||
+             truth_table == 0xd);
          if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-             !native_uniform_word &&
+             !native_uniform_word && !named_reg_word &&
              truth_table != AGX3_SEL_TT_AND &&
              truth_table != AGX3_SEL_TT_OR &&
              truth_table != AGX3_SEL_TT_XOR &&
