@@ -159,6 +159,14 @@ lower_gs_intrinsics(nir_shader *shader)
    return nir_progress(true, impl, nir_metadata_none);
 }
 
+/* Helpers for lowering I/O to variables */
+struct lower_output_to_var_slot {
+   nir_variable *output_var;
+   nir_variable *selected_var;
+   nir_alu_type type;
+   unsigned nr_components;
+};
+
 struct lower_gs_state {
    int static_count[POLY_MAX_VERTEX_STREAMS];
 
@@ -170,6 +178,19 @@ struct lower_gs_state {
    int count_index[POLY_MAX_VERTEX_STREAMS];
 
    struct poly_gs_info *info;
+
+   /* Materialized emitted-vertex output records. When record_mask is nonzero
+    * the main geometry program stores each emitted vertex's outputs into a
+    * driver-allocated record buffer and the rasterization vertex shader just
+    * indexed-loads its record, instead of replaying the geometry shader body
+    * through a select tree per emitted vertex.
+    */
+   uint64_t record_mask;
+   uint32_t record_off_B[NUM_TOTAL_VARYING_SLOTS];
+   unsigned record_stride_B;
+   unsigned record_mult;
+   unsigned record_chunk_B;
+   struct lower_output_to_var_slot outputs[NUM_TOTAL_VARYING_SLOTS];
 };
 
 /* Helpers for loading from the vertex state buffer */
@@ -205,14 +226,6 @@ load_geometry_param_offset(nir_builder *b, uint32_t offset, uint8_t bytes)
    load_geometry_param_offset(                                                 \
       b, offsetof(struct poly_geometry_params, field),                         \
       sizeof(((struct poly_geometry_params *)0)->field))
-
-/* Helpers for lowering I/O to variables */
-struct lower_output_to_var_slot {
-   nir_variable *output_var;
-   nir_variable *selected_var;
-   nir_alu_type type;
-   unsigned nr_components;
-};
 
 static bool
 collect_output_types(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -891,6 +904,217 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
    return shader;
 }
 
+/* Emitted-vertex output records are one 16-byte granule per output slot,
+ * addressed by the same emitted-vertex encoding the rasterized index feed
+ * carries: padded (unrolled primitive * POT vertex stride + emit ordinal)
+ * times the stream multiplier plus the stream for a dynamic shape, and the
+ * dense unrolled primitive equivalent for the static shapes. That makes the
+ * record index equal to the rasterization shader's vertex ID for a dynamic
+ * indexed draw and a multiply-add away for the static shapes.
+ *
+ * Per-primitive record footprint is bounded so a pathological shader cannot
+ * shrink the fixed geometry heap's maximum draw beyond recognition; anything
+ * over the cap keeps the replay shader.
+ */
+#define POLY_GS_MAX_RECORD_CHUNK_B (16 * 1024)
+
+static bool
+gs_output_record_layout(const nir_shader *gs, struct lower_gs_state *state)
+{
+   /* Transform feedback needs the strip bookkeeping that only the replayed
+    * body computes; keep the replay there.
+    */
+   if (gs->xfb_info || state->record_mask == 0)
+      return false;
+
+   unsigned stride_B = 0;
+   u_foreach_bit64(slot, state->record_mask) {
+      struct lower_output_to_var_slot *output = &state->outputs[slot];
+      if (output->type == nir_type_invalid) {
+         output->type = nir_type_float32;
+         output->nr_components = 4;
+      }
+
+      /* Records are raw 32-bit words */
+      if (nir_alu_type_get_type_size(output->type) > 32)
+         return false;
+
+      state->record_off_B[slot] = stride_B;
+      stride_B += 16;
+   }
+
+   unsigned mult = stream_multiplier(gs);
+   unsigned span = state->info->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED
+                      ? output_vertex_id_pot_stride(gs)
+                      : gs->info.gs.vertices_out;
+   unsigned chunk_B = stride_B * mult * span;
+
+   if (chunk_B > POLY_GS_MAX_RECORD_CHUNK_B || span == 0)
+      return false;
+
+   state->record_stride_B = stride_B;
+   state->record_mult = mult;
+   state->record_chunk_B = chunk_B;
+   return true;
+}
+
+/* Store every live output variable as this emitted vertex's record. Runs in
+ * the main geometry program at each emit, mirroring the select that the
+ * replay shader would have made -- except the snapshot lands in memory once,
+ * instead of being re-derived per rasterized vertex.
+ */
+static void
+gs_record_outputs(nir_builder *b, nir_intrinsic_instr *intr,
+                  struct lower_gs_state *state)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *ordinal = intr->src[0].ssa;
+   nir_def *vertex_base;
+   if (state->info->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
+      ordinal = nir_umin_imm(b, ordinal,
+                             output_vertex_id_pot_stride(b->shader) - 1);
+      vertex_base = calc_unrolled_index_id(b);
+   } else {
+      ordinal = nir_umin_imm(b, ordinal,
+                             b->shader->info.gs.vertices_out - 1);
+      vertex_base = nir_imul_imm(b, calc_unrolled_id(b),
+                                 b->shader->info.gs.vertices_out);
+   }
+
+   nir_def *index = nir_iadd(
+      b, nir_imul_imm(b, nir_iadd(b, vertex_base, ordinal), state->record_mult),
+      nir_imm_int(b, nir_intrinsic_stream_id(intr)));
+
+   nir_def *base = load_geometry_param_offset(
+      b, offsetof(struct poly_geometry_params, output_records), 8);
+   nir_def *record =
+      nir_iadd(b, base,
+               nir_u2u64(b, nir_imul_imm(b, index, state->record_stride_B)));
+
+   u_foreach_bit64(slot, state->record_mask) {
+      nir_def *value = nir_load_var(b, state->outputs[slot].output_var);
+      nir_store_global(b, nir_u2u32(b, value),
+                       nir_iadd_imm(b, record, state->record_off_B[slot]));
+   }
+
+   nir_instr_remove(&intr->instr);
+}
+
+/*
+ * Rasterization companion that reads the emitted-vertex output records the
+ * main geometry program materialized: one indexed fetch per output slot, and
+ * no replay of the geometry shader body.
+ */
+static nir_shader *
+create_gs_rast_indexed_shader(const nir_shader *gs,
+                              const struct lower_gs_state *state)
+{
+   nir_builder b_ = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, gs->options, "gs rast indexed");
+   nir_builder *b = &b_;
+   nir_shader *shader = b->shader;
+
+   shader->info.io_lowered = true;
+   shader->info.outputs_written = state->record_mask;
+   shader->info.clip_distance_array_size = gs->info.clip_distance_array_size;
+   shader->info.cull_distance_array_size = gs->info.cull_distance_array_size;
+   shader->info.layer_viewport_relative = gs->info.layer_viewport_relative;
+   if (gs->info.name)
+      shader->info.name = ralloc_asprintf(shader, "%s_rast", gs->info.name);
+
+   const unsigned mult = state->record_mult;
+   nir_def *vid = nir_load_vertex_id(b);
+   nir_def *stream = NULL;
+   if (mult > 1)
+      stream = nir_umod_imm(b, vid, mult);
+
+   /* Emitted-vertex record index, matching gs_record_outputs. */
+   nir_def *index;
+   switch (state->info->shape) {
+   case POLY_GS_SHAPE_DYNAMIC_INDEXED:
+      /* The index buffer already carries the padded emitted-vertex encoding,
+       * so the hardware vertex ID is the record index verbatim.
+       */
+      index = vid;
+      break;
+
+   case POLY_GS_SHAPE_STATIC_INDEXED:
+   case POLY_GS_SHAPE_STATIC_PER_PRIM:
+      /* Instanced per input primitive: the hardware instance ID is the dense
+       * unrolled primitive index and the vertex ID is ordinal*mult+stream.
+       */
+      index = nir_iadd(b,
+                       nir_imul_imm(b, nir_load_instance_id(b),
+                                    gs->info.gs.vertices_out * mult),
+                       vid);
+      break;
+
+   case POLY_GS_SHAPE_STATIC_PER_INSTANCE: {
+      /* vid = (prim * max_indices + ord) * mult + stream; recover the dense
+       * unrolled primitive and the ordinal+stream tail separately.
+       */
+      unsigned stride = MAX2(state->info->max_indices, 1) * mult;
+      nir_def *prim = nir_udiv_imm(b, vid, stride);
+      nir_def *tail = nir_umod_imm(b, vid, stride);
+      nir_def *unrolled =
+         nir_iadd(b, nir_imul(b, nir_load_instance_id(b),
+                              load_geometry_param(b, grid[0])),
+                  prim);
+      index =
+         nir_iadd(b, nir_imul_imm(b, unrolled,
+                                  gs->info.gs.vertices_out * mult),
+                  tail);
+      break;
+   }
+
+   default:
+      UNREACHABLE("invalid shape");
+   }
+
+   nir_def *base = load_geometry_param_offset(
+      b, offsetof(struct poly_geometry_params, output_records), 8);
+   nir_def *record =
+      nir_iadd(b, base,
+               nir_u2u64(b, nir_imul_imm(b, index, state->record_stride_B)));
+
+   /* Forward each output record to the rasterizer */
+   u_foreach_bit64(slot, state->record_mask) {
+      const struct lower_output_to_var_slot *output = &state->outputs[slot];
+      assert(output->type != nir_type_invalid && output->nr_components > 0);
+
+      nir_def *value = nir_load_global_constant(
+         b, output->nr_components, 32,
+         nir_iadd_imm(b, record, state->record_off_B[slot]), .align_mul = 16);
+      value = nir_u2uN(b, value, nir_alu_type_get_type_size(output->type));
+
+      /* Only the rasterization stream shades; NaN-kill the rest. */
+      if (slot == VARYING_SLOT_POS && state->info->multistream) {
+         nir_def *killed =
+            nir_vector_insert_imm(b, value, nir_imm_float(b, NAN), 3);
+         value = nir_bcsel(b, nir_ieq(b, stream,
+                                      nir_load_rasterization_stream(b)),
+                           value, killed);
+      }
+
+      nir_store_output(b, value, nir_imm_int(b, 0),
+                       .src_type = output->type,
+                       .io_semantics.location = slot);
+   }
+
+   /* The geometry shader might not write point size - ensure it does, if we're
+    * rasterizing at all.
+    */
+   if (gs->info.gs.output_primitive == MESA_PRIM_POINTS &&
+       (shader->info.outputs_written & VARYING_BIT_POS)) {
+      nir_lower_default_point_size(shader);
+   }
+
+   /* Recompute: the defaults above may have added a point size store. */
+   nir_shader_gather_info(shader, nir_shader_get_entrypoint(shader));
+   return shader;
+}
+
 static bool
 lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *state_)
 {
@@ -930,7 +1154,20 @@ lower_gs_instr(nir_builder *b, nir_intrinsic_instr *intr, void *state_)
    }
 
    case nir_intrinsic_store_output:
+      if (state->record_mask) {
+         /* Materializing output records: accumulate outputs into variables
+          * instead of dropping them, so each emit can snapshot to memory.
+          */
+         lower_store_to_var(b, intr, state->outputs);
+         return true;
+      }
+      break;
+
    case nir_intrinsic_select_vertex_poly:
+      if (state->record_mask) {
+         gs_record_outputs(b, intr, state);
+         return true;
+      }
       break;
 
    default:
@@ -1338,7 +1575,26 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
    /* Ensure that outputs_written is still accurate after DCE. */
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
 
-   *gs_copy = create_gs_rast_shader(gs, &gs_state);
+   /* Collect the output slot types once: they drive both the emitted-vertex
+    * record store in the main program and the raster variant's loads.
+    */
+   if (gs->info.outputs_written)
+      nir_shader_intrinsics_pass(gs, collect_output_types, nir_metadata_all,
+                                 gs_state.outputs);
+
+   /* The raster shader drops point size for non-point output */
+   gs_state.record_mask = gs->info.outputs_written;
+   if (gs->info.gs.output_primitive != MESA_PRIM_POINTS)
+      gs_state.record_mask &= ~VARYING_BIT_PSIZ;
+
+   if (!gs_output_record_layout(gs, &gs_state))
+      gs_state.record_mask = 0;
+
+   info->output_record_B = gs_state.record_mask ? gs_state.record_chunk_B : 0;
+
+   *gs_copy = gs_state.record_mask
+                 ? create_gs_rast_indexed_shader(gs, &gs_state)
+                 : create_gs_rast_shader(gs, &gs_state);
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_id,
             nir_metadata_control_flow, NULL);
@@ -1365,6 +1621,24 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
       NIR_PASS(progress, gs, nir_opt_dce);
       NIR_PASS(progress, gs, nir_opt_dead_cf);
    } while (progress);
+
+   /* Materializing output records needs the output variables the record
+    * stores read.
+    */
+   if (gs_state.record_mask) {
+      u_foreach_bit64(slot, gs_state.record_mask) {
+         struct lower_output_to_var_slot *output = &gs_state.outputs[slot];
+         const char *slot_name =
+            gl_varying_slot_name_for_stage(slot, MESA_SHADER_GEOMETRY);
+
+         output->output_var = nir_variable_create(
+            gs, nir_var_shader_temp,
+            glsl_vector_type(
+               nir_get_glsl_base_type_for_nir_type(output->type),
+               output->nr_components),
+            ralloc_asprintf(gs, "%s-emit", slot_name));
+      }
+   }
 
    NIR_PASS(_, gs, nir_shader_intrinsics_pass, lower_gs_instr,
             nir_metadata_none, &gs_state);

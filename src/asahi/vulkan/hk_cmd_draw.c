@@ -3839,6 +3839,16 @@ hk_upload_geometry_params(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 
          cmd->geom_index_buffer = params.output_index_buffer;
       }
+
+      if (gsi->output_record_B) {
+         params.output_records = hk_pool_alloc(
+            cmd,
+            poly_gs_output_records_size(gsi->shape, params.input_primitives,
+                                        draw.b.count[1],
+                                        params.primitives_log2,
+                                        gsi->output_record_B),
+            16).gpu;
+      }
    }
 
    if (gsi->shape == POLY_GS_SHAPE_STATIC_INDEXED) {
@@ -4108,6 +4118,7 @@ hk_launch_gs_prerast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          .is_prefix_summing = count->info.gs.prefix_sum,
          .max_indices = count->info.gs.max_indices,
          .shape = count->info.gs.shape,
+         .output_record_B = count->info.gs.output_record_B,
       };
 
       if (draw.indexed) {

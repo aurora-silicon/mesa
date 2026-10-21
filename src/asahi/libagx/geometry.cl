@@ -159,11 +159,13 @@ libagx_gs_setup_indirect(
    uint32_t index_size_B /* 0 if no index bffer */,
    uint32_t index_buffer_range_el,
    uint32_t prim /* Input primitive type, enum mesa_prim */,
-   int is_prefix_summing, uint max_indices, enum poly_gs_shape shape)
+   int is_prefix_summing, uint max_indices, enum poly_gs_shape shape,
+   uint32_t output_record_B)
 {
    poly_gs_setup_indirect(index_buffer, draw, vp, p, heap,
                           vs_outputs, index_size_B, index_buffer_range_el, prim,
-                          is_prefix_summing, max_indices, shape);
+                          is_prefix_summing, max_indices, shape,
+                          output_record_B);
 }
 
 KERNEL(1024)
