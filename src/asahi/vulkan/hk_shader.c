@@ -54,6 +54,7 @@
 
 #include "nir_builder_opcodes.h"
 #include "nir_builtin_builder.h"
+#include "nir_control_flow.h"
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
 #include "nir_xfb_info.h"
@@ -1028,6 +1029,325 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
       .align_offset = nir_intrinsic_align_offset(intr), .access = access);
 
    nir_def_replace(&intr->def, val);
+}
+
+/* nir_lower_explicit_io implements bounded-buffer stores and atomics
+ * (nir_address_format_64bit_bounded_global) by wrapping a plain
+ * store_global / global_atomic in `nir_push_if(in_bounds)`, plus an
+ * if_phi(result, undef) for the atomic's returned value.  That costs a
+ * control-flow split per access.  Where the guard is uniform we instead
+ * redirect out-of-bounds lanes at the scratch page, a mapped read/write
+ * discard sink bound at AGX_SCRATCH_PAGE_ADDRESS (agx_device.c), and run
+ * the write unconditionally:
+ *
+ *    safe = bcsel(in_bounds, addr, AGX_SCRATCH_PAGE_ADDRESS)
+ *    store_global(value, safe) / global_atomic(safe, ...)
+ *    result = bcsel(in_bounds, atomic_result, 0)   // atomics only
+ *
+ * Selecting the final address rather than clamping the offset keeps the
+ * discarded access at scratch+0, inside the 16 KiB scratch page.  This is
+ * correct without soft faults because the scratch page is always mapped,
+ * and zero is a legal refinement of the undef else-branch value.
+ *
+ * The transform is gated per access on divergence: the address select
+ * plus result mask costs a few instructions, which only pays off when
+ * the bounds check and address are uniform -- the whole select then
+ * lifts into the preamble with the rest of the uniform code and the
+ * kernel keeps just the write.  A divergent access keeps the guard:
+ * the cndst/cndend split it already pays is cheaper than adding select
+ * instructions to the kernel, and it skips the memory transaction on
+ * out-of-bounds lanes entirely.
+ */
+
+/* Matches the shape explicit-io emits for a bounded global write: a
+ * single then block of side-effect-free instructions ending in the store
+ * or atomic, and a single empty else block.  Returns the write
+ * instruction or NULL if this is a different shape. */
+static nir_intrinsic_instr *
+hk_bounded_write_guarded(nir_if *nif)
+{
+   if (exec_list_length(&nif->then_list) != 1 ||
+       exec_list_length(&nif->else_list) != 1)
+      return NULL;
+
+   nir_block *else_block = nir_if_first_else_block(nif);
+   if (!exec_list_is_empty(&else_block->instr_list))
+      return NULL;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_instr *last = nir_block_last_instr(then_block);
+   if (!last || last->type != nir_instr_type_intrinsic)
+      return NULL;
+
+   nir_intrinsic_instr *write = nir_instr_as_intrinsic(last);
+   if (write->intrinsic != nir_intrinsic_store_global &&
+       write->intrinsic != nir_intrinsic_global_atomic &&
+       write->intrinsic != nir_intrinsic_global_atomic_swap)
+      return NULL;
+
+   /* Every preceding instruction gets lifted out of the if, so it must be
+    * free of side effects.  ALU instructions are always pure. */
+   nir_foreach_instr(instr, then_block) {
+      if (instr == last)
+         break;
+      if (instr->type != nir_instr_type_alu)
+         return NULL;
+   }
+
+   return write;
+}
+
+/* Split the atomic's 64-bit address into its base and 32-bit offset
+ * halves, matching `iadd(base64, u2u64(off32))` as emitted by
+ * addr_to_global. */
+static bool
+hk_split_global_addr(nir_def *addr, nir_scalar *base, nir_scalar *offset)
+{
+   nir_scalar s = nir_scalar_resolved(addr, 0);
+   if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_iadd)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar w = nir_scalar_chase_alu_src(s, i);
+      if (nir_scalar_is_alu(w) && nir_scalar_alu_op(w) == nir_op_u2u64 &&
+          nir_scalar_chase_alu_src(w, 0).def->bit_size == 32) {
+         *base = nir_scalar_chase_alu_src(s, 1 - i);
+         *offset = nir_scalar_chase_alu_src(w, 0);
+         return true;
+      }
+   }
+   return false;
+}
+
+/* Clamp a 32-bit byte offset to zero for invalid lanes.  Clamp the index
+ * inside a scale (amul/imul/ishl) instead of the product, and distribute
+ * through adds of scaled terms, so agx_nir_lower_address still recovers
+ * the base+index addressing mode -- the hardware atomic requires the
+ * index's shift to cover the element size.
+ *
+ * Unlike bound_offset() this has no constant-offset shortcut: the discard
+ * sink is the 16 KiB scratch page, not the 64 KiB zero page, so every
+ * out-of-bounds offset must actually reach zero. */
+static nir_def *
+hk_bound_write_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
+{
+   offset = nir_scalar_chase_movs(offset);
+   if (!nir_scalar_is_alu(offset))
+      return nir_bcsel(b, valid, nir_mov_scalar(b, offset),
+                       nir_imm_int(b, 0));
+
+   switch (nir_scalar_alu_op(offset)) {
+   case nir_op_amul:
+   case nir_op_imul:
+   case nir_op_ishl: {
+      nir_scalar x = nir_scalar_chase_alu_src(offset, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(offset, 1);
+      /* Clamp the non-constant operand when there is one, so the scale
+       * factor survives as a constant for the index-shift peel. */
+      if (nir_scalar_is_const(x) && !nir_scalar_is_const(y)) {
+         nir_scalar t = x;
+         x = y;
+         y = t;
+      }
+      nir_def *clamped = nir_bcsel(b, valid, nir_mov_scalar(b, x),
+                                   nir_imm_int(b, 0));
+      nir_def *ys = nir_mov_scalar(b, y);
+      switch (nir_scalar_alu_op(offset)) {
+      case nir_op_amul:
+         return nir_amul(b, clamped, ys);
+      case nir_op_imul:
+         return nir_imul(b, clamped, ys);
+      default:
+         return nir_ishl(b, clamped, ys);
+      }
+   }
+
+   case nir_op_iadd: {
+      nir_scalar x = nir_scalar_chase_alu_src(offset, 0);
+      nir_scalar y = nir_scalar_chase_alu_src(offset, 1);
+      if (is_op(x, nir_op_amul) || is_op(y, nir_op_amul) ||
+          is_op(x, nir_op_imul) || is_op(y, nir_op_imul) ||
+          is_op(x, nir_op_ishl) || is_op(y, nir_op_ishl))
+         return nir_iadd(b, hk_bound_write_offset(b, valid, x),
+                         hk_bound_write_offset(b, valid, y));
+      FALLTHROUGH;
+   }
+
+   default:
+      return nir_bcsel(b, valid, nir_mov_scalar(b, offset),
+                       nir_imm_int(b, 0));
+   }
+}
+
+static bool
+hk_redirect_bounded_write(nir_if *nif)
+{
+   nir_intrinsic_instr *write = hk_bounded_write_guarded(nif);
+   if (!write)
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   const bool atomic = write->intrinsic != nir_intrinsic_store_global;
+   const unsigned addr_src = atomic ? 0 : 1;
+
+   /* The redirect only pays off when the guard and the address are
+    * uniform: the bounds check and the address select then lift into the
+    * preamble with the rest of the uniform code, leaving the kernel with
+    * a bare write.  A divergent select costs more instructions in the
+    * kernel than the cndst/cndend split it replaces. */
+   if (nif->condition.ssa->divergent || write->src[addr_src].ssa->divergent)
+      return false;
+
+   /* Both halves of the if must merge into one common successor, which
+    * must itself be a block (structured control flow always provides one,
+    * but check so the phi logic below stays sound). */
+   nir_block *merge = then_block->successors[0];
+   nir_cf_node *next = nir_cf_node_next(&nif->cf_node);
+   if (!merge || merge != else_block->successors[0] ||
+       nir_block_num_preds(merge) != 2 || !next ||
+       next->type != nir_cf_node_block ||
+       nir_cf_node_as_block(next) != merge)
+      return false;
+
+   /* Removing the if deletes every phi in the merge block.  explicit-io
+    * creates exactly one, if_phi(atomic_result, undef), for atomics and
+    * none for stores; any other phi means this is not that shape and we
+    * must not touch it. */
+   nir_phi_instr *result_phi = NULL;
+   nir_foreach_phi(phi, merge) {
+      if (!atomic || result_phi)
+         return false;
+
+      nir_phi_src *then_src = NULL, *else_src = NULL;
+      nir_foreach_phi_src(src, phi) {
+         if (src->pred == then_block)
+            then_src = src;
+         else if (src->pred == else_block)
+            else_src = src;
+         else
+            return false;
+      }
+
+      if (!then_src || !else_src || then_src->src.ssa != &write->def ||
+          nir_def_instr(else_src->src.ssa)->type != nir_instr_type_undef)
+         return false;
+
+      result_phi = phi;
+   }
+
+   if (atomic && !result_phi)
+      return false;
+
+   nir_def *valid = nif->condition.ssa;
+
+   /* Lift the then-block instructions out of the if, in order, to the end
+    * of the block that precedes it.  The bounds check that produced the
+    * condition is already there, so it dominates the hoisted sequence. */
+   nir_foreach_instr_safe(instr, then_block)
+      nir_instr_move(nir_before_cf_node(&nif->cf_node), instr);
+
+   /* Point out-of-bounds lanes at the scratch page.  Keep the
+    * iadd(base64, u2u64(offset32)) decomposition so agx_nir_lower_address
+    * recovers the base+index addressing mode; selecting the whole address
+    * would force a 64-bit carry chain.  Scratch+0 is inside the 16 KiB
+    * scratch page, so the offset is clamped to zero. */
+   nir_def *addr = write->src[addr_src].ssa;
+   nir_builder b = nir_builder_at(nir_before_instr(&write->instr));
+
+   nir_scalar base, offset;
+   nir_def *safe;
+   if (hk_split_global_addr(addr, &base, &offset)) {
+      /* Select the base's 32-bit halves as a vector: the select folds
+       * into the base's pair formation instead of producing a 64-bit
+       * bcsel plus an unpack/repack round-trip. */
+      nir_scalar base_s = nir_scalar_chase_movs(base);
+      nir_def *new_base;
+      if (nir_scalar_is_alu(base_s) &&
+          nir_scalar_alu_op(base_s) == nir_op_pack_64_2x32) {
+         nir_alu_instr *pack = nir_def_as_alu(base_s.def);
+         nir_def *v2 = nir_bcsel(&b, valid, pack->src[0].src.ssa,
+                                 nir_imm_ivec2(&b, 0x10000, 1));
+         new_base = nir_pack_64_2x32(&b, v2);
+      } else {
+         nir_def *base_def =
+            base.comp == 0 ? base.def : nir_mov_scalar(&b, base);
+         new_base =
+            nir_bcsel(&b, valid, base_def,
+                      nir_imm_int64(&b, AGX_SCRATCH_PAGE_ADDRESS));
+      }
+      nir_def *new_off = hk_bound_write_offset(&b, valid, offset);
+      safe = nir_iadd(&b, new_base, nir_u2u64(&b, new_off));
+   } else {
+      safe = nir_bcsel(&b, valid, addr,
+                       nir_imm_int64(&b, AGX_SCRATCH_PAGE_ADDRESS));
+   }
+   nir_src_rewrite(&write->src[addr_src], safe);
+
+   if (atomic) {
+      /* Mask the atomic's old value to zero for out-of-bounds lanes,
+       * refining the undef else-branch value. */
+      b.cursor = nir_after_instr(&write->instr);
+      nir_def *res =
+         nir_bcsel(&b, valid, &write->def,
+                   nir_imm_zero(&b, write->def.num_components,
+                                write->def.bit_size));
+      nir_def_rewrite_uses(&result_phi->def, res);
+   }
+
+   /* Deletes the now-empty then block, the else block and the merge phis;
+    * the atomic's phi already forwards to the masked result. */
+   nir_cf_node_remove(&nif->cf_node);
+   return true;
+}
+
+static bool
+hk_redirect_bounded_writes_cf_list(struct exec_list *cf_list)
+{
+   bool progress = false;
+   bool restart;
+
+   do {
+      restart = false;
+      foreach_list_typed_safe(nir_cf_node, node, node, cf_list) {
+         switch (node->type) {
+         case nir_cf_node_if: {
+            nir_if *nif = nir_cf_node_as_if(node);
+            progress |= hk_redirect_bounded_writes_cf_list(&nif->then_list);
+            progress |= hk_redirect_bounded_writes_cf_list(&nif->else_list);
+
+            /* Removing the if stitches its merge block into the preceding
+             * block, unlinking the merge block's cf node -- which is the
+             * iterator's cached successor.  Restart this list's scan rather
+             * than chase a stale link. */
+            if (hk_redirect_bounded_write(nif))
+               progress = restart = true;
+            break;
+         }
+         case nir_cf_node_loop:
+            progress |= hk_redirect_bounded_writes_cf_list(
+               &nir_cf_node_as_loop(node)->body);
+            break;
+         default:
+            break;
+         }
+
+         if (restart)
+            break;
+      }
+   } while (restart);
+
+   return progress;
+}
+
+static bool
+hk_nir_redirect_bounded_writes(nir_shader *nir)
+{
+   bool progress = false;
+   nir_divergence_analysis(nir);
+   nir_foreach_function_impl(impl, nir)
+      progress |= hk_redirect_bounded_writes_cf_list(&impl->body);
+   return progress;
 }
 
 static bool
@@ -2347,6 +2667,19 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor));
+
+   /* With bounded storage buffers, explicit-io guards every store and
+    * atomic with `push_if(in_bounds)` + if_phi.  Where the guard and the
+    * address are uniform, redirect those writes at the mapped scratch
+    * page instead: bcsel the address and mask the atomic's result, no
+    * control-flow split, and the uniform select lifts into the preamble.
+    * Divergent accesses keep the guard -- adding select instructions to
+    * the kernel costs more than the cndst/cndend split it replaces. */
+   if (hk_buffer_addr_format(rs->storage_buffers,
+                             rs->null_storage_buffer_descriptor) ==
+       nir_address_format_64bit_bounded_global)
+      NIR_PASS(_, nir, hk_nir_redirect_bounded_writes);
+
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
