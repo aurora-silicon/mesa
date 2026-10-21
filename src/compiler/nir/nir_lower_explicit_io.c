@@ -1507,6 +1507,17 @@ nir_lower_explicit_io_instr(nir_builder *b,
    switch (intrin->intrinsic) {
    case nir_intrinsic_load_deref: {
       nir_def *value;
+      /* load_global_bounded bounds-checks the whole access itself:
+       * robustBufferAccess2's granularity is the access, so a vector load
+       * straddling the bound may zero the whole vector -- the same
+       * contract the store side relies on to guard a contiguous vector
+       * store once.  Splitting a contiguous vector load into per-
+       * component accesses buys no correctness the spec requires, so
+       * don't. */
+      if (deref->modes == nir_var_mem_ssbo &&
+          b->shader->options->has_load_global_bounded &&
+          vec_stride == scalar_size)
+         scalarize = false;
       if (scalarize) {
          nir_def *comps[NIR_MAX_VEC_COMPONENTS] = {
             NULL,

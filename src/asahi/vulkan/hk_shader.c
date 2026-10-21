@@ -1000,6 +1000,31 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
          if (intr->intrinsic == nir_intrinsic_load_global_bounded) {
             if (end_delta > UINT32_MAX) {
                val = nir_imm_zero(b, val->num_components, val->bit_size);
+            } else if (intr->def.num_components > 1 &&
+                       intr->def.bit_size == 32) {
+               /* A vector access is checked whole (bounds granularity is
+                * the access), so every lane shares the check of the
+                * exclusive end.  Emitting the fused compare-select per
+                * lane -- the same shape the scalar path reaches through
+                * bounds_check_slack -- keeps the per-dword masking cost
+                * at one icmpsel and lets hk_nir_share_bounded_load_slack
+                * fold the slack onto neighbouring accesses on the same
+                * (bound, common) pair; a straddling access zeroes every
+                * lane at once, exactly the whole-access contract
+                * robustBufferAccess2 grants.
+                *
+                * The offset-independent slack usub_sat(bound, size - 1)
+                * form with a separate ult would cost a whole extra
+                * instruction per group; this form keeps the compare
+                * folded into each lane's select. */
+               nir_def *slack = nir_usub_sat(b, bound, common_def);
+               nir_def *lanes[NIR_MAX_VEC_COMPONENTS];
+               for (unsigned c = 0; c < intr->def.num_components; c++) {
+                  lanes[c] =
+                     nir_bounds_agx(b, nir_channel(b, val, c),
+                                    nir_imm_int(b, end_delta), slack);
+               }
+               val = nir_vec(b, lanes, intr->def.num_components);
             } else if (intr->def.num_components > 1) {
                /* A vector access is checked whole (bounds granularity is
                 * the access), so it can compare the offset itself against
@@ -2953,8 +2978,34 @@ hk_bload_match(nir_intrinsic_instr *intr, struct hk_bload_cand *out)
    hk_bload_base_leaves(intr->src[0].ssa, &out->base_lo, &out->base_hi);
    out->bound = bound;
    out->delta = out->dec.delta;
-   out->align = nir_combined_align(nir_intrinsic_align_mul(intr),
-                                   nir_intrinsic_align_offset(intr));
+
+   /* The declared alignment bottoms out at the element's own alignment,
+    * which says nothing about the structure of the offset: an unrolled
+    * float[] run carries align 4 per dword even when every lane's address
+    * is 16-aligned.  The decomposition exposes the true stride: offset =
+    * delta + sum(mul_i * term_i) is a multiple of gcd(delta, muls), so the
+    * byte alignment of the offset is at least that gcd's power-of-two
+    * part.  Bounded-global bases are descriptor bases, themselves at
+    * least HK_MIN_SSBO_ALIGNMENT-aligned, so the access alignment is the
+    * offset alignment capped at that -- the declared alignment may still
+    * be the better claim where the deref carried explicit alignment, so
+    * take the stronger of the two. */
+   uint64_t g = (uint64_t)ullabs(out->delta);
+   for (unsigned i = 0; i < out->dec.num_terms; i++) {
+      uint64_t m = (uint64_t)ullabs(out->dec.muls[i]);
+      while (m) {
+         uint64_t t = g % m;
+         g = m;
+         m = t;
+      }
+   }
+   unsigned off_align =
+      g ? (1u << (ffsll(g) - 1)) : HK_MIN_SSBO_ALIGNMENT;
+
+   out->align =
+      MAX2(nir_combined_align(nir_intrinsic_align_mul(intr),
+                              nir_intrinsic_align_offset(intr)),
+           MIN2(off_align, HK_MIN_SSBO_ALIGNMENT));
    out->access = nir_intrinsic_access(intr);
    return true;
 }
@@ -2973,8 +3024,10 @@ hk_emit_merged_bload(nir_builder *b, struct hk_bload_cand *members,
    nir_def *vec = nir_load_global_bounded(
       b, n, 32, first->src[0].ssa, first->src[1].ssa, first->src[2].ssa,
       .access = members[0].access,
-      .align_mul = nir_intrinsic_align_mul(first),
-      .align_offset = nir_intrinsic_align_offset(first));
+      /* members[0].align was derived as a "divides the address" bound
+       * (nir_combined_align/gcd), so the residue is zero. */
+      .align_mul = members[0].align,
+      .align_offset = 0);
 
    for (unsigned i = 0; i < n; i++) {
       /* Each member's channel is emitted where its load stood, so the
