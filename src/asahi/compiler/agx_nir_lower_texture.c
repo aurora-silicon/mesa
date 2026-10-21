@@ -54,60 +54,91 @@ load_buffer_metadata(nir_builder *b, nir_def *descriptor, unsigned offset,
 /* Residency flags are inverted from NIR */
 #define AGX_RESIDENT (0)
 
-static bool
+/* The memory domain an image write lands in, used to pick both the fence
+ * flavour and the accesses that can observe it.  Image stores go through
+ * the PBE/texture pipe, while image atomics are lowered to plain device
+ * atomics on the texel's global address. */
+#define AGX_IMAGE_WRITE_PBE  (1 << 0)
+#define AGX_IMAGE_WRITE_MEM  (1 << 1)
+
+static unsigned
 image_fence_writer(const nir_intrinsic_instr *intr)
 {
    /* If the image is write-only, there is no fencing needed */
    if (nir_intrinsic_has_access(intr) &&
        (nir_intrinsic_access(intr) & ACCESS_NON_READABLE)) {
-      return false;
+      return 0;
    }
 
    switch (intr->intrinsic) {
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_store:
+      return AGX_IMAGE_WRITE_PBE;
+
    case nir_intrinsic_image_atomic:
    case nir_intrinsic_bindless_image_atomic:
    case nir_intrinsic_image_atomic_swap:
    case nir_intrinsic_bindless_image_atomic_swap:
-      return true;
+      return AGX_IMAGE_WRITE_MEM;
 
    default:
-      return false;
+      return 0;
    }
 }
 
 /* Instructions that can observe an earlier image write and therefore need
- * the pending fence ordered before them: anything that reads or orders
- * memory the write could alias, including the write-write ordering of a
- * later store and a memory barrier that publishes the write.  Texture
- * samples can observe image stores through an aliased view. */
-static bool
-image_fence_observer(const nir_instr *instr)
+ * the pending fence ordered before them, as a bitmask of the writer
+ * domains they observe.  A PBE write can be observed by anything that
+ * reads or orders memory it could alias -- including the write-write
+ * ordering of a later store and a memory barrier that publishes the
+ * write -- since a device access needs the write flushed out of the
+ * texture pipe first.
+ *
+ * A device atomic already lands in the device domain, so a later device
+ * access (an SSBO/global load, store or atomic, or another image atomic,
+ * which is itself a device atomic) shares its ordering and is not a
+ * reason to emit the mem->tex fence.  Only texture-domain consumers --
+ * samples and PBE image loads/stores, which can alias the written texel
+ * through the texture cache -- plus barriers that publish the write still
+ * need it. */
+static unsigned
+image_fence_observers(const nir_instr *instr)
 {
+   /* Texture samples can observe image writes through an aliased view,
+    * whichever domain the write used. */
    if (instr->type == nir_instr_type_tex)
-      return true;
+      return AGX_IMAGE_WRITE_PBE | AGX_IMAGE_WRITE_MEM;
+
    if (instr->type != nir_instr_type_intrinsic)
-      return false;
+      return 0;
 
    switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+   /* Texture-domain accesses and memory barriers observe both writer
+    * kinds. */
    case nir_intrinsic_image_load:
    case nir_intrinsic_bindless_image_load:
    case nir_intrinsic_bindless_image_sparse_load:
    case nir_intrinsic_image_sparse_load:
    case nir_intrinsic_image_store:
    case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_heap_load:
+   case nir_intrinsic_image_heap_store:
+   case nir_intrinsic_barrier:
+   case nir_intrinsic_begin_invocation_interlock:
+   case nir_intrinsic_end_invocation_interlock:
+      return AGX_IMAGE_WRITE_PBE | AGX_IMAGE_WRITE_MEM;
+
+   /* Device-domain accesses observe a PBE write but not a device
+    * atomic. */
    case nir_intrinsic_image_atomic:
    case nir_intrinsic_bindless_image_atomic:
    case nir_intrinsic_image_atomic_swap:
    case nir_intrinsic_bindless_image_atomic_swap:
-   case nir_intrinsic_image_deref_load:
-   case nir_intrinsic_image_deref_sparse_load:
-   case nir_intrinsic_image_deref_store:
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap:
-   case nir_intrinsic_image_heap_load:
-   case nir_intrinsic_image_heap_store:
    case nir_intrinsic_image_heap_atomic:
    case nir_intrinsic_image_heap_atomic_swap:
    case nir_intrinsic_load_ssbo:
@@ -118,12 +149,10 @@ image_fence_observer(const nir_instr *instr)
    case nir_intrinsic_global_atomic_swap:
    case nir_intrinsic_ssbo_atomic:
    case nir_intrinsic_ssbo_atomic_swap:
-   case nir_intrinsic_barrier:
-   case nir_intrinsic_begin_invocation_interlock:
-   case nir_intrinsic_end_invocation_interlock:
-      return true;
+      return AGX_IMAGE_WRITE_PBE;
+
    default:
-      return false;
+      return 0;
    }
 }
 
@@ -170,45 +199,57 @@ fence_image(nir_shader *s)
    bool progress = false;
 
    /* An observer in a different function cannot be ordered against a
-    * writer here; count them conservatively. */
-   unsigned total_reads = 0;
+    * writer here; count them conservatively, per domain. */
+   unsigned total_pbe = 0, total_mem = 0;
    nir_foreach_function_impl(impl, s) {
       nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block)
-            total_reads += image_fence_observer(instr);
+         nir_foreach_instr(instr, block) {
+            unsigned obs = image_fence_observers(instr);
+            total_pbe += !!(obs & AGX_IMAGE_WRITE_PBE);
+            total_mem += !!(obs & AGX_IMAGE_WRITE_MEM);
+         }
       }
    }
 
    nir_foreach_function_impl(impl, s) {
       unsigned nr_writes = 0, nr_reads = 0;
+      unsigned nr_pbe = 0, nr_mem = 0;
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
-            nr_reads += image_fence_observer(instr);
+            unsigned obs = image_fence_observers(instr);
+            nr_pbe += !!(obs & AGX_IMAGE_WRITE_PBE);
+            nr_mem += !!(obs & AGX_IMAGE_WRITE_MEM);
+            nr_reads += !!obs;
             if (instr->type == nir_instr_type_intrinsic &&
                 image_fence_writer(nir_instr_as_intrinsic(instr)))
                nr_writes++;
          }
       }
-      if (!nr_writes || !(nr_reads || total_reads > nr_reads))
+      if (!nr_writes || !(total_pbe || total_mem))
          continue;
 
       nir_intrinsic_instr **writes =
          ralloc_array(NULL, nir_intrinsic_instr *, nr_writes);
       unsigned *write_pos = ralloc_array(NULL, unsigned, nr_writes);
+      unsigned *write_dom = ralloc_array(NULL, unsigned, nr_writes);
       nir_instr **reads = ralloc_array(NULL, nir_instr *, nr_reads);
       unsigned *read_pos = ralloc_array(NULL, unsigned, nr_reads);
       unsigned w = 0, r = 0;
       nir_foreach_block(block, impl) {
          unsigned pos = 0;
          nir_foreach_instr(instr, block) {
-            if (image_fence_observer(instr)) {
+            if (image_fence_observers(instr)) {
                reads[r] = instr;
                read_pos[r++] = pos;
             }
-            if (instr->type == nir_instr_type_intrinsic &&
-                image_fence_writer(nir_instr_as_intrinsic(instr))) {
-               writes[w] = nir_instr_as_intrinsic(instr);
-               write_pos[w++] = pos;
+            if (instr->type == nir_instr_type_intrinsic) {
+               unsigned dom =
+                  image_fence_writer(nir_instr_as_intrinsic(instr));
+               if (dom) {
+                  writes[w] = nir_instr_as_intrinsic(instr);
+                  write_pos[w] = pos;
+                  write_dom[w++] = dom;
+               }
             }
             pos++;
          }
@@ -216,11 +257,17 @@ fence_image(nir_shader *s)
 
       nir_metadata_require(impl, nir_metadata_block_index);
 
-      const bool foreign_reads = total_reads > nr_reads;
       for (unsigned i = 0; i < nr_writes; ++i) {
          nir_intrinsic_instr *intr = writes[i];
-         bool needed = foreign_reads;
+         const unsigned dom = write_dom[i];
+         const unsigned foreign =
+            (dom == AGX_IMAGE_WRITE_PBE ? total_pbe - nr_pbe
+                                        : total_mem - nr_mem);
+         bool needed = foreign > 0;
          for (unsigned j = 0; j < nr_reads && !needed; ++j) {
+            if (!(image_fence_observers(reads[j]) & dom))
+               continue;
+
             if (reads[j]->block == intr->instr.block)
                needed = read_pos[j] > write_pos[i];
             else
@@ -232,20 +279,16 @@ fence_image(nir_shader *s)
             continue;
 
          nir_builder b = nir_builder_at(nir_after_instr(&intr->instr));
-         switch (intr->intrinsic) {
-         case nir_intrinsic_image_store:
-         case nir_intrinsic_bindless_image_store:
+         if (dom == AGX_IMAGE_WRITE_PBE)
             nir_fence_pbe_to_tex_agx(&b);
-            break;
-         default:
+         else
             nir_fence_mem_to_tex_agx(&b);
-            break;
-         }
          progress = true;
       }
 
       ralloc_free(writes);
       ralloc_free(write_pos);
+      ralloc_free(write_dom);
       ralloc_free(reads);
       ralloc_free(read_pos);
       nir_progress(progress, impl, nir_metadata_none);
