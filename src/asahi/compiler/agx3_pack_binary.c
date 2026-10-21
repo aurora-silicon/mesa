@@ -11276,16 +11276,26 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
 
          if (I->op == AGX_OPCODE_SAMPLE_MASK_AGX3) {
+            const bool const_word =
+               (I->imm & AGX3_SAMPLE_MASK_CONST_WORD) != 0;
             if (enc != AGX_ISA_ENCODING_AGX3B || ctx->stage != MESA_SHADER_FRAGMENT ||
                 I->nr_dests || I->nr_srcs != 2 ||
                 !(agx3_src_is_register(I->src[0]) ||
                   (I->src[0].type == AGX_INDEX_IMMEDIATE &&
                    I->src[0].value == 1)) || I->src[0].memory ||
                 I->src[0].size != AGX_SIZE_16 || agx_channels(I->src[0]) != 1 ||
-                !agx3_vary_reg32(I->src[1]) || agx_channels(I->src[1]) != 1)
+                (const_word
+                    ? (I->src[1].type != AGX_INDEX_IMMEDIATE ||
+                       I->src[1].value != 1 || I->src[1].memory ||
+                       I->src[1].size != AGX_SIZE_16)
+                    : (!agx3_vary_reg32(I->src[1]) ||
+                       agx_channels(I->src[1]) != 1)))
                AGX3_REFUSE(I);
             const bool force_early = I->imm & 1;
-            if ((I->imm & ~3) || (force_early && !(I->imm & 2)))
+            if ((I->imm & ~(UINT64_C(3) | AGX3_SAMPLE_MASK_CONST_WORD) &
+                 UINT64_C(0xffffffff)) ||
+                (force_early && !(I->imm & 2)) ||
+                (const_word && !(I->imm >> 32)))
                AGX3_REFUSE(I);
             if (!g17p_colour_open) {
                uint8_t entry[AGX3_PIXEL_MAX_LENGTH], entry_len;
@@ -11297,11 +11307,24 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                g17p_colour_open = true;
             }
             uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
-            if (!agx3_stage_copy_source(enc, 0, I->src[1].value,
-                                         I->src[1].discard, 1,
-                                         wait | outstanding_here, bytes, &len) ||
-                !agx3_append(emission, bytes, len))
+            const uint16_t stage_wait = wait | outstanding_here;
+            if (const_word) {
+               /* The staged-constant form is a single ldimm.ep2 with no
+                * wait fields; retire an outstanding producer first, which
+                * is never worse than the register copy it replaces. */
+               if (stage_wait &&
+                   !agx3_retire_slots_noop(emission, enc, stage_wait))
+                  AGX3_REFUSE(I);
+               if (!agx3_stage_ldimm(enc, 0, (uint32_t)(I->imm >> 32), 1,
+                                     bytes, &len) ||
+                   !agx3_append(emission, bytes, len))
+                  AGX3_REFUSE(I);
+            } else if (!agx3_stage_copy_source(enc, 0, I->src[1].value,
+                                               I->src[1].discard, 1,
+                                               stage_wait, bytes, &len) ||
+                       !agx3_append(emission, bytes, len)) {
                AGX3_REFUSE(I);
+            }
             /* Native simple and sampled-alpha fragments produce and stage
              * SR2's complete coverage word before acquiring class1. Keep
              * this ordering within the atomic pseudo rather than inheriting

@@ -26,6 +26,7 @@
 #include "agx_nir.h"
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
+#include "agx3_zs_core.h"
 #include "glsl_types.h"
 #include "nir.h"
 #include "util/os_misc.h"
@@ -2808,8 +2809,9 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
              (nir_src_as_uint(instr->src[0]) & all) == all &&
              nir_src_as_uint(instr->src[1]) == 0) {
             return agx_sample_mask_agx3(
-               b, agx_mov_imm(b, 16, 1),
-               agx_mov_imm(b, 32, UINT32_C(0xffffff00)), 0);
+               b, agx_mov_imm(b, 16, 1), agx_immediate(1),
+               AGX3_SAMPLE_MASK_CONST_WORD |
+                  ((uint64_t)AGX3_ZS_KILL_ALL_SAMPLES << 32));
          }
          agx_index target_in = agx_src_index(&instr->src[0]);
          agx_index live_in = agx_src_index(&instr->src[1]);
@@ -2847,6 +2849,36 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                       ? agx_immediate(nir_src_as_uint(instr->src[1]) & 1)
                    : (reduced & 2) ? agx_g17p_reg16(b, live_in)
                                    : agx_and(b, live_in, agx_immediate(1));
+
+            /* A kill-only update at one sample never needs the current
+             * coverage in its staged word: with no tested sample, TARGET
+             * either names nothing, which the staged word zero already
+             * spells, or kills the only sample, which Apple's
+             * unconditional-kill word does outright. metal-nt spells the
+             * latter `ldimm r0, 0xFFFFFF00; movmsk r0` on every G17 discard
+             * and `[[sample_mask]] = 0` probe. Select between the two
+             * constants and the SR read, both shift-adds and the widening
+             * move of the general update all fold away. */
+            if (k_const && !(nir_src_as_uint(instr->src[1]) & 1)) {
+               const uint64_t flags =
+                  (uint64_t)((!no_tests ? 2 : 0) | (force_early ? 1 : 0));
+               if (t_const) {
+                  /* A constant TARGET of the only sample is Apple's
+                   * two-instruction unconditional kill; keep the constant
+                   * staged so pack can emit its ldimm.ep2 form directly. */
+                  return agx_sample_mask_agx3(
+                     b, target, agx_immediate(1),
+                     flags | AGX3_SAMPLE_MASK_CONST_WORD |
+                        ((uint64_t)AGX3_ZS_KILL_ALL_SAMPLES << 32));
+               }
+               agx_index word =
+                  agx_mov_imm(b, 32, UINT32_C(0xffffff00));
+               agx_index selected = agx_temp(b->shader, AGX_SIZE_32);
+               agx_icmpsel_to(b, selected, target, agx_immediate(0), word,
+                              agx_immediate(0), AGX_ICOND_UGT);
+               return agx_sample_mask_agx3(b, target, selected, flags);
+            }
+
             agx_index t16 = agx_temp(b->shader, AGX_SIZE_16);
             agx_get_coverage_1x_agx3_to(b, t16);
             mid = agx_iadd(b, t16, t16, 4);

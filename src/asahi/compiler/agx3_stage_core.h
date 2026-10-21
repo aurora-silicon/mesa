@@ -100,6 +100,15 @@ bool agx3_stage_copy_kill(enum agx_isa_encoding enc, uint16_t dest,
 bool agx3_clr(enum agx_isa_encoding enc, uint16_t dest, bool half, bool hint,
               uint8_t out[AGX3_STAGE_MAX_LENGTH], uint8_t *len);
 
+/* staging[dest] <- imm32, the ten-byte `ldimm.ep2`. Grounded only at
+ * staging[0], slots 1 and 2, with no scoreboard wait: the two witnesses
+ * (staging[0] <- 0xFFFFFF00 slot 1, staging[0] <- 0x3F800000 slot 2) differ
+ * from the eight-byte general LDIMM only by the f16/f21 staging marker and
+ * the trailing slot byte. Everything else is refused rather than guessed. */
+bool agx3_stage_ldimm(enum agx_isa_encoding enc, uint16_t dest, uint32_t imm,
+                      uint8_t slot, uint8_t out[AGX3_STAGE_MAX_LENGTH],
+                      uint8_t *len);
+
 #ifdef __cplusplus
 }
 #endif
