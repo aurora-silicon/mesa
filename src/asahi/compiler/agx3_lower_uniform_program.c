@@ -181,6 +181,42 @@ agx3_lower_uniform_half_exports(agx_context *ctx)
    }
 
    bool progress = false;
+
+   /* A 64-bit export reaches the store as a two-source collect of 32-bit
+    * halves through a widening mov -- three instructions for two aligned
+    * uniform dwords. Emit one 32-bit store per half from the collect's
+    * sources instead: for the heap-index tokens the high half is the shared
+    * zero register, so the whole pack collapses to a second store and the
+    * collect and mov die with their only use. */
+   agx_instr **defs = rzalloc_array(ctx, agx_instr *, ctx->alloc);
+   if (defs) {
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            defs[I->dest[d].value] = I;
+      }
+      agx_foreach_instr_global_safe(ctx, I) {
+         if (I->op != AGX_OPCODE_UNIFORM_STORE || I->nr_srcs != 2 ||
+             I->mask != 1 || I->src[0].type != AGX_INDEX_NORMAL ||
+             I->src[0].size != AGX_SIZE_64 ||
+             I->src[1].type != AGX_INDEX_IMMEDIATE || (I->src[1].value & 1))
+            continue;
+         const unsigned base = I->src[1].value;
+         agx_instr *def = defs[I->src[0].value];
+         while (def && def->op == AGX_OPCODE_MOV && def->nr_srcs == 1 &&
+                def->nr_dests == 1 && def->src[0].type == AGX_INDEX_NORMAL)
+            def = defs[def->src[0].value];
+         if (!def || def->op != AGX_OPCODE_COLLECT || def->nr_srcs != 2 ||
+             def->src[0].size != AGX_SIZE_32 ||
+             def->src[1].size != AGX_SIZE_32)
+            continue;
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_uniform_store(&b, def->src[0], agx_immediate(base), 1);
+         agx_uniform_store(&b, def->src[1], agx_immediate(base + 2), 1);
+         agx_remove_instruction(I);
+         progress = true;
+      }
+      ralloc_free(defs);
+   }
    agx_foreach_instr_global_safe(ctx, I) {
       if (I->op != AGX_OPCODE_UNIFORM_STORE || I->nr_srcs != 2)
          continue;
