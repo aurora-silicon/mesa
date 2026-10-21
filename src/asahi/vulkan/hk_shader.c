@@ -1071,8 +1071,14 @@ hk_bounded_write_guarded(nir_if *nif)
       return NULL;
 
    nir_block *else_block = nir_if_first_else_block(nif);
-   if (!exec_list_is_empty(&else_block->instr_list))
-      return NULL;
+   if (!exec_list_is_empty(&else_block->instr_list)) {
+      /* A guarded atomic's else block holds only the undefs that feed
+       * if_phi(atomic, undef); anything else is a different shape. */
+      nir_foreach_instr(instr, else_block) {
+         if (instr->type != nir_instr_type_undef)
+            return NULL;
+      }
+   }
 
    nir_block *then_block = nir_if_first_then_block(nif);
    nir_instr *last = nir_block_last_instr(then_block);
@@ -1191,14 +1197,6 @@ hk_redirect_bounded_write(nir_if *nif)
    const bool atomic = write->intrinsic != nir_intrinsic_store_global;
    const unsigned addr_src = atomic ? 0 : 1;
 
-   /* The redirect only pays off when the guard and the address are
-    * uniform: the bounds check and the address select then lift into the
-    * preamble with the rest of the uniform code, leaving the kernel with
-    * a bare write.  A divergent select costs more instructions in the
-    * kernel than the cndst/cndend split it replaces. */
-   if (nif->condition.ssa->divergent || write->src[addr_src].ssa->divergent)
-      return false;
-
    /* Both halves of the if must merge into one common successor, which
     * must itself be a block (structured control flow always provides one,
     * but check so the phi logic below stays sound). */
@@ -1237,6 +1235,21 @@ hk_redirect_bounded_write(nir_if *nif)
    }
 
    if (atomic && !result_phi)
+      return false;
+
+   /* The redirect only pays off when the guard and the address are
+    * uniform: the bounds check and the address select then lift into the
+    * preamble with the rest of the uniform code, leaving the kernel with
+    * a bare write.  A divergent select costs more instructions in the
+    * kernel than the cndst/cndend split it replaces. */
+   /* The redirect only pays off when the guard and the address are
+    * uniform: the bounds check and the address select then lift into the
+    * preamble with the rest of the uniform code, leaving the kernel with
+    * a bare write.  A divergent select costs more instructions in the
+    * kernel than the cndst/cndend split it replaces -- measured +1..+5 on
+    * every mem-atom-* shader whether or not the atomic's old value is
+    * used. */
+   if (nif->condition.ssa->divergent || write->src[addr_src].ssa->divergent)
       return false;
 
    nir_def *valid = nif->condition.ssa;
@@ -1348,6 +1361,58 @@ hk_nir_redirect_bounded_writes(nir_shader *nir)
    nir_foreach_function_impl(impl, nir)
       progress |= hk_redirect_bounded_writes_cf_list(&impl->body);
    return progress;
+}
+
+/* nir_lower_explicit_io bounds-checks a bounded write or atomic with
+ * ult(off + (size - 1), bound): one add per access to form the exclusive
+ * end.  The equivalent ult(off, usub_sat(bound, size - 1)) computes the
+ * slack once per buffer -- it is a uniform function of the descriptor
+ * bound, so it folds and hoists into the preamble and every check keeps
+ * only the compare.  The saturating subtract is at least as conservative
+ * as the original: for any offset the new check passes, off + (size - 1)
+ * cannot wrap, and a bound smaller than the access rejects every offset
+ * the wrapping compare could have passed near 2^32. */
+static bool
+hk_slacken_bounds_check_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_ult)
+      return false;
+
+   nir_def *bound = alu->src[1].src.ssa;
+   if (bound->bit_size != 32)
+      return false;
+
+   nir_scalar end = nir_scalar_resolved(alu->src[0].src.ssa,
+                                        alu->src[0].swizzle[0]);
+   end = nir_scalar_chase_movs(end);
+   if (end.def->bit_size != 32 || !nir_scalar_is_alu(end) ||
+       nir_scalar_alu_op(end) != nir_op_iadd)
+      return false;
+
+   nir_scalar x = nir_scalar_chase_alu_src(end, 0);
+   nir_scalar y = nir_scalar_chase_alu_src(end, 1);
+   nir_scalar c = nir_scalar_is_const(x) ? x : y;
+   nir_scalar off = nir_scalar_is_const(x) ? y : x;
+   if (!nir_scalar_is_const(c) || nir_scalar_as_uint(c) == 0 ||
+       off.def->bit_size != 32)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *slack =
+      nir_usub_sat(b, bound, nir_imm_int(b, nir_scalar_as_uint(c)));
+   nir_def_replace(&alu->def, nir_ult(b, nir_mov_scalar(b, off), slack));
+   return true;
+}
+
+static bool
+hk_nir_slacken_bounded_checks(nir_shader *nir)
+{
+   return nir_shader_instructions_pass(
+      nir, hk_slacken_bounds_check_instr, nir_metadata_control_flow, NULL);
 }
 
 static bool
@@ -2677,8 +2742,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * the kernel costs more than the cndst/cndend split it replaces. */
    if (hk_buffer_addr_format(rs->storage_buffers,
                              rs->null_storage_buffer_descriptor) ==
-       nir_address_format_64bit_bounded_global)
+       nir_address_format_64bit_bounded_global) {
+      NIR_PASS(_, nir, hk_nir_slacken_bounded_checks);
       NIR_PASS(_, nir, hk_nir_redirect_bounded_writes);
+   }
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
