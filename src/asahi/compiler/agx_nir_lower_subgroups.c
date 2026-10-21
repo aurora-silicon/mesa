@@ -472,6 +472,38 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
    }
 
+   case nir_intrinsic_read_first_invocation: {
+      /* G17P: mask every lane but the first active one and OR-reduce.
+       * The hardware reduce publishes its result to every active lane,
+       * so sRedOR(select(first, v, 0)) is a broadcast of the first active
+       * lane's value -- hardware-verified under masks that exclude raw
+       * lane 0.  Three instructions replace the ballot + ufind_msb +
+       * simdbcast sequence (~16).
+       */
+      if (options->g17p && intr->def.num_components == 1 &&
+          (intr->def.bit_size == 16 || intr->def.bit_size == 32)) {
+         nir_def *active_id = nir_load_active_subgroup_invocation_agx(b, 16);
+         nir_def *is_first = nir_ieq_imm(b, active_id, 0);
+         nir_def *masked =
+            nir_bcsel(b, is_first, intr->src[0].ssa,
+                      nir_imm_zero(b, 1, intr->def.bit_size));
+         nir_def_rewrite_uses(&intr->def,
+                              agx_subgroup_reduce(b, nir_op_ior, 0, masked));
+         return true;
+      }
+
+      /* Everything else keeps the common form -- read the lowest active
+       * lane, found through the ballot of the first-active predicate
+       * (the same expansion first_invocation gets below). */
+      nir_def *active_id = nir_load_active_subgroup_invocation_agx(b, 16);
+      nir_def *is_first = nir_ieq_imm(b, active_id, 0);
+      nir_def *first_bit = nir_ballot(b, 1, 32, is_first);
+      nir_def *first = nir_ufind_msb(b, first_bit);
+      nir_def_rewrite_uses(
+         &intr->def, nir_read_invocation(b, intr->src[0].ssa, first));
+      return true;
+   }
+
    case nir_intrinsic_vote_ieq:
    case nir_intrinsic_vote_feq: {
       /* The common lowering does:
@@ -738,33 +770,30 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    case nir_intrinsic_ballot: {
       /* Optimize popcount(ballot(true)) to load_active_subgroup_count_agx().
-       *
-       * Not on G17P: Apple's compiler reads its active-count register (SR36)
-       * only inside the helper-guarded region of a uniform atomic, and
-       * compiles simd_sum(1u) to a reduction instead, so keep the ballot whose
-       * lane membership every other subgroup operation shares.
+       * Hardware-verified on G17P that the SR36 read returns the active
+       * count under partial masks, so the fold now applies there too.
        */
       const struct agx_subgroup_lower_options *agx_options = data;
+
+      if (nir_src_is_const(intr->src[0]) &&
+          nir_src_as_bool(intr->src[0]) &&
+          list_is_singular(&intr->def.uses)) {
+         nir_src *use = list_first_entry(&intr->def.uses, nir_src, use_link);
+         nir_instr *parent = nir_src_use_instr(use);
+
+         if (parent->type == nir_instr_type_alu &&
+             nir_instr_as_alu(parent)->op == nir_op_bit_count) {
+            nir_def_rewrite_uses(
+               &nir_instr_as_alu(parent)->def,
+               nir_load_active_subgroup_count_agx(b, 32));
+            return true;
+         }
+      }
+
       if (agx_options->g17p)
          return agx_g17p_normalize_ballot_src(b, intr);
 
-      if (!nir_src_is_const(intr->src[0]) ||
-          !nir_src_as_bool(intr->src[0]) ||
-          !list_is_singular(&intr->def.uses))
-         return false;
-
-      nir_src *use = list_first_entry(&intr->def.uses, nir_src, use_link);
-      nir_instr *parent = nir_src_use_instr(use);
-      if (parent->type != nir_instr_type_alu)
-         return false;
-
-      nir_alu_instr *alu = nir_instr_as_alu(parent);
-      if (alu->op != nir_op_bit_count)
-         return false;
-
-      nir_def_rewrite_uses(&alu->def,
-                           nir_load_active_subgroup_count_agx(b, 32));
-      return true;
+      return false;
    }
 
    default:
@@ -839,6 +868,71 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    }
 }
 
+/* bit_count(ballot(true) & subgroup lt/le mask) counts the active lanes
+ * below (or at-or-below) the calling lane -- that is the active-lane rank
+ * ACTIVE_THREAD_INDEX_IN_SUBGROUP (SR34) already returns, plus one for the
+ * inclusive mask.  nir_opt_uniform_subgroup lowers a scan of a uniform
+ * value to exactly this shape; rewrite it while the mask is still an
+ * intrinsic, before nir_lower_subgroups expands it to shifts.  SR34's
+ * rank semantics under partial masks are what the elect lowering already
+ * relies on.  The surrounding imul from the scan rewrite is left in
+ * place: only the count itself is being substituted.
+ */
+static bool
+agx_ballot_masked_count(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_bit_count || alu->def.num_components != 1)
+      return false;
+
+   nir_def *and_def = alu->src[0].src.ssa;
+   if (!nir_def_is_alu(and_def))
+      return false;
+
+   nir_alu_instr *and = nir_def_as_alu(and_def);
+   if (and->op != nir_op_iand)
+      return false;
+
+   bool found = false, inclusive = false;
+   for (unsigned i = 0; i < 2 && !found; i++) {
+      nir_def *maybe_ballot = and->src[i].src.ssa;
+      nir_def *maybe_mask = and->src[1 - i].src.ssa;
+      if (!nir_def_is_intrinsic(maybe_ballot) ||
+          !nir_def_is_intrinsic(maybe_mask))
+         continue;
+
+      nir_intrinsic_instr *ballot = nir_def_as_intrinsic(maybe_ballot);
+      nir_intrinsic_instr *mask = nir_def_as_intrinsic(maybe_mask);
+      if (ballot->intrinsic != nir_intrinsic_ballot ||
+          ballot->def.num_components != 1 || ballot->def.bit_size != 32 ||
+          !nir_src_is_const(ballot->src[0]) ||
+          !nir_src_as_bool(ballot->src[0]))
+         continue;
+
+      if (mask->intrinsic == nir_intrinsic_load_subgroup_lt_mask)
+         inclusive = false;
+      else if (mask->intrinsic == nir_intrinsic_load_subgroup_le_mask)
+         inclusive = true;
+      else
+         continue;
+
+      if (mask->def.num_components != 1 || mask->def.bit_size != 32)
+         continue;
+
+      found = true;
+   }
+
+   if (!found)
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *rank =
+      nir_u2uN(b, nir_load_active_subgroup_invocation_agx(b, 32),
+               alu->def.bit_size);
+   nir_def_rewrite_uses(&alu->def,
+                        inclusive ? nir_iadd_imm(b, rank, 1) : rank);
+   return true;
+}
+
 static bool
 agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
 {
@@ -847,11 +941,19 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
       .g17p_clustered_float = g17p_clustered_float,
    };
 
+   /* Fold the masked-ballot lane count to the SR34 rank read while the
+    * subgroup mask is still an intrinsic (nir_lower_subgroups expands it
+    * to shifts below). */
+   bool progress = nir_shader_alu_pass(s, agx_ballot_masked_count,
+                                       nir_metadata_none, NULL);
+
    /* First, do as much common lowering as we can */
    nir_lower_subgroups_options opts = {
       .filter = lower_subgroup_filter,
       .filter_data = &agx_options,
-      .lower_read_first_invocation = true,
+      /* On G17P read_first_invocation lowers in lower() to the masked
+       * OR-reduce, which broadcasts through the hardware reduce. */
+      .lower_read_first_invocation = !g17p_clustered_float,
       .lower_inverse_ballot = true,
       .lower_to_scalar = true,
       .lower_relative_shuffle = false,
@@ -864,7 +966,7 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float)
       .subgroup_size = 32,
    };
 
-   bool progress = nir_lower_subgroups(s, &opts);
+   progress |= nir_lower_subgroups(s, &opts);
 
    /* Then do AGX-only lowerings on top. */
    progress |= nir_shader_intrinsics_pass(s, lower, nir_metadata_none,
