@@ -189,49 +189,6 @@ agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
    return nir_bcsel(b, ok, buddy, identity);
 }
 
-/* Whether a clustered reduction takes the representative-read lowering
- * in lower() (guarded pair combine, or quad base plus per-block sibling
- * reads): a scalar reduce at a width the shuffles cover, over an aligned
- * 2-, 8- or 16-lane cluster.  Cluster size 4 goes to the hardware quad
- * reduce through the ordinary intrinsic path instead.  The filter below
- * must return false for exactly these so they survive
- * nir_lower_subgroups as intrinsics.
- */
-static bool
-agx_clustered_reduce_eligible(const nir_intrinsic_instr *intr)
-{
-   if (intr->intrinsic != nir_intrinsic_reduce ||
-       !nir_intrinsic_has_cluster_size(intr))
-      return false;
-
-   unsigned cluster = nir_intrinsic_cluster_size(intr);
-   if (cluster != 2 && cluster != 8 && cluster != 16)
-      return false;
-
-   return intr->def.num_components == 1 &&
-          (intr->def.bit_size == 16 || intr->def.bit_size == 32);
-}
-
-/* Guarded xor-combine at distance 1: fold the pair buddy's value into
- * `v` when lane^1 is live, else keep `v`.  The shuffle itself is
- * unconditional -- an inactive buddy's register is stale, not
- * unreadable -- and the ballot guard drops its contribution, so the
- * step is exact under any activity mask.
- */
-static nir_def *
-agx_pair_combine(nir_builder *b, nir_op op, nir_def *m, nir_def *lane,
-                 nir_def *v)
-{
-   nir_def *live = nir_ine_imm(
-      b, nir_iand_imm(b, nir_ushr(b, m, nir_ixor(b, lane, nir_imm_int(b, 1))),
-                      1),
-      0);
-   return nir_bcsel(b, live,
-                    nir_build_alu2(b, op, v,
-                                   nir_shuffle_xor(b, v, nir_imm_int(b, 1))),
-                    v);
-}
-
 /* Whether the hardware quad reduce implements `op` at `bit_size` -- the
  * same shapes the subgroup filter admits to isel: everything but integer
  * multiply has a quad form, and the float min/max encodings are only
@@ -259,6 +216,56 @@ agx_quad_reduce_supported(nir_op op, unsigned bit_size, bool g17p)
    default:
       return false;
    }
+}
+
+/* Whether a clustered reduction takes the representative-read lowering
+ * in lower() (guarded pair combine, or quad base plus per-block sibling
+ * reads): a scalar reduce at a width the shuffles cover, over an aligned
+ * 2-, 8- or 16-lane cluster, or a 4-lane cluster of an op the hardware
+ * quad reduce does not implement -- that shape is exactly the two
+ * intra-quad combine steps.  Cluster-4 reduces of quad-capable ops go
+ * to the hardware quad reduce through the ordinary intrinsic path
+ * instead.  The filter below must return false for exactly these so
+ * they survive nir_lower_subgroups as intrinsics.
+ */
+static bool
+agx_clustered_reduce_eligible(const nir_intrinsic_instr *intr, bool g17p)
+{
+   if (intr->intrinsic != nir_intrinsic_reduce ||
+       !nir_intrinsic_has_cluster_size(intr))
+      return false;
+
+   unsigned cluster = nir_intrinsic_cluster_size(intr);
+   if (cluster != 2 && cluster != 4 && cluster != 8 && cluster != 16)
+      return false;
+
+   if (intr->def.num_components != 1 ||
+       (intr->def.bit_size != 16 && intr->def.bit_size != 32))
+      return false;
+
+   return cluster != 4 ||
+          !agx_quad_reduce_supported(nir_intrinsic_reduction_op(intr),
+                                     intr->def.bit_size, g17p);
+}
+
+/* Guarded xor-combine at distance 1: fold the pair buddy's value into
+ * `v` when lane^1 is live, else keep `v`.  The shuffle itself is
+ * unconditional -- an inactive buddy's register is stale, not
+ * unreadable -- and the ballot guard drops its contribution, so the
+ * step is exact under any activity mask.
+ */
+static nir_def *
+agx_pair_combine(nir_builder *b, nir_op op, nir_def *m, nir_def *lane,
+                 nir_def *v)
+{
+   nir_def *live = nir_ine_imm(
+      b, nir_iand_imm(b, nir_ushr(b, m, nir_ixor(b, lane, nir_imm_int(b, 1))),
+                      1),
+      0);
+   return nir_bcsel(b, live,
+                    nir_build_alu2(b, op, v,
+                                   nir_shuffle_xor(b, v, nir_imm_int(b, 1))),
+                    v);
 }
 
 /* Whether a 64-bit min/max reduction takes the two-phase hi/lo lowering
@@ -572,7 +579,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          return true;
       }
 
-      if (!agx_clustered_reduce_eligible(intr))
+      if (!agx_clustered_reduce_eligible(intr,
+                                         options->g17p_clustered_float))
          return false;
 
       /* Reduce over the active lanes of an aligned cluster, without
@@ -615,12 +623,6 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          return true;
       }
 
-      /* p: the position of the last live lane of this lane's own quad.
-       * The lane itself is active, so its quad always has one. */
-      nir_def *qb = nir_iand_imm(b, lane, ~3u);
-      nir_def *p = nir_ufind_msb(
-         b, nir_iand_imm(b, nir_ushr(b, m, qb), 0xf));
-
       nir_def *acc;
 
       if (agx_quad_reduce_supported(red_op, data->bit_size,
@@ -647,6 +649,22 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
             b, nir_iand_imm(b, nir_ushr(b, m, pair), 3), 0);
          acc = nir_bcsel(b, ok2, nir_build_alu2(b, red_op, acc, b2), acc);
       }
+
+      /* A 4-lane cluster is exactly the quad: for the ops that get here
+       * (no quad form -- the eligible filter keeps quad-capable cluster-4
+       * reduces on the hardware path) the intra-quad steps are the whole
+       * reduction.
+       */
+      if (cluster == 4) {
+         nir_def_rewrite_uses(&intr->def, acc);
+         return true;
+      }
+
+      /* p: the position of the last live lane of this lane's own quad.
+       * The lane itself is active, so its quad always has one. */
+      nir_def *qb = nir_iand_imm(b, lane, ~3u);
+      nir_def *p = nir_ufind_msb(
+         b, nir_iand_imm(b, nir_ushr(b, m, qb), 0xf));
 
       /* d = 4: the sibling block is exactly one quad.  Reading it lands
        * on its last live lane, which holds its total. */
@@ -731,7 +749,9 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    /* Scans and clustered reductions handled by the guarded lowerings in
     * lower() stay intrinsics and reach it untouched.
     */
-   if (agx_scan_eligible(intr) || agx_clustered_reduce_eligible(intr) ||
+   if (agx_scan_eligible(intr) ||
+       agx_clustered_reduce_eligible(intr,
+                                     agx_options->g17p_clustered_float) ||
        agx_minmax64_reduce_eligible(intr))
       return false;
 
