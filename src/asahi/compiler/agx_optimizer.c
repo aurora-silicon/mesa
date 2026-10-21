@@ -271,7 +271,11 @@ agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
    case AGX_OPCODE_FADD: {
       const agx_index other = ins->src[1 - s];
       if (other.size == AGX_SIZE_16)
-         return false; /* two 16-bit add sources are unwitnessed */
+         /* Two plain 16-bit add sources into a 32-bit destination are
+          * witnessed (fp16-heavy-10 tail, f32add.ep0 f43+f26); any
+          * modifier or a narrow destination on top is not. */
+         return !narrow && !ins->saturate && !neg && !other.neg &&
+                !other.abs;
       if (narrow)
          /* w23: a clean 16-bit f35-side source under a narrow dest. */
          return s == 0 && !neg && !other.neg && !other.abs &&
@@ -295,10 +299,18 @@ agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
       if (ins->saturate || narrow)
          return false;
       if (s == 2) {
-         /* w09: a 16-bit addend, including negated (f65+f60), only
-          * beside two 32-bit register multiplicands. */
-         return ins->src[0].size == AGX_SIZE_32 &&
-                ins->src[1].size == AGX_SIZE_32;
+         /* w09: a 16-bit addend, including negated (f65+f60), beside two
+          * 32-bit register multiplicands. The fp16 corpus additionally
+          * grounds the plain form beside a 16-bit src0 (f43+f60) and
+          * beside two 16-bit multiplicands (f43+f26+f60). */
+         if (ins->src[1].size != AGX_SIZE_32 &&
+             !(ins->src[0].size == AGX_SIZE_16 &&
+               ins->src[1].size == AGX_SIZE_16))
+            return false;
+         if (ins->src[0].size == AGX_SIZE_16)
+            return !neg && !ins->src[0].neg && !ins->src[0].abs &&
+                   !ins->src[1].neg && !ins->src[1].abs;
+         return ins->src[0].size == AGX_SIZE_32;
       }
       if (ins->src[2].type != AGX_INDEX_NORMAL &&
           ins->src[2].type != AGX_INDEX_REGISTER)

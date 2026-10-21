@@ -62,6 +62,7 @@ lower_pack = [
     (('pack_half_2x16_split', a, b),
      ('pack_32_2x16_split', ('f2f16', a), ('f2f16', b))),
 
+
     # We don't have 8-bit ALU, so we need to lower this. But if we lower it like
     # this, we can at least coalesce the pack_32_2x16_split and only pay the
     # cost of the iors and ishl. (u2u16 of 8-bit is assumed free.)
@@ -106,6 +107,20 @@ for T, sizes, one in [('f', [16, 32], 1.0),
             ((f'b2{T}{size}', ('inot', 'a@1')), ('bcsel', a, 0, one)),
             ((f'b2{T}{size}', 'a@1'), ('bcsel', a, one, 0)),
         ])
+
+# packHalf2x16 of fp16 data arrives as f2f16(f2f32(half)) once
+# pack_half_2x16_split is lowered -- too late for the main algebraic
+# table's matching rule to see it. Re-issue that fold here and resolve
+# the canonicalize the same way it does, so a widened half repacked to
+# 16 bits costs nothing when fp16 denormals are not flushed.
+fold_pack_rt = [
+    # f2f16(f2f32(half)) is the identity on the value itself; upstream
+    # reaches it through fcanonicalize, which is exactly its elimination
+    # contract: drop it only when fp16 denormals are not required to
+    # flush, where the surviving pair is what performs the flush.
+    (('f2f16', ('f2f32', 'a@16')), a,
+     '!nir_is_denorm_flush_to_zero(info->float_controls_execution_mode, 16)'),
+]
 
 # Rewriting bcsel(a || b, ...) in terms of bcsel(a, ...) and bcsel(b, ...) lets
 # our rules to fuse compare-and-select do a better job, assuming that a and b
@@ -454,6 +469,8 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
     print(nir_algebraic.AlgebraicPass("agx_nir_lower_algebraic_late",
                                       lower_sm5_shift + lower_pack +
                                       lower_selects).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_fold_pack_roundtrip",
+                                      fold_pack_rt).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_selects",
                                       opt_selects).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fold_pixel_coord",

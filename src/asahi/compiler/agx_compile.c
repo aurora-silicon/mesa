@@ -3972,16 +3972,16 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
 
          /* AGX3B composes a 16-bit register onto the f32fma slots: src0
           * (f43, w03/w08), src1 beside a 16-bit src0 or a minifloat
-          * multiplier (f26, w03/w22), and the addend beside two 32-bit
-          * multiplicands (f60, w09). Keep a source on the grounded
+          * multiplier (f26, w03/w22), and the addend beside 32-bit
+          * multiplicands (f60, w09) or beside a 16-bit src0 (f43+f60
+          * and f43+f26+f60, fp16 corpus). Keep a source on the grounded
           * combinations and widen the rest. */
          const agx_index s0 = I->src[0], s1 = I->src[1], s2 = I->src[2];
-         const bool reg32_s2 =
-            s2.size == AGX_SIZE_32 &&
+         const bool reg_s2 =
             (s2.type == AGX_INDEX_NORMAL || s2.type == AGX_INDEX_REGISTER);
          bool keep = false;
          if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
-             reg32_s2) {
+             reg_s2) {
             if (s == 0)
                keep = s1.type == AGX_INDEX_NORMAL ||
                       s1.type == AGX_INDEX_REGISTER ||
@@ -3990,9 +3990,13 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
                keep = s0.size == AGX_SIZE_16 ||
                       s0.type == AGX_INDEX_IMMEDIATE;
             else
-               keep = s0.size == AGX_SIZE_32 && s1.size == AGX_SIZE_32 &&
-                      s0.type != AGX_INDEX_UNIFORM &&
-                      s1.type != AGX_INDEX_UNIFORM;
+               keep = (s2.size == AGX_SIZE_32 || s2.size == AGX_SIZE_16) &&
+                      ((s0.size == AGX_SIZE_32 && s1.size == AGX_SIZE_32 &&
+                        s0.type != AGX_INDEX_UNIFORM &&
+                        s1.type != AGX_INDEX_UNIFORM) ||
+                       (s0.size == AGX_SIZE_16 &&
+                        !s0.abs && !s0.neg && !s1.abs && !s1.neg &&
+                        !s2.abs && !s2.neg));
          }
          if (keep)
             continue;
@@ -5005,17 +5009,21 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
       }
 
       /* AGX3B composes one 16-bit register onto the f32add source slots
-       * natively (w01/w19/w21), so a lone half stays narrow. Two 16-bit
-       * add sources are unwitnessed; break such a pair with a single
-       * exact widening of the first operand, leaving the result on the
-       * mixed-width form again. */
+       * natively (w01/w19/w21), so a lone half stays narrow, and a plain
+       * pair of 16-bit sources is grounded too (fp16 corpus:
+       * f32add.ep0 f43+f26, e.g. 09001804). A modified two-half add is
+       * unwitnessed; break such a pair with a single exact widening of
+       * the first operand, leaving the result on the mixed-width form
+       * again. */
       if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
           I->dest[0].size == AGX_SIZE_32 &&
           I->src[0].size == AGX_SIZE_16 &&
           I->src[1].size == AGX_SIZE_16 &&
           I->src[0].type != AGX_INDEX_IMMEDIATE &&
-          I->src[1].type != AGX_INDEX_IMMEDIATE) {
+          I->src[1].type != AGX_INDEX_IMMEDIATE &&
+          (I->src[0].abs || I->src[0].neg || I->src[1].abs ||
+           I->src[1].neg)) {
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
          agx_index widened = agx_temp(ctx, AGX_SIZE_32);
          agx_fmov_to(&b, widened, I->src[0]);
@@ -8014,6 +8022,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
    NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
    NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
+   /* The pack lowering above mints f2f16(f2f32) round-trips; fold them. */
+   NIR_PASS(_, nir, agx_nir_fold_pack_roundtrip);
    NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
    NIR_PASS(_, nir, agx_nir_fuse_selects);
    NIR_PASS(_, nir, nir_opt_constant_folding);
