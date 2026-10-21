@@ -190,9 +190,11 @@ agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
 }
 
 /* Whether a clustered reduction takes the representative-read lowering
- * in lower() (quad base plus per-block sibling reads): a scalar reduce
- * at a width the shuffles cover, over an aligned 8- or 16-lane cluster.
- * The filter below must return false for exactly these so they survive
+ * in lower() (guarded pair combine, or quad base plus per-block sibling
+ * reads): a scalar reduce at a width the shuffles cover, over an aligned
+ * 2-, 8- or 16-lane cluster.  Cluster size 4 goes to the hardware quad
+ * reduce through the ordinary intrinsic path instead.  The filter below
+ * must return false for exactly these so they survive
  * nir_lower_subgroups as intrinsics.
  */
 static bool
@@ -203,11 +205,31 @@ agx_clustered_reduce_eligible(const nir_intrinsic_instr *intr)
       return false;
 
    unsigned cluster = nir_intrinsic_cluster_size(intr);
-   if (cluster != 8 && cluster != 16)
+   if (cluster != 2 && cluster != 8 && cluster != 16)
       return false;
 
    return intr->def.num_components == 1 &&
           (intr->def.bit_size == 16 || intr->def.bit_size == 32);
+}
+
+/* Guarded xor-combine at distance 1: fold the pair buddy's value into
+ * `v` when lane^1 is live, else keep `v`.  The shuffle itself is
+ * unconditional -- an inactive buddy's register is stale, not
+ * unreadable -- and the ballot guard drops its contribution, so the
+ * step is exact under any activity mask.
+ */
+static nir_def *
+agx_pair_combine(nir_builder *b, nir_op op, nir_def *m, nir_def *lane,
+                 nir_def *v)
+{
+   nir_def *live = nir_ine_imm(
+      b, nir_iand_imm(b, nir_ushr(b, m, nir_ixor(b, lane, nir_imm_int(b, 1))),
+                      1),
+      0);
+   return nir_bcsel(b, live,
+                    nir_build_alu2(b, op, v,
+                                   nir_shuffle_xor(b, v, nir_imm_int(b, 1))),
+                    v);
 }
 
 /* Whether the hardware quad reduce implements `op` at `bit_size` -- the
@@ -582,6 +604,17 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *m = nir_ballot(b, 1, 32, nir_imm_true(b));
       nir_def *lane = nir_load_subgroup_invocation(b);
 
+      /* A 2-lane cluster is the pair (l, l^1), which never straddles a
+       * quad, so the guarded d=1 combine is the whole reduction.  It is
+       * the whole reduction for every op: the quad form would fold in
+       * the quad's other pair too.
+       */
+      if (cluster == 2) {
+         nir_def_rewrite_uses(
+            &intr->def, agx_pair_combine(b, red_op, m, lane, data));
+         return true;
+      }
+
       /* p: the position of the last live lane of this lane's own quad.
        * The lane itself is active, so its quad always has one. */
       nir_def *qb = nir_iand_imm(b, lane, ~3u);
@@ -600,15 +633,7 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
           * the sibling pair through whichever of its lanes is live --
           * lane^2 when active, else lane^3, its pair-mate.
           */
-         nir_def *ok1 = nir_ine_imm(
-            b, nir_iand_imm(b,
-                            nir_ushr(b, m, nir_ixor(b, lane, nir_imm_int(b, 1))), 1),
-            0);
-         acc = nir_bcsel(
-            b, ok1,
-            nir_build_alu2(b, red_op, data,
-                           nir_shuffle_xor(b, data, nir_imm_int(b, 1))),
-            data);
+         acc = agx_pair_combine(b, red_op, m, lane, data);
 
          nir_def *live2 = nir_ine_imm(
             b, nir_iand_imm(b,
