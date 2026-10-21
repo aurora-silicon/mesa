@@ -1448,6 +1448,454 @@ lower_load_global_constant_offset_instr(nir_builder *b,
    return true;
 }
 
+/* nir_lower_explicit_io implements bounded-buffer stores
+ * (nir_address_format_64bit_bounded_global) as one guarded region per
+ * store:
+ *
+ *    if (ult(iadd(off32, size - 1), bound))
+ *       store_global(value, iadd(pack64(lo, hi), u2u64(off32)))
+ *
+ * Reservoir-style writes store a run of consecutive dwords this way and
+ * pay a control-flow split per dword.  A run of those guards covering a
+ * contiguous range of the same descriptor needs only one guard for the
+ * whole span:
+ *
+ *    if (usub_sat(bound, off_first) >= span_bytes) {
+ *       store_global(v0, addr0)
+ *       store_global(v1, iadd(addr0, 4))
+ *       ...
+ *    } else {
+ *       if (ult(off0 + 3, bound)) store0   // original sequence, verbatim
+ *       if (ult(off1 + 3, bound)) store1
+ *       ...
+ *    }
+ *
+ * usub_sat(bound, first) >= span is exactly "first + span <= bound without
+ * wrap", which makes every per-store end check pass -- and nothing else
+ * does, since the offsets are strictly increasing.  The fallback therefore
+ * preserves the component-granularity contract robustBufferAccess2 needs:
+ * a lane (dword) that is in bounds is still stored even when a neighbour
+ * is out of bounds.  On the fast path the stores share one address chain
+ * with constant offsets, so nir_opt_load_store_vectorize can merge them
+ * into vector stores. */
+
+/* A then-block holding exactly one store_global and an empty else block:
+ * the shape build_explicit_io_store emits for a bounded write. */
+#define HK_MAX_OFF_TERMS 8
+
+struct hk_off_decomp {
+   /* offset = delta + sum(muls[i] * terms[i]) */
+   nir_scalar terms[HK_MAX_OFF_TERMS];
+   int64_t muls[HK_MAX_OFF_TERMS];
+   unsigned num_terms;
+   int64_t delta;
+   bool valid;
+};
+
+struct hk_guarded_store {
+   nir_if *nif;
+   nir_intrinsic_instr *store;
+   nir_scalar bound;
+   struct hk_off_decomp dec;
+   nir_scalar off;  /* 32-bit byte offset feeding the store address */
+   int64_t delta;   /* constant byte delta of this store */
+};
+
+/* Chase movs and vector constructions down to a leaf scalar: a scalar that
+ * is not produced by a mov or vec op.  Two independently built copies of
+ * the same addressing expression -- like the (lo, hi, bound, offset)
+ * vectors explicit-io builds per store -- resolve to the same leaf
+ * scalars. */
+static nir_scalar
+hk_scalar_leaf(nir_scalar s, unsigned depth)
+{
+   for (;;) {
+      s = nir_scalar_chase_movs(s);
+      if (depth++ >= 16 || !nir_scalar_is_alu(s))
+         return s;
+
+      if (!nir_op_is_vec(nir_scalar_alu_op(s)))
+         return s;
+
+      /* vec ops either take one unsized vector source -- the component
+       * follows the destination -- or one scalar source per component,
+       * indexed by the component. */
+      unsigned idx = nir_op_infos[nir_scalar_alu_op(s)].num_inputs == 1
+                        ? 0
+                        : s.comp;
+      s = nir_scalar_chase_alu_src(s, idx);
+   }
+}
+
+static void
+hk_off_add_term(struct hk_off_decomp *d, nir_scalar s, int64_t mul)
+{
+   for (unsigned i = 0; i < d->num_terms; i++) {
+      if (nir_scalar_equal(d->terms[i], s)) {
+         d->muls[i] += mul;
+         return;
+      }
+   }
+   if (d->num_terms >= HK_MAX_OFF_TERMS) {
+      d->valid = false;
+      return;
+   }
+   d->terms[d->num_terms] = s;
+   d->muls[d->num_terms] = mul;
+   d->num_terms++;
+}
+
+/* Decompose a byte offset scalar into a linear combination of leaf
+ * scalars plus a constant delta, distributing constants out of
+ * multiplications ((idx + k) * s = idx * s + k * s mod 2^32) so two
+ * neighbouring offsets compare equal but for their deltas. */
+static void
+hk_decompose_offset(nir_scalar s, int64_t mul, struct hk_off_decomp *d,
+                    unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+
+   if (!d->valid || depth >= 16) {
+      d->valid = false;
+      return;
+   }
+
+   if (nir_scalar_is_const(s)) {
+      d->delta += mul * (int64_t)(int32_t)nir_scalar_as_uint(s);
+      return;
+   }
+
+   if (!nir_scalar_is_alu(s)) {
+      hk_off_add_term(d, s, mul);
+      return;
+   }
+
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_iadd:
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 0), mul, d, depth + 1);
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 1), mul, d, depth + 1);
+      return;
+   case nir_op_isub:
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 0), mul, d, depth + 1);
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 1), -mul, d, depth + 1);
+      return;
+   case nir_op_imul:
+   case nir_op_amul:
+   case nir_op_ishl: {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar c = nir_scalar_chase_alu_src(s, 1);
+      if (!nir_scalar_is_const(c)) {
+         if (!nir_scalar_is_const(a)) {
+            hk_off_add_term(d, s, mul);
+            return;
+         }
+         nir_scalar t = a;
+         a = c;
+         c = t;
+      }
+      int64_t m2 = (int64_t)(int32_t)nir_scalar_as_uint(c);
+      if (nir_scalar_alu_op(s) == nir_op_ishl)
+         m2 = m2 & 31 ? 1ll << (m2 & 31) : 1;
+      hk_decompose_offset(a, mul * m2, d, depth + 1);
+      return;
+   }
+   default:
+      if (nir_op_is_vec(nir_scalar_alu_op(s))) {
+         unsigned idx =
+            nir_op_infos[nir_scalar_alu_op(s)].num_inputs == 1 ? 0 : s.comp;
+         hk_decompose_offset(nir_scalar_chase_alu_src(s, idx), mul, d,
+                             depth + 1);
+         return;
+      }
+      hk_off_add_term(d, s, mul);
+      return;
+   }
+}
+
+static void
+hk_offset_decomp_init(nir_scalar s, struct hk_off_decomp *d)
+{
+   memset(d, 0, sizeof(*d));
+   d->valid = true;
+   hk_decompose_offset(s, 1, d, 0);
+}
+
+static bool
+hk_off_decomp_equal(const struct hk_off_decomp *a,
+                    const struct hk_off_decomp *b)
+{
+   if (!a->valid || !b->valid || a->num_terms != b->num_terms)
+      return false;
+
+   for (unsigned i = 0; i < a->num_terms; i++) {
+      bool found = false;
+      for (unsigned j = 0; j < b->num_terms; j++) {
+         if (a->muls[i] == b->muls[j] &&
+             nir_scalar_equal(a->terms[i], b->terms[j])) {
+            found = true;
+            break;
+         }
+      }
+      if (!found)
+         return false;
+   }
+   return true;
+}
+
+/* Match one bounded-store guard and record the pieces needed to merge it
+ * with its neighbours.  The check must cover exactly this store:
+ * end == off + size - 1 where end is the checked offset. */
+static bool
+hk_match_guarded_store(nir_if *nif, struct hk_guarded_store *out)
+{
+   if (exec_list_get_head(&nif->then_list) !=
+          exec_list_get_tail(&nif->then_list) ||
+       exec_list_get_head(&nif->else_list) !=
+          exec_list_get_tail(&nif->else_list))
+      return false;
+
+   if (!exec_list_is_empty(&nir_if_first_else_block(nif)->instr_list))
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_instr *only = NULL;
+   unsigned instrs = 0;
+   nir_foreach_instr(instr, then_block) {
+      only = instr;
+      instrs++;
+   }
+   if (instrs != 1 || only->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *store = nir_instr_as_intrinsic(only);
+   if (store->intrinsic != nir_intrinsic_store_global ||
+       store->num_components != 1 || store->src[0].ssa->bit_size != 32 ||
+       nir_intrinsic_write_mask(store) != 1)
+      return false;
+
+   /* Condition: ult(end, bound) */
+   nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
+   if (!is_op(cond, nir_op_ult))
+      return false;
+
+   struct hk_off_decomp end_dec;
+   hk_offset_decomp_init(nir_scalar_chase_alu_src(cond, 0), &end_dec);
+   nir_scalar bound =
+      hk_scalar_leaf(nir_scalar_chase_alu_src(cond, 1), 0);
+   if (!bound.def || nir_scalar_is_const(bound))
+      return false;
+
+   /* Store address: iadd(base64, u2u64(off32)) */
+   nir_scalar addr = nir_scalar_resolved(store->src[1].ssa, 0);
+   if (!is_op(addr, nir_op_iadd))
+      return false;
+
+   nir_scalar base64 = {NULL, 0};
+   nir_scalar off = {NULL, 0};
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar o = nir_scalar_chase_alu_src(addr, i);
+      if (is_op(o, nir_op_u2u64)) {
+         off = nir_scalar_chase_alu_src(o, 0);
+         base64 = nir_scalar_chase_alu_src(addr, 1 - i);
+      }
+   }
+   if (!off.def || !base64.def || off.def->bit_size != 32)
+      return false;
+
+   hk_offset_decomp_init(off, &out->dec);
+   if (!hk_off_decomp_equal(&end_dec, &out->dec) ||
+       end_dec.delta - out->dec.delta != 3)
+      return false;
+
+   /* Base and bound must come from the same descriptor vector: chase the
+    * base's pack_64_2x32 back to the vector that also provides the bound,
+    * so two different buffers can never share a guard.  pack_64_2x32 takes
+    * a vector input, so peel it manually instead of chasing scalars. */
+   nir_scalar b64 = nir_scalar_chase_movs(base64);
+   if (!is_op(b64, nir_op_pack_64_2x32))
+      return false;
+   nir_alu_instr *pack = nir_scalar_as_alu(b64);
+   nir_scalar lo = hk_scalar_leaf(
+      nir_get_scalar(pack->src[0].src.ssa, pack->src[0].swizzle[0]), 0);
+   if (lo.def != bound.def)
+      return false;
+
+   out->nif = nif;
+   out->store = store;
+   out->bound = bound;
+   out->off = off;
+   out->delta = out->dec.delta;
+   return true;
+}
+
+/* A plain block the merged guard may skip over: nothing that reads or
+ * writes memory, no control flow.  Between two guards such a block just
+ * computes values (often the next store's data). */
+static bool
+hk_storeguard_neutral_block(nir_block *block)
+{
+   nir_foreach_instr(instr, block) {
+      switch (instr->type) {
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+      case nir_instr_type_deref:
+         break;
+      case nir_instr_type_intrinsic:
+         if (!nir_intrinsic_can_reorder(nir_instr_as_intrinsic(instr)))
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+hk_storeguard_compatible(const struct hk_guarded_store *prev,
+                         const struct hk_guarded_store *cur)
+{
+   return nir_scalar_equal(prev->bound, cur->bound) &&
+          hk_off_decomp_equal(&prev->dec, &cur->dec) &&
+          cur->delta == prev->delta + 4;
+}
+
+static void
+hk_emit_guarded_store_clone(nir_builder *b, nir_intrinsic_instr *st,
+                            nir_def *addr)
+{
+   nir_store_global(b, st->src[0].ssa, addr,
+                    .write_mask = nir_intrinsic_write_mask(st),
+                    .access = nir_intrinsic_access(st),
+                    .align_mul = nir_intrinsic_align_mul(st),
+                    .align_offset = nir_intrinsic_align_offset(st));
+}
+
+/* Merge a run of >= 2 guards covering a contiguous span of dwords.  run[]
+ * holds strictly ascending deltas 4 bytes apart (verified by
+ * hk_storeguard_compatible), all checking the same bound and the same
+ * descriptor. */
+static bool
+hk_merge_guarded_stores(nir_builder *b, struct hk_guarded_store *run,
+                        unsigned count)
+{
+   nir_if *last = run[count - 1].nif;
+
+   /* Removing the last guard stitches its merge block into place; phis
+    * there would lose their sources. */
+   nir_cf_node *next = nir_cf_node_next(&last->cf_node);
+   if (!next || next->type != nir_cf_node_block)
+      return false;
+   nir_foreach_phi(phi, nir_cf_node_as_block(next))
+      return false;
+
+   /* one "all stores in bounds" test, emitted before the last guard so it
+    * dominates the merged region placed right after it. */
+   b->cursor = nir_before_cf_node(&last->cf_node);
+   nir_def *bound = nir_mov_scalar(b, run[0].bound);
+   nir_def *slack =
+      nir_usub_sat(b, bound, nir_mov_scalar(b, run[0].off));
+   nir_def *all = nir_uge(
+      b, slack, nir_imm_int(b, run[count - 1].delta - run[0].delta + 4));
+
+   b->cursor = nir_after_cf_node(&last->cf_node);
+   nir_if *outer = nir_push_if(b, all);
+
+   /* Fast path: every store's own check passes here, so issue them all
+    * against one address chain with constant offsets -- the shape
+    * nir_opt_load_store_vectorize merges. */
+   nir_def *addr0 = run[0].store->src[1].ssa;
+   for (unsigned i = 0; i < count; i++)
+      hk_emit_guarded_store_clone(
+         b, run[i].store,
+         i ? nir_iadd_imm(b, addr0, run[i].delta - run[0].delta) : addr0);
+
+   /* Slow path: the original per-store guards, so partially in-bounds
+    * ranges keep component granularity. */
+   nir_push_else(b, outer);
+   for (unsigned i = 0; i < count; i++) {
+      nir_if *inner = nir_push_if(b, run[i].nif->condition.ssa);
+      hk_emit_guarded_store_clone(b, run[i].store, run[i].store->src[1].ssa);
+      nir_pop_if(b, inner);
+   }
+   nir_pop_if(b, outer);
+
+   for (unsigned i = 0; i < count; i++)
+      nir_cf_node_remove(&run[i].nif->cf_node);
+
+   return true;
+}
+
+/* Flush an open run: merge it if it holds two or more guards, then reset.
+ * The merge is emitted right before the node that closed the run, behind
+ * the scan cursor, so the ifs it creates are never revisited -- important
+ * because the out-of-bounds fallback re-emits the same guarded-store
+ * shape and would re-match on a rescan. */
+static bool
+hk_flush_guarded_store_run(nir_builder *b, struct hk_guarded_store *run,
+                         unsigned *n)
+{
+   bool progress = *n >= 2 && hk_merge_guarded_stores(b, run, *n);
+   *n = 0;
+   return progress;
+}
+
+static bool
+hk_merge_bounded_stores_cf_list(nir_builder *b, struct exec_list *cf_list)
+{
+   bool progress = false;
+   struct hk_guarded_store run[64];
+   unsigned n = 0;
+
+   foreach_list_typed_safe(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= hk_merge_bounded_stores_cf_list(b, &nif->then_list);
+         progress |= hk_merge_bounded_stores_cf_list(b, &nif->else_list);
+
+         struct hk_guarded_store m;
+         if (hk_match_guarded_store(nif, &m)) {
+            if (n == 0 ||
+                (n < ARRAY_SIZE(run) &&
+                 hk_storeguard_compatible(&run[n - 1], &m))) {
+               run[n++] = m;
+               continue;
+            }
+            /* Mismatched or full run: flush, then start a new run here. */
+            progress |= hk_flush_guarded_store_run(b, run, &n);
+            run[n++] = m;
+            continue;
+         }
+      }
+
+      if (node->type == nir_cf_node_block && n &&
+          hk_storeguard_neutral_block(nir_cf_node_as_block(node)))
+         continue;
+
+      if (node->type == nir_cf_node_loop)
+         progress |= hk_merge_bounded_stores_cf_list(
+            b, &nir_cf_node_as_loop(node)->body);
+
+      /* Boundary in the sequence: flush whatever run was open. */
+      progress |= hk_flush_guarded_store_run(b, run, &n);
+   }
+
+   progress |= hk_flush_guarded_store_run(b, run, &n);
+   return progress;
+}
+
+static bool
+hk_nir_merge_bounded_stores(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      progress |= hk_merge_bounded_stores_cf_list(&b, &impl->body);
+   }
+   return progress;
+}
+
 struct lower_ycbcr_state {
    uint32_t set_layout_count;
    struct vk_descriptor_set_layout *const *set_layouts;
@@ -2739,16 +3187,25 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor));
 
-   /* With bounded storage buffers, explicit-io guards every store and
-    * atomic with `push_if(in_bounds)` + if_phi.  Where the guard and the
-    * address are uniform, redirect those writes at the mapped scratch
-    * page instead: bcsel the address and mask the atomic's result, no
-    * control-flow split, and the uniform select lifts into the preamble.
-    * Divergent accesses keep the guard -- adding select instructions to
-    * the kernel costs more than the cndst/cndend split it replaces. */
    if (hk_buffer_addr_format(rs->storage_buffers,
                              rs->null_storage_buffer_descriptor) ==
        nir_address_format_64bit_bounded_global) {
+      /* With bounded storage buffers, explicit-io emits one guarded
+       * region per store.  Runs of those guards over a contiguous dword
+       * range of one descriptor collapse into a single guard plus
+       * vectorisable stores, keeping the original per-store guards on
+       * the out-of-bounds path.  Must precede slacken, which rewrites
+       * the ult(off + size - 1, bound) guard form this pass matches. */
+      NIR_PASS(_, nir, hk_nir_merge_bounded_stores);
+
+      /* Every remaining store and atomic carries its own
+       * push_if(in_bounds) + if_phi.  Where the guard and the address
+       * are uniform, redirect those writes at the mapped scratch page
+       * instead: bcsel the address and mask the atomic's result, no
+       * control-flow split, and the uniform select lifts into the
+       * preamble.  Divergent accesses keep the guard -- adding select
+       * instructions to the kernel costs more than the cndst/cndend
+       * split it replaces. */
       NIR_PASS(_, nir, hk_nir_slacken_bounded_checks);
       NIR_PASS(_, nir, hk_nir_redirect_bounded_writes);
    }
