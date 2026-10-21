@@ -1367,7 +1367,8 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
                         uint16_t outstanding,
                         uint16_t *staged_end, bool pixel_entry,
                         uint32_t *pixel_entry_offset,
-                        uint16_t heap_uniform_base)
+                        uint16_t heap_uniform_base,
+                        uint16_t published_base, bool publication_last)
 {
    const bool immediate = I->nr_srcs == 6 &&
       I->src[3].type == AGX_INDEX_IMMEDIATE;
@@ -1389,6 +1390,20 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       I->src[3].value <= 252 &&
       !(I->src[3].cache && (I->src[3].discard || I->src[3].kill)) &&
       (agx3_tex_plain_uniform64(I->src[2]) || agx3_tex_imm(I->src[2], 0));
+   const bool published = agx_texture_resource(I) != 0;
+   /* A publication holds only the x/y coordinate halves. Dynamic LOD,
+    * residency and the auxiliary operand banks keep their own staging
+    * protocols, so a fetch may consume a resource solely in its plain
+    * immediate-level 2D shape. */
+   const bool published_coords =
+      published && enc == AGX_ISA_ENCODING_AGX3B && I->dim == AGX_DIM_2D &&
+      !I->offset && !I->sparse && immediate_lod &&
+      I->src[0].type == AGX_INDEX_RESOURCE &&
+      I->src[0].size == AGX_SIZE_32 && agx_channels(I->src[0]) == 2 &&
+      !I->src[0].memory && !I->src[0].abs && !I->src[0].neg &&
+      !I->src[0].cache && !I->src[0].discard && stage_coordinates;
+   if (published && !published_coords)
+      return false;
    /* Apple's lane-indexed image read publishes coordinates and uint LOD on
     * staging slot 2, then issues the texture result on slot 1. Keep those two
     * independent scoreboard domains; reusing slot 1 for both is not a native
@@ -1406,14 +1421,16 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
        agx_channels(I->dest[0]) != (I->sparse ? 8u : 4u) ||
        I->dest[0].value >= 128 ||
        (I->dest[0].size == AGX_SIZE_32 && (I->dest[0].value & 1)) ||
-       !agx3_tex_plain_reg(I->src[0]) ||
-       I->src[0].size != AGX_SIZE_32 ||
-       agx_channels(I->src[0]) !=
-          ((I->dim == AGX_DIM_2D_ARRAY || ms_array || ms_2d || three_d)
-              ? 3 : 2) ||
-       (stage_coordinates ? ((I->src[0].value & 1) ||
-         I->src[0].value + 2 * agx_channels(I->src[0]) > 128) :
-         ((I->src[0].value & 3) || I->src[0].value > 60)) ||
+
+       !(published_coords ||
+         (agx3_tex_plain_reg(I->src[0]) && I->src[0].size == AGX_SIZE_32 &&
+          agx_channels(I->src[0]) ==
+             ((I->dim == AGX_DIM_2D_ARRAY || ms_array || ms_2d || three_d)
+                 ? 3 : 2) &&
+          !(stage_coordinates
+               ? ((I->src[0].value & 1) ||
+                  I->src[0].value + 2 * agx_channels(I->src[0]) > 128)
+               : ((I->src[0].value & 3) || I->src[0].value > 60)))) ||
        ((ms_array || ms_2d)
            ? !agx3_tex_imm(I->src[1], 0)
            : (!(I->lod_mode == AGX_LOD_MODE_AUTO_LOD &&
@@ -1510,7 +1527,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    const bool plain_2d_lod =
       register_lod && !combined_array_lod && I->dim == AGX_DIM_2D;
 
-   if (stage_coordinates) {
+   if (stage_coordinates && !published) {
       uint16_t staging_wait = wait_mask & (uint16_t)~bank_retire;
       /* COPY carries one wait bit, while the image coordinates and heap
        * index may have several independent producers. A runtime LOD's
@@ -1633,7 +1650,7 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       }
    }
 
-   if (stage_coordinates && banks &&
+   if (stage_coordinates && !published && banks &&
        !agx3_staging_hold(banks, plain_bank ? staging_coord : 0, bank_span,
                           slot))
       return false;
@@ -1641,7 +1658,9 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
    const struct agx3_tex_fetch_desc d = {
       .heap_uniform_base = heap_uniform_base,
       .dest = I->dest[0].value,
-      .coord = stage_coordinates ? staging_coord : I->src[0].value,
+      .coord = published ? published_base
+                         : stage_coordinates ? staging_coord
+                                             : I->src[0].value,
       .width = I->dest[0].size == AGX_SIZE_32 ? AGX3_TEX_W32 : AGX3_TEX_W16,
       .mask = I->mask,
       .sparse = I->sparse,
@@ -1653,8 +1672,11 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       .texture_kill = !immediate && I->src[3].type == AGX_INDEX_REGISTER &&
          (I->src[3].discard || I->src[3].kill),
       .slot = slot,
-      .wait_mask = stage_coordinates ? (1u << (staging_slot - 1)) : wait_mask,
-      .coord_kill = stage_coordinates || I->src[0].kill,
+      .wait_mask = published ? wait_mask
+                            : stage_coordinates ? (1u << (staging_slot - 1))
+                                                : wait_mask,
+      .coord_kill = published ? publication_last
+                              : (stage_coordinates || I->src[0].kill),
       .final = final,
       .array = I->dim == AGX_DIM_2D_ARRAY || ms_array,
       .multisample = ms_2d || ms_array,
@@ -9343,8 +9365,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
          if (agx_texture_resource(I)) {
             const unsigned id = agx_texture_resource(I);
-            if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || id > resource_capacity ||
-                !publication_values[id])
+            if ((I->op != AGX_OPCODE_TEXTURE_SAMPLE &&
+                 I->op != AGX_OPCODE_TEXTURE_LOAD) ||
+                id > resource_capacity || !publication_values[id])
                goto fail;
             const unsigned value = publication_values[id] - 1;
             resource_uses[resource_use_count++] = (struct agx3_resource_use){
@@ -10289,11 +10312,34 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             const bool staged_bank_reads = staged;
             assert(texture_ops_left > 0);
             const bool final = --texture_ops_left == 0;
-            const uint16_t fetch_wait =
+            const bool fetch_published = agx_texture_resource(I) != 0;
+            const unsigned fetch_published_resource = fetch_published
+               ? publication_values[agx_texture_resource(I)] - 1 : 0;
+            uint16_t fetch_wait =
                wait | ((I->dim == AGX_DIM_2D_MS ||
                          I->dim == AGX_DIM_2D_MS_ARRAY)
                           ? (outstanding_here & 1u)
                           : 0);
+            if (fetch_published) {
+               /* A published fetch has no staging copies of its own to
+                * absorb extra producer waits: the publication's slot is the
+                * one coordinate dependency the read encodes, so retire
+                * independent producers on carriers exactly as a published
+                * sample does. */
+               const unsigned producer =
+                  resources[fetch_published_resource].producer;
+               const uint16_t publication_wait =
+                  (uint16_t)(1u << (res[producer].slot - 1));
+               if (fetch_wait & (fetch_wait - 1)) {
+                  const uint16_t keep =
+                     (fetch_wait & publication_wait) ? publication_wait
+                                                     : (fetch_wait & -fetch_wait);
+                  if (!agx3_retire_slots_noop(emission, enc,
+                                              fetch_wait & ~keep))
+                     AGX3_REFUSE(I);
+                  fetch_wait = keep;
+               }
+            }
             /* A fragment texel fetch with a per-lane level stages that level
              * into the sampler-private bank; Apple enters the pixel
              * transaction before such an SMP. Keep the same straight-line
@@ -10313,14 +10359,34 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                          outstanding_here, &staged_end,
                                          open_pixel_fetch,
                                          &ctx->agx3_colour_link.entry_offset,
-                                         ctx->key->g17p_texture_uniform_base))
+                                         ctx->key->g17p_texture_uniform_base,
+                                         fetch_published
+                                            ? resource_bases[
+                                                 fetch_published_resource]
+                                            : 0,
+                                         fetch_published &&
+                                            resource_last_use[
+                                               fetch_published_resource] ==
+                                               instr_index))
                AGX3_REFUSE(I);
             if (open_pixel_fetch) {
                ctx->agx3_colour_link.entry_emitted = true;
                ctx->agx3_colour_link.entry_offset -= initial_size;
                g17p_colour_open = true;
             }
-            if (staged) {
+            if (fetch_published) {
+               const uint16_t fetch_bank =
+                  resource_bases[fetch_published_resource];
+               ctx->agx3_staging_halfs =
+                  MAX2(ctx->agx3_staging_halfs, fetch_bank + 4);
+               /* The resource is held under this read's slot so later
+                * emit-time staging cannot overwrite it while the fetch
+                * still consumes it. */
+               agx3_staging_release(&staging_banks, outstanding);
+               if (slot &&
+                   !agx3_staging_hold(&staging_banks, fetch_bank, 4, slot))
+                  AGX3_REFUSE(I);
+            } else if (staged) {
                /* The coordinate bank, or the eight halves of a read with
                 * PACK_SMPIR operands: native MS fragments reserve eight
                 * halves, not just the four occupied by the x/y COPYs. */

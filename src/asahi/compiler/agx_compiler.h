@@ -496,8 +496,11 @@ typedef struct {
 static inline uint32_t
 agx_texture_resource(const agx_instr *I)
 {
-   return I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->nr_srcs &&
-          I->src[0].type == AGX_INDEX_RESOURCE ? I->src[0].value : 0;
+   return (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+           I->op == AGX_OPCODE_TEXTURE_LOAD) &&
+          I->nr_srcs && I->src[0].type == AGX_INDEX_RESOURCE
+             ? I->src[0].value
+             : 0;
 }
 
 static inline bool

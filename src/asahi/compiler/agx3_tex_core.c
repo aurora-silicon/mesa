@@ -54,7 +54,14 @@ fetch_ok(enum agx_isa_encoding enc, const struct agx3_tex_fetch_desc *d)
 
    if ((d->width != AGX3_TEX_W16 && d->width != AGX3_TEX_W32) ||
        d->dest >= 128 || (d->width == AGX3_TEX_W32 && (d->dest & 1)) ||
-       (d->coord & 3) || d->coord > 60 ||
+       /* The coordinate bank names the same staging half-register field a
+        * filtered sample's does: f19 is eight bits on AGX3b (the sample gate
+        * takes 252 above), so a published coordinate resource may land
+        * anywhere in the sampler-private file.  Emit-time staging never
+        * places a bank past half 60, which keeps the narrower unstaged
+        * corpus range the bound still encodes. */
+       (d->coord & 3) ||
+       d->coord > (enc == AGX_ISA_ENCODING_AGX3B ? 252 : 60) ||
        (enc == AGX_ISA_ENCODING_AGX3B ? (!d->mask || d->mask > 15)
                                     : (d->mask != 1 && d->mask != 15)) ||
        d->texture > 15)
