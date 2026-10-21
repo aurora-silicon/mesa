@@ -68,6 +68,40 @@ struct hk_g17p_buffer_texture_metadata {
    uint32_t sparse;
 };
 
+/* CPU-decoded image geometry kept in the last sixteen bytes of a G17P
+ * storage-image descriptor record (AGX_G17P_IMAGE_SIDEBAND_OFFSET, agx_abi.h):
+ * everything the shader-side size and texel-address crawls would otherwise
+ * recover from the packed native texture/PBE and atomic words.  The widths
+ * are already minified to the view's level and divided by the view's block
+ * denominator, the layer stride is already in view elements, and the tile
+ * fields are masks -- the shader reads each field with a plain load.
+ */
+struct hk_g17p_image_sideband {
+   uint32_t aligned_width_px;
+   uint32_t layer_stride_el;
+   uint16_t width_px;
+   uint16_t height_px;
+   uint16_t tile_width_mask;
+   uint16_t tile_height_mask;
+};
+static_assert(sizeof(struct hk_g17p_image_sideband) == 16,
+              "the sideband fills the record tail exactly");
+
+static inline void
+hk_pack_g17p_image_sideband(struct hk_g17p_image_sideband *out,
+                            uint32_t width_px, uint32_t height_px,
+                            uint32_t tile_width_px, uint32_t tile_height_px,
+                            uint64_t layer_stride_B, uint32_t elem_size_B)
+{
+   out->aligned_width_px =
+      (width_px + tile_width_px - 1) & ~(tile_width_px - 1);
+   out->layer_stride_el = elem_size_B ? layer_stride_B / elem_size_B : 0;
+   out->width_px = width_px;
+   out->height_px = height_px;
+   out->tile_width_mask = tile_width_px - 1;
+   out->tile_height_mask = tile_height_px - 1;
+}
+
 struct hk_sampled_image_descriptor_layout {
    uint8_t texture;
    uint8_t sampler;

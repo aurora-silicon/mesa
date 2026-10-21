@@ -311,6 +311,74 @@ libagx_image_texel_address_gen9(
           (uint64_t)total_sa * bytes_per_sample_B;
 }
 
+static uint32_t
+libagx_twiddle_coordinates_gen9_masks(uint2 coord, uint32_t tile_w_mask,
+                                      uint32_t tile_h_mask,
+                                      uint32_t aligned_width_px)
+{
+   const uint32_t offs_x = coord.x & tile_w_mask;
+   const uint32_t offs_y = coord.y & tile_h_mask;
+   const uint32_t offset_within_tile_px =
+      libagx_spread_morton_16_gen9(offs_x) +
+      (libagx_spread_morton_16_gen9(offs_y) << 1);
+   const uint32_t tile_x = coord.x - offs_x;
+   const uint32_t tile_y = coord.y - offs_y;
+
+   /* tile_h is one more than its mask. */
+   return tile_y * aligned_width_px + tile_x * (tile_h_mask + 1u) +
+          offset_within_tile_px;
+}
+
+/* Variant of libagx_image_texel_address_gen9 for descriptors whose writer
+ * filled the decoded geometry sideband at record offset 80 (hk storage
+ * images).  The tile masks, aligned width and layer stride come straight
+ * from the sideband; only the native base/linear stride and the packed
+ * atomic word's level offset still need extracting.  Never called for
+ * multisampled images, whose tail is the eMRT aligned width instead. */
+uint64_t
+libagx_image_texel_address_gen9_sb(
+   constant const struct agx_pbe_gen9_packed *ptr,
+   constant const uint64_t *sw_ptr, uint4 coord, uint sample_idx,
+   uint bytes_per_sample_B, bool is_1d, bool is_layered, bool return_index)
+{
+   const uint64_t native01 =
+      (uint64_t)ptr->opaque[0] | ((uint64_t)ptr->opaque[1] << 32);
+   const uint64_t native23 =
+      (uint64_t)ptr->opaque[2] | ((uint64_t)ptr->opaque[3] << 32);
+   /* A linear PBE shortens the address to 40 bits and stores its row pitch
+    * minus 16 bytes at bit 40, see agx_pbe_agx3_2d_pack(). */
+   const bool linear = ((native01 >> 4) & 0x3u) == AGX_LAYOUT_LINEAR;
+   const uint64_t buffer =
+      (native23 & (linear ? 0xffffffffffUL : 0xfffffffffffUL)) << 4;
+   const uint linear_stride_B = (uint)((native23 >> 40) & 0x1fffffu) + 16;
+   const uint level_offset_B = (uint)(*sw_ptr & 0x7ffffffu) << 7;
+   constant const uint *sb =
+      (constant const uint *)((constant const char *)ptr +
+                              AGX_G17P_IMAGE_SIDEBAND_FROM_PBE);
+
+   uint total_px;
+   if (is_1d) {
+      total_px = coord.x;
+   } else if (linear) {
+      total_px = coord.y * (linear_stride_B / bytes_per_sample_B) + coord.x;
+   } else {
+      total_px = libagx_twiddle_coordinates_gen9_masks(
+         coord.xy, ((constant const ushort *)sb)[6],
+         ((constant const ushort *)sb)[7], sb[0]);
+   }
+
+   if (is_layered)
+      total_px += coord[is_1d ? 1 : 2] * sb[1];
+
+   /* samples_log2 is always zero here: multisampled images keep the
+    * dedicated eMRT path. */
+   const uint total_sa = total_px + sample_idx;
+   if (return_index)
+      return total_sa;
+
+   return (buffer + level_offset_B) + (uint64_t)total_sa * bytes_per_sample_B;
+}
+
 /* eMRT writes MS images through a linear PBE view. Its native descriptor
  * therefore cannot describe the source image's tile geometry. The private
  * eMRT sideband carries the original geometry and aligned pixel width. */

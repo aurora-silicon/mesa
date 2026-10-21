@@ -415,9 +415,10 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
       hk_storage_image_descriptor_layout(generation);
    bool supported = false;
    bool texture_supported = false;
+   const struct hk_image_view *view = NULL;
 
    if (info && info->imageView != VK_NULL_HANDLE) {
-      VK_FROM_HANDLE(hk_image_view, view, info->imageView);
+      view = hk_image_view_from_handle(info->imageView);
 
       /* Gate on what the PBE packer accepts (storage_pbe_valid carries every
        * real constraint) plus the shape limits of this fallback; any
@@ -471,6 +472,16 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
    if (stride >= AGX_G17P_IMAGE_ATOMIC_SW_OFFSET + sizeof(desc.atomic_sw))
       memcpy(packed + AGX_G17P_IMAGE_ATOMIC_SW_OFFSET, &desc.atomic_sw,
              sizeof(desc.atomic_sw));
+   /* The last sixteen bytes carry the CPU-decoded image geometry the
+    * compiler's image_sideband lowering reads back directly.  A view whose
+    * texture half is null keeps the zeroed tail, so the null paths are
+    * unchanged. */
+   if (stride >=
+          AGX_G17P_IMAGE_SIDEBAND_OFFSET + AGX_G17P_IMAGE_SIDEBAND_SIZE &&
+       view && texture_supported)
+      memcpy(packed + AGX_G17P_IMAGE_SIDEBAND_OFFSET,
+             &view->planes[0].storage_sideband,
+             sizeof(view->planes[0].storage_sideband));
    write_desc(set, binding, elem, packed, stride);
 }
 

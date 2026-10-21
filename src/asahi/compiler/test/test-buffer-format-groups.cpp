@@ -100,7 +100,7 @@ lower_buffer_shader(nir_shader *shader, bool sparse_feature = false)
 {
    nir_validate_shader(shader, "before buffer format groups");
    EXPECT_TRUE(agx_nir_lower_texture_with_buffer_metadata(
-      shader, 9, false, 0, sparse_feature));
+      shader, 9, false, 0, sparse_feature, false));
    bool progress;
    do {
       progress = nir_opt_constant_folding(shader);

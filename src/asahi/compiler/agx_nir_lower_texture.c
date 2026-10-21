@@ -41,6 +41,15 @@ struct agx_texture_lower_options {
     * the primary mapping, so nothing else delivers
     * sparseResidencyNonResidentStrict for these reads. */
    bool sparse_buffer_residency;
+
+   /* The driver writes the decoded image-geometry sideband at offset 80 of
+    * every 96-byte G17P storage-image record (AGX_G17P_IMAGE_SIDEBAND_*,
+    * agx_abi.h).  Image size and texel-address crawls may then load the
+    * fields directly instead of extracting them from the packed native
+    * words.  Only Honeykrisp writes it: the GL driver's records, the eMRT
+    * entries table and sampled-image records all leave the tail to other
+    * uses, so the flag is strictly opt-in. */
+   bool image_sideband;
 };
 
 static nir_def *
@@ -1354,12 +1363,67 @@ legalize_image_lod(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 }
 
 static nir_def *
+load_image_sideband(nir_builder *b, nir_def *descriptor, unsigned offset,
+                    unsigned bits)
+{
+   return nir_load_global_constant(b, 1, bits,
+      nir_iadd_imm(b, descriptor, offset), .align_mul = bits / 8);
+}
+
+/* Whether an image size query can read the CPU-decoded sideband instead of
+ * unpacking the native texture descriptor.  The sideband carries only width
+ * and height, so dims whose answer needs the depth/layer count stay on the
+ * native decode, as do texel buffers (their tail is buffer metadata) and
+ * multisampled images (the tail is the eMRT aligned width).
+ */
+static bool
+image_size_has_sideband(bool image_sideband, enum glsl_sampler_dim dim,
+                        bool is_array)
+{
+   return image_sideband && !is_array &&
+          (dim == GLSL_SAMPLER_DIM_1D || dim == GLSL_SAMPLER_DIM_2D);
+}
+
+/* The imageSize of a non-array 1D/2D image from the descriptor sideband.
+ * `desc` is the record's texture-descriptor address.  A null descriptor has
+ * a zeroed tail, and max(0 >> lod, 0) is the required zero, so the null path
+ * needs no extra select: for a valid view (w >= 1) the umax against w != 0 is
+ * the usual minification clamp, and for a zeroed tail every component is 0.
+ */
+static nir_def *
+image_size_sideband(nir_builder *b, nir_def *desc, nir_def *lod,
+                    unsigned nr_comps)
+{
+   nir_def *w = nir_u2u32(b, load_image_sideband(
+      b, desc, AGX_G17P_IMAGE_SIDEBAND_WIDTH, 16));
+   nir_def *h = nir_u2u32(b, load_image_sideband(
+      b, desc, AGX_G17P_IMAGE_SIDEBAND_HEIGHT, 16));
+   nir_def *lod32 = nir_u2u32(b, lod);
+
+   nir_def *comp[4] = {
+      nir_umax(b, nir_ushr(b, w, lod32), nir_b2i32(b, nir_ine_imm(b, w, 0))),
+      nir_umax(b, nir_ushr(b, h, lod32), nir_b2i32(b, nir_ine_imm(b, h, 0))),
+      nir_imm_int(b, 0),
+      nir_imm_int(b, 0),
+   };
+   return nir_vec(b, comp, nr_comps);
+}
+
+static nir_def *
 txs_for_image(nir_builder *b, nir_intrinsic_instr *intr,
-              unsigned num_components, unsigned bit_size, bool query_samples)
+              unsigned num_components, unsigned bit_size, bool query_samples,
+              const struct agx_texture_lower_options *options)
 {
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
    nir_def *lod = query_samples ? NULL : intr->src[1].ssa;
    nir_texop op = query_samples ? nir_texop_texture_samples : nir_texop_txs;
+
+   if (!query_samples &&
+       image_size_has_sideband(options && options->image_sideband, dim,
+                               nir_intrinsic_image_array(intr))) {
+      nir_def *desc = nir_load_from_texture_handle_agx(b, intr->src[0].ssa);
+      return image_size_sideband(b, desc, lod, num_components);
+   }
 
    nir_def *res =
       nir_build_tex(b, op, .texture_handle = intr->src[0].ssa, .lod = lod,
@@ -1378,7 +1442,8 @@ txs_for_image(nir_builder *b, nir_intrinsic_instr *intr,
 
 static nir_def *
 image_texel_address(nir_builder *b, nir_intrinsic_instr *intr,
-                    bool return_index, bool gen9, bool buffer_metadata)
+                    bool return_index, bool gen9, bool buffer_metadata,
+                    bool image_sideband)
 {
    /* First, calculate the address of the PBE descriptor */
    nir_def *desc_address =
@@ -1443,6 +1508,16 @@ image_texel_address(nir_builder *b, nir_intrinsic_instr *intr,
          return nir_iadd(
             b, base, nir_imul_imm(b, nir_u2u64(b, index),
                                   util_format_get_blocksize(format)));
+      }
+      if (image_sideband) {
+         /* The record's tail carries the decoded tile masks, aligned width
+          * and layer stride; only the native base address/linear stride and
+          * the packed word's level offset still need extracting. */
+         return libagx_image_texel_address_gen9_sb(
+            b, desc_address, sw_address, coord,
+            nir_u2u32(b, intr->src[2].ssa), blocksize_B,
+            nir_imm_bool(b, dim == GLSL_SAMPLER_DIM_1D),
+            nir_imm_bool(b, layered), nir_imm_bool(b, return_index));
       }
       return libagx_image_texel_address_gen9(
          b, desc_address, sw_address, coord, nir_u2u32(b, intr->src[2].ssa),
@@ -1606,7 +1681,8 @@ lower_image_load_robustness(nir_builder *b, nir_intrinsic_instr *intr, bool gen9
  * image, and select the view's out-of-bounds value after the fetch.
  */
 static void
-lower_g17p_formatless_image_load(nir_builder *b, nir_intrinsic_instr *intr)
+lower_g17p_formatless_image_load(nir_builder *b, nir_intrinsic_instr *intr,
+                                 bool image_sideband)
 {
    enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
    const bool is_array = nir_intrinsic_image_array(intr);
@@ -1614,10 +1690,18 @@ lower_g17p_formatless_image_load(nir_builder *b, nir_intrinsic_instr *intr)
    const bool cube = dim == GLSL_SAMPLER_DIM_CUBE;
 
    /* The size of a cube is that of one face, and a cube array counts cubes. */
-   nir_def *size =
-      nir_build_tex(b, nir_texop_txs, .texture_handle = intr->src[0].ssa,
-                    .lod = nir_imm_int(b, 0), .dim = dim, .is_array = is_array,
-                    .can_speculate = nir_instr_can_speculate(&intr->instr));
+   nir_def *size;
+   if (image_size_has_sideband(image_sideband, dim, is_array)) {
+      size = image_size_sideband(
+         b, nir_load_from_texture_handle_agx(b, intr->src[0].ssa),
+         nir_imm_int(b, 0), 3);
+   } else {
+      size =
+         nir_build_tex(b, nir_texop_txs, .texture_handle = intr->src[0].ssa,
+                       .lod = nir_imm_int(b, 0), .dim = dim,
+                       .is_array = is_array,
+                       .can_speculate = nir_instr_can_speculate(&intr->instr));
+   }
    if (cube) {
       nir_def *layers = is_array ? nir_channel(b, size, 2) : nir_imm_int(b, 6);
       size = nir_vec3(b, nir_channel(b, size, 0), nir_channel(b, size, 1),
@@ -1666,7 +1750,8 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, void *data)
           nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_MS &&
           nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_BUF &&
           intr->def.num_components == 4) {
-         lower_g17p_formatless_image_load(b, intr);
+         lower_g17p_formatless_image_load(
+            b, intr, options && options->image_sideband);
          b->cursor = nir_before_instr(&intr->instr);
       } else if (intr->intrinsic == nir_intrinsic_image_load ||
                  intr->intrinsic == nir_intrinsic_bindless_image_load ||
@@ -1696,13 +1781,14 @@ lower_images(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          &intr->def,
          txs_for_image(
             b, intr, intr->def.num_components, intr->def.bit_size,
-            intr->intrinsic == nir_intrinsic_bindless_image_samples));
+            intr->intrinsic == nir_intrinsic_bindless_image_samples, options));
       return true;
 
    case nir_intrinsic_bindless_image_texel_address:
       nir_def_rewrite_uses(&intr->def,
                            image_texel_address(b, intr, false, gen9,
-                                               options && options->buffer_metadata));
+                                               options && options->buffer_metadata,
+                                               options && options->image_sideband));
       return true;
 
    case nir_intrinsic_is_sparse_texels_resident:
@@ -2047,7 +2133,8 @@ static bool
 lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
               bool robust_formatless_images, bool robust_texel_fetch,
               uint64_t sparse_ro_offset, bool sparse_buffer_residency,
-              agx_buffer_texture_metadata_cb buffer_metadata_cb)
+              agx_buffer_texture_metadata_cb buffer_metadata_cb,
+              bool image_sideband)
 {
    bool progress = false;
    const bool gen9 = generation == 9;
@@ -2059,6 +2146,7 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
       .robust_texel_fetch = robust_texel_fetch,
       .sparse_ro_offset = sparse_ro_offset,
       .sparse_buffer_residency = sparse_buffer_residency,
+      .image_sideband = image_sideband && gen9,
    };
 
    nir_tex_src_type_constraints tex_constraints = {
@@ -2141,19 +2229,21 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
 bool
 agx_nir_lower_texture_for_generation(nir_shader *s, unsigned generation)
 {
-   return lower_texture(s, generation, false, false, true, 0, false, NULL);
+   return lower_texture(s, generation, false, false, true, 0, false, NULL,
+                        false);
 }
 
 bool
 agx_nir_lower_texture_with_buffer_metadata(nir_shader *s, unsigned generation,
                                            bool robust_formatless_images,
                                            uint64_t sparse_ro_offset,
-                                           bool sparse_buffer_residency)
+                                           bool sparse_buffer_residency,
+                                           bool image_sideband)
 {
    /* hk's image robustness covers both formatless loads and texel fetches. */
    return lower_texture(s, generation, true, robust_formatless_images,
                         robust_formatless_images, sparse_ro_offset,
-                        sparse_buffer_residency, NULL);
+                        sparse_buffer_residency, NULL, image_sideband);
 }
 
 bool
@@ -2162,7 +2252,7 @@ agx_nir_lower_texture_with_buffer_metadata_cb(
    agx_buffer_texture_metadata_cb buffer_metadata)
 {
    return lower_texture(s, generation, true, false, true, 0, false,
-                        buffer_metadata);
+                        buffer_metadata, false);
 }
 
 bool
@@ -2192,7 +2282,8 @@ lower_multisampled_store(nir_builder *b, nir_intrinsic_instr *intr,
          intr->src[1].ssa, nir_u2u32(b, intr->src[2].ssa),
          nir_imm_int(b, util_format_get_blocksize(nir_intrinsic_format(intr))));
    } else {
-      index_px = nir_u2u32(b, image_texel_address(b, intr, true, false, false));
+      index_px = nir_u2u32(b, image_texel_address(b, intr, true, false, false,
+                                                false));
    }
    nir_def *coord2d = coords_for_buffer_texture(b, index_px);
 
