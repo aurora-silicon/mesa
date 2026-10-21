@@ -548,13 +548,21 @@ static bool
 hk_g17p_compute_shader_supported(struct hk_shader *s,
                                  struct hk_linked_shader *linked)
 {
-   /* An API compute pipeline may carry its native constant program when it
-    * is inside the bounded protocol -- the compile keeps only that shape
-    * (hk_g17p_compile_cs_cprog()). Software graphics variants launched
-    * through CDM keep running preamble-free: their compiled stage is
-    * compute-adjacent but their VUNI layout is not a cprog contract. */
+   /* A CDM-launched kernel may carry its native constant program when it is
+    * inside the bounded protocol -- the compile keeps only that shape
+    * (hk_g17p_compile_cdm_cprog()). The constant program is a branch suffix
+    * on the dispatch's Ioto loader and the launch record carries no stage
+    * field, so a software TCS or the main GS program (which keeps the API
+    * geometry stage in both stage fields) is admitted exactly like compute:
+    * their uniform ranges come from the compute collector already. The
+    * software vertex variant stays preamble-free here: its VUNI layout is
+    * not the root ABI a constant program would read. */
    const bool native_preamble =
-      s && s->info.stage == MESA_SHADER_COMPUTE &&
+      s && (s->info.stage == MESA_SHADER_COMPUTE ||
+            (s->info.stage == MESA_SHADER_TESS_CTRL &&
+             s->b.info.stage == MESA_SHADER_TESS_CTRL) ||
+            (s->info.stage == MESA_SHADER_GEOMETRY &&
+             s->b.info.stage == MESA_SHADER_GEOMETRY)) &&
       hk_g17p_native_cprog_qualified(&s->b.info);
 
    /* poly_nir_lower_gs preserves the API geometry stage on the main kernel,

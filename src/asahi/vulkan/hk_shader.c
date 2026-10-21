@@ -3560,13 +3560,14 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
 }
 
 /*
- * The compute constant program is admitted by the same bounded native
+ * The CDM-launched constant program is admitted by the same bounded native
  * protocol as the vertex and fragment ones (hk_g17p_native_cprog_qualified()),
  * with the compile deciding launchability once, here: clone the NIR, flip the
  * clone key's no_preamble and ask for the native constant-program lowering,
- * and keep the clone only when the result is launchable. Compute compiles
- * with no_preamble in the ordinary key, so a decline needs no key fixup --
- * the plain compile produces the no-preamble + uniform-DMA binary.
+ * and keep the clone only when the result is launchable. Compute and the
+ * internal-graphics TCS/GS kernels compile with no_preamble in the ordinary
+ * key, so a decline needs no key fixup -- the plain compile produces the
+ * no-preamble (+ uniform-DMA, for compute) binary.
  *
  * The attempt is self-qualifying: when nothing is hoistable the kept compile
  * simply emits no preamble. A candidate whose constant program is outside
@@ -3579,8 +3580,8 @@ hk_g17p_compile_fs_cprog(nir_shader **nir, struct agx_shader_key *key,
  * `*nir` is untouched.
  */
 static bool
-hk_g17p_compile_cs_cprog(nir_shader **nir, const struct agx_shader_key *key,
-                         struct hk_shader *shader)
+hk_g17p_compile_cdm_cprog(nir_shader **nir, const struct agx_shader_key *key,
+                        struct hk_shader *shader, const char *what)
 {
    nir_shader *attempt = nir_shader_clone(NULL, *nir);
    if (!attempt)
@@ -3621,8 +3622,8 @@ hk_g17p_compile_cs_cprog(nir_shader **nir, const struct agx_shader_key *key,
 
       if (agx_get_compiler_debug() & AGX_DBG_SHADERDB) {
          fprintf(stderr,
-                 "HK G17P CS CProg: %s%s preamble=%uB inputs=%u tps=%uB "
-                 "gprs=%u staging=%u uniforms=%u main=%uB\n",
+                 "HK G17P %s CProg: %s%s preamble=%uB inputs=%u tps=%uB "
+                 "gprs=%u staging=%u uniforms=%u main=%uB\n", what,
                  declined ? "declined:"
                  : info->has_preamble ? "admitted" : "none",
                  declined ? declined : "",
@@ -3638,19 +3639,19 @@ hk_g17p_compile_cs_cprog(nir_shader **nir, const struct agx_shader_key *key,
          return true;
       }
 
-      mesa_logw("G17P compute constant program not launchable (%s): "
+      mesa_logw("G17P %s constant program not launchable (%s): "
                 "preamble=%uB tps=%uB inputs=%uB gprs=%u staging_known=%u "
                 "textures=%u samplers=%u; compiling without it",
-                declined, info->preamble_size, info->preamble_scratch_size,
+                what, declined, info->preamble_size, info->preamble_scratch_size,
                 info->agx3_preamble_inputs.storage_bytes,
                 info->nr_preamble_gprs, info->agx3_preamble_staging_known,
                 info->texture_state_count, info->sampler_state_count);
       free(shader->b.binary);
    } else {
       if (agx_get_compiler_debug() & AGX_DBG_SHADERDB)
-         fprintf(stderr, "HK G17P CS CProg: declined:%s\n", declined);
-      mesa_logw("G17P compute constant program failed to compile; "
-                "compiling without it");
+         fprintf(stderr, "HK G17P %s CProg: declined:%s\n", what, declined);
+      mesa_logw("G17P %s constant program failed to compile; "
+                "compiling without it", what);
    }
 
    memset(&shader->b, 0, sizeof(shader->b));
@@ -4278,19 +4279,38 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                          (!shader->info.agx3_gen1_fragment_rq ||
                           debug_get_bool_option("ASAHI_G17P_GRAPHICS_RQ_CPROG_DIAGNOSTIC", false));
    /* API compute pipelines get the same once-per-dispatch constant program.
-    * The sw_stage check keeps the poly software-VS/GS/TCS compute kernels
-    * out (their launch goes through the internal-graphics VUNI layout), and
-    * internal keeps the NIR-built meta/helper kernels preamble-free -- their
-    * TPS story is already special (has_scratch = !internal). */
+    * The sw_stage check keeps the poly software-VS compute kernel out (its
+    * launch goes through the internal-graphics VUNI layout), and internal
+    * keeps the NIR-built meta/helper kernels preamble-free -- their TPS
+    * story is already special (has_scratch = !internal). */
    const bool cs_cprog = agx_chip_native_preamble(dev->dev.chip) &&
                          sw_stage == MESA_SHADER_COMPUTE &&
                          nir->info.stage == MESA_SHADER_COMPUTE &&
                          !nir->info.internal;
+   /* The software TCS and the main GS program are also CDM launches, through
+    * the same program builder as compute, and the launch record has no stage
+    * field the constant program could collide with: it is a branch suffix on
+    * the dispatch's Ioto loader either way. Their uniform ABI is already the
+    * compute root-at-zero contract -- for every stage but the software
+    * vertex variant, hk_g17p_internal_graphics_uniform_ranges() delegates to
+    * the compute collector. The count/pre-GS helpers and the raster variant
+    * are out: they carry COMPUTE and VERTEX NIR stages respectively. */
+   const bool igfx_cprog = agx_chip_native_preamble(dev->dev.chip) &&
+      !nir->info.internal &&
+      ((sw_stage == MESA_SHADER_TESS_CTRL &&
+        nir->info.stage == MESA_SHADER_TESS_CTRL) ||
+       (sw_stage == MESA_SHADER_GEOMETRY &&
+        nir->info.stage == MESA_SHADER_GEOMETRY));
    bool compiled = vs_cprog &&
       hk_g17p_compile_vs_cprog(dev, &nir, &backend_key, shader);
    if (!compiled && cs_cprog &&
        debug_get_bool_option("ASAHI_CS_CPROG", true))
-      compiled = hk_g17p_compile_cs_cprog(&nir, &backend_key, shader);
+      compiled = hk_g17p_compile_cdm_cprog(&nir, &backend_key, shader, "CS");
+   if (!compiled && igfx_cprog &&
+       debug_get_bool_option("ASAHI_GFX_CPROG", true))
+      compiled = hk_g17p_compile_cdm_cprog(
+         &nir, &backend_key, shader,
+         sw_stage == MESA_SHADER_TESS_CTRL ? "TCS" : "GS");
    if (!compiled && agx_native_graphics(&dev->dev) &&
        nir->info.stage == MESA_SHADER_FRAGMENT && !backend_key.no_preamble)
       compiled = hk_g17p_compile_fs_cprog(&nir, &backend_key, shader);
