@@ -234,6 +234,27 @@ fuse_imad += [
     (('iadd', a, ('ishl(is_used_once)', b, '#c')), imad(b, ('ishl', 1, c), a)),
 ]
 
+# (x & m) << s == (x << s) & (m << s), bitwise-exact mod 2^32: pulling the
+# mask out of the shift exposes the scaled base (x << s) to CSE.  AGX3
+# threadgroup atomics take a 16-bit byte address in a register, so each
+# ((index + k) & 63) << 2 otherwise pays iadd+iand+shift; after the fold the
+# shifted iadd distributes to (index << 2) + (k << 2) via the generic
+# ishl(iadd) reassociation, sharing one (index << 2) across all the atomics
+# at iadd+iand each.  is_used_once keeps the rewrite from duplicating a
+# multiply-used mask or add.  The imadshl_agx(0, 1, x, s) shape is what the
+# fuse_imad rules above turn a constant ishl into.
+fuse_shift_mask = [
+    (('ishl', ('iand(is_used_once)', 'a@32', '#m'), '#s'),
+     ('iand', ('ishl', 'a', 's'), ('ishl', 'm', 's'))),
+    (('imadshl_agx', 0, 1, ('iand(is_used_once)', 'a@32', '#m'), '#s'),
+     ('iand', ('imadshl_agx', 0, 1, 'a', 's'), ('ishl', 'm', 's'))),
+
+    # The ishl(iadd) CSE reassociation, on the fused form: (x + k) << s ==
+    # (x << s) + (k << s).  Not upstream because imadshl_agx is a backend op.
+    (('imadshl_agx', 0, 1, ('iadd(is_used_once)', 'a@32', '#k'), '#s'),
+     ('iadd', ('imadshl_agx', 0, 1, 'a', 's'), ('ishl', 'k', 's'))),
+]
+
 # Discard lowering generates this pattern, clean it up
 ixor_bcsel = [
    (('ixor', ('bcsel', a, '#b', '#c'), '#d'),
@@ -441,7 +462,8 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
                                       fold_extract16_bfe).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
-                                      fuse_imad + ixor_bcsel +
+                                      fuse_imad + fuse_shift_mask +
+                                      ixor_bcsel +
                                       fold_aligned_bounds + fold_byte_swap +
                                       fold_selected_f2i32).render())
 
