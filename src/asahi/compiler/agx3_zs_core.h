@@ -73,6 +73,12 @@ extern "C" {
  */
 #define AGX3_ZS_KILL_ALL_SAMPLES 0xFFFFFF00u
 
+/* Bit 2 of the agx3 sample-mask pseudo's flag operand: the staged coverage
+ * word is the 32-bit constant in imm[63:32] rather than a register source.
+ * Pack writes it with the ldimm.ep2 staging form and src[1] is a sentinel
+ * immediate (mirroring src[0]'s `1`) instead of a GPR. */
+#define AGX3_SAMPLE_MASK_CONST_WORD (UINT64_C(1) << 2)
+
 struct agx3_zs_desc {
    /* Half-register index of the staged writeout word. 32-bit, so even. */
    uint16_t value;

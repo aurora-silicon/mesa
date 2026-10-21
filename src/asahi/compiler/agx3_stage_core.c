@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "agx3_binder.h"
+#include "agx3_pack.h"
 #include "agx3_tex_core.h"
 
 #define KV(f, v) {(uint16_t)(f), (uint64_t)(v)}
@@ -178,6 +179,36 @@ agx3_stage_copy_liveness(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
          return true;
    }
    return false;
+}
+
+bool
+agx3_stage_ldimm(enum agx_isa_encoding enc, uint16_t dest, uint32_t imm,
+                 uint8_t slot, uint8_t out[AGX3_STAGE_MAX_LENGTH],
+                 uint8_t *len)
+{
+   if (out == NULL || len == NULL)
+      return false;
+   memset(out, 0, AGX3_STAGE_MAX_LENGTH);
+   *len = 0;
+
+   /* Both witnesses are staging[0]; the destination field of this form is
+    * unverified anywhere else, as are slots past 2 and every wait bit. */
+   if (enc != AGX_ISA_ENCODING_AGX3B || dest != 0 ||
+       (slot != 1 && slot != 2))
+      return false;
+
+   /* The low eight bytes are the ordinary LDIMM of the same immediate;
+    * staging adds the f16/f21 marker bits and a trailing slot byte. */
+   struct agx3_encoded_ldimm general;
+   if (!agx3_pack_ldimm_u32(enc, 0, imm, &general) || general.length != 8)
+      return false;
+
+   memcpy(out, general.bytes, 8);
+   out[2] |= 0x21;
+   out[8] = 0x40;
+   out[9] = (slot == 2) ? 0x20 : 0x00;
+   *len = 10;
+   return true;
 }
 
 bool
