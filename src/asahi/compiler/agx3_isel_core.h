@@ -127,6 +127,17 @@ bool agx3_isel_encode(enum agx_isa_encoding encoding,
                       const struct agx3_isel_desc *desc,
                       uint8_t out[AGX3_ISEL_MAX_LENGTH], uint8_t *len);
 
+/* The flag-destination isel: `flag[slot] = (cmp0 cond cmp1) ?
+ * truth(sel_true) : truth(sel_false)` on the ep23 family endpoints, which
+ * carry no GPR destination. desc.dest/dest_cache are ignored; dest_16
+ * selects the 16-bit (ep23/31) or 32-bit (ep24/32) operand-width form.
+ * Apple emits this ahead of a cndlt/cndst consuming the published slot in
+ * place of a select plus a standalone compare. */
+bool agx3_isel_flag_publish(enum agx_isa_encoding encoding,
+                            const struct agx3_isel_desc *desc,
+                            unsigned flag_slot,
+                            uint8_t out[AGX3_ISEL_MAX_LENGTH], uint8_t *len);
+
 /* G17P condition 3 is a nonzero mask test. Fresh mask1/2/4 witnesses pin
  * f49 and f106; selected-negation contrasts pin f78/f95. The quadrant
  * lowering uses these fused selects, not a branch or a separate bit test. */
