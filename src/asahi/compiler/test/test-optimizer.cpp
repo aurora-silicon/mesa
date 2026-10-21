@@ -130,7 +130,7 @@ TEST_F(Optimizer, G17PPreservesHalfNotAfterBitwise)
    }
 }
 
-TEST_F(Optimizer, G17PPreservesNarrowingAfterAdd)
+TEST_F(Optimizer, G17PFoldsNarrowingIntoAdd)
 {
    agx_builder *actual = agx_test_builder(mem_ctx);
    agx_builder *expected = agx_test_builder(mem_ctx);
@@ -139,16 +139,17 @@ TEST_F(Optimizer, G17PPreservesNarrowingAfterAdd)
    actual->shader->key = &key;
    expected->shader->key = &key;
 
+   /* The f2f16 folds back into the producer: AGX3B writes a half
+    * destination on f32add directly through the f10 width field (w04). */
    agx_index sum = agx_temp(actual->shader, AGX_SIZE_32);
    agx_fadd_to(actual, sum, wx, wy);
    agx_index narrowed = agx_temp(actual->shader, AGX_SIZE_16);
    agx_fmov_to(actual, narrowed, sum);
    agx_unit_test(actual, narrowed);
 
-   sum = agx_temp(expected->shader, AGX_SIZE_32);
-   agx_fadd_to(expected, sum, wx, wy);
+   agx_temp(expected->shader, AGX_SIZE_32);
    narrowed = agx_temp(expected->shader, AGX_SIZE_16);
-   agx_fmov_to(expected, narrowed, sum);
+   agx_fadd_to(expected, narrowed, wx, wy);
    agx_unit_test(expected, narrowed);
 
    agx_optimize_and_dce(actual->shader);

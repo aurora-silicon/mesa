@@ -204,6 +204,120 @@ agx_can_fold_half_uniform(const agx_instr *I, agx_instr **defs)
    return half_uniforms == 1 && full_gpr;
 }
 
+/*
+ * AGX3B composes a 16-bit source on the f32 ALU slots: f43 on the f35
+ * slot, f26 on f18 and f60 on the f32fma addend, grounded per the fp16
+ * probe corpus. Whether folding an f2f32 move into consumer slot s
+ * produces an encodable instruction depends on the op, the slot, the
+ * other operands and the destination width. Only the witnessed
+ * combinations are admitted:
+ *
+ *    f32add: src0-16 (w01/w21), src1-16 with a negate (w19), a single
+ *            saturated 16-bit source (w25), or src0-16 under a narrow
+ *            destination (w23). Both sources narrow is unwitnessed.
+ *    f32mul: either source 16-bit, including both (w02/w07), and one
+ *            16-bit source under a narrow destination (the existing
+ *            fmul_mixed_half endpoint). No modifiers or saturate beside
+ *            a narrow operand.
+ *    f32fma: src0-16 (w08), src0+src1 16-bit (w03), addend-16 (w09),
+ *            and a 16-bit multiplicand beside a minifloat multiplier
+ *            (w22). A lone 16-bit src1, a 16-bit addend beside a narrow
+ *            multiplicand, a narrow destination, or saturation beside a
+ *            narrow operand are unwitnessed.
+ *
+ * A negated 16-bit source is grounded on f32add (f48+f43 or f31+f26)
+ * and on the f32fma addend (f65+f60) only; no absolute modifier is
+ * witnessed beside a 16-bit operand.
+ *
+ * Because the sources are visited in order, a candidate that follows a
+ * source already folded to 16 bits sees the post-fold width; the
+ * combination checks therefore only need the current instruction.
+ */
+static bool
+agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
+                          const agx_index h)
+{
+   const agx_index to = ins->src[s];
+
+   /* A plain scalar half register is the only source the witnessed
+    * width slots take. */
+   if ((h.type != AGX_INDEX_NORMAL && h.type != AGX_INDEX_REGISTER) ||
+       h.memory || agx_channels(h) != 1)
+      return false;
+
+   /* No absolute modifier is witnessed beside a 16-bit operand. */
+   if (h.abs || to.abs)
+      return false;
+
+   const bool narrow = ins->dest[0].size == AGX_SIZE_16;
+   const bool neg = to.neg ^ h.neg;
+
+   /* Every other operand must keep the instruction on a witnessed
+    * route: an immediate or a uniform beside a 16-bit register exists
+    * only as the f32fma immediate-multiplier form (w22). */
+   for (unsigned i = 0; i < ins->nr_srcs; ++i) {
+      if (i == s)
+         continue;
+      const agx_index o = ins->src[i];
+      if (o.type == AGX_INDEX_NORMAL || o.type == AGX_INDEX_REGISTER)
+         continue;
+      if (ins->op == AGX_OPCODE_FFMA && s < 2 && i < 2 &&
+          o.type == AGX_INDEX_IMMEDIATE && !o.memory)
+         continue;
+      return false;
+   }
+
+   switch (ins->op) {
+   case AGX_OPCODE_FADD: {
+      const agx_index other = ins->src[1 - s];
+      if (other.size == AGX_SIZE_16)
+         return false; /* two 16-bit add sources are unwitnessed */
+      if (narrow)
+         /* w23: a clean 16-bit f35-side source under a narrow dest. */
+         return s == 0 && !neg && !other.neg && !other.abs &&
+                other.size == AGX_SIZE_32 && !ins->saturate;
+      if (ins->saturate)
+         /* w25: the saturated 16-bit source composes only with no
+          * other modifier present. */
+         return !neg && !other.neg && !other.abs;
+      return true;
+   }
+   case AGX_OPCODE_FMUL: {
+      const agx_index other = ins->src[1 - s];
+      if (ins->saturate || neg || other.neg || other.abs)
+         return false;
+      if (narrow)
+         /* fmul_mixed_half: one 16-bit source against a 32-bit one. */
+         return other.size == AGX_SIZE_32;
+      return true;
+   }
+   case AGX_OPCODE_FFMA:
+      if (ins->saturate || narrow)
+         return false;
+      if (s == 2) {
+         /* w09: a 16-bit addend, including negated (f65+f60), only
+          * beside two 32-bit register multiplicands. */
+         return ins->src[0].size == AGX_SIZE_32 &&
+                ins->src[1].size == AGX_SIZE_32;
+      }
+      if (ins->src[2].type != AGX_INDEX_NORMAL &&
+          ins->src[2].type != AGX_INDEX_REGISTER)
+         return false;
+      if (ins->src[2].size != AGX_SIZE_32)
+         return false; /* a 16-bit addend beside a narrow multiplier */
+      if (s == 0)
+         /* w08/w03: src0-16 with a 32 or 16-bit src1. */
+         return !neg;
+      /* s == 1: f26 is grounded beside f43 (w03) or a minifloat src0
+       * (w22), never alone beside a 32-bit f35. */
+      return !neg &&
+             (ins->src[0].type == AGX_INDEX_IMMEDIATE ||
+              ins->src[0].size == AGX_SIZE_16);
+   default:
+      return false;
+   }
+}
+
 static void
 agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
 {
@@ -233,19 +347,19 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
       if (src.size == AGX_SIZE_16 && def->src[0].size == AGX_SIZE_32)
          continue;
 
-      /* G17P does not have generally grounded f32 arithmetic over an f16
-       * register.  FMUL has a few native mixed endpoints, but their combined
-       * producer-wait/lifetime domain is intentionally narrow.  Preserve the
-       * explicit exact widening for ordinary full-width arithmetic; native
-       * patterns such as the scalar-half sqrt are emitted without an fmov and
-       * therefore remain available. */
+      /* AGX3B composes a 16-bit register onto the f32 ALU source slots
+       * (f43/f26/f60), so an f2f32 move folds into the witnessed
+       * width-composed endpoints instead of materializing a widened
+       * temporary. The uniform path stays as before; a register half is
+       * admitted only on the grounded combinations. */
       if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
           (ins->op == AGX_OPCODE_FADD || ins->op == AGX_OPCODE_FMUL ||
            ins->op == AGX_OPCODE_FFMA) &&
           src.size == AGX_SIZE_32 && def->src[0].size == AGX_SIZE_16 &&
           !(def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg &&
-            agx_can_fold_half_uniform(ins, defs)))
+            agx_can_fold_half_uniform(ins, defs)) &&
+          !agx3b_f32_src_admits_half(ins, s, def->src[0]))
          continue;
 
       /* FLTNORM and RGB10A2 packing have only captured f32 sources. Keep
@@ -444,6 +558,36 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          if (!agx_minifloat_exact(f))
             continue;
 
+         /* Only the witnessed narrow-destination immediate forms encode:
+          * an all-immediate FADD folds to a move, a narrowing FADD names
+          * -0.0 beside a 32-bit register, and FMUL scales a plain 32-bit
+          * register by a minifloat; no half-destination FFMA takes an
+          * immediate at all. Every other half-destination FADD/FMUL/FFMA
+          * substitution reaches the packer unencodable and refuses the
+          * whole shader (rtpipe-all, ftex-bias-4, ftex-offlod-3). Keep the
+          * move in that case; other operations and destination widths are
+          * unchanged. */
+         if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_16 &&
+             (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+              I->op == AGX_OPCODE_FFMA)) {
+            const agx_index *other =
+               I->nr_srcs == 2 ? &I->src[s ^ 1] : NULL;
+            const bool narrow_imm_form =
+               (I->op == AGX_OPCODE_FADD && other != NULL &&
+                ((other->type == AGX_INDEX_IMMEDIATE && !other->memory &&
+                  !other->abs && !other->neg) ||
+                 (f == 0.0f && signbit(f) &&
+                  other->type != AGX_INDEX_IMMEDIATE && !other->memory &&
+                  !other->abs && (!other->neg || !I->saturate) &&
+                  other->size == AGX_SIZE_32))) ||
+               (I->op == AGX_OPCODE_FMUL && !I->saturate &&
+                other != NULL && other->type != AGX_INDEX_IMMEDIATE &&
+                !other->memory && !other->abs &&
+                other->size == AGX_SIZE_32);
+            if (!narrow_imm_form)
+               continue;
+         }
+
          /* Both halves of a tied minimum/maximum, or neither. */
          if (s < 2 && agx_g17p_tied_minmax(ctx, I))
             I->src[s + 2] = agx_immediate_f(f);
@@ -499,6 +643,70 @@ agx_optimizer_not(agx_context *ctx, agx_instr *I, agx_instr *use)
    return true;
 }
 
+/* Whether an f32 producer may write a half destination directly on
+ * AGX3B -- the witnessed f10 narrow forms only:
+ *
+ *    f32mul: two plain 32-bit registers (w14), or one 16-bit register
+ *            against a 32-bit one (the fmul_mixed_half endpoint).
+ *    f32add: two registers, no absolute modifier, at most one negated
+ *            input (w04/w26); a 16-bit source only unmodified in the
+ *            f35 slot (w23), and never a 16-bit f18 source.
+ *    f32fma: three plain 32-bit registers (w05).
+ *
+ * Saturation beside a narrow destination is unwitnessed on all three.
+ */
+static bool
+agx3b_f32_dest_admits_narrow(const agx_instr *I)
+{
+   if (I->saturate || I->nr_dests != 1)
+      return false;
+
+   switch (I->op) {
+   case AGX_OPCODE_FMUL:
+      if (I->nr_srcs != 2)
+         return false;
+      for (unsigned i = 0; i < 2; ++i)
+         if (I->src[i].abs || I->src[i].neg || I->src[i].memory ||
+             (I->src[i].type != AGX_INDEX_NORMAL &&
+              I->src[i].type != AGX_INDEX_REGISTER))
+            return false;
+      if (I->src[0].size == AGX_SIZE_16 &&
+          I->src[1].size == AGX_SIZE_16)
+         return false;
+      return I->src[0].size == AGX_SIZE_32 ||
+             I->src[1].size == AGX_SIZE_32;
+   case AGX_OPCODE_FADD:
+      if (I->nr_srcs != 2)
+         return false;
+      for (unsigned i = 0; i < 2; ++i)
+         if (I->src[i].abs || I->src[i].memory ||
+             (I->src[i].type != AGX_INDEX_NORMAL &&
+              I->src[i].type != AGX_INDEX_REGISTER))
+            return false;
+      if (I->src[0].neg && I->src[1].neg)
+         return false;
+      if (I->src[1].size == AGX_SIZE_16)
+         return false;
+      if (I->src[0].size == AGX_SIZE_16 &&
+          (I->src[0].neg || I->src[1].neg))
+         return false;
+      return I->src[0].size != AGX_SIZE_16 ||
+             I->src[1].size == AGX_SIZE_32;
+   case AGX_OPCODE_FFMA:
+      if (I->nr_srcs != 3)
+         return false;
+      for (unsigned i = 0; i < 3; ++i)
+         if (I->src[i].size != AGX_SIZE_32 || I->src[i].abs ||
+             I->src[i].neg || I->src[i].memory ||
+             (I->src[i].type != AGX_INDEX_NORMAL &&
+              I->src[i].type != AGX_INDEX_REGISTER))
+            return false;
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
 {
@@ -525,23 +733,15 @@ agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
    if (I->dest[0].size == AGX_SIZE_16 && use->dest[0].size == AGX_SIZE_32)
       return false;
 
-   /* G17P only has a corpus-grounded direct f32 operation with an f16
-    * destination for FMUL.  Keep an explicit f32-to-f16 move after ADD/FMA
-    * and the remaining float operations so each rounds exactly once through
-    * the native narrowing form instead of creating an unencodable mixed-width
-    * producer. */
+   /* AGX3B narrows an f32 result into a half destination on f32add
+    * (w04/w23/w26), f32mul (w14 and the grounded mixed-half endpoint)
+    * and f32fma (w05), all through the f10 destination width field.
+    * Keep an explicit f32-to-f16 move after everything else so each
+    * remaining producer rounds exactly once through the native
+    * narrowing form. */
    if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        I->dest[0].size == AGX_SIZE_32 && use->dest[0].size == AGX_SIZE_16 &&
-       I->op != AGX_OPCODE_FMUL)
-      return false;
-
-   /* ...and that narrowing FMUL takes plain registers only: a multiply that
-    * already carries |x| or -x on a source keeps its explicit f32-to-f16
-    * move (Skia's conic/quad edge shaders narrow abs(f) * rsqrt(g)). */
-   if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-       I->op == AGX_OPCODE_FMUL && I->dest[0].size == AGX_SIZE_32 &&
-       use->dest[0].size == AGX_SIZE_16 &&
-       (I->src[0].abs || I->src[0].neg || I->src[1].abs || I->src[1].neg))
+       !agx3b_f32_dest_admits_narrow(I))
       return false;
 
    /* saturate(saturate(x)) = saturate(x) */

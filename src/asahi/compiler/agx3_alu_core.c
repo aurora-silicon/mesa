@@ -4471,6 +4471,54 @@ agx3_alu_hfma_addend_minifloat(
    return false;
 }
 
+/* Native scalar half FMA with an 8-bit minifloat multiplicand. The
+ * immediate is deposited in f33 with f41=1 selecting it on the f34 slot;
+ * a negated multiplier carries its own sign in bit 7 of the immediate
+ * (w06b 0.5h, w16 2.0h, w17 -0.5h). The register multiplicand stays in
+ * f17 and the register addend in f51, both with their lifetime hints. */
+bool
+agx3_alu_hfma_mul_minifloat(
+   enum agx_isa_encoding enc, uint16_t dest, uint16_t reg,
+   uint16_t immediate, uint16_t addend,
+   enum agx3_alu_hint hint_reg, enum agx3_alu_hint hint_add,
+   bool dest_cache, uint16_t wait_mask,
+   uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
+{
+   if (enc != AGX_ISA_ENCODING_AGX3B || !out || !len ||
+       dest >= 256 || reg >= 256 || addend >= 256 ||
+       immediate > UINT8_MAX || (wait_mask & ~UINT16_C(0x3f)) ||
+       (unsigned)hint_reg > AGX3_ALU_HINT_CACHE ||
+       (unsigned)hint_add > AGX3_ALU_HINT_CACHE)
+      return false;
+
+   const struct agx3_field_kv base[] = {
+      {9, 2}, {10, 1}, {24, 2}, {25, 1},
+      {41, 1}, {42, 1}, {58, 2}, {59, 1},
+   };
+   struct agx3_field_kv fields[15] = {
+      {2, dest}, {17, reg}, {33, immediate}, {51, addend},
+      {11, dest_cache},
+      {26, hint_reg == AGX3_ALU_HINT_CACHE},
+      {28, hint_reg == AGX3_ALU_HINT_DISCARD},
+      {60, hint_add == AGX3_ALU_HINT_CACHE},
+      {62, hint_add == AGX3_ALU_HINT_DISCARD},
+   };
+   for (unsigned i = 0; i < 6; ++i)
+      fields[9 + i] =
+         (struct agx3_field_kv){68 + i, !!(wait_mask & (1u << i))};
+
+   /* ep3 carries one selected wait; the extended endpoints carry a mask. */
+   const unsigned first_ep =
+      wait_mask && (wait_mask & (wait_mask - 1)) ? 4 : 3;
+   for (unsigned ep = first_ep; ep < 6; ++ep) {
+      if (agx3_bind_compose(enc, "f16fma", ep, base, 8, fields, 15, out,
+                            len))
+         return true;
+   }
+
+   return false;
+}
+
 /* Exact half-to-float widening uses native mixed-width ADD with negative zero. */
 bool
 agx3_alu_widen_half(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
