@@ -8024,6 +8024,9 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
    /* The pack lowering above mints f2f16(f2f32) round-trips; fold them. */
    NIR_PASS(_, nir, agx_nir_fold_pack_roundtrip);
+   /* Fuse a widened fp16 product into the f32fma the 16-bit source slots
+    * encode natively; the inexact widening keeps the unrounded product. */
+   NIR_PASS(_, nir, agx_nir_fuse_fp16_fma);
    NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
    NIR_PASS(_, nir, agx_nir_fuse_selects);
    NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -10448,6 +10451,14 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p)
    else
       NIR_PASS(_, nir, agx_nir_lower_subgroups);
    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
+
+   /* AGX3B consumes a 16-bit register in place on the f32 ALU source
+    * slots, so an explicit float(f16(x)) operand costs nothing when the
+    * rounded half survives to the backend. The optimization loop's
+    * inexact f2f32(f2f16) collapse takes the f16 def with it; pin the
+    * widenings feeding those ALU forms first. */
+   if (g17p)
+      NIR_PASS(_, nir, agx_nir_pin_fp16_widen);
 
    /* After lowering, run through the standard suite of NIR optimizations. We
     * will run through the loop later, once we have the shader key, but if we
