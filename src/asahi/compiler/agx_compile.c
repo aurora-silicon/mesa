@@ -7378,6 +7378,14 @@ agx_udivmod64(nir_builder *b, nir_def *n, nir_def *d,
          nir_phi_instr_add_src(phi_dn, entry, dn0);
          nir_phi_instr_add_src(phi_i, entry, trip);
 
+         /* Test the trip count at the top of the loop, not the bottom:
+          * the break edge leaves the header block, so the phis must
+          * already hold the post-update state when the loop exits.  A
+          * bottom test would exit with the iteration-start values and
+          * drop the final quotient bit.  trip >= 1 inside the branch, so
+          * the first test never exits early. */
+         nir_break_if(b, nir_ieq_imm(b, &phi_i->def, 0));
+
          nir_def *ge = nir_uge(b, &phi_n->def, &phi_dn->def);
          nir_def *n_next =
             nir_bcsel(b, ge, nir_isub(b, &phi_n->def, &phi_dn->def),
@@ -7387,7 +7395,6 @@ agx_udivmod64(nir_builder *b, nir_def *n, nir_def *d,
                     nir_b2i64(b, ge));
          nir_def *dn_next = nir_ushr_imm(b, &phi_dn->def, 1);
          nir_def *i_next = nir_iadd_imm(b, &phi_i->def, -1);
-         nir_break_if(b, nir_ieq_imm(b, i_next, 0));
 
          nir_block *tail = nir_loop_last_block(loop);
          nir_phi_instr_add_src(phi_n, tail, n_next);
@@ -7395,6 +7402,10 @@ agx_udivmod64(nir_builder *b, nir_def *n, nir_def *d,
          nir_phi_instr_add_src(phi_dn, tail, dn_next);
          nir_phi_instr_add_src(phi_i, tail, i_next);
 
+         /* Insert the phis only now that every source is attached: the
+          * insert registers the def/use links for all sources at once.
+          * They land at the head of the loop's first block, ahead of the
+          * exit test's compare. */
          b->cursor = nir_before_block(nir_loop_first_block(loop));
          nir_builder_instr_insert(b, &phi_i->instr);
          nir_builder_instr_insert(b, &phi_dn->instr);
@@ -7403,8 +7414,8 @@ agx_udivmod64(nir_builder *b, nir_def *n, nir_def *d,
       }
       nir_pop_loop(b, loop);
 
-      /* The loop phis hold the last iteration's values: the quotient and
-       * the remainder. */
+      /* Exiting through the top test leaves the header phis holding the
+       * last iteration's results: the quotient and the remainder. */
       q_then = &phi_q->def;
       r_then = &phi_n->def;
    }
