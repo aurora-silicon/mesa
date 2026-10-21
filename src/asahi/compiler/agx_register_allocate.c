@@ -4419,11 +4419,12 @@ agx_ra(agx_context *ctx)
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        !getenv("AGX_RA_NORECOLOR")) {
       BITSET_WORD *constrained = BITSET_CALLOC(ctx->alloc);
-      BITSET_OR(constrained, constrained, low_gpr);
-      BITSET_OR(constrained, constrained, texture_gpr);
-      BITSET_OR(constrained, constrained, log2_gpr);
-      BITSET_OR(constrained, constrained, high_gpr);
-      BITSET_OR(constrained, constrained, tex_low128);
+      const unsigned constrained_words = BITSET_WORDS(ctx->alloc);
+      __bitset_or(constrained, constrained, low_gpr, constrained_words);
+      __bitset_or(constrained, constrained, texture_gpr, constrained_words);
+      __bitset_or(constrained, constrained, log2_gpr, constrained_words);
+      __bitset_or(constrained, constrained, high_gpr, constrained_words);
+      __bitset_or(constrained, constrained, tex_low128, constrained_words);
       agx_recolor_merge_joins(ctx, ncomps, classes, max_regs, constrained);
       free(constrained);
    }
