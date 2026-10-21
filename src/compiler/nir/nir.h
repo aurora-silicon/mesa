@@ -7074,6 +7074,8 @@ bool nir_opt_generate_bfi(nir_shader *shader);
 
 bool nir_opt_idiv_const(nir_shader *shader, unsigned min_bit_size);
 
+bool nir_opt_load_after_store(nir_shader *shader);
+
 bool nir_opt_mqsad(nir_shader *shader);
 
 typedef enum {
