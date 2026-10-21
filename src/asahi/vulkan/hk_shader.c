@@ -4094,7 +4094,8 @@ hk_g17p_pbe_record(nir_builder *b, nir_scalar s)
 
    nir_op op = nir_scalar_alu_op(s);
    nir_scalar x = nir_scalar_chase_alu_src(s, 0);
-   nir_scalar y = nir_scalar_chase_alu_src(s, 1);
+   nir_scalar y = nir_scalar_chase_alu_src(
+      s, nir_op_infos[op].num_inputs > 1 ? 1 : 0);
 
    switch (op) {
    case nir_op_iadd: {
