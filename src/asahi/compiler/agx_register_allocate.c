@@ -712,11 +712,13 @@ insert_copy(struct ra_ctx *rctx, struct util_dynarray *copies, unsigned new_reg,
 /* Chooses a region of `count` halves inside [minimum, limit) that
  * assign_regs_by_copying() can free by relocating whole values.  Returns false
  * when no such region exists, which the caller retries with the half-victim
- * restriction lifted before it gives up. */
+ * restriction lifted before it gives up. Reports the number of relocation
+ * copies the chosen region costs. */
 static bool
 find_constrained_region(struct ra_ctx *rctx, unsigned count, unsigned minimum,
                         unsigned limit, bool avoid_half_copies,
-                        unsigned *base_out, unsigned *span_out)
+                        unsigned *base_out, unsigned *span_out,
+                        unsigned *moves_out)
 {
    unsigned best = ~0u, best_moves = ~0u, best_span = 0;
 
@@ -783,6 +785,159 @@ find_constrained_region(struct ra_ctx *rctx, unsigned count, unsigned minimum,
 
    *span_out = best_span;
    *base_out = best;
+   if (moves_out)
+      *moves_out = best_moves;
+   return true;
+}
+
+/*
+ * Validate [base, base + span) as a collect-coherent victim region and
+ * count the relocation copies evicting it costs, the same rule
+ * find_constrained_region() applies: every occupant must be a whole value
+ * fully inside the region, unbanked and modelable. Returns false on a
+ * boundary-straddling, bank-constrained, or unrecoverable occupant.
+ */
+static bool
+collect_region_cost(struct ra_ctx *rctx, unsigned base, unsigned span,
+                    unsigned *moves_out)
+{
+   unsigned moves = 0;
+
+   for (unsigned reg = reserved_size(rctx->shader); reg < base + span;) {
+      if (!BITSET_TEST(rctx->used_regs[RA_GPR], reg)) {
+         ++reg;
+         continue;
+      }
+
+      unsigned ssa = rctx->reg_to_ssa[reg];
+      unsigned n = rctx->ncomps[ssa];
+
+      /* A half whose owner is not recoverable -- interior halves of a
+       * relocated value can carry a stale owner until something else lands
+       * -- cannot be evicted coherently, so reject the region outright. */
+      if (!n || rctx->ssa_to_reg[ssa] != reg)
+         return false;
+
+      if (reg < base) {
+         /* Straddling the region start makes the victim unevictable. */
+         if (reg + n > base)
+            return false;
+         reg += n;
+         continue;
+      }
+
+      /* As does straddling the region end. */
+      if (reg + n > base + span)
+         return false;
+
+      if (ssa_has_bank_constraint(rctx, ssa))
+         return false;
+
+      moves += n / agx_size_align_16(rctx->sizes[ssa]);
+      reg += n;
+   }
+
+   *moves_out = moves;
+   return true;
+}
+
+/*
+ * If `dest` is a source of a collect that will marshal it into a
+ * contiguous operand, choose a victim region coherent with the collect's
+ * layout and return its base. This lets assign_regs_by_copying() place
+ * materialization temporaries directly in their collect slots instead of
+ * scattering them: today a uniform vec4 feeding an SCS or texture operand
+ * costs u->tmp->home->slot triple hops per element, eleven moves, while a
+ * coalesced placement needs one move per element plus the slot's own
+ * eviction.
+ *
+ * The collect destination positions are the interesting object: element i
+ * of the collect goes to collect_base + i*width. The sources are normally
+ * allocated before the collect, so a source's victim region is steered to
+ * exactly its slot on a chosen collect grid; later sources converge on the
+ * same grid because it already holds the most siblings, and the collect
+ * itself coalesces onto it through the ordinary affinity and early-kill
+ * paths.
+ */
+static bool
+find_collect_region(struct ra_ctx *rctx, agx_index dest, const agx_instr *I,
+                    unsigned minimum, unsigned limit, unsigned *place_out,
+                    unsigned *moves_out, unsigned *saves_out)
+{
+   if (rctx->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ra_class_for_index(dest) != RA_GPR ||
+       I->op == AGX_OPCODE_COLLECT)
+      return false;
+
+   /* Skip when the collect is already allocated or when this value lives
+    * past the collect -- then the slot position gains nothing. */
+   const agx_instr *collect = rctx->src_to_collect_phi[dest.value];
+   if (!collect || collect->op != AGX_OPCODE_COLLECT ||
+       collect->dest[0].type != AGX_INDEX_NORMAL ||
+       BITSET_TEST(rctx->visited, collect->dest[0].value))
+      return false;
+
+   unsigned our_source = ~0u;
+   agx_foreach_ssa_src(collect, s) {
+      if (agx_is_equiv(collect->src[s], dest)) {
+         our_source = s;
+         break;
+      }
+   }
+   if (our_source == ~0u || !collect->src[our_source].kill)
+      return false;
+
+   unsigned count = rctx->ncomps[dest.value];
+   unsigned width = agx_size_align_16(collect->src[our_source].size);
+   if (count != width)
+      return false;
+
+   /* The collect destination claims ncomps halves; that is the extent a
+    * coherent grid must fit, and the alignment it snaps to. The victim
+    * region itself is only this source's own slot. */
+   unsigned span = rctx->ncomps[collect->dest[0].value];
+   unsigned cmin = dest_minimum(rctx, collect, 0);
+   unsigned clim = dest_limit(rctx, collect, 0);
+
+   unsigned best_place = ~0u, best_moves = ~0u, best_saves = 0;
+   for (unsigned base = ALIGN_POT(cmin, span); base + span <= clim;
+        base += span) {
+      unsigned place = base + our_source * width;
+      if (place < reserved_size(rctx->shader) || place < minimum ||
+          place + count > limit)
+         continue;
+
+      unsigned moves;
+      if (!collect_region_cost(rctx, place, count, &moves))
+         continue;
+
+      /* How many sibling sources already sit in their slots of this grid
+       * -- preferring them makes every source converge on the same
+       * collect base. */
+      unsigned saves = 0;
+      agx_foreach_ssa_src(collect, k) {
+         if (k != our_source &&
+             collect->src[k].type == AGX_INDEX_NORMAL &&
+             BITSET_TEST(rctx->visited, collect->src[k].value) &&
+             rctx->ssa_to_reg[collect->src[k].value] == base + k * width)
+            ++saves;
+      }
+
+      if (saves > best_saves ||
+          (saves == best_saves && moves < best_moves)) {
+         best_place = place;
+         best_moves = moves;
+         best_saves = saves;
+      }
+   }
+
+   if (best_place == ~0u)
+      return false;
+
+   /* Up to one slot copy saved per remaining element. */
+   *place_out = best_place;
+   *moves_out = best_moves;
+   *saves_out = collect->nr_srcs - 1;
    return true;
 }
 
@@ -798,56 +953,87 @@ assign_regs_by_copying(struct ra_ctx *rctx, agx_index dest, const agx_instr *I,
    unsigned blocked_vars[16] = {dest.value};
    size_t nr_blocked = 1;
 
-   if (minimum > 0 || limit < rctx->bound[RA_GPR]) {
-      unsigned count = rctx->ncomps[dest.value], span, base;
-      bool agx3b =
-         I != NULL && rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   /* If this destination participates in a collect's layout, a victim
+    * region coherent with the collect assembles its destination instead of
+    * scattering: slot the materialization temporary directly, or claim the
+    * region its sources already occupy. */
+   unsigned cplace = ~0u, cmoves = ~0u, csaves = 0;
+   bool collect_candidate =
+      find_collect_region(rctx, dest, I, minimum, limit, &cplace, &cmoves,
+                          &csaves);
 
-      /* Prefer a region with no half victim: relocating one is bounded by the
-       * seven-bit COPY destination.  When the constrained window holds nothing
-       * else -- eight-target MRT packs the low bank solid -- take the half
-       * victim anyway and let find_best_region_to_evict() keep its new home
-       * under AGX3_COPY_REG16_DEST_HALVES. */
-      bool found =
-         find_constrained_region(rctx, count, minimum, limit, agx3b, &base,
-                                 &span) ||
-         (agx3b && find_constrained_region(rctx, count, minimum, limit, false,
-                                           &base, &span));
+   if (minimum > 0 || limit < rctx->bound[RA_GPR] || collect_candidate) {
+      unsigned count = rctx->ncomps[dest.value], span = 0, base = 0;
+      unsigned gen_moves = ~0u;
+      bool found = false;
 
-      /* The tile-store bank (agx3_tile_store_bank()) is sized per colour
-       * target, one live payload each. A fragment can hold two payloads for
-       * the same target at once -- a vec4 stored on one path while another
-       * path's vec4 is still live, as dEQP-VK.glsl.opaque_type_indexing.
-       * sampler.*.fragment does -- and with the reserved prefix a 16-half
-       * bank then holds only one of them. The bank is a native placement
-       * preference, not an encoding bound (agx3_tile_value_ok() takes any
-       * half below 256), and Apple's own single-target fragments store from
-       * halves up to 31 (id_blend_4x stores RGBA8 from half 28). Widen to
-       * the 32- and then the 64-half bank native multi-target fragments use
-       * before giving up, instead of aborting the compile. Only a shader
-       * that would otherwise abort here takes this path. */
-      for (unsigned wide = 32; !found && agx3b && wide <= 64; wide *= 2) {
-         const bool tile_bank =
-            BITSET_TEST(rctx->low_gpr, dest.value) &&
-            limit == rctx->tile_gpr_limit;
-         if (!tile_bank || limit >= wide || wide > rctx->bound[RA_GPR])
-            continue;
-         found = find_constrained_region(rctx, count, minimum, wide, true,
-                                         &base, &span) ||
-                 find_constrained_region(rctx, count, minimum, wide, false,
-                                         &base, &span);
+      if (minimum > 0 || limit < rctx->bound[RA_GPR] ||
+          collect_candidate) {
+         bool agx3b = I != NULL &&
+            rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+
+         /* Prefer a region with no half victim: relocating one is bounded
+          * by the seven-bit COPY destination.  When the constrained window
+          * holds nothing else -- eight-target MRT packs the low bank solid
+          * -- take the half victim anyway and let find_best_region_to_
+          * evict() keep its new home under AGX3_COPY_REG16_DEST_HALVES. */
+         found =
+            find_constrained_region(rctx, count, minimum, limit, agx3b,
+                                    &base, &span, &gen_moves) ||
+            (agx3b && find_constrained_region(rctx, count, minimum, limit,
+                                              false, &base, &span,
+                                              &gen_moves));
+
+         /* The tile-store bank (agx3_tile_store_bank()) is sized per
+          * colour target, one live payload each. A fragment can hold two
+          * payloads for the same target at once -- a vec4 stored on one
+          * path while another path's vec4 is still live, as dEQP-VK.glsl.
+          * opaque_type_indexing.sampler.*.fragment does -- and with the
+          * reserved prefix a 16-half bank then holds only one of them.
+          * The bank is a native placement preference, not an encoding
+          * bound (agx3_tile_value_ok() takes any half below 256), and
+          * Apple's own single-target fragments store from halves up to 31
+          * (id_blend_4x stores RGBA8 from half 28). Widen to the 32- and
+          * then the 64-half bank native multi-target fragments use before
+          * giving up, instead of aborting the compile. Only a shader that
+          * would otherwise abort here takes this path. */
+         for (unsigned wide = 32; !found && agx3b && wide <= 64;
+              wide *= 2) {
+            const bool tile_bank =
+               BITSET_TEST(rctx->low_gpr, dest.value) &&
+               limit == rctx->tile_gpr_limit;
+            if (!tile_bank || limit >= wide || wide > rctx->bound[RA_GPR])
+               continue;
+            found = find_constrained_region(rctx, count, minimum, wide,
+                                            true, &base, &span,
+                                            &gen_moves) ||
+                    find_constrained_region(rctx, count, minimum, wide,
+                                            false, &base, &span,
+                                            &gen_moves);
+         }
       }
 
-      if (!found) {
+      /* Take the collect-coherent region when the slot copies it saves
+       * cover its extra relocations. */
+      bool use_collect = collect_candidate &&
+         (!found || cmoves <= gen_moves + csaves);
+
+      if (!found && !use_collect) {
          /* No legal placement exists. Never write through an unset base --
-          * it feeds BITSET_SET_COUNT() and reg_to_ssa[] -- and never emit the
-          * illegal placement either: record the failure, let the ordinary
-          * eviction below place the value anywhere so allocation finishes
-          * consistently, and let agx_compile_function_nir() refuse the
-          * shader through its normal error path. */
+          * it feeds BITSET_SET_COUNT() and reg_to_ssa[] -- and never emit
+          * the illegal placement either: record the failure, let the
+          * ordinary eviction below place the value anywhere so allocation
+          * finishes consistently, and let agx_compile_function_nir()
+          * refuse the shader through its normal error path. */
          rctx->shader->ra_failed = true;
          goto unconstrained;
       }
+
+      if (use_collect) {
+         base = cplace;
+         span = count;
+      }
+
       nr_blocked = 0;
       for (unsigned reg = base; reg < base + span;) {
          if (!BITSET_TEST(rctx->used_regs[RA_GPR], reg)) {
