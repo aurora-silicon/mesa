@@ -4440,9 +4440,18 @@ agx_agx3_bitop_immediate_ok(const agx_context *ctx, const agx_instr *I)
 
    const agx_index imm = I->src[imm0 ? 0 : 1];
    const agx_index reg = I->src[imm0 ? 1 : 0];
+   /* A narrow result depends only on the low half of a wider register
+    * source, so a 16-bit bitop may read a full register's low half: the
+    * packer keeps the physical index, which already names that half. */
+   /* A 32-bit SSA value always lands on an even half pair, so the physical
+    * index the packer sees names its low half; only the width can be
+    * checked here. */
+   const bool size_ok =
+      reg.size == I->dest[0].size ||
+      (I->dest[0].size == AGX_SIZE_16 && reg.size == AGX_SIZE_32);
    return imm.value <= 0xff && !imm.abs && !imm.neg && !imm.memory &&
           reg.type == AGX_INDEX_NORMAL && !reg.memory && !reg.abs &&
-          !reg.neg && agx_channels(reg) == 1 && reg.size == I->dest[0].size;
+          !reg.neg && agx_channels(reg) == 1 && size_ok;
 }
 
 static void
@@ -4777,11 +4786,11 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
        */
       if (I->op == AGX_OPCODE_SIGNEXT &&
           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
-         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-         agx_mov_to(&b, wide, I->src[0]);
+         /* The widening half-source shift-left form keeps this a bare
+          * shift pair: no 32-bit pad move and no materialized count. */
          agx_index shifted = agx_temp(ctx, AGX_SIZE_32);
-         agx_bfi_to(&b, shifted, agx_zero(), wide,
-                    agx_mov_imm(&b, 32, 16), 0);
+         agx_bfi_to(&b, shifted, agx_zero(), I->src[0],
+                    agx_immediate(16), 0);
          agx_asr_to(&b, I->dest[0], shifted, agx_immediate(16));
          agx_remove_instruction(I);
          continue;
@@ -5581,10 +5590,15 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
           I->nr_dests == 1 && I->nr_srcs == 3 &&
           I->dest[0].size == AGX_SIZE_32 &&
           I->src[2].type == AGX_INDEX_IMMEDIATE) {
+         /* The widening half-source form keeps the immediate count too:
+          * sll d32, h, #imm is witnessed (the `d0` byte-8 pattern) for a
+          * left shift only. */
          const bool immediate_shift =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
             I->bfi_mask == 0 && I->src[0].type == AGX_INDEX_IMMEDIATE &&
-            I->src[0].value == 0 && I->src[1].size == AGX_SIZE_32 &&
+            I->src[0].value == 0 &&
+            (I->src[1].size == AGX_SIZE_32 ||
+             (I->op == AGX_OPCODE_BFI && I->src[1].size == AGX_SIZE_16)) &&
             I->src[2].value >= 1 && I->src[2].value <= 31 &&
             !I->src[2].abs && !I->src[2].neg;
          /* A constant-offset, constant-width extract
@@ -6151,15 +6165,16 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    case nir_op_i2i32: {
       if (src_sz == 8) {
          if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
-            /* G17P's grounded shifts operate on complete 32-bit registers.
-             * Widen first and sign-extend from bit 7 as Apple does, rather
-             * than inventing a half-register BFI/ASR encoding. */
-            agx_index wide = agx_pad_to_32(b, s0);
-            agx_index zero32 = agx_mov_imm(b, 32, 0);
-            agx_index shift = agx_mov_imm(b, 32, 24);
-            agx_index shifted =
-               agx_bfi(b, zero32, wide, shift, 0);
-            return agx_asr_to(b, dst, shifted, shift);
+            /* G17P's shift-left reads a half source into a 32-bit
+             * destination with the count folded as an immediate (the
+             * widening `ushort << imm` form), so sign extension from bit 7
+             * is the bare shift pair -- no pad register, no count GPR. The
+             * left shift keeps only the low byte: bits 8..15 of the half
+             * would shift past bit 31 and are discarded. */
+            agx_index shifted = agx_temp(b->shader, AGX_SIZE_32);
+            agx_bfi_to(b, shifted, agx_immediate(0), s0,
+                       agx_immediate(24), 0);
+            return agx_asr_to(b, dst, shifted, agx_immediate(24));
          }
 
          /* Sign extend in software, NIR likes 8-bit conversions */
@@ -6176,12 +6191,11 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
          if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
             /* Perform the same exact 32-bit sign extension and expose its
              * low half only after the shift pair has completed. */
-            agx_index wide = agx_pad_to_32(b, s0);
-            agx_index zero32 = agx_mov_imm(b, 32, 0);
-            agx_index shift = agx_mov_imm(b, 32, 24);
-            agx_index shifted =
-               agx_bfi(b, zero32, wide, shift, 0);
-            agx_index extended = agx_asr(b, shifted, shift);
+            agx_index shifted = agx_temp(b->shader, AGX_SIZE_32);
+            agx_bfi_to(b, shifted, agx_immediate(0), s0,
+                       agx_immediate(24), 0);
+            agx_index extended = agx_temp(b->shader, AGX_SIZE_32);
+            agx_asr_to(b, extended, shifted, agx_immediate(24));
             return agx_subdivide_to(b, dst, extended, 0);
          }
 

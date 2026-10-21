@@ -213,6 +213,14 @@ bool agx3_alu_shift_imm32(enum agx_isa_encoding enc, bool left,
                           uint16_t wait_mask,
                           uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
 
+/* G17P shift-left with an immediate count reading a 16-bit source into a
+ * 32-bit destination: the widening form (witnessed `...d0` byte-8 pattern). */
+bool agx3_alu_sll_imm_src16(enum agx_isa_encoding enc,
+                            uint16_t dest, uint16_t src, unsigned shift,
+                            enum agx3_alu_hint hint, bool dest_cache,
+                            uint16_t wait_mask,
+                            uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len);
+
 /* Native 16-bit logical shift-right by an immediate bit count. */
 bool agx3_alu_srl_imm16(enum agx_isa_encoding enc, uint16_t dest,
                         uint16_t src, unsigned shift,
