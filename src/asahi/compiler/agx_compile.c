@@ -9511,6 +9511,13 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    AGX_PASS(ctx, agx_lower_uniform_sources);
 
+   /* Uniform-source lowering materializes a constrained uniform operand at
+    * every use site. Merge the redundant copies and hoist the ones a loop
+    * repeats.
+    */
+   if (!(agx_compiler_debug & AGX_DBG_NOOPT))
+      AGX_PASS(ctx, agx_opt_uniform_copy_cse);
+
 
    if (((key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
          (ctx->stage == MESA_SHADER_VERTEX || !ctx->is_preamble)) ||
