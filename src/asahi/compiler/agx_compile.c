@@ -2823,14 +2823,57 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 
          if (samples == 1) {
             /* Apple's one-sample fragments read SR2 and repeat it in both
-             * coverage nibbles. */
-            target = (reduced & 1) ? agx_g17p_reg16(b, target_in)
-                                   : agx_and(b, target_in, agx_immediate(1));
-            keep = (reduced & 2) ? agx_g17p_reg16(b, live_in)
-                                 : agx_and(b, live_in, agx_immediate(1));
+             * coverage nibbles. Constant sources fold into immediates;
+             * LIVE = 0 on every deferred kill and TARGET/LIVE = all-ones
+             * on the prolog/epilog updates, so this is the common case.
+             * A constant-zero TARGET affects no sample at all. */
+            const bool t_const = nir_src_is_const(instr->src[0]);
+            if (t_const && !(nir_src_as_uint(instr->src[0]) & 1)) {
+               /* The update affects no sample.  Apple spells the no-op as
+                * staged word zero; keep it when a forced-early update
+                * already acquired class 1 for its release. */
+               if (force_early)
+                  return agx_sample_mask_agx3(b, agx_immediate(1),
+                                              agx_mov_imm(b, 32, 0),
+                                              (!no_tests ? 2 : 0) | 1);
+               return NULL;
+            }
+            const bool k_const = nir_src_is_const(instr->src[1]);
+            target = t_const ? agx_immediate(1)
+                     : (reduced & 1) ? agx_g17p_reg16(b, target_in)
+                                     : agx_and(b, target_in,
+                                               agx_immediate(1));
+            keep = k_const
+                      ? agx_immediate(nir_src_as_uint(instr->src[1]) & 1)
+                   : (reduced & 2) ? agx_g17p_reg16(b, live_in)
+                                   : agx_and(b, live_in, agx_immediate(1));
             agx_index t16 = agx_temp(b->shader, AGX_SIZE_16);
             agx_get_coverage_1x_agx3_to(b, t16);
             mid = agx_iadd(b, t16, t16, 4);
+
+            /* The staged word, keep | mid << 4, reaches a 32-bit register
+             * in two instructions when keep is an immediate: ABS marks the
+             * narrow half unsigned, so the widening pass moves it in one
+             * mov1 and `#keep + mid32 << 4` is the canonical
+             * constant-addend form.  The fused integer select then applies
+             * TARGET in place of the widening 16x16->32 IMAD and its
+             * operand-class moves. */
+            agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+            if (k_const) {
+               agx_iadd_to(b, word, keep, agx_abs(mid), 4);
+            } else {
+               agx_index word16 = agx_iadd(b, keep, mid, 4);
+               agx_mov_to(b, word, word16);
+            }
+            if (!t_const) {
+               agx_index selected = agx_temp(b->shader, AGX_SIZE_32);
+               agx_icmpsel_to(b, selected, target, agx_immediate(0), word,
+                              agx_immediate(0), AGX_ICOND_UGT);
+               word = selected;
+            }
+            return agx_sample_mask_agx3(
+               b, target, word,
+               (!no_tests ? 2 : 0) | (force_early ? 1 : 0));
          } else {
             /* At two and four samples Apple reads SR39, whose low byte holds
              * the covered samples and the API input mask, masks the coverage
