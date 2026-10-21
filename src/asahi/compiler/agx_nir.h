@@ -63,11 +63,16 @@ bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generat
 /* sparse_buffer_residency: ordinary texel-buffer reads must consult the
  * software sparse residency map, because the descriptor names the primary
  * mapping rather than the read-only shadow (hk_buffer_view.c). */
+/* image_sideband: every storage-image record carries the decoded
+ * image-geometry tail at AGX_G17P_IMAGE_SIDEBAND_OFFSET (agx_abi.h), letting
+ * the image size/texel-address crawls load fields directly.  Set only by
+ * Honeykrisp, whose descriptor writer fills it. */
 bool agx_nir_lower_texture_with_buffer_metadata(struct nir_shader *s,
                                                unsigned generation,
                                                bool robust_formatless_images,
                                                uint64_t sparse_ro_offset,
-                                               bool sparse_buffer_residency);
+                                               bool sparse_buffer_residency,
+                                               bool image_sideband);
 struct nir_builder;
 struct nir_def;
 struct nir_tex_instr;

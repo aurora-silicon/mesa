@@ -762,6 +762,27 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       view->planes[p].storage_pbe_valid = pack_pbe(
          dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage,
          &view->planes[p].storage_atomic_sw);
+      if (agx_native_graphics(&dev->dev)) {
+         /* The decoded tail mirrors the storage descriptor's own view of the
+          * level: minified to the view's base mip and divided by the view's
+          * block denominator, exactly like the PBE's width field the shader
+          * would decode.  Tile fields carry the level's real tile size even
+          * on linear layouts, where the texel-address path never reads them.
+          */
+         const struct ail_layout *ail =
+            &image->planes[view->planes[p].image_plane].layout;
+         const unsigned level = view->vk.base_mip_level;
+         const struct hk_3d denom = view_denominator(view);
+         const bool linear = ail->tiling == AIL_TILING_LINEAR;
+         hk_pack_g17p_image_sideband(
+            &view->planes[p].storage_sideband,
+            DIV_ROUND_UP(u_minify(ail->width_px, level), denom.x),
+            DIV_ROUND_UP(u_minify(ail->height_px, level), denom.y),
+            linear ? 1 : ail->tilesize_el[level].width_el,
+            linear ? 1 : ail->tilesize_el[level].height_el,
+            ail->layer_stride_B,
+            util_format_get_blocksize(format_for_plane(view, p)));
+      }
       view->planes[p].eot_pbe_valid =
          pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].eot,
                   NULL);

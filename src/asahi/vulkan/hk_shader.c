@@ -4862,7 +4862,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, agx_nir_lower_texture_with_buffer_metadata,
                agx_chip_descriptor_generation(dev->dev.chip),
                lower_g17p_robust_images, dev->dev.sparse_ro_offset,
-               dev->vk.enabled_features.sparseResidencyBuffer);
+               dev->vk.enabled_features.sparseResidencyBuffer,
+               true /* image_sideband: hk writes the decoded tail */);
    } else {
       NIR_PASS(_, nir, agx_nir_lower_texture_for_generation,
                agx_chip_descriptor_generation(dev->dev.chip));

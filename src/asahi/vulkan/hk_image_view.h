@@ -46,6 +46,9 @@ struct hk_image_view {
       uint64_t storage_atomic_sw;
       uint64_t emrt_atomic_sw;
       uint32_t emrt_aligned_width;
+      /* Decoded image geometry written to the last sixteen bytes of the
+       * view's storage descriptor record (AGX_G17P_IMAGE_SIDEBAND_*). */
+      struct hk_g17p_image_sideband storage_sideband;
       bool storage_pbe_valid, eot_pbe_valid, layered_eot_pbe_valid,
          emrt_pbe_valid;
    } planes[3];

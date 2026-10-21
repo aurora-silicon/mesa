@@ -108,6 +108,38 @@
 #define AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT 4
 #define AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE 96
 
+/* A G17P storage-image descriptor record is 96 bytes: the native texture and
+ * PBE pair, the two heap-index words, the packed atomic-addressing word, then
+ * sixteen bytes of CPU-decoded image geometry at offset 80.  The sideband
+ * carries the fields the image size/texel-address crawls otherwise extract at
+ * run time from the native words and the atomic word -- the view's minified
+ * width and height, the tile-aligned width, the tile masks, and the layer
+ * stride in view elements -- so the shader-side decode is a plain load.
+ *
+ * The whole tail reads as zero on a null descriptor, so the null paths are
+ * unchanged: the sizes fold to zero and the addressing terms all drop out.
+ * Bytes 80-83 coincide with AGX_G17P_EMRT_ALIGNED_WIDTH_OFFSET, which the
+ * multisampled eMRT index path reads at the same offset of its 96-byte
+ * record; keeping the aligned pixel width there preserves that semantic.
+ * Texel-buffer records put their buffer metadata in the same range instead
+ * (offset 72 on), but buffer images take the buffer-metadata lowering and
+ * never read the image sideband.  Only the Honeykrisp descriptor writer fills
+ * it, and only the Honeykrisp lowering (which sets image_sideband) reads it;
+ * the eMRT entries table and the GL driver's image records leave it zero.
+ */
+#define AGX_G17P_IMAGE_SIDEBAND_OFFSET             80
+#define AGX_G17P_IMAGE_SIDEBAND_ALIGNED_WIDTH      80
+#define AGX_G17P_IMAGE_SIDEBAND_LAYER_STRIDE       84
+#define AGX_G17P_IMAGE_SIDEBAND_WIDTH              88
+#define AGX_G17P_IMAGE_SIDEBAND_HEIGHT             90
+#define AGX_G17P_IMAGE_SIDEBAND_TILE_WIDTH_MASK    92
+#define AGX_G17P_IMAGE_SIDEBAND_TILE_HEIGHT_MASK   94
+#define AGX_G17P_IMAGE_SIDEBAND_SIZE               16
+/* Offset of the sideband relative to the record's native PBE, which is what
+ * image_texel_address's descriptor handle names. */
+#define AGX_G17P_IMAGE_SIDEBAND_FROM_PBE \
+   (AGX_G17P_IMAGE_SIDEBAND_OFFSET - AGX_G17P_BUFFER_TEXTURE_PBE_OFFSET)
+
 /* Layout of struct hk_sparse_buffer_map_header (hk_buffer.h), which both the
  * sparse SSBO lowering and the sparse texel fetch read from the shader.
  * Static-asserted against the struct there. */
