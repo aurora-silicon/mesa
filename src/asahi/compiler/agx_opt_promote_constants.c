@@ -127,6 +127,16 @@ constant_use_accepts_uniform(agx_context *ctx, const agx_instr *I, unsigned s,
 static void
 pass(agx_context *ctx, void *memctx)
 {
+   /* A second invocation after the constant-materializing lowerings promotes
+    * the mov_imms those passes emit, appending to the constant range the
+    * first invocation built. An inline-blend recompile must leave its
+    * constants where the split main program has them, so it only ever runs
+    * the first promotion.
+    */
+   const bool first_run = ctx->out->rodata.size_16 == 0;
+   if (!first_run && ctx->key->g17p_rodata_hint)
+      return;
+
    /* Map from SSA indices to struct constant_info */
    struct hash_table_u64 *constants = _mesa_hash_table_u64_create(memctx);
 
@@ -208,9 +218,11 @@ pass(agx_context *ctx, void *memctx)
 
       /* Set the base for the first constant. This avoids uploading an extra
        * zero if we needed to pad, compared to doing this before the loop. Same
-       * shader code, but slightly more efficient USC record.
+       * shader code, but slightly more efficient USC record. A re-run keeps
+       * the base the first run established so offsets into ctx->rodata still
+       * resolve.
        */
-      if (i == 0) {
+      if (i == 0 && first_run) {
          ctx->out->rodata.base_uniform = uniform;
       }
 
