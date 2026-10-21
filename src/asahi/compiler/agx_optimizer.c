@@ -558,6 +558,36 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          if (!agx_minifloat_exact(f))
             continue;
 
+         /* Only the witnessed narrow-destination immediate forms encode:
+          * an all-immediate FADD folds to a move, a narrowing FADD names
+          * -0.0 beside a 32-bit register, and FMUL scales a plain 32-bit
+          * register by a minifloat; no half-destination FFMA takes an
+          * immediate at all. Every other half-destination FADD/FMUL/FFMA
+          * substitution reaches the packer unencodable and refuses the
+          * whole shader (rtpipe-all, ftex-bias-4, ftex-offlod-3). Keep the
+          * move in that case; other operations and destination widths are
+          * unchanged. */
+         if (I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_16 &&
+             (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+              I->op == AGX_OPCODE_FFMA)) {
+            const agx_index *other =
+               I->nr_srcs == 2 ? &I->src[s ^ 1] : NULL;
+            const bool narrow_imm_form =
+               (I->op == AGX_OPCODE_FADD && other != NULL &&
+                ((other->type == AGX_INDEX_IMMEDIATE && !other->memory &&
+                  !other->abs && !other->neg) ||
+                 (f == 0.0f && signbit(f) &&
+                  other->type != AGX_INDEX_IMMEDIATE && !other->memory &&
+                  !other->abs && (!other->neg || !I->saturate) &&
+                  other->size == AGX_SIZE_32))) ||
+               (I->op == AGX_OPCODE_FMUL && !I->saturate &&
+                other != NULL && other->type != AGX_INDEX_IMMEDIATE &&
+                !other->memory && !other->abs &&
+                other->size == AGX_SIZE_32);
+            if (!narrow_imm_form)
+               continue;
+         }
+
          /* Both halves of a tied minimum/maximum, or neither. */
          if (s < 2 && agx_g17p_tied_minmax(ctx, I))
             I->src[s + 2] = agx_immediate_f(f);
