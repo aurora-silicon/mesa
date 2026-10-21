@@ -395,16 +395,36 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    }
 
    nir_builder b = nir_builder_create(impl);
-   if (fragment && layout->context_uniform) {
+   if (layout->context_uniform) {
+      /* The launch headers mirror the kernel's static traversal context:
+       * none of the words depend on ray data, and a trace does not write
+       * this region, so one copy at kernel entry serves every query in the
+       * shader instead of repeating the block inside each proceed. */
       b.cursor = nir_before_impl(impl);
       nir_def *context = nir_load_preamble(&b, 1, 64,
          .base = layout->context_uniform);
       for (unsigned i = 0; i < 6; ++i) {
          nir_def *header = nir_load_global(&b, 4, 32,
             nir_iadd_imm(&b, context, 16 * i), .align_mul = 16);
+         if (i == 3 && !fragment && layout->dispatch_group_count_offset) {
+            nir_def *groups_ptr = nir_load_global_constant(&b, 1, 64,
+               nir_iadd_imm(&b, nir_load_root_agx(&b),
+                  layout->dispatch_group_count_offset),
+               .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+            nir_def *groups = nir_load_global_constant(&b, 3, 32,
+               groups_ptr, .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+            nir_def *global = nir_imul(&b,
+               groups, nir_imm_ivec3(&b,
+                  b.shader->info.workgroup_size[0],
+                  b.shader->info.workgroup_size[1],
+                  b.shader->info.workgroup_size[2]));
+            header = nir_vec4(&b, nir_channel(&b, header, 0),
+               nir_channel(&b, header, 1), nir_channel(&b, global, 1),
+               nir_channel(&b, global, 2));
+         }
          nir_store_scs_agx(&b, header, .base = 0x6000 + 16 * i);
       }
-      nir_store_scs_agx(&b, nir_load_global(&b, 4, 32,
+      nir_store_scs_agx(&b, nir_load_global(&b, fragment ? 4 : 2, 32,
          nir_iadd_imm(&b, context, 104), .align_mul = 8), .base = 0x6068);
    }
    util_dynarray_foreach(&ops, nir_intrinsic_instr *, op) {
@@ -481,33 +501,6 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if(layout->candidates) nir_push_if(&b,nir_inot(&b,nir_load_deref(&b,started)));
          nir_def *address = nir_load_deref(&b, as);
          nir_def *selector = nir_load_preamble(&b, 1, 64, .base = layout->bvh_uniform);
-         if (layout->context_uniform && !fragment) {
-            nir_def *context=nir_load_preamble(&b,1,64,.base=layout->context_uniform);
-            for(unsigned i=0;i<6;i++) {
-               nir_def *header = nir_load_global(&b,4,32,
-                  nir_iadd_imm(&b,context,16*i),.align_mul=16);
-               if (i == 3 && !fragment && layout->dispatch_group_count_offset) {
-                  nir_def *groups_ptr = nir_load_global_constant(&b, 1, 64,
-                     nir_iadd_imm(&b, nir_load_root_agx(&b),
-                        layout->dispatch_group_count_offset),
-                     .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
-                  nir_def *groups = nir_load_global_constant(&b, 3, 32,
-                     groups_ptr, .align_mul = 4,
-                     .access = ACCESS_CAN_SPECULATE);
-                  nir_def *global = nir_imul(&b,
-                     groups, nir_imm_ivec3(&b,
-                        b.shader->info.workgroup_size[0],
-                        b.shader->info.workgroup_size[1],
-                        b.shader->info.workgroup_size[2]));
-                  header = nir_vec4(&b, nir_channel(&b, header, 0),
-                     nir_channel(&b, header, 1), nir_channel(&b, global, 1),
-                     nir_channel(&b, global, 2));
-               }
-               nir_store_scs_agx(&b,header,.base=0x6000+16*i);
-            }
-            nir_store_scs_agx(&b,nir_load_global(&b,fragment ? 4 : 2,32,
-               nir_iadd_imm(&b,context,104),.align_mul=8),.base=0x6068);
-         }
          const bool stable_as_selector = layout->instance_traversal &&
             layout->as_table_uniform;
          if (stable_as_selector) {
