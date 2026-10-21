@@ -9841,7 +9841,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    }
 
    AGX_PASS(ctx, agx3_coalesce_uniform_half_stores);
-   if (native_cprog)
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
       AGX_PASS(ctx, agx3_lower_uniform_half_exports);
    AGX_PASS(ctx, agx3_drop_unchanged_tile_stores);
 
