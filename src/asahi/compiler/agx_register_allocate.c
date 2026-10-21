@@ -2335,7 +2335,8 @@ struct recolor_ctx {
 
 static bool
 use_blocks_recolor(struct recolor_ctx *rctx, agx_instr *I, unsigned slot,
-                   unsigned reg, unsigned width)
+                   unsigned reg, unsigned width, unsigned excl,
+                   unsigned excl_new)
 {
    bool is_dest = slot & 0x8000;
    unsigned idx = slot & 0x7fff;
@@ -2354,7 +2355,8 @@ use_blocks_recolor(struct recolor_ctx *rctx, agx_instr *I, unsigned slot,
       bool src_overlap = false;
       agx_foreach_src(I, s) {
          if (I->src[s].type == AGX_INDEX_NORMAL && I->src[s].has_reg &&
-             !I->src[s].memory && I->src[s].reg < reg + width &&
+             !I->src[s].memory && I->src[s].value != excl &&
+             I->src[s].reg < reg + width &&
              reg < I->src[s].reg + rctx->ncomps[I->src[s].value])
             src_overlap = true;
       }
@@ -2394,10 +2396,16 @@ use_blocks_recolor(struct recolor_ctx *rctx, agx_instr *I, unsigned slot,
    if (I->op == AGX_OPCODE_PHI) {
       /* An edge already identity can only be broken when the phi's
        * destination is a different value (a join-phi destination renaming
-       * along with its source keeps identity) and not the target. */
+       * along with its source keeps identity) and not the target. When
+       * the destination is the swap partner it is moving to excl_new --
+       * compare against that instead of its recorded register. */
+      unsigned dstreg = I->dest[0].reg;
+      if (I->dest[0].type == AGX_INDEX_NORMAL && I->dest[0].value == excl)
+         dstreg = excl_new;
+
       if (I->dest[0].type == AGX_INDEX_NORMAL && I->dest[0].has_reg &&
-          I->dest[0].value != op->value && op->reg == I->dest[0].reg &&
-          I->dest[0].reg != reg)
+          I->dest[0].value != op->value && op->reg == dstreg &&
+          dstreg != reg)
          return true;
       return false;
    }
@@ -2433,7 +2441,8 @@ use_blocks_recolor(struct recolor_ctx *rctx, agx_instr *I, unsigned slot,
    bool dest_overlap = false;
    agx_foreach_dest(I, d) {
       if (I->dest[d].type == AGX_INDEX_NORMAL && I->dest[d].has_reg &&
-          !I->dest[d].memory && I->dest[d].reg < reg + width &&
+          !I->dest[d].memory && I->dest[d].value != excl &&
+          I->dest[d].reg < reg + width &&
           reg < I->dest[d].reg + rctx->ncomps[I->dest[d].value])
          dest_overlap = true;
    }
@@ -2462,15 +2471,18 @@ use_blocks_recolor(struct recolor_ctx *rctx, agx_instr *I, unsigned slot,
  * block where it is live: every such block's occupancy map must leave the
  * whole window clear. */
 /* Does operand `op` reference any half of [reg, reg+width)? Operands naming
- * `ssa` itself are excluded: they are what is being renamed. */
+ * `ssa` itself are excluded: they are what is being renamed. `excl` names a
+ * second value whose references are also ignored -- used when checking a
+ * register swap, where the partner's current window is being vacated. */
 static bool
 operand_window_overlap(struct recolor_ctx *rctx, const agx_index *op,
-                       unsigned ssa, unsigned reg, unsigned width)
+                       unsigned ssa, unsigned excl, unsigned reg,
+                       unsigned width)
 {
    if (op->memory)
       return false;
    if (op->type == AGX_INDEX_NORMAL) {
-      if (op->value == ssa || !op->has_reg)
+      if (op->value == ssa || op->value == excl || !op->has_reg)
          return false;
       return op->reg < reg + width &&
              reg < op->reg + rctx->ncomps[op->value];
@@ -2486,12 +2498,24 @@ operand_window_overlap(struct recolor_ctx *rctx, const agx_index *op,
  * for the whole live span: blocks it flows through need a clear window,
  * while at its edges -- the block that defines it and blocks where it dies
  * -- occupancy only has to be clear for the part of the block it is live
- * in, found by an instruction-level scan. */
+ * in, found by an instruction-level scan.
+ *
+ * When `excl` is a valid SSA index it names a swap partner: that value's
+ * own occupancy of [excl_reg, excl_reg+excl_width) is being vacated by the
+ * same rename, so its claims do not count as interference.
+ */
 static bool
 recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
-                    unsigned reg, unsigned width)
+                    unsigned reg, unsigned width, unsigned excl,
+                    unsigned excl_reg, unsigned excl_width)
 {
    const unsigned words = rctx->words;
+   const bool have_excl = excl != ~0u;
+   bool phi_def = rctx->def_instr[ssa] &&
+                  rctx->def_instr[ssa]->op == AGX_OPCODE_PHI;
+
+   BITSET_WORD en_adj[BITSET_WORDS(AGX_NUM_REGS)];
+   BITSET_WORD ex_adj[BITSET_WORDS(AGX_NUM_REGS)];
 
    for (unsigned i = 0; i < rctx->nb; ++i) {
       /* Blocks are indexed in source order */
@@ -2508,8 +2532,32 @@ recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
       BITSET_WORD *en = &rctx->entry_regs[i * words];
       BITSET_WORD *ex = &rctx->exit_regs[i * words];
 
+      /* Subtract the swap partner's own claims from the entry/exit maps:
+       * where the partner is live, its current window is being vacated.
+       * Two co-live values never share a half, so clearing the partner's
+       * whole window is exact. */
+      if (have_excl &&
+          u_sparse_bitset_test(&b->live_in, excl)) {
+         memcpy(en_adj, en, words * sizeof(BITSET_WORD));
+         BITSET_CLEAR_COUNT(en_adj, excl_reg, excl_width);
+         en = en_adj;
+      }
+      if (have_excl &&
+          u_sparse_bitset_test(&b->live_out, excl)) {
+         memcpy(ex_adj, ex, words * sizeof(BITSET_WORD));
+         BITSET_CLEAR_COUNT(ex_adj, excl_reg, excl_width);
+         ex = ex_adj;
+      }
+
+      /* A swap partner that also flows through the block forces the
+       * instruction-level scan: its operand references inside would
+       * otherwise count as occupancy. */
+      bool partner_through =
+         have_excl && u_sparse_bitset_test(&b->live_in, excl) &&
+         u_sparse_bitset_test(&b->live_out, excl);
+
       /* Through-block: the window must be completely untouched. */
-      if (entry && exit) {
+      if (entry && exit && !partner_through) {
          if (BITSET_TEST_RANGE(ops, reg, reg + width - 1) ||
              BITSET_TEST_RANGE(en, reg, reg + width - 1) ||
              BITSET_TEST_RANGE(ex, reg, reg + width - 1))
@@ -2523,6 +2571,14 @@ recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
       if (entry && BITSET_TEST_RANGE(en, reg, reg + width - 1))
          return false;
       if (exit && BITSET_TEST_RANGE(ex, reg, reg + width - 1))
+         return false;
+
+      /* A phi-defined value is born at the block's entry edge: anything
+       * arriving in the target window interferes with it for its whole
+       * life in the block. (Phi sources consumed on the incoming edges
+       * are not live-in and do not appear in en.) */
+      if (defined && phi_def &&
+          BITSET_TEST_RANGE(en, reg, reg + width - 1))
          return false;
 
       /* Locate the live span of ssa inside this block: from its entry or
@@ -2557,14 +2613,31 @@ recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
        * defining instruction itself predate the write and are legal. */
       pos = 0;
       agx_foreach_instr_in_block(b, I) {
+         /* In the defining block of a phi-defined value, every phi is
+          * edge-time: phi destinations are born together with ssa (check
+          * them all, regardless of position bounds), while phi sources
+          * die on the incoming edges and never interfere. */
+         if (defined && phi_def && I->op == AGX_OPCODE_PHI) {
+            bool conflict = false;
+            agx_foreach_dest(I, d) {
+               if (operand_window_overlap(rctx, &I->dest[d], ssa, excl,
+                                          reg, width))
+                  conflict = true;
+            }
+            if (conflict)
+               return false;
+            pos++;
+            continue;
+         }
+
          if (pos > hi)
             break;
 
          bool conflict = false;
          if (pos > lo) {
             agx_foreach_src(I, s) {
-               if (operand_window_overlap(rctx, &I->src[s], ssa, reg,
-                                          width))
+               if (operand_window_overlap(rctx, &I->src[s], ssa, excl,
+                                          reg, width))
                   conflict = true;
             }
             if (I->op == AGX_OPCODE_EXPORT &&
@@ -2574,8 +2647,8 @@ recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
          }
          if (pos >= lo) {
             agx_foreach_dest(I, d) {
-               if (operand_window_overlap(rctx, &I->dest[d], ssa, reg,
-                                          width))
+               if (operand_window_overlap(rctx, &I->dest[d], ssa, excl,
+                                          reg, width))
                   conflict = true;
             }
          }
@@ -2586,6 +2659,92 @@ recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
    }
 
    return true;
+}
+
+/* Commit a rename: rewrite every operand naming `v` to `newreg` and claim
+ * the window everywhere v is live or referenced so later renames do not
+ * collide with it. */
+static void
+recolor_commit(struct recolor_ctx *rctx, unsigned v, unsigned newreg,
+               unsigned w)
+{
+   const unsigned words = rctx->words;
+
+   for (unsigned p = rctx->ref_start[v]; p < rctx->ref_start[v + 1]; ++p) {
+      agx_instr *I = rctx->ref_instr[p];
+      unsigned slot = rctx->ref_slot[p];
+      if (slot & 0x8000)
+         I->dest[slot & 0x7fff].reg = newreg;
+      else
+         I->src[slot].reg = newreg;
+   }
+
+   for (unsigned i = 0; i < rctx->nb; ++i) {
+      agx_block *lb = rctx->blocks[i];
+      bool en = u_sparse_bitset_test(&lb->live_in, v);
+      bool ex = u_sparse_bitset_test(&lb->live_out, v);
+      if (en || ex || rctx->def_block[v] == lb) {
+         BITSET_SET_COUNT(&rctx->occ_ops[i * words], newreg, w);
+         if (en)
+            BITSET_SET_COUNT(&rctx->entry_regs[i * words], newreg, w);
+         if (ex)
+            BITSET_SET_COUNT(&rctx->exit_regs[i * words], newreg, w);
+      }
+   }
+   for (unsigned p = rctx->ref_start[v]; p < rctx->ref_start[v + 1]; ++p)
+      BITSET_SET_COUNT(&rctx->occ_ops[rctx->ref_block[p] * words], newreg,
+                       w);
+}
+
+/* Are the live ranges of `a` and `b` block-disjoint (never co-live)? When
+ * true, one value's occupancy claims can never interfere with a rename of
+ * the other, so compound renames may be checked in any order. */
+static bool
+ranges_disjoint(struct recolor_ctx *rctx, unsigned a, unsigned b)
+{
+   for (unsigned i = 0; i < rctx->nb; ++i) {
+      agx_block *lb = rctx->blocks[i];
+      bool pa = u_sparse_bitset_test(&lb->live_in, a) ||
+                u_sparse_bitset_test(&lb->live_out, a) ||
+                rctx->def_block[a] == lb;
+      if (!pa)
+         continue;
+      bool pb = u_sparse_bitset_test(&lb->live_in, b) ||
+                u_sparse_bitset_test(&lb->live_out, b) ||
+                rctx->def_block[b] == lb;
+      if (pb)
+         return false;
+   }
+   return true;
+}
+
+/* Count the phi edges of `phi` that are (or would be) register-identical.
+ * `self`/`other` name values being renamed: `self` moves to `self_new`,
+ * `other` (a swap partner, or ~0u) moves to `other_new`; every other
+ * source keeps its recorded register. */
+static unsigned
+phi_identity_edges(struct recolor_ctx *rctx, agx_instr *phi,
+                   unsigned dest_reg, unsigned self, unsigned self_new,
+                   unsigned other, unsigned other_new)
+{
+   unsigned identical = 0;
+
+   agx_foreach_src(phi, s) {
+      const agx_index *src = &phi->src[s];
+      if (src->type != AGX_INDEX_NORMAL || !src->has_reg || src->memory ||
+          rctx->classes[src->value] != RA_GPR)
+         continue;
+
+      unsigned r = src->reg;
+      if (src->value == self)
+         r = self_new;
+      else if (src->value == other)
+         r = other_new;
+
+      identical += (r == dest_reg);
+   }
+
+   return identical;
 }
 
 /*
@@ -2600,6 +2759,15 @@ recolor_window_free(struct recolor_ctx *rctx, agx_context *ctx, unsigned ssa,
  * This subsumes both merge cases in one rule: sources defined inside the
  * arm (biasable at definition time) and sources defined in a dominator
  * that merely flow through the arm.
+ *
+ * A second pass works from the destination side: renaming the phi
+ * destination (and all of its uses) onto a mismatched source's register
+ * eliminates that edge's copy whenever more edges become identity than
+ * break. The destination's live range is a different window than the
+ * source's, so it admits renames the source side cannot take.
+ *
+ * A third pass swaps the destinations of two phis at the same join when
+ * each one's mismatched sources sit in the other's register.
  */
 static unsigned
 agx_recolor_merge_joins(agx_context *ctx, uint8_t *ncomps,
@@ -2776,7 +2944,8 @@ agx_recolor_merge_joins(agx_context *ctx, uint8_t *ncomps,
             for (unsigned p = rctx.ref_start[v];
                  p < rctx.ref_start[v + 1] && !blocked; ++p) {
                blocked |= use_blocks_recolor(&rctx, rctx.ref_instr[p],
-                                             rctx.ref_slot[p], rD, w);
+                                             rctx.ref_slot[p], rD, w, ~0u,
+                                             ~0u);
             }
             if (blocked) {
                failed++;
@@ -2784,53 +2953,310 @@ agx_recolor_merge_joins(agx_context *ctx, uint8_t *ncomps,
                continue;
             }
 
-            if (!recolor_window_free(&rctx, ctx, v, rD, w)) {
+            if (!recolor_window_free(&rctx, ctx, v, rD, w, ~0u, 0, 0)) {
                failed++;
                fail_window++;
                continue;
             }
 
-            /* Commit: rewrite every operand naming v to the new base. */
-            for (unsigned p = rctx.ref_start[v];
-                 p < rctx.ref_start[v + 1]; ++p) {
-               agx_instr *I = rctx.ref_instr[p];
-               unsigned slot = rctx.ref_slot[p];
-               if (slot & 0x8000)
-                  I->dest[slot & 0x7fff].reg = rD;
-               else
-                  I->src[slot].reg = rD;
-            }
-
-            /* Claim the window everywhere v is live or referenced so
-             * later renames do not collide with it. */
-            for (unsigned i = 0; i < rctx.nb; ++i) {
-               agx_block *lb = rctx.blocks[i];
-               bool en = u_sparse_bitset_test(&lb->live_in, v);
-               bool ex = u_sparse_bitset_test(&lb->live_out, v);
-               if (en || ex || rctx.def_block[v] == lb) {
-                  BITSET_SET_COUNT(&rctx.occ_ops[i * words], rD, w);
-                  if (en)
-                     BITSET_SET_COUNT(&rctx.entry_regs[i * words], rD, w);
-                  if (ex)
-                     BITSET_SET_COUNT(&rctx.exit_regs[i * words], rD, w);
-               }
-            }
-            for (unsigned p = rctx.ref_start[v];
-                 p < rctx.ref_start[v + 1]; ++p)
-               BITSET_SET_COUNT(&rctx.occ_ops[rctx.ref_block[p] * words],
-                                rD, w);
-
+            recolor_commit(&rctx, v, rD, w);
             BITSET_SET(renamed, v);
             fixed++;
          }
       }
    }
 
+   /* The dest-side pass is opt-in: on saturated kernels its edge-count
+    * wins are offset by copy-cycle restructuring for a ~zero net. */
+   const bool no_dest = getenv("AGX_RA_DEST") == NULL;
+   const bool no_pair = getenv("AGX_RA_NOPAIR") != NULL;
+
+   /* Phi-pair swap: two phis at the same join whose mismatched sources sit
+    * in each other's destination register can exchange registers. Each
+    * half of the swap is checked while pretending the partner's window is
+    * already vacated. Runs before dest-side renaming: swaps are the
+    * stronger lever. */
+   unsigned pfixed = 0, pfailed = 0;
+   unsigned pfail_hazard = 0, pfail_window = 0, pwash = 0;
+
+   if (!no_pair)
+   agx_foreach_block(ctx, b) {
+      /* Collect this block's swappable phi destinations. */
+      unsigned cap = 0;
+      agx_foreach_phi_in_block(b, phi)
+         cap++;
+      if (!cap)
+         continue;
+
+      agx_instr **phis = malloc(cap * sizeof(agx_instr *));
+      unsigned nphi = 0;
+
+      agx_foreach_phi_in_block(b, phi) {
+         const agx_index *dst = &phi->dest[0];
+         if (dst->type != AGX_INDEX_NORMAL || !dst->has_reg || dst->memory ||
+             classes[dst->value] != RA_GPR ||
+             BITSET_TEST(renamed, dst->value) ||
+             BITSET_TEST(constrained, dst->value))
+            continue;
+         phis[nphi++] = phi;
+      }
+
+      for (unsigned i = 0; i < nphi; ++i) {
+         unsigned d1 = phis[i]->dest[0].value;
+         unsigned w1 = ncomps[d1];
+         unsigned r1 = phis[i]->dest[0].reg;
+         if (!w1 || BITSET_TEST(renamed, d1))
+            continue;
+
+         for (unsigned j = i + 1; j < nphi; ++j) {
+            unsigned d2 = phis[j]->dest[0].value;
+            unsigned w2 = ncomps[d2];
+            unsigned r2 = phis[j]->dest[0].reg;
+            if (!w2 || w2 != w1 || r2 == r1 || BITSET_TEST(renamed, d2))
+               continue;
+
+            /* Profit: edges of phi1 identity under the swap minus those
+             * identity now, plus the same for phi2. */
+            int gain =
+               (int)phi_identity_edges(&rctx, phis[i], r2, d2, r1, ~0u,
+                                       ~0u) -
+               (int)phi_identity_edges(&rctx, phis[i], r1, d2, r2, ~0u,
+                                       ~0u) +
+               (int)phi_identity_edges(&rctx, phis[j], r1, d1, r2, ~0u,
+                                       ~0u) -
+               (int)phi_identity_edges(&rctx, phis[j], r2, d1, r1, ~0u,
+                                       ~0u);
+
+            if (gain <= 0) {
+               pwash++;
+               continue;
+            }
+
+            /* Legality for d1 -> r2 pretending d2's window is free, and
+             * d2 -> r1 pretending d1's window is free. */
+            bool blocked = false;
+            for (unsigned p = rctx.ref_start[d1];
+                 p < rctx.ref_start[d1 + 1] && !blocked; ++p) {
+               blocked |= use_blocks_recolor(&rctx, rctx.ref_instr[p],
+                                             rctx.ref_slot[p], r2, w1, d2,
+                                             r1);
+            }
+            for (unsigned p = rctx.ref_start[d2];
+                 p < rctx.ref_start[d2 + 1] && !blocked; ++p) {
+               blocked |= use_blocks_recolor(&rctx, rctx.ref_instr[p],
+                                             rctx.ref_slot[p], r1, w2, d1,
+                                             r2);
+            }
+            if (blocked) {
+               pfailed++;
+               pfail_hazard++;
+               continue;
+            }
+
+            if (!recolor_window_free(&rctx, ctx, d1, r2, w1, d2, r2, w2) ||
+                !recolor_window_free(&rctx, ctx, d2, r1, w2, d1, r1, w1)) {
+               pfailed++;
+               pfail_window++;
+               continue;
+            }
+
+            recolor_commit(&rctx, d1, r2, w1);
+            recolor_commit(&rctx, d2, r1, w2);
+            BITSET_SET(renamed, d1);
+            BITSET_SET(renamed, d2);
+            pfixed++;
+            break; /* d1 consumed; move to next i */
+         }
+      }
+
+      free(phis);
+   }
+
+   /* Dest-side renaming: for a merge phi `d = phi(...)` onto a target T,
+    * move d's whole live range onto T and coalesce every sibling source
+    * that can also take T. Sources die on their incoming edges where d is
+    * born, so the windows rarely interfere. Only profitable when the
+    * compound makes strictly more edges identity than it breaks: a source
+    * that stays behind on d's old register pays for the move. */
+   unsigned dfixed = 0, dfailed = 0, dsibs = 0;
+   unsigned dfail_hazard = 0, dfail_window = 0, dwash = 0;
+
+   if (!no_dest)
+   agx_foreach_block(ctx, b) {
+      agx_foreach_phi_in_block(b, phi) {
+         const agx_index *dst = &phi->dest[0];
+         if (dst->type != AGX_INDEX_NORMAL || !dst->has_reg || dst->memory ||
+             classes[dst->value] != RA_GPR)
+            continue;
+
+         unsigned d = dst->value;
+         unsigned w = ncomps[d];
+         unsigned rD = dst->reg;
+
+         if (!w || BITSET_TEST(renamed, d) || BITSET_TEST(constrained, d))
+            continue;
+
+         unsigned nsrc = phi->nr_srcs;
+         unsigned *cand = malloc(nsrc * sizeof(unsigned));
+         unsigned *cand_hits = calloc(nsrc, sizeof(unsigned));
+         unsigned *mov = malloc(nsrc * sizeof(unsigned));
+         unsigned ncand = 0;
+         bool any_mismatch = false;
+
+         /* Candidate targets: the registers of the mismatched GPR
+          * sources, counted by how many edges they would fix directly. */
+         agx_foreach_src(phi, s) {
+            const agx_index *src = &phi->src[s];
+            if (src->type != AGX_INDEX_NORMAL || !src->has_reg ||
+                src->memory || classes[src->value] != RA_GPR ||
+                src->reg == rD)
+               continue;
+            any_mismatch = true;
+            if (ncomps[src->value] != w || (src->reg % w) ||
+                src->reg + w > bound)
+               continue;
+
+            unsigned k = 0;
+            for (; k < ncand; ++k)
+               if (cand[k] == src->reg)
+                  break;
+            if (k == ncand) {
+               cand[ncand] = src->reg;
+               cand_hits[ncand] = 0;
+               ncand++;
+            }
+            cand_hits[k]++;
+         }
+
+         if (!ncand) {
+            dwash += any_mismatch;
+            free(cand);
+            free(cand_hits);
+            free(mov);
+            continue;
+         }
+
+         /* Most hit-bearing targets first. */
+         for (unsigned i = 1; i < ncand; ++i) {
+            unsigned tr = cand[i], th = cand_hits[i], j = i;
+            while (j > 0 && cand_hits[j - 1] < th) {
+               cand[j] = cand[j - 1];
+               cand_hits[j] = cand_hits[j - 1];
+               j--;
+            }
+            cand[j] = tr;
+            cand_hits[j] = th;
+         }
+
+         unsigned old_id = phi_identity_edges(&rctx, phi, rD, ~0u, ~0u,
+                                              ~0u, ~0u);
+         bool consumed = false;
+
+         bool fhaz = false, fwin = false, fwash = false;
+
+         for (unsigned ci = 0; ci < ncand && !consumed; ++ci) {
+            unsigned T = cand[ci];
+
+            /* The dest must be able to move to T at all. */
+            bool blocked = false;
+            for (unsigned p = rctx.ref_start[d];
+                 p < rctx.ref_start[d + 1] && !blocked; ++p) {
+               blocked |= use_blocks_recolor(&rctx, rctx.ref_instr[p],
+                                             rctx.ref_slot[p], T, w, ~0u,
+                                             ~0u);
+            }
+            if (blocked) {
+               fhaz = true;
+               continue;
+            }
+            if (!recolor_window_free(&rctx, ctx, d, T, w, ~0u, 0, 0)) {
+               fwin = true;
+               continue;
+            }
+
+            /* Which sibling sources may move to T? Each must satisfy the
+             * source-side rules and be block-disjoint from d's range and
+             * from every source already accepted (two values sharing T
+             * must never be co-live). */
+            unsigned nmov = 0;
+            agx_foreach_src(phi, s) {
+               const agx_index *src = &phi->src[s];
+               if (src->type != AGX_INDEX_NORMAL || !src->has_reg ||
+                   src->memory || classes[src->value] != RA_GPR ||
+                   src->reg == T)
+                  continue;
+
+               unsigned v = src->value;
+               unsigned wv = ncomps[v];
+               bool movable =
+                  wv == w && !(T % wv) && T + wv <= bound &&
+                  !BITSET_TEST(renamed, v) &&
+                  !BITSET_TEST(constrained, v) && rctx.def_instr[v] &&
+                  rctx.def_instr[v]->op != AGX_OPCODE_PRELOAD &&
+                  ranges_disjoint(&rctx, v, d);
+
+               if (movable) {
+                  for (unsigned q = 0; q < nmov && movable; ++q)
+                     movable = ranges_disjoint(&rctx, v, mov[q]);
+               }
+               if (movable) {
+                  for (unsigned p = rctx.ref_start[v];
+                       p < rctx.ref_start[v + 1] && movable; ++p) {
+                     movable = !use_blocks_recolor(&rctx, rctx.ref_instr[p],
+                                                  rctx.ref_slot[p], T, wv,
+                                                  d, T);
+                  }
+               }
+               if (movable)
+                  movable = recolor_window_free(&rctx, ctx, v, T, wv, ~0u,
+                                                0, 0);
+
+               if (movable)
+                  mov[nmov++] = v;
+            }
+
+            /* Profit: edges fixed at T (already there plus movers) minus
+             * edges stranded at the old destination register -- every
+             * source left at rD becomes a new mismatch. */
+            if (cand_hits[ci] + nmov <= old_id) {
+               fwash = true;
+               continue;
+            }
+
+            recolor_commit(&rctx, d, T, w);
+            BITSET_SET(renamed, d);
+            dfixed++;
+            for (unsigned q = 0; q < nmov; ++q) {
+               recolor_commit(&rctx, mov[q], T, w);
+               BITSET_SET(renamed, mov[q]);
+               dsibs++;
+            }
+            consumed = true;
+         }
+         if (!consumed) {
+            dfailed++;
+            dfail_hazard += fhaz;
+            dfail_window += fwin && !fhaz;
+            dwash += fwash && !fhaz && !fwin;
+         }
+
+         free(cand);
+         free(cand_hits);
+         free(mov);
+      }
+   }
+
    if (getenv("AGX_RA_STATS"))
       fprintf(stderr,
-              "AGX_RA_RECOLOR: %u edges recolored, %u rejected "
-              "(early %u hazard %u window %u)\n",
-              fixed, failed, fail_early, fail_hazard, fail_window);
+              "AGX_RA_RECOLOR: %u src-edges recolored, %u rejected "
+              "(early %u hazard %u window %u); "
+              "%u dest-phis renamed (+%u sibling srcs), %u rejected "
+              "(hazard %u window %u, %u unprofitable skipped); "
+              "%u phi-pair swaps, %u rejected (hazard %u window %u, "
+              "%u unprofitable)\n",
+              fixed, failed, fail_early, fail_hazard, fail_window,
+              dfixed, dsibs, dfailed, dfail_hazard, dfail_window, dwash,
+              pfixed, pfailed, pfail_hazard, pfail_window, pwash);
 
    free(rctx.blocks);
    free(rctx.occ_ops);
@@ -3964,7 +4390,8 @@ agx_ra(agx_context *ctx)
    /* Merge-join recoloring: rename merge-phi sources whose whole live range
     * leaves the phi destination register free onto that register, making
     * the edge copy a no-op. */
-   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       !getenv("AGX_RA_NORECOLOR")) {
       BITSET_WORD *constrained = BITSET_CALLOC(ctx->alloc);
       BITSET_OR(constrained, constrained, low_gpr);
       BITSET_OR(constrained, constrained, texture_gpr);
