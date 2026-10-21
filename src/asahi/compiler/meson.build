@@ -96,6 +96,7 @@ libasahi_agx_files = files(
   'agx_pressure_schedule.c',
   'agx_ir.c',
   'agx_opt_cse.c',
+  'agx_opt_uniform_copy_cse.c',
   'agx_opt_break_if.c',
   'agx_opt_const_branch.c',
   'agx_opt_empty_else.c',
