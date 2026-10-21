@@ -5,23 +5,28 @@
 
 #include "agx_builder.h"
 #include "agx_compiler.h"
-#include "util/u_worklist.h"
 
 /*
  * Operands that cannot read the uniform file materialize their uniform into
  * a GPR with a `mov` per use site (agx_lower_uniform_sources). Programs fed
  * by a constant program read the same few preamble results from many
- * consumers, so the shader -- especially its loops -- fills with identical
- * `mov uN` copies.
+ * consumers, so the shader fills with identical `mov uN` copies.
  *
- * This pass CSEs those copies. A copy in a block dominated by an earlier
- * materialization of the same uniform reuses it. Within a loop, a uniform
- * copied at least twice is materialized once in the preheader instead of
- * once per use per iteration: one extra register stays live across the loop
- * in exchange for removing an instruction from every iteration. A copy that
- * is the only one in its loop keeps its short live range -- hoisting it
- * would buy nothing the spiller could not already recover by rematerializing
- * (agx_can_rematerialize_uniform).
+ * This pass CSEs those copies: a copy in a block dominated by an earlier
+ * materialization of the same uniform reuses it.  Reuse adds no live range
+ * the earlier copy did not already pay for, so it is a reliable win.
+ *
+ * Two range-extending variants were measured and dropped: materializing a
+ * shared copy in a loop preheader, and lifting copies out of sibling
+ * branches to their common dominator.  Both make one temporary live across
+ * a large part of the function, and the interval-carrying cost through a
+ * big kernel -- block-edge copies and index arithmetic, not register-file
+ * spills -- exceeds the copies removed: on the merged vkquake RT pipeline
+ * (post-RA bin3) hoisting cost +977 and the dominator lift +898, while
+ * dominated reuse alone saves -653 (rg3: +1001 / -24 vs -465).  A dropped
+ * per-use copy is the cheapest possible rematerialization -- the spiller
+ * reloads the same uniform in one instruction -- so the extension buys
+ * nothing under pressure either.
  */
 
 static bool
@@ -65,89 +70,6 @@ writes_uniform_file(const agx_instr *I)
    return false;
 }
 
-/*
- * The natural loop of `header`: every block that can reach a back edge (a
- * predecessor at or past the header in source order) without passing through
- * the header. Returns false for an unstructured region -- a block the walk
- * absorbs that entry can still reach without the header means the region is
- * not dominated by it, so a preheader copy would not dominate every dynamic
- * use.
- */
-static bool
-loop_body(agx_context *ctx, agx_block *header, BITSET_WORD *body)
-{
-   const unsigned words = BITSET_WORDS(ctx->num_blocks + 1);
-   BITSET_WORD *reach = calloc(words, sizeof(BITSET_WORD));
-   memset(body, 0, words * sizeof(BITSET_WORD));
-   bool ok = false;
-
-   u_worklist work;
-   agx_worklist_init(ctx, &work);
-
-   /* Blocks reachable from the entry without passing through the header. */
-   agx_worklist_push_tail(&work, agx_start_block(ctx));
-   while (!u_worklist_is_empty(&work)) {
-      agx_block *block = agx_worklist_pop_tail(&work);
-      if (block == header || BITSET_TEST(reach, block->index))
-         continue;
-      BITSET_SET(reach, block->index);
-      agx_foreach_successor(block, succ)
-         agx_worklist_push_tail(&work, succ);
-   }
-
-   /* Backward from each back edge, stopping at the header. */
-   BITSET_SET(body, header->index);
-   agx_foreach_predecessor(header, pred) {
-      if ((*pred)->index >= header->index &&
-          !BITSET_TEST(body, (*pred)->index)) {
-         BITSET_SET(body, (*pred)->index);
-         agx_worklist_push_tail(&work, *pred);
-      }
-   }
-   while (!u_worklist_is_empty(&work)) {
-      agx_block *block = agx_worklist_pop_tail(&work);
-      agx_foreach_predecessor(block, pred) {
-         if (!BITSET_TEST(body, (*pred)->index)) {
-            BITSET_SET(body, (*pred)->index);
-            agx_worklist_push_tail(&work, *pred);
-         }
-      }
-   }
-   u_worklist_fini(&work);
-
-   /* The region is canonical exactly when no absorbed block is reachable
-    * without the header and the header has exactly one outside predecessor:
-    * the preheader, which then dominates every block in `body`.
-    */
-   unsigned entries = 0;
-   bool dominated = true;
-   agx_foreach_block(ctx, block) {
-      if (BITSET_TEST(body, block->index)) {
-         if (block != header && BITSET_TEST(reach, block->index))
-            dominated = false;
-      } else {
-         agx_foreach_successor(block, succ) {
-            if (succ == header)
-               ++entries;
-         }
-      }
-   }
-   ok = dominated && entries == 1;
-
-   free(reach);
-   return ok;
-}
-
-static agx_block *
-loop_preheader(agx_block *header, const BITSET_WORD *body)
-{
-   agx_foreach_predecessor(header, pred) {
-      if (!BITSET_TEST(body, (*pred)->index))
-         return *pred;
-   }
-   UNREACHABLE("canonical loop has a preheader");
-}
-
 /* Halves of new materializations allowed to stay live across a block. Every
  * merged copy extends one temporary's live range across the whole reuse
  * region; the cap keeps that traded pressure bounded and refuses entirely
@@ -185,133 +107,10 @@ pressure_charge(struct pressure *p, unsigned def, unsigned last_use,
    return true;
 }
 
-
-static void
-hoist_loop_copies(agx_context *ctx, agx_index *replacement,
-                  unsigned replacement_size, struct pressure *pressure)
-{
-   unsigned nr_headers = 0;
-   agx_foreach_block(ctx, block)
-      nr_headers += block->loop_header;
-   if (!nr_headers)
-      return;
-
-   /* Innermost loops before their enclosing ones so a copy pulled into an
-    * inner preheader can still merge with the outer loop's other copies.
-    * Source order puts an inner loop's header past its enclosing one.
-    */
-   agx_block **headers = calloc(nr_headers, sizeof(*headers));
-   unsigned n = 0;
-   agx_foreach_block(ctx, block) {
-      if (block->loop_header)
-         headers[n++] = block;
-   }
-   for (unsigned i = 0; i + 1 < nr_headers; ++i) {
-      for (unsigned j = i + 1; j < nr_headers; ++j) {
-         if (headers[j]->index > headers[i]->index) {
-            agx_block *swap = headers[i];
-            headers[i] = headers[j];
-            headers[j] = swap;
-         }
-      }
-   }
-
-   BITSET_WORD *body =
-      calloc(BITSET_WORDS(ctx->num_blocks + 1), sizeof(BITSET_WORD));
-
-   for (unsigned h = 0; h < nr_headers; ++h) {
-      agx_block *header = headers[h];
-      if (!loop_body(ctx, header, body))
-         continue;
-
-      agx_block *preheader = loop_preheader(header, body);
-
-      /* A uniform written inside the loop is not loop-invariant, and the
-       * writes are unordered relative to the reads within an iteration;
-       * refuse the whole loop rather than reason about each index.
-       */
-      bool mutable_uniforms = false;
-      unsigned copies = 0;
-      agx_foreach_block(ctx, block) {
-         if (!BITSET_TEST(body, block->index))
-            continue;
-         agx_foreach_instr_in_block(block, I) {
-            mutable_uniforms |= writes_uniform_file(I);
-            copies += is_uniform_copy(I);
-         }
-      }
-      if (mutable_uniforms || copies < 2)
-         continue;
-
-      agx_instr **loop_copies = calloc(copies, sizeof(*loop_copies));
-      unsigned *copy_blocks = calloc(copies, sizeof(*copy_blocks));
-      unsigned nr_copies = 0;
-      agx_foreach_block(ctx, block) {
-         if (!BITSET_TEST(body, block->index))
-            continue;
-         agx_foreach_instr_in_block(block, I) {
-            if (is_uniform_copy(I)) {
-               copy_blocks[nr_copies] = block->index;
-               loop_copies[nr_copies++] = I;
-            }
-         }
-      }
-
-      /* Group copies by uniform source; hoist groups of at least two. */
-      for (unsigned i = 0; i < nr_copies; ++i) {
-         if (!loop_copies[i])
-            continue;
-         const agx_index uniform = loop_copies[i]->src[0];
-         unsigned count = 1;
-         unsigned last_use = copy_blocks[i];
-         for (unsigned j = i + 1; j < nr_copies; ++j) {
-            if (loop_copies[j] &&
-                same_uniform_source(uniform, loop_copies[j]->src[0])) {
-               ++count;
-               last_use = MAX2(last_use, copy_blocks[j]);
-            }
-         }
-         if (count < 2)
-            continue;
-
-         /* The shared copy stays live from the preheader to the last copy's
-          * block; refuse when a block it crosses is already tight.
-          */
-         if (pressure &&
-             !pressure_charge(pressure, preheader->index, last_use,
-                              agx_index_size_16(uniform)))
-            continue;
-
-         agx_index src = uniform;
-         src.kill = src.cache = src.discard = false;
-         agx_builder b =
-            agx_init_builder(ctx, agx_after_block_logical(preheader));
-         agx_index shared = agx_vec_temp(ctx, src.size, agx_channels(src));
-         agx_mov_to(&b, shared, src);
-         assert(shared.value < replacement_size);
-
-         for (unsigned j = i; j < nr_copies; ++j) {
-            agx_instr *dup = loop_copies[j];
-            if (!dup || !same_uniform_source(src, dup->src[0]))
-               continue;
-            loop_copies[j] = NULL;
-            replacement[dup->dest[0].value] = shared;
-            agx_remove_instruction(dup);
-         }
-      }
-      free(copy_blocks);
-      free(loop_copies);
-   }
-   free(body);
-   free(headers);
-}
-
 void
 agx_opt_uniform_copy_cse(agx_context *ctx)
 {
-   /* The hoisting phase allocates fresh temporaries; size the replacement
-    * map for every temporary that could exist.
-    */
+   /* Size the replacement map for every temporary that could exist. */
    unsigned copies_total = 0;
    bool mutable_uniforms = false;
    agx_foreach_instr_global(ctx, I) {
@@ -351,9 +150,6 @@ agx_opt_uniform_copy_cse(agx_context *ctx)
       agx_foreach_ssa_src(I, s)
          I->src[s].kill = false;
    }
-
-   hoist_loop_copies(ctx, replacement, replacement_size,
-                     dom ? &pressure : NULL);
 
    struct canon {
       agx_index src;
@@ -449,116 +245,6 @@ agx_opt_uniform_copy_cse(agx_context *ctx)
                            .dest = I->dest[0],
                            .instr = I};
       }
-   }
-
-   /* A key whose surviving copies sit in blocks that do not dominate each
-    * other -- the two sides of an if/else, or per-iteration bodies of an
-    * unrolled check sequence -- still materializes the same uniform in each.
-    * Pull one copy up to their nearest common dominator; the shared
-    * definition then dominates every copy block and transitively every use.
-    * The copy may execute on paths that never reach a consumer, a fair trade
-    * for a side-effect-free uniform read.
-    */
-   if (dom) {
-      BITSET_WORD *next_dom = calloc(words, sizeof(BITSET_WORD));
-      unsigned *depth = calloc(ctx->num_blocks + 1, sizeof(*depth));
-      agx_foreach_block(ctx, block) {
-         const BITSET_WORD *d = dom + block->index * words;
-         for (unsigned w = 0; w < words; ++w)
-            depth[block->index] += util_bitcount(d[w]);
-      }
-
-      for (unsigned i = 0; i < nr_canons; ++i) {
-         if (!canons[i].instr)
-            continue;
-         const agx_index uniform = canons[i].src;
-
-         /* Common dominators of every copy block for this uniform. */
-         bool have = false;
-         unsigned count = 0;
-         for (unsigned j = i; j < nr_canons; ++j) {
-            if (!canons[j].instr ||
-                !same_uniform_source(uniform, canons[j].src))
-               continue;
-            if (!have) {
-               memcpy(next_dom, dom + canons[j].block * words,
-                      words * sizeof(BITSET_WORD));
-               have = true;
-            } else {
-               __bitset_and(next_dom, next_dom,
-                            dom + canons[j].block * words, words);
-            }
-            ++count;
-         }
-         if (count < 2)
-            continue;
-
-         /* Deepest common dominator: the candidate dominated by all the
-          * rest, i.e. the one with the most dominators of its own.
-          */
-         int best = -1;
-         agx_foreach_block(ctx, block) {
-            if (!BITSET_TEST(next_dom, block->index))
-               continue;
-            if (best < 0 || depth[block->index] > depth[best])
-               best = block->index;
-         }
-         if (best < 0)
-            continue;
-
-         unsigned last_use = 0;
-         for (unsigned j = i; j < nr_canons; ++j) {
-            if (canons[j].instr &&
-                same_uniform_source(uniform, canons[j].src))
-               last_use = MAX2(last_use, canons[j].block);
-         }
-         if (!pressure_charge(&pressure, best, last_use,
-                              agx_index_size_16(uniform)))
-            continue;
-
-         /* If the dominator is itself a copy block (layout order disagreed
-          * with dominance), reuse its destination; otherwise materialize.
-          */
-         unsigned shared_from = UINT_MAX;
-         agx_index shared = agx_null();
-         for (unsigned j = i; j < nr_canons; ++j) {
-            if (canons[j].instr &&
-                same_uniform_source(uniform, canons[j].src) &&
-                canons[j].block == (unsigned)best) {
-               shared = canons[j].dest;
-               shared_from = j;
-            }
-         }
-         if (agx_is_null(shared)) {
-            agx_block *dom_block = NULL;
-            agx_foreach_block(ctx, block) {
-               if (block->index == (unsigned)best) {
-                  dom_block = block;
-                  break;
-               }
-            }
-            agx_index src = uniform;
-            src.kill = src.cache = src.discard = false;
-            agx_builder b =
-               agx_init_builder(ctx, agx_after_block_logical(dom_block));
-            shared = agx_vec_temp(ctx, src.size, agx_channels(src));
-            agx_mov_to(&b, shared, src);
-            assert(shared.value < replacement_size);
-         }
-
-         for (unsigned j = i; j < nr_canons; ++j) {
-            if (!canons[j].instr ||
-                !same_uniform_source(uniform, canons[j].src))
-               continue;
-            if (j != shared_from)
-               replacement[canons[j].dest.value] = shared;
-            if (j != shared_from)
-               agx_remove_instruction(canons[j].instr);
-            canons[j].instr = NULL;
-         }
-      }
-      free(next_dom);
-      free(depth);
    }
 
    free(canons);
