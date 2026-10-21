@@ -12394,10 +12394,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * atomic per subgroup plus a scan, which reads the subgroup coverage
     * registers the G17P packer admits only in compute, vertex,
     * tessellation-control and fragment (GET_SR_COVERAGE in
-    * agx3_pack_binary.c).  Enable it on G17P only, behind AGX_DBG_UATOMICS,
-    * until a CTS campaign validates it; AGX3C is left out entirely.  A
-    * 64-bit atomic would need a 64-bit reduce/scan the selector has no form
-    * for, so the pass is skipped while any is present. */
+    * agx3_pack_binary.c).  Hardware-validated on G17P (bit-identical
+    * outputs including partial-subgroup early-return); AGX3C is left out
+    * entirely.  A 64-bit atomic would need a 64-bit reduce/scan the
+    * selector has no form for, so the pass is skipped while any is
+    * present. */
    const bool g17p_uatomic_stage =
       nir->info.stage == MESA_SHADER_COMPUTE ||
       nir->info.stage == MESA_SHADER_VERTEX ||
@@ -12405,7 +12406,6 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       nir->info.stage == MESA_SHADER_FRAGMENT;
    const bool uniform_atomics =
       !is_agx3 || (is_g17p && g17p_uatomic_stage &&
-                   (agx_compiler_debug & AGX_DBG_UATOMICS) &&
                    !agx_nir_has_atomic64(nir));
 
    /* Apple's G17P loops are a
