@@ -1000,6 +1000,30 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
          if (intr->intrinsic == nir_intrinsic_load_global_bounded) {
             if (end_delta > UINT32_MAX) {
                val = nir_imm_zero(b, val->num_components, val->bit_size);
+            } else if (intr->def.num_components > 1) {
+               /* A vector access is checked whole (bounds granularity is
+                * the access), so it can compare the offset itself against
+                * a per-descriptor slack:
+                *
+                *    usub_sat(bound, off) >= size
+                *       <=>  off + size <= bound, no wrap
+                *       <=>  off < usub_sat(bound, size - 1)
+                *
+                * which is exact in both directions: the compare only
+                * passes when off <= bound - size, so off + size never
+                * wraps.  The slack is a pure function of the descriptor
+                * bound and access size, so every vector access of one
+                * width on one descriptor shares it through CSE and it
+                * hoists into the uniform preamble; each group pays a
+                * single compare-and-select instead of a per-group
+                * usub_sat (an isub plus its saturation guard) feeding a
+                * second compare.  The scalar path keeps bounds_agx, one
+                * fused compare-select per lane. */
+               nir_def *slack =
+                  nir_usub_sat(b, bound, nir_imm_int(b, load_size - 1));
+               val = nir_bcsel(b, nir_ult(b, off32, slack), val,
+                               nir_imm_zero(b, val->num_components,
+                                            val->bit_size));
             } else {
                nir_def *slack = nir_usub_sat(b, bound, common_def);
                val = bounds_check_slack(b, val, slack, (uint32_t)end_delta);
@@ -2255,6 +2279,273 @@ hk_nir_merge_bounded_stores(nir_shader *nir)
    nir_foreach_function_impl(impl, nir) {
       nir_builder b = nir_builder_create(impl);
       progress |= hk_merge_bounded_stores_cf_list(&b, &impl->body);
+   }
+   return progress;
+}
+
+/* nir_lower_explicit_io scalarizes whole-aggregate bounded loads into one
+ * 32-bit load_global_bounded per component.  Runs of those accesses covering
+ * a contiguous span of one descriptor are exactly the shape a vectorized
+ * load serves: bounds-check the whole vector once (the same whole-access
+ * granularity hk already uses for vector loads -- bounds_check selects the
+ * vector between data and zero on a single compare) instead of one
+ * compare-and-select per dword.  Merging ahead of the scalarized lowering
+ * keeps each member's byte delta in the offset and produces, per group:
+ *
+ *    vecN = load_global_bounded(base, off_min, bound)
+ *
+ * which lower_load_global_bounded covers with one whole-access check,
+ * ult(off_min, usub_sat(bound, 4N - 1)), sharing the bound-derived slack
+ * across every same-width group on the descriptor, plus one vector load;
+ * the per-component masks are replaced by extracting the masked vector's
+ * lanes.  This is the same bounds granularity an unscalarized vecN
+ * member load gets, matching robustBufferAccess2's whole-access
+ * contract: an access straddling the bound may zero the whole access. */
+
+struct hk_bload_cand {
+   nir_intrinsic_instr *load;
+   nir_scalar base_lo, base_hi;
+   nir_scalar bound;
+   struct hk_off_decomp dec;
+   int64_t delta;
+   unsigned align;      /* nir_combined_align of the intrinsic */
+   enum gl_access_qualifier access;
+};
+
+/* The 32-bit leaf scalars behind a 64-bit base def, looking through the
+ * pack_64_2x32 explicit-io emits per access.  Comparing the two halves
+ * separately lets two independently packed copies of one base key the
+ * same merge group; hk_scalar_leaf alone would only reach the low lane.
+ * A non-pack base compares on its own (mov-chased) def identity for both
+ * halves, which is conservative but sound. */
+static void
+hk_bload_base_leaves(nir_def *base, nir_scalar *lo, nir_scalar *hi)
+{
+   nir_scalar s =
+      nir_scalar_chase_movs(nir_scalar_resolved(base, 0));
+   if (nir_scalar_is_alu(s) &&
+       nir_scalar_alu_op(s) == nir_op_pack_64_2x32) {
+      nir_alu_instr *p = nir_scalar_as_alu(s);
+      *lo = hk_scalar_leaf(
+         nir_scalar_resolved(p->src[0].src.ssa, p->src[0].swizzle[0]), 0);
+      *hi = hk_scalar_leaf(
+         nir_scalar_resolved(p->src[0].src.ssa, p->src[0].swizzle[1]), 0);
+      return;
+   }
+   *lo = *hi = s;
+}
+
+/* An intrinsic that splits a mergeable run: anything that may write memory
+ * or is otherwise ordered (barriers, termination).  Loads never order
+ * relative to each other and are transparent for grouping purposes. */
+static bool
+hk_bload_barrier(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (nir_intrinsic_can_reorder(intr))
+      return false;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_bounded:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_global_constant_bounded:
+   case nir_intrinsic_load_global_constant_offset:
+   case nir_intrinsic_load_global_2x32:
+      return false;
+   default:
+      return true;
+   }
+}
+
+static bool
+hk_bload_match(nir_intrinsic_instr *intr, struct hk_bload_cand *out)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_bounded ||
+       intr->def.num_components != 1 || intr->def.bit_size != 32)
+      return false;
+
+   nir_scalar bound =
+      hk_scalar_leaf(nir_scalar_resolved(intr->src[2].ssa, 0), 0);
+   if (!bound.def || nir_scalar_is_const(bound))
+      return false;
+
+   hk_offset_decomp_init(nir_scalar_resolved(intr->src[1].ssa, 0),
+                         &out->dec);
+   if (!out->dec.valid)
+      return false;
+
+   out->load = intr;
+   hk_bload_base_leaves(intr->src[0].ssa, &out->base_lo, &out->base_hi);
+   out->bound = bound;
+   out->delta = out->dec.delta;
+   out->align = nir_combined_align(nir_intrinsic_align_mul(intr),
+                                   nir_intrinsic_align_offset(intr));
+   out->access = nir_intrinsic_access(intr);
+   return true;
+}
+
+/* Emit one vector load for members[0..n) and redirect their scalar defs to
+ * channels of the masked result.  Members carry ascending contiguous deltas
+ * relative to the group's first member; the vector goes at the earliest
+ * member's instruction so the replacement channels keep their dominance. */
+static void
+hk_emit_merged_bload(nir_builder *b, struct hk_bload_cand *members,
+                     unsigned n)
+{
+   nir_intrinsic_instr *first = members[0].load;
+
+   b->cursor = nir_before_instr(&first->instr);
+   nir_def *vec = nir_load_global_bounded(
+      b, n, 32, first->src[0].ssa, first->src[1].ssa, first->src[2].ssa,
+      .access = members[0].access,
+      .align_mul = nir_intrinsic_align_mul(first),
+      .align_offset = nir_intrinsic_align_offset(first));
+
+   for (unsigned i = 0; i < n; i++) {
+      /* Each member's channel is emitted where its load stood, so the
+       * replacement dominates exactly the original uses. */
+      b->cursor = nir_before_instr(&members[i].load->instr);
+      nir_def *ch = nir_channel(b, vec, i);
+      nir_def_rewrite_uses(&members[i].load->def, ch);
+      nir_instr_remove(&members[i].load->instr);
+   }
+}
+
+static bool
+hk_vectorize_bounded_loads_block(nir_builder *b, nir_block *block)
+{
+   struct hk_bload_cand cands[64];
+   /* barrier_after[i]: a memory-ordering intrinsic sits between cands[i]
+    * and cands[i+1] in program order. */
+   bool barrier_after[64] = {0};
+   unsigned n = 0;
+   bool pending_barrier = false;
+
+   nir_foreach_instr(instr, block) {
+      struct hk_bload_cand c;
+      if (instr->type == nir_instr_type_intrinsic &&
+          hk_bload_match(nir_instr_as_intrinsic(instr), &c)) {
+         if (n < ARRAY_SIZE(cands)) {
+            if (pending_barrier && n)
+               barrier_after[n - 1] = true;
+            pending_barrier = false;
+            cands[n++] = c;
+         }
+      } else if (hk_bload_barrier(instr)) {
+         pending_barrier = true;
+      }
+   }
+   if (n < 2)
+      return false;
+
+   bool progress = false;
+   bool claimed[ARRAY_SIZE(cands)] = {0};
+
+   for (unsigned i = 0; i < n; i++) {
+      if (claimed[i])
+         continue;
+
+      /* Group candidates sharing the bound leaf and the linear offset
+       * terms. */
+      unsigned members[ARRAY_SIZE(cands)];
+      unsigned m = 0;
+      for (unsigned j = i; j < n; j++) {
+         if (claimed[j])
+            continue;
+         if (nir_scalar_equal(cands[i].base_lo, cands[j].base_lo) &&
+             nir_scalar_equal(cands[i].base_hi, cands[j].base_hi) &&
+             nir_scalar_equal(cands[i].bound, cands[j].bound) &&
+             cands[i].access == cands[j].access &&
+             hk_off_decomp_equal(&cands[i].dec, &cands[j].dec))
+            members[m++] = j;
+      }
+      for (unsigned j = 0; j < m; j++)
+         claimed[members[j]] = true;
+      if (m < 2)
+         continue;
+
+      /* Sort members by byte delta. */
+      for (unsigned a = 0; a < m; a++)
+         for (unsigned k = a + 1; k < m; k++)
+            if (cands[members[k]].delta < cands[members[a]].delta)
+               SWAP(members[a], members[k]);
+
+      /* Pack contiguous +4 subruns into the widest aligned vector each
+       * group start admits: vec4 needs 16-byte alignment, vec2 needs 8.
+       * A vector may only span members between which no barrier sits in
+       * program order, and its lowest-delta member must also be the
+       * earliest (the merge point) so its address operands dominate it. */
+      for (unsigned r = 0; r < m;) {
+         unsigned rmax = m;
+         for (unsigned k = r; k + 1 < m; k++) {
+            if (cands[members[k + 1]].delta != cands[members[k]].delta + 4) {
+               rmax = k + 1;
+               break;
+            }
+         }
+
+         unsigned r2 = r;
+         while (r2 < rmax) {
+            /* Widest vector admissible by count and alignment. */
+            unsigned width = 1;
+            unsigned room = rmax - r2;
+            if (room >= 4 && cands[members[r2]].align >= 16)
+               width = 4;
+            else if (room >= 2 && cands[members[r2]].align >= 8)
+               width = 2;
+            if (width == 1) {
+               r2++;
+               continue;
+            }
+
+            /* The min-delta member must be the group's earliest in program
+             * order, and no barrier may sit inside its cands-index span. */
+            unsigned first_idx = members[r2];
+            bool bad = false;
+            unsigned lo = first_idx, hi = first_idx;
+            for (unsigned t = r2 + 1; t < r2 + width; t++) {
+               lo = MIN2(lo, members[t]);
+               hi = MAX2(hi, members[t]);
+            }
+            if (lo != first_idx)
+               bad = true;
+            else
+               for (unsigned t = lo; t < hi && !bad; t++)
+                  if (barrier_after[t])
+                     bad = true;
+            if (bad) {
+               r2++;
+               continue;
+            }
+
+            struct hk_bload_cand group[4];
+            for (unsigned t = 0; t < width; t++)
+               group[t] = cands[members[r2 + t]];
+            hk_emit_merged_bload(b, group, width);
+            r2 += width;
+            progress = true;
+         }
+         r = rmax;
+      }
+   }
+
+   return progress;
+}
+
+static bool
+hk_nir_vectorize_bounded_loads(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         if (hk_vectorize_bounded_loads_block(&b, block))
+            progress |= nir_progress(true, impl, nir_metadata_none);
+      }
    }
    return progress;
 }
@@ -3735,6 +4026,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (hk_buffer_addr_format(rs->storage_buffers,
                              rs->null_storage_buffer_descriptor) ==
        nir_address_format_64bit_bounded_global) {
+      /* Scalarized bounded loads covering a contiguous dword span of one
+       * descriptor merge into vector accesses first: one bounds check and
+       * one vector load per group, instead of a per-dword slack check
+       * apiece. */
+      NIR_PASS(_, nir, hk_nir_vectorize_bounded_loads);
+
       /* With bounded storage buffers, explicit-io emits one guarded
        * region per store.  Runs of those guards over a contiguous dword
        * range of one descriptor collapse into a single guard plus
