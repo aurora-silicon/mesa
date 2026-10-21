@@ -277,6 +277,7 @@ else
   'nir_opt_gcm.c',
   'nir_opt_generate_bfi.c',
   'nir_opt_idiv_const.c',
+  'nir_opt_load_after_store.c',
   'nir_opt_if.c',
   'nir_opt_intrinsics.c',
   'nir_opt_large_constants.c',

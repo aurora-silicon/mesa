@@ -3693,6 +3693,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * would hide the pattern.  Covers ssbo, shared and global derefs. */
    NIR_PASS(_, nir, nir_opt_dead_self_stores);
 
+   /* A same-block load of an address a store just covered reads back the
+    * stored value: forward it before explicit-io scatters the store's
+    * index/offset form into bounded guards. */
+   NIR_PASS(_, nir, nir_opt_load_after_store);
+
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
