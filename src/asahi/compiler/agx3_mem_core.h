@@ -52,7 +52,10 @@ struct agx3_mem_desc {
    /* Immediate index: either the signed byte offset (byte form) or a scaled
     * element index (scaled form). */
    bool idx_scaled;
-   int32_t byte_off;  /* byte form: -32768..32767 */
+   /* Signed byte offset added on top of base + (index << shift): the whole
+    * immediate index in the byte form, and an additional displacement in the
+    * register-index form. -32768..32767. */
+   int32_t byte_off;
    uint32_t elem_idx; /* scaled form: 0..65535 */
    /* Register index. */
    uint16_t idx_reg;

@@ -1594,7 +1594,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
                               : agx_vec_temp(b->shader, AGX_SIZE_16, nr);
       agx_instr *load = agx_device_load_to(
          b, packed, addr, offset, norm8 ? AGX_FORMAT_I8 : AGX_FORMAT_I16,
-         BITFIELD_MASK(nr), shift, nir_is_coherent(instr));
+         BITFIELD_MASK(nr), shift, nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
       load->memory_is_packed = norm8 && nr > 1;
 
@@ -1626,7 +1626,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       assert(packed_count == 0);
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, packed, addr, offset,
-         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr));
+         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
       agx_unpack_rgb10a2_agx3_to(b, dest, packed);
       agx_emit_cached_split(b, dest, 4);
@@ -1641,7 +1641,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       assert(packed_count == 0);
       agx_index packed = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, packed, addr, offset,
-         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr));
+         AGX_FORMAT_I32, 1, shift, nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
       agx_unpack_rgb10a2_agx3_to(b, dest, packed)->format = fmt;
       agx_emit_cached_split(b, dest, 3);
@@ -1656,7 +1656,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
       agx_index payload = agx_temp(b->shader, AGX_SIZE_32);
       agx_instr *load = agx_device_load_to(b, payload, addr, offset, fmt,
                                            BITFIELD_MASK(nr), shift,
-                                           nir_is_coherent(instr));
+                                           nir_is_coherent(instr), 0);
       load->memory_index_is_bytes = index_bytes;
 
       if (nr == 1) {
@@ -1670,7 +1670,7 @@ agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
 
    agx_instr *load = agx_device_load_to(b, dest, addr, offset, fmt,
                       BITFIELD_MASK(packed_count ? packed_count : instr->def.num_components), shift,
-                      nir_is_coherent(instr));
+                      nir_is_coherent(instr), 0);
    load->memory_index_is_bytes = index_bytes;
    load->memory_is_packed = packed_count != 0;
    agx_emit_cached_split(b, dest, instr->def.num_components);
@@ -1728,7 +1728,7 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
       mask = BITFIELD_MASK(nir_src_num_components(instr->src[0]));
    }
    agx_instr *store = agx_device_store(b, value, addr, offset, fmt, mask,
-                                      shift, nir_is_coherent(instr));
+                                      shift, nir_is_coherent(instr), 0);
    store->memory_index_is_bytes = index_bytes;
    store->memory_is_packed =
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
