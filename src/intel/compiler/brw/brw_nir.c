@@ -3765,7 +3765,7 @@ brw_postprocess_nir_opts(brw_pass_tracker *pt)
       .lower_boolean_shuffle = jay,
    };
 
-   if (OPT(nir_opt_uniform_atomics, false))
+   if (OPT(nir_opt_uniform_atomics, false, false))
       OPT(nir_lower_subgroups, &subgroups_options);
 
    if (pt->key->divergent_atomics_flags)

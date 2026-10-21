@@ -52,7 +52,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"spill",     AGX_DBG_SPILL,     "Spill (almost) everything"},
    {"nopromote", AGX_DBG_NOPROMOTE, "Do not promote constants to uniforms"},
    {"noilp",     AGX_DBG_NOILP,     "Do not latency-schedule the shader"},
-   {"uatomics",  AGX_DBG_UATOMICS,  "Enable uniform atomics on G17P"},
+   {"uatomics",  AGX_DBG_UATOMICS,  "Also rewrite result-used uniform atomics on G17P"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -7817,8 +7817,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    NIR_PASS(_, nir, agx_nir_lower_atomics, byte_indices);
 
+   /* AGX3B has no native subgroup scan: the broadcast + exclusive-prefix
+    * machinery the pass emits for a result-used atomic costs ~40
+    * instructions per site (vkquake CmCullLensFlares 217->256) and its
+    * runtime win over serialized same-address atomics is unvalidated, so
+    * only fire-and-forget atomics get the near-free elect+single-atomic
+    * rewrite by default.  AGX_MESA_DEBUG=uatomics opts back into the
+    * result-used path for A/B validation. */
    if (uniform_atomics)
-      NIR_PASS(progress, nir, nir_opt_uniform_atomics, true);
+      NIR_PASS(progress, nir, nir_opt_uniform_atomics, true,
+               !(agx_compiler_debug & AGX_DBG_UATOMICS));
 
    /* Lower addressing modes. The sooner we do this, the sooner we get rid of
     * amul/aadd instructions and can let nir_opt_algebraic do its job. But we
@@ -12409,7 +12417,8 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * outputs including partial-subgroup early-return); AGX3C is left out
     * entirely.  A 64-bit atomic would need a 64-bit reduce/scan the
     * selector has no form for, so the pass is skipped while any is
-    * present. */
+    * present.  The result-used form is additionally gated at the pass
+    * call site (see agx_optimize_nir). */
    const bool g17p_uatomic_stage =
       nir->info.stage == MESA_SHADER_COMPUTE ||
       nir->info.stage == MESA_SHADER_VERTEX ||
