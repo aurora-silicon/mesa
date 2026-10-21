@@ -9842,6 +9842,19 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    AGX_PASS(ctx, agx_lower_agx3_wide_iadd);
    AGX_PASS(ctx, agx3_lower_large_fetch_indices);
 
+   /* The lowerings above materialize inline constants into registers where
+    * an encoding has no immediate field, like the compare operand of a mixed
+    * register/minifloat FSEL. A G17P fsel compares a register against an
+    * aligned uniform directly (agx3_alu_fcmp_select, f42/f59 = 3), so give
+    * the materialized constants the same promotion the earlier run gives
+    * translation-time constants.
+    */
+   if (likely(!(agx_compiler_debug & AGX_DBG_NOOPT)) &&
+       key->promote_constants && !key->secondary &&
+       !(agx_compiler_debug & AGX_DBG_NOPROMOTE)) {
+      AGX_PASS(ctx, agx_opt_promote_constants);
+   }
+
    /* For correctness, lower uniform sources after copyprop (for correctness,
     * as copyprop creates uniform sources). To keep register pressure in
     * check, lower after CSE, since moves are cheaper than registers.
