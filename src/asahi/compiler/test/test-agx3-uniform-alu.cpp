@@ -402,7 +402,7 @@ TEST(AGX3ArrayStaging, ReusedCompletionSlotRetainsCoordinateConsumer)
       agx_index value = agx_register(i * 8, AGX_SIZE_32);
       value.channels_m1 = 2;
       agx_device_load_to(b, value, agx_register(96, AGX_SIZE_64),
-                        agx_immediate(i * 16), AGX_FORMAT_I32, 7, 0, false);
+                        agx_immediate(i * 16), AGX_FORMAT_I32, 7, 0, false, 0);
    }
    for (auto pair : {std::pair<unsigned, unsigned>{0, 48}, {8, 56}, {16, 64}}) {
       agx_index coords = agx_register(pair.first, AGX_SIZE_32);

@@ -39,7 +39,7 @@ pack(bool compare, unsigned imm, bool neg, bool swap, bool abs, unsigned hint,
    if (loaded)
       agx_device_load_to(b, r, agx_register(16, AGX_SIZE_64),
                          agx_register(20, AGX_SIZE_32), AGX_FORMAT_I32, 1, 0,
-                         false);
+                         false, 0);
    r.neg = neg;
    r.abs = abs;
    r.cache = hint == 1;

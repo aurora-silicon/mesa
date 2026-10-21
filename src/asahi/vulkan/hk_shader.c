@@ -1416,6 +1416,15 @@ hk_slacken_bounds_check_match(nir_instr *instr, struct hk_slack_site *site)
    if (alu->op != nir_op_ult)
       return false;
 
+   /* Only the scalar guard explicit-io emits.  A vector compare reduced
+    * through OpAll (like the vec4 coordinate clamp a bounded image store
+    * carries, ult(coord4, size.xyyy) feeding ball_iequal4) matches on
+    * component 0 alone, but the rewrite below rebuilds the whole def from
+    * the one site: it would collapse every lane onto component 0's
+    * operands and strand consumers reading the other components. */
+   if (alu->def.num_components != 1)
+      return false;
+
    nir_def *bound = alu->src[1].src.ssa;
    if (bound->bit_size != 32)
       return false;
@@ -1661,8 +1670,13 @@ hk_nir_slacken_bounded_checks(nir_shader *nir)
 
          nir_builder bld =
             nir_builder_at(nir_before_instr(&site->ult->instr));
-         nir_def *slack = nir_usub_sat(&bld, site->ult->src[1].src.ssa,
-                                       nir_imm_int(&bld, site->c));
+         /* Build the slack off the matched scalar, not the bound's whole
+          * def: a scalar guard can still read one component of a vector
+          * bound, and widening the compare to that def would shrink the
+          * replacement under a vector consumer's swizzle. */
+         nir_def *slack =
+            nir_usub_sat(&bld, nir_mov_scalar(&bld, site->bound),
+                         nir_imm_int(&bld, site->c));
          nir_def_replace(&site->ult->def,
                          nir_ult(&bld, nir_mov_scalar(&bld, site->off),
                                  slack));

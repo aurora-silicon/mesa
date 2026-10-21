@@ -897,9 +897,9 @@ TEST(NativeForms, TexturePublicationWaitPreservesUnrelatedResult)
    coords.channels_m1 = 1;
    agx_device_load_to(b, agx_register(0, AGX_SIZE_32),
                      agx_register(28, AGX_SIZE_64), agx_immediate(0),
-                     AGX_FORMAT_I32, 1, 0, false);
+                     AGX_FORMAT_I32, 1, 0, false, 0);
    agx_device_load_to(b, coords, agx_register(28, AGX_SIZE_64),
-                     agx_immediate(4), AGX_FORMAT_I32, 3, 0, false);
+                     agx_immediate(4), AGX_FORMAT_I32, 3, 0, false, 0);
    agx_publish_texture_agx3(b, coords, agx_null(), 1);
    agx_index resource = coords;
    resource.type = AGX_INDEX_RESOURCE;
@@ -1670,10 +1670,10 @@ TEST(NativeForms, LateCoverageStaysAfterImageSideEffects)
       b->shader->stage = MESA_SHADER_FRAGMENT;
       agx_index data = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
       agx_device_load_to(b, data, agx_uniform(8, AGX_SIZE_64), agx_immediate(0),
-                         AGX_FORMAT_I32, 15, 0, false);
+                         AGX_FORMAT_I32, 15, 0, false, 0);
       agx_index coord = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
       agx_device_load_to(b, coord, agx_uniform(8, AGX_SIZE_64), agx_immediate(4),
-                         AGX_FORMAT_I32, 3, 0, false);
+                         AGX_FORMAT_I32, 3, 0, false, 0);
       agx_instr *store = agx_image_write(
          b, data, coord, agx_zero(), agx_uniform(12, AGX_SIZE_64),
          agx_mov_imm(b, 32, 1), AGX_DIM_2D, true);
@@ -2595,7 +2595,7 @@ TEST(NativeForms, TextureFmaPublicationPacksWithoutCopy)
       if (loaded)
          agx_device_load_to(b, agx_register(2, AGX_SIZE_32),
                             agx_register(28, AGX_SIZE_64), agx_zero(),
-                            AGX_FORMAT_I32, 1, 0, false);
+                            AGX_FORMAT_I32, 1, 0, false, 0);
       const agx_index outputs[2] = {
          agx_register(16, AGX_SIZE_32),
          agx_register(18, AGX_SIZE_32),
