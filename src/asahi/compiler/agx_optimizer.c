@@ -1540,12 +1540,21 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     * the fused form whenever the second operand is register or immediate;
     * the packer refuses modified/memory operands, which keep the
     * opposite-compare fallback below. */
+   /* Only EQ with a register second operand is byte-verified against
+    * hardware output (the allequal witness); the immediate-operand and
+    * non-EQ register forms are encoder-table derived and miscompile on
+    * real G17P (sg-vote-3 all-lanes-equal bug). ASAHI_G17P_FBALLOT
+    * re-enables the unwitnessed fused forms for probing. */
    const bool fused_fballot =
       !quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
       def->op == AGX_OPCODE_FCMP &&
       (def->fcond == AGX_FCOND_EQ || def->fcond == AGX_FCOND_LT ||
        def->fcond == AGX_FCOND_GT || def->fcond == AGX_FCOND_GE ||
        def->fcond == AGX_FCOND_LE) &&
+      ((def->fcond == AGX_FCOND_EQ &&
+        def->src[0].type == AGX_INDEX_NORMAL &&
+        def->src[1].type == AGX_INDEX_NORMAL) ||
+       debug_get_bool_option("ASAHI_G17P_FBALLOT", false)) &&
       /* src0 may be an immediate: it swaps into the second-operand slot
        * with the reversed condition below. */
       ((def->src[0].type == AGX_INDEX_NORMAL &&
