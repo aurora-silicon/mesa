@@ -2156,11 +2156,11 @@ hk_merge_guarded_stores(nir_builder *b, struct hk_guarded_store *run,
  * the ladder it replaces.  That tax is only worth paying where the
  * block sequence recoups instructions anyway -- a run of scalarized
  * bounded loads on one offset chain, whose slack subtracts
- * hk_nir_share_bounded_load_slack folds into one -- or where the run is
+ * hk_nir_share_bounded_load_slack folds into one -- where the run is
  * wide enough that one span check replaces a whole ladder of
- * control-flow splits.  A short isolated run (mem-bindless-4's vec4
- * store) pays ~2 instructions per re-emitted guard with no such
- * offset, so it is left as the original ladder. */
+ * control-flow splits, or where the fast path's vector stores re-form
+ * an already-dedicated vector and so pay no marshal copies (see
+ * hk_guarded_store_values_form_vector). */
 
 /* A run of this many dword stores (a >= 24-byte span) collapses enough
  * control-flow splits that the re-emitted fallback is minor even
@@ -2218,6 +2218,90 @@ hk_block_shares_load_slack(nir_block *block)
    return false;
 }
 
+/* Whether the run's stored values reach the merged fast path's vector
+ * form for free.  That is the shape one vector store leaves after
+ * explicit-io scalarizes it: member i stores channel i of a single
+ * vector def, and that def is used by nothing else.  The vectorizer
+ * then rebuilds exactly that vector for the merged stdev, and its
+ * lanes -- dead outside this store -- are laid out for it, so no
+ * marshal copies are needed (mem-bindless-4's vec4 store).
+ *
+ * Anything else costs a marshal copy per member to re-collect the
+ * scalars on the fast path: a vector shared with other stores or with
+ * shader math has its lanes staged for that use instead, and values
+ * that were never vector-shaped collect one at a time.  On a run too
+ * short for the span check's saved region splits to cover the copies
+ * the merge is a net loss -- vkq-CmVertexPreprocess's shared-vector
+ * 4-runs regress ~+5 each this way (analysis/SGGATE-BREAKEVEN.md). */
+static bool
+hk_guarded_store_values_form_vector(const struct hk_guarded_store *run,
+                                    unsigned n)
+{
+   nir_def *vec = NULL;
+   for (unsigned i = 0; i < n; i++) {
+      /* Chase single-channel movs only, stopping at the first non-mov
+       * def: the vector the scalarized store extracts the member's
+       * channel from.  A fully-resolved chase would flatten through it
+       * to the leaf scalars and lose the vector shape. */
+      nir_scalar v = nir_get_scalar(run[i].store->src[0].ssa, 0);
+      while (v.def) {
+         nir_alu_instr *alu = nir_scalar_as_alu(v);
+         if (!alu || alu->op != nir_op_mov)
+            break;
+         v.def = alu->src[0].src.ssa;
+         v.comp = alu->src[0].swizzle[v.comp];
+      }
+      if (!v.def || v.def->num_components != n || v.comp != i)
+         return false;
+      if (!vec)
+         vec = v.def;
+      else if (v.def != vec)
+         return false;
+   }
+
+   /* Every use of the vector must be one of these stores' extract
+    * movs -- any other consumer keeps its lanes in registers laid out
+    * for that consumer, and re-collecting them marshals anyway. */
+   list_for_each_entry(nir_src, use, &vec->uses, use_link) {
+      bool in_run = false;
+      if (!nir_src_is_if(use)) {
+         nir_instr *user = nir_src_use_instr(use);
+         for (unsigned i = 0; i < n; i++)
+            in_run |= user == nir_def_instr(run[i].store->src[0].ssa);
+      }
+      if (!in_run)
+         return false;
+   }
+
+   /* A collect whose lanes repeat (a splat like texbuf-1's
+    * vec4 %83 x4) has no per-lane sources to lay out: it still pays a
+    * marshal copy per repeated lane.  Only a genuine n-lane vector,
+    * with n distinct leaf scalars behind its channels, coalesces free. */
+   if (nir_scalar_is_alu(nir_get_scalar(vec, 0)) &&
+       nir_op_is_vec(nir_scalar_alu_op(nir_get_scalar(vec, 0)))) {
+      for (unsigned i = 0; i < n; i++) {
+         nir_scalar li = nir_scalar_resolved(vec, i);
+         for (unsigned j = 0; j < i; j++)
+            if (nir_scalar_equal(li, nir_scalar_resolved(vec, j)))
+               return false;
+      }
+   }
+   return true;
+}
+
+/* Estimate the instructions the merged fast path spends getting the
+ * run's stored values into vector form: free when the run is one
+ * dedicated vector as above, ~2 per member otherwise (a marshal copy
+ * into the staged quad plus its collect).  Compare against the ~2
+ * instructions per member the span check saves in control-flow splits:
+ * merging pays off statically only when the collect is free. */
+static unsigned
+hk_guarded_store_marshal_cost(const struct hk_guarded_store *run,
+                              unsigned n)
+{
+   return hk_guarded_store_values_form_vector(run, n) ? 0 : 2 * n;
+}
+
 /* Flush an open run: merge it if it holds two or more guards and the
  * block sequence pays for the re-emission (see above), then reset.
  * The merge is emitted right before the node that closed the run, behind
@@ -2229,9 +2313,11 @@ static bool
 hk_flush_guarded_store_run(nir_builder *b, struct hk_guarded_store *run,
                            unsigned *n, bool slack_share)
 {
-   bool progress = *n >= 2 &&
-                   (slack_share || *n >= HK_STOREGUARD_WIDE_RUN) &&
-                   hk_merge_guarded_stores(b, run, *n);
+   bool progress =
+      *n >= 2 &&
+      (slack_share || *n >= HK_STOREGUARD_WIDE_RUN ||
+       hk_guarded_store_marshal_cost(run, *n) <= 2 * (*n - 1)) &&
+      hk_merge_guarded_stores(b, run, *n);
    *n = 0;
    return progress;
 }
