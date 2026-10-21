@@ -8098,6 +8098,76 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
    NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
    NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
+   /* sm5 shift lowering masks every shift count and bitfield offset to five
+    * bits; where the masked value already came out of a narrower extract or
+    * mask the second mask is dead. Drop iand(x, m) when x is bounded by a
+    * constant no larger than m. */
+   {
+      bool mask_progress = false;
+      nir_foreach_function_impl(mask_impl, nir) {
+         nir_foreach_block(mask_block, mask_impl) {
+            nir_foreach_instr_safe(mask_instr, mask_block) {
+               if (mask_instr->type != nir_instr_type_alu)
+                  continue;
+               nir_alu_instr *iand = nir_instr_as_alu(mask_instr);
+               if (iand->op != nir_op_iand)
+                  continue;
+
+               uint64_t mask;
+               nir_def *inner;
+               if (nir_src_is_const(iand->src[0].src)) {
+                  mask = nir_src_as_uint(iand->src[0].src);
+                  inner = iand->src[1].src.ssa;
+               } else if (nir_src_is_const(iand->src[1].src)) {
+                  mask = nir_src_as_uint(iand->src[1].src);
+                  inner = iand->src[0].src.ssa;
+               } else {
+                  continue;
+               }
+
+               uint64_t bound = UINT64_MAX;
+               nir_alu_instr *src = nir_def_as_alu_or_null(inner);
+               if (src) {
+                  switch (src->op) {
+                  case nir_op_iand:
+                     if (nir_src_is_const(src->src[0].src))
+                        bound = nir_src_as_uint(src->src[0].src);
+                     else if (nir_src_is_const(src->src[1].src))
+                        bound = nir_src_as_uint(src->src[1].src);
+                     break;
+                  case nir_op_ubitfield_extract:
+                     if (nir_src_is_const(src->src[2].src)) {
+                        const unsigned bits =
+                           nir_src_as_uint(src->src[2].src);
+                        bound = bits >= 64 ? UINT64_MAX
+                                           : BITFIELD64_MASK(bits);
+                     }
+                     break;
+                  case nir_op_extract_u8:
+                     bound = 0xff;
+                     break;
+                  case nir_op_extract_u16:
+                     bound = 0xffff;
+                     break;
+                  case nir_op_u2u32:
+                     bound = BITFIELD64_MASK(
+                        src->src[0].src.ssa->bit_size);
+                     break;
+                  default:
+                     break;
+                  }
+               }
+               if (bound == UINT64_MAX || (bound & mask) != bound)
+                  continue;
+
+               nir_def_rewrite_uses(&iand->def, inner);
+               nir_instr_remove(mask_instr);
+               mask_progress = true;
+            }
+         }
+         nir_progress(mask_progress, mask_impl, nir_metadata_none);
+      }
+   }
    /* The pack lowering above mints f2f16(f2f32) round-trips; fold them. */
    NIR_PASS(_, nir, agx_nir_fold_pack_roundtrip);
    /* Fuse a widened fp16 product into the f32fma the 16-bit source slots
