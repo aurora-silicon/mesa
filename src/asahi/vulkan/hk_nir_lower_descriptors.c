@@ -47,13 +47,28 @@ static const struct hk_descriptor_set_binding_layout *
 get_binding_layout(uint32_t set, uint32_t binding,
                    const struct lower_descriptors_ctx *ctx)
 {
-   assert(set < HK_MAX_SETS);
-   assert(ctx->set_layouts[set] != NULL);
+   /* A shader may reference a set or binding the supplied layouts do not
+    * declare -- shader objects are compiled against layouts provided per
+    * shader and a pipeline layout can under-declare them.  Access is then
+    * undefined by the Vulkan spec, but lowering must not fault: return NULL
+    * and let callers emit a null descriptor or constant result instead. */
+   if (set >= HK_MAX_SETS || ctx->set_layouts[set] == NULL ||
+       binding >= ctx->set_layouts[set]->binding_count)
+      return NULL;
 
-   const struct hk_descriptor_set_layout *set_layout = ctx->set_layouts[set];
+   return &ctx->set_layouts[set]->binding[binding];
+}
 
-   assert(binding < set_layout->binding_count);
-   return &set_layout->binding[binding];
+/* The driver-wide null buffer descriptor: the read-only zero page and a
+ * zero range, the same form hk_buffer_addr_range() gives a NULL buffer.
+ * Bounded accesses against a zero range are always guarded, and unbounded
+ * reads fault to zero under soft fault. */
+static nir_def *
+null_buffer_descriptor(nir_builder *b)
+{
+   return nir_vec4(b, nir_imm_int(b, (uint32_t)AGX_ZERO_PAGE_ADDRESS),
+                      nir_imm_int(b, (uint32_t)(AGX_ZERO_PAGE_ADDRESS >> 32)),
+                      nir_imm_int(b, 0), nir_imm_int(b, 0));
 }
 
 static nir_def *
@@ -145,6 +160,18 @@ load_descriptor(nir_builder *b, unsigned num_components, unsigned bit_size,
 {
    const struct hk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
+
+   if (binding_layout == NULL) {
+      /* No layout for this set/binding: emit the null descriptor instead of
+       * faulting.  Buffer descriptors take the zero-page (address, zero
+       * range) form; a bare address (an acceleration structure's BVH) is
+       * null as zero, which the software traversal reads as empty; scalar
+       * fields -- sampler indices, LOD clamps, border colours -- are zero. */
+      if (num_components == 4 && bit_size == 32)
+         return null_buffer_descriptor(b);
+
+      return nir_imm_zero(b, num_components, bit_size);
+   }
 
    if (ctx->clamp_desc_array_bounds)
       index =
@@ -338,6 +365,22 @@ get_resource_deref_binding(nir_builder *b, nir_deref_instr *deref,
    *binding = var->data.binding;
 }
 
+/* Whether a descriptor deref names a set/binding the supplied layouts do
+ * not declare. */
+static bool
+missing_deref_layout(nir_builder *b, nir_src src,
+                     const struct lower_descriptors_ctx *ctx)
+{
+   nir_deref_instr *deref = nir_src_as_deref(src);
+   if (deref == NULL)
+      return false;
+
+   uint32_t set, binding;
+   nir_def *index;
+   get_resource_deref_binding(b, deref, &set, &binding, &index);
+   return get_binding_layout(set, binding, ctx) == NULL;
+}
+
 static nir_def *
 load_resource_deref_desc(nir_builder *b, unsigned num_components,
                          unsigned bit_size, nir_deref_instr *deref,
@@ -362,6 +405,15 @@ load_image_handle(nir_builder *b, const struct lower_descriptors_ctx *ctx,
 
    const struct hk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
+
+   if (binding_layout == NULL) {
+      /* No layout for this set/binding.  Callers normally short-circuit to
+       * a constant result before building a handle; as a fallback, point
+       * the handle at the start of the root descriptor area (set slot 0)
+       * with a zero offset rather than emitting a set index whose uniform
+       * slot may not exist. */
+      return nir_bindless_image_agx(b, nir_imm_int(b, 0), .desc_set = 0);
+   }
 
    if (ctx->clamp_desc_array_bounds)
       index =
@@ -430,6 +482,19 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
 {
    b->cursor = nir_before_instr(&intr->instr);
+
+   /* An image on a set/binding the supplied layouts do not declare is
+    * undefined behaviour, but lowering must not fault.  Report null-
+    * descriptor results -- queries produce zero and stores drop. */
+   if (missing_deref_layout(b, intr->src[0], ctx)) {
+      if (!nir_def_is_unused(&intr->def)) {
+         nir_def_rewrite_uses(
+            &intr->def, nir_imm_zero(b, intr->def.num_components,
+                                     intr->def.bit_size));
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
 
    if (lower_g17p_r32_3d_diagnostic(b, intr, ctx))
       return true;
@@ -975,6 +1040,25 @@ static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
 {
+   b->cursor = nir_before_instr(&tex->instr);
+
+   /* A texture or sampler on a set/binding the supplied layouts do not
+    * declare is undefined behaviour, but lowering must not fault.  Sample
+    * zero, matching the null-descriptor semantics queries already use. */
+   const int texture_src =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int sampler_src =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if ((texture_src >= 0 &&
+        missing_deref_layout(b, tex->src[texture_src].src, ctx)) ||
+       (sampler_src >= 0 &&
+        missing_deref_layout(b, tex->src[sampler_src].src, ctx))) {
+      nir_def_replace(&tex->def,
+                      nir_imm_zero(b, tex->def.num_components,
+                                   tex->def.bit_size));
+      return true;
+   }
+
    if (lower_compute_lod_query(b, tex, ctx))
       return true;
 
@@ -1158,17 +1242,25 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
          const struct hk_descriptor_set_binding_layout *binding_layout =
             get_binding_layout(set, binding, ctx);
 
-         if (ctx->clamp_desc_array_bounds)
-            idx =
-               nir_umin(b, idx, nir_imm_int(b, binding_layout->array_size - 1));
+         if (binding_layout == NULL) {
+            /* Unreachable once the texture/sampler deref check above has
+             * run, but keep the no-layout path non-fatal: index 0 is the
+             * pinned null sampler. */
+            index = nir_bindless_sampler_agx(b, nir_imm_int(b, 0), index,
+                                             .desc_set = 0);
+         } else {
+            if (ctx->clamp_desc_array_bounds)
+               idx = nir_umin(b, idx,
+                              nir_imm_int(b, binding_layout->array_size - 1));
 
-         assert(binding_layout->stride > 0);
-         nir_def *desc_offs_B = nir_iadd_imm(
-            b, nir_amul_imm(b, idx, binding_layout->stride),
-            binding_layout->offset + plane_offset_B + native.sampler);
+            assert(binding_layout->stride > 0);
+            nir_def *desc_offs_B = nir_iadd_imm(
+               b, nir_amul_imm(b, idx, binding_layout->stride),
+               binding_layout->offset + plane_offset_B + native.sampler);
 
-         index =
-            nir_bindless_sampler_agx(b, desc_offs_B, index, .desc_set = set);
+            index = nir_bindless_sampler_agx(b, desc_offs_B, index,
+                                             .desc_set = set);
+         }
       }
 
       nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, index);
@@ -1211,6 +1303,14 @@ lower_ssbo_resource_index(nir_builder *b, nir_intrinsic_instr *intrin,
 
    const struct hk_descriptor_set_binding_layout *binding_layout =
       get_binding_layout(set, binding, ctx);
+
+   if (binding_layout == NULL) {
+      /* No layout for this set/binding: emit the null buffer descriptor
+       * (zero page, zero range) rather than faulting.  Its zero stride
+       * keeps reindex on the same address. */
+      nir_def_rewrite_uses(&intrin->def, null_buffer_descriptor(b));
+      return true;
+   }
 
    nir_def *binding_addr;
    uint8_t binding_stride;
