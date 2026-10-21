@@ -1252,9 +1252,11 @@ unsigned agx3_tile_store_bank(agx_context *ctx);
 void agx_lower_64bit_postra(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
+void agx_opt_const_branch(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);
 void agx_opt_break_if(agx_context *ctx);
 void agx_opt_jmp_none(agx_context *ctx);
+void agx_opt_noop_postra(agx_context *ctx);
 void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 
 /* AGX3 (M3/M4/M5) binary emission. Returns false -- failing the shader,

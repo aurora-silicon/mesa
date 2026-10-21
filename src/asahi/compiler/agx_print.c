@@ -196,7 +196,13 @@ agx_print_instr(const agx_instr *I, FILE *fp)
       else
          print_comma = true;
 
-      fprintf(fp, "#0x%" PRIx64, I->imm);
+      /* iadd/imad carry their only immediate in I->shift; printing the
+       * unrelated I->imm field (always zero) made shifted forms look like
+       * plain adds. */
+      if (info.immediates == AGX_IMMEDIATE_SHIFT)
+         fprintf(fp, "#0x%x", I->shift);
+      else
+         fprintf(fp, "#0x%" PRIx64, I->imm);
       if (I->imm && util_is_probably_float(I->imm)) {
          fprintf(fp, " /* %f */", uif(I->imm));
       }

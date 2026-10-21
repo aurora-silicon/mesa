@@ -9657,6 +9657,9 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
     * therefore an AGX2-only pass. */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX2)
       agx_insert_waits(ctx);
+   /* Excise statically-known if sides before the structural cleanups that
+    * pattern-match on the canonical if/else/pop shape. */
+   agx_opt_const_branch(ctx);
    agx_opt_empty_else(ctx);
    agx_opt_break_if(ctx);
    agx_opt_jmp_none(ctx);
@@ -9672,6 +9675,12 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
     * are computed against the instructions that actually survive. */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
       agx3_split_vector_stack_access(ctx);
+
+   /* Drop copy idioms the allocator coalesced onto their own source
+    * (iadd #0 / self-mov). A self-copy neither extends nor shortens the
+    * destination's liveness, so the register-cache pass sees the same
+    * program either way. */
+   agx_opt_noop_postra(ctx);
 
    /* Set last-use bits after lowering pseudo for best results. */
    agx_opt_register_cache(ctx);
