@@ -2078,16 +2078,87 @@ hk_merge_guarded_stores(nir_builder *b, struct hk_guarded_store *run,
    return true;
 }
 
-/* Flush an open run: merge it if it holds two or more guards, then reset.
+/* The merge trades static size for a shorter dynamic path: the
+ * out-of-bounds fallback keeps the original per-store guards, so merging
+ * a run always adds the span check and the fast-path stores on top of
+ * them.  That tax is only worth paying where the block sequence recoups
+ * instructions anyway -- a run of scalarized bounded loads on one offset
+ * chain, whose slack subtracts hk_nir_share_bounded_load_slack folds
+ * into one -- or where the run is wide enough that one span check
+ * replaces a whole ladder of control-flow splits and the fallback stays
+ * a small fraction of the span.  A short isolated run (mem-bindless-4's
+ * vec4 store) pays ~2 instructions per duplicated guard with no such
+ * offset, so it is left as the original ladder. */
+
+/* A run of this many dword stores (a >= 24-byte span) collapses enough
+ * control-flow splits that the fallback duplication is minor even
+ * without slack sharing in the block. */
+#define HK_STOREGUARD_WIDE_RUN 6
+
+/* Does this block hold two or more bounded loads that
+ * hk_nir_share_bounded_load_slack will hang on one slack: loads on one
+ * descriptor (equal bound leaf) whose byte offsets decompose to the same
+ * linear terms, constant deltas aside?  The loads are still
+ * load_global_bounded intrinsics here -- lower_load_global_bounded emits
+ * the bounds_agx(value, end, usub_sat(bound, off)) form afterwards -- so
+ * the offset and bound are taken straight from the intrinsic. */
+static bool
+hk_block_shares_load_slack(nir_block *block)
+{
+   struct hk_slack_load {
+      nir_scalar bound;
+      struct hk_off_decomp dec;
+   } loads[32];
+   unsigned n = 0;
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_load_global_bounded)
+         continue;
+
+      nir_scalar bound =
+         hk_scalar_leaf(nir_scalar_resolved(intr->src[2].ssa, 0), 0);
+      if (!bound.def || nir_scalar_is_const(bound))
+         continue;
+
+      struct hk_off_decomp dec;
+      hk_offset_decomp_init(nir_scalar_resolved(intr->src[1].ssa, 0),
+                            &dec);
+      /* A constant offset lowers to an immediate bounds_check, not the
+       * shared usub_sat slack, so it cannot pay for the merge. */
+      if (!dec.valid || !dec.num_terms)
+         continue;
+
+      for (unsigned i = 0; i < n; i++) {
+         if (nir_scalar_equal(loads[i].bound, bound) &&
+             hk_off_decomp_equal(&loads[i].dec, &dec))
+            return true;
+      }
+      if (n < ARRAY_SIZE(loads)) {
+         loads[n].bound = bound;
+         loads[n].dec = dec;
+         n++;
+      }
+   }
+   return false;
+}
+
+/* Flush an open run: merge it if it holds two or more guards and the
+ * block sequence pays for the duplication (see above), then reset.
  * The merge is emitted right before the node that closed the run, behind
  * the scan cursor, so the ifs it creates are never revisited -- important
  * because the out-of-bounds fallback re-emits the same guarded-store
  * shape and would re-match on a rescan. */
 static bool
 hk_flush_guarded_store_run(nir_builder *b, struct hk_guarded_store *run,
-                         unsigned *n)
+                           unsigned *n, bool slack_share)
 {
-   bool progress = *n >= 2 && hk_merge_guarded_stores(b, run, *n);
+   bool progress = *n >= 2 &&
+                   (slack_share || *n >= HK_STOREGUARD_WIDE_RUN) &&
+                   hk_merge_guarded_stores(b, run, *n);
    *n = 0;
    return progress;
 }
@@ -2098,6 +2169,19 @@ hk_merge_bounded_stores_cf_list(nir_builder *b, struct exec_list *cf_list)
    bool progress = false;
    struct hk_guarded_store run[64];
    unsigned n = 0;
+
+   /* Whether this block sequence holds bounded loads that will share one
+    * slack subtract once lowered -- the regime where duplicating the
+    * fallback guards is paid for by the surrounding scalarized-access
+    * economies. */
+   bool slack_share = false;
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_block &&
+          hk_block_shares_load_slack(nir_cf_node_as_block(node))) {
+         slack_share = true;
+         break;
+      }
+   }
 
    foreach_list_typed_safe(nir_cf_node, node, node, cf_list) {
       if (node->type == nir_cf_node_if) {
@@ -2114,7 +2198,7 @@ hk_merge_bounded_stores_cf_list(nir_builder *b, struct exec_list *cf_list)
                continue;
             }
             /* Mismatched or full run: flush, then start a new run here. */
-            progress |= hk_flush_guarded_store_run(b, run, &n);
+            progress |= hk_flush_guarded_store_run(b, run, &n, slack_share);
             run[n++] = m;
             continue;
          }
@@ -2129,10 +2213,10 @@ hk_merge_bounded_stores_cf_list(nir_builder *b, struct exec_list *cf_list)
             b, &nir_cf_node_as_loop(node)->body);
 
       /* Boundary in the sequence: flush whatever run was open. */
-      progress |= hk_flush_guarded_store_run(b, run, &n);
+      progress |= hk_flush_guarded_store_run(b, run, &n, slack_share);
    }
 
-   progress |= hk_flush_guarded_store_run(b, run, &n);
+   progress |= hk_flush_guarded_store_run(b, run, &n, slack_share);
    return progress;
 }
 
