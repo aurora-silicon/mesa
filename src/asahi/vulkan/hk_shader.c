@@ -1768,9 +1768,9 @@ lower_load_global_constant_offset_instr(nir_builder *b,
  *       store_global(v1, iadd(addr0, 4))
  *       ...
  *    } else {
- *       if (ult(off0 + 3, bound)) store0   // original sequence, verbatim
- *       if (ult(off1 + 3, bound)) store1
- *       ...
+ *       if (slack >= 4)        store0   // same slack, tail prefix only
+ *       if (slack >= 8)        store1
+ *       ...                           // last member: check == span check
  *    }
  *
  * usub_sat(bound, first) >= span is exactly "first + span <= bound without
@@ -1778,9 +1778,11 @@ lower_load_global_constant_offset_instr(nir_builder *b,
  * does, since the offsets are strictly increasing.  The fallback therefore
  * preserves the component-granularity contract robustBufferAccess2 needs:
  * a lane (dword) that is in bounds is still stored even when a neighbour
- * is out of bounds.  On the fast path the stores share one address chain
- * with constant offsets, so nir_opt_load_store_vectorize can merge them
- * into vector stores. */
+ * is out of bounds.  Only a prefix can pass on that path, so it re-checks
+ * each member but the last against the shared slack instead of copying
+ * the whole guard ladder.  On the fast path the stores share one address
+ * chain with constant offsets, so nir_opt_load_store_vectorize can merge
+ * them into vector stores. */
 
 /* A then-block holding exactly one store_global and an empty else block:
  * the shape build_explicit_io_store emits for a bounded write. */
@@ -2114,11 +2116,28 @@ hk_merge_guarded_stores(nir_builder *b, struct hk_guarded_store *run,
          b, run[i].store,
          i ? nir_iadd_imm(b, addr0, run[i].delta - run[0].delta) : addr0);
 
-   /* Slow path: the original per-store guards, so partially in-bounds
-    * ranges keep component granularity. */
+   /* Slow path: the span check failed, so slack < span and only a
+    * prefix of the run can still be in bounds.  Member i's original
+    * check ult(off_i + 3, bound) is uge(slack, delta_i - delta_0 + 4)
+    * on the same usub_sat slack the span check already computed: when
+    * bound >= off_min the wrapped difference cancels exactly
+    * (off_i + 3 < bound  <=>  delta_i - delta_0 + 3 < slack), and when
+    * bound < off_min the saturating subtract yields 0 and rejects every
+    * member, as the original checks do (off_i >= off_min > bound).  The
+    * last member needs no re-check at all: its guard is the span check
+    * itself, already known false on this path.  Where off_min + delta
+    * wraps past 2^32 the original wrapped compare could pass a wild
+    * address; the slack form never does, the same strictly-conservative
+    * stance slacken's usub_sat rewrite takes. */
    nir_push_else(b, outer);
-   for (unsigned i = 0; i < count; i++) {
-      nir_if *inner = nir_push_if(b, run[i].nif->condition.ssa);
+   for (unsigned i = 0; i + 1 < count; i++) {
+      int64_t rel = run[i].delta - run[0].delta;
+      nir_if *inner =
+         nir_push_if(b, nir_uge(b, slack, nir_imm_int(b, rel + 4)));
+      /* Keep the member's own iadd(base, u2u64(off + delta)) address:
+       * the delta folds into the divergent offset term, sharing one
+       * staged base, while iadd64(addr0, delta) would fold it into the
+       * uniform base and stage a fresh 64-bit address per member. */
       hk_emit_guarded_store_clone(b, run[i].store, run[i].store->src[1].ssa);
       nir_pop_if(b, inner);
    }
@@ -2131,19 +2150,20 @@ hk_merge_guarded_stores(nir_builder *b, struct hk_guarded_store *run,
 }
 
 /* The merge trades static size for a shorter dynamic path: the
- * out-of-bounds fallback keeps the original per-store guards, so merging
- * a run always adds the span check and the fast-path stores on top of
- * them.  That tax is only worth paying where the block sequence recoups
- * instructions anyway -- a run of scalarized bounded loads on one offset
- * chain, whose slack subtracts hk_nir_share_bounded_load_slack folds
- * into one -- or where the run is wide enough that one span check
- * replaces a whole ladder of control-flow splits and the fallback stays
- * a small fraction of the span.  A short isolated run (mem-bindless-4's
- * vec4 store) pays ~2 instructions per duplicated guard with no such
+ * out-of-bounds fallback re-checks each member but the last on the
+ * shared slack, so merging a run still adds the span check, the
+ * fast-path stores and one guarded-store region per member on top of
+ * the ladder it replaces.  That tax is only worth paying where the
+ * block sequence recoups instructions anyway -- a run of scalarized
+ * bounded loads on one offset chain, whose slack subtracts
+ * hk_nir_share_bounded_load_slack folds into one -- or where the run is
+ * wide enough that one span check replaces a whole ladder of
+ * control-flow splits.  A short isolated run (mem-bindless-4's vec4
+ * store) pays ~2 instructions per re-emitted guard with no such
  * offset, so it is left as the original ladder. */
 
 /* A run of this many dword stores (a >= 24-byte span) collapses enough
- * control-flow splits that the fallback duplication is minor even
+ * control-flow splits that the re-emitted fallback is minor even
  * without slack sharing in the block. */
 #define HK_STOREGUARD_WIDE_RUN 6
 
@@ -2199,11 +2219,12 @@ hk_block_shares_load_slack(nir_block *block)
 }
 
 /* Flush an open run: merge it if it holds two or more guards and the
- * block sequence pays for the duplication (see above), then reset.
+ * block sequence pays for the re-emission (see above), then reset.
  * The merge is emitted right before the node that closed the run, behind
- * the scan cursor, so the ifs it creates are never revisited -- important
- * because the out-of-bounds fallback re-emits the same guarded-store
- * shape and would re-match on a rescan. */
+ * the scan cursor, so the ifs it creates are never revisited -- the
+ * fallback's uge-on-slack guards do not match the ult(iadd(off, 3),
+ * bound) shape anyway, but emitting behind the cursor keeps that from
+ * ever depending on the match details. */
 static bool
 hk_flush_guarded_store_run(nir_builder *b, struct hk_guarded_store *run,
                            unsigned *n, bool slack_share)
