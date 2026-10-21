@@ -268,6 +268,7 @@ else
   'nir_opt_cse.c',
   'nir_opt_dce.c',
   'nir_opt_dead_cf.c',
+  'nir_opt_dead_self_stores.c',
   'nir_opt_dead_write_vars.c',
   'nir_opt_find_array_copies.c',
   'nir_opt_fp_math_ctrl.c',
