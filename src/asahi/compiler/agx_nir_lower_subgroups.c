@@ -127,6 +127,40 @@ agx_subgroup_read(nir_builder *b, nir_def *data, nir_def *index)
    return result;
 }
 
+/* Exclusive signed-max prefix of `data`, emitted as the intrinsic so isel
+ * reaches the hardware prefix op: 32-bit integer min/max has a prefix
+ * encoding (f53 on sRedsmin/sRedsmax), hardware-verified to scan the
+ * active-lane ordering under a partial mask and to report the per-op
+ * identity -- INT_MIN here -- for lanes with no active predecessor.
+ * The intrinsic survives this pass: agx_scan_eligible admits 32-bit imax
+ * scans only at 64 bits, so it reaches isel untouched.
+ */
+static nir_def *
+agx_exscan_smax(nir_builder *b, nir_def *data)
+{
+   nir_intrinsic_instr *scan =
+      nir_intrinsic_instr_create(b->shader, nir_intrinsic_exclusive_scan);
+   scan->num_components = 1;
+   scan->src[0] = nir_src_for_ssa(data);
+   nir_intrinsic_set_reduction_op(scan, nir_op_imax);
+   nir_def_init(&scan->instr, &scan->def, 1, 32);
+   nir_builder_instr_insert(b, &scan->instr);
+   return &scan->def;
+}
+
+/* Gathered composition of a frontier vector with itself: sq[l] = f[f[l]],
+ * i.e. twice as many chain steps back in one shuffle-read.  A dead
+ * frontier (INT_MIN) clamps to lane 31 and could surface a live value, so
+ * propagate the marker explicitly -- same guard the old per-step chain
+ * carried.
+ */
+static nir_def *
+agx_frontier_square(nir_builder *b, nir_def *f)
+{
+   nir_def *sq = agx_subgroup_read(b, f, nir_umin_imm(b, f, 31));
+   return nir_bcsel(b, nir_ult_imm(b, f, 32), sq, f);
+}
+
 /* Subgroup scan over the active-lane predecessor chain.
  *
  * The common lowering guards a full-subgroup Kogge-Stone sweep with a
@@ -134,45 +168,54 @@ agx_subgroup_read(nir_builder *b, nir_def *data, nir_def *index)
  * at a time; that masked walk costs hundreds of instructions.  But a
  * partially-active subgroup has stale registers in its inactive lanes,
  * not values a shuffle may read, so simply guarding each fixed-distance
- * buddy drops every contribution that lies below an inactive lane.
+ * buddy drops every contribution that lies below an inactive lane.  An
+ * identity fill cannot fix that: inactive lanes never execute the fill.
  *
- * Instead, each lane finds its closest active predecessor once, straight
- * from the ballot, and the scan runs as pointer doubling down that
- * chain: after step k each lane has folded in its first 2^k predecessors
- * and its frontier is the 2^k-th predecessor.  Five steps cover a
- * 32-lane subgroup and only active lanes' registers are ever consumed.
+ * Instead, each lane finds its closest active predecessor once, and the
+ * scan runs as pointer doubling down that chain: after step k each lane
+ * has folded in its first 2^k predecessors and its frontier is the
+ * 2^k-th predecessor.  Five steps cover a 32-lane subgroup and only
+ * active lanes' registers are ever consumed.
+ *
+ * The chain itself is computed without touching the ballot: the closest
+ * active predecessor of every lane is the exclusive signed-max prefix of
+ * the lane indices, and scanning the resulting predecessor vector again
+ * composes one more chain link (the prefix evaluates the vector at the
+ * first predecessor, so a scan of f_k yields f_{k+1}).  The fold consumes
+ * the frontiers at chain positions 1, 2, 4, 8 and 16: the first four
+ * cost eight prefix ops between them, and f16 = f8[f8] is the one
+ * squaring that beats eight more scans.  All of it is mask-only data,
+ * so the whole apparatus commons up across scans sharing a block.
  */
 static nir_def *
 agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
                   bool inclusive)
 {
-   nir_def *m = nir_ballot(b, 1, 32, nir_imm_true(b));
    nir_def *lane = nir_load_subgroup_invocation(b);
 
-   /* Bit 31 - k of `below` is set when lane (l - k) is active; bit 31 is
-    * the lane's own bit.
+   /* The frontiers the fold consumes: f1, f2, f4, f8 -- each a single
+    * prefix op per extra chain link -- and f16 = f8[f8], the one squaring
+    * that beats the next eight prefix ops.
     */
-   nir_def *below = nir_ishl(b, m, nir_isub_imm(b, 31, lane));
-
-   /* prev = highest active lane strictly below this one.  ufind_msb
-    * returns -1 when no predecessor exists, so prev lands in [-32, -1]:
-    * as an unsigned value it sorts past 31, which both fails the `f < 32`
-    * validity test and clamps to a legal lane for the shuffle index.
-    */
-   nir_def *below_exc = nir_iand_imm(b, below, 0x7fffffff);
-   nir_def *prev = nir_iadd(b, lane,
-                            nir_iadd_imm(b, nir_ufind_msb(b, below_exc),
-                                         -31));
+   nir_def *f[5];
+   nir_def *link = agx_exscan_smax(b, lane);
+   f[0] = link;
+   for (unsigned i = 2; i <= 8; ++i) {
+      link = agx_exscan_smax(b, link);
+      if (i == 2)
+         f[1] = link;
+      else if (i == 4)
+         f[2] = link;
+   }
+   f[3] = link;
+   f[4] = agx_frontier_square(b, link);
 
    nir_def *v = data;
-   nir_def *f = prev;
    for (unsigned i = 0; i < 5; ++i) {
-      nir_def *ok = nir_ult_imm(b, f, 32);
-      nir_def *idx = nir_umin_imm(b, f, 31);
+      nir_def *ok = nir_ult_imm(b, f[i], 32);
+      nir_def *idx = nir_umin_imm(b, f[i], 31);
       nir_def *buddy = agx_subgroup_read(b, v, idx);
       v = nir_bcsel(b, ok, nir_build_alu2(b, red_op, v, buddy), v);
-      nir_def *next = agx_subgroup_read(b, f, idx);
-      f = nir_bcsel(b, ok, next, f);
    }
 
    if (inclusive)
@@ -181,8 +224,8 @@ agx_subgroup_scan(nir_builder *b, nir_op red_op, nir_def *data,
    /* The exclusive result is the inclusive value held by the closest
     * active predecessor, or the identity where there is none.
     */
-   nir_def *ok = nir_ult_imm(b, prev, 32);
-   nir_def *idx = nir_umin_imm(b, prev, 31);
+   nir_def *ok = nir_ult_imm(b, f[0], 32);
+   nir_def *idx = nir_umin_imm(b, f[0], 31);
    nir_def *buddy = agx_subgroup_read(b, v, idx);
    nir_const_value ident = nir_alu_binop_identity(red_op, data->bit_size);
    nir_def *identity = nir_build_imm(b, 1, data->bit_size, &ident);
