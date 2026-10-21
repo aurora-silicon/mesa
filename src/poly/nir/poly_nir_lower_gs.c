@@ -1331,6 +1331,45 @@ struct topology_ctx {
    uint32_t topology[384];
 };
 
+/* All emit-primitives must execute exactly once per invocation. It is not
+ * enough to check for the start block: inlined helpers (e.g. the topology
+ * decode feeding load_per_vertex_input) expand to if/else ladders whose
+ * merge blocks legitimately hold the emit calls.
+ *
+ * A block executes on every completed path iff it dominates every
+ * predecessor of the end block (end_block itself is a sentinel outside the
+ * dominance tree). If the block is not inside a loop, it additionally cannot
+ * be revisited, so it executes exactly once.
+ */
+static bool
+emit_executes_once(nir_block *emit_block, nir_function_impl *impl)
+{
+   /* Only consider the entrypoint: emits inside a callee could be reached
+    * from conditional or repeated call sites, which local CFG analysis
+    * cannot see.
+    */
+   if (impl != nir_shader_get_entrypoint(impl->function->shader))
+      return false;
+
+   unsigned preds = 0;
+   nir_foreach_pred(pred, impl->end_block) {
+      if (!nir_block_dominates(emit_block, pred))
+         return false;
+      ++preds;
+   }
+
+   if (!preds)
+      return false;
+
+   for (nir_cf_node *node = emit_block->cf_node.parent; node;
+        node = node->parent) {
+      if (node->type == nir_cf_node_loop)
+         return false;
+   }
+
+   return true;
+}
+
 static bool
 evaluate_topology(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -1339,11 +1378,7 @@ evaluate_topology(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (intr->intrinsic != nir_intrinsic_emit_primitive_poly)
       return false;
 
-   /* All emit-primitives must execute exactly once. That happens if everything
-    * is in the start block. Strictly we could relax this (to handle
-    * if-statements interleaved with other stuff).
-    */
-   if (intr->instr.block != nir_start_block(b->impl)) {
+   if (!emit_executes_once(intr->instr.block, b->impl)) {
       info->shape = POLY_GS_SHAPE_DYNAMIC_INDEXED;
       return false;
    }
@@ -1429,6 +1464,9 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
 {
    struct topology_ctx ctx = {.info = info};
    bool has_restart = info->mode != MESA_PRIM_POINTS;
+
+   /* evaluate_topology needs dominance for its executes-exactly-once test */
+   nir_calc_dominance(gs);
    nir_shader_intrinsics_pass(gs, evaluate_topology, nir_metadata_all, &ctx);
    if (info->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED)
       return;
