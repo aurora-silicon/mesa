@@ -374,8 +374,13 @@ validate_ioto_program(const struct asahi_g17p_stream_memory *memory,
                const bool absolute_source = fragment || nested_tables ||
                                             dest == 3;
                if (absolute_source && source > UINT32_MAX) {
-                  if (!memory->owned(memory->data, source, 4))
-                     return fail_at(cursor, "Ioto load source is unowned");
+                  if (!memory->owned(memory->data, source, 4)) {
+                     char what[128];
+                     snprintf(what, sizeof(what),
+                              "Ioto load source %#llx is unowned",
+                              (unsigned long long)source);
+                     return fail_at(cursor, what);
+                  }
 
                   uint8_t nested[16];
                   if (nested_tables &&
