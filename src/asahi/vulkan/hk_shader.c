@@ -2390,6 +2390,470 @@ hk_nir_merge_bounded_stores(nir_shader *nir)
    return progress;
 }
 
+/* When the pipeline's storage-buffer robustness is DISABLED the
+ * bounded-global address format is in use only for null-descriptor
+ * semantics: every bound seen on a real buffer is a range the application
+ * already promised to stay inside, so per-access granularity on
+ * out-of-bounds lanes preserves nothing the API requires.  A group of
+ * accesses that shares one descriptor (base and bound) and one linear
+ * offset chain can then sink or source the whole group on a single span
+ * check:
+ *
+ *    ok      = ult(off_first, usub_sat(bound, span - 1))
+ *    base_ld = bcsel(ok, base, AGX_ZERO_PAGE_ADDRESS)
+ *    base_st = bcsel(ok, base, AGX_SCRATCH_PAGE_ADDRESS)
+ *    off'    = bcsel(ok, off_first, first_delta - min_delta) + (d - d0)
+ *
+ * A null descriptor has a zero bound, so the check fails there: loads read
+ * the zero page and return zeros, stores land in the scratch-page discard
+ * sink -- the same sinks the per-access lowering uses for its fallbacks.
+ * Every member keeps its program position, so no access is reordered.  The
+ * per-load compare-and-selects and the per-store guard regions all go
+ * away; the group pays one compare and a handful of selects.
+ */
+
+#define HK_FLAT_MAX_GROUPS 16
+#define HK_FLAT_MAX_MEMBERS 64
+/* Redirected members write or read inside one sink page. */
+#define HK_FLAT_MAX_SPAN 16384
+
+static void hk_bload_base_leaves(nir_def *base, nir_scalar *lo,
+                                 nir_scalar *hi);
+
+struct hk_flat_group_key {
+   nir_scalar bound;
+   nir_scalar base_lo, base_hi;
+   struct hk_off_decomp dec;
+};
+
+static bool
+hk_flat_group_key_equal(const struct hk_flat_group_key *a,
+                        const struct hk_flat_group_key *b)
+{
+   return nir_scalar_equal(a->bound, b->bound) &&
+          nir_scalar_equal(a->base_lo, b->base_lo) &&
+          nir_scalar_equal(a->base_hi, b->base_hi) &&
+          hk_off_decomp_equal(&a->dec, &b->dec);
+}
+
+/* Decompose the store's checked end and stored-to offset and confirm they
+ * differ by exactly size - 1, i.e. the guard covers exactly this store's
+ * span, the shape build_explicit_io_store emits for a bounded write.
+ * Returns the offset's linear terms and the store's byte size. */
+static bool
+hk_flat_store_guard(nir_if *nif, nir_intrinsic_instr **store_out,
+                    struct hk_flat_group_key *key, int64_t *delta,
+                    int64_t *end_delta, unsigned *size)
+{
+   if (exec_list_get_head(&nif->then_list) !=
+          exec_list_get_tail(&nif->then_list) ||
+       exec_list_get_head(&nif->else_list) !=
+          exec_list_get_tail(&nif->else_list))
+      return false;
+
+   if (!exec_list_is_empty(&nir_if_first_else_block(nif)->instr_list))
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_instr *last = nir_block_last_instr(then_block);
+   if (!last || last->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *store = nir_instr_as_intrinsic(last);
+   if (store->intrinsic != nir_intrinsic_store_global ||
+       store->src[0].ssa->bit_size != 32)
+      return false;
+
+   /* Masked tail writes cover [0, top): the written span ends at the
+    * highest masked component. */
+   unsigned mask = nir_intrinsic_write_mask(store);
+   if (!mask || (mask & (mask + 1)) != 0)
+      return false;
+   *size = 4 * util_last_bit(mask);
+
+   /* Everything before the store gets lifted out of the if, so it must be
+    * side-effect-free: ALU and constants only. */
+   nir_foreach_instr(instr, then_block) {
+      if (instr == last)
+         break;
+      if (instr->type != nir_instr_type_alu &&
+          instr->type != nir_instr_type_load_const &&
+          instr->type != nir_instr_type_undef)
+         return false;
+   }
+
+   /* Condition: ult(end, bound) */
+   nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
+   if (!is_op(cond, nir_op_ult))
+      return false;
+
+   struct hk_off_decomp end_dec;
+   hk_offset_decomp_init(nir_scalar_chase_alu_src(cond, 0), &end_dec);
+   nir_scalar bound =
+      hk_scalar_leaf(nir_scalar_chase_alu_src(cond, 1), 0);
+   if (!bound.def || nir_scalar_is_const(bound))
+      return false;
+
+   /* Store address: iadd(base64, u2u64(off32)) */
+   nir_scalar addr = nir_scalar_resolved(store->src[1].ssa, 0);
+   if (!is_op(addr, nir_op_iadd))
+      return false;
+
+   nir_scalar base64 = {NULL, 0};
+   nir_scalar off = {NULL, 0};
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar o = nir_scalar_chase_alu_src(addr, i);
+      if (is_op(o, nir_op_u2u64)) {
+         off = nir_scalar_chase_alu_src(o, 0);
+         base64 = nir_scalar_chase_alu_src(addr, 1 - i);
+      }
+   }
+   if (!off.def || !base64.def || off.def->bit_size != 32)
+      return false;
+
+   hk_offset_decomp_init(off, &key->dec);
+   if (!hk_off_decomp_equal(&end_dec, &key->dec) ||
+       end_dec.delta - key->dec.delta != (int64_t)*size - 1)
+      return false;
+
+   /* Base and bound must come from the same descriptor vector, so two
+    * different buffers can never share a group. */
+   nir_scalar b64 = nir_scalar_chase_movs(base64);
+   if (nir_scalar_is_alu(b64) &&
+       nir_scalar_alu_op(b64) == nir_op_pack_64_2x32) {
+      nir_alu_instr *pack = nir_scalar_as_alu(b64);
+      key->base_lo = hk_scalar_leaf(
+         nir_get_scalar(pack->src[0].src.ssa, pack->src[0].swizzle[0]), 0);
+      key->base_hi = hk_scalar_leaf(
+         nir_get_scalar(pack->src[0].src.ssa, pack->src[0].swizzle[1]), 0);
+      if (key->base_lo.def != bound.def)
+         return false;
+   } else {
+      /* Unpacked base: still require the bound to be non-constant
+       * descriptor state, but key the halves on the shared def. */
+      key->base_lo = key->base_hi = b64;
+   }
+
+   key->bound = bound;
+   *delta = key->dec.delta;
+   *end_delta = end_dec.delta;
+   *store_out = store;
+   return true;
+}
+
+struct hk_flat_group {
+   struct hk_flat_group_key key;
+   /* Loads: the load_global_bounded intrinsic, nif NULL.
+    * Stores: the guarding if and the store inside it. */
+   nir_intrinsic_instr *intr[HK_FLAT_MAX_MEMBERS];
+   nir_if *nif[HK_FLAT_MAX_MEMBERS];
+   int64_t delta[HK_FLAT_MAX_MEMBERS]; /* access offset delta, bytes */
+   int64_t end_delta[HK_FLAT_MAX_MEMBERS]; /* checked end delta, stores */
+   unsigned size[HK_FLAT_MAX_MEMBERS];
+   unsigned n;
+};
+
+/* Select a 64-bit descriptor base between the real one and a sink page,
+ * keeping the pack_64_2x32 structure where the base has one so the select
+ * folds into the pair formation. */
+static nir_def *
+hk_flat_select_base(nir_builder *b, nir_def *ok, nir_def *base64,
+                    uint64_t sink)
+{
+   nir_scalar s = nir_scalar_chase_movs(nir_scalar_resolved(base64, 0));
+   if (nir_scalar_is_alu(s) &&
+       nir_scalar_alu_op(s) == nir_op_pack_64_2x32) {
+      nir_alu_instr *pack = nir_scalar_as_alu(s);
+      nir_def *v2 =
+         nir_bcsel(b, ok, pack->src[0].src.ssa,
+                   nir_imm_ivec2(b, (uint32_t)sink, (uint32_t)(sink >> 32)));
+      return nir_pack_64_2x32(b, v2);
+   }
+   return nir_bcsel(b, ok, base64, nir_imm_int64(b, sink));
+}
+
+/* The group guard: ok = ult(off0, usub_sat(bound, slack_sub)) passes
+ * exactly when every member's checked end lands below the bound (member
+ * checks all share the bound and the same linear offset terms; the slack
+ * constant is the member-relative span, so the compare cannot wrap-pass a
+ * wild offset).  Redirected lanes get base->sink and off0->else_off; the
+ * per-member iadd then yields delta_i - min_delta inside the page. */
+static nir_def *
+hk_flat_emit_guard(nir_builder *b, nir_def *bound, nir_def *base64,
+                   nir_def *off0, int64_t else_off, int64_t slack_sub,
+                   uint64_t sink, nir_def **base_out)
+{
+   nir_def *slack =
+      nir_usub_sat(b, bound, nir_imm_int(b, (uint32_t)slack_sub));
+   nir_def *ok = nir_ult(b, off0, slack);
+   *base_out = hk_flat_select_base(b, ok, base64, sink);
+   return nir_bcsel(b, ok, off0, nir_imm_int(b, (uint32_t)else_off));
+}
+
+/* Flatten one group of bounded loads: replace each member with an
+ * unguarded load at the redirected base plus its clamped offset. */
+static void
+hk_flatten_load_group(nir_builder *b, struct hk_flat_group *g)
+{
+   int64_t min_delta = g->delta[0], max_end = 0;
+   for (unsigned i = 0; i < g->n; i++) {
+      min_delta = MIN2(min_delta, g->delta[i]);
+      max_end = MAX2(max_end, g->delta[i] + (int64_t)g->size[i]);
+   }
+
+   nir_intrinsic_instr *first = g->intr[0];
+   const int64_t d0 = g->delta[0];
+
+   b->cursor = nir_before_instr(&first->instr);
+   nir_def *bound =
+      nir_mov_scalar(b, hk_scalar_leaf(
+                           nir_scalar_resolved(first->src[2].ssa, 0), 0));
+   nir_def *base = NULL;
+   nir_def *c = hk_flat_emit_guard(b, bound, first->src[0].ssa,
+                                   first->src[1].ssa, d0 - min_delta,
+                                   max_end - d0 - 1,
+                                   AGX_ZERO_PAGE_ADDRESS, &base);
+
+   for (unsigned i = 0; i < g->n; i++) {
+      nir_intrinsic_instr *load = g->intr[i];
+      b->cursor = nir_before_instr(&load->instr);
+
+      int64_t rel = g->delta[i] - d0;
+      nir_def *off = rel ? nir_iadd_imm(b, c, rel) : c;
+      nir_def *addr = nir_iadd(b, base, nir_u2u64(b, off));
+      nir_def *val = nir_load_global(
+         b, load->def.num_components, load->def.bit_size, addr,
+         .align_mul = nir_intrinsic_align_mul(load),
+         .align_offset = nir_intrinsic_align_offset(load),
+         .access = nir_intrinsic_access(load));
+
+      nir_def_rewrite_uses(&load->def, val);
+      nir_instr_remove(&load->instr);
+   }
+}
+
+/* Flatten one group of guarded stores sharing (base, bound, offset terms):
+ * hoist each member's then-block, re-issue the store unconditionally at
+ * the scratch-redirected base plus its clamped offset, and drop the guard
+ * region. */
+static void
+hk_flatten_store_group(nir_builder *b, struct hk_flat_group *g)
+{
+   int64_t min_delta = g->delta[0], max_end = 0;
+   for (unsigned i = 0; i < g->n; i++) {
+      min_delta = MIN2(min_delta, g->delta[i]);
+      max_end = MAX2(max_end, g->end_delta[i]);
+   }
+   const int64_t e0_delta = g->end_delta[0];
+
+   nir_if *first = g->nif[0];
+   b->cursor = nir_before_cf_node(&first->cf_node);
+
+   /* The guard condition is ult(end, bound); both operands are computed
+    * before the if they condition, so they dominate the prologue.  The
+    * descriptor base's leaf scalars feed the store address inside the
+    * guard, so they dominate it too. */
+   nir_scalar cond = nir_scalar_resolved(first->condition.ssa, 0);
+   nir_def *e0 = nir_mov_scalar(b, nir_scalar_chase_alu_src(cond, 0));
+   nir_def *bound = nir_mov_scalar(b, nir_scalar_chase_alu_src(cond, 1));
+
+   nir_def *base_in;
+   if (g->key.base_lo.def == g->key.base_hi.def &&
+       g->key.base_lo.comp == g->key.base_hi.comp) {
+      /* Non-pack base chased whole in the matcher. */
+      base_in = nir_mov_scalar(b, g->key.base_lo);
+   } else {
+      nir_def *v2 = nir_vec2(b, nir_mov_scalar(b, g->key.base_lo),
+                             nir_mov_scalar(b, g->key.base_hi));
+      base_in = nir_pack_64_2x32(b, v2);
+   }
+
+   nir_def *base = NULL;
+   nir_def *c =
+      hk_flat_emit_guard(b, bound, base_in, e0, e0_delta - min_delta,
+                         max_end - e0_delta, AGX_SCRATCH_PAGE_ADDRESS,
+                         &base);
+
+   for (unsigned i = 0; i < g->n; i++) {
+      nir_if *nif = g->nif[i];
+      nir_intrinsic_instr *st = g->intr[i];
+
+      b->cursor = nir_before_cf_node(&nif->cf_node);
+      /* off_i = common + delta_i = e0 - end_delta_0 + delta_i; on the
+       * else path the constant collapses to delta_i - min_delta. */
+      int64_t rel = g->delta[i] - e0_delta;
+      nir_def *off = rel ? nir_iadd_imm(b, c, rel) : c;
+      nir_def *addr = nir_iadd(b, base, nir_u2u64(b, off));
+      nir_src_rewrite(&st->src[1], addr);
+
+      /* Lift the value computation and the rewritten store out of the
+       * guard, then drop the empty region. */
+      nir_block *then_block = nir_if_first_then_block(nif);
+      nir_foreach_instr_safe(instr, then_block)
+         nir_instr_move(nir_before_cf_node(&nif->cf_node), instr);
+
+      nir_cf_node_remove(&nif->cf_node);
+   }
+}
+
+/* Removing a guard if stitches its merge block into place; a phi there
+ * would lose the then/else sources, so such a member stays guarded. */
+static bool
+hk_flat_store_merge_has_phis(nir_if *nif)
+{
+   nir_cf_node *next = nir_cf_node_next(&nif->cf_node);
+   if (!next || next->type != nir_cf_node_block)
+      return true;
+
+   bool phis = false;
+   nir_foreach_phi(phi, nir_cf_node_as_block(next))
+      phis = true;
+   return phis;
+}
+
+static bool
+hk_flat_add_member(struct hk_flat_group *groups, unsigned *ng,
+                   const struct hk_flat_group_key *key,
+                   nir_intrinsic_instr *intr, nir_if *nif, int64_t delta,
+                   int64_t end_delta, unsigned size)
+{
+   for (unsigned i = 0; i < *ng; i++) {
+      if (hk_flat_group_key_equal(&groups[i].key, key) &&
+          groups[i].n < HK_FLAT_MAX_MEMBERS) {
+         unsigned m = groups[i].n++;
+         groups[i].intr[m] = intr;
+         groups[i].nif[m] = nif;
+         groups[i].delta[m] = delta;
+         groups[i].end_delta[m] = end_delta;
+         groups[i].size[m] = size;
+         return true;
+      }
+   }
+   if (*ng >= HK_FLAT_MAX_GROUPS)
+      return false;
+
+   struct hk_flat_group *g = &groups[(*ng)++];
+   memset(&g->intr, 0, sizeof(*g) - sizeof(g->key));
+   g->key = *key;
+   g->n = 1;
+   g->intr[0] = intr;
+   g->nif[0] = nif;
+   g->delta[0] = delta;
+   g->end_delta[0] = end_delta;
+   g->size[0] = size;
+   return true;
+}
+
+static bool
+hk_flatten_store_guards_cf_list(nir_builder *b, struct exec_list *cf_list)
+{
+   bool progress = false;
+   struct hk_flat_group groups[HK_FLAT_MAX_GROUPS];
+   unsigned ng = 0;
+
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= hk_flatten_store_guards_cf_list(b, &nif->then_list);
+         progress |= hk_flatten_store_guards_cf_list(b, &nif->else_list);
+
+         nir_intrinsic_instr *store;
+         struct hk_flat_group_key key;
+         int64_t delta, end_delta;
+         unsigned size;
+         if (hk_flat_store_guard(nif, &store, &key, &delta, &end_delta,
+                                 &size) &&
+             !hk_flat_store_merge_has_phis(nif))
+            hk_flat_add_member(groups, &ng, &key, store, nif, delta,
+                               end_delta, size);
+      } else if (node->type == nir_cf_node_loop) {
+         progress |= hk_flatten_store_guards_cf_list(
+            b, &nir_cf_node_as_loop(node)->body);
+      }
+   }
+
+   for (unsigned i = 0; i < ng; i++) {
+      int64_t min_delta = groups[i].delta[0], max_end = 0;
+      for (unsigned m = 0; m < groups[i].n; m++) {
+         min_delta = MIN2(min_delta, groups[i].delta[m]);
+         max_end =
+            MAX2(max_end, groups[i].delta[m] + (int64_t)groups[i].size[m]);
+      }
+      /* A single store keeps its guard: the select sequence is not
+       * cheaper than one cndst/cndend split. */
+      if (groups[i].n < 2 || max_end - min_delta > HK_FLAT_MAX_SPAN)
+         continue;
+
+      hk_flatten_store_group(b, &groups[i]);
+      progress = true;
+   }
+   return progress;
+}
+
+static bool
+hk_flatten_loads_block(nir_builder *b, nir_block *block)
+{
+   bool progress = false;
+   struct hk_flat_group groups[HK_FLAT_MAX_GROUPS];
+   unsigned ng = 0;
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_load_global_bounded ||
+          intr->def.bit_size != 32)
+         continue;
+
+      nir_scalar bound =
+         hk_scalar_leaf(nir_scalar_resolved(intr->src[2].ssa, 0), 0);
+      if (!bound.def || nir_scalar_is_const(bound))
+         continue;
+
+      struct hk_flat_group_key key = {.bound = bound};
+      hk_bload_base_leaves(intr->src[0].ssa, &key.base_lo, &key.base_hi);
+      hk_offset_decomp_init(nir_scalar_resolved(intr->src[1].ssa, 0),
+                            &key.dec);
+      if (!key.dec.valid)
+         continue;
+
+      hk_flat_add_member(groups, &ng, &key, intr, NULL, key.dec.delta,
+                         0, intr->def.num_components * 4);
+   }
+
+   for (unsigned i = 0; i < ng; i++) {
+      int64_t min_delta = groups[i].delta[0], max_end = 0;
+      for (unsigned m = 0; m < groups[i].n; m++) {
+         min_delta = MIN2(min_delta, groups[i].delta[m]);
+         max_end =
+            MAX2(max_end, groups[i].delta[m] + (int64_t)groups[i].size[m]);
+      }
+      /* A lone bounded load already pays a single whole-access
+       * compare-and-select; the redirect only wins for a group. */
+      if (groups[i].n < 2 || max_end - min_delta > AGX_ZERO_PAGE_SIZE)
+         continue;
+
+      hk_flatten_load_group(b, &groups[i]);
+      progress = true;
+   }
+   return progress;
+}
+
+static bool
+hk_nir_flatten_bounded_accesses(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl)
+         impl_progress |= hk_flatten_loads_block(&b, block);
+      impl_progress |= hk_flatten_store_guards_cf_list(&b, &impl->body);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+   }
+   return progress;
+}
+
 /* nir_lower_explicit_io scalarizes whole-aggregate bounded loads into one
  * 32-bit load_global_bounded per component.  Runs of those accesses covering
  * a contiguous span of one descriptor are exactly the shape a vectorized
@@ -4139,13 +4603,29 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
        * apiece. */
       NIR_PASS(_, nir, hk_nir_vectorize_bounded_loads);
 
-      /* With bounded storage buffers, explicit-io emits one guarded
-       * region per store.  Runs of those guards over a contiguous dword
-       * range of one descriptor collapse into a single guard plus
-       * vectorisable stores, keeping the original per-store guards on
-       * the out-of-bounds path.  Must precede slacken, which rewrites
-       * the ult(off + size - 1, bound) guard form this pass matches. */
-      NIR_PASS(_, nir, hk_nir_merge_bounded_stores);
+      /* With storage-buffer robustness disabled, the bound exists only to
+       * give null descriptors their zero range -- out-of-bounds access on
+       * a real buffer is already undefined, so no per-access granularity
+       * survives.  Groups of bounded accesses on one descriptor and one
+       * offset chain sink or source whole: one span check redirects the
+       * base (zero page for loads, scratch for stores) and clamps the
+       * offset, and every member issues unconditionally.  Must precede
+       * slacken, which rewrites the ult(off + size - 1, bound) guard form
+       * this pass matches; supersedes merge_bounded_stores, which keeps
+       * per-access prefix semantics the disabled mode does not need. */
+      if (rs->storage_buffers ==
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
+         NIR_PASS(_, nir, hk_nir_flatten_bounded_accesses);
+      } else {
+         /* With bounded storage buffers, explicit-io emits one guarded
+          * region per store.  Runs of those guards over a contiguous
+          * dword range of one descriptor collapse into a single guard
+          * plus vectorisable stores, keeping the original per-store
+          * guards on the out-of-bounds path.  Must precede slacken,
+          * which rewrites the ult(off + size - 1, bound) guard form this
+          * pass matches. */
+         NIR_PASS(_, nir, hk_nir_merge_bounded_stores);
+      }
 
       /* Every remaining store and atomic carries its own
        * push_if(in_bounds) + if_phi.  Where the guard and the address
