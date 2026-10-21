@@ -1371,9 +1371,43 @@ hk_nir_redirect_bounded_writes(nir_shader *nir)
  * only the compare.  The saturating subtract is at least as conservative
  * as the original: for any offset the new check passes, off + (size - 1)
  * cannot wrap, and a bound smaller than the access rejects every offset
- * the wrapping compare could have passed near 2^32. */
+ * the wrapping compare could have passed near 2^32.
+ *
+ * The hoist only pays when the slack actually replaces work.  Staging one
+ * usub_sat through the preamble costs roughly SLACK_COST instructions
+ * (an input word read, isub+isel, and the staging stores), while each
+ * rewritten check saves at most its end add -- a lone check grows the
+ * shader by ~3 instructions, which regressed most of the corpus in the
+ * v7 sweep where one check per buffer is the common case.  A slack earns
+ * its keep in two situations:
+ *
+ * - several checks share one (bound, size - 1) pair, so one preamble
+ *   slack replaces that many end adds;
+ * - every use of the bound component is a candidate check, so the
+ *   rewritten sites free the staging slot the raw bound would otherwise
+ *   need -- the slack output effectively replaces it.
+ *
+ * Only sites whose end add dies with the check count toward sharing: an
+ * add with other users survives the rewrite and saves nothing.
+ *
+ * Measured on the v7 corpus: the staged slack costs 4-7 instructions once
+ * the extra input word and staging copies land, so shared groups only
+ * break even past a handful of sites. */
+#define HK_SLACK_COST    4
+#define HK_SLACK_BONUS   4
+#define HK_SLACK_SHARED  8
+
+struct hk_slack_site {
+   nir_alu_instr *ult;
+   nir_src *bound_src;    /* the ult operand reading the bound */
+   nir_scalar bound;      /* literal bound operand {def, comp} */
+   nir_scalar off;
+   uint32_t c;            /* size - 1 */
+   bool dead_add;         /* the exclusive-end add has no other users */
+};
+
 static bool
-hk_slacken_bounds_check_instr(nir_builder *b, nir_instr *instr, void *data)
+hk_slacken_bounds_check_match(nir_instr *instr, struct hk_slack_site *site)
 {
    if (instr->type != nir_instr_type_alu)
       return false;
@@ -1393,26 +1427,257 @@ hk_slacken_bounds_check_instr(nir_builder *b, nir_instr *instr, void *data)
        nir_scalar_alu_op(end) != nir_op_iadd)
       return false;
 
+   nir_scalar bound_s = nir_scalar_chase_movs(
+      nir_scalar_resolved(bound, alu->src[1].swizzle[0]));
+
    nir_scalar x = nir_scalar_chase_alu_src(end, 0);
    nir_scalar y = nir_scalar_chase_alu_src(end, 1);
    nir_scalar c = nir_scalar_is_const(x) ? x : y;
    nir_scalar off = nir_scalar_is_const(x) ? y : x;
-   if (!nir_scalar_is_const(c) || nir_scalar_as_uint(c) == 0 ||
+
+   /* This is only the explicit-io bounds-check shape when the bound is a
+    * runtime descriptor word and the end constant is an access size.
+    * With a constant bound or a large/wrapping end constant the rewritten
+    * compare is no longer a stricter form of the original -- a user's
+    * `x - 17 < 32` would fold the slack to zero and drop live work. */
+   if (nir_scalar_is_const(bound_s) || !nir_scalar_is_const(c) ||
+       nir_scalar_as_uint(c) == 0 || nir_scalar_as_uint(c) >= 1024 ||
        off.def->bit_size != 32)
       return false;
 
-   b->cursor = nir_before_instr(instr);
-   nir_def *slack =
-      nir_usub_sat(b, bound, nir_imm_int(b, nir_scalar_as_uint(c)));
-   nir_def_replace(&alu->def, nir_ult(b, nir_mov_scalar(b, off), slack));
+   site->ult = alu;
+   site->bound_src = &alu->src[1].src;
+   site->bound = nir_scalar_resolved(bound, alu->src[1].swizzle[0]);
+   site->off = off;
+   site->c = nir_scalar_as_uint(c);
+   site->dead_add = list_is_singular(&alu->src[0].src.ssa->uses) &&
+                    list_is_singular(&end.def->uses);
+   return true;
+}
+
+struct hk_slack_key {
+   const nir_def *bound;
+   uint32_t comp;
+   uint32_t c;
+};
+
+static uint32_t
+hk_slack_key_hash(const void *vkey)
+{
+   const struct hk_slack_key *key = vkey;
+
+   return _mesa_hash_pointer(key->bound) ^ key->comp * 0x9e3779b9u ^
+          key->c * 0x85ebca6bu;
+}
+
+static bool
+hk_slack_key_equal(const void *va, const void *vb)
+{
+   const struct hk_slack_key *a = va;
+   const struct hk_slack_key *b = vb;
+
+   return a->bound == b->bound && a->comp == b->comp && a->c == b->c;
+}
+
+/* A slack group per (bound operand, size - 1); the count is the number of
+ * sites whose end add dies with the rewrite. */
+struct hk_slack_group {
+   struct hk_slack_key key;
+   unsigned n_dead;
+};
+
+/* One bound operand's worth of checks: whether every use of the component
+ * is a candidate site (the slack output then replaces the bound's own
+ * staging slot), and the group/dead-add totals over the whole operand. */
+struct hk_slack_bound {
+   const nir_def *def;
+   unsigned comp;
+   bool consumed;
+   unsigned n_groups;
+   unsigned n_dead;
+   bool rewrite_all;
+};
+
+/* Every use that reads the bound component has to be a candidate check's
+ * bound operand, or rewriting a subset keeps the bound staged anyway.
+ *
+ * Do not extend this to look through mov/vec passthroughs of the bound
+ * component: the bounded-address vec4 reassembly only carries .z to the
+ * check, but whether that admission wins is decided downstream, not here.
+ * The bonus pays for a freed staging slot, which exists only when the
+ * bound's producer needs a store_preamble to reach the main program -- a
+ * descriptor record that falls outside the uniform-DMA windows.  When the
+ * record lands in a DMA window its bound word is a free input read, the
+ * staging never existed, and the preamble slack is a pure +3..+4 cost.
+ * Measured: chasing the vec4 chain admits vkq-CmLuminanceHistogram (+3,
+ * whose oversized set-2 table keeps the descriptor a device load) but
+ * regresses every corpus shader whose single static set fits a window
+ * (+3..+4 each on 12 of 254).  The same economics apply to a fully uniform
+ * check -- it hoists into the preamble where there is no slot to free. */
+static bool
+hk_slack_bound_consumed(const nir_def *bound, unsigned comp,
+                        const struct util_dynarray *sites)
+{
+   nir_foreach_use_including_if(src, bound) {
+      /* An if use is a divergent consumer of whatever component it
+         reads; play it safe and treat it as touching ours. */
+      unsigned mask = nir_src_is_if(src) ? 1u : nir_src_components_read(src);
+      if (!(mask & BITFIELD_BIT(comp)))
+         continue;
+
+      bool ours = false;
+      util_dynarray_foreach(sites, struct hk_slack_site, site) {
+         if (site->bound_src == src) {
+            ours = true;
+            break;
+         }
+      }
+      if (!ours)
+         return false;
+   }
    return true;
 }
 
 static bool
 hk_nir_slacken_bounded_checks(nir_shader *nir)
 {
-   return nir_shader_instructions_pass(
-      nir, hk_slacken_bounds_check_instr, nir_metadata_control_flow, NULL);
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      /* Collect the candidate checks first: whether a preamble slack pays
+       * for itself depends on how the sites cluster on each bound. */
+      struct util_dynarray sites;
+      util_dynarray_init(&sites, NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            struct hk_slack_site site;
+
+            if (hk_slacken_bounds_check_match(instr, &site))
+               util_dynarray_append(&sites, site);
+         }
+      }
+
+      unsigned n_sites = util_dynarray_num_elements(&sites,
+                                                  struct hk_slack_site);
+      if (!n_sites) {
+         util_dynarray_fini(&sites);
+         continue;
+      }
+
+      void *mem_ctx = ralloc_context(NULL);
+
+      /* Dead end adds per (bound, size - 1) slack group. */
+      struct hash_table *groups =
+         _mesa_hash_table_create(mem_ctx, hk_slack_key_hash,
+                                 hk_slack_key_equal);
+      /* Bound operands present in the candidate set. */
+      struct util_dynarray bounds;
+      util_dynarray_init(&bounds, mem_ctx);
+
+      util_dynarray_foreach(&sites, struct hk_slack_site, site) {
+         struct hk_slack_key probe = {site->bound.def, site->bound.comp,
+                                      site->c};
+         struct hash_entry *e = _mesa_hash_table_search(groups, &probe);
+         if (e) {
+            struct hk_slack_group *group = e->data;
+            group->n_dead += site->dead_add;
+         } else {
+            struct hk_slack_key *key =
+               ralloc(mem_ctx, struct hk_slack_key);
+            struct hk_slack_group *group =
+               ralloc(mem_ctx, struct hk_slack_group);
+            *key = probe;
+            *group = (struct hk_slack_group){.key = probe,
+                                             .n_dead = site->dead_add};
+            _mesa_hash_table_insert(groups, key, group);
+         }
+
+         bool seen = false;
+         util_dynarray_foreach(&bounds, struct hk_slack_bound, b) {
+            if (b->def == site->bound.def && b->comp == site->bound.comp) {
+               seen = true;
+               break;
+            }
+         }
+         if (!seen) {
+            struct hk_slack_bound nb = {
+               .def = site->bound.def,
+               .comp = site->bound.comp,
+               .consumed = false,
+               .n_groups = 0,
+               .n_dead = 0,
+               .rewrite_all = false,
+            };
+            util_dynarray_append(&bounds, nb);
+         }
+      }
+
+      /* Group multiplicity and dead adds per bound, plus whether the
+       * bound's component is read by anything but the candidate checks. */
+      util_dynarray_foreach(&bounds, struct hk_slack_bound, b) {
+         b->consumed = hk_slack_bound_consumed(b->def, b->comp, &sites);
+
+         hash_table_foreach(groups, e) {
+            const struct hk_slack_key *k = e->key;
+            const struct hk_slack_group *group = e->data;
+            if (k->bound == b->def && k->comp == b->comp) {
+               b->n_groups++;
+               b->n_dead += group->n_dead;
+            }
+         }
+
+         /* Rewriting every check on a consumed bound trades the bound's
+          * staging slot for the slack groups'; each extra group still has
+          * to pay for its own slack out of the adds it removes. */
+         b->rewrite_all =
+            b->consumed &&
+            b->n_dead + HK_SLACK_BONUS >= HK_SLACK_COST * b->n_groups;
+      }
+
+      bool impl_progress = false;
+      util_dynarray_foreach(&sites, struct hk_slack_site, site) {
+         const struct hk_slack_bound *b = NULL;
+         util_dynarray_foreach(&bounds, struct hk_slack_bound, it) {
+            if (it->def == site->bound.def && it->comp == site->bound.comp) {
+               b = it;
+               break;
+            }
+         }
+
+         /* Otherwise the slack group stands alone: profitable once it
+          * replaces enough end adds to clear its preamble cost with
+          * margin. */
+         bool rewrite = b->rewrite_all;
+         if (!rewrite) {
+            struct hk_slack_key probe = {site->bound.def,
+                                         site->bound.comp, site->c};
+            struct hash_entry *e = _mesa_hash_table_search(groups, &probe);
+            assert(e);
+            rewrite = ((const struct hk_slack_group *)e->data)->n_dead >=
+                      HK_SLACK_SHARED;
+         }
+         if (!rewrite)
+            continue;
+
+         nir_builder bld =
+            nir_builder_at(nir_before_instr(&site->ult->instr));
+         nir_def *slack = nir_usub_sat(&bld, site->ult->src[1].src.ssa,
+                                       nir_imm_int(&bld, site->c));
+         nir_def_replace(&site->ult->def,
+                         nir_ult(&bld, nir_mov_scalar(&bld, site->off),
+                                 slack));
+         impl_progress = true;
+      }
+
+      _mesa_hash_table_destroy(groups, NULL);
+      util_dynarray_fini(&bounds);
+      ralloc_free(mem_ctx);
+      util_dynarray_fini(&sites);
+      progress |= nir_progress(impl_progress, impl,
+                               nir_metadata_control_flow);
+   }
+
+   return progress;
 }
 
 static bool
@@ -1446,6 +1711,715 @@ lower_load_global_constant_offset_instr(nir_builder *b,
 
    nir_def_replace(&intrin->def, val);
    return true;
+}
+
+/* nir_lower_explicit_io implements bounded-buffer stores
+ * (nir_address_format_64bit_bounded_global) as one guarded region per
+ * store:
+ *
+ *    if (ult(iadd(off32, size - 1), bound))
+ *       store_global(value, iadd(pack64(lo, hi), u2u64(off32)))
+ *
+ * Reservoir-style writes store a run of consecutive dwords this way and
+ * pay a control-flow split per dword.  A run of those guards covering a
+ * contiguous range of the same descriptor needs only one guard for the
+ * whole span:
+ *
+ *    if (usub_sat(bound, off_first) >= span_bytes) {
+ *       store_global(v0, addr0)
+ *       store_global(v1, iadd(addr0, 4))
+ *       ...
+ *    } else {
+ *       if (ult(off0 + 3, bound)) store0   // original sequence, verbatim
+ *       if (ult(off1 + 3, bound)) store1
+ *       ...
+ *    }
+ *
+ * usub_sat(bound, first) >= span is exactly "first + span <= bound without
+ * wrap", which makes every per-store end check pass -- and nothing else
+ * does, since the offsets are strictly increasing.  The fallback therefore
+ * preserves the component-granularity contract robustBufferAccess2 needs:
+ * a lane (dword) that is in bounds is still stored even when a neighbour
+ * is out of bounds.  On the fast path the stores share one address chain
+ * with constant offsets, so nir_opt_load_store_vectorize can merge them
+ * into vector stores. */
+
+/* A then-block holding exactly one store_global and an empty else block:
+ * the shape build_explicit_io_store emits for a bounded write. */
+#define HK_MAX_OFF_TERMS 8
+
+struct hk_off_decomp {
+   /* offset = delta + sum(muls[i] * terms[i]) */
+   nir_scalar terms[HK_MAX_OFF_TERMS];
+   int64_t muls[HK_MAX_OFF_TERMS];
+   unsigned num_terms;
+   int64_t delta;
+   bool valid;
+};
+
+struct hk_guarded_store {
+   nir_if *nif;
+   nir_intrinsic_instr *store;
+   nir_scalar bound;
+   struct hk_off_decomp dec;
+   nir_scalar off;  /* 32-bit byte offset feeding the store address */
+   int64_t delta;   /* constant byte delta of this store */
+};
+
+/* Chase movs and vector constructions down to a leaf scalar: a scalar that
+ * is not produced by a mov or vec op.  Two independently built copies of
+ * the same addressing expression -- like the (lo, hi, bound, offset)
+ * vectors explicit-io builds per store -- resolve to the same leaf
+ * scalars. */
+static nir_scalar
+hk_scalar_leaf(nir_scalar s, unsigned depth)
+{
+   for (;;) {
+      s = nir_scalar_chase_movs(s);
+      if (depth++ >= 16 || !nir_scalar_is_alu(s))
+         return s;
+
+      if (!nir_op_is_vec(nir_scalar_alu_op(s)))
+         return s;
+
+      /* vec ops either take one unsized vector source -- the component
+       * follows the destination -- or one scalar source per component,
+       * indexed by the component. */
+      unsigned idx = nir_op_infos[nir_scalar_alu_op(s)].num_inputs == 1
+                        ? 0
+                        : s.comp;
+      s = nir_scalar_chase_alu_src(s, idx);
+   }
+}
+
+static void
+hk_off_add_term(struct hk_off_decomp *d, nir_scalar s, int64_t mul)
+{
+   for (unsigned i = 0; i < d->num_terms; i++) {
+      if (nir_scalar_equal(d->terms[i], s)) {
+         d->muls[i] += mul;
+         return;
+      }
+   }
+   if (d->num_terms >= HK_MAX_OFF_TERMS) {
+      d->valid = false;
+      return;
+   }
+   d->terms[d->num_terms] = s;
+   d->muls[d->num_terms] = mul;
+   d->num_terms++;
+}
+
+/* Decompose a byte offset scalar into a linear combination of leaf
+ * scalars plus a constant delta, distributing constants out of
+ * multiplications ((idx + k) * s = idx * s + k * s mod 2^32) so two
+ * neighbouring offsets compare equal but for their deltas. */
+static void
+hk_decompose_offset(nir_scalar s, int64_t mul, struct hk_off_decomp *d,
+                    unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+
+   if (!d->valid || depth >= 16) {
+      d->valid = false;
+      return;
+   }
+
+   if (nir_scalar_is_const(s)) {
+      d->delta += mul * (int64_t)(int32_t)nir_scalar_as_uint(s);
+      return;
+   }
+
+   if (!nir_scalar_is_alu(s)) {
+      hk_off_add_term(d, s, mul);
+      return;
+   }
+
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_iadd:
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 0), mul, d, depth + 1);
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 1), mul, d, depth + 1);
+      return;
+   case nir_op_isub:
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 0), mul, d, depth + 1);
+      hk_decompose_offset(nir_scalar_chase_alu_src(s, 1), -mul, d, depth + 1);
+      return;
+   case nir_op_imul:
+   case nir_op_amul:
+   case nir_op_ishl: {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar c = nir_scalar_chase_alu_src(s, 1);
+      if (!nir_scalar_is_const(c)) {
+         if (!nir_scalar_is_const(a)) {
+            hk_off_add_term(d, s, mul);
+            return;
+         }
+         nir_scalar t = a;
+         a = c;
+         c = t;
+      }
+      int64_t m2 = (int64_t)(int32_t)nir_scalar_as_uint(c);
+      if (nir_scalar_alu_op(s) == nir_op_ishl)
+         m2 = m2 & 31 ? 1ll << (m2 & 31) : 1;
+      hk_decompose_offset(a, mul * m2, d, depth + 1);
+      return;
+   }
+   default:
+      if (nir_op_is_vec(nir_scalar_alu_op(s))) {
+         unsigned idx =
+            nir_op_infos[nir_scalar_alu_op(s)].num_inputs == 1 ? 0 : s.comp;
+         hk_decompose_offset(nir_scalar_chase_alu_src(s, idx), mul, d,
+                             depth + 1);
+         return;
+      }
+      hk_off_add_term(d, s, mul);
+      return;
+   }
+}
+
+static void
+hk_offset_decomp_init(nir_scalar s, struct hk_off_decomp *d)
+{
+   memset(d, 0, sizeof(*d));
+   d->valid = true;
+   hk_decompose_offset(s, 1, d, 0);
+}
+
+static bool
+hk_off_decomp_equal(const struct hk_off_decomp *a,
+                    const struct hk_off_decomp *b)
+{
+   if (!a->valid || !b->valid || a->num_terms != b->num_terms)
+      return false;
+
+   for (unsigned i = 0; i < a->num_terms; i++) {
+      bool found = false;
+      for (unsigned j = 0; j < b->num_terms; j++) {
+         if (a->muls[i] == b->muls[j] &&
+             nir_scalar_equal(a->terms[i], b->terms[j])) {
+            found = true;
+            break;
+         }
+      }
+      if (!found)
+         return false;
+   }
+   return true;
+}
+
+/* Match one bounded-store guard and record the pieces needed to merge it
+ * with its neighbours.  The check must cover exactly this store:
+ * end == off + size - 1 where end is the checked offset. */
+static bool
+hk_match_guarded_store(nir_if *nif, struct hk_guarded_store *out)
+{
+   if (exec_list_get_head(&nif->then_list) !=
+          exec_list_get_tail(&nif->then_list) ||
+       exec_list_get_head(&nif->else_list) !=
+          exec_list_get_tail(&nif->else_list))
+      return false;
+
+   if (!exec_list_is_empty(&nir_if_first_else_block(nif)->instr_list))
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_instr *only = NULL;
+   unsigned instrs = 0;
+   nir_foreach_instr(instr, then_block) {
+      only = instr;
+      instrs++;
+   }
+   if (instrs != 1 || only->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *store = nir_instr_as_intrinsic(only);
+   if (store->intrinsic != nir_intrinsic_store_global ||
+       store->num_components != 1 || store->src[0].ssa->bit_size != 32 ||
+       nir_intrinsic_write_mask(store) != 1)
+      return false;
+
+   /* Condition: ult(end, bound) */
+   nir_scalar cond = nir_scalar_resolved(nif->condition.ssa, 0);
+   if (!is_op(cond, nir_op_ult))
+      return false;
+
+   struct hk_off_decomp end_dec;
+   hk_offset_decomp_init(nir_scalar_chase_alu_src(cond, 0), &end_dec);
+   nir_scalar bound =
+      hk_scalar_leaf(nir_scalar_chase_alu_src(cond, 1), 0);
+   if (!bound.def || nir_scalar_is_const(bound))
+      return false;
+
+   /* Store address: iadd(base64, u2u64(off32)) */
+   nir_scalar addr = nir_scalar_resolved(store->src[1].ssa, 0);
+   if (!is_op(addr, nir_op_iadd))
+      return false;
+
+   nir_scalar base64 = {NULL, 0};
+   nir_scalar off = {NULL, 0};
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar o = nir_scalar_chase_alu_src(addr, i);
+      if (is_op(o, nir_op_u2u64)) {
+         off = nir_scalar_chase_alu_src(o, 0);
+         base64 = nir_scalar_chase_alu_src(addr, 1 - i);
+      }
+   }
+   if (!off.def || !base64.def || off.def->bit_size != 32)
+      return false;
+
+   hk_offset_decomp_init(off, &out->dec);
+   if (!hk_off_decomp_equal(&end_dec, &out->dec) ||
+       end_dec.delta - out->dec.delta != 3)
+      return false;
+
+   /* Base and bound must come from the same descriptor vector: chase the
+    * base's pack_64_2x32 back to the vector that also provides the bound,
+    * so two different buffers can never share a guard.  pack_64_2x32 takes
+    * a vector input, so peel it manually instead of chasing scalars. */
+   nir_scalar b64 = nir_scalar_chase_movs(base64);
+   if (!is_op(b64, nir_op_pack_64_2x32))
+      return false;
+   nir_alu_instr *pack = nir_scalar_as_alu(b64);
+   nir_scalar lo = hk_scalar_leaf(
+      nir_get_scalar(pack->src[0].src.ssa, pack->src[0].swizzle[0]), 0);
+   if (lo.def != bound.def)
+      return false;
+
+   out->nif = nif;
+   out->store = store;
+   out->bound = bound;
+   out->off = off;
+   out->delta = out->dec.delta;
+   return true;
+}
+
+/* A plain block the merged guard may skip over: nothing that reads or
+ * writes memory, no control flow.  Between two guards such a block just
+ * computes values (often the next store's data). */
+static bool
+hk_storeguard_neutral_block(nir_block *block)
+{
+   nir_foreach_instr(instr, block) {
+      switch (instr->type) {
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+      case nir_instr_type_deref:
+         break;
+      case nir_instr_type_intrinsic:
+         if (!nir_intrinsic_can_reorder(nir_instr_as_intrinsic(instr)))
+            return false;
+         break;
+      default:
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+hk_storeguard_compatible(const struct hk_guarded_store *prev,
+                         const struct hk_guarded_store *cur)
+{
+   return nir_scalar_equal(prev->bound, cur->bound) &&
+          hk_off_decomp_equal(&prev->dec, &cur->dec) &&
+          cur->delta == prev->delta + 4;
+}
+
+static void
+hk_emit_guarded_store_clone(nir_builder *b, nir_intrinsic_instr *st,
+                            nir_def *addr)
+{
+   nir_store_global(b, st->src[0].ssa, addr,
+                    .write_mask = nir_intrinsic_write_mask(st),
+                    .access = nir_intrinsic_access(st),
+                    .align_mul = nir_intrinsic_align_mul(st),
+                    .align_offset = nir_intrinsic_align_offset(st));
+}
+
+/* Merge a run of >= 2 guards covering a contiguous span of dwords.  run[]
+ * holds strictly ascending deltas 4 bytes apart (verified by
+ * hk_storeguard_compatible), all checking the same bound and the same
+ * descriptor. */
+static bool
+hk_merge_guarded_stores(nir_builder *b, struct hk_guarded_store *run,
+                        unsigned count)
+{
+   nir_if *last = run[count - 1].nif;
+
+   /* Removing the last guard stitches its merge block into place; phis
+    * there would lose their sources. */
+   nir_cf_node *next = nir_cf_node_next(&last->cf_node);
+   if (!next || next->type != nir_cf_node_block)
+      return false;
+   nir_foreach_phi(phi, nir_cf_node_as_block(next))
+      return false;
+
+   /* one "all stores in bounds" test, emitted before the last guard so it
+    * dominates the merged region placed right after it. */
+   b->cursor = nir_before_cf_node(&last->cf_node);
+   nir_def *bound = nir_mov_scalar(b, run[0].bound);
+   nir_def *slack =
+      nir_usub_sat(b, bound, nir_mov_scalar(b, run[0].off));
+   nir_def *all = nir_uge(
+      b, slack, nir_imm_int(b, run[count - 1].delta - run[0].delta + 4));
+
+   b->cursor = nir_after_cf_node(&last->cf_node);
+   nir_if *outer = nir_push_if(b, all);
+
+   /* Fast path: every store's own check passes here, so issue them all
+    * against one address chain with constant offsets -- the shape
+    * nir_opt_load_store_vectorize merges. */
+   nir_def *addr0 = run[0].store->src[1].ssa;
+   for (unsigned i = 0; i < count; i++)
+      hk_emit_guarded_store_clone(
+         b, run[i].store,
+         i ? nir_iadd_imm(b, addr0, run[i].delta - run[0].delta) : addr0);
+
+   /* Slow path: the original per-store guards, so partially in-bounds
+    * ranges keep component granularity. */
+   nir_push_else(b, outer);
+   for (unsigned i = 0; i < count; i++) {
+      nir_if *inner = nir_push_if(b, run[i].nif->condition.ssa);
+      hk_emit_guarded_store_clone(b, run[i].store, run[i].store->src[1].ssa);
+      nir_pop_if(b, inner);
+   }
+   nir_pop_if(b, outer);
+
+   for (unsigned i = 0; i < count; i++)
+      nir_cf_node_remove(&run[i].nif->cf_node);
+
+   return true;
+}
+
+/* The merge trades static size for a shorter dynamic path: the
+ * out-of-bounds fallback keeps the original per-store guards, so merging
+ * a run always adds the span check and the fast-path stores on top of
+ * them.  That tax is only worth paying where the block sequence recoups
+ * instructions anyway -- a run of scalarized bounded loads on one offset
+ * chain, whose slack subtracts hk_nir_share_bounded_load_slack folds
+ * into one -- or where the run is wide enough that one span check
+ * replaces a whole ladder of control-flow splits and the fallback stays
+ * a small fraction of the span.  A short isolated run (mem-bindless-4's
+ * vec4 store) pays ~2 instructions per duplicated guard with no such
+ * offset, so it is left as the original ladder. */
+
+/* A run of this many dword stores (a >= 24-byte span) collapses enough
+ * control-flow splits that the fallback duplication is minor even
+ * without slack sharing in the block. */
+#define HK_STOREGUARD_WIDE_RUN 6
+
+/* Does this block hold two or more bounded loads that
+ * hk_nir_share_bounded_load_slack will hang on one slack: loads on one
+ * descriptor (equal bound leaf) whose byte offsets decompose to the same
+ * linear terms, constant deltas aside?  The loads are still
+ * load_global_bounded intrinsics here -- lower_load_global_bounded emits
+ * the bounds_agx(value, end, usub_sat(bound, off)) form afterwards -- so
+ * the offset and bound are taken straight from the intrinsic. */
+static bool
+hk_block_shares_load_slack(nir_block *block)
+{
+   struct hk_slack_load {
+      nir_scalar bound;
+      struct hk_off_decomp dec;
+   } loads[32];
+   unsigned n = 0;
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_load_global_bounded)
+         continue;
+
+      nir_scalar bound =
+         hk_scalar_leaf(nir_scalar_resolved(intr->src[2].ssa, 0), 0);
+      if (!bound.def || nir_scalar_is_const(bound))
+         continue;
+
+      struct hk_off_decomp dec;
+      hk_offset_decomp_init(nir_scalar_resolved(intr->src[1].ssa, 0),
+                            &dec);
+      /* A constant offset lowers to an immediate bounds_check, not the
+       * shared usub_sat slack, so it cannot pay for the merge. */
+      if (!dec.valid || !dec.num_terms)
+         continue;
+
+      for (unsigned i = 0; i < n; i++) {
+         if (nir_scalar_equal(loads[i].bound, bound) &&
+             hk_off_decomp_equal(&loads[i].dec, &dec))
+            return true;
+      }
+      if (n < ARRAY_SIZE(loads)) {
+         loads[n].bound = bound;
+         loads[n].dec = dec;
+         n++;
+      }
+   }
+   return false;
+}
+
+/* Flush an open run: merge it if it holds two or more guards and the
+ * block sequence pays for the duplication (see above), then reset.
+ * The merge is emitted right before the node that closed the run, behind
+ * the scan cursor, so the ifs it creates are never revisited -- important
+ * because the out-of-bounds fallback re-emits the same guarded-store
+ * shape and would re-match on a rescan. */
+static bool
+hk_flush_guarded_store_run(nir_builder *b, struct hk_guarded_store *run,
+                           unsigned *n, bool slack_share)
+{
+   bool progress = *n >= 2 &&
+                   (slack_share || *n >= HK_STOREGUARD_WIDE_RUN) &&
+                   hk_merge_guarded_stores(b, run, *n);
+   *n = 0;
+   return progress;
+}
+
+static bool
+hk_merge_bounded_stores_cf_list(nir_builder *b, struct exec_list *cf_list)
+{
+   bool progress = false;
+   struct hk_guarded_store run[64];
+   unsigned n = 0;
+
+   /* Whether this block sequence holds bounded loads that will share one
+    * slack subtract once lowered -- the regime where duplicating the
+    * fallback guards is paid for by the surrounding scalarized-access
+    * economies. */
+   bool slack_share = false;
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_block &&
+          hk_block_shares_load_slack(nir_cf_node_as_block(node))) {
+         slack_share = true;
+         break;
+      }
+   }
+
+   foreach_list_typed_safe(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= hk_merge_bounded_stores_cf_list(b, &nif->then_list);
+         progress |= hk_merge_bounded_stores_cf_list(b, &nif->else_list);
+
+         struct hk_guarded_store m;
+         if (hk_match_guarded_store(nif, &m)) {
+            if (n == 0 ||
+                (n < ARRAY_SIZE(run) &&
+                 hk_storeguard_compatible(&run[n - 1], &m))) {
+               run[n++] = m;
+               continue;
+            }
+            /* Mismatched or full run: flush, then start a new run here. */
+            progress |= hk_flush_guarded_store_run(b, run, &n, slack_share);
+            run[n++] = m;
+            continue;
+         }
+      }
+
+      if (node->type == nir_cf_node_block && n &&
+          hk_storeguard_neutral_block(nir_cf_node_as_block(node)))
+         continue;
+
+      if (node->type == nir_cf_node_loop)
+         progress |= hk_merge_bounded_stores_cf_list(
+            b, &nir_cf_node_as_loop(node)->body);
+
+      /* Boundary in the sequence: flush whatever run was open. */
+      progress |= hk_flush_guarded_store_run(b, run, &n, slack_share);
+   }
+
+   progress |= hk_flush_guarded_store_run(b, run, &n, slack_share);
+   return progress;
+}
+
+static bool
+hk_nir_merge_bounded_stores(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      progress |= hk_merge_bounded_stores_cf_list(&b, &impl->body);
+   }
+   return progress;
+}
+
+/* lower_load_global_bounded under soft fault emits, per component:
+ *
+ *    out = bounds_agx(value, end, usub_sat(bound, off))
+ *
+ *    -- out = end <= slack ? value : 0, i.e. off + end <= bound.
+ *
+ * Scalarized accesses (a whole-struct copy explodes into one dword load
+ * per member) give every component its own saturating subtract even
+ * though their offsets differ only by a constant against one bound.
+ * Taken at the group's smallest offset, a single slack serves the whole
+ * run: a member at off = base + delta_k checks
+ * slack_min >= end_k + (delta_k - delta_min), which is exactly
+ * off_k + end_k <= bound.  Group bounds checks in one block that share
+ * the bound and decompose to the same linear offset terms, then hang
+ * them on the minimum-delta member's existing slack. */
+
+struct hk_slack_bounds {
+   nir_alu_instr *bounds;   /* bounds_agx(value, end, slack) */
+   nir_instr *slack_instr;  /* the usub_sat producing slack */
+   nir_def *slack;
+   nir_scalar bound;
+   struct hk_off_decomp dec;
+   uint32_t end;
+   unsigned order;          /* program-order index of bounds in its block */
+};
+
+static bool
+hk_match_slack_bounds(nir_instr *instr, unsigned order,
+                      struct hk_slack_bounds *out)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_bounds_agx || alu->def.num_components != 1 ||
+       alu->def.bit_size != 32 || !nir_src_is_const(alu->src[1].src))
+      return false;
+
+   nir_scalar slack =
+      nir_scalar_resolved(alu->src[2].src.ssa, alu->src[2].swizzle[0]);
+   if (!is_op(slack, nir_op_usub_sat))
+      return false;
+
+   nir_scalar off =
+      nir_scalar_chase_movs(nir_scalar_chase_alu_src(slack, 1));
+   hk_offset_decomp_init(off, &out->dec);
+   if (!out->dec.valid)
+      return false;
+
+   out->bound =
+      hk_scalar_leaf(nir_scalar_chase_alu_src(slack, 0), 0);
+   if (!out->bound.def || nir_scalar_is_const(out->bound))
+      return false;
+
+   out->bounds = alu;
+   out->slack_instr = &nir_scalar_as_alu(slack)->instr;
+   out->slack = slack.def;
+   out->end = nir_src_as_uint(alu->src[1].src);
+   out->order = order;
+   return true;
+}
+
+/* Program-order index of an instruction inside its block. */
+static unsigned
+hk_instr_index(nir_block *block, const nir_instr *instr)
+{
+   unsigned i = 0;
+   nir_foreach_instr(it, block) {
+      if (it == instr)
+         return i;
+      i++;
+   }
+   return ~0u;
+}
+
+static bool
+hk_share_bounded_load_slack_block(nir_builder *b, nir_block *block)
+{
+   struct hk_slack_bounds cand[64];
+   unsigned n = 0, order = 0;
+
+   nir_foreach_instr(instr, block) {
+      if (n < ARRAY_SIZE(cand) &&
+          hk_match_slack_bounds(instr, order, &cand[n]))
+         n++;
+      order++;
+   }
+   if (n < 2)
+      return false;
+
+   bool progress = false;
+   bool claimed[ARRAY_SIZE(cand)] = {0};
+
+   for (unsigned i = 0; i < n; i++) {
+      if (claimed[i])
+         continue;
+
+      /* Group every candidate checking the same bound at offsets built
+       * from the same terms. */
+      unsigned members[ARRAY_SIZE(cand)];
+      unsigned m = 0;
+      for (unsigned j = i; j < n; j++) {
+         if (claimed[j])
+            continue;
+         if (nir_scalar_equal(cand[i].bound, cand[j].bound) &&
+             hk_off_decomp_equal(&cand[i].dec, &cand[j].dec)) {
+            claimed[j] = true;
+            members[m++] = j;
+         }
+      }
+      if (m < 2)
+         continue;
+
+      /* Anchor on the member with the smallest offset delta: its slack
+       * is the most conservative of the group. */
+      unsigned anchor = members[0];
+      for (unsigned k = 1; k < m; k++) {
+         if (cand[members[k]].dec.delta < cand[anchor].dec.delta)
+            anchor = members[k];
+      }
+      nir_def *shared = cand[anchor].slack;
+
+      /* The anchor's slack may sit in an earlier block or later in this
+       * block; it can only serve members it dominates. */
+      const bool slack_in_block =
+         cand[anchor].slack_instr->block == block;
+      const unsigned slack_idx =
+         slack_in_block ? hk_instr_index(block, cand[anchor].slack_instr)
+                        : ~0u;
+      const bool slack_dominates =
+         !slack_in_block &&
+         nir_block_dominates(cand[anchor].slack_instr->block, block);
+
+      for (unsigned k = 0; k < m; k++) {
+         unsigned j = members[k];
+         if (j == anchor)
+            continue;
+         if (slack_in_block && cand[j].order <= slack_idx)
+            continue;
+         if (!slack_in_block && !slack_dominates)
+            continue;
+
+         int64_t end =
+            (int64_t)cand[j].end + (cand[j].dec.delta - cand[anchor].dec.delta);
+         /* Offsets are 32-bit; an end that cannot fit wraps.  Constants
+          * past the icmpsel immediate range materialise as mov_imm, same
+          * as the stock emission already does for large deltas. */
+         if (end < 0 || end > (int64_t)UINT32_MAX)
+            continue;
+
+         b->cursor = nir_before_instr(&cand[j].bounds->instr);
+         nir_src_rewrite(&cand[j].bounds->src[1].src,
+                         nir_imm_int(b, (uint32_t)end));
+         cand[j].bounds->src[1].swizzle[0] = 0;
+         nir_src_rewrite(&cand[j].bounds->src[2].src, shared);
+         cand[j].bounds->src[2].swizzle[0] = 0;
+         progress = true;
+      }
+   }
+
+   return progress;
+}
+
+static bool
+hk_nir_share_bounded_load_slack(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         if (hk_share_bounded_load_slack_block(&b, block))
+            progress |= nir_progress(true, impl, nir_metadata_none);
+      }
+   }
+   return progress;
 }
 
 struct lower_ycbcr_state {
@@ -2727,22 +3701,42 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             set_layouts, false, dev->dev.sparse_ro_offset,
             hk_device_physical(dev)->scaled_sampling,
             agx_chip_sampler_has_lod_bias(dev->dev.chip));
+
+   /* Store of a value just loaded from the same address is unobservable:
+    * drop it before explicit-io wraps the store in a bounded guard, which
+    * would hide the pattern.  Covers ssbo, shared and global derefs. */
+   NIR_PASS(_, nir, nir_opt_dead_self_stores);
+
+   /* A same-block load of an address a store just covered reads back the
+    * stored value: forward it before explicit-io scatters the store's
+    * index/offset form into bounded guards. */
+   NIR_PASS(_, nir, nir_opt_load_after_store);
+
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor));
 
-   /* With bounded storage buffers, explicit-io guards every store and
-    * atomic with `push_if(in_bounds)` + if_phi.  Where the guard and the
-    * address are uniform, redirect those writes at the mapped scratch
-    * page instead: bcsel the address and mask the atomic's result, no
-    * control-flow split, and the uniform select lifts into the preamble.
-    * Divergent accesses keep the guard -- adding select instructions to
-    * the kernel costs more than the cndst/cndend split it replaces. */
    if (hk_buffer_addr_format(rs->storage_buffers,
                              rs->null_storage_buffer_descriptor) ==
        nir_address_format_64bit_bounded_global) {
+      /* With bounded storage buffers, explicit-io emits one guarded
+       * region per store.  Runs of those guards over a contiguous dword
+       * range of one descriptor collapse into a single guard plus
+       * vectorisable stores, keeping the original per-store guards on
+       * the out-of-bounds path.  Must precede slacken, which rewrites
+       * the ult(off + size - 1, bound) guard form this pass matches. */
+      NIR_PASS(_, nir, hk_nir_merge_bounded_stores);
+
+      /* Every remaining store and atomic carries its own
+       * push_if(in_bounds) + if_phi.  Where the guard and the address
+       * are uniform, redirect those writes at the mapped scratch page
+       * instead: bcsel the address and mask the atomic's result, no
+       * control-flow split, and the uniform select lifts into the
+       * preamble.  Divergent accesses keep the guard -- adding select
+       * instructions to the kernel costs more than the cndst/cndend
+       * split it replaces. */
       NIR_PASS(_, nir, hk_nir_slacken_bounded_checks);
       NIR_PASS(_, nir, hk_nir_redirect_bounded_writes);
    }
@@ -2825,6 +3819,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &soft_fault);
+
+   /* Scalarized bounded loads on one offset chain each paid their own
+    * usub_sat slack; share the minimum-offset slack across the group.
+    * Runs while the slack is still a single usub_sat op. */
+   if (soft_fault)
+      NIR_PASS(_, nir, hk_nir_share_bounded_load_slack);
 
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,

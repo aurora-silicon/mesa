@@ -271,7 +271,11 @@ agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
    case AGX_OPCODE_FADD: {
       const agx_index other = ins->src[1 - s];
       if (other.size == AGX_SIZE_16)
-         return false; /* two 16-bit add sources are unwitnessed */
+         /* Two plain 16-bit add sources into a 32-bit destination are
+          * witnessed (fp16-heavy-10 tail, f32add.ep0 f43+f26); any
+          * modifier or a narrow destination on top is not. */
+         return !narrow && !ins->saturate && !neg && !other.neg &&
+                !other.abs;
       if (narrow)
          /* w23: a clean 16-bit f35-side source under a narrow dest. */
          return s == 0 && !neg && !other.neg && !other.abs &&
@@ -295,10 +299,18 @@ agx3b_f32_src_admits_half(const agx_instr *ins, unsigned s,
       if (ins->saturate || narrow)
          return false;
       if (s == 2) {
-         /* w09: a 16-bit addend, including negated (f65+f60), only
-          * beside two 32-bit register multiplicands. */
-         return ins->src[0].size == AGX_SIZE_32 &&
-                ins->src[1].size == AGX_SIZE_32;
+         /* w09: a 16-bit addend, including negated (f65+f60), beside two
+          * 32-bit register multiplicands. The fp16 corpus additionally
+          * grounds the plain form beside a 16-bit src0 (f43+f60) and
+          * beside two 16-bit multiplicands (f43+f26+f60). */
+         if (ins->src[1].size != AGX_SIZE_32 &&
+             !(ins->src[0].size == AGX_SIZE_16 &&
+               ins->src[1].size == AGX_SIZE_16))
+            return false;
+         if (ins->src[0].size == AGX_SIZE_16)
+            return !neg && !ins->src[0].neg && !ins->src[0].abs &&
+                   !ins->src[1].neg && !ins->src[1].abs;
+         return ins->src[0].size == AGX_SIZE_32;
       }
       if (ins->src[2].type != AGX_INDEX_NORMAL &&
           ins->src[2].type != AGX_INDEX_REGISTER)
@@ -1540,12 +1552,21 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     * the fused form whenever the second operand is register or immediate;
     * the packer refuses modified/memory operands, which keep the
     * opposite-compare fallback below. */
+   /* Only EQ with a register second operand is byte-verified against
+    * hardware output (the allequal witness); the immediate-operand and
+    * non-EQ register forms are encoder-table derived and miscompile on
+    * real G17P (sg-vote-3 all-lanes-equal bug). ASAHI_G17P_FBALLOT
+    * re-enables the unwitnessed fused forms for probing. */
    const bool fused_fballot =
       !quad && ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
       def->op == AGX_OPCODE_FCMP &&
       (def->fcond == AGX_FCOND_EQ || def->fcond == AGX_FCOND_LT ||
        def->fcond == AGX_FCOND_GT || def->fcond == AGX_FCOND_GE ||
        def->fcond == AGX_FCOND_LE) &&
+      ((def->fcond == AGX_FCOND_EQ &&
+        def->src[0].type == AGX_INDEX_NORMAL &&
+        def->src[1].type == AGX_INDEX_NORMAL) ||
+       debug_get_bool_option("ASAHI_G17P_FBALLOT", false)) &&
       /* src0 may be an immediate: it swaps into the second-operand slot
        * with the reversed condition below. */
       ((def->src[0].type == AGX_INDEX_NORMAL &&
@@ -1639,8 +1660,25 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
             def->src[0].size == AGX_SIZE_32 &&
             (def->src[0].type == AGX_INDEX_UNIFORM ||
              other.type == AGX_INDEX_UNIFORM);
+
+         /* The two-register truth tables the AGX3B packer encodes as their
+          * own instructions: bit_nor (0x1), bit_andc either side (0x2/0x4),
+          * bit_nand (0x7), bit_xnor (0x9) and bit_orc either side (0xb/0xd).
+          * They take register operands only, so require a 32-bit register on
+          * both sides after the fuse. */
+         const bool named_reg_word =
+            I->dest[0].size == AGX_SIZE_32 &&
+            I->src[0].size == AGX_SIZE_32 &&
+            I->src[1].size == AGX_SIZE_32 &&
+            def->src[0].size == AGX_SIZE_32 &&
+            def->src[0].type == AGX_INDEX_NORMAL &&
+            I->src[1 - s].type == AGX_INDEX_NORMAL &&
+            (truth_table == 0x1 || truth_table == 0x2 ||
+             truth_table == 0x4 || truth_table == 0x7 ||
+             truth_table == 0x9 || truth_table == 0xb ||
+             truth_table == 0xd);
          if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-             !native_uniform_word &&
+             !native_uniform_word && !named_reg_word &&
              truth_table != AGX3_SEL_TT_AND &&
              truth_table != AGX3_SEL_TT_OR &&
              truth_table != AGX3_SEL_TT_XOR &&

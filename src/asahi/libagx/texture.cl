@@ -158,9 +158,8 @@ libagx_twiddle_coordinates(ushort2 coord, uint16_t tile_w_px,
 }
 
 static uint32_t
-libagx_spread_morton_16_gen9(uint16_t input)
+libagx_spread_morton_16_gen9(uint32_t x)
 {
-   uint32_t x = input;
    x = (x | (x << 8)) & 0x00ff00ffu;
    x = (x | (x << 4)) & 0x0f0f0f0fu;
    x = (x | (x << 2)) & 0x33333333u;
@@ -174,24 +173,32 @@ libagx_spread_morton_16_gen9(uint16_t input)
  * SWAR expansion on Gen9, which keeps this architectural lowering out of the
  * AGX2 path and avoids inventing an AGX3 encoding. */
 static uint32_t
-libagx_twiddle_coordinates_gen9(ushort2 coord, uint16_t tile_w_px,
+libagx_twiddle_coordinates_gen9(uint2 coord, uint16_t tile_w_px,
                                 uint16_t tile_h_px,
                                 uint32_t aligned_width_px)
 {
-   const ushort2 tile_mask_vec =
-      (ushort2)(tile_w_px - 1, tile_h_px - 1);
-   const uint32_t tile_mask = upsample(tile_mask_vec.y, tile_mask_vec.x);
-   const uint32_t coord_xy = upsample(coord.y, coord.x);
-   const ushort2 offs_px = as_ushort2(coord_xy & tile_mask);
+   /* Mask the coordinates per component instead of packing both into one
+    * 16x2 word for a single vector AND: the pack/mask/unpack round-trip
+    * costs about five instructions more than two scalar ANDs, and the
+    * spread input is scalar anyway.  Keeping the coordinates at full
+    * width avoids a u2u16/u2u32 round-trip per component; the twiddle
+    * result is consumed only for in-bounds texels. */
+   const uint32_t mask_x = tile_w_px - 1u;
+   const uint32_t mask_y = tile_h_px - 1u;
+   const uint32_t offs_x = coord.x & mask_x;
+   const uint32_t offs_y = coord.y & mask_y;
    /* The spreads hold only even and only odd bits, so the combine adds
     * cleanly and the shl folds into the shifted iadd. */
    const uint32_t offset_within_tile_px =
-      libagx_spread_morton_16_gen9(offs_px.x) +
-      (libagx_spread_morton_16_gen9(offs_px.y) << 1);
-   const ushort2 tile_px = as_ushort2(coord_xy & ~tile_mask);
+      libagx_spread_morton_16_gen9(offs_x) +
+      (libagx_spread_morton_16_gen9(offs_y) << 1);
+   /* coord & ~mask == coord - (coord & mask) for disjoint bit sets, so the
+    * tile corner needs no complemented mask uniform at all. */
+   const uint32_t tile_x = coord.x - offs_x;
+   const uint32_t tile_y = coord.y - offs_y;
 
-   return tile_px.y * aligned_width_px +
-          tile_px.x * tile_h_px + offset_within_tile_px;
+   return tile_y * aligned_width_px + tile_x * tile_h_px +
+          offset_within_tile_px;
 }
 
 uint64_t
@@ -284,8 +291,7 @@ libagx_image_texel_address_gen9(
       const uint aligned_width_px =
          (width_px + tile_width_px - 1u) & ~(tile_width_px - 1u);
       total_px = libagx_twiddle_coordinates_gen9(
-         convert_ushort2(coord.xy), tile_width_px, tile_height_px,
-         aligned_width_px);
+         coord.xy, tile_width_px, tile_height_px, aligned_width_px);
    }
 
    /* Native multisample atomics need a separately recovered sample-count
@@ -319,7 +325,7 @@ libagx_emrt_ms_index_gen9(constant const uint64_t *sw_ptr,
    const uint layer_stride = (uint)((sw >> 35) & 0x7ffffffu) << 7;
    const uint samples_log2 = (uint)(sw >> 62);
    const uint pixel = libagx_twiddle_coordinates_gen9(
-      convert_ushort2(coord.xy), tile_width, tile_height, *width_ptr);
+      coord.xy, tile_width, tile_height, *width_ptr);
    return (pixel << samples_log2) + sample +
           coord.z * (layer_stride / bytes_per_sample);
 }

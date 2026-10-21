@@ -90,6 +90,27 @@ constant_use_accepts_uniform(agx_context *ctx, const agx_instr *I, unsigned s,
    if (agx_instr_accepts_uniform(ctx->key->dev.encoding, I->op, s, uniform, size))
       return true;
 
+   /* G17P's isel compares a 32-bit register against one aligned 32-bit
+    * uniform comparand in the low uniform file (agx3_isel_core.c).  There
+    * is no form with an immediate comparand beside a uniform, nor with a
+    * uniform select beside a uniform comparand, so the other comparand
+    * must be a register and both selects must stay non-uniform.  Robust
+    * buffer bounds checks emit `icmpsel(#end, slack, 0, data)` per access;
+    * ends above the 8-bit immediate field otherwise pay a mov_imm each.
+    */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+       I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4 && s < 2 &&
+       size == AGX_SIZE_32 && !(uniform & 1) && uniform + 2 <= 256 &&
+       I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
+       agx_channels(I->dest[0]) == 1 &&
+       I->src[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32 &&
+       I->src[2].type != AGX_INDEX_UNIFORM &&
+       I->src[3].type != AGX_INDEX_UNIFORM &&
+       I->src[s ^ 1].type == AGX_INDEX_NORMAL && !I->src[s ^ 1].abs &&
+       !I->src[s ^ 1].neg && !I->src[s ^ 1].memory &&
+       agx_channels(I->src[s ^ 1]) == 1)
+      return true;
+
    if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B || I->nr_srcs > 3 ||
        uniform >= AGX_NUM_UNIFORMS)
       return false;
