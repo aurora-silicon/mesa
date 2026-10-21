@@ -203,9 +203,13 @@ uniform32_ok(uint16_t half)
 }
 
 static bool
-encode_explicit(const struct agx3_isel_desc *d,
+encode_explicit(const struct agx3_isel_desc *d, int flag_slot,
                  uint8_t out[AGX3_ISEL_MAX_LENGTH], uint8_t *len)
 {
+   /* A negative slot is the GPR-destination form; a flag slot (0..5) is the
+    * flag-destination select on the ep23 family: the comparison publishes
+    * the selected operand's truth instead of writing a register. */
+   const bool publish = flag_slot >= 0;
    const bool tu = d->true_kind == AGX3_ISEL_UNIFORM;
    const bool fu = d->false_kind == AGX3_ISEL_UNIFORM;
    const bool any_uniform = d->cmp0_uniform || d->cmp1_uniform || tu || fu;
@@ -265,9 +269,22 @@ encode_explicit(const struct agx3_isel_desc *d,
       KV(72, ti ? 1 : tu ? 3 : 2), KV(73, width),
       KV(89, fi ? 1 : fu ? 3 : 2), KV(90, width),
    };
+   const struct agx3_field_kv flag_base[] = {
+      /* The flag-destination select swaps the destination block for the
+       * publish marker f31=1 and the three-bit flag slot f32. f0 = 2 is a
+       * fixed selector of the flag form, not a register. Witnessed:
+       * `1a0313e1..` (f32 = 0 feeds cndlt slot 0), `3a8313e1..` (f32 = 1). */
+      KV(0, 2), KV(31, 1), KV(32, flag_slot),
+      KV(42, d->cmp0_uniform ? 3 : 2), KV(43, d->cmp_16 ? 1 : 2),
+      KV(57, d->cmp1_immediate ? 1 : d->cmp1_uniform ? 3 : 2),
+      KV(58, (d->cmp1_immediate || d->cmp_16) ? 1 : 2),
+      KV(72, ti ? 1 : tu ? 3 : 2), KV(73, width),
+      KV(89, fi ? 1 : fu ? 3 : 2), KV(90, width),
+   };
    struct agx3_field_kv ov[24];
    unsigned n = 0;
-   ov[n++] = (struct agx3_field_kv)KV(3, d->dest);
+   if (!publish)
+      ov[n++] = (struct agx3_field_kv)KV(3, d->dest);
    ov[n++] = (struct agx3_field_kv)KV(d->cmp0_uniform ? 36 : 35, d->cmp0);
    ov[n++] = (struct agx3_field_kv)KV(d->cmp1_immediate ? 49 :
                                       d->cmp1_uniform ? 51 : 50, d->cmp1);
@@ -297,9 +314,53 @@ encode_explicit(const struct agx3_isel_desc *d,
    for (unsigned i = 0; i < 6; ++i)
       ov[n++] = (struct agx3_field_kv)KV(98 + i, (d->wait_mask >> i) & 1);
 
+   if (publish) {
+      /* The flag-destination endpoints are split by selected-operand width:
+       * ep23 is the ten-byte 16-bit form and ep24 the ten-byte 32-bit one;
+       * ep31/ep32 are the fourteen-byte variants. */
+      const unsigned first = d->dest_16 ? 23 : 24;
+      const unsigned second = d->dest_16 ? 31 : 32;
+      if (agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "isel", first,
+                            flag_base, sizeof(flag_base) / sizeof(flag_base[0]),
+                            ov, n, out, len) ||
+          agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "isel", second,
+                            flag_base, sizeof(flag_base) / sizeof(flag_base[0]),
+                            ov, n, out, len))
+         return true;
+      return false;
+   }
+
    const unsigned ep = d->dest_16 ? 25 + (d->dest & 1) : 27;
    return agx3_bind_compose(AGX_ISA_ENCODING_AGX3B, "isel", ep,
                            base, sizeof(base) / sizeof(base[0]), ov, n, out, len);
+}
+
+/* Encode the flag-destination select: `flag[slot] = (cmp0 cond cmp1) ?
+ * truth(sel_true) : truth(sel_false)`, where truth of a register or
+ * uniform operand is "nonzero" and of an immediate is the constant itself.
+ * No GPR destination exists on these endpoints; sel operand width follows
+ * desc.dest_16 (ep23 16-bit, ep24 32-bit). */
+bool
+agx3_isel_flag_publish(enum agx_isa_encoding encoding,
+                       const struct agx3_isel_desc *d, unsigned flag_slot,
+                       uint8_t out[AGX3_ISEL_MAX_LENGTH], uint8_t *len)
+{
+   if (d == NULL || out == NULL || len == NULL)
+      return false;
+   if (encoding != AGX_ISA_ENCODING_AGX3B || flag_slot >= 6)
+      return false;
+   if (!cond_ok(d->cond) ||
+       (!d->cmp0_uniform &&
+        !(d->cmp_16 ? reg16_ok(d->cmp0) : reg32_ok(d->cmp0))) ||
+       (!d->cmp1_immediate && !d->cmp1_uniform &&
+        !(d->cmp_16 ? reg16_ok(d->cmp1) : reg32_ok(d->cmp1))))
+      return false;
+   if (d->wait_mask >= (1u << 6))
+      return false;
+   if (!operand_ok(d->true_kind, d->sel_true, d->dest_16) ||
+       !operand_ok(d->false_kind, d->sel_false, d->dest_16))
+      return false;
+   return encode_explicit(d, (int)flag_slot, out, len);
 }
 
 bool
@@ -331,7 +392,7 @@ agx3_isel_encode(enum agx_isa_encoding encoding,
                         d->true_kind == AGX3_ISEL_UNIFORM ||
                         d->false_kind == AGX3_ISEL_UNIFORM;
    if (uniform)
-      return encode_explicit(d, out, len);
+      return encode_explicit(d, -1, out, len);
 
    if (!operand_ok(d->true_kind, d->sel_true, d->dest_16) ||
        !operand_ok(d->false_kind, d->sel_false, d->dest_16))
@@ -339,7 +400,7 @@ agx3_isel_encode(enum agx_isa_encoding encoding,
 
    if (d->cmp1_immediate || d->cmp_16 || d->explicit_hints ||
        d->dest_cache)
-      return encode_explicit(d, out, len);
+      return encode_explicit(d, -1, out, len);
 
    const struct agx3_isel_form *form =
       pick_form(d->dest_16, d->true_kind, d->false_kind);

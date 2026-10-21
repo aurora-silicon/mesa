@@ -5361,6 +5361,395 @@ agx3_retire_extra_waits(struct util_dynarray *emission,
    return true;
 }
 
+/*
+ * Flag-destination select fusion.
+ *
+ * Apple's ep23-family isel/fsel carries no GPR destination: f31 = 1 plus
+ * f32 = slot make the select publish `flag[slot] = (cmp0 cond cmp1) ?
+ * truth(sel_true) : truth(sel_false)` for a later cndlt/cndst/cndcf, so a
+ * boolean-materialising select feeding only a `!= 0` flag compare needs no
+ * standalone icmp/fcmp at all. When every use of a compare-select's result
+ * is one such flag compare, the planner below encodes the producer as the
+ * flag-destination form at its own program point -- the flag persists
+ * across intervening instructions -- and the consumer emits just the cnd.
+ */
+struct agx3_flagpub_plan {
+   /* Per linear instruction index: encoded flag-destination-select bytes
+    * for a fused producer (len 0 = unfused) and, for a fused consumer, the
+    * flag slot that has already been published (-1 = unfused). */
+   uint8_t *producer_bytes;
+   uint8_t *producer_len;
+   int8_t *consumer_slot;
+};
+
+static bool agx3_is_cf_op(const agx_instr *I);
+static bool agx3_is_loop_entry_push(const agx_instr *I);
+static bool agx3_instr_touches_regs(const agx_instr *I, bool dests,
+                                    unsigned reg, unsigned count);
+static enum agx3_alu_hint agx3_post_ra_hint(agx_index idx);
+static enum agx_fcond agx3_fcond_reverse(enum agx_fcond c);
+
+/* Backward DFS: true when every path from the shader entry to `block`
+ * passes through `dom`. */
+static bool
+agx3_block_dominates(agx_context *ctx, agx_block *dom, agx_block *block)
+{
+   if (dom == block)
+      return true;
+   agx_block **stack = ralloc_array(ctx, agx_block *, 64);
+   agx_block **seen = ralloc_array(ctx, agx_block *, 64);
+   if (!stack || !seen)
+      return false;
+   unsigned n = 0, ns = 0;
+   stack[n++] = block;
+   while (n) {
+      agx_block *b = stack[--n];
+      bool dup = false;
+      for (unsigned i = 0; i < ns; ++i)
+         dup |= seen[i] == b;
+      if (dup)
+         continue;
+      seen[ns++] = b;
+      if (ns >= 63)
+         return false;
+      if (b == dom)
+         continue;
+      if (agx_num_predecessors(b) == 0)
+         return false; /* reached the entry without crossing dom */
+      agx_foreach_predecessor(b, pred) {
+         if (*pred == b || *pred == block)
+            return false; /* alternate path back to block */
+         stack[n++] = *pred;
+         if (n >= 63)
+            return false;
+      }
+   }
+   return true;
+}
+
+static void
+agx3_flag_select_fields(const agx_instr *S, bool is_float,
+                        struct agx3_isel_desc *id,
+                        struct agx3_fsel_desc *fd)
+{
+   const agx_index cmp0 = S->src[0], cmp1 = S->src[1];
+   const agx_index tv = S->src[2], fv = S->src[3];
+   if (!is_float) {
+      memset(id, 0, sizeof(*id));
+      const bool swap = cmp0.type == AGX_INDEX_IMMEDIATE;
+      const agx_index a = swap ? cmp1 : cmp0;
+      const agx_index b = swap ? cmp0 : cmp1;
+      id->dest_16 = S->dest[0].size == AGX_SIZE_16;
+      id->cmp0 = a.value;
+      id->cmp1 = b.value;
+      id->cmp1_immediate = b.type == AGX_INDEX_IMMEDIATE;
+      id->cmp0_uniform = a.type == AGX_INDEX_UNIFORM;
+      id->cmp1_uniform = b.type == AGX_INDEX_UNIFORM;
+      id->cmp_16 = a.size == AGX_SIZE_16;
+      id->explicit_hints = true;
+      const agx_index hinted[4] = {a, b, tv, fv};
+      for (unsigned i = 0; i < 4; ++i) {
+         if (hinted[i].type == AGX_INDEX_REGISTER) {
+            id->cache[i] = hinted[i].cache;
+            id->discard[i] = hinted[i].discard;
+         }
+      }
+      switch (S->icond) {
+      case AGX_ICOND_UEQ:
+      case AGX_ICOND_SEQ: id->cond = AGX3_ISEL_ICOND_EQ; break;
+      case AGX_ICOND_ULT: id->cond = AGX3_ISEL_ICOND_ULT; break;
+      case AGX_ICOND_UGT: id->cond = AGX3_ISEL_ICOND_UGT; break;
+      case AGX_ICOND_SLT: id->cond = AGX3_ISEL_ICOND_SLT; break;
+      case AGX_ICOND_SGT: id->cond = AGX3_ISEL_ICOND_SGT; break;
+      }
+      if (swap) {
+         switch (id->cond) {
+         case AGX3_ISEL_ICOND_ULT: id->cond = AGX3_ISEL_ICOND_UGT; break;
+         case AGX3_ISEL_ICOND_UGT: id->cond = AGX3_ISEL_ICOND_ULT; break;
+         case AGX3_ISEL_ICOND_SLT: id->cond = AGX3_ISEL_ICOND_SGT; break;
+         case AGX3_ISEL_ICOND_SGT: id->cond = AGX3_ISEL_ICOND_SLT; break;
+         default: break;
+         }
+      }
+      const agx_index sel[2] = {tv, fv};
+      enum agx3_isel_operand kind[2];
+      uint16_t value[2];
+      for (unsigned i = 0; i < 2; ++i) {
+         if (sel[i].type == AGX_INDEX_IMMEDIATE) {
+            kind[i] = AGX3_ISEL_IMMEDIATE;
+         } else if (sel[i].type == AGX_INDEX_UNIFORM) {
+            kind[i] = AGX3_ISEL_UNIFORM;
+         } else {
+            kind[i] = AGX3_ISEL_REGISTER;
+         }
+         value[i] = sel[i].value;
+      }
+      id->true_kind = kind[0];
+      id->false_kind = kind[1];
+      id->sel_true = value[0];
+      id->sel_false = value[1];
+      id->wait_mask = 0;
+      return;
+   }
+
+   /* FCMPSEL, mirroring the generic packing path: put the immediate in
+    * compare slot 1, swap the selected operands on invert_cond, and map the
+    * extended LTN/GTN relations as there. */
+   memset(fd, 0, sizeof(*fd));
+   const bool c0_imm = cmp0.type == AGX_INDEX_IMMEDIATE;
+   const bool c1_imm = cmp1.type == AGX_INDEX_IMMEDIATE;
+   unsigned condition = S->fcond;
+   bool swap = S->invert_cond;
+   if (condition == AGX_FCOND_LTN) {
+      condition = AGX_FCOND_GE;
+      swap = !swap;
+   } else if (condition == AGX_FCOND_GTN) {
+      condition = AGX_FCOND_LE;
+      swap = !swap;
+   }
+   const bool reverse = c0_imm;
+   const agx_index m0 = reverse ? cmp1 : cmp0;
+   const agx_index m1 = reverse ? cmp0 : cmp1;
+   if (reverse)
+      condition = agx3_fcond_reverse(condition);
+   const agx_index stv = swap ? fv : tv;
+   const agx_index sfv = swap ? tv : fv;
+   const bool stv_imm = stv.type == AGX_INDEX_IMMEDIATE;
+   const bool sfv_imm = sfv.type == AGX_INDEX_IMMEDIATE;
+   const bool stv_uni = stv.type == AGX_INDEX_UNIFORM;
+   const bool sfv_uni = sfv.type == AGX_INDEX_UNIFORM;
+   fd->dest = S->dest[0].value;
+   fd->dest_16 = S->dest[0].size == AGX_SIZE_16;
+   fd->dest_cache = S->dest[0].cache;
+   fd->cmp0 = m0.value;
+   fd->cmp0_uniform = m0.type == AGX_INDEX_UNIFORM;
+   fd->cmp0_hint = m0.type == AGX_INDEX_UNIFORM
+                      ? AGX3_ALU_HINT_NONE
+                      : agx3_post_ra_hint(m0);
+   fd->cmp0_abs = m0.abs;
+   fd->cmp0_neg = m0.neg;
+   fd->cmp0_16 = m0.size == AGX_SIZE_16;
+   fd->cmp1_is_immediate = reverse ? c0_imm : c1_imm;
+   fd->cmp1_uniform = m1.type == AGX_INDEX_UNIFORM;
+   fd->cmp1 = m1.value;
+   fd->cmp1_hint = m1.type == AGX_INDEX_UNIFORM
+                      ? AGX3_ALU_HINT_NONE
+                      : agx3_post_ra_hint(m1);
+   fd->cmp1_abs = m1.abs;
+   fd->cmp1_neg = m1.neg;
+   fd->cmp1_16 = m1.size == AGX_SIZE_16;
+   fd->sel0_kind = stv_imm   ? AGX3_FSEL_SEL_IMMEDIATE
+                   : stv_uni ? AGX3_FSEL_SEL_UNIFORM
+                             : AGX3_FSEL_SEL_REGISTER;
+   fd->sel1_kind = sfv_imm   ? AGX3_FSEL_SEL_IMMEDIATE
+                   : sfv_uni ? AGX3_FSEL_SEL_UNIFORM
+                             : AGX3_FSEL_SEL_REGISTER;
+   fd->sel0 = stv.value;
+   fd->sel1 = sfv.value;
+   fd->sel0_hint = (stv_imm || stv_uni) ? AGX3_ALU_HINT_NONE
+                                        : agx3_post_ra_hint(stv);
+   fd->sel1_hint = (sfv_imm || sfv_uni) ? AGX3_ALU_HINT_NONE
+                                        : agx3_post_ra_hint(sfv);
+   fd->sel_16 = S->dest[0].size == AGX_SIZE_16;
+   fd->condition = condition;
+   fd->wait_mask = 0;
+}
+
+/* Test-encode a producer's flag-destination form. Returns the byte count or
+ * 0 when the shape does not compose on the ep23 family. */
+static unsigned
+agx3_flag_select_try(enum agx_isa_encoding enc, const agx_instr *S,
+                     unsigned flag_slot, uint16_t wait_mask,
+                     uint8_t out[AGX3_ISEL_MAX_LENGTH])
+{
+   uint8_t len = 0;
+   if (S->op == AGX_OPCODE_ICMPSEL) {
+      struct agx3_isel_desc d;
+      agx3_flag_select_fields(S, false, &d, NULL);
+      d.wait_mask = wait_mask;
+      if (agx3_isel_flag_publish(enc, &d, flag_slot, out, &len))
+         return len;
+   } else if (S->op == AGX_OPCODE_FCMPSEL) {
+      struct agx3_fsel_desc d;
+      agx3_flag_select_fields(S, true, NULL, &d);
+      d.flag_publish = true;
+      d.flag_slot = flag_slot;
+      if (agx3_alu_fcmp_select(enc, &d, out, &len))
+         return len;
+   }
+   return 0;
+}
+
+static void
+agx3_plan_flag_selects(agx_context *ctx, enum agx_isa_encoding enc,
+                       enum agx_chip chip, agx_instr **ordered,
+                       const struct agx3_slot_result *res, unsigned count,
+                       struct agx3_flagpub_plan *plan)
+{
+   if (enc != AGX_ISA_ENCODING_AGX3B)
+      return;
+
+   plan->producer_bytes =
+      rzalloc_array(ctx, uint8_t, count * AGX3_ISEL_MAX_LENGTH + 1);
+   plan->producer_len = rzalloc_array(ctx, uint8_t, count ? count : 1);
+   plan->consumer_slot = rzalloc_array(ctx, int8_t, count ? count : 1);
+   if (!plan->producer_bytes || !plan->producer_len || !plan->consumer_slot)
+      return;
+   memset(plan->consumer_slot, 0xff, count * sizeof(int8_t));
+
+   /* Instruction -> block, in the same linear order ordered[] was built. */
+   agx_block **block_of = rzalloc_array(ctx, agx_block *, count ? count : 1);
+   if (!block_of)
+      return;
+   {
+      unsigned k = 0;
+      agx_foreach_block(ctx, block) {
+         agx_foreach_instr_in_block(block, I) {
+            if (I->op == AGX_OPCODE_STOP || k >= count)
+               continue;
+            block_of[k++] = block;
+         }
+      }
+   }
+
+   uint16_t writer[256];
+   memset(writer, 0xff, sizeof(writer));
+   uint16_t flag_writer[6];
+   memset(flag_writer, 0xff, sizeof(flag_writer));
+   unsigned loop_depth = 0;
+   bool after_backedge = false;
+   agx_block *cur_block = NULL;
+
+   for (unsigned i = 0; i < count; ++i) {
+      const agx_instr *I = ordered[i];
+      if (block_of[i] != cur_block) {
+         cur_block = block_of[i];
+         after_backedge = false;
+      }
+
+      const bool is_if =
+         I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP;
+      const bool is_while =
+         I->op == AGX_OPCODE_WHILE_ICMP || I->op == AGX_OPCODE_WHILE_FCMP;
+      const bool is_break_if = I->op == AGX_OPCODE_BREAK_IF_ICMP ||
+                               I->op == AGX_OPCODE_BREAK_IF_FCMP;
+      const bool is_float = I->op == AGX_OPCODE_IF_FCMP ||
+                            I->op == AGX_OPCODE_WHILE_FCMP ||
+                            I->op == AGX_OPCODE_BREAK_IF_FCMP;
+      const bool is_compare_op = is_if || is_while || is_break_if;
+
+      /* This instruction's flag-slot write, matching the emitter's slot
+       * arithmetic so a planned flag-destination select publishes to the
+       * same slot the cnd reads. */
+      int this_slot = -1;
+      if (is_compare_op && I->nr_srcs == 2 &&
+          !(is_if && I->nest != 1) && !(is_break_if && I->nest == 0) &&
+          !((is_break_if || is_while) && loop_depth == 0)) {
+         const unsigned loop_slot = loop_depth - 1;
+         this_slot = chip == AGX_CHIP_G16G
+            ? ((is_break_if || is_while) ? loop_slot % 6 : 0)
+            : (is_break_if ? (loop_slot + (I->nest > 1)) % 6
+                           : (is_while ? loop_slot % 6 : 0));
+      }
+
+      /* Candidate consumer: `h == 0` (an inverted equality is `h != 0`) on a
+       * single 16-bit register half. Only equality tests fuse: the published
+       * flag is the select result's own truth value. */
+      if (this_slot >= 0 && I->nr_srcs == 2 && !I->src[0].memory &&
+          !I->src[1].memory &&
+          ((!is_float &&
+            (I->icond == AGX_ICOND_UEQ || I->icond == AGX_ICOND_SEQ)) ||
+           (is_float && I->fcond == AGX_FCOND_EQ))) {
+         unsigned h = UINT_MAX;
+         for (unsigned s = 0; s < 2; ++s) {
+            const agx_index src = I->src[s], other = I->src[1 - s];
+            if (src.type == AGX_INDEX_REGISTER &&
+                src.size == AGX_SIZE_16 && agx_channels(src) == 1 &&
+                !src.abs && !src.neg &&
+                other.type == AGX_INDEX_IMMEDIATE && other.value == 0 &&
+                !other.abs && !other.neg)
+               h = src.value;
+         }
+
+         const unsigned s_idx = h < 256 ? writer[h] : 0xffff;
+         if (h < 256 && s_idx != 0xffff) {
+            agx_instr *S = ordered[s_idx];
+            const bool sel_float = S->op == AGX_OPCODE_FCMPSEL;
+            const bool sel_int = S->op == AGX_OPCODE_ICMPSEL;
+            /* The flag select's truth domain must match the consumer's
+             * compare: an isel feeds an icmp; an fcmpsel may feed either
+             * (its halves hold booleans, where integer and float truth
+             * agree). */
+            const bool domain_ok =
+               (sel_int && !is_float) || (sel_float && is_float) ||
+               (sel_float && !is_float);
+            bool cf_free_between = true;
+            for (unsigned j = s_idx + 1; j < i && cf_free_between; ++j)
+               if (agx3_is_cf_op(ordered[j]) &&
+                   ordered[j]->op != AGX_OPCODE_BEGIN_CF)
+                  cf_free_between = false;
+            bool no_other_read = true;
+            for (unsigned j = s_idx + 1; j < count && no_other_read; ++j) {
+               if (j == i)
+                  continue;
+               if (agx3_instr_touches_regs(ordered[j], true, h, 1))
+                  break; /* rewritten before any bad read */
+               if (agx3_instr_touches_regs(ordered[j], false, h, 1))
+                  no_other_read = false;
+            }
+            const bool encodable =
+               domain_ok && S->nr_dests == 1 && S->nr_srcs == 4 &&
+               S->dest[0].type == AGX_INDEX_REGISTER &&
+               S->dest[0].value == h &&
+               S->dest[0].size == AGX_SIZE_16 &&
+               agx_channels(S->dest[0]) == 1 && !S->dest[0].memory &&
+               res[s_idx].slot == 0 &&
+               (sel_int
+                   ? util_bitcount(res[s_idx].wait_mask) <= 1
+                   : res[s_idx].wait_mask == 0);
+
+            if (domain_ok && encodable && cf_free_between && no_other_read &&
+                res[i].wait_mask == 0 &&
+                flag_writer[this_slot] <= s_idx &&
+                agx3_block_dominates(ctx, block_of[s_idx], block_of[i])) {
+               const unsigned len = agx3_flag_select_try(
+                  enc, S, this_slot, res[s_idx].wait_mask,
+                  plan->producer_bytes + s_idx * AGX3_ISEL_MAX_LENGTH);
+               if (len) {
+                  plan->producer_len[s_idx] = len;
+                  plan->consumer_slot[i] = this_slot;
+                  S->agx3_flag_publish = true;
+                  flag_writer[this_slot] = s_idx;
+               }
+            }
+         }
+      }
+
+      /* An unfused compare writes its flag at its own position; a fused one
+       * was already credited to the producer above. */
+      if (this_slot >= 0 && plan->consumer_slot[i] < 0)
+         flag_writer[this_slot] = i;
+
+      /* Loop-depth bookkeeping, mirroring the emit loop's rules. */
+      if (agx3_is_cf_op(I)) {
+         if (agx3_is_loop_entry_push(I))
+            loop_depth++;
+         else if (I->op == AGX_OPCODE_POP_EXEC && after_backedge &&
+                  loop_depth > 0)
+            loop_depth--;
+         after_backedge = I->op == AGX_OPCODE_JMP_EXEC_ANY;
+      }
+
+      /* Track the latest GPR-half writer. */
+      agx_foreach_reg_dest(I, d) {
+         const unsigned r = I->dest[d].value;
+         const unsigned n = agx_index_size_16(I->dest[d]);
+         for (unsigned x = 0; x < n && r + x < 256; ++x)
+            writer[r + x] = i;
+      }
+   }
+}
+
 /* The instructions agx3_try_control_flow() claims. */
 static bool
 agx3_is_cf_op(const agx_instr *I)
@@ -5412,7 +5801,7 @@ agx3_try_control_flow(struct util_dynarray *emission,
                       const agx_instr *I, uint16_t wait_mask,
                       uint16_t outstanding, bool after_loop_backedge,
                       bool loop_exit_jump, unsigned loop_depth,
-                      off_t *compare_end)
+                      off_t *compare_end, int prepub_slot)
 {
    const bool is_if =
       I->op == AGX_OPCODE_IF_ICMP || I->op == AGX_OPCODE_IF_FCMP;
@@ -5488,14 +5877,21 @@ agx3_try_control_flow(struct util_dynarray *emission,
       if ((is_break_if || is_while) && loop_depth == 0)
          return -1;
       const unsigned loop_slot = loop_depth - 1;
-      const unsigned flag_slot = chip == AGX_CHIP_G16G
-         ? (is_break_if || is_while ? loop_slot % 6 : 0)
-         : (is_break_if ? (loop_slot + (I->nest > 1)) % 6
-                        : (is_while ? loop_slot % 6 : 0));
+      const unsigned flag_slot = prepub_slot >= 0
+         ? (unsigned)prepub_slot
+         : chip == AGX_CHIP_G16G
+              ? (is_break_if || is_while ? loop_slot % 6 : 0)
+              : (is_break_if ? (loop_slot + (I->nest > 1)) % 6
+                             : (is_while ? loop_slot % 6 : 0));
       if (flag_slot >= 6)
          return -1;
-      if (!agx3_emit_cf_compare(emission, enc, I, is_float, flag_slot,
-                                &invert)) {
+      if (prepub_slot >= 0) {
+         /* A flag-destination select already published `h != 0` to this
+          * slot; the fused instruction's equality test needs the
+          * complement of what the compare would have written. */
+         invert = !invert;
+      } else if (!agx3_emit_cf_compare(emission, enc, I, is_float, flag_slot,
+                                       &invert)) {
          if (agx_compiler_debug & AGX_DBG_SHADERS)
             fprintf(stderr, "AGX3 control-flow compare refused\n");
          return -1;
@@ -7580,7 +7976,9 @@ agx3_apply_loop_head_hints(agx_context *ctx, struct util_dynarray *emission)
 static bool
 agx3_early_compare_crossable(const agx_instr *I)
 {
-   if (I->agx3_tex_coord_stage)
+   /* A flag-destination select writes a flag slot an early-hoisted compare
+    * could clobber, so nothing may cross it. */
+   if (I->agx3_tex_coord_stage || I->agx3_flag_publish)
       return false;
    switch (I->op) {
    case AGX_OPCODE_MOV_IMM:
@@ -9157,6 +9555,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    if (!tps_rereads)
       goto fail;
 
+   /* Plan flag-destination select fusion before emission: producers whose
+    * result only feeds a `!= 0` flag compare encode as ep23-family selects
+    * publishing the flag directly, and the consumers emit only their cnd. */
+   struct agx3_flagpub_plan flagpub = {0};
+   agx3_plan_flag_selects(ctx, enc, ctx->key->dev.chip, ordered, res, count,
+                          &flagpub);
+
    k = 0;
    const bool interleaved_zs =
       agx3_g17p_interleaved_zs(ctx) && enc == AGX_ISA_ENCODING_AGX3B &&
@@ -9286,7 +9691,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             cf_outstanding,
             after_loop_backedge,
             I->op == AGX_OPCODE_JMP_EXEC_NONE_AFTER && after_loop_exit_test,
-            loop_depth, &cf_compare_end);
+            loop_depth, &cf_compare_end,
+            flagpub.consumer_slot ? flagpub.consumer_slot[instr_index] : -1);
          if (early_compare && cf > 0 && cf_compare_end > cf_start) {
             struct agx3_early_compare c = {
                .I = I, .block = block, .instr_start = span_start,
@@ -9313,6 +9719,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          }
          after_loop_backedge = false;
          after_loop_exit_test = false;
+
+         /* A compare-select whose result only feeds a fused `!= 0` flag
+          * compare is emitted here as the flag-destination select: it
+          * publishes its truth to the flag slot instead of writing a GPR,
+          * and the consumer emits only its cnd. */
+         if (flagpub.producer_len && flagpub.producer_len[instr_index]) {
+            if (!agx3_append(emission,
+                             flagpub.producer_bytes +
+                                instr_index * AGX3_ISEL_MAX_LENGTH,
+                             flagpub.producer_len[instr_index]))
+               AGX3_REFUSE(I);
+            continue;
+         }
 
          if (I->op == AGX_OPCODE_UNIFORM_FADD_AGX3 ||
              I->op == AGX_OPCODE_UNIFORM_FMUL_AGX3 ||

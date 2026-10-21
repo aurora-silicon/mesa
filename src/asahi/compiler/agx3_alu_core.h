@@ -349,6 +349,12 @@ struct agx3_fsel_desc {
    enum agx3_alu_hint sel0_hint, sel1_hint;
    bool sel_16;
 
+   /* The flag-destination select (ep23/ep24 family): publishes
+    * `flag[flag_slot] = (cmp0 cond cmp1) ? truth(sel0) : truth(sel1)`
+    * instead of writing a GPR. dest/dest_16/dest_cache are ignored. */
+   bool flag_publish;
+   uint8_t flag_slot;
+
    unsigned condition;
    uint16_t wait_mask;
 };

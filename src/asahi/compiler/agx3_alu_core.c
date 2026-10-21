@@ -1963,10 +1963,25 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
       {77, d.sel_16 ? 1 : 2}, {94, d.sel_16 ? 1 : 2},
    };
 
+   /* The flag-destination select (ep23/ep24 family) replaces the GPR
+    * destination block with the publish marker f31 = 1 and flag slot f32;
+    * f0 = 2 selects the flag form. Apple emits it ahead of a cndlt/cndst in
+    * place of a select plus a standalone compare (`1a0313e1..`, f32 = 0
+    * feeding cndlt slot 0; `3a8313e1..`, f32 = 1). */
+   const struct agx3_field_kv flag_base[] = {
+      {0, 2}, {31, 1}, {32, d.flag_slot},
+      {42, d.cmp0_uniform ? AGX3_FSEL_CMP_UNIFORM : AGX3_FSEL_CMP_REGISTER},
+      {43, cmp0_16 ? 1 : 2},
+      {60, cmp1_16 ? 1 : 2},
+      {77, d.sel_16 ? 1 : 2}, {94, d.sel_16 ? 1 : 2},
+   };
+
    struct agx3_field_kv f[25];
    unsigned n = 0;
-   f[n++] = (struct agx3_field_kv){3, d.dest};
-   f[n++] = (struct agx3_field_kv){12, d.dest_cache};
+   if (!d.flag_publish) {
+      f[n++] = (struct agx3_field_kv){3, d.dest};
+      f[n++] = (struct agx3_field_kv){12, d.dest_cache};
+   }
 
    /* A uniform comparand, as Apple selects on a constant-program flag
     * (applegpu_g17p, `f ? x : a` with f in a constant buffer):
@@ -2040,6 +2055,22 @@ agx3_alu_fcmp_select(enum agx_isa_encoding enc, const struct agx3_fsel_desc *in,
     * non-zero immediate comparator recorded what had been measured, not what
     * the field can hold.
     */
+   if (d.flag_publish) {
+      if (d.flag_slot >= 6)
+         return false;
+      /* The flag endpoints are split by selected-operand width: the
+       * ten-byte ep23 is 16-bit and ep24 32-bit; ep31/ep32 are the
+       * fourteen-byte variants. */
+      const unsigned eps[2] = {d.sel_16 ? 23 : 24, d.sel_16 ? 31 : 32};
+      for (unsigned e = 0; e < 2; ++e) {
+         if (agx3_bind_compose(enc, "fsel", eps[e], flag_base,
+                               sizeof(flag_base) / sizeof(flag_base[0]), f, n,
+                               out, len))
+            return true;
+      }
+      return false;
+   }
+
    const bool integer_select =
       (d.sel0_kind == AGX3_FSEL_SEL_IMMEDIATE && d.sel0 != 0) ||
       (d.sel1_kind == AGX3_FSEL_SEL_IMMEDIATE && d.sel1 != 0);

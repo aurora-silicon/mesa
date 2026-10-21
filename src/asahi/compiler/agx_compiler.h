@@ -485,6 +485,12 @@ typedef struct {
    bool agx3_tex_coords_staged : 1;
    bool agx3_cube_scalar_coords  : 1;
 
+   /* This compare-select is emitted as a flag-destination select (isel/fsel
+    * ep23 family): it publishes its boolean result to a flag slot for a
+    * later control-flow consumer and writes no GPR. The packer's
+    * early-compare hoisting must not move a compare across it. */
+   bool agx3_flag_publish : 1;
+
 } agx_instr;
 
 static inline uint32_t
