@@ -2956,6 +2956,44 @@ agx3_alu_shift_imm32(enum agx_isa_encoding enc, bool left,
                             base, 8, fields, n, out, len);
 }
 
+/* The same immediate-count shift reading a scalar half into a 32-bit
+ * destination: f24 selects the 16-bit source width the way it does on the
+ * register-count form (agx3_alu_shift_reg), while the destination and the
+ * implicit full-width count boundary keep width 2. Apple emits this form to
+ * widen a ushort shift-left; the corpus carries eight instances of it (the
+ * `d0` byte at bit-69 selects the narrow source where the 32-bit form has
+ * `f0`). This is what a widening `(ushort)x << imm` or the shift leg of a
+ * byte/half sign extension needs, with no 32-bit pad register.
+ */
+bool
+agx3_alu_sll_imm_src16(enum agx_isa_encoding enc,
+                       uint16_t dest, uint16_t src, unsigned shift,
+                       enum agx3_alu_hint hint, bool dest_cache,
+                       uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
+                       uint8_t *len)
+{
+   if (enc != AGX_ISA_ENCODING_AGX3B || !out || !len ||
+       dest >= 192 || src >= 256 || (dest & 1) ||
+       shift < 1 || shift > 31 ||
+       (unsigned)hint > AGX3_ALU_HINT_CACHE || (wait_mask & ~0x3fu))
+      return false;
+
+   const struct agx3_field_kv base[] = {
+      {9, 2}, {10, 2}, {23, 2}, {24, 1},
+      {38, 1}, {39, 2}, {52, 1}, {53, 2},
+   };
+   struct agx3_field_kv fields[12] = {
+      {2, dest}, {11, dest_cache}, {16, src},
+      {25, hint == AGX3_ALU_HINT_CACHE},
+      {27, hint == AGX3_ALU_HINT_DISCARD}, {30, shift},
+   };
+   unsigned n = 6;
+   for (unsigned i = 0; i < 6; ++i)
+      if (wait_mask & (1u << i))
+         fields[n++] = (struct agx3_field_kv){60 + i, 1};
+   return agx3_bind_compose(enc, "sll", 0, base, 8, fields, n, out, len);
+}
+
 bool
 agx3_alu_srl_imm16(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
                    unsigned shift, enum agx3_alu_hint hint, bool dest_cache,

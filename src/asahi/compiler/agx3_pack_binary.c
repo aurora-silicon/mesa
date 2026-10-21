@@ -15174,14 +15174,19 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             const agx_index imm = I->src[immediate_first ? 0 : 1];
             const agx_index reg = I->src[immediate_first ? 1 : 0];
             const bool narrow = I->dest[0].size == AGX_SIZE_16;
+            /* A narrow result depends only on the low half of each input,
+             * including a wider IR register whose physical index already
+             * names that half -- the register form above says the same. */
+            const bool size_ok =
+               reg.size == I->dest[0].size ||
+               (narrow && reg.size == AGX_SIZE_32 && (reg.value & 1) == 0);
             if ((tt == AGX3_SEL_TT_AND || tt == AGX3_SEL_TT_OR ||
                  tt == AGX3_SEL_TT_XOR) &&
                 imm.type == AGX_INDEX_IMMEDIATE && imm.value <= 0xff &&
                 !imm.abs && !imm.neg && !imm.memory &&
                 agx3_src_is_register(reg) && !reg.memory && !reg.abs &&
                 !reg.neg && !reg.kill && agx_channels(reg) == 1 &&
-                !(reg.cache && reg.discard) &&
-                reg.size == I->dest[0].size) {
+                !(reg.cache && reg.discard) && size_ok) {
                const enum agx3_alu_op op = tt == AGX3_SEL_TT_AND
                                               ? AGX3_ALU_BAND
                                               : tt == AGX3_SEL_TT_OR
@@ -15512,6 +15517,38 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
          /* Native immediate-count logical shifts do not require a GPR
           * holding the count. Keep the existing masked/register forms below. */
+         /* The widening half-source shift-left: a scalar-half value feeds a
+          * 32-bit destination without a pad register, exactly the leg a
+          * sign extension needs before its arithmetic right shift. Apple
+          * emits it for `ushort << imm` (the `d0` byte-8 form); no narrow
+          * right-shift counterpart is witnessed, so BFEIL stays closed. */
+         if (enc == AGX_ISA_ENCODING_AGX3B && I->op == AGX_OPCODE_BFI &&
+             I->nr_dests == 1 && I->nr_srcs == 3 && I->bfi_mask == 0 &&
+             agx3_src_is_zero_imm(I->src[0]) &&
+             I->dest[0].size == AGX_SIZE_32 &&
+             I->src[1].size == AGX_SIZE_16 &&
+             I->src[2].type == AGX_INDEX_IMMEDIATE &&
+             I->src[2].value >= 1 && I->src[2].value <= 31) {
+            const agx_index dest = I->dest[0], value = I->src[1];
+            const agx_index base = I->src[0], shift = I->src[2];
+            if (I->saturate || base.memory || base.abs || base.neg ||
+                base.kill || base.cache || base.discard ||
+                !agx3_src_is_register(dest) || dest.memory ||
+                agx_channels(dest) != 1 || !agx3_src_is_register(value) ||
+                value.memory || agx_channels(value) != 1 || value.abs ||
+                value.neg || value.kill || (value.cache && value.discard) ||
+                shift.memory || shift.abs || shift.neg || shift.kill ||
+                shift.cache || shift.discard)
+               AGX3_REFUSE(I);
+            uint8_t bytes[AGX3_ALU_MAX_LENGTH], length;
+            if (!agx3_alu_sll_imm_src16(enc, dest.value, value.value,
+                                        shift.value, agx3_post_ra_hint(value),
+                                        dest.cache, wait, bytes, &length) ||
+                !agx3_append(emission, bytes, length))
+               AGX3_REFUSE(I);
+            continue;
+         }
+
          if (enc == AGX_ISA_ENCODING_AGX3B &&
              (I->op == AGX_OPCODE_BFI || I->op == AGX_OPCODE_BFEIL) &&
              I->nr_dests == 1 && I->nr_srcs == 3 && I->bfi_mask == 0 &&
