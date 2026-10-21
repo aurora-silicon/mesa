@@ -2727,6 +2727,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             set_layouts, false, dev->dev.sparse_ro_offset,
             hk_device_physical(dev)->scaled_sampling,
             agx_chip_sampler_has_lod_bias(dev->dev.chip));
+
+   /* Store of a value just loaded from the same address is unobservable:
+    * drop it before explicit-io wraps the store in a bounded guard, which
+    * would hide the pattern.  Covers ssbo, shared and global derefs. */
+   NIR_PASS(_, nir, nir_opt_dead_self_stores);
+
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
