@@ -1896,6 +1896,183 @@ hk_nir_merge_bounded_stores(nir_shader *nir)
    return progress;
 }
 
+/* lower_load_global_bounded under soft fault emits, per component:
+ *
+ *    out = bounds_agx(value, end, usub_sat(bound, off))
+ *
+ *    -- out = end <= slack ? value : 0, i.e. off + end <= bound.
+ *
+ * Scalarized accesses (a whole-struct copy explodes into one dword load
+ * per member) give every component its own saturating subtract even
+ * though their offsets differ only by a constant against one bound.
+ * Taken at the group's smallest offset, a single slack serves the whole
+ * run: a member at off = base + delta_k checks
+ * slack_min >= end_k + (delta_k - delta_min), which is exactly
+ * off_k + end_k <= bound.  Group bounds checks in one block that share
+ * the bound and decompose to the same linear offset terms, then hang
+ * them on the minimum-delta member's existing slack. */
+
+struct hk_slack_bounds {
+   nir_alu_instr *bounds;   /* bounds_agx(value, end, slack) */
+   nir_instr *slack_instr;  /* the usub_sat producing slack */
+   nir_def *slack;
+   nir_scalar bound;
+   struct hk_off_decomp dec;
+   uint32_t end;
+   unsigned order;          /* program-order index of bounds in its block */
+};
+
+static bool
+hk_match_slack_bounds(nir_instr *instr, unsigned order,
+                      struct hk_slack_bounds *out)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_bounds_agx || alu->def.num_components != 1 ||
+       alu->def.bit_size != 32 || !nir_src_is_const(alu->src[1].src))
+      return false;
+
+   nir_scalar slack =
+      nir_scalar_resolved(alu->src[2].src.ssa, alu->src[2].swizzle[0]);
+   if (!is_op(slack, nir_op_usub_sat))
+      return false;
+
+   nir_scalar off =
+      nir_scalar_chase_movs(nir_scalar_chase_alu_src(slack, 1));
+   hk_offset_decomp_init(off, &out->dec);
+   if (!out->dec.valid)
+      return false;
+
+   out->bound =
+      hk_scalar_leaf(nir_scalar_chase_alu_src(slack, 0), 0);
+   if (!out->bound.def || nir_scalar_is_const(out->bound))
+      return false;
+
+   out->bounds = alu;
+   out->slack_instr = &nir_scalar_as_alu(slack)->instr;
+   out->slack = slack.def;
+   out->end = nir_src_as_uint(alu->src[1].src);
+   out->order = order;
+   return true;
+}
+
+/* Program-order index of an instruction inside its block. */
+static unsigned
+hk_instr_index(nir_block *block, const nir_instr *instr)
+{
+   unsigned i = 0;
+   nir_foreach_instr(it, block) {
+      if (it == instr)
+         return i;
+      i++;
+   }
+   return ~0u;
+}
+
+static bool
+hk_share_bounded_load_slack_block(nir_builder *b, nir_block *block)
+{
+   struct hk_slack_bounds cand[64];
+   unsigned n = 0, order = 0;
+
+   nir_foreach_instr(instr, block) {
+      if (n < ARRAY_SIZE(cand) &&
+          hk_match_slack_bounds(instr, order, &cand[n]))
+         n++;
+      order++;
+   }
+   if (n < 2)
+      return false;
+
+   bool progress = false;
+   bool claimed[ARRAY_SIZE(cand)] = {0};
+
+   for (unsigned i = 0; i < n; i++) {
+      if (claimed[i])
+         continue;
+
+      /* Group every candidate checking the same bound at offsets built
+       * from the same terms. */
+      unsigned members[ARRAY_SIZE(cand)];
+      unsigned m = 0;
+      for (unsigned j = i; j < n; j++) {
+         if (claimed[j])
+            continue;
+         if (nir_scalar_equal(cand[i].bound, cand[j].bound) &&
+             hk_off_decomp_equal(&cand[i].dec, &cand[j].dec)) {
+            claimed[j] = true;
+            members[m++] = j;
+         }
+      }
+      if (m < 2)
+         continue;
+
+      /* Anchor on the member with the smallest offset delta: its slack
+       * is the most conservative of the group. */
+      unsigned anchor = members[0];
+      for (unsigned k = 1; k < m; k++) {
+         if (cand[members[k]].dec.delta < cand[anchor].dec.delta)
+            anchor = members[k];
+      }
+      nir_def *shared = cand[anchor].slack;
+
+      /* The anchor's slack may sit in an earlier block or later in this
+       * block; it can only serve members it dominates. */
+      const bool slack_in_block =
+         cand[anchor].slack_instr->block == block;
+      const unsigned slack_idx =
+         slack_in_block ? hk_instr_index(block, cand[anchor].slack_instr)
+                        : ~0u;
+      const bool slack_dominates =
+         !slack_in_block &&
+         nir_block_dominates(cand[anchor].slack_instr->block, block);
+
+      for (unsigned k = 0; k < m; k++) {
+         unsigned j = members[k];
+         if (j == anchor)
+            continue;
+         if (slack_in_block && cand[j].order <= slack_idx)
+            continue;
+         if (!slack_in_block && !slack_dominates)
+            continue;
+
+         int64_t end =
+            (int64_t)cand[j].end + (cand[j].dec.delta - cand[anchor].dec.delta);
+         /* Offsets are 32-bit; an end that cannot fit wraps.  Constants
+          * past the icmpsel immediate range materialise as mov_imm, same
+          * as the stock emission already does for large deltas. */
+         if (end < 0 || end > (int64_t)UINT32_MAX)
+            continue;
+
+         b->cursor = nir_before_instr(&cand[j].bounds->instr);
+         nir_src_rewrite(&cand[j].bounds->src[1].src,
+                         nir_imm_int(b, (uint32_t)end));
+         cand[j].bounds->src[1].swizzle[0] = 0;
+         nir_src_rewrite(&cand[j].bounds->src[2].src, shared);
+         cand[j].bounds->src[2].swizzle[0] = 0;
+         progress = true;
+      }
+   }
+
+   return progress;
+}
+
+static bool
+hk_nir_share_bounded_load_slack(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         if (hk_share_bounded_load_slack_block(&b, block))
+            progress |= nir_progress(true, impl, nir_metadata_none);
+      }
+   }
+   return progress;
+}
+
 struct lower_ycbcr_state {
    uint32_t set_layout_count;
    struct vk_descriptor_set_layout *const *set_layouts;
@@ -3288,6 +3465,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &soft_fault);
+
+   /* Scalarized bounded loads on one offset chain each paid their own
+    * usub_sat slack; share the minimum-offset slack across the group.
+    * Runs while the slack is still a single usub_sat op. */
+   if (soft_fault)
+      NIR_PASS(_, nir, hk_nir_share_bounded_load_slack);
 
    if (nir->info.stage == MESA_SHADER_TASK || nir->info.stage == MESA_SHADER_MESH) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,
