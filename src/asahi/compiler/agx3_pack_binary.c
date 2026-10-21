@@ -1322,6 +1322,22 @@ agx3_tex_imm(agx_index index, uint16_t value)
           !index.memory && !index.abs && !index.neg;
 }
 
+/* The register descriptor operand's field names a GPR half index. It is
+ * witnessed carrying a zero-extended {index,0} 64-bit pair, and the
+ * multisample record-index form already names a 32-bit register in the same
+ * field, so both widths are admitted: the raw 32-bit heap index or the
+ * legacy widened pair. Uniform operands remain the 64-bit pair. */
+static bool
+agx3_tex_desc_reg_ok(agx_index index, bool narrow_uniform)
+{
+   if (index.size == AGX_SIZE_64)
+      return index.type == AGX_INDEX_REGISTER ||
+             index.type == AGX_INDEX_UNIFORM;
+   return index.size == AGX_SIZE_32 &&
+          (index.type == AGX_INDEX_REGISTER ||
+           (narrow_uniform && index.type == AGX_INDEX_UNIFORM));
+}
+
 static bool
 agx3_tex_plain_uniform64(agx_index index)
 {
@@ -1412,7 +1428,10 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
         (enc != AGX_ISA_ENCODING_AGX3B ||
          (I->src[3].type != AGX_INDEX_REGISTER && I->src[3].type != AGX_INDEX_UNIFORM) ||
          (I->src[3].size != AGX_SIZE_64 &&
-          !((ms_array || ms_2d) && I->src[3].size == AGX_SIZE_32)) ||
+          !(I->src[3].size == AGX_SIZE_32 &&
+            (I->op == AGX_OPCODE_TEXTURE_LOAD
+                ? I->src[3].type == AGX_INDEX_REGISTER
+                : (ms_array || ms_2d)))) ||
          agx_channels(I->src[3]) != 1 ||
          (I->src[3].value & 1) || I->src[3].value > 252)) ||
        I->src[3].memory || I->src[3].abs || I->src[3].neg ||
@@ -2111,13 +2130,13 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
            ? I->src[3].value > 15
            : ((I->src[3].type != AGX_INDEX_REGISTER &&
                I->src[3].type != AGX_INDEX_UNIFORM) ||
-              I->src[3].size != AGX_SIZE_64 ||
+              !agx3_tex_desc_reg_ok(I->src[3], false) ||
               agx_channels(I->src[3]) != 1 || (I->src[3].value & 1))) ||
        (sampler_immediate
            ? I->src[4].value > 15
            : ((I->src[4].type != AGX_INDEX_REGISTER &&
                I->src[4].type != AGX_INDEX_UNIFORM) ||
-              I->src[4].size != AGX_SIZE_64 ||
+              !agx3_tex_desc_reg_ok(I->src[4], false) ||
               agx_channels(I->src[4]) != 1 || (I->src[4].value & 1))) ||
        I->src[3].memory || I->src[3].abs || I->src[3].neg ||
        I->src[4].memory || I->src[4].abs || I->src[4].neg ||

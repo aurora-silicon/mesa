@@ -956,16 +956,15 @@ lower_indexed_samplers(nir_shader *shader, int native32_set)
                nir_def *address = nir_iadd(&b, set, nir_u2u64(&b, offset));
                texture_index = nir_load_global_constant(&b, 1, 32, address, .align_mul = 4);
             }
-            /* G17P Vulkan descriptors already name the native zero-based
-             * sampler heap. The packed native32 path also uses raw indices.
-             * Untouched/null descriptors select reserved entry zero. Preserve
-             * native32's explicitly admitted wider sampler sources here. */
-            texture_index = nir_u2u64(&b, texture_index);
+            /* G17P's register descriptor operand names the 32-bit heap index
+             * itself: SMP's operand field selects a GPR, so the zero-extended
+             * 64-bit pair only materialized a dead high half through a
+             * {index,0} collect per site. Keep the scalar width here. */
             nir_steal_tex_src(tex, nir_tex_src_texture_handle);
             nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, texture_index);
             if (!fetch) {
-               nir_def *sampler_index = nir_u2u64(
-                  &b, native32_set >= 0 ? nir_u2u32(&b, sampler) : sampler);
+               nir_def *sampler_index =
+                  sampler->bit_size == 32 ? sampler : nir_u2u32(&b, sampler);
                nir_steal_tex_src(tex, nir_tex_src_sampler_handle);
                nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, sampler_index);
             }
