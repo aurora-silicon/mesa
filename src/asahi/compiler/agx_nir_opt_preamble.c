@@ -97,6 +97,49 @@ all_uses_float(nir_def *def)
 }
 
 static float
+alu_cost(nir_alu_instr *alu);
+
+static float
+alu_cost_g17p(nir_alu_instr *alu)
+{
+   /* Costs in the same SCIB(1)/IC(4) units as alu_cost, updated for what
+    * the AGX3B backend actually emits today. */
+   if (alu->def.bit_size == 64) {
+      /* *mul_2x32_64 stay unlowered to isel and encode as one grounded
+       * widening 32x32->64 imad. */
+      if (alu->op == nir_op_umul_2x32_64 || alu->op == nir_op_imul_2x32_64)
+         return 4.0f;
+      return 10.0f;
+   }
+
+   switch (alu->op) {
+   case nir_op_umul_high:
+   case nir_op_imul_high:
+      /* One widening imad plus a high-half extract that coalesces */
+      return 4.0f;
+
+   case nir_op_bit_count:
+      /* Single cbs-block popcount; the 16->32 form pays one widening mov */
+      return nir_src_bit_size(alu->src[0].src) == 16 ? 2.0f : 1.0f;
+
+   case nir_op_bitfield_reverse:
+      /* Single cbs-block rev for 32-bit sources; narrower defs are widened
+       * to it and truncated back (rev + convert). */
+      return alu->def.bit_size == 32 ? 1.0f : 2.0f;
+
+   case nir_op_ufind_msb:
+      /* ASAHI_G17P_FT1 selects the single ft1 instruction. */
+      if (nir_src_bit_size(alu->src[0].src) == 32 &&
+          debug_get_bool_option("ASAHI_G17P_FT1", false))
+         return 4.0f;
+      return alu_cost(alu);
+
+   default:
+      return alu_cost(alu);
+   }
+}
+
+static float
 alu_cost(nir_alu_instr *alu)
 {
    /* TODO: Model 64-bit better */
@@ -291,6 +334,7 @@ instr_cost_g17p(nir_instr *instr, const void *data)
       nir_alu_instr *alu = nir_instr_as_alu(instr);
       if (alu->op == nir_op_fabs && alu->def.bit_size <= 32)
          return 1.0f;
+      return alu_cost_g17p(alu);
    }
    return instr_cost(instr, data);
 }
