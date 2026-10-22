@@ -69,10 +69,11 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
          b.shader->info.fs.require_full_quads = true;
          b.shader->info.fs.quad_derivatives = true;
          nir_def *lane = nir_load_subgroup_invocation(&b);
-         nir_def *input = bits == 64
-                             ? nir_pack_64_2x32_split(
-                                  &b, lane, nir_ixor_imm(&b, lane, 0x5a5a))
-                             : nir_u2uN(&b, lane, bits);
+         nir_def *input =
+            bits == 64
+               ? nir_pack_64_2x32_split(
+                    &b, lane, nir_ixor(&b, lane, nir_imm_int(&b, 0x5a5a)))
+               : nir_u2uN(&b, lane, bits);
          nir_def *value;
          /* Adjacent quads take different branches; each quad is uniform. */
          nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, lane, 4), 0));
@@ -98,12 +99,12 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
                &b, input, nir_iand_imm(&b, nir_ushr_imm(&b, lane, 2), 3));
             break;
          case 6:
-            value =
-               nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_ine_imm(&b, lane, 0)));
+            value = nir_b2i32(
+               &b, nir_quad_vote_any(&b, 1, nir_ine_imm(&b, lane, 0)));
             break;
          case 7:
-            value =
-               nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 0)));
+            value = nir_b2i32(
+               &b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 0)));
             break;
          case 8:
             value = nir_ddx_fine(&b, nir_u2f32(&b, lane));
@@ -112,17 +113,18 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
             value = nir_ddy_coarse(&b, nir_u2f32(&b, lane));
             break;
          case 10:
-            value =
-               nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_ilt_imm(&b, lane, 5)));
+            value = nir_b2i32(
+               &b, nir_quad_vote_any(&b, 1, nir_ilt_imm(&b, lane, 5)));
             break;
          case 11:
-            value =
-               nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 7)));
+            value = nir_b2i32(
+               &b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 7)));
             break;
          case 12:
             value = nir_b2i32(
-               &b, nir_quad_vote_any(&b, 1, nir_flt(&b, nir_u2f32(&b, lane),
-                                                 nir_imm_float(&b, 8.0))));
+               &b, nir_quad_vote_any(&b, 1,
+                                     nir_flt(&b, nir_u2f32(&b, lane),
+                                             nir_imm_float(&b, 8.0))));
             break;
          case 13:
             value = nir_b2i32(
