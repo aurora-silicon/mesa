@@ -13,7 +13,7 @@ store_result(nir_builder *b, nir_def *v)
 {
    agx_test_store_local_pixel_agx(
       b, nir_vec4(b, v, v, v, v), nir_imm_intN_t(b, 0xff, 16),
-      nir_undef(b, 2, 16), 0, 0xf, PIPE_FORMAT_R32_FLOAT);
+      nir_undef(b, 2, 16), 0, 0xf, PIPE_FORMAT_R32_UINT);
    b->shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
 }
 

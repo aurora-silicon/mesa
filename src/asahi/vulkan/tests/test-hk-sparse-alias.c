@@ -132,7 +132,7 @@ image_aliases(struct hk_device *dev, struct hk_device_memory *memory)
       .depth_px = 1,
       .levels = 1,
       .sample_count_sa = 1,
-      .tiling = AIL_TILING_TWIDDLED,
+      .tiling = AIL_TILING_GPU,
       .format = PIPE_FORMAT_R32_UINT,
    };
    ail_make_miptree(layout);
