@@ -99,11 +99,11 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
             break;
          case 6:
             value =
-               nir_b2i32(&b, nir_quad_vote_any(&b, nir_ine_imm(&b, lane, 0)));
+               nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_ine_imm(&b, lane, 0)));
             break;
          case 7:
             value =
-               nir_b2i32(&b, nir_quad_vote_all(&b, nir_ine_imm(&b, lane, 0)));
+               nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 0)));
             break;
          case 8:
             value = nir_ddx_fine(&b, nir_u2f32(&b, lane));
@@ -113,15 +113,15 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
             break;
          case 10:
             value =
-               nir_b2i32(&b, nir_quad_vote_any(&b, nir_ilt_imm(&b, lane, 5)));
+               nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_ilt_imm(&b, lane, 5)));
             break;
          case 11:
             value =
-               nir_b2i32(&b, nir_quad_vote_all(&b, nir_ine_imm(&b, lane, 7)));
+               nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_ine_imm(&b, lane, 7)));
             break;
          case 12:
             value = nir_b2i32(
-               &b, nir_quad_vote_any(&b, nir_flt(&b, nir_u2f32(&b, lane),
+               &b, nir_quad_vote_any(&b, 1, nir_flt(&b, nir_u2f32(&b, lane),
                                                  nir_imm_float(&b, 8.0))));
             break;
          case 13:
@@ -131,10 +131,10 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
                   &b, nir_ilt(&b, lane, agx_test_load_preamble(&b, 1, 32, 4))));
             break;
          case 14:
-            value = nir_b2i32(&b, nir_quad_vote_any(&b, nir_imm_true(&b)));
+            value = nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_imm_true(&b)));
             break;
          default:
-            value = nir_b2i32(&b, nir_quad_vote_all(&b, nir_imm_false(&b)));
+            value = nir_b2i32(&b, nir_quad_vote_all(&b, 1, nir_imm_false(&b)));
             break;
          }
          nir_pop_if(&b, NULL);
