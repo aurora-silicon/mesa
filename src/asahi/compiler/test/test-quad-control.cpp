@@ -130,7 +130,7 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
             value = nir_b2i32(
                &b,
                nir_quad_vote_all(
-                  &b, nir_ilt(&b, lane, agx_test_load_preamble(&b, 1, 32, 4))));
+                  &b, 1, nir_ilt(&b, lane, agx_test_load_preamble(&b, 1, 32, 4))));
             break;
          case 14:
             value = nir_b2i32(&b, nir_quad_vote_any(&b, 1, nir_imm_true(&b)));
