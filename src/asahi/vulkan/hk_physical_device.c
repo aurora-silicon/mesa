@@ -1576,10 +1576,11 @@ hk_get_device_properties(const struct agx_device *dev,
        *   QUAD              g08_subgroup_quad           encodes
        *   ROTATE/CLUSTERED  g24_subgroup_rotate         encodes
        *
-       * Quad broadcasts and swaps are now grounded for the compute and
-       * fragment stages.  Keep subgroupQuadOperationsInAllStages false until
-       * every other advertised graphics stage is independently witnessed. */
-      properties->subgroupQuadOperationsInAllStages = false;
+       * G17P uses the same lane instructions in native vertex/fragment
+       * programs and the compute programs implementing tessellation and
+       * geometry. Other AGX3 targets retain their stage restriction. */
+      properties->subgroupQuadOperationsInAllStages =
+         dev->chip == AGX_CHIP_G17P;
       properties->sparseResidencyNonResidentStrict = false;
    }
 
