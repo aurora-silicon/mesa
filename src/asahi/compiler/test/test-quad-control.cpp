@@ -75,6 +75,7 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
                     &b, lane, nir_ixor(&b, lane, nir_imm_int(&b, 0x5a5a)))
                : nir_u2uN(&b, lane, bits);
          nir_def *value;
+         nir_def *fallback = nir_imm_intN_t(&b, 0, bits);
          /* Adjacent quads take different branches; each quad is uniform. */
          nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, lane, 4), 0));
          switch (op) {
@@ -140,7 +141,7 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
             break;
          }
          nir_pop_if(&b, NULL);
-         value = nir_if_phi(&b, value, nir_imm_intN_t(&b, 0, value->bit_size));
+         value = nir_if_phi(&b, value, fallback);
          value = bits == 64
                     ? nir_ixor(&b, nir_unpack_64_2x32_split_x(&b, value),
                                nir_unpack_64_2x32_split_y(&b, value))
