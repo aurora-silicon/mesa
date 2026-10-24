@@ -177,7 +177,7 @@ check_shape(VkFormat format, bool is_zs)
    CHECK(ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(ELIGIBLE(i) == (is_zs && s <= 4));
+      CHECK(ELIGIBLE(i) == (is_depth && s <= 4));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!ELIGIBLE(i));

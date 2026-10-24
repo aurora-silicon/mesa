@@ -213,7 +213,7 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    }
 
    return (hk_g17p_compression_depth_format(info->format) ||
-           info->format == VK_FORMAT_S8_UINT) &&
+           (info->format == VK_FORMAT_S8_UINT && !multisampled)) &&
           !three_d && info->extent.width <= 16384 &&
           info->extent.height <= 16384 && info->mipLevels <= 16;
 }
