@@ -890,6 +890,17 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * is implemented; otherwise a newly-recognised chip can silently reach an
     * encoder from the wrong generation.
     */
+   /* G15G (T8122) runs on the native path only on explicit request. */
+   if (dev->chip == AGX_CHIP_G15G && agx_params_driver_supported(&dev->params)) {
+      if (!debug_get_bool_option("ASAHI_M3_EXPERIMENTAL", false)) {
+         fprintf(stderr, "Apple G15G (T8122) is recognised but not admitted: "
+                         "set ASAHI_M3_EXPERIMENTAL=1 to run it\n");
+         goto fail;
+      }
+      fprintf(stderr, "WARNING: experimental G15G/T8122 admission "
+                      "(ASAHI_M3_EXPERIMENTAL=1)\n");
+   }
+
    if (!agx_params_driver_supported(&dev->params)) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
          fprintf(stderr,
@@ -1044,6 +1055,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    uint64_t shader_size = 0x100000000ull;
+   /* T8122: only the lower half of the 2^40 window is free. */
+   if (dev->chip == AGX_CHIP_G15G)
+      shader_size = AGX_T8122_RUNTIME_WINDOW_HIGH - dev->shader_base;
 
    /*
     * Where the user heap goes relative to the USC window.
@@ -1068,7 +1082,14 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * robustness carveout untouched while making every ordinary VDM payload
     * directly representable, with no per-run alias option.
     */
-   const bool heap_below_usc = agx_chip_native_agx3(dev->chip);
+   /* T8122 keeps the user heap above the window and its reservations: the
+    * sparse alias of a heap below the window would cross the runtime's
+    * 0x7000000000-0x8000000000. The heap then sits at 2^41 or above, past the
+    * absolute 36-bit-shr(3) and 38-bit-shr(2) fields of the legacy USC records,
+    * which G15G's native path does not emit (it uses Ioto pointers and compact
+    * VDM aliases). */
+   const bool heap_below_usc =
+      agx_chip_native_agx3(dev->chip) && dev->chip != AGX_CHIP_G15G;
 
    /*
     * Start the low heap as high as it can go rather than at the reservation.
@@ -1091,7 +1112,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
        */
       user_start = MAX2(low_floor, AGX_G17P_USER_LIMIT / 2);
    } else {
-      user_start = dev->shader_base + shader_size;
+      user_start = dev->chip == AGX_CHIP_G15G
+                      ? AGX_T8122_RUNTIME_WINDOW_END
+                      : dev->shader_base + shader_size;
    }
 
    /* Checked rather than asserted: the base is settable at runtime and these
@@ -1211,6 +1234,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    if (agx_chip_native_agx3(dev->chip))
       initialized |= AGX_INIT_ALIAS_HEAP;
+   /* The compact alias heap starts inside the T8122 runtime USC base; keep
+    * out of it (the rest of that range is already outside the heap). */
+   if (dev->chip == AGX_CHIP_G15G &&
+       !util_vma_heap_alloc_addr(&dev->g17p_vdm_alias_heap,
+                                 AGX_G17P_VDM_ALIAS_BASE,
+                                 AGX_G17P_VDM_ALIAS_RESERVED_START -
+                                    AGX_G17P_VDM_ALIAS_BASE)) {
+      fprintf(stderr, "Failed to reserve the T8122 runtime USC base\n");
+      goto fail;
+   }
 
    if (!agx_va_reserve_runtime_graph_hole(
           dev->chip, &dev->main_heap, user_start, user_size,
@@ -1244,6 +1277,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
          dev->libagx_programs = libagx_g13g;
    } else if (dev->chip == AGX_CHIP_G17P) {
       dev->libagx_programs = libagx_g17p;
+   } else if (dev->chip == AGX_CHIP_G15G) {
+      /* Its own build: G15G needs the scheduling stalls G15S does not. */
+      dev->libagx_programs = libagx_g15g;
    } else if (dev->chip == AGX_CHIP_G15S || dev->chip == AGX_CHIP_G15C) {
       /* G15C executes the same AGX3B encoding as G15S with no extra
        * scheduling rules, so it runs the G15S build of the programs. */
