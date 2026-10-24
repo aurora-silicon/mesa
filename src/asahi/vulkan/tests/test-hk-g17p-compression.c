@@ -55,7 +55,8 @@ check_formats(void)
    unsigned color = 0, depth = 0;
    for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
       const bool c = hk_g17p_compression_color_format((VkFormat)f);
-      const bool d = hk_g17p_compression_depth_format((VkFormat)f);
+      const bool d = hk_g17p_compression_depth_format((VkFormat)f) ||
+                     f == VK_FORMAT_S8_UINT;
       CHECK(!(c && d));
       color += c;
       depth += d;
@@ -64,21 +65,28 @@ check_formats(void)
       CHECK(ELIGIBLE(i) == (c || d));
    }
    CHECK(color == 46);
-   CHECK(depth == 3);
+   CHECK(depth == 4);
 
-   /* No 16-byte texels (tilebuffer spill), no packed/padded RGB, no stencil
-    * or combined depth/stencil, no block-compressed or YCbCr formats. */
+   /* No 16-byte texels (tilebuffer spill), no packed/padded RGB, no packed
+    * depth/stencil, no block-compressed or YCbCr formats. */
    static const VkFormat rejected[] = {
-      VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT,
-      VK_FORMAT_R32G32B32A32_SINT,   VK_FORMAT_R32G32B32_SFLOAT,
-      VK_FORMAT_R8G8B8_UNORM,        VK_FORMAT_R16G16B16_SFLOAT,
+      VK_FORMAT_R32G32B32A32_SFLOAT,
+      VK_FORMAT_R32G32B32A32_UINT,
+      VK_FORMAT_R32G32B32A32_SINT,
+      VK_FORMAT_R32G32B32_SFLOAT,
+      VK_FORMAT_R8G8B8_UNORM,
+      VK_FORMAT_R16G16B16_SFLOAT,
       VK_FORMAT_B10G11R11_UFLOAT_PACK32,
-      VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_FORMAT_R4G4B4A4_UNORM_PACK16,
-      VK_FORMAT_A1R5G5B5_UNORM_PACK16, VK_FORMAT_S8_UINT,
-      VK_FORMAT_D24_UNORM_S8_UINT,   VK_FORMAT_D16_UNORM_S8_UINT,
+      VK_FORMAT_E5B9G9R9_UFLOAT_PACK32,
+      VK_FORMAT_R4G4B4A4_UNORM_PACK16,
+      VK_FORMAT_A1R5G5B5_UNORM_PACK16,
+      VK_FORMAT_D24_UNORM_S8_UINT,
+      VK_FORMAT_D16_UNORM_S8_UINT,
       VK_FORMAT_X8_D24_UNORM_PACK32,
-      VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
-      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, VK_FORMAT_G8B8G8R8_422_UNORM,
+      VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
+      VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+      VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
+      VK_FORMAT_G8B8G8R8_422_UNORM,
       VK_FORMAT_R64_UINT,
    };
    for (unsigned r = 0; r < sizeof(rejected) / sizeof(rejected[0]); ++r) {
@@ -88,13 +96,14 @@ check_formats(void)
 }
 
 static void
-check_shape(VkFormat format, bool is_depth)
+check_shape(VkFormat format, bool is_zs)
 {
+   const bool is_depth = hk_g17p_compression_depth_format(format);
    const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       VK_IMAGE_USAGE_SAMPLED_BIT |
-      (is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
-                : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+      (is_zs ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+             : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
    const VkImageCreateInfo base = image(format, 2408, 1508, 1, usage);
    CHECK(ELIGIBLE(base));
 
@@ -159,7 +168,7 @@ check_shape(VkFormat format, bool is_depth)
    i.imageType = VK_IMAGE_TYPE_1D;
    CHECK(!ELIGIBLE(i));
    i = base; i.imageType = VK_IMAGE_TYPE_3D;
-   CHECK(ELIGIBLE(i) == !is_depth);
+   CHECK(ELIGIBLE(i) == !is_zs);
    i = base; i.extent.depth = 2;
    CHECK(!ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
@@ -168,7 +177,7 @@ check_shape(VkFormat format, bool is_depth)
    CHECK(ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(ELIGIBLE(i) == (is_depth && s <= 4));
+      CHECK(ELIGIBLE(i) == (is_zs && s <= 4));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!ELIGIBLE(i));
@@ -177,7 +186,7 @@ check_shape(VkFormat format, bool is_depth)
    i = base; i.mipLevels = 0;
    CHECK(!ELIGIBLE(i));
    i = base; i.mipLevels = 12;
-   CHECK(ELIGIBLE(i) == !is_depth);
+   CHECK(ELIGIBLE(i));
    i = base; i.extent.width = 15;
    CHECK(!ELIGIBLE(i));
    i = base; i.extent.height = 15;
@@ -268,6 +277,55 @@ check_layered_and_msaa(void)
    for (unsigned samples = 1; samples <= 64; samples <<= 1) {
       i.samples = (VkSampleCountFlagBits)samples;
       CHECK(ELIGIBLE(i) == (samples <= 4));
+   }
+}
+
+static void
+check_zls_mips(void)
+{
+   static const VkFormat formats[] = {
+      VK_FORMAT_D16_UNORM,
+      VK_FORMAT_D32_SFLOAT,
+      VK_FORMAT_S8_UINT,
+      VK_FORMAT_D32_SFLOAT_S8_UINT,
+   };
+   for (unsigned f = 0; f < sizeof(formats) / sizeof(formats[0]); ++f) {
+      VkImageCreateInfo i =
+         image(formats[f], 129, 127, 8,
+               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      for (unsigned layers = 1; layers <= 12; ++layers) {
+         i.arrayLayers = layers;
+         CHECK(ELIGIBLE(i));
+         CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &i) ==
+               (formats[f] == VK_FORMAT_D32_SFLOAT_S8_UINT));
+      }
+      i.extent.width = i.extent.height = 256;
+      i.mipLevels = 9;
+      i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      CHECK(ELIGIBLE(i));
+      i.flags = 0;
+      i.samples = VK_SAMPLE_COUNT_2_BIT;
+      CHECK(!ELIGIBLE(i));
+      i.samples = VK_SAMPLE_COUNT_4_BIT;
+      CHECK(!ELIGIBLE(i));
+      i.samples = VK_SAMPLE_COUNT_8_BIT;
+      CHECK(!ELIGIBLE(i));
+      i.samples = VK_SAMPLE_COUNT_1_BIT;
+      i.tiling = VK_IMAGE_TILING_LINEAR;
+      CHECK(!ELIGIBLE(i));
+      i.tiling = VK_IMAGE_TILING_OPTIMAL;
+      i.extent.width = 32768;
+      CHECK(!ELIGIBLE(i));
+      i.extent.width = 16384;
+      i.extent.height = 32768;
+      CHECK(!ELIGIBLE(i));
+      i.extent.height = 16384;
+      i.mipLevels = 15;
+      CHECK(ELIGIBLE(i));
+      i.mipLevels = 17;
+      CHECK(!ELIGIBLE(i));
    }
 }
 
@@ -533,6 +591,8 @@ main(void)
    check_shape(VK_FORMAT_R8_UNORM, false);
    check_shape(VK_FORMAT_D32_SFLOAT, true);
    check_shape(VK_FORMAT_D16_UNORM, true);
+   check_shape(VK_FORMAT_S8_UINT, true);
+   check_zls_mips();
    check_shape(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
    check_layered_and_msaa();
    check_minecraft();

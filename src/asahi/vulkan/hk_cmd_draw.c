@@ -39,6 +39,7 @@
 #include "hk_image_view.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_g17p_ppp_indices.h"
+#include "hk_g17p_zls.h"
 #include "hk_g17p_full_frame_scissor.h"
 #include "hk_g17p_draw_state_upload.h"
 #include "hk_agx3_vdm_decode.h"
@@ -3531,6 +3532,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       pRenderingInfo->pStencilAttachment;
 
    struct ail_layout *z_layout = NULL, *s_layout = NULL;
+   struct ail_layout z_level_layout, s_level_layout;
 
    if (attach_z != NULL && attach_z != VK_NULL_HANDLE && attach_z->imageView) {
       struct hk_image_view *view = render->depth_att.iview;
@@ -3550,44 +3552,57 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
              desc->format == PIPE_FORMAT_Z16_UNORM_S8_UINT ||
              desc->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT);
 
-      render->cr.depth.buffer =
-         hk_image_base_address(image, 0) +
-         ail_get_layer_level_B(z_layout, first_layer, level);
+      if (dev->dev.chip == AGX_CHIP_G17P) {
+         const struct hk_g17p_zls_plane state = hk_g17p_zls_plane(
+            z_layout, hk_image_base_address(image, 0), first_layer, level);
+         render->cr.depth.buffer = state.buffer;
+         render->cr.depth.stride = state.stride;
+         render->cr.depth.meta = state.meta;
+         render->cr.depth.meta_stride = state.meta_stride;
+         render->cr.zls_width = state.width;
+         render->cr.zls_height = state.height;
 
-      /* Main stride in pages */
-      assert((z_layout->depth_px == 1 ||
-              util_is_aligned(z_layout->layer_stride_B, AIL_PAGESIZE)) &&
-             "Page aligned Z layers");
+         /* All control-word variants use the selected aspect's level. */
+         z_level_layout = *z_layout;
+         z_level_layout.compressed = state.meta != 0;
+         z_level_layout.tiling = state.tiling;
+         z_layout = &z_level_layout;
+      } else {
+         render->cr.depth.buffer =
+            hk_image_base_address(image, 0) +
+            ail_get_layer_level_B(z_layout, first_layer, level);
 
-      unsigned stride_pages = z_layout->layer_stride_B / AIL_PAGESIZE;
-      render->cr.depth.stride = ((stride_pages - 1) << 14) | 1;
+         /* Main stride in pages */
+         assert((z_layout->depth_px == 1 ||
+                 util_is_aligned(z_layout->layer_stride_B, AIL_PAGESIZE)) &&
+                "Page aligned Z layers");
 
-      /* A compressed single-layer image is not page padded, so a small one
-       * has a zero-page layer stride and the expression above underflows.
-       * The stride is unused for one layer; Apple's G17P Framebuffer writes
-       * 0 for a sub-cacheline layer and cacheline units below one page, a
-       * form the G17P kernel's ZLS validation does not accept. Send 0. */
-      if (agx_native_graphics(&dev->dev) && stride_pages == 0) {
-         assert(z_layout->depth_px == 1);
-         render->cr.depth.stride = 0;
-      }
+         unsigned stride_pages = z_layout->layer_stride_B / AIL_PAGESIZE;
+         render->cr.depth.stride = ((stride_pages - 1) << 14) | 1;
 
-      assert(z_layout->tiling != AIL_TILING_LINEAR && "must tile");
+         /* The native kernel requires zero for an unused sub-page stride. */
+         if (agx_native_graphics(&dev->dev) && stride_pages == 0) {
+            assert(z_layout->depth_px == 1);
+            render->cr.depth.stride = 0;
+         }
 
-      if (z_layout->compressed) {
-         render->cr.depth.meta =
-            hk_image_base_address(image, 0) + z_layout->metadata_offset_B +
-            (first_layer * z_layout->compression_layer_stride_B) +
-            z_layout->level_offsets_compressed_B[level];
+         assert(z_layout->tiling != AIL_TILING_LINEAR && "must tile");
 
-         /* Meta stride in cache lines */
-         assert(util_is_aligned(z_layout->compression_layer_stride_B,
-                                AIL_CACHELINE) &&
-                "Cacheline aligned Z meta layers");
+         if (z_layout->compressed) {
+            render->cr.depth.meta =
+               hk_image_base_address(image, 0) + z_layout->metadata_offset_B +
+               (first_layer * z_layout->compression_layer_stride_B) +
+               z_layout->level_offsets_compressed_B[level];
 
-         unsigned stride_lines =
-            z_layout->compression_layer_stride_B / AIL_CACHELINE;
-         render->cr.depth.meta_stride = (stride_lines - 1) << 14;
+            /* Meta stride in cache lines */
+            assert(util_is_aligned(z_layout->compression_layer_stride_B,
+                                   AIL_CACHELINE) &&
+                   "Cacheline aligned Z meta layers");
+
+            unsigned stride_lines =
+               z_layout->compression_layer_stride_B / AIL_CACHELINE;
+            render->cr.depth.meta_stride = (stride_lines - 1) << 14;
+         }
       }
 
       float clear_depth = attach_z->clearValue.depthStencil.depth;
@@ -3612,36 +3627,54 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
       unsigned level = view->vk.base_mip_level;
       unsigned first_layer = view->vk.base_array_layer;
 
-      render->cr.stencil.buffer =
-         hk_image_base_address(image, plane) +
-         ail_get_layer_level_B(s_layout, first_layer, level);
+      if (dev->dev.chip == AGX_CHIP_G17P) {
+         const struct hk_g17p_zls_plane state = hk_g17p_zls_plane(
+            s_layout, hk_image_base_address(image, plane), first_layer, level);
+         render->cr.stencil.buffer = state.buffer;
+         render->cr.stencil.stride = state.stride;
+         render->cr.stencil.meta = state.meta;
+         render->cr.stencil.meta_stride = state.meta_stride;
+         render->cr.zls_width = state.width;
+         render->cr.zls_height = state.height;
 
-      /* Main stride in pages */
-      assert((s_layout->depth_px == 1 ||
-              util_is_aligned(s_layout->layer_stride_B, AIL_PAGESIZE)) &&
-             "Page aligned S layers");
-      unsigned stride_pages = s_layout->layer_stride_B / AIL_PAGESIZE;
-      render->cr.stencil.stride = ((stride_pages - 1) << 14) | 1;
-      if (agx_native_graphics(&dev->dev) && stride_pages == 0) {
-         assert(s_layout->depth_px == 1);
-         render->cr.stencil.stride = 0;
-      }
+         /* All control-word variants use the selected aspect's level. */
+         s_level_layout = *s_layout;
+         s_level_layout.compressed = state.meta != 0;
+         s_level_layout.tiling = state.tiling;
+         s_layout = &s_level_layout;
+      } else {
+         render->cr.stencil.buffer =
+            hk_image_base_address(image, plane) +
+            ail_get_layer_level_B(s_layout, first_layer, level);
 
-      if (s_layout->compressed) {
-         render->cr.stencil.meta =
-            hk_image_base_address(image, plane) + s_layout->metadata_offset_B +
-            (first_layer * s_layout->compression_layer_stride_B) +
-            s_layout->level_offsets_compressed_B[level];
+         /* Main stride in pages */
+         assert((s_layout->depth_px == 1 ||
+                 util_is_aligned(s_layout->layer_stride_B, AIL_PAGESIZE)) &&
+                "Page aligned S layers");
+         unsigned stride_pages = s_layout->layer_stride_B / AIL_PAGESIZE;
+         render->cr.stencil.stride = ((stride_pages - 1) << 14) | 1;
+         if (agx_native_graphics(&dev->dev) && stride_pages == 0) {
+            assert(s_layout->depth_px == 1);
+            render->cr.stencil.stride = 0;
+         }
 
-         /* Meta stride in cache lines */
-         assert(util_is_aligned(s_layout->compression_layer_stride_B,
-                                AIL_CACHELINE) &&
-                "Cacheline aligned S meta layers");
+         if (s_layout->compressed) {
+            render->cr.stencil.meta =
+               hk_image_base_address(image, plane) +
+               s_layout->metadata_offset_B +
+               (first_layer * s_layout->compression_layer_stride_B) +
+               s_layout->level_offsets_compressed_B[level];
 
-         unsigned stride_lines =
-            s_layout->compression_layer_stride_B / AIL_CACHELINE;
+            /* Meta stride in cache lines */
+            assert(util_is_aligned(s_layout->compression_layer_stride_B,
+                                   AIL_CACHELINE) &&
+                   "Cacheline aligned S meta layers");
 
-         render->cr.stencil.meta_stride = (stride_lines - 1) << 14;
+            unsigned stride_lines =
+               s_layout->compression_layer_stride_B / AIL_CACHELINE;
+
+            render->cr.stencil.meta_stride = (stride_lines - 1) << 14;
+         }
       }
 
       render->cr.isp_bgobjvals |= attach_s->clearValue.depthStencil.stencil;

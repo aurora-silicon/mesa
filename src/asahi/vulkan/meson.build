@@ -48,6 +48,7 @@ hk_files = files(
   'hk_ioto_arena_core.c',
   'hk_ioto_arena_core.h',
   'hk_g17p_meta_copy_core.h',
+  'hk_g17p_zls.h',
   'hk_agx3_ioto_program_core.c',
   'hk_agx3_ioto_program_core.h',
   'hk_agx3_vdm_decode.c',
@@ -254,6 +255,21 @@ if with_tests
       'hk_g17p_compression_test',
       files('tests/test-hk-g17p-compression.c'),
       include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk_g17p_zls',
+    executable(
+      'hk_g17p_zls_test',
+      files('tests/test-hk-g17p-zls.c', 'hk_drm_render_core.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src,
+                             inc_asahi],
+      dependencies : [idep_mesautil, idep_libagx, idep_libagx_shaders_h,
+                      idep_agx_pack],
+      link_with : [libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
     ),
     suite : ['asahi'],
   )
