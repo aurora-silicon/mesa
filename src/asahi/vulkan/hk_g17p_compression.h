@@ -9,39 +9,22 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* G17P lossless compression policy.
+/* G17P lossless compression policy. Admitted images use texture reads and
+ * PBE/ZLS writes or metadata fast clears. Storage and host access stay
+ * excluded. Colour formats are bounded to 8 bytes per sample, so compressed
+ * single-sample attachments cannot spill the 120-byte tilebuffer.
  *
- * The compressed Gen9 PBE (write) packet matches Apple's HAL200 StateFields
- * encoder byte-for-byte for GPU-tiled one-layer 2D images, the read
- * descriptor carries the same compression bit and metadata address, and the
- * G17P ZLS control word Apple's Framebuffer builds uses the same load/store
- * compression bits (2/4/6/8), 16-bit depth format bit and metadata stride
- * encoding as Mesa's agx_pack_zls_control. The shapes below are the ones
- * whose every write path in hk goes through one of those three units or the
- * libagx_fast_clear metadata kernel:
+ * Layered colour allocations currently use one level: the compressed PBE's
+ * secondary-view stride aliases its mip fields. Keep the existing ordinary
+ * 2D mip path separate until layered mip stores can be represented.
+ * Multisample colour images are admitted for transfer/sampling use only.
+ * Application colour attachments may spill at 2x/4x, which requires an
+ * in-place decompression path before raw eMRT stores. G17P has no such kernel.
+ * Depth/stencil has independent ZLS data and metadata layer strides and does
+ * not spill; it remains limited to one level.
  *
- *  - Color: single-plane, 1-8 byte texels, one layer, one sample. Layered
- *    and multisampled compressed PBE packets are refused by
- *    agx_pbe_agx3_core.c (no witness), so arrays/MSAA stay plain. 16-byte
- *    texels are excluded so that a single-sample tilebuffer never spills a
- *    compressed target (spilling needs libagx_decompress, which has no G17P
- *    binary): 8 targets x 8 B fit in the 120 B/sample G17P budget.
- *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
- *    one level, one layer, one sample. The ZLS unit compresses the S8
- *    stencil plane with the same metadata layout as depth (stencil
- *    load/store compression bits 4/8), it is read through its R8_UINT
- *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
- *    as D32S8, so these planes carry every GL depth/stencil buffer's ZLS
- *    traffic; buffer uploads into them take the graphics copy (R32_UINT
- *    and R8_UINT PBEs).
- *
- * Images that may be shared with another process or device (external
- * memory, WSI, DRM modifiers) stay plain under this private policy. Colour
- * images are shared compressed only through the GPU_TILED_COMPRESSED
- * modifier contract, see hk_g17p_shared_compression_eligible().
- *
- * This is the only G17P policy: every eligible image is compressed, with no
- * runtime opt-out.
+ * External memory, WSI and DRM modifiers retain their sharing contracts;
+ * shared colour admission is handled separately below.
  */
 
 /* Colour formats admitted on G17P: plain single-plane formats of 1-8 bytes
@@ -151,9 +134,14 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
 
    VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+   if (info->imageType == VK_IMAGE_TYPE_2D)
+      allowed_flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   if (info->imageType == VK_IMAGE_TYPE_3D)
+      allowed_flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+                       VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
    /* Zink marks every depth attachment sample-location compatible, including
     * single-sample images. This changes sample-location tracking, not the
-    * depth plane's storage class. The one-sample restriction below remains.
+    * depth plane's storage class.
     * Refusing the flag also makes the host-copy performance query advertise
     * a plain device layout, so zink adds HOST_TRANSFER and keeps depth plain.
     */
@@ -175,14 +163,31 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    if (hk_g17p_compression_depth_format(info->format))
       allowed_usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
-   if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
-       info->arrayLayers != 1 || info->samples != VK_SAMPLE_COUNT_1_BIT ||
+   const bool multisampled = info->samples != VK_SAMPLE_COUNT_1_BIT;
+   const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
+   if ((info->imageType != VK_IMAGE_TYPE_2D && !three_d) ||
+       !info->extent.depth || !info->arrayLayers ||
+       (three_d ? (info->arrayLayers != 1 || multisampled)
+                : info->extent.depth != 1) ||
+       (multisampled && ((info->samples != VK_SAMPLE_COUNT_2_BIT &&
+                          info->samples != VK_SAMPLE_COUNT_4_BIT) ||
+                         info->mipLevels != 1)) ||
+       ((info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+        (multisampled || info->extent.width != info->extent.height ||
+         info->arrayLayers % 6)) ||
        info->tiling != VK_IMAGE_TILING_OPTIMAL || info->mipLevels < 1 ||
        (info->flags & ~allowed_flags) || (info->usage & ~allowed_usage) ||
        info->extent.width < 16 || info->extent.height < 16)
       return false;
 
    if (hk_g17p_compression_color_format(info->format)) {
+      if ((three_d || info->arrayLayers > 1) && info->mipLevels != 1)
+         return false;
+      if (multisampled &&
+          (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                          VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)))
+         return false;
+
       /* An RGBA8/BGRA8 UNORM mip chain the application never renders to is
        * written only by uploads and mip blits. A plain image takes each
        * upload as one raw compute copy and each mip level as a raw compute
@@ -207,7 +212,7 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
       return true;
    }
 
-   return hk_g17p_compression_depth_format(info->format) &&
+   return hk_g17p_compression_depth_format(info->format) && !three_d &&
           info->mipLevels == 1;
 }
 

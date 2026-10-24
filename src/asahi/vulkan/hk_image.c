@@ -1044,7 +1044,11 @@ hk_GetPhysicalDeviceImageFormatProperties2(
             .format = pImageFormatInfo->format,
             .extent = {64, 64, 1},
             .mipLevels = 1,
-            .arrayLayers = 1,
+            .arrayLayers = pdev->dev.chip == AGX_CHIP_G17P &&
+                                 (pImageFormatInfo->flags &
+                                  VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)
+                              ? 6
+                              : 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = pImageFormatInfo->tiling,
             .usage = (pImageFormatInfo->usage &
