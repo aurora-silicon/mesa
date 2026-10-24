@@ -21,7 +21,7 @@
  * Application colour attachments may spill at 2x/4x, which requires an
  * in-place decompression path before raw eMRT stores. G17P has no such kernel.
  * Depth/stencil has independent ZLS data and metadata layer strides and does
- * not spill; it remains limited to one level.
+ * not spill. Its single-sample mip chains select compression per level.
  *
  * External memory, WSI and DRM modifiers retain their sharing contracts;
  * shared colour admission is handled separately below.
@@ -212,8 +212,10 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
       return true;
    }
 
-   return hk_g17p_compression_depth_format(info->format) && !three_d &&
-          info->mipLevels == 1;
+   return (hk_g17p_compression_depth_format(info->format) ||
+           (info->format == VK_FORMAT_S8_UINT && !multisampled)) &&
+          !three_d && info->extent.width <= 16384 &&
+          info->extent.height <= 16384 && info->mipLevels <= 16;
 }
 
 /* G17P colour images shared through DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
