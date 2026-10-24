@@ -15,6 +15,13 @@
 #define AGX_G17_RUNTIME_GRAPH_VA_START UINT64_C(0x7000000000)
 #define AGX_G17_RUNTIME_GRAPH_VA_END   UINT64_C(0x7100000000)
 
+/* The T8122 (M3, G15G) kernel runtime reserves, in every VM, the top half of
+ * the 2^40 USC window and 0x7000000000 up to 0x8000000000, as well as its own
+ * USC base at 0x1000000000 (drivers/gpu/drm/asahi/m3/m3_runtime.rs,
+ * Runtime::new_vm). A bind that touches one fails with EINVAL. */
+#define AGX_T8122_RUNTIME_WINDOW_HIGH UINT64_C(0x10080000000)
+#define AGX_T8122_RUNTIME_WINDOW_END  UINT64_C(0x10100000000)
+
 /* T8140's channel-owned AXFB aliases are installed by the kernel in
  * every render-capable client root.  This range falls inside G17P's 4-GiB USC
  * heap, so userspace must remove it from the allocator before creating any
