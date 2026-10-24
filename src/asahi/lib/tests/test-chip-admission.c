@@ -46,11 +46,10 @@ main(void)
 {
    check_native_g15(AGX_CHIP_G15S);
    check_native_g15(AGX_CHIP_G15C);
+   check_native_g15(AGX_CHIP_G15G);
 
    /* The other M3 parts stay off the native path. */
-   assert(!agx_chip_native_agx3(AGX_CHIP_G15G));
    assert(!agx_chip_native_agx3(AGX_CHIP_G15D));
-   assert(!agx_chip_driver_supported(AGX_CHIP_G15G));
    assert(!agx_chip_driver_supported(AGX_CHIP_G15D));
 
    /* T6030 and T6031 are each admitted with their own identity only. */
@@ -120,6 +119,28 @@ main(void)
    assert(agx_chip_usc_helper_table_slots(AGX_CHIP_G17P, 0) == 6);
    assert(agx_chip_usc_helper_table_slots(AGX_CHIP_G17P, 6) == 6);
    assert(agx_chip_usc_helper_table_slots(AGX_CHIP_G17P, 10) == 10);
+
+   /* T8122 (G15G) by its own identity only; the device additionally needs
+    * ASAHI_M3_EXPERIMENTAL=1 (agx_open_device). */
+   struct drm_asahi_params_global g15g = g15_params('G', 0x8122, 1);
+   assert(agx_chip_from_params(&g15g) == AGX_CHIP_G15G);
+   assert(agx_params_driver_supported(&g15g));
+
+   bad = g15g;
+   bad.chip_id = 0x6030;
+   assert(!agx_params_driver_supported(&bad));
+
+   bad = g15g;
+   bad.num_clusters_total = 2;
+   assert(!agx_params_driver_supported(&bad));
+
+   bad = g15g;
+   bad.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
+   assert(!agx_params_driver_supported(&bad));
+
+   bad = g15g;
+   bad.usc_generation = 2;
+   assert(!agx_params_driver_supported(&bad));
 
    printf("chip admission: ok\n");
    return 0;
