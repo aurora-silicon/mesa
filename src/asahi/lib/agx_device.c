@@ -890,6 +890,17 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * is implemented; otherwise a newly-recognised chip can silently reach an
     * encoder from the wrong generation.
     */
+   /* G15G (T8122) runs on the native path only on explicit request. */
+   if (dev->chip == AGX_CHIP_G15G && agx_params_driver_supported(&dev->params)) {
+      if (!agx_chip_experimental_admitted(dev->chip)) {
+         fprintf(stderr, "Apple G15G (T8122) is recognised but not admitted: "
+                         "set ASAHI_M3_EXPERIMENTAL=1 to run it\n");
+         goto fail;
+      }
+      fprintf(stderr, "WARNING: experimental G15G/T8122 admission "
+                      "(ASAHI_M3_EXPERIMENTAL=1)\n");
+   }
+
    if (!agx_params_driver_supported(&dev->params)) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
          fprintf(stderr,
@@ -1258,6 +1269,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
          dev->libagx_programs = libagx_g13g;
    } else if (dev->chip == AGX_CHIP_G17P) {
       dev->libagx_programs = libagx_g17p;
+   } else if (dev->chip == AGX_CHIP_G15G) {
+      /* Its own build: G15G needs the scheduling stalls G15S does not. */
+      dev->libagx_programs = libagx_g15g;
    } else if (dev->chip == AGX_CHIP_G15S || dev->chip == AGX_CHIP_G15C) {
       /* G15C executes the same AGX3B encoding as G15S with no extra
        * scheduling rules, so it runs the G15S build of the programs. */
