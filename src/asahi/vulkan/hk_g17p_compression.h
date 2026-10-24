@@ -11,8 +11,9 @@
 
 /* G17P lossless compression policy. Admitted images use texture reads and
  * PBE/ZLS writes or metadata fast clears. Storage and host access stay
- * excluded. Colour formats are bounded to 8 bytes per sample, so compressed
- * single-sample attachments cannot spill the 120-byte tilebuffer.
+ * excluded. Colour formats are bounded to 8 bytes per sample, so a
+ * single-sample pass containing one fits the 120-byte tilebuffer even with
+ * seven other 16-byte attachments.
  *
  * Layered colour allocations currently use one level: the compressed PBE's
  * secondary-view stride aliases its mip fields. Keep the existing ordinary
@@ -20,6 +21,9 @@
  * Multisample colour images are admitted for transfer/sampling use only.
  * Application colour attachments may spill at 2x/4x, which requires an
  * in-place decompression path before raw eMRT stores. G17P has no such kernel.
+ * A format's own footprint cannot prove safety: other attachments, a stored
+ * LOAD attachment or multiview can force the pass to spill. Keep this an
+ * allocation decision, including images first used in a non-spilling pass.
  * Depth/stencil has independent ZLS data and metadata layer strides and does
  * not spill; it remains limited to one level.
  *

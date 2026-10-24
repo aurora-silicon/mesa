@@ -259,6 +259,20 @@ if with_tests
   )
 
   test(
+    'hk_g17p_msaa_spill',
+    executable(
+      'hk_g17p_msaa_spill_test',
+      files('tests/test-hk-g17p-msaa-spill.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util],
+      link_with : [libasahi_lib, libasahi_layout],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    timeout : 180,
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_g17p_metadata_grid',
     executable(
       'hk_g17p_metadata_grid_test',
