@@ -3769,10 +3769,11 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
                perf_debug(cmd, "Decompressing in-place");
 
-               /* libagx_decompress has no G17P binary. G17P only compresses
-                * 1-8 byte single-sample targets, which cannot spill (8 x 8 B
-                * fit the 120 B/sample tilebuffer), so this is unreachable;
-                * fail closed with a diagnostic rather than a NULL program. */
+               /* libagx_decompress has no G17P binary. G17P admits only
+                * single-sample colour attachments of at most 8 bytes, so a
+                * pass containing one fits even with seven 16-byte targets.
+                * Compressed MSAA images are for transfer/sampling use only.
+                * Keep the guard if allocation policy ever admits more. */
                if (dev->dev.chip == AGX_CHIP_G17P) {
                   mesa_loge_once("G17P: spilled render pass with a compressed "
                                  "attachment (%s) is unsupported",
