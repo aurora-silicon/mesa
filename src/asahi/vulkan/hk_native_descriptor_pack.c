@@ -75,6 +75,13 @@ hk_pack_native_texture(unsigned generation,
       return false;
 
    if (generation == 9) {
+      /* Lossless multisample reads are limited to the sample counts the
+       * corresponding PBE can store. Metadata always needs an extension. */
+      if (legacy->compressed &&
+          (!legacy->extended || !legacy->acceleration_buffer ||
+           (multisampled && legacy->samples == AGX_SAMPLE_COUNT_8)))
+         return false;
+
       if (!legacy->width || legacy->width > 16384 || !legacy->height ||
           legacy->height > 16384)
          return false;
@@ -230,11 +237,10 @@ hk_pack_native_pbe(unsigned generation,
    if (!hk_descriptor_generation_is_agx3(generation))
       return false;
 
-   /* The recovered subset excludes fields whose Gen9/10 semantic placement
-    * remains incomplete: sparse mode, Gen10 gamma and the software-addressing
-    * sideband. The host-only HAL200 StateFields oracle matches the complete
-    * GPU-tiled 2D compressed packet, including the metadata GPU address and
-    * mip extension. Other compressed shapes remain closed. */
+   /* Sparse mode, Gen10 gamma and the software-addressing sideband remain
+    * unsupported here. Gen9 GPU-tiled lossless packets carry a metadata
+    * GPU address. Layered and multisample compression uses the same address
+    * field, with zero codec and footprint selectors. */
    const bool array = generation == 9 &&
                       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
    const bool array_multisample =
@@ -250,10 +256,9 @@ hk_pack_native_pbe(unsigned generation,
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ||
        array_multisample);
    const bool interchange = legacy->layout == AGX_LAYOUT_INTERCHANGE;
-   const bool compressed_2d = legacy->compressed && generation == 9 &&
-                              legacy->dimension == AGX_TEXTURE_DIMENSION_2D &&
-                              (legacy->layout == AGX_LAYOUT_GPU || interchange) &&
-                              !multisample;
+   const bool compressed_supported =
+      generation == 9 && (legacy->layout == AGX_LAYOUT_GPU ||
+                          (interchange && !layered && !multisample));
    if ((!layered && !multisample &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        (legacy->layout == AGX_LAYOUT_LINEAR &&
@@ -268,19 +273,19 @@ hk_pack_native_pbe(unsigned generation,
        (multisample ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
                        legacy->samples != AGX_SAMPLE_COUNT_4)
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
-       (legacy->compressed && !compressed_2d) ||
+       (legacy->compressed && !compressed_supported) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && legacy->layers != 1) ||
-       (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
-                        legacy->level != 0 || legacy->levels != 1 ||
-                        legacy->unk_mipmapped || legacy->compressed)) ||
-       (generation != 9 && (legacy->level != 0 || legacy->levels != 1 ||
-                            legacy->unk_mipmapped)) ||
+       (multisample &&
+        (legacy->layout == AGX_LAYOUT_LINEAR || legacy->level != 0 ||
+         legacy->levels != 1 || legacy->unk_mipmapped)) ||
+       (generation != 9 &&
+        (legacy->level != 0 || legacy->levels != 1 || legacy->unk_mipmapped)) ||
        (generation != 9 && legacy->srgb) ||
        (legacy->extended != legacy->compressed) ||
        (legacy->layout == AGX_LAYOUT_LINEAR || interchange
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4
-                                             : legacy->stride != 0) ||
+           : legacy->stride != 0) ||
        (!legacy->compressed && legacy->acceleration_buffer) ||
        legacy->depth_linear != 1 || legacy->layer_stride_linear ||
        legacy->level_offset_sw || legacy->aligned_width_msaa_sw ||

@@ -213,10 +213,10 @@ pack_layered(uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
     * Linear stride and Gen10's shifted mode fields remain independently
     * gated. */
    if (generation != AGX_PBE_AGX3_GENERATION_9 || !fields ||
-       fields->compressed ||
+       (fields->compressed &&
+        (fields->layout != AGX_PBE_LAYOUT_GPU || level || levels != 1)) ||
        fields->layout == AGX_PBE_LAYOUT_LINEAR || layers < 1 ||
-       layers > UINT16_MAX + 1u || !levels || levels > 16 ||
-       level >= levels ||
+       layers > UINT16_MAX + 1u || !levels || levels > 16 || level >= levels ||
        !agx_pbe_agx3_2d_pack(generation, fields, out))
       return false;
 
@@ -275,7 +275,7 @@ agx_pbe_agx3_2d_multisample_pack(
     * its own witness to recover, so it is refused here too.
     */
    if (generation != AGX_PBE_AGX3_GENERATION_9 || !fields ||
-       fields->compressed ||
+       (fields->compressed && fields->layout != AGX_PBE_LAYOUT_GPU) ||
        (samples != 2 && samples != 4) ||
        fields->layout == AGX_PBE_LAYOUT_LINEAR ||
        !agx_pbe_agx3_2d_pack(generation, fields, out))

@@ -18,7 +18,12 @@ static unsigned checks;
       }                                                                       \
    } while (0)
 
-#define ELIGIBLE(i) hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &(i))
+/* Exercise mutable extension chains through a runtime call, as the driver
+ * does, rather than letting the compiler fold the whole stack fixture. */
+static bool (*volatile runtime_eligible)(enum agx_chip, unsigned,
+                                         const VkImageCreateInfo *) =
+   hk_g17p_compression_eligible;
+#define ELIGIBLE(i) runtime_eligible(AGX_CHIP_G17P, 0, &(i))
 
 static VkImageCreateInfo
 image(VkFormat format, uint32_t w, uint32_t h, uint32_t mips,
@@ -154,16 +159,16 @@ check_shape(VkFormat format, bool is_depth)
    i.imageType = VK_IMAGE_TYPE_1D;
    CHECK(!ELIGIBLE(i));
    i = base; i.imageType = VK_IMAGE_TYPE_3D;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i) == !is_depth);
    i = base; i.extent.depth = 2;
    CHECK(!ELIGIBLE(i));
    i = base; i.arrayLayers = 2;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
-   CHECK(!ELIGIBLE(i));
+   CHECK(ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(!ELIGIBLE(i));
+      CHECK(ELIGIBLE(i) == (is_depth && s <= 4));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!ELIGIBLE(i));
@@ -206,6 +211,64 @@ check_shape(VkFormat format, bool is_depth)
    VkBaseInStructure wsi = {.sType = HK_G17P_WSI_IMAGE_CREATE_INFO_MESA};
    i = base; i.pNext = &wsi;
    CHECK(!ELIGIBLE(i));
+}
+
+static void
+check_layered_and_msaa(void)
+{
+   VkImageCreateInfo i =
+      image(VK_FORMAT_R8G8B8A8_SRGB, 256, 256, 1,
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT);
+   i.arrayLayers = 12;
+   i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   CHECK(ELIGIBLE(i));
+   i.mipLevels = 5;
+   CHECK(!ELIGIBLE(i));
+   i.mipLevels = 1;
+   i.flags = 0;
+   for (unsigned samples = 1; samples <= 64; samples <<= 1) {
+      i.samples = (VkSampleCountFlagBits)samples;
+      CHECK(ELIGIBLE(i) == (samples <= 4));
+      i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      CHECK(ELIGIBLE(i) == (samples == 1));
+      i.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      CHECK(!ELIGIBLE(i));
+      i.usage &= ~VK_IMAGE_USAGE_STORAGE_BIT;
+   }
+   i.samples = VK_SAMPLE_COUNT_1_BIT;
+   i.arrayLayers = 1;
+   i.imageType = VK_IMAGE_TYPE_3D;
+   i.extent.depth = 9;
+   i.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
+             VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT;
+   CHECK(ELIGIBLE(i));
+   i.mipLevels = 5;
+   CHECK(!ELIGIBLE(i));
+   i.mipLevels = 1;
+   i.samples = VK_SAMPLE_COUNT_2_BIT;
+   CHECK(!ELIGIBLE(i));
+   i.samples = VK_SAMPLE_COUNT_1_BIT;
+   i.arrayLayers = 2;
+   CHECK(!ELIGIBLE(i));
+   i.arrayLayers = 1;
+   i.format = VK_FORMAT_D32_SFLOAT;
+   CHECK(!ELIGIBLE(i));
+
+   i.imageType = VK_IMAGE_TYPE_2D;
+   i.extent.depth = 1;
+   i.arrayLayers = 12;
+   i.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+   i.samples = VK_SAMPLE_COUNT_1_BIT;
+   i.usage =
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+   CHECK(ELIGIBLE(i));
+   i.flags = 0;
+   for (unsigned samples = 1; samples <= 64; samples <<= 1) {
+      i.samples = (VkSampleCountFlagBits)samples;
+      CHECK(ELIGIBLE(i) == (samples <= 4));
+   }
 }
 
 static void
@@ -303,7 +366,7 @@ check_zink(void)
    depth.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
    CHECK(ELIGIBLE(depth));
    depth.samples = VK_SAMPLE_COUNT_4_BIT;
-   CHECK(!ELIGIBLE(depth));
+   CHECK(ELIGIBLE(depth));
    const VkImageCreateInfo d32 = image(VK_FORMAT_D32_SFLOAT, 2408, 1506, 1, ds);
    CHECK(ELIGIBLE(d32));
    /* A host-transfer image keeps the plain layout host copies require. */
@@ -471,6 +534,7 @@ main(void)
    check_shape(VK_FORMAT_D32_SFLOAT, true);
    check_shape(VK_FORMAT_D16_UNORM, true);
    check_shape(VK_FORMAT_D32_SFLOAT_S8_UINT, true);
+   check_layered_and_msaa();
    check_minecraft();
    check_zink();
    check_shared();

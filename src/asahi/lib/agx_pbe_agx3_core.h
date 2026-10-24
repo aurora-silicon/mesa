@@ -21,8 +21,8 @@ extern "C" {
 
 /* This is intentionally the subset whose complete byte geometry is recovered:
  * ordinary non-sparse 2D images in Gen9 linear or Gen9/10 twiddled/GPU
- * memory, Gen9 GPU-tiled compressed 2D images, and Gen9's exact uncompressed
- * tiled 2D-array extension.
+ * memory, and Gen9 GPU-tiled lossless 2D, 2D-array, 3D and 2x/4x MSAA
+ * images. Compressed layered/MSAA packets currently describe one level.
  * Gen9's ordinary single-layer packet has no layer-mode bit regardless of
  * allocation padding; the inherited page-aligned-layer input is ignored on
  * scalar pack and canonicalized to false on unpack. Gen10 keeps its existing
@@ -40,7 +40,7 @@ struct agx_pbe_agx3_2d_fields {
    uint16_t width;
    uint16_t height;
    uint64_t buffer;
-   /* Gen9 GPU-tiled 2D lossless compression metadata base. Exactly zero when
+   /* Gen9 GPU-tiled lossless compression metadata base. Exactly zero when
     * compressed is false; 16-byte aligned and below bit 48 otherwise. */
    uint64_t acceleration_buffer;
    bool compressed;
@@ -71,7 +71,9 @@ bool agx_pbe_agx3_2d_array_pack(
 
 /* The layered packets with the native mip extension of
  * agx_pbe_agx3_2d_mip_pack(). Layers or depth, width, height and buffer
- * describe the whole chain; level selects the addressed level. */
+ * describe the whole chain; level selects the addressed level. Compressed
+ * layered targets require level=0, levels=1: their secondary-view stride
+ * occupies the same bits as the mip extension. */
 bool agx_pbe_agx3_2d_array_mip_pack(
    uint32_t generation, const struct agx_pbe_agx3_2d_fields *fields,
    uint32_t layers, uint32_t level, uint32_t levels,
