@@ -55,6 +55,7 @@
 #include "vk_pipeline_layout.h"
 #include "vk_common_entrypoints.h"
 #include "vk_synchronization.h"
+#include "vk_meta_object_list.h"
 
 #include "util/list.h"
 #include "util/macros.h"
@@ -176,6 +177,19 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    hk_descriptor_state_fini(cmd, &cmd->state.cs.descriptors);
    hk_descriptor_state_fini(cmd, &cmd->state.rt.descriptors);
 
+   /* Meta boundary copies may have made additional views of the backing.
+    * Destroy those views before their private image handles, also on the
+    * destroy path where vk_command_buffer_finish() has not run yet. */
+   if (!list_is_empty(&cmd->transient_spills))
+      vk_meta_object_list_reset(&dev->vk, &cmd->vk.meta_objects);
+   list_for_each_entry_safe(struct hk_transient_spill, spill,
+                            &cmd->transient_spills, link) {
+      hk_DestroyImageView(hk_device_to_handle(dev), spill->view, NULL);
+      hk_DestroyImage(hk_device_to_handle(dev), spill->image, NULL);
+      list_del(&spill->link);
+      free(spill);
+   }
+
    hk_cmd_pool_free_gen1_as_chunks(pool, &cmd->gen1_as_table_chunks);
 
    hk_cmd_pool_free_bo_list(pool, HK_CMD_BO_MAIN, &cmd->uploader.main.bos);
@@ -251,6 +265,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
    list_inithead(&cmd->uploader.usc.bos);
    list_inithead(&cmd->uploader.root.bos);
    list_inithead(&cmd->vdm_allocations);
+   list_inithead(&cmd->transient_spills);
    list_inithead(&cmd->gen1_as_table_chunks);
    list_inithead(&cmd->control_streams);
 

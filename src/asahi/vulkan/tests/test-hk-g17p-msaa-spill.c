@@ -7,6 +7,7 @@
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/vulkan/hk_g17p_compression.h"
+#include "asahi/vulkan/hk_g17p_spill.h"
 #include "vulkan/util/vk_format.h"
 
 /* Deliberately independent of assert(): the release build defines NDEBUG. */
@@ -143,11 +144,16 @@ check_layout(const enum pipe_format *formats, unsigned count,
             CHECK(tib.tile_size * samples <= 2048);
             if (agx_tilebuffer_spills(&tib)) {
                ++spilling[s][reload];
-               /* BeginRendering prepares all colour attachments for raw
-                * eMRT access when ANY target spills, including resident ones.
-                */
-               for (unsigned rt = 0; rt < count; ++rt)
-                  CHECK(!classes[ids[rt]].compressed[s]);
+               CHECK(hk_g17p_transient_spill_mask(AGX_CHIP_G17P, &tib) ==
+                     spill_mask(&tib));
+               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G13G, &tib));
+               CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G14G, &tib));
+               for (unsigned rt = 0; rt < count; ++rt) {
+                  /* Compression is per image and no longer excludes a
+                   * footprint merely because this pass spills. */
+                  CHECK(classes[ids[rt]].compressed[s] ==
+                        classes[ids[rt]].compressed[0]);
+               }
             }
          }
       }
@@ -244,9 +250,9 @@ probe(int argc, char **argv)
    struct agx_tilebuffer_layout tib =
       layout(formats, argc - 5, samples, layered, reload);
    printf("samples=%u mode=%s layered=%u sample_bytes=%u tile_pixels=%u "
-          "spill_mask=0x%02x\n",
+          "spill_mask=0x%02x transient_mask=0x%02x\n",
           samples, argv[3], layered, tib.sample_size_B, tib.tile_size,
-          spill_mask(&tib));
+          spill_mask(&tib), hk_g17p_transient_spill_mask(AGX_CHIP_G17P, &tib));
    for (int rt = 0; rt < argc - 5; ++rt)
       printf("slot=%d format=%s spilled=%u\n", rt,
              util_format_name(formats[rt]), tib.spilled[rt]);
@@ -270,6 +276,24 @@ main(int argc, char **argv)
    }
    init_classes();
    check_witnesses();
+   const VkRect2D area = {{3, 7}, {31, 19}};
+   for (unsigned store = 0; store < 2; ++store) {
+      for (unsigned layer = 0; layer < 32; ++layer) {
+         VkImageCopy2 copy = hk_g17p_spill_region(area, 2, 5, layer, store);
+         CHECK(copy.srcOffset.x == 3 && copy.dstOffset.x == 3);
+         CHECK(copy.srcOffset.y == 7 && copy.dstOffset.y == 7);
+         CHECK(copy.extent.width == 31 && copy.extent.height == 19);
+         CHECK(copy.extent.depth == 1);
+         CHECK(copy.srcSubresource.mipLevel == (store ? 0 : 2));
+         CHECK(copy.dstSubresource.mipLevel == (store ? 2 : 0));
+         CHECK(copy.srcSubresource.baseArrayLayer == layer + (store ? 0 : 5));
+         CHECK(copy.dstSubresource.baseArrayLayer == layer + (store ? 5 : 0));
+         CHECK(copy.srcSubresource.layerCount == 1 &&
+               copy.dstSubresource.layerCount == 1);
+      }
+   }
+   struct agx_tilebuffer_layout unproven = {.nr_samples = 8, .spilled = {true}};
+   CHECK(!hk_g17p_transient_spill_mask(AGX_CHIP_G17P, &unproven));
    enum pipe_format formats[AGX_MAX_RENDER_TARGETS] = {0};
    unsigned ids[AGX_MAX_RENDER_TARGETS] = {0};
    matrix(formats, ids, 0, ~0u);
@@ -282,6 +306,6 @@ main(int argc, char **argv)
       }
    }
    puts(
-      "G17P spill matrix: no compressed colour attachment in a spilling pass");
+      "G17P spill matrix: compressed attachments admitted, all spills use transient backing");
    return 0;
 }
