@@ -1044,6 +1044,9 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
 
    uint64_t shader_size = 0x100000000ull;
+   /* T8122: only the lower half of the 2^40 window is free. */
+   if (dev->chip == AGX_CHIP_G15G)
+      shader_size = AGX_T8122_RUNTIME_WINDOW_HIGH - dev->shader_base;
 
    /*
     * Where the user heap goes relative to the USC window.
@@ -1121,9 +1124,10 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    /* G17P is bounded by the narrower of the compact VDM aperture and the
     * absolute USC texture/sampler table pointer, both of which sit below the
-    * USC window. Other chips retain the kernel-reported user limit. */
+    * USC window, and T8122 additionally by its runtime's reservation. Other
+    * chips retain the kernel-reported user limit. */
    const uint64_t user_limit =
-      heap_below_usc ? AGX_G17P_USER_LIMIT : vm_create.kernel_start;
+      agx_va_user_limit(dev->chip, heap_below_usc, vm_create.kernel_start);
    uint64_t user_size = user_limit - user_start;
 
    int ret = dev->ops.simple_ioctl(dev, DRM_IOCTL_ASAHI_VM_CREATE, &vm_create);
@@ -1211,6 +1215,16 @@ agx_open_device(void *memctx, struct agx_device *dev)
    }
    if (agx_chip_native_agx3(dev->chip))
       initialized |= AGX_INIT_ALIAS_HEAP;
+   /* The compact alias heap starts inside the T8122 runtime USC base; keep
+    * out of it (the rest of that range is already outside the heap). */
+   if (dev->chip == AGX_CHIP_G15G &&
+       !util_vma_heap_alloc_addr(&dev->g17p_vdm_alias_heap,
+                                 AGX_G17P_VDM_ALIAS_BASE,
+                                 AGX_G17P_VDM_ALIAS_RESERVED_START -
+                                    AGX_G17P_VDM_ALIAS_BASE)) {
+      fprintf(stderr, "Failed to reserve the T8122 runtime USC base\n");
+      goto fail;
+   }
 
    if (!agx_va_reserve_runtime_graph_hole(
           dev->chip, &dev->main_heap, user_start, user_size,
