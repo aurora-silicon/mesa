@@ -168,7 +168,7 @@ check_shape(VkFormat format, bool is_depth)
    CHECK(ELIGIBLE(i));
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(ELIGIBLE(i) == (is_depth && s <= 4));
+      CHECK(ELIGIBLE(i) == (s <= 4));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!ELIGIBLE(i));
@@ -240,10 +240,10 @@ check_colour_msaa_spill_policy(void)
                   attachment.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
                if (mask & 2)
                   attachment.usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
-               CHECK(ELIGIBLE(attachment) == (samples == 1));
+               CHECK(ELIGIBLE(attachment) == (samples == 1 || !(mask & 1)));
                attachment.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                                   VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-               CHECK(ELIGIBLE(attachment) == (samples == 1));
+               CHECK(ELIGIBLE(attachment) == (samples == 1 || !(mask & 1)));
             }
          }
       }
@@ -268,7 +268,7 @@ check_layered_and_msaa(void)
       i.samples = (VkSampleCountFlagBits)samples;
       CHECK(ELIGIBLE(i) == (samples <= 4));
       i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      CHECK(ELIGIBLE(i) == (samples == 1));
+      CHECK(ELIGIBLE(i) == (samples <= 4));
       i.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
       CHECK(!ELIGIBLE(i));

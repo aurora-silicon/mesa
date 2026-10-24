@@ -39,6 +39,7 @@
 #include "hk_image_view.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_g17p_ppp_indices.h"
+#include "hk_g17p_spill.h"
 #include "hk_g17p_full_frame_scissor.h"
 #include "hk_g17p_draw_state_upload.h"
 #include "hk_agx3_vdm_decode.h"
@@ -3325,8 +3326,8 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
 }
 
 static void
-hk_begin_rendering(VkCommandBuffer commandBuffer,
-                   const VkRenderingInfo *pRenderingInfo)
+hk_begin_rendering_internal(VkCommandBuffer commandBuffer,
+                             const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
@@ -3732,11 +3733,9 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
     * may execute in any order). */
    hk_sync_first_render_stream(cmd, cs);
 
-   /* If we spill colour attachments, we need to decompress them. This happens
-    * at the start of the render; it is not re-emitted when resuming
-    * secondaries. It could be hoisted to the start of the command buffer but
-    * we're not that clever yet.
-    */
+   /* AGX2 spills into the attachment and decompresses it in place. G17P
+    * spills into the plain transient allocation prepared before this pass;
+    * resident compressed attachments keep their normal BG/EOT descriptors. */
    if (agx_tilebuffer_spills(&render->tilebuffer)) {
       const unsigned descriptor_generation =
          agx_chip_descriptor_generation(dev->dev.chip);
@@ -3749,7 +3748,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
       for (unsigned i = 0; i < render->color_att_count; ++i) {
          struct hk_image_view *view = render->color_att[i].iview;
-         if (view) {
+         if (view && (!agx_native_graphics(&dev->dev) ||
+                      render->tilebuffer.spilled[i])) {
             if (!view->planes[0].emrt_pbe_valid) {
                vk_command_buffer_set_error(&cmd->vk,
                                            VK_ERROR_FORMAT_NOT_SUPPORTED);
@@ -3769,11 +3769,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
                perf_debug(cmd, "Decompressing in-place");
 
-               /* libagx_decompress has no G17P binary. G17P admits only
-                * single-sample colour attachments of at most 8 bytes, so a
-                * pass containing one fits even with seven 16-byte targets.
-                * Compressed MSAA images are for transfer/sampling use only.
-                * Keep the guard if allocation policy ever admits more. */
+               /* G17P's transient targets must always be plain. Leave this
+                * fail-closed check for any unsupported spill configuration. */
                if (dev->dev.chip == AGX_CHIP_G17P) {
                   mesa_loge_once("G17P: spilled render pass with a compressed "
                                  "attachment (%s) is unsupported",
@@ -3928,6 +3925,199 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
    }
 }
 
+/* Use the existing uncompressed AIL tile layout for private spill storage.
+ * This is an internal choice: application image descriptors never name it.
+ * The eMRT texture fetch and linear PBE store already agree on this layout. */
+static struct hk_image_view *
+hk_alloc_transient_spill(struct hk_cmd_buffer *cmd,
+                          const struct hk_image_view *original, unsigned layers)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_transient_spill *spill = calloc(1, sizeof(*spill));
+   if (!spill) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return NULL;
+   }
+   list_addtail(&spill->link, &cmd->transient_spills);
+   const VkImageCreateInfo image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = original->vk.format,
+      .extent = {original->vk.extent.width, original->vk.extent.height, 1},
+      .mipLevels = 1,
+      .arrayLayers = layers,
+      .samples = original->vk.image->samples,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      /* STORAGE explicitly selects a plain allocation. The private view is
+       * used by eMRT, never exposed to application storage operations. */
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+               VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+   };
+   VkResult result = hk_CreateImage(hk_device_to_handle(dev), &image_info, NULL,
+                                    &spill->image);
+   if (result != VK_SUCCESS)
+      goto fail;
+   VK_FROM_HANDLE(hk_image, image, spill->image);
+   const struct ail_layout *layout = &image->planes[0].layout;
+   if (image->plane_count != 1 || layout->compressed ||
+       layout->size_B > UINT32_MAX) {
+      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      goto fail;
+   }
+   struct agx_ptr allocation = hk_pool_alloc(cmd, layout->size_B, AIL_PAGESIZE);
+   if (!allocation.cpu) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return NULL;
+   }
+   image->planes[0].addr = allocation.gpu;
+   const VkImageViewCreateInfo view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = spill->image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+      .format = original->vk.format,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers},
+   };
+   result = hk_CreateImageView(hk_device_to_handle(dev), &view_info, NULL,
+                               &spill->view);
+   if (result != VK_SUCCESS)
+      goto fail;
+   return hk_image_view_from_handle(spill->view);
+fail:
+   vk_command_buffer_set_error(&cmd->vk, result);
+   return NULL;
+}
+
+static void
+hk_copy_transient_spill(struct hk_cmd_buffer *cmd,
+                        const struct hk_image_view *original,
+                        const struct hk_image_view *backing, VkRect2D area,
+                        unsigned layers, uint32_t view_mask, bool store)
+{
+   if (!area.extent.width || !area.extent.height)
+      return;
+   for (unsigned layer = 0; layer < layers; ++layer) {
+      if (view_mask && !(view_mask & BITFIELD_BIT(layer)))
+         continue;
+      const VkImageCopy2 region = hk_g17p_spill_region(
+         area, original->vk.base_mip_level, original->vk.base_array_layer,
+         layer, store);
+      const VkCopyImageInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
+         .srcImage = vk_image_to_handle(store ? backing->vk.image
+                                             : original->vk.image),
+         .dstImage = vk_image_to_handle(store ? original->vk.image
+                                             : backing->vk.image),
+         .srcImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .dstImageLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .regionCount = 1,
+         .pRegions = &region,
+      };
+      hk_cmd_copy_spill(cmd, &info);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+   }
+}
+
+static void
+hk_begin_rendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *info)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->dev.chip != AGX_CHIP_G17P || cmd->in_meta) {
+      hk_begin_rendering_internal(commandBuffer, info);
+      return;
+   }
+
+   VkFormat formats[HK_MAX_RTS] = {0};
+   unsigned samples = 0;
+   bool reload = info->viewMask != 0;
+   for (unsigned rt = 0; rt < info->colorAttachmentCount; ++rt) {
+      const VkRenderingAttachmentInfo *att = &info->pColorAttachments[rt];
+      VK_FROM_HANDLE(hk_image_view, view, att->imageView);
+      if (!view)
+         continue;
+      formats[rt] = view->vk.format;
+      samples = view->vk.image->samples;
+      reload |= att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+                is_attachment_stored(att);
+   }
+   const unsigned layers = info->viewMask ? util_last_bit(info->viewMask)
+                                          : info->layerCount;
+   struct agx_tilebuffer_layout tib = hk_tilebuffer_layout(
+      dev, formats, sizeof(formats[0]), info->colorAttachmentCount, samples,
+      !hk_agx3_g17p_single_layer_rendering(info->viewMask, layers),
+      samples > 1 && reload);
+   unsigned mask = hk_g17p_transient_spill_mask(dev->dev.chip, &tib);
+   /* Aliasing and feedback need the application-visible storage during the
+    * pass. Their plain images retain the existing direct eMRT path. Do not
+    * silently redirect a compressed input-feedback attachment: that protocol
+    * has not been implemented. Ordinary input usage in later passes is fine. */
+   u_foreach_bit(rt, mask) {
+      const VkRenderingAttachmentInfo *att = &info->pColorAttachments[rt];
+      struct hk_image_view *view = hk_image_view_from_handle(att->imageView);
+      const VkAttachmentFeedbackLoopInfoEXT *loop = vk_find_struct_const(
+         att->pNext, ATTACHMENT_FEEDBACK_LOOP_INFO_EXT);
+      if (view->vk.image->image_type != VK_IMAGE_TYPE_2D ||
+          hk_m5_attachment_image_aliasable(view) ||
+          (view->vk.image->usage &
+           (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+            VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) ||
+          (vk_get_rendering_attachment_flags(att) &
+           VK_RENDERING_ATTACHMENT_INPUT_ATTACHMENT_FEEDBACK_BIT_KHR) ||
+          (loop && loop->feedbackLoopEnable)) {
+         const struct hk_image *image =
+            container_of(view->vk.image, struct hk_image, vk);
+         if (image->planes[0].layout.compressed) {
+            vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+            return;
+         }
+         mask &= ~BITFIELD_BIT(rt);
+      }
+   }
+   if (!mask) {
+      hk_begin_rendering_internal(commandBuffer, info);
+      return;
+   }
+
+   VkRenderingInfo redirected = *info;
+   VkRenderingAttachmentInfo atts[HK_MAX_RTS];
+   struct hk_image_view *originals[HK_MAX_RTS] = {0};
+   memcpy(atts, info->pColorAttachments,
+          sizeof(atts[0]) * info->colorAttachmentCount);
+   redirected.pColorAttachments = atts;
+   u_foreach_bit(rt, mask) {
+      struct hk_image_view *original =
+         hk_image_view_from_handle(atts[rt].imageView);
+      struct hk_image_view *backing =
+         hk_alloc_transient_spill(cmd, original, layers);
+      if (!backing)
+         return;
+      originals[rt] = original;
+      if (atts[rt].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+          (info->flags & VK_RENDERING_RESUMING_BIT)) {
+         hk_copy_transient_spill(cmd, original, backing, info->renderArea,
+                                 layers, info->viewMask, false);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return;
+      }
+      atts[rt].imageView = hk_image_view_to_handle(backing);
+      atts[rt].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+   }
+   /* Boundary imports are ordinary graphics producers. The dependency into
+    * the API pass is the same graphics dependency used for pass resolves. */
+   if (info->flags & VK_RENDERING_RESUMING_BIT) {
+      /* Resuming defers creation of the first stream until the first draw,
+       * so retain the ordinary graphics dependency beyond this call. */
+      hk_sync_barrier(cmd, HK_SYNC_GFX, HK_SYNC_GFX);
+   }
+   hk_sync_resolve_begin(cmd);
+   hk_begin_rendering_internal(commandBuffer, &redirected);
+   hk_sync_resolve_end(cmd);
+   memcpy(cmd->state.gfx.render.spill_original, originals, sizeof(originals));
+}
+
 static void hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
                                     const VkRenderingInfo *info);
 
@@ -4037,6 +4227,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    bool need_resolve = false;
 
+   const struct hk_rendering_state spill_state = *render;
+
    /* Translate render state back to VK for meta */
    VkRenderingAttachmentInfo vk_color_att[HK_MAX_RTS];
    VkRenderingAttachmentFlagsInfoKHR vk_color_att_flags[HK_MAX_RTS];
@@ -4052,7 +4244,8 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       vk_color_att[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
          .pNext = &vk_color_att_flags[i],
-         .imageView = hk_image_view_to_handle(render->color_att[i].iview),
+         .imageView = hk_image_view_to_handle(render->spill_original[i] ?:
+                                               render->color_att[i].iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
          .resolveMode = render->g17p_direct_color_resolve
                            ? VK_RESOLVE_MODE_NONE
@@ -4114,6 +4307,20 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    memset(render, 0, sizeof(*render));
 
    hk_sync_end_rendering(cmd);
+
+   for (unsigned rt = 0; rt < spill_state.color_att_count; ++rt) {
+      const struct hk_image_view *original = spill_state.spill_original[rt];
+      const struct hk_attachment *att = &spill_state.color_att[rt];
+      if (!original ||
+          (att->store_op != VK_ATTACHMENT_STORE_OP_STORE &&
+           att->resolve_mode == VK_RESOLVE_MODE_NONE &&
+           !(spill_state.flags & VK_RENDERING_SUSPENDING_BIT)))
+         continue;
+      hk_copy_transient_spill(cmd, original, att->iview, spill_state.area,
+                              spill_state.cr.layers, spill_state.view_mask, true);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+   }
 
    /* Classic upstream submits each render after its predecessor. In
     * particular, coherent advanced blending in a later render pass must

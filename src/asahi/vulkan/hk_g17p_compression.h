@@ -18,12 +18,8 @@
  * Layered colour allocations currently use one level: the compressed PBE's
  * secondary-view stride aliases its mip fields. Keep the existing ordinary
  * 2D mip path separate until layered mip stores can be represented.
- * Multisample colour images are admitted for transfer/sampling use only.
- * Application colour attachments may spill at 2x/4x, which requires an
- * in-place decompression path before raw eMRT stores. G17P has no such kernel.
- * A format's own footprint cannot prove safety: other attachments, a stored
- * LOAD attachment or multiview can force the pass to spill. Keep this an
- * allocation decision, including images first used in a non-spilling pass.
+ * Multisample colour attachments use transient eMRT backing when a pass
+ * spills. Compression belongs to the image, independently of its neighbours.
  * Depth/stencil has independent ZLS data and metadata layer strides and does
  * not spill; it remains limited to one level.
  *
@@ -187,9 +183,11 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    if (hk_g17p_compression_color_format(info->format)) {
       if ((three_d || info->arrayLayers > 1) && info->mipLevels != 1)
          return false;
-      if (multisampled &&
-          (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                          VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)))
+      /* A colour/input image may feed back during the same pass through an
+       * application descriptor. Transient backing is visible only to eMRT,
+       * so keep this unproven MSAA access pattern plain for its lifetime. */
+      if (multisampled && (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+          (info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
          return false;
 
       /* An RGBA8/BGRA8 UNORM mip chain the application never renders to is
