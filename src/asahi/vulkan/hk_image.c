@@ -1301,6 +1301,17 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
                             const VkImageCreateInfo *info,
                             bool float_image_atomics, bool srgb_pair_views)
 {
+   /* Diagnostic candidate: isolate compression's background/EOT store cost
+    * on private single-sample G16S colour attachments. Explicit pNext layout
+    * and sharing contracts retain their original allocation policy. This
+    * experiment is not a qualified production compression policy.
+    */
+   if (agx_is_m4_pro(dev) && info->pNext == NULL &&
+       info->samples == VK_SAMPLE_COUNT_1_BIT &&
+       (info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+       !vk_format_is_depth_or_stencil(info->format))
+      return false;
+
    /* AGX3: G17P compresses every image hk_g17p_compression.h admits. Other
     * AGX3 chips stay plain until their packets are recovered. */
    const bool m5_storage =
