@@ -3496,7 +3496,14 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
    }
    return agx_build_tilebuffer_layout_with_limits(
       formats, count, samples, layered, max_sample_size_B,
-      imageblock ? 32768 : 0, agx_native_graphics(&dev->dev) ? 2048 : 0);
+      imageblock ? 32768 : 0,
+      /* Diagnostic candidate: smaller single-sample tiles test G16S tile
+       * residency/scheduling against per-tile overhead. Keep MSAA, layered
+       * rendering and all other physical devices on their existing layout.
+       * This is not a qualified production policy.
+       */
+      agx_is_m4_pro(&dev->dev) && samples == 1 && !layered ? 512 :
+      agx_native_graphics(&dev->dev) ? 2048 : 0);
 }
 
 /* M5 compressed multisample colour attachments stay in the tilebuffer: a
