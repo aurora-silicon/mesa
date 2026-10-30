@@ -5964,3 +5964,60 @@ TEST(NativeForms, HalfMultiplyMaterializationPreservesOtherDomains)
       ralloc_free(mem);
    }
 }
+
+TEST(NativeForms, G17PSignExtendRetainsZeroExtendedWord)
+{
+   for (bool multiply : {false, true}) {
+      for (bool negate : {false, true}) {
+         for (agx_size size : {AGX_SIZE_32, AGX_SIZE_64}) {
+            SCOPED_TRACE(multiply);
+            SCOPED_TRACE(negate);
+            SCOPED_TRACE(size);
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_shader_key key = {};
+            key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+            key.dev.chip = AGX_CHIP_G17P;
+            b->shader->key = &key;
+            agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+            agx_signext_to(b, word, agx_register(0, AGX_SIZE_16));
+            agx_index source = agx_abs(word);
+            source.neg = negate;
+            agx_index out = agx_temp(b->shader, size);
+            agx_instr *use = multiply
+               ? agx_imad_to(b, out, source, agx_register(2, AGX_SIZE_32),
+                             agx_zero(), 0)
+               : agx_iadd_to(b, out, source, agx_register(2, size), 0);
+            agx_unit_test(b, out);
+            agx_optimizer_forward(b->shader);
+            EXPECT_TRUE(agx_is_equiv(use->src[0], word));
+            EXPECT_EQ(use->src[0].size, AGX_SIZE_32);
+            EXPECT_TRUE(use->src[0].abs);
+            EXPECT_EQ(use->src[0].neg, negate);
+            ralloc_free(mem);
+         }
+      }
+   }
+}
+
+TEST(NativeForms, SignExtendSignedConsumersStillFold)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G17P}) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = chip == AGX_CHIP_G13G ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      b->shader->key = &key;
+      agx_index input = agx_register(0, AGX_SIZE_16);
+      agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+      agx_signext_to(b, word, input);
+      agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *use = agx_iadd_to(b, out, word, agx_register(2, AGX_SIZE_32), 0);
+      agx_unit_test(b, out);
+      agx_optimizer_forward(b->shader);
+      EXPECT_TRUE(agx_is_equiv(use->src[0], input));
+      EXPECT_FALSE(use->src[0].abs);
+      ralloc_free(mem);
+   }
+}
