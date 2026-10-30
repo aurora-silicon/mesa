@@ -667,6 +667,19 @@ if with_tests and ld_args_gc_sections.length() > 0
 endif
 
 if with_tests
+  hk_dual_source_gpl_test = executable(
+    'hk-dual-source-gpl',
+    files('tests/hk_dual_source_gpl.c'),
+    include_directories : [
+      inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm, include_directories('.'),
+    ],
+    dependencies : [hk_deps, cc.find_library('vulkan')],
+    # hk_cmd_buffer.h uses GNU void-pointer arithmetic in inline helpers.
+    c_args : [c_msvc_compat_args, '-Wno-pointer-arith'],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   executable(
     'vulkan-xfb-resume',
     files('tests/vulkan_xfb_resume.c'),
