@@ -5455,7 +5455,16 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    bool need_resolve = false;
 
-   const struct hk_rendering_state spill_state = *render;
+   bool has_transient_spill = false;
+   const struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (hk_g17p_transient_spill_device(dev->dev.chip, dev->dev.params.chip_id)) {
+      for (unsigned rt = 0; rt < render->color_att_count; ++rt)
+         has_transient_spill |= render->spill_original[rt] != NULL;
+   }
+
+   struct hk_rendering_state spill_state;
+   if (has_transient_spill)
+      spill_state = *render;
 
    /* Translate render state back to VK for meta */
    VkRenderingAttachmentInfo vk_color_att[HK_MAX_RTS];
@@ -5472,7 +5481,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       vk_color_att[i] = (VkRenderingAttachmentInfo){
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
          .pNext = &vk_color_att_flags[i],
-         .imageView = hk_image_view_to_handle(render->spill_original[i] ?:
+         .imageView = hk_image_view_to_handle(has_transient_spill &&
+                                               render->spill_original[i] ?
+                                               render->spill_original[i] :
                                                render->color_att[i].iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
          .resolveMode = render->g17p_direct_color_resolve
@@ -5536,18 +5547,20 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
 
    hk_sync_end_rendering(cmd);
 
-   for (unsigned rt = 0; rt < spill_state.color_att_count; ++rt) {
-      const struct hk_image_view *original = spill_state.spill_original[rt];
-      const struct hk_attachment *att = &spill_state.color_att[rt];
-      if (!original ||
-          (att->store_op != VK_ATTACHMENT_STORE_OP_STORE &&
-           att->resolve_mode == VK_RESOLVE_MODE_NONE &&
-           !(spill_state.flags & VK_RENDERING_SUSPENDING_BIT)))
-         continue;
-      hk_copy_transient_spill(cmd, original, att->iview, spill_state.area,
-                              spill_state.cr.layers, spill_state.view_mask, true);
-      if (vk_command_buffer_has_error(&cmd->vk))
-         return;
+   if (has_transient_spill) {
+      for (unsigned rt = 0; rt < spill_state.color_att_count; ++rt) {
+         const struct hk_image_view *original = spill_state.spill_original[rt];
+         const struct hk_attachment *att = &spill_state.color_att[rt];
+         if (!original ||
+             (att->store_op != VK_ATTACHMENT_STORE_OP_STORE &&
+              att->resolve_mode == VK_RESOLVE_MODE_NONE &&
+              !(spill_state.flags & VK_RENDERING_SUSPENDING_BIT)))
+            continue;
+         hk_copy_transient_spill(cmd, original, att->iview, spill_state.area,
+                                 spill_state.cr.layers, spill_state.view_mask, true);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return;
+      }
    }
 
    /* Classic upstream submits each render after its predecessor. In
