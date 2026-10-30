@@ -5899,3 +5899,68 @@ TEST(NativeForms, M5OrSelectTracksVectorConversionComponent)
       }
    }
 }
+
+TEST(NativeForms, G17PHalfImmediateMultiplyReachesPacker)
+{
+   for (unsigned multiplier : {6u, 7u, 9u, 11u, 17u, 255u}) {
+      for (bool constant_first : {false, true}) {
+         SCOPED_TRACE(multiplier);
+         SCOPED_TRACE(constant_first);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = AGX_CHIP_G17P;
+         b->shader->key = &key;
+         b->shader->stage = MESA_SHADER_COMPUTE;
+         b->shader->max_reg = 15;
+         agx_index input = agx_register(2, AGX_SIZE_16);
+         agx_index imm = agx_immediate(multiplier);
+         agx_instr *mul = agx_imad_to(
+            b, agx_register(4, AGX_SIZE_16), constant_first ? imm : input,
+            constant_first ? input : imm, agx_zero(), 0);
+         agx_materialize_agx3_alu_constants(b->shader);
+         ASSERT_TRUE(agx_is_equiv(mul->src[0], input));
+         ASSERT_EQ(mul->src[1].type, AGX_INDEX_NORMAL);
+         agx_instr *constant = NULL;
+         agx_foreach_instr_global(b->shader, I) {
+            if (I->nr_dests && agx_is_equiv(I->dest[0], mul->src[1]))
+               constant = I;
+         }
+         ASSERT_NE(constant, nullptr);
+         ASSERT_EQ(constant->op, AGX_OPCODE_MOV_IMM);
+         EXPECT_EQ(constant->imm, multiplier);
+         EXPECT_EQ(constant->dest[0].size, AGX_SIZE_16);
+         /* Stand in for allocation, then check the real register-multiply
+          * encoding rather than accepting only a change in the IR. */
+         constant->dest[0] = agx_register(6, AGX_SIZE_16);
+         mul->src[1] = constant->dest[0];
+         agx_stop(b);
+         util_dynarray binary;
+         util_dynarray_init(&binary, mem);
+         EXPECT_TRUE(agx3_pack_binary(b->shader, &binary));
+         util_dynarray_fini(&binary);
+         ralloc_free(mem);
+      }
+   }
+}
+
+TEST(NativeForms, HalfMultiplyMaterializationPreservesOtherDomains)
+{
+   for (unsigned control = 0; control < 3; ++control) {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = control == 0 ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = control == 0 ? AGX_CHIP_G13G : AGX_CHIP_G17P;
+      b->shader->key = &key;
+      agx_size size = control == 1 ? AGX_SIZE_32 : AGX_SIZE_16;
+      agx_instr *mul = agx_imad_to(b, agx_register(4, size),
+         agx_register(2, size), agx_immediate(7),
+         control == 2 ? agx_immediate(1) : agx_zero(), 0);
+      agx_materialize_agx3_alu_constants(b->shader);
+      EXPECT_EQ(mul->src[1].type, AGX_INDEX_IMMEDIATE);
+      EXPECT_EQ(mul->src[1].value, 7u);
+      ralloc_free(mem);
+   }
+}
