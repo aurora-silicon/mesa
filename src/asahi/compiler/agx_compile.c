@@ -12869,7 +12869,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
     * modes survive that gather and must still reach the AGX3 entry protocol
     * and the draw-time triangle-merge control, even without a surviving quad
     * intrinsic. Keep the AGX2 compilation path unchanged. */
-   if (key->dev.chip == AGX_CHIP_G17P)
+   if (key->dev.chip == AGX_CHIP_G17P && key->dev.shader_quad_control)
       agx_preserve_quad_control(nir);
 
    agx_compiler_debug = agx_get_compiler_debug();

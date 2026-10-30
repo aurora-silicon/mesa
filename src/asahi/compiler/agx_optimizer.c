@@ -1487,6 +1487,7 @@ agx_optimizer_ballot(agx_context *ctx, agx_instr **defs, agx_instr *I)
     */
    if (quad && I->dest[0].size == AGX_SIZE_16 && ctx->key &&
        ctx->key->dev.chip == AGX_CHIP_G17P &&
+       ctx->key->dev.shader_quad_control &&
        (def->op != AGX_OPCODE_ICMP ||
         def->src[1].type != AGX_INDEX_IMMEDIATE || def->src[1].value != 0 ||
         (def->icond != AGX_ICOND_UEQ && def->icond != AGX_ICOND_SEQ)))

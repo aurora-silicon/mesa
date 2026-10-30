@@ -19,9 +19,11 @@ store_result(nir_builder *b, nir_def *v)
 
 TEST(QuadControl, ExecutionModesSurviveInfoRegather)
 {
-   for (bool g17p : {false, true}) {
+   /* The M4 Pro shares the G17P compiler profile, but not this capability. */
+   for (unsigned profile = 0; profile < 3; ++profile) {
+      const bool g17p = profile != 0, quad_control = profile == 1;
       for (unsigned mode = 0; mode < 4; ++mode) {
-         SCOPED_TRACE(::testing::Message() << g17p << ":" << mode);
+         SCOPED_TRACE(::testing::Message() << profile << ":" << mode);
          nir_builder b = nir_builder_init_simple_shader(
             MESA_SHADER_FRAGMENT, &agx_nir_options, "quad execution modes");
          b.shader->info.fs.require_full_quads = mode & 1;
@@ -41,6 +43,7 @@ TEST(QuadControl, ExecutionModesSurviveInfoRegather)
          EXPECT_EQ(b.shader->info.fs.quad_derivatives, bool(mode & 2));
          agx_shader_key key = {};
          key.dev.chip = g17p ? AGX_CHIP_G17P : AGX_CHIP_G14G;
+         key.dev.shader_quad_control = quad_control;
          key.dev.encoding =
             g17p ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX2;
          key.no_preamble = true;
@@ -49,8 +52,8 @@ TEST(QuadControl, ExecutionModesSurviveInfoRegather)
          agx_shader_part part = {};
          ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
          EXPECT_GT(part.info.main_size, 0u);
-         EXPECT_EQ(part.info.needs_quad_derivatives, g17p && mode != 0);
-         EXPECT_EQ(part.info.disable_tri_merging, g17p && mode != 0);
+         EXPECT_EQ(part.info.needs_quad_derivatives, quad_control && mode != 0);
+         EXPECT_EQ(part.info.disable_tri_merging, quad_control && mode != 0);
          free(part.binary);
          ralloc_free(b.shader);
       }
@@ -150,6 +153,7 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
          agx_preprocess_nir_g17p(b.shader);
          agx_shader_key key = {};
          key.dev.chip = AGX_CHIP_G17P;
+         key.dev.shader_quad_control = true;
          key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
          key.no_preamble = true;
          key.reserved_preamble = 8;
@@ -167,12 +171,14 @@ TEST(QuadControl, G17PDivergentQuadInstructions)
 
 TEST(QuadControl, BallotFusionStaysWithinEncodingDomain)
 {
-   for (bool g17p : {false, true}) {
+   for (unsigned profile = 0; profile < 3; ++profile) {
+      const bool g17p = profile != 0, quad_control = profile == 1;
       for (unsigned predicate = 0; predicate < 4; ++predicate) {
          void *mem = ralloc_context(NULL);
          agx_builder *b = agx_test_builder(mem);
          agx_shader_key key = {};
          key.dev.chip = g17p ? AGX_CHIP_G17P : AGX_CHIP_G14G;
+         key.dev.shader_quad_control = quad_control;
          key.dev.encoding =
             g17p ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX2;
          b->shader->key = &key;
@@ -191,7 +197,7 @@ TEST(QuadControl, BallotFusionStaysWithinEncodingDomain)
          agx_optimizer_backward(b->shader);
          agx_optimizer_forward(b->shader);
          agx_dce(b->shader, true);
-         const bool keep_predicate = g17p && predicate != 3;
+         const bool keep_predicate = quad_control && predicate != 3;
          unsigned unfused = 0, fused = 0;
          agx_foreach_instr_global(b->shader, I) {
             unfused += I->op == AGX_OPCODE_QUAD_BALLOT;
