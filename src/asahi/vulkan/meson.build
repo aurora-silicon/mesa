@@ -316,6 +316,20 @@ if with_tests
     suite : ['asahi'],
   )
 
+  test('hk_g17p_color_msaa_compression',
+    executable('hk_g17p_color_msaa_compression_test',
+      files('tests/test-hk-g17p-color-msaa-compression.c'),
+      include_directories : [inc_include, inc_src]), suite : ['asahi'])
+
+  test('hk_g17p_msaa_spill',
+    executable('hk_g17p_msaa_spill_test',
+      files('tests/test-hk-g17p-msaa-spill.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_mesautil, idep_vulkan_util,
+                      idep_vulkan_runtime_headers],
+      link_with : [libasahi_layout, libasahi_lib],
+      gnu_symbol_visibility : 'hidden'), suite : ['asahi'])
+
   test(
     'hk_g16s_compression',
     executable(

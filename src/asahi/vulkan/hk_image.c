@@ -1316,6 +1316,8 @@ hk_can_compress_create_info(const struct agx_device *dev, unsigned plane,
          dev->chip, plane, info, dev->params.features,
          debug_get_option_m5_depth_msaa_compression(),
          debug_get_option_m5_depth_msaa_transfer()) ||
+      hk_g17p_color_msaa_compression_eligible(
+         dev->chip, dev->params.chip_id, plane, info) ||
       m5_storage || hk_hal200_compression_eligible(dev->chip, plane, info,
                                                   agx_is_m4_pro(dev)) ||
       hk_g17p_shared_compression_eligible(dev->chip, plane, info) ||
