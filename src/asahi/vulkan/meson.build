@@ -175,6 +175,11 @@ if with_tests
     suite : ['asahi'],
   )
 
+  test('hk_image_store_forward', executable('hk_image_store_forward_test',
+    files('tests/test-hk-image-store-forward.c', 'hk_nir_forward_image_stores.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
+
   test('hk_root_size', executable('hk_root_size_test',
     files('tests/test-hk-root-size.c', 'hk_nir_root_size.c'),
     include_directories : [include_directories('.'), inc_include, inc_src],
