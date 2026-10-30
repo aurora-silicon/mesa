@@ -4583,6 +4583,9 @@ hk_ensure_cs_has_space(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->end = cs->current + size;
    cs->chunk = T;
    cs->stream_linked |= linked;
+   /* Conservative: G17P re-emits its restart State Update after a link. */
+   if (vdm && hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+      cs->restart_index_set = false;
 }
 
 static void
