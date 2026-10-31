@@ -1927,7 +1927,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       goto fail_fd;
    }
 
-   bool is_asahi = (strcmp(version->name, "asahi") == 0);
+   bool is_asahi = agx_is_native_drm_driver(version->name);
    is_asahi |= strcmp(version->name, "virtio_gpu") == 0;
    drmFreeVersion(version);
 

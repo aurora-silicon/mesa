@@ -859,10 +859,15 @@ agx_open_device(void *memctx, struct agx_device *dev)
          goto fail;
       }
 
-      if (!strcmp(version->name, "asahi")) {
+      if (agx_is_native_drm_driver(version->name)) {
          dev->is_virtio = false;
-         dev->render_rsrc_spec_hi = version->version_major > 0 ||
-                                   version->version_minor >= 2;
+         /* The 0.2 rule describes the "asahi" numbering only. The "aurora"
+          * kernel versions its UAPI separately and gates the high dwords on
+          * DRM_ASAHI_RENDER_RSRC_SPEC_HI per runtime.
+          */
+         dev->render_rsrc_spec_hi =
+            !strcmp(version->name, AGX_DRM_DRIVER_NAME_LEGACY) &&
+            (version->version_major > 0 || version->version_minor >= 2);
          dev->ops = agx_device_drm_ops;
       } else if (!strcmp(version->name, "virtio_gpu")) {
          dev->is_virtio = true;
