@@ -140,6 +140,12 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5)
         * roughness-indexed probe lookup every image-based lighting shader
         * does, SuperTuxKart's IBL.frag included.
         *
+        * On M5 a cube-array comparison takes a per-lane level too: the
+        * packer stages it beside the face and layer exactly as for the colour
+        * cube array (agx3_tex_stage_cube_array_lod), and implicit LOD in a
+        * compute derivative group reaches it that way (txd, then
+        * lower_txd_cube_map's txl).
+        *
         * A cube-array comparison takes a per-lane bias beside its face and
         * layer, as the packer stages it: a Gen4 sampler has no bias field,
         * so G15 hands every depth cube-array texture() its sampler bias this
@@ -148,7 +154,7 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5)
        (cube &&
         (tex->op != nir_texop_tex && tex->op != nir_texop_tg4 && !query_lod &&
          !((!tex->is_shadow || shadow_level_zero ||
-            (!cube_array && level_src >= 0 &&
+            ((!cube_array || m5) && level_src >= 0 &&
              !nir_src_is_const(tex->src[level_src].src))) &&
             tex->op == nir_texop_txl) &&
          !(tex->op == nir_texop_txb &&
