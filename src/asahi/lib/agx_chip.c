@@ -335,24 +335,46 @@ agx_chip_exact_product_name(enum agx_chip chip)
    switch (chip) {
    case AGX_CHIP_G17P:
       return "A18 Pro";
+   case AGX_CHIP_G17D:
+      /* Only the T6050 Ultra reports variant D at generation 17, and its
+       * admission requires that exact two-die contract. */
+      return "M5 Ultra";
    default:
       return NULL;
    }
 }
 
+/*
+ * The experimental M5 contracts, one exact identity and topology per family
+ * member. Every member runs AGX3 (USC3) shaders on the HAL300 firmware
+ * interface. Core masks are not part of the check: binned parts differ only
+ * in them, and every consumer reads them from the parameters.
+ */
 bool
 agx_params_m5_bringup_supported(const struct drm_asahi_params_global *params)
 {
-   if (!params || params->num_dies != 1 ||
-       params->usc_generation != AGX_ISA_AGX3 ||
+   if (!params || params->usc_generation != AGX_ISA_AGX3 ||
        params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_300)
       return false;
 
-   const enum agx_chip chip = agx_chip_from_params(params);
-   return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
-           params->num_clusters_total == 1) ||
-          (chip == AGX_CHIP_G17S && params->chip_id == 0x6050);
-
+   switch (agx_chip_from_params(params)) {
+   case AGX_CHIP_G17G:
+      /* T8142/M5: one die, one cluster. */
+      return params->chip_id == 0x8142 && params->num_dies == 1 &&
+             params->num_clusters_total == 1;
+   case AGX_CHIP_G17S:
+      /* T6050/M5 Pro: one die. */
+      return params->chip_id == 0x6050 && params->num_dies == 1;
+   case AGX_CHIP_G17D:
+      /* T6050/M5 Ultra: two dies of four clusters each, presented as one
+       * logical GPU. chip_id alone cannot tell it from the Pro; the variant
+       * and die count do. Cross-die coherency is not qualified: the AGX2
+       * needs_g13x_coherency path does not apply to AGX3C. */
+      return params->chip_id == 0x6050 && params->num_dies == 2 &&
+             params->num_clusters_total == 8;
+   default:
+      return false;
+   }
 }
 
 bool

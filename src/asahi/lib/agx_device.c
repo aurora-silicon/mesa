@@ -946,6 +946,14 @@ agx_open_device(void *memctx, struct agx_device *dev)
                  dev->params.chip_id, dev->params.num_dies,
                  dev->params.num_clusters_total, dev->params.usc_generation,
                  dev->params.gpu_hal_generation);
+      } else if (agx_chip_g17_m5(dev->chip)) {
+         fprintf(stderr,
+                 "Apple %s (chip %#x, %u dies, %u clusters, USC %u, HAL %u) "
+                 "is admitted only with ASAHI_M5_BRINGUP=1 and its exact M5 "
+                 "contract\n",
+                 agx_chip_name(dev->chip), dev->params.chip_id,
+                 dev->params.num_dies, dev->params.num_clusters_total,
+                 dev->params.usc_generation, dev->params.gpu_hal_generation);
       } else {
          fprintf(stderr,
                  "Apple %s uses the %s command stream, which this driver "
@@ -960,10 +968,12 @@ agx_open_device(void *memctx, struct agx_device *dev)
       goto fail;
    }
 
-   /* The M4 Pro runs as G17P too; it takes the M-series name below. */
-   const char *product = dev->params.chip_id == 0x8140
-                            ? agx_chip_exact_product_name(dev->chip)
-                            : NULL;
+   /* The M4 Pro runs as G17P too; it takes the M-series name below. Other
+    * identities with an exact product name (G17D) take it directly. */
+   const char *product =
+      dev->chip != AGX_CHIP_G17P || dev->params.chip_id == 0x8140
+         ? agx_chip_exact_product_name(dev->chip)
+         : NULL;
    if (product) {
       /* Match the M-series format with the exact GPU codename and revision. */
       snprintf(dev->name, sizeof(dev->name), "Apple %s (%s %02X)", product,
