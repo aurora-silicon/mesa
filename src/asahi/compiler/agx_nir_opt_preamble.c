@@ -66,6 +66,19 @@ def_size_g17p(nir_def *def, unsigned *size, unsigned *align,
  * widens scalar half preamble results the same way), and no half-width
  * copy-to-uniform form is witnessed. Give a scalar 16-bit value its own
  * aligned pair so the export never lands on an odd half. */
+/* A half result takes a whole word, see widen_half_exports(). */
+static void
+def_size_agx3b(nir_def *def, unsigned *size, unsigned *align,
+               nir_preamble_class *class)
+{
+   def_size_g17p(def, size, align, class);
+   if (*class == nir_preamble_class_general && def->num_components == 1 &&
+       def->bit_size <= 16) {
+      *size = 2;
+      *align = 2;
+   }
+}
+
 static void
 def_size_agx3c(nir_def *def, unsigned *size, unsigned *align,
                nir_preamble_class *class)
@@ -301,15 +314,32 @@ instr_cost(nir_instr *instr, const void *data)
    }
 }
 
+/* Uniform slots run out in big shaders. Code under an if may never run, so
+ * divide its claim on them per level: otherwise the many small loads of a
+ * cold branch outbid the vectors every fragment reads, and the shader spills
+ * to hold those. The rewrite cost scales the same way, so this reorders the
+ * candidates without dropping any while slots are free. */
+static float
+execution_weight(const nir_block *block)
+{
+   float weight = 1.0f;
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+      if (node->type == nir_cf_node_if)
+         weight /= 8.0f;
+   }
+   return weight;
+}
+
 static float
 instr_cost_g17p(nir_instr *instr, const void *data)
 {
+   float weight = execution_weight(instr->block);
    if (instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
       if (alu->op == nir_op_fabs && alu->def.bit_size <= 32)
-         return 1.0f;
+         return weight;
    }
-   return instr_cost(instr, data);
+   return instr_cost(instr, data) * weight;
 }
 
 /* G17P's vertex output store reads its 16-bit index from the uniform file
@@ -375,7 +405,12 @@ rewrite_cost(nir_def *def, const void *data)
 static float
 rewrite_cost_g17p(nir_def *def, const void *data)
 {
-   return rewrite_cost_impl(def, true);
+   /* A phi is worth what its arms are, one if deeper than it sits. */
+   float weight = execution_weight(nir_def_block(def));
+   if (nir_def_instr(def)->type == nir_instr_type_phi)
+      weight /= 8.0f;
+
+   return rewrite_cost_impl(def, true) * weight;
 }
 
 /* AGX3C publishes constant-program results with 32-bit uniform copies only
@@ -649,6 +684,44 @@ agx_nir_export_select_flags_as_halves(nir_shader *nir)
    return true;
 }
 
+/* A G17P constant program writes uniforms a word at a time, from an aligned
+ * register pair. A half exported from the top of a pair, or into the top of a
+ * word, cannot be packed, and that refusal costs the shader its whole constant
+ * program. So export every half result as a word with zeroes on top, in the
+ * slot def_size_agx3b() reserved; the main program still reads the low half.
+ */
+static bool
+widen_half_exports(nir_shader *nir)
+{
+   nir_function_impl *pre = nir_shader_get_preamble(nir);
+   bool progress = false;
+
+   nir_foreach_block(block, pre) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble ||
+             nir_intrinsic_preamble_class(intr) != nir_preamble_class_general)
+            continue;
+         nir_def *value = intr->src[0].ssa;
+         if (value->num_components != 1 || value->bit_size > 16)
+            continue;
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_src_rewrite(&intr->src[0],
+                         value->bit_size == 1
+                            ? nir_bcsel(&b, value, nir_imm_int(&b, 1),
+                                        nir_imm_int(&b, 0))
+                            : nir_u2u32(&b, value));
+         progress = true;
+      }
+   }
+
+   nir_foreach_function_impl(impl, nir)
+      nir_progress(impl == pre && progress, impl, nir_metadata_control_flow);
+   return progress;
+}
+
 bool
 agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
                      bool agx3c)
@@ -662,13 +735,15 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
    if (g17p) {
       /* The G17P uniform fabs cost is not an M5 witness; keep the
        * generic instruction cost there. */
-      options.def_size = agx3c ? def_size_agx3c : def_size_g17p;
+      options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
       options.instr_cost_cb = agx3c ? instr_cost : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
    NIR_PASS(progress, nir, nir_opt_preamble, &options, sizes);
    if (progress && g17p)
       NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves);
+   if (progress && g17p && !agx3c)
+      NIR_PASS(_, nir, widen_half_exports);
 
    struct preamble_image heap[512];
    memset(heap, ~0, sizeof(heap));
