@@ -4421,6 +4421,17 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, bind_point);
 }
 
+/* A spill import/export is part of the render operation. Use the same
+ * dependency scope as a render-pass resolve, rather than reclassifying the
+ * work as an application transfer or changing an image's metadata state. */
+void
+hk_cmd_copy_spill(struct hk_cmd_buffer *cmd, const VkCopyImageInfo2 *info)
+{
+   hk_sync_resolve_begin(cmd);
+   hk_xfer_copyimage2(hk_cmd_buffer_to_handle(cmd), info);
+   hk_sync_resolve_end(cmd);
+}
+
 static void
 hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
                         VkDeviceSize offset, VkDeviceSize size, uint32_t data,
