@@ -14,12 +14,34 @@ CTS revision, binary SHA256 and deqp-runner version. Do not mix builds between
 the two driver paths. Do not use an x86 DRM-shim build as a hardware result.
 
 An overlay has `usr/lib64/` or `usr/lib/` with Mesa EGL, GLX, GBM, Gallium,
-Honeykrisp, and relative `dri/asahi_dri.so` and `dri/zink_dri.so` links.
+Honeykrisp, the `gbm/dri_gbm.so` backend, and relative `dri/asahi_dri.so` and
+`dri/zink_dri.so` links.
 `with-mesa.py` checks that its library links remain inside the overlay, creates
 absolute loader JSON files, and overrides library search paths only in the
 child. Native runs unset both driver selectors so the loader selects Asahi.
 Zink runs select Zink and the overlay's Honeykrisp ICD explicitly. Mesa's shader
 cache is disabled by default; `--cache on` explicitly enables it for warm runs.
+
+Package a native aarch64 release build with `DESTDIR` (never a system install):
+
+```sh
+STAGE=$(mktemp -d)
+DESTDIR="$STAGE" meson install -C build --no-rebuild
+python3 src/asahi/tools/native-gl-qualification/make-overlay.py \
+  --stage "$STAGE" --commit "$(git rev-parse HEAD)" --architecture AArch64 \
+  --output /var/tmp/mesa-native-qualification/overlay
+```
+
+Alternatively extract the matching native RPM artifact into a fresh staging
+directory with `rpm2cpio`/`cpio`, then run the same packager with the recorded
+source commit. Select the native artifact, not FEX or source RPMs. The packager
+checks source identity in Gallium/Honeykrisp, ELF architecture and absence of
+LLVM/SPIRV-Tools runtime dependencies, and records SHA256 hashes and dynamic
+dependencies in `MANIFEST.json`. Preserve the original RPM/archive checksums.
+It includes Mesa's license notices from the source tree containing the kit;
+use `--source` if the matching public source is in a different directory.
+Resolve any missing runtime dependencies in the test environment before a run;
+do not mix a different Mesa driver into the overlay to satisfy them.
 
 ```sh
 export KIT=$PWD/src/asahi/tools/native-gl-qualification

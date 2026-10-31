@@ -20,7 +20,7 @@ if len(libs) != 1:
     p.error("overlay must have exactly one Mesa library directory")
 lib = libs[0]
 for name in ("libEGL_mesa.so.0", "libGLX_mesa.so.0", "libgbm.so.1",
-             "libvulkan_asahi.so", "dri/asahi_dri.so", "dri/zink_dri.so"):
+             "libvulkan_asahi.so", "gbm/dri_gbm.so", "dri/asahi_dri.so", "dri/zink_dri.so"):
     path = lib / name
     if not path.is_file() or not path.resolve().is_relative_to(root):
         p.error(f"missing library or symlink escaping overlay: {path}")
