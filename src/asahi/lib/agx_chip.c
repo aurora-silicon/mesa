@@ -77,6 +77,9 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
       case 'G': return AGX_CHIP_G17G;
       case 'S': return AGX_CHIP_G17S;
       case 'C': return AGX_CHIP_G17C;
+      /* M5 Ultra (T6050, two dies). Recognition only: admission checks the
+       * exact topology in agx_params_m5_bringup_supported. */
+      case 'D': return AGX_CHIP_G17D;
       default: return AGX_CHIP_UNKNOWN;
       }
    default:
@@ -108,6 +111,7 @@ agx_chip_isa(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_ISA_AGX3;
 
    case AGX_CHIP_UNKNOWN:
@@ -152,6 +156,7 @@ agx_chip_isa_encoding(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_ISA_ENCODING_AGX3C;
 
    case AGX_CHIP_UNKNOWN:
@@ -183,6 +188,7 @@ agx_chip_submission_model(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_SUBMISSION_MODEL_SKSM;
 
    /* No corresponding accelerator class was present in the Mac corpus. */
@@ -400,6 +406,7 @@ agx_chip_name(enum agx_chip chip)
    case AGX_CHIP_G17G: return "G17G";
    case AGX_CHIP_G17S: return "G17S";
    case AGX_CHIP_G17C: return "G17C";
+   case AGX_CHIP_G17D: return "G17D";
    case AGX_CHIP_UNKNOWN:
    default: return "unknown";
    }

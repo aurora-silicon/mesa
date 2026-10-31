@@ -231,6 +231,7 @@ agxdecode_chip_from_params(const decoder_params *params)
       case 'G': return AGX_CHIP_G17G;
       case 'S': return AGX_CHIP_G17S;
       case 'C': return AGX_CHIP_G17C;
+      case 'D': return AGX_CHIP_G17D;
       default: return AGX_CHIP_UNKNOWN;
       }
    default:
@@ -255,6 +256,7 @@ agxdecode_chip_uses_agx3(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return true;
    default:
       return false;
@@ -278,6 +280,7 @@ agxdecode_chip_name(enum agx_chip chip)
    case AGX_CHIP_G17G: return "G17G";
    case AGX_CHIP_G17S: return "G17S";
    case AGX_CHIP_G17C: return "G17C";
+   case AGX_CHIP_G17D: return "G17D";
    default: return "unknown";
    }
 }
