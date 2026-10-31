@@ -106,6 +106,7 @@ static bool compile(unsigned mode, unsigned variant, unsigned width,
             .scratch_size=MAX2(part.info.scratch_size, part.info.agx3_spectpr_scratch_size),
             .compiler_d_valid=part.info.agx3_staging_known,
             .compiler_d=(uint32_t)part.info.agx3_staging_halfs*2,
+            .num_clusters=2,
          };
          struct agx3_g17p_graphics_program program;
          assert(agx3_g17g_compute_program_generate(AGX_CHIP_G17S,&desc,&program));

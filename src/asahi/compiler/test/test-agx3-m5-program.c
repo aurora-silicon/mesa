@@ -5,6 +5,8 @@
 #include "agx3_copy_core.h"
 #include "agx3_binder.h"
 #include "asahi/lib/agx_ioto_program_core.h"
+#include "asahi/lib/agx_ioto_load_core.h"
+#include "asahi/lib/agx_bytes.h"
 #include "agx3_ioto_load_packer.h"
 #include "agx3_cprog_input.h"
 #include "asahi/lib/agx_ioto_preshader_core.h"
@@ -23,6 +25,24 @@
          return 1;                                                             \
       }                                                                        \
    } while (0)
+
+/* The cluster counts of the admitted M5 contracts: the profile loader's
+ * helper-table base follows the device topology, not the chip name. */
+/* The profile loader's LDIMM (destination r0, at program +28 + 16) loading
+ * the byte offset `base` of the helper-table group, encoded independently of
+ * the composer. */
+static uint64_t
+loader_ldimm(uint32_t base)
+{
+   return agx_ioto_load_ldimm_long_dest(0) |
+          agx_ioto_load_ldimm_long_immediate(base);
+}
+
+static unsigned
+test_clusters(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17D ? 8 : chip == AGX_CHIP_G17S ? 2 : 1;
+}
 
 static int
 test_g17g_programs(enum agx_chip chip)
@@ -47,6 +67,7 @@ test_g17g_programs(enum agx_chip chip)
          .compiler_d = fragment ? 0 : 32,
          .fragment = fragment,
          .imageblock = { .sample_size_B = 8, .nr_samples = 1, .tile_size_px = 1024 },
+         .num_clusters = test_clusters(chip),
       };
       struct agx3_g17p_graphics_program output;
       size_t empty_bound;
@@ -57,8 +78,28 @@ test_g17g_programs(enum agx_chip chip)
                                                  &output));
       CHECK(output.length == (fragment ? 90 : 84));
       CHECK(memcmp(output.bytes, expected_tail[fragment], 28) == 0);
-      CHECK(output.bytes[48] == (fragment ? 4 : 8) *
-            (chip == AGX_CHIP_G17S ? 2 : 1));
+      CHECK(agx_load_le64(output.bytes + 44) ==
+            loader_ldimm((fragment ? 0x100 : 0x200) * test_clusters(chip)));
+      {
+         /* The topology, not the chip, selects the table base, and composing
+          * without it fails closed. */
+         struct agx3_g17p_graphics_program_desc other = desc;
+         struct agx3_g17p_graphics_program other_output;
+         other.num_clusters = 0;
+         CHECK(!agx3_g17g_graphics_program_generate(chip, &other,
+                                                     &other_output));
+         other.num_clusters = 8;
+         CHECK(agx3_g17g_graphics_program_generate(chip, &other,
+                                                    &other_output));
+         CHECK(other_output.length == output.length);
+         /* Eight clusters: 0x800/0x1000, past the raw bytes the smaller
+          * bases happen to share with their immediate fields. */
+         CHECK(agx_load_le64(other_output.bytes + 44) ==
+               loader_ldimm(fragment ? 0x800 : 0x1000));
+         CHECK(!memcmp(other_output.bytes, output.bytes, 44));
+         CHECK(!memcmp(other_output.bytes + 52, output.bytes + 52,
+                       output.length - 52));
+      }
 
 
       {
@@ -227,7 +268,8 @@ test_g17g_programs(enum agx_chip chip)
          CHECK(output.length == 84);
          CHECK(!memcmp(output.bytes, expected_tail[0], 8));
          CHECK(!memcmp(output.bytes + 8, expected_tail[1] + 8, 20));
-         CHECK(output.bytes[28 + 20] == (chip == AGX_CHIP_G17S ? 8 : 4));
+         CHECK(agx_load_le64(output.bytes + 28 + 16) ==
+               loader_ldimm(0x100 * test_clusters(chip)));
          static const uint8_t end[] = {14, 0, 0, 0};
          CHECK(!memcmp(output.bytes + 80, end, sizeof(end)));
 
@@ -533,6 +575,7 @@ test_multiround_uniforms(enum agx_chip chip)
       .shader_binary_size = 128, .nr_gprs = 16,
       .compiler_d_valid = true, .uniform_ranges = ranges,
       .uniform_range_count = ARRAY_SIZE(ranges), .patchable = true,
+      .num_clusters = test_clusters(chip),
    };
    struct agx3_g17p_graphics_program_template first, moved;
    CHECK(agx3_g17g_compute_program_template_generate(chip, &desc, &first));
@@ -751,14 +794,20 @@ test_flat_shading_vertex(void)
 int main(void) {
    int r = test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
            test_load_completion_wait(AGX_CHIP_G17S) ||
+           test_load_completion_wait(AGX_CHIP_G17D) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||
            test_multiround_uniforms(AGX_CHIP_G17S) ||
+           test_multiround_uniforms(AGX_CHIP_G17D) ||
            test_cprog_input_bound(AGX_CHIP_G17G) ||
            test_cprog_input_bound(AGX_CHIP_G17S) ||
+           test_cprog_input_bound(AGX_CHIP_G17D) ||
            test_color_disabled() || test_visibility() || test_line_width() || test_polygon_and_primitive_msaa() || test_g17g_programs(AGX_CHIP_G17G) || test_g17g_programs(AGX_CHIP_G17S) ||
+           test_g17g_programs(AGX_CHIP_G17D) ||
            test_m5_dispatch(AGX_CHIP_G17G) || test_m5_dispatch(AGX_CHIP_G17S) ||
+           test_m5_dispatch(AGX_CHIP_G17D) ||
            test_m5_single_kick_launch(AGX_CHIP_G17G) ||
-           test_m5_single_kick_launch(AGX_CHIP_G17S);
+           test_m5_single_kick_launch(AGX_CHIP_G17S) ||
+           test_m5_single_kick_launch(AGX_CHIP_G17D);
    if (!r) puts("M5_PROGRAM_DISPATCH_PASS");
    return r;
 }

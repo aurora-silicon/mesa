@@ -559,6 +559,7 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
          .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
          .fragment = true,
          .imageblock = imageblock,
+         .num_clusters = dev->dev.params.num_clusters_total,
       };
       if (!hk_agx3_g17p_basic_graphics_program_generate(
              dev->dev.chip, &desc, &empty_program) ||
@@ -1434,6 +1435,7 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
             .nr_samples = key->tib.nr_samples,
             .tile_size_px = key->tib.tile_size,
          },
+         .num_clusters = dev->dev.params.num_clusters_total,
       };
       struct hk_agx3_g17p_graphics_program program;
       if (!hk_agx3_g17p_basic_graphics_program_generate(dev->dev.chip, &desc,
@@ -2284,6 +2286,7 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
       .uniform_ranges = ranges,
       .uniform_range_count = range_count,
+      .num_clusters = dev->dev.params.num_clusters_total,
    };
    struct agx3_g17p_graphics_program program;
    if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
@@ -2398,6 +2401,7 @@ hk_build_m5_empty_bg_eot(struct hk_cmd_buffer *cmd,
       .fragment = true,
       .imageblock = {key->tib.sample_size_B, MAX2(key->tib.nr_samples, 1),
                      key->tib.tile_size},
+      .num_clusters = dev->dev.params.num_clusters_total,
    };
    struct agx3_g17p_graphics_program program;
    if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
@@ -2597,6 +2601,7 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
       .uniform_ranges = ranges,
       .uniform_range_count = range_count,
+      .num_clusters = dev->dev.params.num_clusters_total,
    };
    struct agx3_g17p_graphics_program program;
    if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||

@@ -1667,6 +1667,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       .compiler_d = (uint32_t)prog->info.agx3_staging_halfs * 2,
       .threadgroup_memory_size_B = prog->info.local_size
          ? MAX2(256u, ALIGN_POT(prog->info.local_size, 64u)) : 0,
+      .num_clusters = dev->dev.params.num_clusters_total,
    };
    struct agx3_g17p_graphics_program program;
    struct agx3_g17p_native_compute_program_desc launch_desc = {
@@ -2009,6 +2010,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                          (uint32_t)s->b.info.agx3_preamble_staging_halfs * 2),
       .threadgroup_memory_size_B = s->b.info.local_size
          ? MAX2(256u, ALIGN_POT(s->b.info.local_size, 64u)) : 0,
+      .num_clusters = dev->dev.params.num_clusters_total,
    };
    if (s->b.info.has_preamble) {
       reason = "native constant-program extent";

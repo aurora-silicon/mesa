@@ -956,15 +956,50 @@ type0_tail_records_valid(enum agx_chip chip,
    return offset == packed_tail->length;
 }
 
+/*
+ * The profile loader's LDIMM at +16 loads the byte offset B of the helper-table
+ * group the stage calls; the loader then calls USC window + B + 16 * SR14, with
+ * SR14 = 16 * cluster + core slot, so cluster c's 0x100-byte table is at
+ * B + 0x100 * c. agx3_build_m5_container_lead() places one table per cluster
+ * for each of two stage groups: every stage but vertex (fragment, tile,
+ * compute, mesh, object) calls the group at clusters * 0x100, vertex the group
+ * at 2 * clusters * 0x100.
+ * That reproduces every witness: G17G (one cluster) 0x100/0x200, G17S (two)
+ * 0x200/0x400, and G17P's single-cluster GPU0 prefix, whose table at 0x100
+ * loads 0x100. Their raw words at +20 (4/8/16) are the LDIMM's scattered
+ * immediate fields, not the offset in 64-byte units: G17D's 0x800/0x1000 must
+ * go through the packer (raw 32/64 decode to 0 and set a non-immediate field).
+ *
+ * G17D numbers its eight clusters densely, 0..7 across both dies: an M5 Ultra
+ * compute dispatch passes with tables at the dense slots and none beyond.
+ */
+static uint32_t
+m5_profile_loader_table_base(unsigned clusters, bool fragment)
+{
+   return (fragment ? 1u : 2u) * clusters * 0x100u;
+}
+
+/* Replaces the immediate of the 8-byte LDIMM at `ldimm`, keeping its
+ * destination fields. */
+static void
+m5_profile_loader_set_table_base(uint8_t *ldimm, uint32_t base)
+{
+   const uint64_t immediate = agx_ioto_load_ldimm_long_immediate(UINT32_MAX);
+   agx_store_le64(ldimm, (agx_load_le64(ldimm) & ~immediate) |
+                         agx_ioto_load_ldimm_long_immediate(base));
+}
+
 static bool
 m5_no_resource_program_compose(
-   enum agx_chip chip, uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
+   unsigned clusters, uint64_t program_va,
+   const struct agx_ioto_state_tail_output *packed_tail,
    bool fragment, void *output, size_t capacity, size_t *written)
 {
    const size_t size = fragment
       ? AGX_IOTO_G17G_FRAGMENT_NO_RESOURCE_PROGRAM_SIZE
       : AGX_IOTO_G17G_VERTEX_NO_RESOURCE_PROGRAM_SIZE;
-   if (!output || !written ||
+   if (!output || !written || clusters == 0 ||
+       clusters > DRM_ASAHI_MAX_CLUSTERS ||
        !type0_tail_records_valid(AGX_CHIP_G17G, packed_tail) ||
        program_va == 0 || program_va > UINT64_C(0x1000000000000) - size ||
        (program_va & (AGX_IOTO_PROGRAM_ALIGNMENT - 1)) != 0 || capacity < size)
@@ -983,8 +1018,8 @@ m5_no_resource_program_compose(
                                                 sizeof(staged) - offset))
       return false;
 
-   staged[offset + 20] = (fragment ? 4 : 8) *
-                         (chip == AGX_CHIP_G17S ? 2 : 1);
+   m5_profile_loader_set_table_base(
+      staged + offset + 16, m5_profile_loader_table_base(clusters, fragment));
    offset += AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
    if (fragment) {
       static const uint8_t pixrel[] = {0x9f, 0x17, 0x00, 0x04, 0x00, 0x00};
@@ -1003,7 +1038,8 @@ m5_no_resource_program_compose(
 
 bool
 agx_ioto_m5_resource_program_compose_classes(
-   enum agx_chip chip, uint64_t program_va, const void *body, size_t body_size,
+   enum agx_chip chip, unsigned clusters, uint64_t program_va,
+   const void *body, size_t body_size,
    const struct agx_ioto_state_tail_output *packed_tail,
    enum agx_ioto_g17g_program_stage stage, unsigned colour_classes,
    void *output, size_t capacity, size_t *written)
@@ -1028,7 +1064,8 @@ agx_ioto_m5_resource_program_compose_classes(
    uint8_t base[AGX_IOTO_G17G_FRAGMENT_NO_RESOURCE_PROGRAM_SIZE];
    size_t base_size;
    if (!m5_no_resource_program_compose(
-          chip, program_va, packed_tail, stage != AGX_IOTO_G17G_PROGRAM_VERTEX,
+          clusters, program_va, packed_tail,
+          stage != AGX_IOTO_G17G_PROGRAM_VERTEX,
           base, sizeof(base), &base_size))
       return false;
 

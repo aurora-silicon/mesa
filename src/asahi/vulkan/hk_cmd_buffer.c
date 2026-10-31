@@ -3220,6 +3220,8 @@ hk_g17p_graphics_program_desc_init(
          .nr_samples = cmd->state.gfx.render.tilebuffer.nr_samples,
          .tile_size_px = cmd->state.gfx.render.tilebuffer.tile_size,
       },
+      .num_clusters =
+         hk_cmd_buffer_device(cmd)->dev.params.num_clusters_total,
    };
 
    /* Attachmentless discard never resolves a raster sample count. Its inert
@@ -3302,6 +3304,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .compiler_d = linked->b.g17p_compiler_d,
       .threadgroup_memory_size_B = dev->dev.chip == AGX_CHIP_G17P && object
                                     ? 0 : s->b.info.local_size,
+      .num_clusters = dev->dev.params.num_clusters_total,
    };
    size_t bound;
    if (!(dev->dev.chip == AGX_CHIP_G17P

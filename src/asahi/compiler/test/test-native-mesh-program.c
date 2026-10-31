@@ -25,11 +25,15 @@ int main(void)
       d.program_va = UINT64_C(0x10000128000);d.shader_va=c.shader;
       d.shader_binary_size=c.binary_size;d.scratch_size=c.scratch;
       d.nr_gprs=32;d.compiler_d_valid=true;d.compiler_d=c.compiler_d;
-      d.threadgroup_memory_size_B=c.shared;
+      d.threadgroup_memory_size_B=c.shared;d.num_clusters=2;
       struct agx3_g17p_graphics_program p = {0};
       assert(agx3_g17g_mesh_program_generate(AGX_CHIP_G17S,&d,c.object,&p));
       assert(p.length>=28);assert(memcmp(p.bytes,c.tail,28)==0);
       assert(!agx3_g17g_mesh_program_generate(AGX_CHIP_G17P,&d,c.object,&p));
+      /* Mesh stays G17S-only until it is qualified on the Ultra. */
+      d.num_clusters=8;
+      assert(!agx3_g17g_mesh_program_generate(AGX_CHIP_G17D,&d,c.object,&p));
+      d.num_clusters=2;
       d.fragment=true;
       assert(!agx3_g17g_mesh_program_generate(AGX_CHIP_G17S,&d,c.object,&p));
    }

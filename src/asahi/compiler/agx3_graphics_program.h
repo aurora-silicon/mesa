@@ -79,6 +79,11 @@ struct agx3_g17p_graphics_program_desc {
     * resource accounting; a zero extent preserves the absent END suffix. */
    struct agx_ioto_constant_program constant_program;
    const struct agx3_cprog_inputs *cprog_inputs;
+
+   /* M5 only: the device's cluster count (params.num_clusters_total). The
+    * profile loader addresses per-cluster helper tables in the code container
+    * built for that count, so M5 composition refuses zero. G17P ignores it. */
+   unsigned num_clusters;
 };
 
 struct agx3_g17p_graphics_program {

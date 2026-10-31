@@ -103,7 +103,7 @@ static void compile(unsigned mode,unsigned count,unsigned width,unsigned flags,
    .uniform_ranges=mode==1?&range:NULL,.uniform_range_count=mode==1,
    .shader_binary_size=part.info.main_size,.nr_gprs=part.info.nr_gprs,
    .scratch_size=MAX2(part.info.scratch_size,part.info.agx3_spectpr_scratch_size),
-   .compiler_d_valid=part.info.agx3_staging_known,.compiler_d=(uint32_t)part.info.agx3_staging_halfs*2};
+   .compiler_d_valid=part.info.agx3_staging_known,.compiler_d=(uint32_t)part.info.agx3_staging_halfs*2,.num_clusters=2};
   struct agx3_g17p_graphics_program program;assert(agx3_g17g_compute_program_generate(AGX_CHIP_G17S,&desc,&program));
   snprintf(name,sizeof(name),"%s/form-%u-%u-%u-%u.program",dir,mode,count,width,flags);write_file(name,program.bytes,program.length);
   struct agx3_g17p_native_compute_program_desc ld={.program_va=desc.program_va,.shader_va=desc.shader_va};
@@ -168,7 +168,7 @@ static void candidate_packet(const char *dir)
    .uniform_ranges=NULL,.uniform_range_count=0,
    .shader_binary_size=part.info.main_size,.nr_gprs=part.info.nr_gprs,
    .scratch_size=MAX2(part.info.scratch_size,part.info.agx3_spectpr_scratch_size),
-   .compiler_d_valid=part.info.agx3_staging_known,.compiler_d=(uint32_t)part.info.agx3_staging_halfs*2};
+   .compiler_d_valid=part.info.agx3_staging_known,.compiler_d=(uint32_t)part.info.agx3_staging_halfs*2,.num_clusters=2};
   struct agx3_g17p_graphics_program program;assert(agx3_g17g_compute_program_generate(AGX_CHIP_G17S,&desc,&program));
   snprintf(name,sizeof(name),"%s/candidate-packet.program",dir);write_file(name,program.bytes,program.length);
   struct agx3_g17p_native_compute_program_desc ld={.program_va=desc.program_va,.shader_va=desc.shader_va};
