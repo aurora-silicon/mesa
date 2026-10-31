@@ -491,7 +491,8 @@ agx3_g17s_minimal_compute_program_prepare(
 }
 
 /* Narrow production condition for the independently witnessed G17S minimal
- * root-uniform program.  This does not imply chip-wide Ioto load readiness. */
+ * root-uniform program.  This does not imply chip-wide Ioto load readiness.
+ * G17D stays out: the witness embeds G17S's two-cluster profile loader. */
 static bool
 agx3_g17s_minimal_compute_dispatch_ready(enum agx_chip chip)
 {

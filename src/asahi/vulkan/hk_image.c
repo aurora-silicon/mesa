@@ -564,6 +564,8 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
 
+   /* Qualified on G17S only; G17D keeps uncompressed storage images until
+    * its own hardware qualification. */
    if (dev->chip != AGX_CHIP_G17S || plane ||
        (info->pNext && !format_list_only) ||
        (info->flags & ~allowed_flags) ||

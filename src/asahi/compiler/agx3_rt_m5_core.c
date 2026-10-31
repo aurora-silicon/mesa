@@ -198,6 +198,10 @@ agx3_rt_m5_ift_entry_generate(
 
    /* Keep the complete native call setup, including the SR14 read. LDSHDR
     * alone is not the end of this entry program. */
+   /* 1024 is the profile helper-table base of G17S's two-cluster code
+    * container (2 * clusters * 0x100); G17D's eight-cluster container puts
+    * it at 0x1000. This fixed entry has no topology input and no driver
+    * caller, and is checked on G17S only. */
    for (unsigned i = 0; i < 3; ++i) {
       const unsigned dest = i == 1 ? 0 : 2;
       const unsigned value = i == 0 ? 0 : i == 1 ? 1024 : 256;

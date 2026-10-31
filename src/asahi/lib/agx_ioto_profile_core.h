@@ -37,7 +37,9 @@ agx_ioto_profile_control_pack(const struct agx_ioto_profile_control *profile,
                               uint8_t out[AGX_IOTO_PROFILE_CONTROL_MAX_SIZE]);
 
 /* Exact minimal-profile loader emitted by G17S after the state tail.  A
- * zero-payload SETPROFILECTL is not an equivalent encoding. */
+ * zero-payload SETPROFILECTL is not an equivalent encoding.  Its LDIMM at +16
+ * holds G17S's two-cluster helper-table base (byte offset 0x200); a caller
+ * composing for another topology replaces that immediate. */
 bool agx_ioto_g17s_minimal_profile_loader_pack(
    void *output, size_t capacity);
 

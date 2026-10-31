@@ -3843,6 +3843,7 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
    const unsigned samples = render->tilebuffer.nr_samples;
    const bool msaa = samples > 1;
+   /* MSAA pass merging is qualified on G17S only (not yet on G17D). */
    const bool msaa_enabled = msaa && dev->dev.chip == AGX_CHIP_G17S &&
       (samples == 2 || samples == 4) &&
       debug_get_option_m5_msaa_pass_merge();
