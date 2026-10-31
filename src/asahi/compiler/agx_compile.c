@@ -6058,6 +6058,23 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          I->src[1] = tmp;
       }
 
+      /* G17P has a register half multiply, but its immediate half form
+       * requires an addend. Keep a pure half multiply in the witnessed
+       * register domain instead of passing an unencodable immediate to the
+       * packer. The low-half product has the same modulo-2^16 value. */
+      if (ctx->key->dev.chip == AGX_CHIP_G17P &&
+          I->op == AGX_OPCODE_IMAD && I->nr_dests == 1 && I->nr_srcs == 3 &&
+          I->dest[0].size == AGX_SIZE_16 && I->shift == 0 && !I->saturate &&
+          agx_channels(I->dest[0]) == 1 &&
+          I->src[0].size == AGX_SIZE_16 && agx_channels(I->src[0]) == 1 &&
+          !I->src[0].abs && !I->src[0].neg &&
+          I->src[1].type == AGX_INDEX_IMMEDIATE &&
+          I->src[1].value <= UINT8_MAX &&
+          !I->src[1].abs && !I->src[1].neg &&
+          I->src[2].type == AGX_INDEX_IMMEDIATE &&
+          I->src[2].value == 0 && !I->src[2].abs && !I->src[2].neg)
+         I->src[1] = agx_mov_imm(&b, 16, I->src[1].value);
+
       /* Neither register nor immediate multiplication has a grounded
        * negative immediate addend. Split a * b - byte into the native
        * pure multiply followed by subtract-immediate, with the same

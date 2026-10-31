@@ -1578,13 +1578,21 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
  * Fuse sign-extends into addition-like instructions:
  */
 static void
-agx_optimizer_signext(agx_instr **defs, agx_instr *I)
+agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
    agx_foreach_ssa_src(I, s) {
       agx_index src = I->src[s];
       agx_instr *def = defs[src.value];
 
       if (def == NULL || def->op != AGX_OPCODE_SIGNEXT)
+         continue;
+
+      /* Integer abs means zero extension. Keep the intermediate signed
+       * word when G17P later zero-extends it: narrowing that operand would
+       * change the value for negative halves. The native legalization pass
+       * already knows how to materialize SIGNEXT without a signed-half
+       * source modifier. */
+      if (ctx->key && ctx->key->dev.chip == AGX_CHIP_G17P && src.abs)
          continue;
 
       agx_replace_src(I, s, def->src[0]);
@@ -1660,7 +1668,7 @@ agx_optimizer_forward(agx_context *ctx)
       } else if (I->op == AGX_OPCODE_BITOP) {
          agx_optimizer_bitop(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
-         agx_optimizer_signext(defs, I);
+         agx_optimizer_signext(ctx, defs, I);
       }
    }
 
