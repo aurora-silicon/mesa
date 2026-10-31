@@ -121,14 +121,7 @@ agx_vdm_state_update_unpack(enum agx_chip chip, const void *bytes, size_t size,
 static bool
 agx_vdm_state_update_is_hal300(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_hal300(chip);
 }
 
 /*

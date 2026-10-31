@@ -26,6 +26,9 @@ store_u16(uint8_t *bytes, uint16_t value)
 enum agx_ioto_load_encoding
 agx_ioto_load_target_encoding(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return AGX_IOTO_LOAD_ENCODING_GPU1;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -36,10 +39,6 @@ agx_ioto_load_target_encoding(enum agx_chip chip)
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
       return AGX_IOTO_LOAD_ENCODING_GPU0;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_IOTO_LOAD_ENCODING_GPU1;
    default:
       return AGX_IOTO_LOAD_ENCODING_UNSUPPORTED;
    }

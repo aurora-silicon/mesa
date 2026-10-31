@@ -508,6 +508,9 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
       }
    }
 
+   if (agx_chip_hal300(chip))
+      return 0;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -519,9 +522,6 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
    case AGX_CHIP_G17A:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return 0;
    default:
       break;
@@ -553,6 +553,11 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
     * legacy genxml packet below: that packet is AGX2 and has a different
     * opcode/field layout.  Keep the unwitnessed G16P/G17A identities closed
     * instead of guessing from their neighbouring families. */
+   if (agx_chip_hal300(chip)) {
+      *out++ = 0x21000960u;
+      return out;
+   }
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -562,9 +567,6 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       *out++ = 0x21000960u;
       return out;
 

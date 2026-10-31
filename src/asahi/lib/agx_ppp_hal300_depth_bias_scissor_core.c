@@ -37,15 +37,7 @@ unpack_base(const uint8_t *src, uint64_t *base)
 bool
 agx_ppp_hal300_depth_bias_scissor_core_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-
-   default:
-      return false;
-   }
+   return agx_chip_hal300(chip);
 }
 
 bool

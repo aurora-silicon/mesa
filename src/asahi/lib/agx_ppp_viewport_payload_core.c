@@ -12,6 +12,12 @@ static bool
 agx_ppp_viewport_header_layout(enum agx_chip chip, uint32_t *base_header,
                                unsigned *count_shift)
 {
+   if (agx_chip_hal300(chip)) {
+      *base_header = AGX_PPP_VIEWPORT_PAYLOAD_GEN7_BASE_HEADER;
+      *count_shift = 14;
+      return true;
+   }
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -23,13 +29,6 @@ agx_ppp_viewport_header_layout(enum agx_chip chip, uint32_t *base_header,
    case AGX_CHIP_G17P:
       *base_header = AGX_PPP_VIEWPORT_PAYLOAD_GEN6_BASE_HEADER;
       *count_shift = 12;
-      return true;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      *base_header = AGX_PPP_VIEWPORT_PAYLOAD_GEN7_BASE_HEADER;
-      *count_shift = 14;
       return true;
 
    default:

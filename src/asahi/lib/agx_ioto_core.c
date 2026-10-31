@@ -197,6 +197,9 @@ static const struct agx_ioto_form agx_ioto_gpu1_forms[] = {
 static enum agx_ioto_encoding
 agx_ioto_target_encoding(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return AGX_IOTO_ENCODING_GPU1;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -207,10 +210,6 @@ agx_ioto_target_encoding(enum agx_chip chip)
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
       return AGX_IOTO_ENCODING_GPU0;
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return AGX_IOTO_ENCODING_GPU1;
    default:
       return AGX_IOTO_ENCODING_UNSUPPORTED;
    }

@@ -11,6 +11,11 @@
 static bool
 agx_ppp_w_clamp_cull2_header(enum agx_chip chip, uint32_t *header)
 {
+   if (agx_chip_hal300(chip)) {
+      *header = AGX_PPP_W_CLAMP_CULL2_GEN7_HEADER;
+      return true;
+   }
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -21,12 +26,6 @@ agx_ppp_w_clamp_cull2_header(enum agx_chip chip, uint32_t *header)
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
       *header = AGX_PPP_W_CLAMP_CULL2_GEN6_HEADER;
-      return true;
-
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      *header = AGX_PPP_W_CLAMP_CULL2_GEN7_HEADER;
       return true;
 
    default:

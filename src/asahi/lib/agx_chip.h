@@ -178,6 +178,38 @@ agx_chip_native_agx3(enum agx_chip chip)
           chip == AGX_CHIP_G16G || chip == AGX_CHIP_G17P;
 }
 
+/*
+ * Whether a chip's command-stream records use the HAL300 (Gen7) formats: the
+ * M5 G/S/C/D classes.  Packers and decoders ask this instead of listing chips.
+ *
+ * Written as a comparison so OpenCL (libagx) can use it too; it must agree
+ * with agx_chip_command_stream_generation() == HAL300, and the chip-table
+ * test pins that.
+ */
+static inline bool
+agx_chip_hal300(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
+}
+
+/*
+ * The M5 family Honeykrisp's M5 runtime paths drive: AGX3C instructions and
+ * HAL300 command formats, with an exact admission contract per member
+ * (agx_params_m5_bringup_supported).  G17C shares the formats but has no
+ * admission contract and stays outside.
+ *
+ * Membership is identity, not topology.  Code that depends on cluster or die
+ * count reads the device parameters; features qualified on one member only
+ * test that member.
+ */
+static inline bool
+agx_chip_g17_m5(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
+          chip == AGX_CHIP_G17D;
+}
+
 /* The chip whose record encodings GPU-generated (libagx) command-stream
  * records use.  Every native chip shares G17P's VDM records, so naming that
  * one family keeps the precompiled kernels independent of the native chip. */
@@ -561,13 +593,6 @@ bool agx_params_m5_bringup_supported(
    const struct drm_asahi_params_global *params);
 
 bool agx_chip_uses_legacy_precompiled_programs(enum agx_chip chip);
-
-/* M5 variants sharing the AGX3C instruction and HAL300 command formats. */
-static inline bool
-agx_chip_g17_m5(enum agx_chip chip)
-{
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S;
-}
 
 /* Stable name for diagnostics, e.g. "G15X". Never NULL. */
 const char *agx_chip_name(enum agx_chip chip);

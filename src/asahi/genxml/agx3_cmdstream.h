@@ -131,6 +131,9 @@ agx3_cmdstream_load_le32(const uint8_t *src)
 static inline bool
 agx3_cdm_launch_target_grounded(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return true;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -140,9 +143,6 @@ agx3_cdm_launch_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return true;
    default:
       return false;
@@ -155,6 +155,9 @@ agx3_cdm_launch_target_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return true;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -164,9 +167,6 @@ agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return true;
    default:
       return false;
@@ -179,6 +179,9 @@ agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return true;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -188,9 +191,6 @@ agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return true;
    default:
       return false;
@@ -204,6 +204,9 @@ agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
 static inline bool
 agx3_cdm_stream_link_target_grounded(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return true;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -213,9 +216,6 @@ agx3_cdm_stream_link_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return true;
    default:
       return false;
@@ -560,6 +560,9 @@ agx3_cdm_link_padding_unpack(
 static inline bool
 agx3_cdm_barrier_target_grounded(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return true;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -569,9 +572,6 @@ agx3_cdm_barrier_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return true;
    default:
       return false;
@@ -584,14 +584,7 @@ agx3_cdm_barrier_flags_grounded(enum agx_chip chip, uint8_t flags)
    if (!agx3_cdm_barrier_target_grounded(chip) || flags > 0xf)
       return false;
 
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return flags == 0 || flags == 0x5;
-   }
+   return agx_chip_hal300(chip) || flags == 0 || flags == 0x5;
 }
 
 /* The wide-visibility barrier forms are witnessed in the G15S (AGXG15SDevice)
@@ -634,6 +627,9 @@ agx3_cdm_barrier_flush_memory_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   /* G17D (M5 Ultra) is HAL300 too, and runs its desktop and conformance
+    * runs with this record. */
+   case AGX_CHIP_G17D:
       return true;
    default:
       return false;
@@ -813,8 +809,7 @@ agx3_cdm_substream_barrier_unpack(
 static inline bool
 agx3_cdm_secondary_barrier_target_grounded(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+   return agx_chip_hal300(chip);
 }
 
 static inline bool

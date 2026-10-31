@@ -25,6 +25,9 @@
 static bool
 agx_vdm_tessellate_direct_target_supported(enum agx_chip chip)
 {
+   if (agx_chip_hal300(chip))
+      return true;
+
    switch (chip) {
    case AGX_CHIP_G15G:
    case AGX_CHIP_G15S:
@@ -34,9 +37,6 @@ agx_vdm_tessellate_direct_target_supported(enum agx_chip chip)
    case AGX_CHIP_G16S:
    case AGX_CHIP_G16C:
    case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
       return true;
 
    case AGX_CHIP_G13G:

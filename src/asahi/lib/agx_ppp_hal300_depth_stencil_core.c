@@ -26,22 +26,14 @@
  * homologous G16 path at 0x213e49834..0x213e498b8 instead stages front
  * stencil before back face, proving the HAL300-only adjacent-word swap.
  *
- * The three admitted chip identities are the HAL300 G17 GPU classes covered
- * by the G17G/G17X plugin witnesses.  This codec neither emits the surrounding
+ * The admitted chip identities are the HAL300 G17 GPU classes
+ * (agx_chip_hal300).  This codec neither emits the surrounding
  * VDM PPP pointer nor admits a device or advertises a feature.
  */
 static bool
 agx_ppp_hal300_depth_stencil_core_supported(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-
-   default:
-      return false;
-   }
+   return agx_chip_hal300(chip);
 }
 
 bool
