@@ -7904,6 +7904,8 @@ agx_nir_preserve_position_order(nir_shader *nir)
    }
    util_dynarray_fini(&state.todo);
    _mesa_set_destroy(state.seen, NULL);
+   /* Only ALU math-control flags changed: every analysis stays valid. */
+   nir_shader_preserve_all_metadata(nir);
    return progress;
 }
 
