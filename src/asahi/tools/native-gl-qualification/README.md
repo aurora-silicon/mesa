@@ -77,7 +77,7 @@ mkdir -p "$LISTS"
 for suite in gles2 gles3 gles31; do
   (
     cd "$CTS/modules/$suite"
-    python3 "$KIT/with-mesa.py" --overlay "$OVERLAY" --driver native -- \
+    EGL_PLATFORM=surfaceless python3 "$KIT/with-mesa.py" --overlay "$OVERLAY" --driver native -- \
       "./deqp-$suite" --deqp-runmode=txt-caselist
     sed -n 's/^TEST: //p' "dEQP-$(echo "$suite" | tr '[:lower:]' '[:upper:]')-cases.txt" \
       > "$LISTS/$suite.txt"
@@ -115,7 +115,7 @@ for driver in native zink; do
   for suite in gl46a gl46b gles-khr; do
     (
       cd "$CTS/external/openglcts/modules"
-      python3 "$KIT/with-mesa.py" --overlay "$OVERLAY" --driver "$driver" -- \
+      EGL_PLATFORM=surfaceless python3 "$KIT/with-mesa.py" --overlay "$OVERLAY" --driver "$driver" -- \
         deqp-runner run --deqp "$PWD/glcts" --caselist "$KIT/$suite.txt" \
         --output "$OUT/$driver-$suite" --jobs 1 --timeout 180 \
         --tests-per-group 1 -- --deqp-surface-type=pbuffer \
@@ -143,7 +143,7 @@ export PIGLIT=/var/tmp/piglit
 for driver in native zink; do
   (
     cd "$PIGLIT"
-    PIGLIT_PLATFORM=surfaceless_egl python3 "$KIT/with-mesa.py" \
+    EGL_PLATFORM=surfaceless PIGLIT_PLATFORM=surfaceless_egl python3 "$KIT/with-mesa.py" \
       --overlay "$OVERLAY" --driver "$driver" -- \
       ./piglit run gpu "$OUT/piglit-$driver" \
       -t 'draw-elements|primitive-restart|arb_gpu_shader_fp64|sample.mask|multisample|fbo-blit'

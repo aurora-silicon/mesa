@@ -22,7 +22,7 @@ for suite in gles2 gles3 gles31; do
     deqp-runner --version > "$out/$suite/runner-version.txt"
     # Continue to the other suites after a CTS failure, preserving its exit code.
     rc=0
-    (cd "$(dirname "$binary")" && python3 "$kit/with-mesa.py" \
+    (cd "$(dirname "$binary")" && EGL_PLATFORM=surfaceless python3 "$kit/with-mesa.py" \
       --overlay "$overlay" --driver "$driver" -- \
       deqp-runner run --deqp "$binary" --caselist "$lists/$suite.txt" \
       --output "$out/$suite/results" --jobs "${JOBS:-1}" \
