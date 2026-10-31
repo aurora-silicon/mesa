@@ -343,6 +343,24 @@ static const struct drm_asahi_params_global params_g17s_task = {
    .usc_generation = 3, .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
 };
 
+/* Explicit offline M5 Ultra (J775D) identity: T6050, two dies, eight
+ * clusters of ten slots with eight enabled cores (0x3db), revision B1. The
+ * feature set matches the Pro's offline identity; it is not a statement of
+ * what the J775D kernel advertises. */
+static const struct drm_asahi_params_global params_g17d = {
+   .features = DRM_ASAHI_FEATURE_SOFT_FAULTS | DRM_ASAHI_FEATURE_RENDER_RESOURCES |
+               DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2,
+   .gpu_generation = 17, .gpu_variant = 'D', .gpu_revision = 0x11,
+   .chip_id = 0x6050, .num_dies = 2, .num_clusters_total = 8,
+   .num_cores_per_cluster = 10,
+   .core_masks = {0x3db, 0x3db, 0x3db, 0x3db, 0x3db, 0x3db, 0x3db, 0x3db},
+   .vm_start = 0x4000, .vm_end = (1ull << 42) - 0x8000ull,
+   .vm_kernel_min_size = 0x20000000, .max_commands_per_submission = 64,
+   .max_attachments = 16, .max_frequency_khz = 1500000,
+   .command_timestamp_frequency_hz = 1000000000,
+   .usc_generation = 3, .gpu_hal_generation = DRM_ASAHI_GPU_HAL_300,
+};
+
 static const struct drm_asahi_params_global *
 shim_params(void)
 {
@@ -371,6 +389,8 @@ shim_params(void)
       return &params_g16g;
    if (chip && !strcmp(chip, "g17s"))
       return &params_g17s;
+   if (chip && !strcmp(chip, "g17d"))
+      return &params_g17d;
 
    return &params_g13g;
 }

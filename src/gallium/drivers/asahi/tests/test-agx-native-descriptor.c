@@ -52,6 +52,7 @@ test_chip_routing(void)
       {AGX_CHIP_G17G, AGX_DESCRIPTOR_GENERATION_10, 32},
       {AGX_CHIP_G17S, AGX_DESCRIPTOR_GENERATION_10, 32},
       {AGX_CHIP_G17C, AGX_DESCRIPTOR_GENERATION_10, 32},
+      {AGX_CHIP_G17D, AGX_DESCRIPTOR_GENERATION_10, 32},
    };
 
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {

@@ -44,6 +44,25 @@ int main(void)
    CHECK(!agx3_build_m5_container_lead(bytes, sizeof(bytes), 0));
    CHECK(!agx3_build_m5_container_lead(bytes, sizeof(bytes), UINT_MAX));
    CHECK(!memcmp(before, bytes, sizeof(bytes)));
+
+   /* G17D: eight clusters, 0x1840 bytes, still inside the 16 KiB USC base
+    * page. The non-vertex helper group starts at 8 * 0x100 and the vertex
+    * group at 16 * 0x100, where the profile loader's table base points. */
+   {
+      static uint8_t ultra[0x1841], single[0x341];
+      memset(ultra, 0xa5, sizeof(ultra));
+      CHECK(agx3_build_m5_container_lead(ultra, sizeof(ultra), 8));
+      CHECK(ultra[0] == 0x40 && ultra[1] == 0x18);
+      CHECK(ultra[0x1840] == 0xa5);
+      CHECK(0x1840 <= 0x4000);
+      CHECK(agx3_build_m5_container_lead(single, sizeof(single), 1));
+      for (unsigned table = 8; table < 24; ++table)
+         CHECK(!memcmp(ultra + table * 0x100, single + 0x100, 0x100));
+      for (unsigned i = 0x40; i < 0x800; i += 2)
+         CHECK(ultra[i] == 0x06 && ultra[i + 1] == 0x00);
+      CHECK(!agx3_build_m5_container_lead(ultra, 0x183f, 8));
+   }
+
    struct agx_m5_va_layout layout;
    CHECK(agx_m5_va_layout(UINT64_C(0x100000000), UINT64_C(0x20000000000),
                           0, AGX_M5_SHADER_BASE, &layout));

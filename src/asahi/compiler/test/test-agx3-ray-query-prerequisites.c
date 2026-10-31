@@ -182,7 +182,9 @@ test_fail_closed_boundaries(void)
 {
    static const enum agx_chip unwitnessed[] = {
       AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G15C, AGX_CHIP_G16P,
-      AGX_CHIP_G16C, AGX_CHIP_G17A, AGX_CHIP_G17C, AGX_CHIP_UNKNOWN,
+      AGX_CHIP_G16C, AGX_CHIP_G17A, AGX_CHIP_G17C,
+      /* Ray queries stay closed on the Ultra until qualified there. */
+      AGX_CHIP_G17D, AGX_CHIP_UNKNOWN,
    };
 
    for (unsigned i = 0; i < sizeof(unwitnessed) / sizeof(unwitnessed[0]); ++i)

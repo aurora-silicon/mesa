@@ -635,7 +635,7 @@ check_sparse_translation(void)
    /* Both native HALs emit this exact sparse-table maintenance command. */
    const uint8_t expected[] = {0x02, 0x41, 0x02, 0x60};
    const enum agx_chip chips[] = {
-      AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S,
+      AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
       uint8_t stream[AGX3_CDM_SSTT_FLUSH_INVALIDATE_SIZE];

@@ -188,7 +188,7 @@ test_agx3_cdm_launch(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    const uint8_t expected[AGX3_CDM_LAUNCH_SIZE] = {
       0x67, 0x45, 0x23, 0x01, 0xde, 0xbc, 0x0a, 0x01,
@@ -572,7 +572,7 @@ test_agx3_live_vdm_draw(void)
    static const uint32_t empty_jump_without_state[] = {
       UINT32_C(0x8000005a), UINT32_C(0x12345678),
    };
-   for (enum agx_chip chip = AGX_CHIP_G17G; chip <= AGX_CHIP_G17C; ++chip) {
+   for (enum agx_chip chip = AGX_CHIP_G17G; chip <= AGX_CHIP_G17D; ++chip) {
       uint64_t compact;
       CHECK_EQ(agx_m5_vdm_compact(UINT64_C(0x5a12345678), &compact), true);
       CHECK_EQ(compact, UINT64_C(0x4a12345678));
@@ -662,7 +662,7 @@ test_agx3_live_vdm_barrier(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
 
    for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
@@ -691,7 +691,7 @@ test_agx3_cdm_stream_link(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    const uint8_t expected[AGX3_CDM_STREAM_LINK_SIZE] = {
       0xbc, 0x9a, 0x00, 0x30, 0x78, 0x56, 0x34, 0x12,
@@ -760,7 +760,7 @@ test_agx3_cdm_link_padding(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
 
    for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
@@ -865,6 +865,7 @@ test_agx3_cdm_barrier(void)
       AGX_CHIP_G17G,
       AGX_CHIP_G17S,
       AGX_CHIP_G17C,
+      AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < sizeof(gen7) / sizeof(gen7[0]); ++i) {
       for (uint8_t flags = 0; flags < 16; ++flags) {
@@ -998,13 +999,14 @@ test_agx3_cdm_substream_barrier(void)
    const enum agx_chip targets[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
 
    for (unsigned i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
       const bool gen7 = targets[i] == AGX_CHIP_G17G ||
                         targets[i] == AGX_CHIP_G17S ||
-                        targets[i] == AGX_CHIP_G17C;
+                        targets[i] == AGX_CHIP_G17C ||
+                        targets[i] == AGX_CHIP_G17D;
       for (uint16_t substream = 0; substream < UINT8_MAX; ++substream) {
          for (uint8_t flags = 0; flags < 16; ++flags) {
             if (!gen7 && flags != 0 && flags != 5)
@@ -1063,6 +1065,7 @@ test_agx3_cdm_secondary_barrier(void)
       AGX_CHIP_G17G,
       AGX_CHIP_G17S,
       AGX_CHIP_G17C,
+      AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
       uint8_t packed[AGX3_CDM_SECONDARY_BARRIER_SIZE];
@@ -1100,7 +1103,7 @@ test_agx3_cdm_stream_terminate(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    const uint8_t expected[AGX3_CDM_STREAM_TERMINATE_SIZE] = {
       0x00, 0x00, 0x00, 0x40,

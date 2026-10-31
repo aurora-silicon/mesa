@@ -132,6 +132,7 @@ main(void)
    check_chip(AGX_CHIP_G17G, AGX_SAMPLER_GENERATION_GEN5, 32);
    check_chip(AGX_CHIP_G17S, AGX_SAMPLER_GENERATION_GEN5, 32);
    check_chip(AGX_CHIP_G17C, AGX_SAMPLER_GENERATION_GEN5, 32);
+   check_chip(AGX_CHIP_G17D, AGX_SAMPLER_GENERATION_GEN5, 32);
 
    struct hk_native_sampler_descriptor gen4, hal200, g17p, gen5;
    assert(hk_pack_native_sampler(AGX_CHIP_G14G, &gen4, &base));
