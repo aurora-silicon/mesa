@@ -61,6 +61,17 @@ int main(void)
       for (unsigned i = 0x40; i < 0x800; i += 2)
          CHECK(ultra[i] == 0x06 && ultra[i + 1] == 0x00);
       CHECK(!agx3_build_m5_container_lead(ultra, 0x183f, 8));
+      /* The one layout definition: sizes and group bases agree with the
+       * tables the builder writes, for the fixed G17S container too
+       * (lead 0x640, groups at 0x200/0x400). */
+      CHECK(agx3_m5_container_lead_size(8) == 0x1840);
+      CHECK(agx3_m5_helper_group_base(8, false) == 0x800);
+      CHECK(agx3_m5_helper_group_base(8, true) == 0x1000);
+      CHECK(agx3_m5_container_lead_size(2) == 0x640);
+      CHECK(agx3_m5_helper_group_base(2, false) == 0x200);
+      CHECK(agx3_m5_helper_group_base(2, true) == 0x400);
+      CHECK(agx3_m5_container_lead_size(0) == 0);
+      CHECK(agx3_m5_container_lead_size(UINT_MAX) == 0);
    }
 
    struct agx_m5_va_layout layout;

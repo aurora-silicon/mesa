@@ -184,7 +184,7 @@ static size_t
 agx3_container_lead_size(const struct agx_device *dev)
 {
    return agx_chip_g17_m5(dev->chip)
-      ? (size_t)dev->params.num_clusters_total * 0x300u + 0x40u
+      ? agx3_m5_container_lead_size(dev->params.num_clusters_total)
       : AGX3_CONTAINER_LEAD;
 }
 

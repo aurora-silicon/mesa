@@ -23,6 +23,14 @@ void agx3_build_container_constant_program(
  * deliberately not part of this helper. */
 #define AGX3_CODE_BLOCK_HEADER_SIZE 0x40u
 #define AGX3_CODE_BLOCK_ENTRY_OFFSET 0x80u
+/* The M5 container lead, one definition for every user: a 0x40-byte header,
+ * then from 0x100 * clusters one 0x100-byte helper table per cluster for each
+ * of two stage groups. The profile loader calls USC window + B + 16 * SR14
+ * (SR14 = 16 * cluster + core slot), so cluster c of a group finds its table
+ * at the group's base B + 0x100 * c. Clusters are numbered densely: G17D's
+ * eight run 0..7 across both dies. */
+size_t agx3_m5_container_lead_size(unsigned clusters);
+uint32_t agx3_m5_helper_group_base(unsigned clusters, bool vertex);
 bool agx3_build_m5_container_lead(void *image, size_t capacity,
                                   unsigned clusters);
 

@@ -8,6 +8,7 @@
 
 #include "agx_ioto_core.h"
 #include "agx_ioto_load_core.h"
+#include "agx3_code_container_core.h"
 
 #include "util/u_debug.h"
 
@@ -976,7 +977,7 @@ type0_tail_records_valid(enum agx_chip chip,
 static uint32_t
 m5_profile_loader_table_base(unsigned clusters, bool fragment)
 {
-   return (fragment ? 1u : 2u) * clusters * 0x100u;
+   return agx3_m5_helper_group_base(clusters, !fragment);
 }
 
 /* Replaces the immediate of the 8-byte LDIMM at `ldimm`, keeping its

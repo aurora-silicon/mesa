@@ -7,13 +7,29 @@
 
 #include <string.h>
 
+/* Returns 0 for an unsupported cluster count. */
+size_t
+agx3_m5_container_lead_size(unsigned clusters)
+{
+   if (!clusters || clusters > (UINT32_MAX - 0x40u) / 0x300u)
+      return 0;
+   return (size_t)agx3_m5_helper_group_base(clusters, true) +
+          (size_t)clusters * 0x100u + 0x40u;
+}
+
+/* Every stage but vertex (fragment, tile, compute, mesh, object) calls the
+ * first group, vertex the second. */
+uint32_t
+agx3_m5_helper_group_base(unsigned clusters, bool vertex)
+{
+   return (vertex ? 2u : 1u) * clusters * 0x100u;
+}
+
 bool
 agx3_build_m5_container_lead(void *image, size_t capacity, unsigned clusters)
 {
-   if (!clusters || clusters > (UINT32_MAX - 0x40u) / 0x300u)
-      return false;
-   const size_t size = (size_t)clusters * 0x300u + 0x40u;
-   if (!image || capacity < size)
+   const size_t size = agx3_m5_container_lead_size(clusters);
+   if (!size || !image || capacity < size)
       return false;
 
    /* Both native M5 tables contain ten helper records, then two identical
@@ -33,8 +49,9 @@ agx3_build_m5_container_lead(void *image, size_t capacity, unsigned clusters)
    for (size_t i = 0x40; i < size; i += 2)
       bytes[i] = 0x06;
    /* One helper table per cluster for each of the two stage groups. */
-   for (unsigned table = clusters; table < 3 * clusters; ++table) {
-      uint8_t *base = bytes + table * 0x100;
+   for (unsigned table = 0; table < 2 * clusters; ++table) {
+      uint8_t *base = bytes + agx3_m5_helper_group_base(clusters, false) +
+                      table * 0x100;
       for (unsigned i = 0; i < sizeof(helpers) / sizeof(helpers[0]); ++i) {
          uint8_t *record = base + i * 16;
          memset(record, 0, 10);

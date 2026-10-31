@@ -83,7 +83,7 @@ agx_g17p_upload_bg_eot(struct agx_bg_eot_cache *cache,
     * shaders. Native packed CODE blocks do not each own such a lead. */
    const bool m5 = agx_chip_g17_m5(cache->dev->chip);
    const size_t lead_size = m5
-      ? (size_t)cache->dev->params.num_clusters_total * 0x300u + 0x40u : 0x340;
+      ? agx3_m5_container_lead_size(cache->dev->params.num_clusters_total) : 0x340;
    /* LDSHDR's existing auxiliary fetch-span metadata is based on compiler
     * text size. Reserve at least that span after the main entry too, so the
     * EOT text128/main64 case cannot prefetch outside this CODE block. */
@@ -792,7 +792,7 @@ agx_get_precompiled_locked(struct agx_bg_eot_cache *cache, unsigned program)
        agx_chip_g17_m5(cache->dev->chip)) {
       const bool m5 = agx_chip_g17_m5(cache->dev->chip);
       const size_t lead_size = m5
-         ? (size_t)cache->dev->params.num_clusters_total * 0x300u + 0x40u
+         ? agx3_m5_container_lead_size(cache->dev->params.num_clusters_total)
          : 0x340;
       const size_t main_span = MAX2(info->main_size, info->binary_size);
       const size_t block_size = agx3_code_block_size(main_span);
