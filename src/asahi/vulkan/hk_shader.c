@@ -1362,7 +1362,7 @@ m5_merge_buffer_words(nir_shader *nir)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
             if (in->num_components != 1 || in->def.bit_size != 32 ||
-                !nir_intrinsic_can_reorder(in) || nir_intrinsic_align(in) < 4)
+                !nir_intrinsic_can_reorder(in))
                continue;
             struct m5_word_read r = {.load = in};
             switch (in->intrinsic) {
@@ -1382,7 +1382,10 @@ m5_merge_buffer_words(nir_shader *nir)
             default:
                continue;
             }
-            if (r.offset_def->bit_size != 32)
+            /* Only the global loads above carry an alignment; other
+             * reorderable scalar reads (texture descriptor crawls, buffer
+             * texture metadata) have no ALIGN_MUL index to ask for. */
+            if (nir_intrinsic_align(in) < 4 || r.offset_def->bit_size != 32)
                continue;
             r.offset = m5_bounded_offset(nir_scalar_resolved(r.offset_def, 0), 12);
             if (r.offset.valid)
