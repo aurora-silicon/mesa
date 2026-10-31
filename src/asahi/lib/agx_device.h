@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <string.h>
 #ifdef HAVE_LIBDRM
 #include <xf86drm.h>
 #endif
@@ -34,6 +35,20 @@
 struct vdrm_device;
 struct asahi_ccmd_submit_res;
 #endif
+
+/* DRM name of the native kernel driver. Kernels before the Aurora rename
+ * report "asahi", so both are accepted and Mesa and the kernel can update in
+ * either order.
+ */
+#define AGX_DRM_DRIVER_NAME        "aurora"
+#define AGX_DRM_DRIVER_NAME_LEGACY "asahi"
+
+static inline bool
+agx_is_native_drm_driver(const char *name)
+{
+   return name && (!strcmp(name, AGX_DRM_DRIVER_NAME) ||
+                   !strcmp(name, AGX_DRM_DRIVER_NAME_LEGACY));
+}
 
 enum agx_dbg {
    AGX_DBG_TRACE = BITFIELD_BIT(0),
