@@ -270,7 +270,7 @@ test_timestamp_execution_scopes(void)
         timed->sync.prior[HK_SYNC_CDM] == 1);
    }
 }
-/* The fixture has no open compute stream. A request to close one is a bug. */
+/* Fixtures never queue immediate writes. Emitting one is a bug. */
 void
 hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -287,7 +287,7 @@ hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
-/* This fixture never records query resets. */
+/* Reset-stream fixtures model the ordering, without emitting reset payloads. */
 void
 hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
