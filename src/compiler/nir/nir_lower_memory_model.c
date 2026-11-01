@@ -102,7 +102,8 @@ get_intrinsic_info(nir_intrinsic_instr *intrin, nir_variable_mode *modes,
 }
 
 static bool
-visit_instr(nir_instr *instr, uint32_t *cur_modes, unsigned vis_avail_sem)
+visit_instr(nir_instr *instr, uint32_t *cur_modes, unsigned vis_avail_sem,
+            bool non_readable_available)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return false;
@@ -145,7 +146,11 @@ visit_instr(nir_instr *instr, uint32_t *cur_modes, unsigned vis_avail_sem)
 
    unsigned access = nir_intrinsic_access(intrin);
 
-   if (access & (ACCESS_NON_READABLE | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_COHERENT))
+   unsigned exempt = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER | ACCESS_COHERENT;
+   /* See nir_lower_memory_model_options::non_readable_available. */
+   if (vis_avail_sem != NIR_MEMORY_MAKE_AVAILABLE || !non_readable_available)
+      exempt |= ACCESS_NON_READABLE;
+   if (access & exempt)
       return false;
 
    if (*cur_modes & modes) {
@@ -164,7 +169,8 @@ lower_make_visible(nir_cf_node *cf_node, uint32_t *cur_modes)
    case nir_cf_node_block: {
       nir_block *block = nir_cf_node_as_block(cf_node);
       nir_foreach_instr_safe(instr, block)
-         progress |= visit_instr(instr, cur_modes, NIR_MEMORY_MAKE_VISIBLE);
+         progress |= visit_instr(instr, cur_modes, NIR_MEMORY_MAKE_VISIBLE,
+                                 false);
       break;
    }
    case nir_cf_node_if: {
@@ -197,14 +203,16 @@ lower_make_visible(nir_cf_node *cf_node, uint32_t *cur_modes)
 }
 
 static bool
-lower_make_available(nir_cf_node *cf_node, uint32_t *cur_modes)
+lower_make_available(nir_cf_node *cf_node, uint32_t *cur_modes,
+                     bool non_readable_available)
 {
    bool progress = false;
    switch (cf_node->type) {
    case nir_cf_node_block: {
       nir_block *block = nir_cf_node_as_block(cf_node);
       nir_foreach_instr_reverse_safe(instr, block)
-         progress |= visit_instr(instr, cur_modes, NIR_MEMORY_MAKE_AVAILABLE);
+         progress |= visit_instr(instr, cur_modes, NIR_MEMORY_MAKE_AVAILABLE,
+                                 non_readable_available);
       break;
    }
    case nir_cf_node_if: {
@@ -212,9 +220,11 @@ lower_make_available(nir_cf_node *cf_node, uint32_t *cur_modes)
       uint32_t cur_modes_then = *cur_modes;
       uint32_t cur_modes_else = *cur_modes;
       foreach_list_typed_reverse(nir_cf_node, if_node, node, &nif->then_list)
-         progress |= lower_make_available(if_node, &cur_modes_then);
+         progress |= lower_make_available(if_node, &cur_modes_then,
+                                          non_readable_available);
       foreach_list_typed_reverse(nir_cf_node, if_node, node, &nif->else_list)
-         progress |= lower_make_available(if_node, &cur_modes_else);
+         progress |= lower_make_available(if_node, &cur_modes_else,
+                                          non_readable_available);
       *cur_modes |= cur_modes_then | cur_modes_else;
       break;
    }
@@ -225,7 +235,8 @@ lower_make_available(nir_cf_node *cf_node, uint32_t *cur_modes)
       do {
          loop_progress = false;
          foreach_list_typed_reverse(nir_cf_node, loop_node, node, &loop->body)
-            loop_progress |= lower_make_available(loop_node, cur_modes);
+            loop_progress |= lower_make_available(loop_node, cur_modes,
+                                                  non_readable_available);
          progress |= loop_progress;
       } while (loop_progress);
       break;
@@ -237,8 +248,11 @@ lower_make_available(nir_cf_node *cf_node, uint32_t *cur_modes)
 }
 
 bool
-nir_lower_memory_model(nir_shader *shader)
+nir_lower_memory_model_with_options(
+   nir_shader *shader, const nir_lower_memory_model_options *options)
 {
+   const bool non_readable_available =
+      options && options->non_readable_available;
    bool progress = false;
 
    nir_foreach_function_impl(impl, shader) {
@@ -251,12 +265,19 @@ nir_lower_memory_model(nir_shader *shader)
 
       modes = 0;
       foreach_list_typed_reverse(nir_cf_node, cf_node, node, cf_list)
-         impl_progress |= lower_make_available(cf_node, &modes);
+         impl_progress |= lower_make_available(cf_node, &modes,
+                                               non_readable_available);
       progress |= nir_progress(impl_progress, impl,
                                nir_metadata_control_flow);
    }
 
    return progress;
+}
+
+bool
+nir_lower_memory_model(nir_shader *shader)
+{
+   return nir_lower_memory_model_with_options(shader, NULL);
 }
 
 static void

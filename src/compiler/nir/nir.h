@@ -6882,7 +6882,22 @@ bool nir_lower_discard_if(nir_shader *shader, nir_lower_discard_if_options optio
 
 bool nir_lower_terminate_to_demote(nir_shader *nir);
 
+typedef struct nir_lower_memory_model_options {
+   /**
+    * Also make an ACCESS_NON_READABLE write coherent when a release makes it
+    * available. By default such a write (to a resource the shader never
+    * reads, declared or inferred by nir_opt_access) is exempt on both sides.
+    * A driver sets this when its write-only stores still have to be ordered
+    * by a release, for instance because another invocation's later write to
+    * the same location, after it acquires, must land after this one.
+    */
+   bool non_readable_available;
+} nir_lower_memory_model_options;
+
 bool nir_lower_memory_model(nir_shader *shader);
+/* options may be NULL: then the same as nir_lower_memory_model(). */
+bool nir_lower_memory_model_with_options(
+   nir_shader *shader, const nir_lower_memory_model_options *options);
 bool nir_lower_disordered_control_barriers(nir_shader *shader);
 
 bool nir_lower_goto_ifs(nir_shader *shader);
