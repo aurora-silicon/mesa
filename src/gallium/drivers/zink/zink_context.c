@@ -272,14 +272,29 @@ zink_context_destroy(struct pipe_context *pctx)
    ralloc_free(ctx);
 }
 
-static void
-check_device_lost(struct zink_context *ctx)
+/* zink cannot tell whose work the device lost. As before, a context whose own work failed (a submission, a
+ * wait on its own batch, a sparse commit) assumes it is in the wrong; one that saw only the screen's loss,
+ * through another context or a wait on anything else, does not know
+ */
+static enum pipe_reset_status
+device_lost_status(struct zink_context *ctx)
 {
-   if (!zink_screen(ctx->base.screen)->device_lost || ctx->is_device_lost)
+   return p_atomic_read(&ctx->device_lost_guilty) ? PIPE_GUILTY_CONTEXT_RESET : PIPE_UNKNOWN_CONTEXT_RESET;
+}
+
+/* own: the loss was seen through this context's own work */
+static void
+check_device_lost(struct zink_context *ctx, bool own)
+{
+   if (!zink_screen(ctx->base.screen)->device_lost)
+      return;
+   if (own)
+      p_atomic_set(&ctx->device_lost_guilty, true);
+   if (ctx->is_device_lost)
       return;
    debug_printf("ZINK: device lost detected!\n");
    if (ctx->reset.reset)
-      ctx->reset.reset(ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
+      ctx->reset.reset(ctx->reset.data, device_lost_status(ctx));
    ctx->is_device_lost = true;
 }
 
@@ -290,10 +305,12 @@ zink_get_device_reset_status(struct pipe_context *pctx)
 
    enum pipe_reset_status status = PIPE_NO_RESET;
 
+   /* the device may have been lost by a wait or another context's submission since this context last flushed */
+   if (zink_screen(pctx->screen)->device_lost)
+      ctx->is_device_lost = true;
+
    if (ctx->is_device_lost) {
-      // Since we don't know what really happened to the hardware, just
-      // assume that we are in the wrong
-      status = PIPE_GUILTY_CONTEXT_RESET;
+      status = device_lost_status(ctx);
 
       debug_printf("ZINK: device lost detected!\n");
 
@@ -4101,39 +4118,39 @@ flush_batch(struct zink_context *ctx, bool sync)
    if (sync)
       sync_flush(ctx, ctx->bs);
 
-   if (ctx->bs->is_device_lost) {
-      check_device_lost(ctx);
-   } else {
-      struct zink_screen *screen = zink_screen(ctx->base.screen);
-      zink_start_batch(ctx);
-      if (screen->info.have_EXT_transform_feedback && ctx->num_so_targets)
-         ctx->dirty_so_targets = true;
-      memset(ctx->pipeline_changed, 1, sizeof(ctx->pipeline_changed));
-      zink_select_draw_vbo(ctx);
-      zink_select_draw_mesh_tasks(ctx);
-      zink_select_launch_grid(ctx);
+   struct zink_screen *screen = zink_screen(ctx->base.screen);
+   /* a loss any submission or wait on the device saw is this context's too */
+   if (ctx->bs->is_device_lost || screen->device_lost)
+      check_device_lost(ctx, ctx->bs->is_device_lost);
+   /* batches still start after a loss: zink_end_batch retires them unsubmitted, so their states are recycled */
+   zink_start_batch(ctx);
+   if (screen->info.have_EXT_transform_feedback && ctx->num_so_targets)
+      ctx->dirty_so_targets = true;
+   memset(ctx->pipeline_changed, 1, sizeof(ctx->pipeline_changed));
+   zink_select_draw_vbo(ctx);
+   zink_select_draw_mesh_tasks(ctx);
+   zink_select_launch_grid(ctx);
 
-      if (ctx->oom_stall)
-         stall(ctx);
-      zink_reset_ds3_states(ctx);
+   if (ctx->oom_stall)
+      stall(ctx);
+   zink_reset_ds3_states(ctx);
 
-      ctx->oom_flush = false;
-      ctx->oom_stall = false;
-      ctx->dd.bindless_bound = false;
-      ctx->di.bindless_refs_dirty = true;
-      ctx->index_buffer = NULL;
-      ctx->sample_locations_changed = ctx->base.screen->caps.programmable_sample_locations;
-      if (zink_screen(ctx->base.screen)->info.dynamic_state2_feats.extendedDynamicState2PatchControlPoints) {
-         VKCTX(CmdSetPatchControlPointsEXT)(ctx->bs->cmdbuf, ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch);
-         VKCTX(CmdSetPatchControlPointsEXT)(ctx->bs->reordered_cmdbuf, 1);
-      }
-      update_feedback_loop_dynamic_state(ctx);
-      if (screen->info.have_EXT_color_write_enable)
-         reapply_color_write(ctx);
-      update_layered_rendering_state(ctx);
-      tc_renderpass_info_reset(&ctx->dynamic_fb.tc_info);
-      ctx->rp_tc_info_updated = true;
+   ctx->oom_flush = false;
+   ctx->oom_stall = false;
+   ctx->dd.bindless_bound = false;
+   ctx->di.bindless_refs_dirty = true;
+   ctx->index_buffer = NULL;
+   ctx->sample_locations_changed = ctx->base.screen->caps.programmable_sample_locations;
+   if (zink_screen(ctx->base.screen)->info.dynamic_state2_feats.extendedDynamicState2PatchControlPoints) {
+      VKCTX(CmdSetPatchControlPointsEXT)(ctx->bs->cmdbuf, ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch);
+      VKCTX(CmdSetPatchControlPointsEXT)(ctx->bs->reordered_cmdbuf, 1);
    }
+   update_feedback_loop_dynamic_state(ctx);
+   if (screen->info.have_EXT_color_write_enable)
+      reapply_color_write(ctx);
+   update_layered_rendering_state(ctx);
+   tc_renderpass_info_reset(&ctx->dynamic_fb.tc_info);
+   ctx->rp_tc_info_updated = true;
    util_queue_fence_signal(&ctx->flush_fence);
 }
 
@@ -4575,7 +4592,7 @@ zink_flush(struct pipe_context *pctx,
          if (last) {
             sync_flush(ctx, last);
             if (last->is_device_lost)
-               check_device_lost(ctx);
+               check_device_lost(ctx, true);
          }
       }
       if (ctx->tc && !ctx->track_renderpasses)
@@ -4655,7 +4672,7 @@ zink_wait_on_batch(struct zink_context *ctx, uint64_t batch_id)
    }
    assert(batch_id);
    if (!zink_screen_timeline_wait(zink_screen(ctx->base.screen), batch_id, UINT64_MAX))
-      check_device_lost(ctx);
+      check_device_lost(ctx, true);
 }
 
 bool
@@ -4671,7 +4688,7 @@ zink_check_batch_completion(struct zink_context *ctx, uint64_t batch_id)
 
    bool success = zink_screen_timeline_wait(zink_screen(ctx->base.screen), batch_id, 0);
    if (!success)
-      check_device_lost(ctx);
+      check_device_lost(ctx, true);
    return success;
 }
 
@@ -5612,7 +5629,7 @@ zink_resource_commit(struct pipe_context *pctx, struct pipe_resource *pres, unsi
       zink_batch_reference_resource_rw(ctx, res, true);
       ctx->bs->has_work = true;
    } else {
-      check_device_lost(ctx);
+      check_device_lost(ctx, true);
    }
 
    return ret;

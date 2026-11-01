@@ -1410,6 +1410,8 @@ struct zink_screen {
    simple_mtx_t dt_lock;
 
    bool device_lost;
+   /* the queues were waited idle after the loss (find_completed_batch_state) */
+   bool device_lost_idle;
    int drm_fd;
 #ifdef HAVE_LIBDRM
    struct renderonly *ro;
@@ -2005,6 +2007,8 @@ struct zink_context {
 
    bool shobj_draw : 1; //using shader objects for draw
    bool is_device_lost;
+   /* the device was lost under this context's own work (check_device_lost, post_submit) */
+   bool device_lost_guilty;
    bool primitive_restart;
    bool blitting : 1;
    bool blit_scissor : 1;

@@ -158,6 +158,8 @@ reset_batch_state_internal(struct zink_screen *screen, struct zink_batch_state *
    bs->has_work = false;
    bs->has_reordered_work = false;
    bs->has_unsync = false;
+   /* a state is reused after a loss too (find_completed_batch_state): its next batch starts clean */
+   bs->is_device_lost = false;
 }
 
 static void
@@ -428,11 +430,45 @@ find_screen_state(struct zink_screen *screen, struct zink_context *ctx)
    return bs;
 }
 
+/* reset the states contexts have handed to the screen (find_completed_batch_state) and free them for any context:
+ * every submit does this, and once the device is lost, which ends submission, the context looking for a state does
+ */
+static void
+recycle_active_batch_states(struct zink_screen *screen)
+{
+   simple_mtx_lock(&screen->active_batch_states_lock);
+   simple_mtx_lock(&screen->free_batch_states_lock);
+   for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
+      reset_batch_state_internal(screen, i);
+      zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
+   }
+   screen->active_batch_states = NULL;
+   screen->last_active_batch_state = NULL;
+   simple_mtx_unlock(&screen->free_batch_states_lock);
+   simple_mtx_unlock(&screen->active_batch_states_lock);
+}
+
 /* only returns batch state for COPY_ONLY contexts */
 static struct zink_batch_state *
 find_completed_batch_state(struct zink_context *ctx)
 {
    struct zink_screen *screen = zink_screen(ctx->base.screen);
+   /* nothing runs once the device is lost, and the states in flight then never complete: every state that has
+    * been through submit_queue, or that zink_end_batch retired unsubmitted, is done with
+    */
+   bool device_lost = screen->device_lost;
+   /* but a state submitted before the loss stays pending until a wait has returned (VK_SUCCESS or
+    * VK_ERROR_DEVICE_LOST, which count the same): wait the queues idle once before resetting any of them.
+    * A submission made after this wait waits for itself (submit_queue).
+    */
+   if (device_lost && !p_atomic_read(&screen->device_lost_idle)) {
+      simple_mtx_lock(screen->queue_lock);
+      (void)VKSCR(QueueWaitIdle)(screen->queue);
+      if (screen->queue_sparse && screen->queue_sparse != screen->queue)
+         (void)VKSCR(QueueWaitIdle)(screen->queue_sparse);
+      p_atomic_set(&screen->device_lost_idle, true);
+      simple_mtx_unlock(screen->queue_lock);
+   }
 
    /* states are stored sequentially, so if the first one doesn't work, none of them will */
    struct zink_batch_state *i = ctx->batch_states;
@@ -441,7 +477,7 @@ find_completed_batch_state(struct zink_context *ctx)
       /* only a submitted state can be reused */
       if (i->fence.submitted &&
           /* a submitted state must have completed before it can be reused */
-          (zink_screen_check_last_finished(screen, i->fence.batch_id) || i->fence.completed)) {
+          (device_lost || zink_screen_check_last_finished(screen, i->fence.batch_id) || i->fence.completed)) {
          pop_batch_state(ctx);
          reset_batch_state_ctx(ctx, i);
          if (ctx->flags & ZINK_CONTEXT_COPY_ONLY) {
@@ -458,6 +494,9 @@ find_completed_batch_state(struct zink_context *ctx)
          break;
       }
    }
+   /* no submit will recycle them now */
+   if (device_lost)
+      recycle_active_batch_states(screen);
    return NULL;
 }
 
@@ -615,6 +654,8 @@ post_submit(struct zink_batch_state *bs, struct zink_screen *screen)
    MESA_TRACE_FUNC();
 
    if (bs->is_device_lost) {
+      /* this context's own submission failed (zink_get_device_reset_status) */
+      p_atomic_set(&bs->ctx->device_lost_guilty, true);
       if (bs->ctx->reset.reset)
          bs->ctx->reset.reset(bs->ctx->reset.data, PIPE_GUILTY_CONTEXT_RESET);
       else if (screen->abort_on_hang && !screen->robust_ctx_count)
@@ -628,6 +669,17 @@ post_submit(struct zink_batch_state *bs, struct zink_screen *screen)
       /* try to avoid ooming by regularly checking for batch completion */
       zink_screen_timeline_wait(screen, screen->last_finished + 1, 0);
    }
+}
+
+/* drop the references the batch took on its dmabuf exports (zink_batch_resource_usage_set) */
+static void
+release_dmabuf_exports(struct zink_batch_state *bs)
+{
+   set_foreach(&bs->dmabuf_exports, entry) {
+      struct pipe_resource *pres = (void*)entry->key;
+      pipe_resource_reference(&pres, NULL);
+   }
+   _mesa_set_clear(&bs->dmabuf_exports, NULL);
 }
 
 typedef enum {
@@ -822,6 +874,11 @@ submit_queue(void *data, void *gdata, int thread_index)
          bs->is_device_lost = true;
       }
    );
+   /* submitted after find_completed_batch_state waited the queues idle for a loss: this state is recycled
+    * without another wait, so wait for its submission here
+    */
+   if (p_atomic_read(&screen->device_lost_idle))
+      (void)VKSCR(QueueWaitIdle)(screen->queue);
    simple_mtx_unlock(screen->queue_lock);
 
    unsigned i = 0;
@@ -832,17 +889,18 @@ submit_queue(void *data, void *gdata, int thread_index)
          for (; res; res = zink_resource(res->base.b.next))
             zink_screen_import_dmabuf_semaphore(screen, res, sem[i++]);
       }
-
-      struct pipe_resource *pres = (void*)entry->key;
-      pipe_resource_reference(&pres, NULL);
    }
-   _mesa_set_clear(&bs->dmabuf_exports, NULL);
 
+end:
+   /* the early exits too: a state whose submit failed is recycled like any other once the device is lost, so
+    * it must not keep its exports, return the sparse semaphore to the screen's pool (reset_batch_state_internal)
+    * or let a usage recorded against it match its next batch (zink_bo_has_usage)
+    */
+   release_dmabuf_exports(bs);
    if (bs->sparse_semaphore)
       (void)util_dynarray_pop(&bs->acquires, VkSemaphore);
-
    bs->usage.submit_count++;
-end:
+
    /* Pair the notification with the cross-context waiter's predicate check.
     * Otherwise the submission can finish between that check and cnd_wait,
     * leaving the waiter asleep with no future submission to wake it.
@@ -855,16 +913,29 @@ end:
 
    p_atomic_set(&bs->fence.submitted, true);
 
-   simple_mtx_lock(&screen->active_batch_states_lock);
-   simple_mtx_lock(&screen->free_batch_states_lock);
-   for (struct zink_batch_state *i = screen->active_batch_states, *j = i ? i->next : NULL; i; i = j, j = j ? j->next : NULL) {
-      reset_batch_state_internal(screen, i);
-      zink_batch_state_append(&screen->free_batch_states, &screen->last_free_batch_state, i);
-   }
-   screen->active_batch_states = NULL;
-   screen->last_active_batch_state = NULL;
-   simple_mtx_unlock(&screen->free_batch_states_lock);
-   simple_mtx_unlock(&screen->active_batch_states_lock);
+   recycle_active_batch_states(screen);
+}
+
+/* once the device is lost nothing more is submitted: finish the batch as if it had run, without submitting it,
+ * so its state and everything it references can be recycled instead of being held forever
+ */
+static void
+retire_lost_batch(struct zink_batch_state *bs)
+{
+   /* as submit_queue does after importing their semaphores */
+   release_dmabuf_exports(bs);
+
+   p_atomic_set(&bs->usage.unflushed, false);
+   /* as submit_queue does: with the reset's increment, a usage recorded against this batch no longer matches
+    * the state's next one
+    */
+   bs->usage.submit_count++;
+   p_atomic_set(&bs->fence.completed, true);
+   /* wake cross-context waiters, as submit_queue does */
+   mtx_lock(&bs->usage.mtx);
+   cnd_broadcast(&bs->usage.flush);
+   mtx_unlock(&bs->usage.mtx);
+   p_atomic_set(&bs->fence.submitted, true);
 }
 
 /* called during flush */
@@ -895,8 +966,10 @@ zink_end_batch(struct zink_context *ctx)
       ctx->swapchain = NULL;
    }
 
-   if (screen->device_lost)
+   if (screen->device_lost) {
+      retire_lost_batch(bs);
       return;
+   }
 
    if (ctx->tc) {
       set_foreach(&bs->active_queries, entry)
