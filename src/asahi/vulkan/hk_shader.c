@@ -15,6 +15,7 @@
 #include "asahi/compiler/agx_nir_m5_ray_query.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
+#include "asahi/compiler/agx3_pack.h"
 #include "hk_nir_sampler_bias.h"
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
@@ -3030,8 +3031,15 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (agx_chip_g17_m5(dev->dev.chip))
       NIR_PASS(_, nir, agx_nir_lower_cmat);
 
-   /* Turn cache flushes into image coherency bits while we still have derefs */
-   NIR_PASS(_, nir, nir_lower_memory_model);
+   /* Turn cache flushes into image coherency bits while we still have derefs.
+    * Where AGX3C's device-coherent image forms are selected (G17D), a
+    * write-only store under a release must take them too: another
+    * invocation's later write to the same texel has to land after it, and
+    * with the plain write it does not. */
+   const nir_lower_memory_model_options memory_model = {
+      .non_readable_available = agx3_coherent_image_forms(dev->dev.chip),
+   };
+   NIR_PASS(_, nir, nir_lower_memory_model_with_options, &memory_model);
 
    /* G17P's texture/PBE accesses stay inside mapped memory, but native 2D
     * image accesses outside the Vulkan view can alias another texel in the
