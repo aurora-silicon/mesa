@@ -2648,18 +2648,21 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (agx_chip_g17_m5(dev->dev.chip)) {
-      hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
-      return;
-   }
-   if (agx_native_graphics(&dev->dev)) {
-      hk_reserve_scratch(cmd, cs, s);
-      hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   if (m5 || agx_native_graphics(&dev->dev)) {
+      if (m5) {
+         hk_dispatch_m5_native(cmd, cs, s, grid, local_size);
+      } else {
+         hk_reserve_scratch(cmd, cs, s);
+         hk_dispatch_g17p_native(cmd, cs, s, grid, local_size);
+      }
       /* Software graphics stages communicate through memory: VS outputs,
-       * geometry counts and XFB bases are consumed by the next dispatch.
-       * The application cannot supply barriers between these internal
-       * stages. Preserve the AGX2 flush-after-launch contract, including
-       * indirect launches, by strengthening the native ordering barrier. */
+       * TCS outputs and tessellation levels, geometry counts and XFB bases
+       * are consumed by the next dispatch. The application cannot supply
+       * barriers between these internal stages. Both native launch paths end
+       * a launch in a weak ordering record, which does not make its writes
+       * visible to the next one; preserve the AGX2 flush-after-launch
+       * contract, including indirect launches, by strengthening it. */
       if (s->info.stage != MESA_SHADER_COMPUTE) {
          hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
          hk_cdm_cache_flush(dev, cs);
