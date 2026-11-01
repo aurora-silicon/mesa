@@ -155,11 +155,52 @@ agx_validate_defs(agx_instr *I, BITSET_WORD *defs)
    return true;
 }
 
+/*
+ * A byte-packed AGX3 memory access (memory_is_packed on a device, local or
+ * stack load or store) moves its masked elements back to back in the register
+ * file: two bytes to a 16-bit register, or whole 32-bit words for a 32-bit
+ * payload. Its data operand is that wide whichever memory it addresses, so
+ * every such access shares this one rule.
+ */
+static bool
+agx_is_packed_memory(const agx_instr *I)
+{
+   switch (I->op) {
+   case AGX_OPCODE_DEVICE_LOAD:
+   case AGX_OPCODE_LOCAL_LOAD:
+   case AGX_OPCODE_STACK_LOAD:
+   case AGX_OPCODE_DEVICE_STORE:
+   case AGX_OPCODE_LOCAL_STORE:
+   case AGX_OPCODE_STACK_STORE:
+      return I->memory_is_packed;
+   default:
+      return false;
+   }
+}
+
+static unsigned
+agx_packed_memory_registers(const agx_context *ctx, const agx_instr *I,
+                            agx_index data)
+{
+   assert(agx_isa_is_agx3(ctx->key->dev.encoding));
+   assert(data.size == AGX_SIZE_32 ||
+          (data.size == AGX_SIZE_16 && I->format == AGX_FORMAT_I8));
+
+   const unsigned bytes = I->format == AGX_FORMAT_I8    ? 1
+                          : I->format == AGX_FORMAT_I16 ? 2
+                                                        : 4;
+   const unsigned unit = agx_size_align_16(data.size);
+   return DIV_ROUND_UP(util_bitcount(I->mask) * bytes, 2 * unit) * unit;
+}
+
 /** Returns number of registers written by an instruction */
 static unsigned
 agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
 {
    unsigned size = agx_size_align_16(I->dest[d].size);
+
+   if (agx_is_packed_memory(I))
+      return agx_packed_memory_registers(ctx, I, I->dest[d]);
 
    switch (I->op) {
    case AGX_OPCODE_SCS_LOAD_AGX3:
@@ -203,19 +244,6 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
    case AGX_OPCODE_LOCAL_LOAD:
    case AGX_OPCODE_STACK_LOAD:
    case AGX_OPCODE_LD_TILE:
-      if (I->op == AGX_OPCODE_LOCAL_LOAD && I->memory_is_packed) {
-         assert(agx_isa_is_agx3(ctx->key->dev.encoding));
-         assert(I->format == AGX_FORMAT_I8 && I->dest[d].size == AGX_SIZE_16);
-         return DIV_ROUND_UP(util_bitcount(I->mask), 2);
-      }
-      if (I->op == AGX_OPCODE_DEVICE_LOAD && I->memory_is_packed) {
-         assert(agx_isa_is_agx3(ctx->key->dev.encoding));
-         assert(I->dest[d].size == AGX_SIZE_32);
-         const unsigned bytes = I->format == AGX_FORMAT_I8 ? 1 :
-                                I->format == AGX_FORMAT_I16 ? 2 : 4;
-         return DIV_ROUND_UP(util_bitcount(I->mask) * bytes, 4) * 2;
-      }
-
       /* An AGX3 tile load of an 8-bit attachment comes back packed, two
        * channels to a 16-bit register; normflt_agx3 unpacks a normalized one
        * and agx_unpack_integer_8_agx3 a pure integer one. */
@@ -382,12 +410,8 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
    case AGX_OPCODE_ST_TILE:
       /* See agx_write_registers */
       if (s == 0) {
-         if ((I->op == AGX_OPCODE_DEVICE_STORE ||
-              I->op == AGX_OPCODE_LOCAL_STORE) && I->memory_is_packed) {
-            assert(agx_isa_is_agx3(ctx->key->dev.encoding));
-            assert(I->format == AGX_FORMAT_I8);
-            return DIV_ROUND_UP(util_bitcount(I->mask), 2);
-         }
+         if (agx_is_packed_memory(I))
+            return agx_packed_memory_registers(ctx, I, I->src[0]);
 
          /* AGX3's tile store carries a width, not a format, so an 8-bit
           * target arrives packed two channels to a 16-bit register. Normalized
