@@ -10934,6 +10934,24 @@ agx3_scratch_word_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    };
 }
 
+/*
+ * Whether agx_compile_shader_nir() accesses scratch in whole 32-bit words.
+ *
+ * The M5 Ultra's stack forms take a 32-bit word at a constant or a register
+ * offset, a 16-bit half only at a constant offset, and bytes only as a packed
+ * vector of two to four. A dynamically indexed 8- or 16-bit scalar, or a
+ * 2-byte vector, has no form there, and the packer refused it. In words, a
+ * load over-reads within the thread's frame (16-byte aligned) and a narrow
+ * store becomes a read-modify-write of the word that holds it, a word only
+ * this thread addresses. G17P takes the same lowering in
+ * agx_preprocess_nir_g17p().
+ */
+static bool
+agx_scratch_in_words(const struct agx_device_key *dev)
+{
+   return dev->chip == AGX_CHIP_G17D;
+}
+
 bool
 agx3_nir_lower_scratch_words(nir_shader *nir)
 {
@@ -12985,6 +13003,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
                nir_var_function_temp, ~0);
    }
+
+   /* After the internal shaders' scratch above, so this covers every scratch
+    * access the compile encodes, whichever preprocessing built the shader. */
+   if (agx_scratch_in_words(&key->dev))
+      agx3_nir_lower_scratch_words(nir);
 
    /* Cleanup 8-bit math before lowering */
    bool progress;

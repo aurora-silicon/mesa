@@ -601,7 +601,8 @@ void agx_preprocess_nir(nir_shader *nir);
 void agx_preprocess_nir_g17p(nir_shader *nir);
 
 /* Access private (scratch) memory in whole 32-bit words, the only width the
- * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
+ * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it for G17P
+ * and agx_compile_shader_nir() for G17D. */
 bool agx3_nir_lower_scratch_words(nir_shader *nir);
 void agx_preprocess_nir_m5(nir_shader *nir);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
