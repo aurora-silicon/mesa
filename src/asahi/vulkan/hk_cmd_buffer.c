@@ -1952,11 +1952,13 @@ hk_g17p_basic_graphics_program_supported(struct hk_cmd_buffer *cmd,
       (s->b.info.stage == MESA_SHADER_VERTEX ||
        s->info.stage == MESA_SHADER_FRAGMENT) &&
       hk_g17p_native_cprog_qualified(&s->b.info);
+   const unsigned max_spill_B =
+      agx3_graphics_max_spill_B(hk_cmd_buffer_device(cmd)->dev.chip);
    if (!linked || !linked->b.bo || !linked->b.bo->va || linked->b.size == 0 ||
        linked->b.size > UINT32_MAX || (s->b.info.has_preamble && !native_preamble) ||
-       s->b.info.scratch_size > AGX3_G17P_MAX_SPILL_B ||
+       s->b.info.scratch_size > max_spill_B ||
        (s->b.info.preamble_scratch_size != 0 && !native_preamble) ||
-       linked->b.scratch_size > AGX3_G17P_MAX_SPILL_B ||
+       linked->b.scratch_size > max_spill_B ||
        s->b.info.texture_state_count != 0 ||
        (s->b.info.sampler_state_count != 0 &&
         !(s->info.agx3_indexed_sampler_valid &&
@@ -1966,13 +1968,13 @@ hk_g17p_basic_graphics_program_supported(struct hk_cmd_buffer *cmd,
        s->info.set_count > HK_AGX3_G17P_MAX_ROOT_SETS) {
       mesa_loge_once(
          "G17P graphics program refused: linked=%u bo=%u va=%u size=%zu "
-         "preamble=%u scratch=%u/%u/%u textures=%u samplers=%u "
+         "preamble=%u scratch=%u/%u/%u (bound %u) textures=%u samplers=%u "
          "indexed_sampler=%u sampler_heap=%u txf=%u sets=%u",
          linked != NULL, linked && linked->b.bo != NULL,
          linked && linked->b.bo && linked->b.bo->va != NULL,
          linked ? linked->b.size : 0, s->b.info.has_preamble,
          s->b.info.scratch_size, s->b.info.preamble_scratch_size,
-         linked ? linked->b.scratch_size : 0,
+         linked ? linked->b.scratch_size : 0, max_spill_B,
          s->b.info.texture_state_count, s->b.info.sampler_state_count,
          s->info.agx3_indexed_sampler_valid, s->b.info.uses_sampler_heap,
          linked ? linked->b.uses_txf : 0, s->info.set_count);

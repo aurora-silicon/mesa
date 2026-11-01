@@ -2,6 +2,7 @@
 
 
 #include "agx3_graphics_program.h"
+#include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
 #include "agx3_binder.h"
 #include "asahi/lib/agx_ioto_program_core.h"
@@ -119,10 +120,12 @@ test_g17g_programs(enum agx_chip chip)
             CHECK(memcmp(wide_output.bytes + 18, expected_spectpr[i], 10) == 0);
          }
       }
-      const uint32_t scratch_bytes[] = {4, 272, 400, 528, 1040, 262140};
+      const uint32_t scratch_bytes[] = {4, 272, 400, 528, 1040, 4096, 8192,
+                                        16384, 262140};
       const uint8_t scratch_fields[][4] = {
          {1, 0, 1, 0}, {68, 0, 68, 0}, {100, 0, 100, 0},
-         {132, 0, 132, 0}, {4, 1, 4, 1}, {255, 255, 255, 255},
+         {132, 0, 132, 0}, {4, 1, 4, 1}, {0, 4, 0, 4}, {0, 8, 0, 8},
+         {0, 16, 0, 16}, {255, 255, 255, 255},
       };
       for (unsigned i = 0; i < ARRAY_SIZE(scratch_bytes); ++i) {
          struct agx3_g17p_graphics_program_desc spill = desc;
@@ -791,8 +794,24 @@ test_flat_shading_vertex(void)
    return 0;
 }
 
+/* The graphics frame bound Honeykrisp admits under: 16 KiB on the M5 Ultra
+ * alone, every other chip the G17P bound (test_g17g_programs() encodes 4, 8
+ * and 16 KiB frames). */
+static int
+test_graphics_spill_bound(void)
+{
+   for (unsigned c = 0; c < AGX_CHIP_UNKNOWN; ++c) {
+      const enum agx_chip chip = (enum agx_chip)c;
+      CHECK(agx3_graphics_max_spill_B(chip) ==
+            (chip == AGX_CHIP_G17D ? 16384u : 4096u));
+   }
+   CHECK(AGX3_G17P_MAX_SPILL_B == 4096u);
+   return 0;
+}
+
 int main(void) {
-   int r = test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
+   int r = test_graphics_spill_bound() ||
+           test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
            test_load_completion_wait(AGX_CHIP_G17S) ||
            test_load_completion_wait(AGX_CHIP_G17D) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||

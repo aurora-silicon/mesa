@@ -8,12 +8,29 @@
 #include "agx3_ioto_uniform_program.h"
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx3_compute_program_core.h"
+#include "asahi/lib/agx_chip.h"
 
 #define AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
 #define AGX3_G17P_COMPUTE_MAX_LOAD_CHUNKS 128u
 /* Largest thread-private spill frame a G17P program publishes, in bytes.
  * applegpu_g17p holding 60 live uint4 temporaries publishes 1584. */
 #define AGX3_G17P_MAX_SPILL_B 4096u
+/* Largest thread-private frame a vertex or fragment program may publish on
+ * the M5 Ultra, in bytes.  Its graphics SPECTPR carries the frame as a 16-bit
+ * count of words, which represents this exactly, and the kernel sizes each
+ * stage's frame pages and the render pool from the declared bytes. */
+#define AGX3_G17D_MAX_GRAPHICS_SPILL_B 16384u
+
+/* The one graphics frame bound Honeykrisp admits a vertex or fragment program
+ * under, for both the shader's and its linked program's scratch: the M5
+ * Ultra's own, and AGX3_G17P_MAX_SPILL_B on every other chip. */
+static inline unsigned
+agx3_graphics_max_spill_B(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17D ? AGX3_G17D_MAX_GRAPHICS_SPILL_B
+                                : AGX3_G17P_MAX_SPILL_B;
+}
+
 /* SPECTPR has a 16-bit count of four-byte units. RT callable stacks can
  * exceed 8 KiB (31 frames of a callable with a local array). Keep admission
  * consistent with agx_ioto_g17p_compiler_spectpr_pack(). */
