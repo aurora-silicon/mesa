@@ -5233,7 +5233,7 @@ agx3_emit_scoped_barrier(struct util_dynarray *emission,
 {
    if (I->op != AGX_OPCODE_SCOPED_BARRIER_AGX3 ||
        I->nr_dests != 0 || I->nr_srcs != 0 ||
-       I->imm > AGX3_BARRIER_SCOPE_COHERENT_WRITE)
+       I->imm > AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE)
       return false;
 
    struct agx3_encoded_scoped_barrier encoded;
@@ -9683,8 +9683,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          /* Release ordering includes reads whose results are used after the
           * fence. Register dependencies alone do not order those reads. */
          e->drain = I->op == AGX_OPCODE_SCOPED_BARRIER_AGX3 &&
-            (I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
-             I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE);
+            agx3_barrier_scope_is_device(I->imm);
          e->reissues_live_slot = I->op == AGX_OPCODE_LDCF;
          if (I->agx3_tex_coord_start)
             e->preferred_slot = native_coord_preferred_slot;
@@ -12618,8 +12617,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             /* Image-write slots are assigned by the staging allocator after
              * the general scheduler. A device fence must also complete these
              * issued writes, which the scheduler's drain cannot see. */
-            const bool device = I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
-                                I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE;
+            const bool device = agx3_barrier_scope_is_device(I->imm);
             /* The native PBE-to-texture fence includes a wait on slot1.
              * Heap image writes rotate through the six completion slots,
              * however, so retire their other live generations before the

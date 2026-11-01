@@ -1,4 +1,5 @@
 #include "agx3_alu_core.h"
+#include "agx3_binder.h"
 #include "agx3_falu_mod_core.h"
 #include "agx3_iadd_core.h"
 #include "agx3_pack.h"
@@ -4302,6 +4303,101 @@ TEST(NativeForms, M5CoherentImageFormsOnlyOnUltra)
       else
          EXPECT_EQ(programs[1], programs[0]) << chip;
    }
+}
+
+/* G17D's memory-only device fence over images is DEVICE_FENCE with f41
+ * (bit 10): `0f 2f`, form 27 like `0f 2b`. Only G17D selects it, and only
+ * when the fence's modes include images; the packer drains and retires
+ * before it exactly as before DEVICE_FENCE. */
+TEST(NativeForms, M5UltraImageDeviceFence)
+{
+   const std::vector<uint8_t> global_word = {0x0f, 0x2b, 0x00, 0x06, 0x00, 0x00};
+   const std::vector<uint8_t> image_word = {0x0f, 0x2f, 0x00, 0x06, 0x00, 0x00};
+   agx3_encoded_scoped_barrier enc = {};
+   ASSERT_TRUE(agx3_pack_scoped_barrier(
+      AGX_ISA_ENCODING_AGX3C, AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE, &enc));
+   EXPECT_EQ(std::vector<uint8_t>(enc.bytes, enc.bytes + enc.length), image_word);
+   ASSERT_TRUE(agx3_pack_scoped_barrier(
+      AGX_ISA_ENCODING_AGX3C, AGX3_BARRIER_SCOPE_DEVICE_FENCE, &enc));
+   EXPECT_EQ(std::vector<uint8_t>(enc.bytes, enc.bytes + enc.length), global_word);
+   EXPECT_FALSE(agx3_pack_scoped_barrier(
+      AGX_ISA_ENCODING_AGX3B, AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE, &enc));
+   EXPECT_FALSE(agx3_pack_scoped_barrier_wait(
+      AGX_ISA_ENCODING_AGX3C, AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE, 0x2,
+      &enc));
+
+   /* Mesa's AGX3C tables compose the same bytes from the named fields. */
+   const struct agx3_field_kv fields[] = {
+      {14, 3}, {15, 9}, {24, 1}, {30, 5}, {39, 1}, {40, 1}, {41, 1},
+   };
+   uint8_t composed[AGX3_SCOPED_BARRIER_MAX_LENGTH] = {0}, len = 0;
+   ASSERT_TRUE(agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "barrier", 0, fields,
+                                 sizeof(fields) / sizeof(fields[0]), NULL, 0,
+                                 composed, &len));
+   EXPECT_EQ(std::vector<uint8_t>(composed, composed + len), image_word);
+   ASSERT_TRUE(agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "barrier", 0, fields,
+                                 sizeof(fields) / sizeof(fields[0]) - 1, NULL,
+                                 0, composed, &len));
+   EXPECT_EQ(std::vector<uint8_t>(composed, composed + len), global_word);
+
+   /* G17D only, and only with images: the other M5 parts and older GPUs
+    * keep today's word. */
+   EXPECT_EQ(agx3_device_fence_scope(AGX_CHIP_G17D, true),
+             AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE);
+   EXPECT_EQ(agx3_device_fence_scope(AGX_CHIP_G17D, false),
+             AGX3_BARRIER_SCOPE_DEVICE_FENCE);
+   for (enum agx_chip chip : {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+                              AGX_CHIP_G17P, AGX_CHIP_G16G, AGX_CHIP_G15S,
+                              AGX_CHIP_G13G}) {
+      EXPECT_EQ(agx3_device_fence_scope(chip, true),
+                AGX3_BARRIER_SCOPE_DEVICE_FENCE) << chip;
+      EXPECT_EQ(agx3_device_fence_scope(chip, false),
+                AGX3_BARRIER_SCOPE_DEVICE_FENCE) << chip;
+   }
+   EXPECT_TRUE(agx3_barrier_scope_is_device(AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE));
+
+   /* Through the packer, after a coherent image write: the program with the
+    * image word is the DEVICE_FENCE program but for that one bit. */
+   std::vector<uint8_t> programs[2];
+   for (unsigned image = 0; image < 2; ++image) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17D;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index data = agx_register(16, AGX_SIZE_32);
+      data.channels_m1 = 3;
+      agx_index coord = agx_register(24, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      agx_image_write(b, data, coord, agx_zero(), agx_uniform(8, AGX_SIZE_64),
+                      agx_register(28, AGX_SIZE_32), AGX_DIM_2D, true);
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_COHERENT_WRITE);
+      agx_scoped_barrier_agx3(b, image ? AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE
+                                       : AGX3_BARRIER_SCOPE_DEVICE_FENCE);
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT);
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary)) << image;
+      const uint8_t *bytes = (const uint8_t *)binary.data;
+      programs[image].assign(bytes, bytes + binary.size);
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+   ASSERT_EQ(programs[0].size(), programs[1].size());
+   unsigned diffs = 0, at = 0;
+   for (unsigned i = 0; i < programs[0].size(); ++i) {
+      if (programs[0][i] != programs[1][i])
+         ++diffs, at = i;
+   }
+   ASSERT_EQ(diffs, 1u);
+   ASSERT_GE(at, 1u);
+   EXPECT_EQ(programs[0][at] ^ programs[1][at], 0x04);
+   EXPECT_EQ(std::vector<uint8_t>(programs[1].begin() + at - 1,
+                                  programs[1].begin() + at + 5),
+             image_word);
 }
 
 /* G17G 2D-MS texel fetches staged through PACK_SMPIR: the vertex form

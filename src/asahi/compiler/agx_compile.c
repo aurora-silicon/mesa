@@ -3406,9 +3406,12 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                (modes & nir_var_shader_out);
             if ((modes & (nir_var_mem_global | nir_var_image)) ||
                 tcs_outputs) {
+               /* G17D's memory-only fence over images is its own word
+                * (f41 set); see agx3_device_fence_scope. */
                agx_scoped_barrier_agx3(
-                  b, nir_intrinsic_execution_scope(instr) < SCOPE_WORKGROUP
-                        ? AGX3_BARRIER_SCOPE_DEVICE_FENCE
+                  b, memory_only
+                        ? agx3_device_fence_scope(b->shader->key->dev.chip,
+                                                  modes & nir_var_image)
                         : AGX3_BARRIER_SCOPE_DEVICE);
                emitted = true;
             }

@@ -2328,6 +2328,11 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
          0x87, 0x0e, 0x00, 0x06, 0x00, 0x00,
          0x87, 0x06, 0x00, 0x06, 0x00, 0x00,
       },
+      /* DEVICE_FENCE plus f41 (bit 10): G17D's device word for a fence over
+       * device and texture memory at device scope, as measured on the M5
+       * Ultra. Composes as form 27, like DEVICE_FENCE. */
+      [AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE] =
+         {0x0f, 0x2f, 0x00, 0x06, 0x00, 0x00},
    };
    const uint8_t(*canonical)[AGX3_SCOPED_BARRIER_MAX_LENGTH] =
       encoding == AGX_ISA_ENCODING_AGX3B ? canonical_b :
@@ -2342,7 +2347,8 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
          : 6;
    const bool agx3c_only =
       scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP ||
-      scope == AGX3_BARRIER_SCOPE_COHERENT_WRITE;
+      scope == AGX3_BARRIER_SCOPE_COHERENT_WRITE ||
+      scope == AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE;
 
    if (canonical == NULL || out == NULL ||
        scope < AGX3_BARRIER_SCOPE_EXECUTION ||

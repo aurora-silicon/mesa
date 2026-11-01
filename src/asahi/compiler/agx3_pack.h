@@ -223,6 +223,11 @@ enum agx3_barrier_scope {
    /* AGX3C only: the barrier pair after every device-coherent texture
     * write, its first word waiting on the write's result slot. */
    AGX3_BARRIER_SCOPE_COHERENT_WRITE,
+   /* AGX3C, chosen for G17D only: DEVICE_FENCE with f41 (bit 10), the
+    * device word of the M5 Ultra's memory-only device fence whose classes
+    * include texture memory (`0f 2f`). A global-only fence keeps
+    * DEVICE_FENCE (`0f 2b`). */
+   AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE,
 };
 
 /* AGX3C's device-coherent image forms: the read with f79=2 and the write
@@ -233,6 +238,28 @@ static inline bool
 agx3_coherent_image_forms(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17D;
+}
+
+/* The scopes that order device memory: the packer drains every outstanding
+ * slot before them and retires the image writes still in flight. */
+static inline bool
+agx3_barrier_scope_is_device(unsigned scope)
+{
+   return scope == AGX3_BARRIER_SCOPE_DEVICE ||
+          scope == AGX3_BARRIER_SCOPE_DEVICE_FENCE ||
+          scope == AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE;
+}
+
+/* The device word of a memory-only fence (execution scope below the
+ * workgroup) whose modes include global memory or images. G17D's fence that
+ * also names images sets f41; every other chip, the other M5 parts
+ * included, keeps the global-only word. */
+static inline enum agx3_barrier_scope
+agx3_device_fence_scope(enum agx_chip chip, bool images)
+{
+   return chip == AGX_CHIP_G17D && images
+             ? AGX3_BARRIER_SCOPE_DEVICE_IMAGE_FENCE
+             : AGX3_BARRIER_SCOPE_DEVICE_FENCE;
 }
 
 struct agx3_encoded_scoped_barrier {
