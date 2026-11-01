@@ -220,7 +220,20 @@ enum agx3_barrier_scope {
    AGX3_BARRIER_SCOPE_MESH_PAYLOAD_ENTRY,
    /* Captured object.write_childcount after the API workgroup barrier. */
    AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT,
+   /* AGX3C only: the barrier pair after every device-coherent texture
+    * write, its first word waiting on the write's result slot. */
+   AGX3_BARRIER_SCOPE_COHERENT_WRITE,
 };
+
+/* AGX3C's device-coherent image forms: the read with f79=2 and the write
+ * with f75=2 followed by AGX3_BARRIER_SCOPE_COHERENT_WRITE. They were
+ * measured on G17D, the M5 Ultra; the other M5 parts (G17G, G17S) keep the
+ * plain forms until theirs are observed. */
+static inline bool
+agx3_coherent_image_forms(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17D;
+}
 
 struct agx3_encoded_scoped_barrier {
    uint8_t bytes[AGX3_SCOPED_BARRIER_MAX_LENGTH];

@@ -221,6 +221,11 @@ agx3_tex_encode_fetch(enum agx_isa_encoding enc,
          ov[n++] = (struct agx3_field_kv)KV(120, 1);
       ov[n++] = (struct agx3_field_kv)KV(142, 1);
    }
+   /* Semantic value 2 deposits instruction bit 15 in every smp form (ep0..3)
+    * and nothing else; 1 is not a legal value and 3/5 select an extended
+    * operand profile. */
+   if (d->coherent && enc == AGX_ISA_ENCODING_AGX3C)
+      ov[n++] = (struct agx3_field_kv)KV(79, 2);
    for (unsigned i = 0; i < 8; ++i)
       if (d->wait_mask & (1u << i))
          ov[n++] = (struct agx3_field_kv)KV(62 + i, 1);
@@ -1190,6 +1195,7 @@ decode_c(const uint8_t *p, struct agx3_tex_fetch_desc *d)
    d->coord = (((w1 >> 10) & 0x3f) << 2) | (((w1 >> 9) & 1) << 8);
    d->coord_kill = (w1 >> 4) & 1;
    d->final = (w2 >> 15) & 1;
+   d->coherent = (w0 >> 15) & 1;
 
    const unsigned mask_code = ((w3 >> 5) & 3) | (((w3 >> 11) & 1) << 2);
    if (mask_code == 0)
@@ -2644,6 +2650,9 @@ agx3_tex_encode_image_write_agx3c(
       KV(immediate ? 91 : reg ? 92 : 93, d->image_value),
       KV(99, immediate ? 1 : reg ? 2 : 3), KV(100, immediate ? 1 : 2),
       KV(103, d->image_kill), KV(113, 1),
+      /* f75's encoder LUT maps 0 (plain) to bits 94:95 = 2 and 2 (device
+       * coherent) to 0; 1, 3 and 4 do not compose. */
+      KV(75, d->coherent ? 2 : 0),
    };
    if (!agx3_bind_compose(AGX_ISA_ENCODING_AGX3C, "imgwci", 0,
                           fields, sizeof(fields) / sizeof(fields[0]),

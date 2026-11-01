@@ -2321,6 +2321,13 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
          0x87, 0x27, 0x00, 0x06, 0x00, 0x00,
          0x87, 0x1f, 0x00, 0x06, 0x00, 0x00,
       },
+      /* After a device-coherent texture write: the texture-class words of
+       * TEXTURE_FENCE_WAIT with phase (f30) 1 and 0 instead of 4 and 3. The
+       * first word also waits on the write's slot. */
+      [AGX3_BARRIER_SCOPE_COHERENT_WRITE] = {
+         0x87, 0x0e, 0x00, 0x06, 0x00, 0x00,
+         0x87, 0x06, 0x00, 0x06, 0x00, 0x00,
+      },
    };
    const uint8_t(*canonical)[AGX3_SCOPED_BARRIER_MAX_LENGTH] =
       encoding == AGX_ISA_ENCODING_AGX3B ? canonical_b :
@@ -2329,15 +2336,18 @@ agx3_pack_scoped_barrier(enum agx_isa_encoding encoding,
       scope == AGX3_BARRIER_SCOPE_TEXTURE ||
             scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE ||
             scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT ||
-            scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP
+            scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP ||
+            scope == AGX3_BARRIER_SCOPE_COHERENT_WRITE
          ? 12
          : 6;
+   const bool agx3c_only =
+      scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP ||
+      scope == AGX3_BARRIER_SCOPE_COHERENT_WRITE;
 
    if (canonical == NULL || out == NULL ||
        scope < AGX3_BARRIER_SCOPE_EXECUTION ||
-       scope > AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP ||
-       (encoding == AGX_ISA_ENCODING_AGX3B &&
-        scope > AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT) ||
+       (scope > AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT && !agx3c_only) ||
+       (encoding == AGX_ISA_ENCODING_AGX3B && agx3c_only) ||
        (encoding == AGX_ISA_ENCODING_AGX3C &&
         scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE))
       return false;
@@ -2360,20 +2370,23 @@ agx3_pack_scoped_barrier_wait(enum agx_isa_encoding encoding,
       return true;
 
    /* Field 29 is the threadgroup rendezvous and field 39 the threadgroup
-    * memory scope; the first word is scope 4, the second scope 3. */
+    * memory scope; the first word is phase (f30) 4, the second 3, except
+    * after a coherent write, whose words are phases 1 and 0. */
    const bool rendezvous = scope == AGX3_BARRIER_SCOPE_TEXTURE;
    const bool threadgroup =
       rendezvous || scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP;
+   const unsigned phase = scope == AGX3_BARRIER_SCOPE_COHERENT_WRITE ? 1 : 4;
    if (encoding != AGX_ISA_ENCODING_AGX3C || (wait_mask & ~UINT16_C(0xff)) ||
        (scope != AGX3_BARRIER_SCOPE_TEXTURE &&
         scope != AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT &&
-        scope != AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP)) {
+        scope != AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP &&
+        scope != AGX3_BARRIER_SCOPE_COHERENT_WRITE)) {
       memset(out, 0, sizeof(*out));
       return false;
    }
 
    const struct agx3_field_kv base[] = {
-      {14, 3}, {15, 9}, {28, 1}, {29, rendezvous}, {30, 4},
+      {14, 3}, {15, 9}, {28, 1}, {29, rendezvous}, {30, phase},
       {39, threadgroup}, {40, 1}, {41, 1},
    };
    struct agx3_field_kv wait[8];

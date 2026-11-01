@@ -4073,6 +4073,237 @@ TEST(NativeForms, M5ImageFenceWaitsWriteSlotInBarrier)
    ralloc_free(mem);
 }
 
+/* M5 Ultra device-coherent texture forms, from reference programs that
+ * differ only in coherence (a texel read and write, and a message-passing
+ * kernel with and without coherent accesses). A coherent read is the
+ * plain smp with instruction bit 15 set; a coherent write is the plain imgwci
+ * with bits 94:95 = 0 instead of 2, followed by a two-word barrier whose first
+ * word waits on the write's slot. The reference words carry their own
+ * register and heap choices, so the reads and writes are compared as the
+ * coherent-versus-plain difference. */
+TEST(NativeForms, M5CoherentTextureAccessWitnesses)
+{
+   static const uint8_t ref_rd_coh[8] = {0x1f, 0x86, 0x1a, 0x00,
+                                           0x40, 0x80, 0x00, 0x21};
+   static const uint8_t ref_rd_plain[8] = {0x1f, 0x06, 0x1a, 0x00,
+                                             0x40, 0x80, 0x00, 0x21};
+   static const uint8_t ref_wr_coh[18] = {
+      0x25, 0x04, 0x11, 0x0c, 0x24, 0x20, 0xa0, 0x02, 0x00,
+      0x80, 0x00, 0x0c, 0x00, 0x20, 0x0e, 0x00, 0x01, 0x00};
+   static const uint8_t ref_wr_plain[18] = {
+      0x25, 0x04, 0x11, 0x0c, 0x24, 0x20, 0xa0, 0x02, 0x00,
+      0x80, 0x00, 0x8c, 0x00, 0x20, 0x0e, 0x00, 0x01, 0x00};
+
+   /* Reads: every smp form a texel fetch takes (ep0, the array ep2 and the
+    * sparse ep3) differs from its plain form by bit 15 and nothing else,
+    * and the strict decoder keeps it. */
+   for (unsigned shape = 0; shape < 3; ++shape) {
+      agx3_tex_fetch_desc d = {};
+      d.dest = 2;
+      d.width = AGX3_TEX_W32;
+      d.mask = 1;
+      d.slot = 1;
+      d.coord_kill = shape != 2;
+      d.final = shape != 2;
+      d.array = shape == 1;
+      d.sparse = shape == 2;
+      uint8_t plain[AGX3_TEX_MAX_LENGTH] = {0}, coh[AGX3_TEX_MAX_LENGTH] = {0};
+      uint8_t plain_len = 0, coh_len = 0;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3C, &d, plain,
+                                        &plain_len)) << shape;
+      d.coherent = true;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3C, &d, coh,
+                                        &coh_len)) << shape;
+      ASSERT_EQ(plain_len, coh_len) << shape;
+      for (unsigned i = 0; i < plain_len; ++i) {
+         const uint8_t ref = i < 8 ? ref_rd_coh[i] ^ ref_rd_plain[i] : 0;
+         EXPECT_EQ(coh[i] ^ plain[i], ref) << shape << " byte " << i;
+      }
+      if (shape == 0) {
+         agx3_tex_fetch_desc back = {};
+         ASSERT_TRUE(agx3_tex_decode_fetch(AGX_ISA_ENCODING_AGX3C, coh,
+                                           coh_len, &back));
+         EXPECT_TRUE(back.coherent);
+         ASSERT_TRUE(agx3_tex_decode_fetch(AGX_ISA_ENCODING_AGX3C, plain,
+                                           plain_len, &back));
+         EXPECT_FALSE(back.coherent);
+      }
+   }
+
+   /* AGX3B has no such bit: the flag must not change its encoding. */
+   {
+      agx3_tex_fetch_desc d = {};
+      d.dest = 2;
+      d.width = AGX3_TEX_W32;
+      d.mask = 1;
+      d.slot = 1;
+      uint8_t plain[AGX3_TEX_MAX_LENGTH] = {0}, coh[AGX3_TEX_MAX_LENGTH] = {0};
+      uint8_t plain_len = 0, coh_len = 0;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3B, &d, plain,
+                                        &plain_len));
+      d.coherent = true;
+      ASSERT_TRUE(agx3_tex_encode_fetch(AGX_ISA_ENCODING_AGX3B, &d, coh,
+                                        &coh_len));
+      EXPECT_EQ(std::vector<uint8_t>(coh, coh + coh_len),
+                std::vector<uint8_t>(plain, plain + plain_len));
+   }
+
+   /* Writes: the reference heap at uniform half 4, bank 0, slot 1. */
+   for (unsigned dim = 0; dim < 3; ++dim) {
+      agx3_image_write_desc d = {};
+      d.result_slot = 1;
+      d.dim = dim == 0 ? AGX3_IMAGE_WRITE_2D
+              : dim == 1 ? AGX3_IMAGE_WRITE_2D_ARRAY
+                         : AGX3_IMAGE_WRITE_3D;
+      uint8_t plain[AGX3_TEX_MAX_LENGTH] = {0}, coh[AGX3_TEX_MAX_LENGTH] = {0};
+      uint8_t plain_len = 0, coh_len = 0;
+      ASSERT_TRUE(agx3_tex_encode_image_write_agx3c(&d, 4, 1, plain,
+                                                    &plain_len)) << dim;
+      d.coherent = true;
+      ASSERT_TRUE(agx3_tex_encode_image_write_agx3c(&d, 4, 1, coh, &coh_len))
+         << dim;
+      ASSERT_EQ(coh_len, 18u);
+      ASSERT_EQ(plain_len, 18u);
+      for (unsigned i = 0; i < 18; ++i)
+         EXPECT_EQ(coh[i] ^ plain[i], ref_wr_coh[i] ^ ref_wr_plain[i])
+            << dim << " byte " << i;
+      /* The plain form is unchanged: bits 94:95 = 2. */
+      EXPECT_EQ(plain[11] & 0xc0, 0x80) << dim;
+   }
+
+   /* The barrier pair after the write, waiting on its slot 1, matches the
+    * reference exactly; with no write in flight the first word has no wait. */
+   const struct {
+      uint16_t wait;
+      std::vector<uint8_t> native;
+   } pairs[] = {
+      {0x1, {0x87, 0x0e, 0x00, 0x06, 0x00, 0x04,
+             0x87, 0x06, 0x00, 0x06, 0x00, 0x00}},
+      {0x2, {0x87, 0x0e, 0x00, 0x06, 0x00, 0x08,
+             0x87, 0x06, 0x00, 0x06, 0x00, 0x00}},
+      {0, {0x87, 0x0e, 0x00, 0x06, 0x00, 0x00,
+           0x87, 0x06, 0x00, 0x06, 0x00, 0x00}},
+   };
+   for (const auto &p : pairs) {
+      agx3_encoded_scoped_barrier enc = {};
+      ASSERT_TRUE(agx3_pack_scoped_barrier_wait(
+         AGX_ISA_ENCODING_AGX3C, AGX3_BARRIER_SCOPE_COHERENT_WRITE, p.wait,
+         &enc)) << p.wait;
+      EXPECT_EQ(std::vector<uint8_t>(enc.bytes, enc.bytes + enc.length),
+                p.native) << p.wait;
+   }
+   agx3_encoded_scoped_barrier enc = {};
+   EXPECT_FALSE(agx3_pack_scoped_barrier(
+      AGX_ISA_ENCODING_AGX3B, AGX3_BARRIER_SCOPE_COHERENT_WRITE, &enc));
+}
+
+/* Through the packer: a coherent write is the coherent imgwci, and the
+ * COHERENT_WRITE barrier after it waits, in its first word, on the slot that
+ * imgwci signals. A plain write keeps the plain form. */
+TEST(NativeForms, M5CoherentWriteBarrierWaitsWriteSlot)
+{
+   for (unsigned coherent = 0; coherent < 2; ++coherent) {
+      void *mem = ralloc_context(NULL);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17D;
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      agx_index data = agx_register(16, AGX_SIZE_32);
+      data.channels_m1 = 3;
+      agx_index coord = agx_register(24, AGX_SIZE_32);
+      coord.channels_m1 = 1;
+      agx_image_write(b, data, coord, agx_zero(), agx_uniform(8, AGX_SIZE_64),
+                      agx_register(28, AGX_SIZE_32), AGX_DIM_2D, coherent);
+      if (coherent)
+         agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_COHERENT_WRITE);
+      agx_stop(b);
+      util_dynarray binary;
+      util_dynarray_init(&binary, mem);
+      ASSERT_TRUE(agx3_pack_binary(b->shader, &binary)) << coherent;
+
+      const uint8_t *bytes = (const uint8_t *)binary.data;
+      unsigned writes = 0, pairs = 0;
+      for (unsigned i = 0; i + 18 <= binary.size; ++i) {
+         /* imgwci: exact bits 0:2 16:18 = 101 001, length 18. */
+         if ((bytes[i] & 7) != 5 || (bytes[i + 2] & 7) != 1 ||
+             bytes[i + 16] != 0x01)
+            continue;
+         ++writes;
+         EXPECT_EQ(bytes[i + 11] & 0xc0, coherent ? 0x00 : 0x80);
+         /* f12, the result slot less one: bits 46:47 and 19. */
+         const unsigned slot_m1 = ((bytes[i + 5] >> 6) & 3) |
+                                  (((bytes[i + 2] >> 3) & 1) << 2);
+         if (coherent) {
+            agx3_encoded_scoped_barrier enc = {};
+            ASSERT_TRUE(agx3_pack_scoped_barrier_wait(
+               AGX_ISA_ENCODING_AGX3C, AGX3_BARRIER_SCOPE_COHERENT_WRITE,
+               1u << slot_m1, &enc));
+            ASSERT_LE(i + 18 + enc.length, binary.size);
+            EXPECT_EQ(memcmp(bytes + i + 18, enc.bytes, enc.length), 0);
+            pairs += !memcmp(bytes + i + 18, enc.bytes, enc.length);
+         }
+         i += 17;
+      }
+      EXPECT_EQ(writes, 1u) << coherent;
+      EXPECT_EQ(pairs, coherent ? 1u : 0u);
+      util_dynarray_fini(&binary);
+      ralloc_free(mem);
+   }
+}
+
+/* The device-coherent forms are measured on G17D only. Through the
+ * compiler, a coherent image load on G17G and G17S compiles to the same
+ * program as a plain one, as before those forms; on G17D it differs. (The
+ * store's selection is the same predicate; an M5 image store needs
+ * Honeykrisp's descriptor lowering to reach the packer, so it is covered at
+ * the packer by M5CoherentWriteBarrierWaitsWriteSlot.) */
+TEST(NativeForms, M5CoherentImageFormsOnlyOnUltra)
+{
+   EXPECT_TRUE(agx3_coherent_image_forms(AGX_CHIP_G17D));
+   for (enum agx_chip chip : {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+                              AGX_CHIP_G17P, AGX_CHIP_G13G})
+      EXPECT_FALSE(agx3_coherent_image_forms(chip)) << chip;
+
+   for (enum agx_chip chip : {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17D}) {
+      std::vector<uint8_t> programs[2];
+      for (unsigned coherent = 0; coherent < 2; ++coherent) {
+         SCOPED_TRACE(::testing::Message() << chip << " " << coherent);
+         nir_builder b = nir_builder_init_simple_shader(
+            MESA_SHADER_COMPUTE, &agx_nir_options, "coherent image load");
+         const enum gl_access_qualifier access =
+            coherent ? ACCESS_COHERENT : (enum gl_access_qualifier)0;
+         nir_def *coord = nir_imm_ivec4(&b, 1, 2, 0, 0);
+         nir_def *value = nir_image_load(
+            &b, 4, 32, nir_imm_intN_t(&b, 1, 16), coord,
+            nir_imm_intN_t(&b, 0, 16), nir_imm_intN_t(&b, 0, 16),
+            .image_dim = GLSL_SAMPLER_DIM_2D,
+            .format = PIPE_FORMAT_R32G32B32A32_UINT, .access = access,
+            .dest_type = nir_type_uint32);
+         nir_store_global(&b, value, nir_imm_int64(&b, 0x1000),
+                          .align_mul = 16);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+         key.dev.chip = chip;
+         key.no_preamble = true;
+         key.reserved_preamble = 16;
+         agx_preprocess_nir(b.shader);
+         agx_shader_part part = {};
+         ASSERT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+            << agx_last_compile_refusal();
+         const uint8_t *code = static_cast<const uint8_t *>(part.binary);
+         programs[coherent].assign(code, code + part.info.binary_size);
+         free(part.binary);
+         ralloc_free(b.shader);
+      }
+      if (chip == AGX_CHIP_G17D)
+         EXPECT_NE(programs[1], programs[0]);
+      else
+         EXPECT_EQ(programs[1], programs[0]) << chip;
+   }
+}
+
 /* G17G 2D-MS texel fetches staged through PACK_SMPIR: the vertex form
  * (port/vmswit v_ms_f) is the fragment form (f_ms_f) with sampler index 0. */
 TEST(NativeForms, M5VertexMultisampleFetchWitness)

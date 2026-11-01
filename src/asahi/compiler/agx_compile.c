@@ -1654,6 +1654,17 @@ nir_is_coherent(nir_intrinsic_instr *instr)
           (ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_ATOMIC);
 }
 
+/* An image load or store's coherent flag. AGX2 and AGX3B take it as before;
+ * AGX3C selects its device-coherent forms from it, so it is set there only
+ * on the chips those forms are measured on (agx3_coherent_image_forms). */
+static bool
+agx_image_access_coherent(agx_builder *b, nir_intrinsic_instr *instr)
+{
+   return nir_is_coherent(instr) &&
+          (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+           agx3_coherent_image_forms(b->shader->key->dev.chip));
+}
+
 static void
 agx_emit_load(agx_builder *b, agx_index dest, nir_intrinsic_instr *instr)
 {
@@ -2560,7 +2571,8 @@ agx_emit_image_load(agx_builder *b, agx_index dst, nir_intrinsic_instr *intr)
    agx_instr *I = agx_image_load_to(b, tmp, coords, lod, bindless, texture,
                                     agx_immediate(0), agx_null(),
                                     agx_tex_dim(dim, is_array), lod_mode, 0,
-                                    false, sparse, nir_is_coherent(intr));
+                                    false, sparse,
+                                    agx_image_access_coherent(b, intr));
    /* ACCESS_CAN_REORDER (nir_opt_access: the image is NonWritable, so
     * nothing in this shader writes it) and ACCESS_RESTRICT (vtn: an image
     * not decorated Aliased, which SPIR-V's Simple/GLSL/Vulkan memory models
@@ -2679,7 +2691,7 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
    b->shader->out->tag_write_disable = false;
 
    agx_instr *write = agx_image_write(b, data, coords, lod, base, index, dim,
-                                      nir_is_coherent(instr));
+                                      agx_image_access_coherent(b, instr));
    /* The selector below is native G17P's witnessed imgwci f70 rule. The
     * AGX3C packer encodes its float/UNORM and I32 forms for 1D/2D stores
     * only; 3D, array and cube stores keep the integer format it encodes for
@@ -2751,6 +2763,17 @@ agx_emit_image_store(agx_builder *b, nir_intrinsic_instr *instr)
          break;
       }
    }
+
+   /* AGX2 makes a coherent image access visible across the GPU with the
+    * cache-bypass bit on the access and agx_flush_memory_to_texture on the
+    * acquiring side. AGX3C has a device-coherent form of both the read and
+    * the write (on G17D: agx3_coherent_image_forms), which the packer
+    * selects from write->coherent; every device-coherent write is followed
+    * by this barrier pair, whose first word waits on the write's result
+    * slot. */
+   if (write->coherent &&
+       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
+      agx_scoped_barrier_agx3(b, AGX3_BARRIER_SCOPE_COHERENT_WRITE);
    return write;
 }
 

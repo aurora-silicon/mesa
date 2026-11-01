@@ -117,6 +117,14 @@ struct agx3_tex_fetch_desc {
     * profile: Apple's argument-buffer f112 profile is a different ABI.
     */
    bool sparse;
+   /*
+    * Device-coherent read (AGX3C): f79=2, instruction bit 15 (byte 1 0x80).
+    * Set for a device-coherent read and clear otherwise; nothing else in the
+    * instruction changes (a coherent and a plain read of the same texel
+    * differ in this bit alone). It is the AGX3C counterpart of AGX2's
+    * image-load cache bypass (agx_pack.c).
+    */
+   bool coherent;
 };
 
 bool agx3_tex_encode_fetch(enum agx_isa_encoding enc,
@@ -526,6 +534,12 @@ struct agx3_image_write_desc {
    bool image_kill;
    bool normalized;
    enum agx3_image_write_dim dim;
+   /* Device-coherent write (AGX3C only): f75=2, instruction bits 94:95 = 0
+    * instead of 2 (byte 11 0x0c, not 0x8c), with nothing else in the
+    * instruction changed (a coherent and a plain write differ in these bits
+    * alone). The packer follows it with
+    * AGX3_BARRIER_SCOPE_COHERENT_WRITE on the write's slot. */
+   bool coherent;
 };
 
 /* Explicit PBE heap base in uniform halves, native descriptor index in

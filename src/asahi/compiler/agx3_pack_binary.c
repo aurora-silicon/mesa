@@ -1945,6 +1945,12 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
       .three_d = three_d,
       .lod_x64 = immediate_lod ? I->src[1].value * 64 : 0,
       .register_lod = register_lod,
+      /* A coherent image load (ACCESS_COHERENT, which nir_lower_memory_model
+       * also derives from availability/visibility barriers) reads through
+       * the device-coherent path; the compiler sets the flag on AGX3C only
+       * where that path is measured (agx3_coherent_image_forms). AGX2 sets
+       * its cache-bypass bit for the same flag. */
+      .coherent = m5 && I->op == AGX_OPCODE_IMAGE_LOAD && I->coherent,
    };
    uint8_t bytes[AGX3_TEX_MAX_LENGTH];
    uint8_t len = 0;
@@ -1973,8 +1979,10 @@ agx3_emit_texture_fetch(struct util_dynarray *emission,
 
 /* Two bounded public storage-image forms: integer 2D state0 fed by an image
  * load or atomic result, and normalized formatted-float state1 fed by one
- * explicit-LOD sample. The native imgwci operation is the coherent image
- * write form; NIR's coherent bit does not select a different instruction.
+ * explicit-LOD sample. On AGX3C the instruction's coherent bit (set only
+ * where agx3_coherent_image_forms holds) selects imgwci's device-coherent
+ * form (f75); the compiler follows that write with
+ * AGX3_BARRIER_SCOPE_COHERENT_WRITE. AGX3B has one form for both.
  * The PBE descriptor selects RGBA8 versus RGB10A2.
  * The four slot1 COPYs route the packed vec4 into the exact imgwci data lanes.
  * The first COPY consumes the one-shot texture dependency when it is still
@@ -2183,6 +2191,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
       .dim = array     ? AGX3_IMAGE_WRITE_2D_ARRAY
              : three_d ? AGX3_IMAGE_WRITE_3D
                        : AGX3_IMAGE_WRITE_2D,
+      .coherent = m5 && I->coherent,
    };
    bool encoded;
    if (m5) {
@@ -5213,7 +5222,8 @@ agx3_m5_texture_barrier(enum agx_isa_encoding enc, unsigned scope)
    return enc == AGX_ISA_ENCODING_AGX3C &&
           (scope == AGX3_BARRIER_SCOPE_TEXTURE ||
            scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_WAIT ||
-           scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP);
+           scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP ||
+           scope == AGX3_BARRIER_SCOPE_COHERENT_WRITE);
 }
 
 static bool
@@ -5223,7 +5233,7 @@ agx3_emit_scoped_barrier(struct util_dynarray *emission,
 {
    if (I->op != AGX_OPCODE_SCOPED_BARRIER_AGX3 ||
        I->nr_dests != 0 || I->nr_srcs != 0 ||
-       I->imm > AGX3_BARRIER_SCOPE_OBJECT_PAYLOAD_EXIT)
+       I->imm > AGX3_BARRIER_SCOPE_COHERENT_WRITE)
       return false;
 
    struct agx3_encoded_scoped_barrier encoded;
