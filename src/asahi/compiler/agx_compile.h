@@ -430,6 +430,10 @@ struct agx_device_key {
     * kernel, but that's functionally a hardware feature.
     */
    bool soft_fault;
+
+   /* Physical A18 Pro capability, not the G17P profile shared with T6040.
+    * Offline/shared library keys leave this disabled. */
+   bool shader_quad_control;
 };
 
 struct agx_shader_key {
