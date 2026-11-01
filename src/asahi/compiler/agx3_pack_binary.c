@@ -4416,11 +4416,82 @@ agx3_translate_dynamic_stack_store(const agx_instr *I, uint16_t wait_mask,
    return true;
 }
 
+/*
+ * Emission's ordering between the static copy/rld forms and the dynamic
+ * STTPS/LDTPS forms when the dynamic ones are in program order
+ * (agx3_tps_dynamic_in_order). A static form names a stack location that a
+ * dynamic one may alias; these waits are what order the two kinds:
+ *  - a dynamic load waits for in-flight static copies;
+ *  - a dynamic store waits for in-flight static copies and reloads;
+ *  - a static reload waits for in-flight dynamic stores;
+ *  - a static copy waits for in-flight dynamic stores and loads.
+ * The slot masks hold the slots whose generation the access issued; they are
+ * read against what is still outstanding. A dynamic store is not part of
+ * `outstanding`, which control flow drains: `stores` is the slot it
+ * completes on, kept until something waits that slot. It is set again at
+ * every control-flow instruction of a shader with a dynamic store, since a
+ * backedge or a join can bring a store still in flight from another path.
+ */
+struct agx3_tps_order {
+   uint16_t static_writes;
+   uint16_t static_reads;
+   uint16_t dynamic_reads;
+   uint16_t stores;
+   uint16_t stores_in_shader;
+};
+
+static inline void
+agx3_tps_order_retire(struct agx3_tps_order *o, uint16_t waited)
+{
+   o->static_writes &= (uint16_t)~waited;
+   o->static_reads &= (uint16_t)~waited;
+   o->dynamic_reads &= (uint16_t)~waited;
+   o->stores &= (uint16_t)~waited;
+}
+
+/*
+ * Whether one thread's dynamically addressed TPS accesses (STTPS and LDTPS)
+ * take effect in program order without any wait between them: a load after a
+ * store to the same location returns the stored value, and stores and loads
+ * to the same location never reorder. G17D only.
+ *
+ * Then only register results need the scoreboard. A dynamic load still
+ * carries its destination's slot and its consumers wait for it; a dynamic
+ * store still completes on slot 1. But no dynamic access waits for another,
+ * and the store's slot 1 is not drained at control flow, so stores stay in
+ * flight across a loop's backedge. The static copy/rld forms are ordered
+ * against dynamic accesses explicitly at emission (agx3_tps_order), in both
+ * directions, as before.
+ *
+ * Every other chip orders every dynamic TPS access behind the last one
+ * through AGX3_SLOT_DYNAMIC_TPS_TOKEN and drains the scoreboard around it.
+ */
+static bool
+agx3_tps_dynamic_in_order(const agx_context *ctx)
+{
+   return ctx->key->dev.chip == AGX_CHIP_G17D;
+}
+
 static bool
 agx3_append_static_spill_tokens(const agx_instr *I,
                                 struct agx3_slot_instr *slot_instr,
-                                enum agx_isa_encoding enc)
+                                enum agx_isa_encoding enc, bool in_order)
 {
+   /* In program order, nothing reads or writes the dynamic alias token: the
+    * dynamic accesses need no wait between them, and emission orders the
+    * static forms against them (agx3_tps_order). The store keeps its slot. */
+   if (in_order && agx3_dynamic_stack_load(I)) {
+      struct agx3_tps_desc desc;
+      return agx3_translate_dynamic_stack_load(I, 1, &desc);
+   }
+   if (in_order && agx3_dynamic_stack_store(I)) {
+      struct agx3_tps_desc desc;
+      if (!agx3_translate_dynamic_stack_store(I, 0, &desc))
+         return false;
+      if (enc == AGX_ISA_ENCODING_AGX3C)
+         slot_instr->preferred_slot = 1;
+      return true;
+   }
    if (agx3_dynamic_stack_load(I)) {
       struct agx3_tps_desc desc;
       if (!agx3_translate_dynamic_stack_load(I, 1, &desc) ||
@@ -4445,10 +4516,12 @@ agx3_append_static_spill_tokens(const agx_instr *I,
       }
       return true;
    }
-   if (slot_instr->nr_srcs >= AGX3_SLOT_MAX_REGS)
-      return false;
-   /* A dynamically addressed read can alias any static write. */
-   slot_instr->src[slot_instr->nr_srcs++] = AGX3_SLOT_DYNAMIC_TPS_TOKEN;
+   if (!in_order) {
+      if (slot_instr->nr_srcs >= AGX3_SLOT_MAX_REGS)
+         return false;
+      /* A dynamically addressed read can alias any static write. */
+      slot_instr->src[slot_instr->nr_srcs++] = AGX3_SLOT_DYNAMIC_TPS_TOKEN;
+   }
    const bool is_store = I->op == AGX_OPCODE_STACK_STORE;
    struct agx3_static_spill_store_desc store;
    struct agx3_static_spill_load_desc load;
@@ -9074,6 +9147,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    struct util_dynarray fixups;
    uint16_t outstanding = 0;
    uint16_t image_write_slots = 0;
+   const bool tps_in_order = agx3_tps_dynamic_in_order(ctx);
+   struct agx3_tps_order tps_order = {0};
    uint8_t next_uvs_slot = 1;
    unsigned texture_ops_left = 0;
    unsigned tile_loads_left = 0;
@@ -9904,7 +9979,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          e->nr_srcs = (uint8_t)ns;
          if ((I->op == AGX_OPCODE_STACK_LOAD ||
               I->op == AGX_OPCODE_STACK_STORE) &&
-             !agx3_append_static_spill_tokens(I, e, enc)) {
+             !agx3_append_static_spill_tokens(I, e, enc,
+                                              agx3_tps_dynamic_in_order(ctx))) {
             /* Report like every other refusal.  Without this the whole
              * shader fails with no diagnostic at all, which is how a
              * scratch-lowered constant array once looked like a mystery
@@ -10050,6 +10126,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    const bool *tps_rereads = agx3_static_reload_rereads(ctx, ordered, count);
    if (!tps_rereads)
       AGX3_PACK_FAIL();
+
+   if (tps_in_order && enc == AGX_ISA_ENCODING_AGX3C) {
+      for (unsigned i = 0; i < count; ++i) {
+         if (agx3_dynamic_stack_store(ordered[i]))
+            tps_order.stores_in_shader = 1u;
+      }
+   }
 
    k = 0;
    const bool interleaved_zs =
@@ -10204,6 +10287,16 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          /* A wait retires its slots before this instruction issues its own. */
          outstanding &= (uint16_t)~wait;
          const uint16_t outstanding_here = outstanding;
+         if (tps_in_order) {
+            agx3_tps_order_retire(&tps_order, wait);
+            /* A new generation on the slot is not the TPS access recorded
+             * there; an in-flight store stays until its slot is waited. */
+            if (slot) {
+               const uint16_t stores = tps_order.stores;
+               agx3_tps_order_retire(&tps_order, (uint16_t)(1u << (slot - 1)));
+               tps_order.stores = stores;
+            }
+         }
          image_write_slots &= outstanding_here;
          /* A new scheduled producer starts a different slot generation. */
          if (slot)
@@ -10296,6 +10389,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                cf_wait = 0;
                cf_outstanding = 0;
                outstanding = 0;
+            }
+            /* Dynamic stores are not drained here (agx3_tps_order). */
+            if (tps_in_order) {
+               agx3_tps_order_retire(&tps_order, retire);
+               tps_order.stores |= tps_order.stores_in_shader;
             }
          }
 
@@ -12499,8 +12597,12 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint8_t bytes[AGX3_LOCAL_TPS_MAX_LENGTH], len;
             /* The address is unknown at compile time. Complete outstanding
              * static writes before reading; retain this read's alias token
-             * until later static accesses have waited for it. */
-            const uint16_t retire = wait | outstanding_here;
+             * until later static accesses have waited for it. In program
+             * order, only the static copies in flight are waited, and later
+             * static copies wait for this read (agx3_tps_order). */
+            const uint16_t retire = tps_in_order
+               ? (uint16_t)(wait | (outstanding_here & tps_order.static_writes))
+               : (uint16_t)(wait | outstanding_here);
             if (!agx3_translate_dynamic_stack_load(I, slot, &desc) ||
                 (retire && !agx3_retire_slots_noop(emission, enc, retire)) ||
                 !agx3_tps_encode_load(enc, &desc, bytes, &len) ||
@@ -12508,6 +12610,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                AGX3_REFUSE(I);
             outstanding &= ~retire;
             outstanding |= 1u << (slot - 1);
+            if (tps_in_order) {
+               agx3_tps_order_retire(&tps_order, retire);
+               tps_order.dynamic_reads |= (uint16_t)(1u << (slot - 1));
+            }
             continue;
          }
 
@@ -12516,9 +12622,13 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint8_t bytes[AGX3_LOCAL_TPS_MAX_LENGTH], len;
             /* The address is unknown at compile time: every outstanding
              * static copy or reload may touch the same location, so the
-             * store waits for all of them in its own wait field (Apple's
-             * STTPS carries the wait of the preceding static copies). */
-            const uint16_t retire = wait | outstanding_here;
+             * store waits for all of them in its own wait field. In program
+             * order those are the only waits it adds (agx3_tps_order). */
+            const uint16_t retire = tps_in_order
+               ? (uint16_t)(wait | (outstanding_here &
+                                    (tps_order.static_writes |
+                                     tps_order.static_reads)))
+               : (uint16_t)(wait | outstanding_here);
             if (!agx3_translate_dynamic_stack_store(I, retire, &desc) ||
                 !agx3_tps_encode_store(enc, &desc, bytes, &len) ||
                 !agx3_append(emission, bytes, len))
@@ -12526,7 +12636,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             outstanding &= ~retire;
             if (enc == AGX_ISA_ENCODING_AGX3C) {
                assert(slot == 1);
-               outstanding |= 1u;
+               if (tps_in_order) {
+                  /* The store's completion is not outstanding work for a
+                   * control-flow drain: slot 1 stays outstanding only for an
+                   * earlier producer this store did not wait for. */
+                  if (!(outstanding_here & ~retire & 1u))
+                     outstanding &= ~1u;
+                  agx3_tps_order_retire(&tps_order, retire);
+                  tps_order.stores |= 1u;
+               } else {
+                  outstanding |= 1u;
+               }
             }
             continue;
          }
@@ -12564,6 +12684,22 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             struct agx3_static_spill_load_desc load;
             uint8_t bytes[AGX3_STATIC_SPILL_MAX_LENGTH];
             uint8_t len = 0;
+            if (tps_in_order) {
+               /* agx3_tps_order: the dynamic accesses this one may alias. */
+               const uint16_t order = (uint16_t)(tps_order.stores |
+                  (is_store ? outstanding_here & tps_order.dynamic_reads : 0));
+               wait |= order;
+               agx3_tps_order_retire(&tps_order, wait);
+               outstanding &= (uint16_t)~order;
+               if (slot) {
+                  const uint16_t bit = (uint16_t)(1u << (slot - 1));
+                  outstanding |= bit;
+                  if (is_store)
+                     tps_order.static_writes |= bit;
+                  else
+                     tps_order.static_reads |= bit;
+               }
+            }
             if (!agx3_translate_static_spill(I, is_store, slot, wait,
                                              tps_rereads[instr_index], &store,
                                              &load))
@@ -17819,8 +17955,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     * epilog cannot know that upstream slot, so finish only the still-live
     * async work at this boundary. Constant-colour parts and parts with real
     * in-part consumers add no instructions. */
-   if (ctx->key->no_stop && !ctx->is_preamble && outstanding != 0 &&
-       !agx3_retire_slots_noop(emission, enc, outstanding))
+   /* A dynamic store still in flight completes here too (agx3_tps_order). */
+   if (ctx->key->no_stop && !ctx->is_preamble &&
+       (outstanding | tps_order.stores) != 0 &&
+       !agx3_retire_slots_noop(emission, enc, outstanding | tps_order.stores))
       AGX3_PACK_FAIL();
 
    if (ctx->key->dev.chip == AGX_CHIP_G17P &&

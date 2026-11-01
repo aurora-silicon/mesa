@@ -438,6 +438,150 @@ test_native_m5_hit_commit(void)
    return true;
 }
 
+static bool
+tps_find(const struct util_dynarray *binary, const uint8_t *bytes,
+         unsigned len)
+{
+   for (unsigned off = 0; off + len <= binary->size; off += 2) {
+      if (!memcmp((const uint8_t *)binary->data + off, bytes, len))
+         return true;
+   }
+   return false;
+}
+
+/* G17D's dynamic TPS accesses are in program order (agx3_tps_dynamic_in_order):
+ * two dynamic stores and a dynamic load of the first location carry no wait
+ * and no retire between them, and a following static reload still waits for
+ * the stores' slot 1. Every other chip keeps the alias token: there the second
+ * store waits for the first. Returns 0 on success. */
+static int
+test_m5_dynamic_tps_order(enum agx_chip chip)
+{
+   void *memctx = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(memctx);
+   struct agx_shader_key key = {0};
+   struct agx_shader_info info = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = chip;
+   b->shader->key = &key;
+   b->shader->out = &info;
+   b->shader->nir = rzalloc(memctx, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+   b->shader->stage = info.stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 15;
+   b->shader->scratch_size_B = 64;
+   agx_stack_store(b, agx_register(0, AGX_SIZE_32),
+                   agx_register(4, AGX_SIZE_32), AGX_FORMAT_I32, 1);
+   agx_stack_store(b, agx_register(2, AGX_SIZE_32),
+                   agx_register(6, AGX_SIZE_32), AGX_FORMAT_I32, 1);
+   agx_stack_load_to(b, agx_register(8, AGX_SIZE_32),
+                     agx_register(4, AGX_SIZE_32), AGX_FORMAT_I32, 1);
+   agx_stack_load_to(b, agx_register(10, AGX_SIZE_32), agx_immediate(32),
+                     AGX_FORMAT_I32, 1);
+   agx_stop(b);
+   struct util_dynarray binary = UTIL_DYNARRAY_INIT;
+   int rc = 0;
+   if (!agx3_pack_binary(b->shader, &binary)) {
+      rc = 1;
+      goto done;
+   }
+
+   const bool in_order = chip == AGX_CHIP_G17D;
+   uint8_t bytes[AGX3_LOCAL_TPS_MAX_LENGTH], len;
+   for (unsigned s = 0; s < 2; ++s) {
+      const struct agx3_tps_desc store = {
+         .data = 2 * s, .width = AGX3_MEM_W32, .mask = 1, .index = 4 + 2 * s,
+         .frame_region = 1,
+      };
+      if (!agx3_tps_encode_store(AGX_ISA_ENCODING_AGX3C, &store, bytes, &len)) {
+         rc = 2;
+         goto done;
+      }
+      /* The first store never waits; the second only in program order. */
+      if (tps_find(&binary, bytes, len) != (s == 0 || in_order)) {
+         rc = 3 + s;
+         goto done;
+      }
+   }
+   unsigned loads = 0;
+   for (uint8_t slot = 1; slot <= 8; ++slot) {
+      const struct agx3_tps_desc load = {
+         .data = 8, .width = AGX3_MEM_W32, .mask = 1, .index = 4,
+         .frame_region = 1, .retain_tps = true, .slot = slot,
+      };
+      if (!agx3_tps_encode_load(AGX_ISA_ENCODING_AGX3C, &load, bytes, &len)) {
+         rc = 5;
+         goto done;
+      }
+      loads += tps_find(&binary, bytes, len);
+   }
+   if (loads != 1) {
+      rc = 6;
+      goto done;
+   }
+   /* Program order: nothing but the encodings is emitted before the load,
+    * no retire carrier between the accesses. */
+   if (in_order) {
+      const struct agx3_tps_desc first = {
+         .data = 0, .width = AGX3_MEM_W32, .mask = 1, .index = 4,
+         .frame_region = 1,
+      };
+      uint8_t a[AGX3_LOCAL_TPS_MAX_LENGTH], alen, c[AGX3_LOCAL_TPS_MAX_LENGTH],
+         clen;
+      const struct agx3_tps_desc second = {
+         .data = 2, .width = AGX3_MEM_W32, .mask = 1, .index = 6,
+         .frame_region = 1,
+      };
+      if (!agx3_tps_encode_store(AGX_ISA_ENCODING_AGX3C, &first, a, &alen) ||
+          !agx3_tps_encode_store(AGX_ISA_ENCODING_AGX3C, &second, c, &clen) ||
+          !tps_find(&binary, a, alen) || memcmp(binary.data, a, alen) ||
+          binary.size < alen + clen ||
+          memcmp((const uint8_t *)binary.data + alen, c, clen)) {
+         rc = 7;
+         goto done;
+      }
+      bool load_next = false;
+      for (uint8_t slot = 1; slot <= 8; ++slot) {
+         const struct agx3_tps_desc load = {
+            .data = 8, .width = AGX3_MEM_W32, .mask = 1, .index = 4,
+            .frame_region = 1, .retain_tps = true, .slot = slot,
+         };
+         agx3_tps_encode_load(AGX_ISA_ENCODING_AGX3C, &load, bytes, &len);
+         load_next |= binary.size >= alen + clen + len &&
+            !memcmp((const uint8_t *)binary.data + alen + clen, bytes, len);
+      }
+      if (!load_next) {
+         rc = 8;
+         goto done;
+      }
+   }
+   /* The static reload of a location a dynamic store may have written
+    * waits for slot 1 on every chip. */
+   unsigned reloads = 0;
+   for (unsigned off = 0; off < binary.size; off += 2) {
+      for (unsigned l = 4; l <= 8; l += 4) {
+         struct agx3_static_spill_load_desc reload;
+         if (off + l <= binary.size &&
+             agx3_static_spill_decode_load(AGX_ISA_ENCODING_AGX3C,
+                                           (const uint8_t *)binary.data + off,
+                                           l, &reload) &&
+             reload.tps_half == 16 && reload.dest == 10) {
+            if (!(reload.wait_mask & 1)) {
+               rc = 9;
+               goto done;
+            }
+            reloads++;
+         }
+      }
+   }
+   if (reloads != 1)
+      rc = 10;
+done:
+   util_dynarray_fini(&binary);
+   ralloc_free(memctx);
+   return rc;
+}
+
 int main(void)
 {
    if (!test_native_ray_scs() || !test_native_rt_m5() ||
@@ -582,6 +726,18 @@ int main(void)
          return 132;
       util_dynarray_fini(&binary);
       ralloc_free(memctx);
+   }
+   {
+      const enum agx_chip chips[] = {AGX_CHIP_G17D, AGX_CHIP_G17S,
+                                     AGX_CHIP_G17G};
+      for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+         const int rc = test_m5_dynamic_tps_order(chips[c]);
+         if (rc) {
+            fprintf(stderr, "dynamic TPS order, chip %u: %d\n",
+                    (unsigned)chips[c], rc);
+            return 133;
+         }
+      }
    }
    /* Metal532: int/short variable ASR, then all four mixed-width signs. */
    {
