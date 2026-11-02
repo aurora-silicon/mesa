@@ -375,3 +375,72 @@ TEST_F(nir_loop_unroll_test, partial_unroll_oob_load_zero_init)
    EXPECT_EQ(4, count_used_instr(nir_op_flt));
    EXPECT_EQ(1, count_unused_instr(nir_op_flt));
 }
+
+/* nir_opt_loop_unroll_exact_partial: a loop of exactly `limit` iterations,
+ * unrolled by `factor`, keeps one loop and one exit test. The test stays in
+ * copy limit % factor, so `limit % factor` increments come before it and the
+ * rest of the factor after it. */
+static unsigned
+exact_partial_factor(const nir_loop *loop, const void *data)
+{
+   return *(const unsigned *)data;
+}
+
+static void
+exact_partial_unroll_test(nir_builder *bld, int limit, unsigned factor,
+                          bool expect_progress)
+{
+   loop_unroll_test_helper(bld, nir_imm_int(bld, 0), nir_imm_int(bld, limit),
+                           nir_imm_int(bld, 1), &nir_ige, &nir_iadd, false);
+   EXPECT_EQ(nir_opt_loop_unroll_exact_partial(bld->shader,
+                                               exact_partial_factor, &factor),
+             expect_progress);
+   nir_validate_shader(bld->shader, NULL);
+
+   unsigned loops = 0, breaks = 0, before = 0, after = 0;
+   bool seen_test = false;
+   nir_loop *loop = NULL;
+   foreach_list_typed(nir_cf_node, node, node, &bld->impl->body) {
+      if (node->type == nir_cf_node_loop) {
+         loops++;
+         loop = nir_cf_node_as_loop(node);
+      }
+   }
+   ASSERT_EQ(loops, 1u);
+   foreach_list_typed(nir_cf_node, node, node, &loop->body) {
+      if (node->type == nir_cf_node_if) {
+         breaks++;
+         seen_test = true;
+         continue;
+      }
+      ASSERT_EQ(node->type, nir_cf_node_block);
+      nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+         if (instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(instr)->op == nir_op_iadd)
+            (seen_test ? after : before)++;
+      }
+   }
+   EXPECT_EQ(breaks, 1u);
+   if (expect_progress) {
+      EXPECT_EQ(before, limit % factor);
+      EXPECT_EQ(after, factor - limit % factor);
+      EXPECT_EQ(loop->control, nir_loop_control_dont_unroll);
+   } else {
+      EXPECT_EQ(before + after, 1u);
+   }
+}
+
+TEST_F(nir_loop_unroll_test, exact_partial_test_in_first_copy)
+{
+   exact_partial_unroll_test(&bld, 1024, 16, true);
+}
+
+TEST_F(nir_loop_unroll_test, exact_partial_test_in_later_copy)
+{
+   exact_partial_unroll_test(&bld, 1027, 8, true);
+}
+
+TEST_F(nir_loop_unroll_test, exact_partial_fewer_iterations_than_factor)
+{
+   exact_partial_unroll_test(&bld, 5, 8, false);
+}

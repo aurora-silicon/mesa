@@ -235,6 +235,7 @@ if with_tests
          'test/test-shared-byte-offsets.cpp',
          'test/test-device-load-batches.cpp',
          'test/test-m5-copy-schedule.cpp',
+         'test/test-m5-scratch-schedule.cpp',
          'test/test-agx3-packed-memory.cpp',
          'test/test-m5-narrow-scratch.cpp',
       ),

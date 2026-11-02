@@ -4466,10 +4466,13 @@ agx3_tps_order_retire(struct agx3_tps_order *o, uint16_t waited)
  * Every other chip orders every dynamic TPS access behind the last one
  * through AGX3_SLOT_DYNAMIC_TPS_TOKEN and drains the scoreboard around it.
  */
+/* Dynamic TPS loads that may share one scoreboard slot on G17D. */
+#define AGX3_TPS_LOAD_JOIN 2
+
 static bool
 agx3_tps_dynamic_in_order(const agx_context *ctx)
 {
-   return ctx->key->dev.chip == AGX_CHIP_G17D;
+   return agx_scratch_dynamic_in_order(&ctx->key->dev);
 }
 
 static bool
@@ -9739,6 +9742,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             e->join_class = 1;
             e->join_limit = 8;
             e->prefer_join = device_load_batch == 2;
+         }
+         /* On G17D a thread's dynamic TPS loads need no wait between them
+          * (agx3_tps_dynamic_in_order), so they can share completion queues
+          * the same way: up to AGX3_TPS_LOAD_JOIN loads on one slot, whose
+          * wait covers all of them. A block then keeps more scratch loads in
+          * flight than there are slots (agx_ilp_schedule issues up to sixteen
+          * ahead of their consumers); with one generation per slot, the
+          * ninth load retired the first before it could issue. */
+         if (agx3_dynamic_stack_load(I) && agx3_tps_dynamic_in_order(ctx)) {
+            e->join_class = 2;
+            e->join_limit = AGX3_TPS_LOAD_JOIN;
          }
          /* Native query-once +0x5fc reads the traversal completion byte on
           * slot8, waiting for the intersect/continue engine on that slot. */

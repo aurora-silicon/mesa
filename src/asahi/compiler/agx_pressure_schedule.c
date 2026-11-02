@@ -478,6 +478,17 @@ ilp_is_sample(const agx_context *ctx, const agx_instr *I)
            I->op == AGX_OPCODE_IMAGE_LOAD);
 }
 
+/* A load the sample-issue schedule moves ahead of its consumers: a sample,
+ * or with hoist_scratch a scratch load as well (agx_ilp_schedule's scratch
+ * blocks). */
+static bool
+ilp_is_issued_load(const agx_context *ctx, const agx_instr *I,
+                   bool hoist_scratch)
+{
+   return ilp_is_sample(ctx, I) ||
+          (hoist_scratch && I->op == AGX_OPCODE_STACK_LOAD);
+}
+
 static unsigned
 ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
 {
@@ -765,7 +776,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    unsigned load_latency, signed slack, signed cap,
                    bool place_exit_compare, bool order_edges_free,
                    signed fwd_cap, unsigned hoist_samples,
-                   bool hoist_past_writes,
+                   bool hoist_past_writes, bool hoist_scratch,
                    struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
@@ -834,7 +845,8 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       unsigned ordinal = 0;
       for (unsigned i = 0; i < n; ++i) {
          first_sample[i] =
-            ilp_is_sample(ctx, nodes[i]->instr) ? ordinal++ : ~0u;
+            ilp_is_issued_load(ctx, nodes[i]->instr, hoist_scratch)
+               ? ordinal++ : ~0u;
       }
       for (unsigned i = n; i-- > 0;) {
          util_dynarray_foreach(&dependents[i], unsigned, d)
@@ -935,7 +947,8 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       done[best] = true;
       order[step] = nodes[best];
-      issued_samples += ilp_is_sample(ctx, nodes[best]->instr);
+      issued_samples +=
+         ilp_is_issued_load(ctx, nodes[best]->instr, hoist_scratch);
       issued_writes += nodes[best]->instr->op == AGX_OPCODE_IMAGE_WRITE ||
                        nodes[best]->instr->op == AGX_OPCODE_DEVICE_STORE;
       changed |= (unsigned)best != step;
@@ -1190,6 +1203,25 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
    return loads == 1 && stores == 1 && load_target == store_target;
 }
 
+/* Scratch blocks (agx_scratch_dynamic_in_order): a block with at least this
+ * many scratch loads issues them ahead of their consumers, at most
+ * AGX_ILP_SCRATCH_HOIST_LOADS ahead of the first unissued one. A thread's
+ * scratch accesses need no wait between them there, so only each load's
+ * consumers wait for it; in the pressure order each consumer follows its load
+ * and the thread waits for every load in turn. Sixteen in flight is what a
+ * scratch loop unrolled by AGX_SCRATCH_UNROLL_MAX holds. */
+#define AGX_ILP_SCRATCH_MIN_LOADS   2
+#define AGX_ILP_SCRATCH_HOIST_LOADS 16
+
+static unsigned
+ilp_block_scratch_loads(const agx_block *block)
+{
+   unsigned loads = 0;
+   agx_foreach_instr_in_block(block, I)
+      loads += I->op == AGX_OPCODE_STACK_LOAD;
+   return loads;
+}
+
 /* M5 compute sample-issue budget: register halves kept free below an
  * occupancy bucket for allocation alignment, and the register file size. */
 #define AGX_ILP_M5_OCCUPANCY_MARGIN 8
@@ -1344,9 +1376,13 @@ agx_ilp_schedule(agx_context *ctx)
       ctx->stage == MESA_SHADER_FRAGMENT &&
       debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
 
+   /* Scratch blocks, in every stage but constant programs. */
+   const bool scratch_loads =
+      agx_scratch_dynamic_in_order(&ctx->key->dev) && !ctx->is_preamble;
+
    uint8_t *size16 = NULL;
    signed m5_occupancy_cap = 0;
-   if ((m5_samples && !m5_full) || m5_copy || m5_fragment) {
+   if ((m5_samples && !m5_full) || m5_copy || m5_fragment || scratch_loads) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1376,6 +1412,20 @@ agx_ilp_schedule(agx_context *ctx)
        * shared AGX3 policy below, as agx_isa_is_agx3() gates it. */
       const bool copy = copy_mode[block->index];
       const bool loop_samples = loop_sample_mode[block->index];
+      if (scratch_loads && !copy && !loop_samples &&
+          ilp_block_scratch_loads(block) >= AGX_ILP_SCRATCH_MIN_LOADS) {
+         /* The same occupancy-capped growth as the sample-issue schedule
+          * of M5 fragments; samples in the block are issued early too. */
+         const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+         const signed slack = MAX2(AGX_ILP_FS_SAMPLE_SLACK,
+                                   m5_occupancy_cap - peak);
+         ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
+                            16 * alu_latency, slack, 0, false, true,
+                            AGX_ILP_FS_SAMPLE_HALVES,
+                            AGX_ILP_SCRATCH_HOIST_LOADS, false, true,
+                            &dag_state);
+         continue;
+      }
       if ((m5_compute && !m5_full) || copy || loop_samples) {
          if ((m5_samples || copy || loop_samples) &&
              (!in_loop[block->index] || m5_sample_probe || copy ||
@@ -1405,7 +1455,7 @@ agx_ilp_schedule(agx_context *ctx)
                                false, true, AGX_ILP_FS_SAMPLE_HALVES,
                                copy ? AGX_ILP_M5_COPY_SAMPLES
                                     : AGX_ILP_FS_HOIST_SAMPLES,
-                               copy, &dag_state);
+                               copy, false, &dag_state);
          }
          continue;
       }
@@ -1427,12 +1477,12 @@ agx_ilp_schedule(agx_context *ctx)
           !m5_ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0, false,
-                            &dag_state);
+                            false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, true, false, 0, 0, false,
-                            &dag_state);
+                            false, &dag_state);
       } else if ((!in_loop[block->index] || m5_sample_probe) &&
                  !ctx->is_preamble &&
                  (ctx->stage == MESA_SHADER_FRAGMENT || m5_sample_probe) &&
@@ -1450,7 +1500,8 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, slack, 0, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
-                            AGX_ILP_FS_HOIST_SAMPLES, false, &dag_state);
+                            AGX_ILP_FS_HOIST_SAMPLES, false, false,
+                            &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -1463,7 +1514,8 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, AGX_ILP_SLACK,
                             AGX_ILP_CPROG_HALVES, false, true,
-                            AGX_ILP_CPROG_HALVES - 16, 0, false, &dag_state);
+                            AGX_ILP_CPROG_HALVES - 16, 0, false, false,
+                            &dag_state);
       }
    }
 

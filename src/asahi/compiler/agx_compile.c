@@ -8142,9 +8142,55 @@ static bool agx3_nir_lower_uniform_dma(nir_shader *nir,
                                        const struct agx_shader_key *key,
                                        struct agx_shader_info *info);
 
+/*
+ * Loops that access scratch at a run-time offset, when a thread's scratch
+ * accesses need no wait between them (agx_scratch_dynamic_in_order). Such a
+ * loop past the complete-unroll limits otherwise issues one access per
+ * iteration, and its loads complete one after another: each one's consumer
+ * follows it in the same iteration. Unrolled, consecutive iterations' loads
+ * share a block, and agx_ilp_schedule issues them ahead of their consumers.
+ * Up to AGX_SCRATCH_UNROLL_MAX copies, as many as keep the unrolled body
+ * within AGX_SCRATCH_UNROLL_INSTRS NIR instructions; the copies also share one
+ * loop test and branch.
+ */
+#define AGX_SCRATCH_UNROLL_MAX    16
+#define AGX_SCRATCH_UNROLL_INSTRS 512
+
+static unsigned
+agx_scratch_loop_unroll_factor(const nir_loop *loop, UNUSED const void *data)
+{
+   unsigned instrs = 0;
+   bool dynamic_scratch = false;
+   foreach_list_typed(nir_cf_node, node, node, &loop->body) {
+      if (node->type != nir_cf_node_block)
+         continue;
+      nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+         if (instr->type == nir_instr_type_phi ||
+             instr->type == nir_instr_type_load_const ||
+             instr->type == nir_instr_type_undef)
+            continue;
+         instrs++;
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_scratch)
+            dynamic_scratch |= !nir_src_is_const(intr->src[0]);
+         else if (intr->intrinsic == nir_intrinsic_store_scratch)
+            dynamic_scratch |= !nir_src_is_const(intr->src[1]);
+      }
+   }
+   if (!dynamic_scratch || !instrs)
+      return 0;
+   unsigned factor = AGX_SCRATCH_UNROLL_MAX;
+   while (factor > 1 && instrs * factor > AGX_SCRATCH_UNROLL_INSTRS)
+      factor /= 2;
+   return factor;
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
+                 bool scratch_in_order,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info)
@@ -8153,6 +8199,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
 
    agx_optimize_loop_nir(nir, m5);
+
+   bool unrolled = false;
+   if (scratch_in_order && nir->scratch_size) {
+      NIR_PASS(unrolled, nir, nir_opt_loop_unroll_exact_partial,
+               agx_scratch_loop_unroll_factor, NULL);
+   }
+   if (unrolled)
+      agx_optimize_loop_nir(nir, m5);
 
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
@@ -13169,6 +13223,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
       key->dev.chip == AGX_CHIP_G17P,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
+      agx_scratch_dynamic_in_order(&key->dev),
       form_preamble ? &info->push_count : NULL,
       (form_preamble && key->promote_textures) ? &info->texture_state_count
                                               : NULL,

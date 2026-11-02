@@ -436,6 +436,20 @@ struct agx_device_key {
    bool shader_quad_control;
 };
 
+/*
+ * Whether one thread's dynamically addressed scratch accesses take effect in
+ * program order with no wait between them (G17D). The packer then leaves
+ * their order to the hardware (agx3_pack_binary.c), so independent scratch
+ * loads can be in flight together: the compiler partially unrolls loops that
+ * access scratch (agx_optimize_nir) and issues their loads ahead of the
+ * consumers (agx_ilp_schedule).
+ */
+static inline bool
+agx_scratch_dynamic_in_order(const struct agx_device_key *dev)
+{
+   return dev->chip == AGX_CHIP_G17D;
+}
+
 struct agx_shader_key {
    /* Device info */
    struct agx_device_key dev;

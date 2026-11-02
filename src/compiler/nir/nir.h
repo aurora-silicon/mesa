@@ -7105,6 +7105,14 @@ bool nir_opt_loop_rotate(nir_shader *shader, bool uniform_only);
 
 bool nir_opt_loop_unroll(nir_shader *shader);
 
+/* Unroll factor nir_opt_loop_unroll_exact_partial applies to an innermost
+ * loop with an exact trip count; 0 or 1 leaves the loop alone. */
+typedef unsigned (*nir_loop_unroll_factor_cb)(const nir_loop *loop,
+                                              const void *data);
+bool nir_opt_loop_unroll_exact_partial(nir_shader *shader,
+                                       nir_loop_unroll_factor_cb factor,
+                                       const void *data);
+
 typedef enum {
    nir_move_const_undef =              BITFIELD_BIT(0),
    nir_move_alu =                      BITFIELD_BIT(1),

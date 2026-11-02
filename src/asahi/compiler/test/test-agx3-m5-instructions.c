@@ -582,6 +582,72 @@ done:
    return rc;
 }
 
+/* G17D's dynamic TPS loads share scoreboard slots (AGX3_TPS_LOAD_JOIN): sixteen
+ * independent loads, then their consumers, issue back to back with no retire
+ * carrier between them, twice as many as there are slots. Every other chip
+ * orders each load behind the previous one. Returns the number of loads
+ * emitted back to back from the start of the binary, or -1. */
+static int
+test_m5_dynamic_tps_loads_in_flight(enum agx_chip chip)
+{
+   void *memctx = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(memctx);
+   struct agx_shader_key key = {0};
+   struct agx_shader_info info = {0};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = chip;
+   b->shader->key = &key;
+   b->shader->out = &info;
+   b->shader->nir = rzalloc(memctx, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+   b->shader->stage = info.stage = MESA_SHADER_COMPUTE;
+   b->shader->max_reg = 127;
+   b->shader->scratch_size_B = 4096;
+   for (unsigned i = 0; i < 16; ++i) {
+      agx_stack_load_to(b, agx_register(8 + 2 * i, AGX_SIZE_32),
+                        agx_register(40 + 2 * i, AGX_SIZE_32), AGX_FORMAT_I32,
+                        1);
+   }
+   for (unsigned i = 0; i < 16; ++i) {
+      agx_iadd_to(b, agx_register(80 + 2 * i, AGX_SIZE_32),
+                  agx_register(8 + 2 * i, AGX_SIZE_32),
+                  agx_register(0, AGX_SIZE_32), 0);
+   }
+   agx_stop(b);
+   struct util_dynarray binary = UTIL_DYNARRAY_INIT;
+   int loads = -1;
+   if (agx3_pack_binary(b->shader, &binary)) {
+      unsigned off = 0;
+      loads = 0;
+      for (unsigned i = 0; i < 16; ++i) {
+         bool found = false;
+         for (uint8_t slot = 1; slot <= 8 && !found; ++slot) {
+            for (unsigned retain = 0; retain < 2 && !found; ++retain) {
+               const struct agx3_tps_desc load = {
+                  .data = 8 + 2 * i, .width = AGX3_MEM_W32, .mask = 1,
+                  .index = 40 + 2 * i, .frame_region = 1,
+                  .retain_tps = retain, .slot = slot,
+               };
+               uint8_t bytes[AGX3_LOCAL_TPS_MAX_LENGTH], len;
+               if (agx3_tps_encode_load(AGX_ISA_ENCODING_AGX3C, &load, bytes,
+                                        &len) &&
+                   off + len <= binary.size &&
+                   !memcmp((const uint8_t *)binary.data + off, bytes, len)) {
+                  found = true;
+                  off += len;
+               }
+            }
+         }
+         if (!found)
+            break;
+         loads++;
+      }
+   }
+   util_dynarray_fini(&binary);
+   ralloc_free(memctx);
+   return loads;
+}
+
 int main(void)
 {
    if (!test_native_ray_scs() || !test_native_rt_m5() ||
@@ -736,6 +802,18 @@ int main(void)
             fprintf(stderr, "dynamic TPS order, chip %u: %d\n",
                     (unsigned)chips[c], rc);
             return 133;
+         }
+      }
+   }
+   {
+      const enum agx_chip chips[] = {AGX_CHIP_G17D, AGX_CHIP_G17S,
+                                     AGX_CHIP_G17G};
+      for (unsigned c = 0; c < ARRAY_SIZE(chips); ++c) {
+         const int loads = test_m5_dynamic_tps_loads_in_flight(chips[c]);
+         if (chips[c] == AGX_CHIP_G17D ? loads != 16 : (loads < 1 || loads > 8)) {
+            fprintf(stderr, "dynamic TPS loads in flight, chip %u: %d\n",
+                    (unsigned)chips[c], loads);
+            return 134;
          }
       }
    }

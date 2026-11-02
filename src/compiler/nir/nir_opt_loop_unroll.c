@@ -1205,3 +1205,163 @@ nir_opt_loop_unroll(nir_shader *shader)
    }
    return progress;
 }
+
+/*
+ * Partial unrolling of loops with an exact trip count.
+ *
+ * nir_opt_loop_unroll unrolls a counted loop only completely, so a loop past
+ * its trip-count or size limits keeps one iteration per pass and work from
+ * consecutive iterations can never be scheduled together (independent loads
+ * above all). This replicates the body of such a loop `factor` times inside
+ * the loop. Because the trip count is exact, one copy keeps the exit test and
+ * the others drop it. With T the number of times the test lets the loop
+ * continue, the test stays in copy r = T % factor:
+ *
+ *    loop { H; if (c) break; B }
+ *
+ * becomes
+ *
+ *    loop { (H B) x r; H; if (c) break; B; (H B) x (factor - 1 - r) }
+ *
+ * The test runs at the original positions k * factor + r and so breaks at
+ * position T, as before; every copy run without it is at a position below T,
+ * where the original test would have continued. No remainder loop is needed.
+ *
+ * The callback chooses the factor for each innermost loop with one exact
+ * terminator and no other control flow but straight-line blocks. The result
+ * is marked dont_unroll so that nir_opt_loop_unroll leaves it as it is.
+ */
+static bool
+exact_partial_unroll_candidate(nir_loop *loop)
+{
+   nir_loop_info *li = loop->info;
+   if (loop->partially_unrolled || loop->control != nir_loop_control_none ||
+       li->complex_loop || !li->exact_trip_count_known ||
+       !li->limiting_terminator ||
+       !list_is_singular(&li->loop_terminator_list) ||
+       li->limiting_terminator->exact_trip_count_unknown ||
+       !nir_is_trivial_loop_if(li->limiting_terminator->nif,
+                               li->limiting_terminator->break_block))
+      return false;
+
+   foreach_list_typed(nir_cf_node, node, node, &loop->body) {
+      if (node != &li->limiting_terminator->nif->cf_node &&
+          node->type != nir_cf_node_block)
+         return false;
+   }
+   return true;
+}
+
+static void
+exact_partial_unroll(nir_loop *loop, unsigned factor)
+{
+   nir_loop_terminator *term = loop->info->limiting_terminator;
+   nir_block *break_block = term->break_block;
+   const unsigned tested = loop->info->max_trip_count % factor;
+
+   loop_prepare_for_unroll(loop);
+
+   /* The continue-from branch runs whenever the test continues: move it
+    * after the test, so that a copy without the test still runs it. */
+   nir_block *first_break_block, *first_continue_block;
+   get_first_blocks_in_terminator(term, &first_break_block,
+                                  &first_continue_block);
+   nir_cf_list continue_from;
+   nir_cf_extract(&continue_from, nir_before_block(first_continue_block),
+                  nir_after_block(term->continue_from_block));
+   nir_cf_reinsert(&continue_from, nir_after_cf_node(&term->nif->cf_node));
+
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_block(nir_loop_first_block(loop)),
+                  nir_after_block(nir_loop_last_block(loop)));
+
+   struct hash_table *remap_table = _mesa_pointer_hash_table_create(NULL);
+   for (unsigned i = 0; i < factor; i++) {
+      nir_cf_list_clone_and_reinsert(&body, &loop->cf_node,
+                                     nir_after_cf_list(&loop->body),
+                                     remap_table);
+      if (i != tested) {
+         nir_block *copy =
+            _mesa_hash_table_search(remap_table, break_block)->data;
+         nir_cf_node_remove(copy->cf_node.parent);
+      }
+   }
+   nir_cf_delete(&body);
+   _mesa_hash_table_destroy(remap_table, NULL);
+
+   loop->control = nir_loop_control_dont_unroll;
+   loop->partially_unrolled = true;
+}
+
+static bool
+exact_partial_unroll_cf_list(struct exec_list *list,
+                             nir_loop_unroll_factor_cb factor_cb,
+                             const void *data, bool *has_loop)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_block:
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (exact_partial_unroll_cf_list(&nif->then_list, factor_cb, data,
+                                          has_loop) ||
+             exact_partial_unroll_cf_list(&nif->else_list, factor_cb, data,
+                                          has_loop))
+            return true;
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         bool nested = false;
+         *has_loop = true;
+         if (exact_partial_unroll_cf_list(&loop->body, factor_cb, data,
+                                          &nested))
+            return true;
+         if (nested || !exact_partial_unroll_candidate(loop))
+            break;
+         const unsigned factor = factor_cb(loop, data);
+         if (factor < 2 || loop->info->max_trip_count < factor)
+            break;
+         exact_partial_unroll(loop, factor);
+         return true;
+      }
+      default:
+         UNREACHABLE("unknown cf node type");
+      }
+   }
+   return false;
+}
+
+bool
+nir_opt_loop_unroll_exact_partial(nir_shader *shader,
+                                  nir_loop_unroll_factor_cb factor,
+                                  const void *data)
+{
+   const nir_variable_mode indirect_mask =
+      shader->options->force_indirect_unrolling;
+   const bool force_unroll_sampler_indirect =
+      shader->options->force_indirect_unrolling_sampler;
+   bool progress = false;
+   nir_foreach_function_impl(impl, shader) {
+      /* One loop per round: the loop analysis is stale after an unroll. */
+      bool impl_progress = false, unrolled;
+      do {
+         nir_metadata_require(impl, nir_metadata_loop_analysis, indirect_mask,
+                              (int)force_unroll_sampler_indirect);
+         nir_metadata_require(impl, nir_metadata_block_index);
+         bool has_loop = false;
+         unrolled = exact_partial_unroll_cf_list(&impl->body, factor, data,
+                                                 &has_loop);
+         if (unrolled) {
+            nir_progress(true, impl, nir_metadata_none);
+            nir_lower_reg_intrinsics_to_ssa_impl(impl);
+            impl_progress = true;
+         }
+      } while (unrolled);
+      if (!impl_progress)
+         nir_no_progress(impl);
+      progress |= impl_progress;
+   }
+   return progress;
+}
