@@ -11061,6 +11061,15 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   if (IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
+      const float clip_z_coeff =
+         dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 0.0f;
+      if (desc->root.clip_z_coeff != clip_z_coeff) {
+         desc->root.clip_z_coeff = clip_z_coeff;
+         desc->root_dirty = true;
+      }
+   }
+
    if (IS_DIRTY(RS_RASTERIZATION_STREAM)) {
       const uint16_t stream = dyn->rs.rasterization_stream;
       if (desc->root.draw.rasterization_stream != stream) {
