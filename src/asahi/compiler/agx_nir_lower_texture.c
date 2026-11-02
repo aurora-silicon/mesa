@@ -1975,6 +1975,7 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
        * robustness arithmetic, then restore the hardware ABI on the final
        * texel-fetch instruction. */
       nir_foreach_function_impl(impl, s) {
+         bool restored = false;
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
                if (instr->type != nir_instr_type_tex)
@@ -1990,9 +1991,11 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
                nir_builder b = nir_builder_at(nir_before_instr(instr));
                nir_src_rewrite(&tex->src[lod].src,
                                nir_u2u32(&b, tex->src[lod].src.ssa));
-               progress = true;
+               restored = true;
             }
          }
+         /* New ALU instructions, no new blocks. */
+         progress |= nir_progress(restored, impl, nir_metadata_control_flow);
       }
    }
 
