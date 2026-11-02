@@ -375,29 +375,58 @@ union drm_asahi_cmd {
    struct drm_asahi_cmd_render render;
 };
 
-static void
-asahi_append_compute_attachments(struct hk_device *dev,
-                                 struct util_dynarray *payload,
-                                 const struct hk_cs *cs)
+/* Append the records the kernel reads before a compute command: its
+ * attachment spans and, on M5, its storage declarations. Both persist until
+ * replaced, so every compute command in a submit goes through here, the
+ * queue's own SSTT flush included, and replaces both. The M5 kernel refuses a
+ * compute command with no declaration in force (EINVAL); a command without
+ * dispatches declares an empty list, which plans the storage-free minimum.
+ * NULL attachments and resources mean none. Returns false if the declaration
+ * list does not fit the 16-bit record size. */
+static bool
+asahi_append_compute_records(struct hk_device *dev,
+                             struct util_dynarray *payload,
+                             const struct hk_drm_attachment_set *set,
+                             const struct util_dynarray *resources)
 {
    /* Attachment spans are hints for the native AGX3 firmware interface.
     * AGX2 has never sent them, so G13 and G14 keep that submission. */
-   if (!agx_native_graphics(&dev->dev))
-      return;
+   if (agx_native_graphics(&dev->dev)) {
+      const uint32_t count =
+         set ? MIN2(set->count, dev->dev.params.max_attachments) : 0;
+      const struct drm_asahi_cmd_header header = {
+         .cmd_type = DRM_ASAHI_SET_COMPUTE_ATTACHMENTS,
+         .size = count * sizeof(struct drm_asahi_attachment),
+         .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+         .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      };
+      /* Clear the preceding command's list even for an attachmentless
+       * dispatch. */
+      util_dynarray_append(payload, header);
+      if (count)
+         util_dynarray_append_array(payload, struct drm_asahi_attachment,
+                                    set->list, count);
+   }
 
-   const struct hk_drm_attachment_set *set = &cs->compute_attachments;
-   const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
-   const struct drm_asahi_cmd_header header = {
-      .cmd_type = DRM_ASAHI_SET_COMPUTE_ATTACHMENTS,
-      .size = count * sizeof(set->list[0]),
-      .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-      .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-   };
-   /* Clear the preceding command's list even for an attachmentless dispatch. */
-   util_dynarray_append(payload, header);
-   if (count)
-      util_dynarray_append_array(payload, struct drm_asahi_attachment,
-                                 set->list, count);
+   if (agx_chip_g17_m5(dev->dev.chip) &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
+      const unsigned size = resources ? resources->size : 0;
+      /* The header size is 16 bits; never let it truncate. */
+      if (size > UINT16_MAX)
+         return false;
+
+      const struct drm_asahi_cmd_header header = {
+         .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
+         .size = size,
+         .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
+         .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
+      };
+      util_dynarray_append(payload, header);
+      if (size)
+         util_dynarray_append_array(payload, uint8_t, resources->data, size);
+   }
+
+   return true;
 }
 
 static void
@@ -1334,6 +1363,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       };
       if (queue->sync.exact_prior)
          header.size = sizeof(cmd);
+      /* A stream without dispatches: no attachments, an empty declaration. */
+      ASSERTED bool records =
+         asahi_append_compute_records(dev, &payload, NULL, NULL);
+      assert(records);
       util_dynarray_append(&payload, header);
       util_dynarray_append_array(&payload, uint8_t, &cmd, header.size);
       nr_cdm++;
@@ -1432,29 +1465,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             assert(cs->stats.cmds > 0 || cs->stats.flushes > 0 ||
                    cs->timestamp.end.handle || cs->timestamp.start.handle);
 
-            asahi_append_compute_attachments(dev, &payload, cs);
-            if (agx_chip_g17_m5(dev->dev.chip) &&
-                (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) {
-               /* The header size is 16 bits; never let it truncate. */
-               if (cs->compute_resources.size > UINT16_MAX) {
-                  util_dynarray_fini(&payload);
-                  if (unlikely(anatomy))
-                     hk_frame_anatomy_end_submit(anatomy, dev, queue,
-                                                 VK_ERROR_DEVICE_LOST);
-                  return vk_device_set_lost(
-                     &dev->vk, "M5 compute resource list too large (%u bytes)",
-                     cs->compute_resources.size);
-               }
-               const struct drm_asahi_cmd_header resources = {
-                  .cmd_type = DRM_ASAHI_SET_COMPUTE_RESOURCES,
-                  .size = cs->compute_resources.size,
-                  .vdm_barrier = DRM_ASAHI_BARRIER_NONE,
-                  .cdm_barrier = DRM_ASAHI_BARRIER_NONE,
-               };
-               util_dynarray_append(&payload, resources);
-               util_dynarray_append_array(&payload, uint8_t,
-                                         cs->compute_resources.data,
-                                         cs->compute_resources.size);
+            if (!asahi_append_compute_records(dev, &payload,
+                                              &cs->compute_attachments,
+                                              &cs->compute_resources)) {
+               util_dynarray_fini(&payload);
+               if (unlikely(anatomy))
+                  hk_frame_anatomy_end_submit(anatomy, dev, queue,
+                                              VK_ERROR_DEVICE_LOST);
+               return vk_device_set_lost(
+                  &dev->vk, "M5 compute resource list too large (%u bytes)",
+                  cs->compute_resources.size);
             }
             struct drm_asahi_cmd_compute_with_prior cmd = {0};
             asahi_fill_cdm_command(dev, cs, &cmd.legacy);
