@@ -8008,6 +8008,44 @@ hk_draw_restart_index(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    return cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
 }
 
+/* A direct Index List compares its indices with the stream's restart index:
+ * the value of the last restart State Update before it in the control
+ * stream. An indexed indirect Index List carries its own State Update
+ * (agx_vdm_draw()), which sets that value too. cs->restart_index mirrors it,
+ * so every record that writes it goes through hk_emit_restart_index() or is
+ * noted with hk_note_restart_index().
+ */
+static inline void
+hk_note_restart_index(struct hk_cs *cs, uint32_t index)
+{
+   cs->restart_index = index;
+   cs->restart_index_set = true;
+}
+
+/* VDM State updates are relatively expensive, so only emit them when the
+ * restart index changes. This is simpler than accurate dirty tracking.
+ */
+static uint8_t *
+hk_emit_restart_index(struct hk_cs *cs, uint8_t *out, uint32_t index)
+{
+   if (cs->restart_index_set && cs->restart_index == index)
+      return out;
+
+   agx_push(out, VDM_STATE, cfg) {
+      cfg.restart_index_present = true;
+   }
+
+   agx_push(out, VDM_STATE_RESTART_INDEX, cfg) {
+      cfg.value = index;
+   }
+
+   hk_note_restart_index(cs, index);
+   return out;
+}
+
+/* The restart index ahead of the draw-state publication, for the Index List
+ * generations whose indirect form carries no State Update of its own.
+ */
 static void
 hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
@@ -8020,23 +8058,33 @@ hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
       index = BITFIELD_MASK(8 * poly_gs_index_size(shape));
    }
 
-   /* VDM State updates are relatively expensive, so only emit them when the
-    * restart index changes. This is simpler than accurate dirty tracking.
-    */
-   if (!cs->restart_index_set || cs->restart_index != index) {
-      uint8_t *out = cs->current;
-      agx_push(out, VDM_STATE, cfg) {
-         cfg.restart_index_present = true;
-      }
+   cs->current = hk_emit_restart_index(cs, cs->current, index);
+}
 
-      agx_push(out, VDM_STATE_RESTART_INDEX, cfg) {
-         cfg.value = index;
-      }
+/* An Index List outside the native HAL200 path (hk_g17p_emit_draw()), with
+ * the restart index a direct indexed draw restarts at in front of it. Where
+ * hk_flush_index() already set it, the value is the same and nothing is
+ * emitted; the M5 GPUs (HAL300) take it here, after their draw-state
+ * publication, immediately before the Index List.
+ */
+static uint8_t *
+hk_emit_vdm_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
+                 struct agx_draw draw, enum agx_primitive topology)
+{
+   const enum agx_chip chip = hk_cmd_buffer_device(cmd)->dev.chip;
+   const uint32_t restart_index = hk_draw_restart_index(cmd, draw);
 
-      cs->current = out;
-      cs->restart_index = index;
-      cs->restart_index_set = true;
-   }
+   if (draw.indexed && draw.restart && !agx_is_indirect(draw.b))
+      out = hk_emit_restart_index(cs, out, restart_index);
+
+   uint8_t *end = (uint8_t *)agx_vdm_draw((uint32_t *)out, chip, draw,
+                                          topology, restart_index);
+
+   if (end != out && draw.indexed && agx_is_indirect(draw.b) &&
+       agx_vdm_index_list_direct_target_supported_inline(chip))
+      hk_note_restart_index(cs, restart_index);
+
+   return end;
 }
 
 static float hk_depth_bias_factor(VkFormat format, bool exact,
@@ -11457,7 +11505,9 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    /* HAL200's indexed draw packet carries its own native restart-state
     * record. Geometry/XFB lowers even a non-indexed API draw to that packet,
     * so emitting the legacy state here as well produces two consecutive
-    * restart records before the synthetic indexed draw. */
+    * restart records before the synthetic indexed draw. HAL300's indirect
+    * packet carries one too, and its direct draws take theirs at the Index
+    * List (hk_emit_vdm_draw()). */
    if ((draw->restart || geom) && !agx_native_graphics(&dev->dev) &&
        !agx_chip_g17_m5(dev->dev.chip))
       hk_flush_index(cmd, cs);
@@ -11918,6 +11968,12 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   /* Outside G17P the record the GPU writes is a direct Index List without a
+    * State Update of its own: it restarts at the stream's restart index. */
+   const uint32_t restart_index = hk_draw_restart_index(cmd, draw);
+   if (!agx_native_graphics(&dev->dev) && draw.restart)
+      cs->current = hk_emit_restart_index(cs, cs->current, restart_index);
+
    size_t size_B = libagx_draw_robust_index_vdm_size(
       agx_chip_record_family(dev->dev.chip), tail_emitted);
    uint64_t target = hk_cs_alloc_for_indirect(cs, size_B);
@@ -11944,7 +12000,6 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       .draw_state_offset = draw_state_offset,
       .render_state_emitted = tail_emitted,
    };
-   const uint32_t restart_index = hk_draw_restart_index(cmd, draw);
    cs->stats.robust_index_draws++;
    if (batch) {
       assert(batch->count == 0 || batch->cs == cs);
@@ -12359,26 +12414,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                                    g17p_native_bind_tail_emitted))
                return;
          } else {
-            /* HAL300 direct Index Lists consume persistent restart state;
-             * the indirect packet carries its own state update. Geometry
-             * may have synthesized an index width unrelated to the API IB. */
-            if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed &&
-                draw.restart && !agx_is_indirect(draw.b)) {
-               const uint32_t index =
-                  agx_primitive_restart_index(draw.index_size);
-               if (cs->restart_index != index) {
-                  agx_push(out, VDM_STATE, cfg) {
-                     cfg.restart_index_present = true;
-                  }
-                  agx_push(out, VDM_STATE_RESTART_INDEX, cfg) {
-                     cfg.value = index;
-                  }
-                  cs->restart_index = index;
-               }
-            }
-            cs->current = (void *)agx_vdm_draw((uint32_t *)out,
-                                               dev->dev.chip, draw, topology,
-                                               hk_draw_restart_index(cmd, draw));
+            cs->current = hk_emit_vdm_draw(cmd, cs, out, draw, topology);
          }
       }
 
@@ -12888,10 +12924,8 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    } else {
       /* As hk_draw_impl() emits an indirect HAL300 draw: the packet carries
        * its own restart state. */
-      cs->current = (void *)agx_vdm_draw((uint32_t *)cs->current,
-                                         hk_cmd_buffer_device(cmd)->dev.chip,
-                                         draw, gfx->topology,
-                                         hk_draw_restart_index(cmd, draw));
+      cs->current = hk_emit_vdm_draw(cmd, cs, cs->current, draw,
+                                     gfx->topology);
    }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    hk_note_pre_raster_images(cmd, cs);
