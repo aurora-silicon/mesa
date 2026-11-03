@@ -3817,7 +3817,11 @@ hk_cs_capture_fragment_attachments(const struct hk_device *dev,
          continue;
       }
 
-      hk_drm_attachment_set_add(&cs->fragment_attachments, plane->addr, size);
+      /* A bound plane's memory object is mapped writable from the plane to
+       * its end (plane->rem); a sparse plane's binding is the span alone. */
+      hk_drm_attachment_set_add_mapped(&cs->fragment_attachments, plane->addr,
+                                       size,
+                                       plane->va ? 0 : plane->addr + plane->rem);
    }
 }
 
@@ -3836,8 +3840,8 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
    hk_drm_attachment_set_init(&cs->fragment_attachments);
 
-   /* Only the native AGX3 path submits the spans (hk_queue.c). */
-   if (agx_native_graphics(&dev->dev))
+   /* Submitted where the kernel takes them (hk_queue.c). */
+   if (agx_render_attachment_spans(&dev->dev))
       hk_cs_capture_fragment_attachments(dev, render, cs);
 
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {

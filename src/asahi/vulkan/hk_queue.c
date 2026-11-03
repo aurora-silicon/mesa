@@ -405,12 +405,26 @@ asahi_append_fragment_attachments(struct hk_device *dev,
                                   struct util_dynarray *payload,
                                   const struct hk_cs *cs)
 {
-   /* See asahi_append_compute_attachments(). */
-   if (!agx_native_graphics(&dev->dev))
+   if (!agx_render_attachment_spans(&dev->dev))
       return;
 
    const struct hk_drm_attachment_set *set = &cs->fragment_attachments;
-   const uint32_t count = MIN2(set->count, dev->dev.params.max_attachments);
+   const uint32_t max = dev->dev.params.max_attachments;
+   struct drm_asahi_attachment list[ARRAY_SIZE(set->list)];
+   bool superset = true;
+   uint32_t count;
+
+   /* On M5 the spans are what the kernel's render admission orders renders by,
+    * so they are fitted as a superset. Native AGX3 hands them to firmware as
+    * hints, the first max_attachments of them. */
+   if (agx_chip_g17_m5(dev->dev.chip)) {
+      count = hk_drm_attachment_set_fit(set, max, list, &superset);
+   } else {
+      count = MIN2(set->count, max);
+      superset = count == set->count;
+      memcpy(list, set->list, count * sizeof(list[0]));
+   }
+
    const struct drm_asahi_cmd_header header = {
       .cmd_type = DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS,
       .size = count * sizeof(set->list[0]),
@@ -423,13 +437,13 @@ asahi_append_fragment_attachments(struct hk_device *dev,
     * set retained by the preceding render. */
    util_dynarray_append(payload, header);
    if (count)
-      util_dynarray_append_array(payload, struct drm_asahi_attachment,
-                                 set->list, count);
+      util_dynarray_append_array(payload, struct drm_asahi_attachment, list,
+                                 count);
 
-   if (!set->complete || count != set->count) {
+   if (!set->complete || !superset) {
       perf_debug_dev(&dev->dev,
-                     "Fragment attachment hint incomplete: retained %u, emitted %u (kernel limit %u)",
-                     set->count, count, dev->dev.params.max_attachments);
+                     "Fragment attachment spans incomplete: retained %u, emitted %u (kernel limit %u)",
+                     set->count, count, max);
    }
 }
 

@@ -130,6 +130,16 @@ bool
 hk_drm_attachment_set_add(struct hk_drm_attachment_set *set,
                           uint64_t pointer, uint64_t size)
 {
+   return hk_drm_attachment_set_add_mapped(set, pointer, size,
+                                           size > UINT64_MAX - pointer
+                                              ? 0 : pointer + size);
+}
+
+bool
+hk_drm_attachment_set_add_mapped(struct hk_drm_attachment_set *set,
+                                 uint64_t pointer, uint64_t size,
+                                 uint64_t mapped_end)
+{
    if (!pointer || !size || size > UINT64_MAX - pointer) {
       set->complete = false;
       return false;
@@ -137,6 +147,7 @@ hk_drm_attachment_set_add(struct hk_drm_attachment_set *set,
 
    uint64_t start = pointer;
    uint64_t end = pointer + size;
+   uint64_t limit = mapped_end > end ? mapped_end : end;
 
    /* Coalesce duplicate, overlapping, and adjacent image spans. Vulkan may
     * bind depth/stencil planes or several image views into the same memory
@@ -149,9 +160,14 @@ hk_drm_attachment_set_add(struct hk_drm_attachment_set *set,
          continue;
       }
 
+      /* The two mappings touch where the spans do, so together they reach
+       * the later of their ends. */
       start = start < current_start ? start : current_start;
       end = end > current_end ? end : current_end;
-      set->list[i] = set->list[--set->count];
+      limit = limit > set->mapped_end[i] ? limit : set->mapped_end[i];
+      --set->count;
+      set->list[i] = set->list[set->count];
+      set->mapped_end[i] = set->mapped_end[set->count];
    }
 
    if (set->count == HK_DRM_MAX_FRAGMENT_ATTACHMENTS) {
@@ -159,11 +175,82 @@ hk_drm_attachment_set_add(struct hk_drm_attachment_set *set,
       return false;
    }
 
+   set->mapped_end[set->count] = limit;
    set->list[set->count++] = (struct drm_asahi_attachment){
       .pointer = start,
       .size = end - start,
    };
    return true;
+}
+
+/* Fit the set into the kernel's @max spans as a superset of it, into @out.
+ * On M5 the spans are what the kernel's render admission orders passes of
+ * different queues by, so a span left out goes unordered. Over the limit,
+ * neighbours (by address) are merged, the smallest gap first. A merge must
+ * stay inside writable mappings, since the kernel refuses a span it does not
+ * find mapped writable: the gap must lie in the mapping of a span at or below
+ * it (mapped_end). If no such merge is left and the set still does not fit,
+ * the highest spans are left out and *@superset is false. Returns the count
+ * written to @out. */
+uint32_t
+hk_drm_attachment_set_fit(const struct hk_drm_attachment_set *set,
+                          uint32_t max, struct drm_asahi_attachment *out,
+                          bool *superset)
+{
+   uint64_t limit[HK_DRM_MAX_FRAGMENT_ATTACHMENTS];
+   uint32_t count = set->count;
+
+   memcpy(out, set->list, count * sizeof(*out));
+   memcpy(limit, set->mapped_end, count * sizeof(*limit));
+   *superset = true;
+   if (count <= max)
+      return count;
+
+   /* Insertion sort by address: at most HK_DRM_MAX_FRAGMENT_ATTACHMENTS. The
+    * spans are coalesced, so they are then disjoint and ascending. */
+   for (uint32_t i = 1; i < count; ++i) {
+      const struct drm_asahi_attachment span = out[i];
+      const uint64_t span_limit = limit[i];
+      uint32_t j = i;
+
+      for (; j && out[j - 1].pointer > span.pointer; --j) {
+         out[j] = out[j - 1];
+         limit[j] = limit[j - 1];
+      }
+      out[j] = span;
+      limit[j] = span_limit;
+   }
+
+   while (count > max) {
+      uint64_t reach = 0, best_gap = UINT64_MAX;
+      uint32_t best = count;
+
+      for (uint32_t i = 0; i + 1 < count; ++i) {
+         const uint64_t end = out[i].pointer + out[i].size;
+         const uint64_t gap = out[i + 1].pointer - end;
+
+         reach = reach > limit[i] ? reach : limit[i];
+         if (reach >= out[i + 1].pointer && gap < best_gap) {
+            best_gap = gap;
+            best = i;
+         }
+      }
+      if (best == count) {
+         *superset = false;
+         return max;
+      }
+
+      out[best].size = out[best + 1].pointer + out[best + 1].size -
+                       out[best].pointer;
+      limit[best] = limit[best] > limit[best + 1] ? limit[best]
+                                                  : limit[best + 1];
+      memmove(&out[best + 1], &out[best + 2],
+              (count - best - 2) * sizeof(*out));
+      memmove(&limit[best + 1], &limit[best + 2],
+              (count - best - 2) * sizeof(*limit));
+      count--;
+   }
+   return count;
 }
 
 static bool

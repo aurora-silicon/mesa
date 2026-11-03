@@ -537,6 +537,16 @@ agx_native_graphics(const struct agx_device *dev)
    return agx_chip_native_agx3(dev->chip);
 }
 
+/* Render submissions name the allocation spans each pass writes
+ * (DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS): native AGX3 encodes them, and both it
+ * and M5 order passes of different queues that write overlapping spans (the
+ * kernel's render admission). */
+static inline bool
+agx_render_attachment_spans(const struct agx_device *dev)
+{
+   return agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip);
+}
+
 /* T6040 uses the G17P architecture profile, while capability rollout may
  * still be product-specific. Device admission has already checked USC/HAL. */
 static inline bool

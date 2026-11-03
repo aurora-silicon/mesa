@@ -288,6 +288,17 @@ if with_tests
   )
 
   test(
+    'hk_attachment_fit',
+    executable(
+      'hk_attachment_fit_test',
+      files('tests/test-hk-attachment-fit.c', 'hk_drm_render_core.c'),
+      include_directories : [include_directories('.'), inc_include],
+      c_args : [c_msvc_compat_args],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'hk_query_program',
     executable(
       'hk_query_program_test',

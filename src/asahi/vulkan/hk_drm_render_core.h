@@ -15,6 +15,11 @@
 
 struct hk_drm_attachment_set {
    struct drm_asahi_attachment list[HK_DRM_MAX_FRAGMENT_ATTACHMENTS];
+   /* Per span, the end of the GPU mapping its start lies in (its memory
+    * object's), at least the span's own end: hk_drm_attachment_set_fit() may
+    * widen a span up to it, and the kernel checks every span is mapped
+    * writable. */
+   uint64_t mapped_end[HK_DRM_MAX_FRAGMENT_ATTACHMENTS];
    uint32_t count;
    bool complete;
 };
@@ -59,6 +64,15 @@ void hk_drm_attachment_set_init(struct hk_drm_attachment_set *set);
 
 bool hk_drm_attachment_set_add(struct hk_drm_attachment_set *set,
                                uint64_t pointer, uint64_t size);
+
+bool hk_drm_attachment_set_add_mapped(struct hk_drm_attachment_set *set,
+                                      uint64_t pointer, uint64_t size,
+                                      uint64_t mapped_end);
+
+uint32_t hk_drm_attachment_set_fit(const struct hk_drm_attachment_set *set,
+                                   uint32_t max,
+                                   struct drm_asahi_attachment *out,
+                                   bool *superset);
 
 bool hk_drm_next_command_span(const void *cmdbuf, size_t cmdbuf_size,
                               size_t start_offset, unsigned hardware_limit,
