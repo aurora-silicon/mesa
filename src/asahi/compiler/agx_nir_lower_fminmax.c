@@ -79,6 +79,37 @@ could_be_denorm(nir_scalar s, unsigned depth, unsigned *budget)
    return true;
 }
 
+/* Whether the result of a min/max of scalar sources s0 and s1 needs an
+ * explicit denormal flush. */
+static bool
+needs_flush(const nir_shader *shader, nir_scalar src0, nir_scalar src1,
+            bool is_max, bool ftz_only)
+{
+   /* Without a flush-to-zero execution mode, whether a denormal result is
+    * flushed is implementation-defined (Vulkan, "Precision and Operation of
+    * SPIR-V Instructions": any denormal an instruction produces may be
+    * flushed), so the min/max result may stay denormal. Only a shader that
+    * asks for flushing needs it. Callers that keep flushing every min/max
+    * pass false.
+    */
+   const unsigned mode = shader->info.float_controls_execution_mode;
+   if (ftz_only && !(mode & FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32))
+      return false;
+
+   if (normal_bound(src0, is_max) || normal_bound(src1, is_max))
+      return false;
+
+   unsigned budget = 64;
+   return could_be_denorm(src0, 8, &budget) || could_be_denorm(src1, 8, &budget);
+}
+
+static nir_def *
+flush(nir_builder *b, nir_def *def)
+{
+   b->fp_math_ctrl = nir_fp_no_fast_math;
+   return nir_fadd_imm(b, def, -0.0);
+}
+
 static bool
 lower(nir_builder *b, nir_alu_instr *alu, void *data)
 {
@@ -92,40 +123,102 @@ lower(nir_builder *b, nir_alu_instr *alu, void *data)
    else
       alu->op = nir_op_fmin_agx;
 
-   /* Without a flush-to-zero execution mode, whether a denormal result is
-    * flushed is implementation-defined (Vulkan, "Precision and Operation of
-    * SPIR-V Instructions": any denormal an instruction produces may be
-    * flushed), so the min/max result may stay denormal. Only a shader that
-    * asks for flushing needs it. Callers that keep flushing every min/max
-    * pass false.
-    */
    const bool *ftz_only = data;
-   const unsigned mode = b->shader->info.float_controls_execution_mode;
-   if (*ftz_only && !(mode & FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32))
-      return true;
-
    bool canonicalize = false;
    for (unsigned c = 0; c < alu->def.num_components; ++c) {
       nir_scalar scalar = nir_get_scalar(&alu->def, c);
-      nir_scalar src0 = nir_scalar_chase_alu_src(scalar, 0);
-      nir_scalar src1 = nir_scalar_chase_alu_src(scalar, 1);
-      const bool is_max = alu->op == nir_op_fmax_agx;
-      if (normal_bound(src0, is_max) || normal_bound(src1, is_max))
-         continue;
-      unsigned budget = 64;
-      canonicalize |=
-         could_be_denorm(src0, 8, &budget) || could_be_denorm(src1, 8, &budget);
+      canonicalize |= needs_flush(b->shader, nir_scalar_chase_alu_src(scalar, 0),
+                                  nir_scalar_chase_alu_src(scalar, 1),
+                                  alu->op == nir_op_fmax_agx, *ftz_only);
    }
 
    if (canonicalize) {
       b->cursor = nir_after_instr(&alu->instr);
-      b->fp_math_ctrl = nir_fp_no_fast_math;
-
-      nir_def *canonicalized = nir_fadd_imm(b, &alu->def, -0.0);
+      nir_def *canonicalized = flush(b, &alu->def);
       nir_def_rewrite_uses_after(&alu->def, canonicalized);
    }
 
    return true;
+}
+
+/* A tie between a nonzero, non-denormal constant and anything is between
+ * identical bits. */
+static bool
+nonzero_constant(nir_scalar s)
+{
+   return nir_scalar_is_const(s) &&
+          (nir_scalar_as_uint(s) & 0x7f800000u) != 0;
+}
+
+static bool
+zero_constant(nir_scalar s)
+{
+   return nir_scalar_is_const(s) &&
+          (nir_scalar_as_uint(s) & 0x7fffffffu) == 0;
+}
+
+/* fcmpsel returns one of its operands unchanged, so the hardware min/max is
+ * already exact for signed zeros except when +0 and -0 tie: then it returns
+ * its second operand. Integer min/max of the bits orders the two zeros as
+ * IEEE 754-2019 does (-0 < +0) and returns either operand of any other tie,
+ * as they are identical. That needs feq to compare denormals exactly, as
+ * G17P does: a compare that flushed its inputs would tie two different
+ * denormals of one sign and imin/imax would pick by bit pattern. NaNs never
+ * tie. This replaces the generic lower_fminmax_signed_zero emulation (up to
+ * 9 instructions) with 3, with the bare min/max when a source is a nonzero
+ * constant, or with one select against a zero constant.
+ */
+static bool
+lower_signed_zero(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if ((alu->op != nir_op_fmin && alu->op != nir_op_fmax) ||
+       alu->def.bit_size != 32 || alu->def.num_components != 1 ||
+       !nir_alu_instr_is_signed_zero_preserve(alu))
+      return false;
+
+   const bool *ftz_only = data;
+   const bool is_max = alu->op == nir_op_fmax;
+   nir_scalar src0 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 0);
+   nir_scalar src1 = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 1);
+
+   b->cursor = nir_before_instr(&alu->instr);
+   b->fp_math_ctrl = alu->fp_math_ctrl;
+   nir_def *s0 = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *s1 = nir_ssa_for_alu_src(b, alu, 1);
+   nir_def *res;
+
+   const int zero = zero_constant(src0) ? 0 : zero_constant(src1) ? 1 : -1;
+   if (zero >= 0) {
+      /* One select, ordered so a NaN or a tie picks the right zero:
+       *    max(x, +0) = 0 < x ? x : +0      min(x, -0) = x < 0 ? x : -0
+       *    max(x, -0) = x >= 0 ? x : -0     min(x, +0) = 0 >= x ? x : +0
+       */
+      nir_def *z = zero ? s1 : s0;
+      nir_def *x = zero ? s0 : s1;
+      const bool negative = nir_scalar_as_uint(zero ? src1 : src0) >> 31;
+      nir_def *take_x = is_max ? (negative ? nir_fge(b, x, z) : nir_flt(b, z, x))
+                               : (negative ? nir_flt(b, x, z) : nir_fge(b, z, x));
+      res = nir_bcsel(b, take_x, x, z);
+   } else {
+      res = is_max ? nir_fmax_agx(b, s0, s1) : nir_fmin_agx(b, s0, s1);
+      if (!nonzero_constant(src0) && !nonzero_constant(src1)) {
+         nir_def *tie = is_max ? nir_imax(b, s0, s1) : nir_imin(b, s0, s1);
+         res = nir_bcsel(b, nir_feq(b, s0, s1), tie, res);
+      }
+   }
+
+   if (needs_flush(b->shader, src0, src1, is_max, *ftz_only))
+      res = flush(b, res);
+
+   nir_def_replace(&alu->def, res);
+   return true;
+}
+
+bool
+agx_nir_lower_fminmax_signed_zero(nir_shader *s, bool ftz_only)
+{
+   return nir_shader_alu_pass(s, lower_signed_zero, nir_metadata_control_flow,
+                              &ftz_only);
 }
 
 bool
