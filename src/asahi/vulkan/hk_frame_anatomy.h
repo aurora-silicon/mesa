@@ -111,6 +111,12 @@ void hk_frame_anatomy_note_barriers(struct hk_frame_anatomy_submit *s,
                                     const void *payload, size_t begin,
                                     size_t end);
 
+/* Timestamp query pools bound to the kernel, whose stamps the profiler reads
+ * back for commands that end on a query instead of a profiler stamp. */
+void hk_frame_anatomy_bind_pool(struct hk_device *dev, uint32_t handle,
+                                const void *map, uint64_t size);
+void hk_frame_anatomy_unbind_pool(struct hk_device *dev, uint32_t handle);
+
 /* Queue the records for readback once queue->drm.timeline_value completes;
  * a failed result retires them immediately without timestamps. */
 void hk_frame_anatomy_end_submit(struct hk_frame_anatomy_submit *s,
