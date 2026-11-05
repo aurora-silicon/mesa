@@ -545,15 +545,20 @@ hk_frame_anatomy_dump_nir(struct hk_device *dev, const struct hk_shader *shader,
                           struct nir_shader *nir, unsigned stage)
 {
    struct hk_frame_anatomy *fa = dev->frame_anatomy;
-   if (!fa || !fa->dump_dir || !shader->code_size ||
-       (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE &&
-        stage != MESA_SHADER_VERTEX))
+   if (!fa || !fa->dump_dir || !shader->code_size)
+      return;
+
+   /* Named by the same binary hash as the record's fs=, vs= or cs=. */
+   const char *prefix = stage == MESA_SHADER_FRAGMENT ? "fs"
+                        : stage == MESA_SHADER_COMPUTE ? "cs"
+                        : stage == MESA_SHADER_MESH    ? "ms"
+                        : stage == MESA_SHADER_VERTEX  ? "vs"
+                                                       : NULL;
+   if (!prefix)
       return;
 
    char path[512];
-   snprintf(path, sizeof(path), "%s/%s-%08x.nir", fa->dump_dir,
-            stage == MESA_SHADER_FRAGMENT ? "fs"
-            : stage == MESA_SHADER_VERTEX ? "vs" : "cs",
+   snprintf(path, sizeof(path), "%s/%s-%08x.nir", fa->dump_dir, prefix,
             _mesa_hash_data(shader->code_ptr, shader->code_size));
    if (access(path, F_OK) == 0)
       return;
