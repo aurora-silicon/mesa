@@ -478,6 +478,28 @@ agx_t8122_params_supported(const struct drm_asahi_params_global *params)
           agx_chip_sampler_heap_element_size(AGX_CHIP_G15G) == 32;
 }
 
+/* T6034 shares the G15C contract: four clusters of ten core slots on one
+ * die. Every consumer reads the fused cores from the supplied masks, so the
+ * check is on the slot layout, not on one revision or core count. Ten slots
+ * is a hardware property the driver depends on: G15 USC code containers have
+ * ten helper-table slots (agx_chip_usc_helper_table_slots()), and the
+ * kernel's G15C command layouts are ten-slot. The kernel is the gate for
+ * which T6034 firmware and silicon start at all.
+ */
+static bool
+agx_params_t6034_supported(const struct drm_asahi_params_global *params)
+{
+   if (params->chip_id != 0x6034 || params->num_cores_per_cluster != 10)
+      return false;
+
+   for (unsigned i = 0; i < 4; ++i) {
+      uint64_t mask = params->core_masks[i];
+      if (!mask || (mask & ~UINT64_C(0x3ff)))
+         return false;
+   }
+   return true;
+}
+
 bool
 agx_params_driver_supported(const struct drm_asahi_params_global *params)
 {
@@ -513,10 +535,11 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
    case AGX_CHIP_G15C:
-      /* T6031/M3 Max: the same generation as T6030 with four clusters.
-       * Binned parts differ only in their core masks, which every consumer
-       * reads from the parameters, so the masks are not part of the check. */
-      return params->chip_id == 0x6031 && params->num_dies == 1 &&
+      /* T6031 and T6034 use the four-cluster G15C contract. T6034 also
+       * requires ten-slot clusters with masks inside them; the existing
+       * T6031 admission is unchanged. */
+      return (params->chip_id == 0x6031 || agx_params_t6034_supported(params)) &&
+             params->num_dies == 1 &&
              params->num_clusters_total == 4 &&
              params->usc_generation == AGX_ISA_AGX3 &&
              params->gpu_hal_generation == DRM_ASAHI_GPU_HAL_LEGACY;
