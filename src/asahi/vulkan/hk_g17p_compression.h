@@ -276,6 +276,32 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
    return hk_hal200_compression_eligible(chip, plane, info, false);
 }
 
+/* T8140 colour MSAA uses private transient backing for eMRT. Keep this
+ * independent of T6040's HAL200 policy: the two products share a chip enum.
+ * Reuse the existing single-layer policy for all format, usage, flag and
+ * extension exclusions. Only sample count and single-level array storage
+ * are expanded; depth/stencil, 3D, cubes and mip chains keep their old policy. */
+static inline bool
+hk_g17p_color_msaa_compression_eligible(enum agx_chip chip, unsigned chip_id,
+                                       unsigned plane,
+                                       const VkImageCreateInfo *info)
+{
+   if (chip != AGX_CHIP_G17P || chip_id != 0x8140 || !info || plane != 0 ||
+       !hk_g17p_compression_color_format(info->format) ||
+       info->imageType != VK_IMAGE_TYPE_2D || !info->arrayLayers ||
+       info->mipLevels != 1 ||
+       (info->samples != VK_SAMPLE_COUNT_2_BIT &&
+        info->samples != VK_SAMPLE_COUNT_4_BIT) ||
+       ((info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        (info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
+      return false;
+
+   VkImageCreateInfo single = *info;
+   single.samples = VK_SAMPLE_COUNT_1_BIT;
+   single.arrayLayers = 1;
+   return hk_g17p_compression_eligible(chip, plane, &single);
+}
+
 /* G17P and M5 colour images shared through
  * DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED.
  *
