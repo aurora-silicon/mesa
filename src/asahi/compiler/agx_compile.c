@@ -13530,8 +13530,13 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    /* Before nir_lower_alu's generic lower_fminmax_signed_zero. Validated on
     * G17P only (`g17p` above means any native AGX3 chip); other chips keep
     * the generic lowering. The flush policy is agx_nir_lower_fminmax's. */
-   if (chip_g17p)
+   if (chip_g17p) {
+      /* DXVK and vkd3d-proton mark every float op signed-zero preserving.
+       * Drop the flag where no use can tell -0 from +0, before the min/max
+       * lowering pays for it. */
+      NIR_PASS(_, nir, nir_opt_fp_math_ctrl);
       NIR_PASS(_, nir, agx_nir_lower_fminmax_signed_zero, g17p || m5);
+   }
    NIR_PASS(_, nir, nir_lower_alu);
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, nir_lower_flrp, 16 | 32 | 64, false);
