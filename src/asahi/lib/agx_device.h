@@ -76,6 +76,7 @@ enum agx_dbg {
    AGX_DBG_NOMERGE = BITFIELD_BIT(22),
    /* Track BOs without serializing submissions, then decode only a failed
     * submit while its command stream and referenced allocations are live. */
+   AGX_DBG_FAULTTRACE = BITFIELD_BIT(23),
    /* Decode every command stream at submit time without waiting for the GPU. */
    AGX_DBG_ASYNCTRACE = BITFIELD_BIT(24),
 };
@@ -317,7 +318,7 @@ agx_bo_sync_for_device(struct agx_bo *bo, size_t offset, size_t size)
  * for sparse_ro_offset.
  */
 static inline bool
-agx_addr_is_ro(struct agx_device *dev, uint64_t addr)
+agx_addr_is_ro(const struct agx_device *dev, uint64_t addr)
 {
    return (addr & dev->sparse_ro_offset);
 }
@@ -342,7 +343,7 @@ agx_fill_bind_flags(const struct agx_device *dev)
 }
 
 static inline uint64_t
-agx_rw_addr_to_ro(struct agx_device *dev, uint64_t addr)
+agx_rw_addr_to_ro(const struct agx_device *dev, uint64_t addr)
 {
    assert(!agx_addr_is_ro(dev, addr));
    return addr + dev->sparse_ro_offset;
@@ -433,7 +434,7 @@ agx_bo_unmap_owned(struct agx_bo *bo, void *map, size_t size)
 }
 
 static inline bool
-agx_has_soft_fault(struct agx_device *dev)
+agx_has_soft_fault(const struct agx_device *dev)
 {
    return (dev->params.features & DRM_ASAHI_FEATURE_SOFT_FAULTS) &&
           !(dev->debug & AGX_DBG_NOSOFT);
