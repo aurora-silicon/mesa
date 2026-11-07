@@ -2227,8 +2227,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * many queues and expect it to succeed. Handing the shared pool out as
        * the guarantee makes any application that asks for queueCount queues
        * fail as soon as other clients hold contexts. Advertise a count we
-       * can deliver; a real guarantee needs a per-client reservation in the
-       * kernel. */
+       * can deliver; hk_device_reserve_queues() then reserves each queue at
+       * vkCreateDevice, so a device the pool cannot serve fails there. */
       queue_count = MIN2(limits.max_queues, HK_ADVERTISED_QUEUES);
    }
 

@@ -1162,8 +1162,9 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
       return VK_SUCCESS;
 
    /* The common queue submit path serializes submissions to this queue.
-    * A logical queue, including one used only for host synchronization, does
-    * not need a kernel scheduling context until it actually submits work. */
+    * With independent kernel queues, hk_device_reserve_queues() creates the
+    * kernel queue at vkCreateDevice; this only runs here for kernels without
+    * them and under virtio. */
    const uint64_t layouts[2] = {
       dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
       dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
@@ -1180,6 +1181,32 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
       VK_ERROR_INITIALIZATION_FAILED;
    return vk_errorf(dev, result, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
                     strerror(error));
+}
+
+VkResult
+hk_device_reserve_queues(struct hk_device *dev)
+{
+   /* The kernel's logical queues are a machine-wide budget shared with every
+    * other client, and VkQueueFamilyProperties::queueCount promises each
+    * device its queues. Created on first submission, a queue the budget can
+    * no longer hold could only fail that submission, which loses the whole
+    * device. Reserve every queue now, so a device the kernel cannot serve
+    * fails vkCreateDevice cleanly instead. This runs after the accel-struct
+    * state, which selects the render SCS layouts the queues are created
+    * with. The kernel waits for a closing queue to return its slot before
+    * refusing, so short-lived clients still take turns. */
+   if (!(dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) ||
+       dev->dev.is_virtio)
+      return VK_SUCCESS;
+
+   vk_foreach_queue(iter, &dev->vk) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      VkResult result = hk_queue_ensure_drm(dev, queue);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   return VK_SUCCESS;
 }
 
 static VkResult

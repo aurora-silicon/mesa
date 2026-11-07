@@ -56,3 +56,5 @@ VkResult hk_queue_init(struct hk_device *dev,
                        uint32_t index_in_family);
 
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
+
+VkResult hk_device_reserve_queues(struct hk_device *dev);
