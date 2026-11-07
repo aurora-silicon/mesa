@@ -472,8 +472,26 @@ max_commands_per_submit(struct hk_device *dev)
 
 static VkResult
 queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
-                    unsigned ring_idx)
+                    unsigned ring_idx, struct hk_cmd_pending *pending)
 {
+   /* Give each ioctl an independent binary completion fence. API signals
+    * may be signalled on the CPU during error unwinding; timeline lookup
+    * can prune a completed error fence. Neither is a safe retirement token. */
+   struct drm_asahi_submit pinned = *submit;
+   if (pending) {
+      const unsigned count = submit->in_sync_count + submit->out_sync_count;
+      struct drm_asahi_sync *syncs =
+         alloca((count + 1) * sizeof(*syncs));
+      if (count)
+         memcpy(syncs, (void *)(uintptr_t)submit->syncs, count * sizeof(*syncs));
+      syncs[count] = (struct drm_asahi_sync) {
+         .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
+         .handle = hk_cmd_pending_signal(pending),
+      };
+      pinned.syncs = (uintptr_t)syncs;
+      pinned.out_sync_count++;
+      submit = &pinned;
+   }
    struct agx_submit_virt virt = {.ring_idx = ring_idx};
 
    /* Complete the cache cleans of CPU-cached descriptor writes
@@ -539,7 +557,8 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
                     struct drm_asahi_submit *submit, unsigned command_count,
                     unsigned ring_idx, const uint64_t prior_base[2],
                     bool chunk_timelines, uint64_t first_chunk_point,
-                    struct hk_frame_anatomy_submit *anatomy)
+                    struct hk_frame_anatomy_submit *anatomy,
+                    struct hk_cmd_pending *pending)
 {
    uint8_t *cmdbuf = (uint8_t *)(uintptr_t)submit->cmdbuf;
    uint32_t offs = 0;
@@ -658,7 +677,7 @@ queue_submit_looped(struct hk_device *dev, struct hk_queue *queue,
 
       if (chunk_timelines)
          last_attempted_point = chunk_signal->timeline_value;
-      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx);
+      VkResult result = queue_submit_single(dev, &submit_ioctl, ring_idx, pending);
       if (result != VK_SUCCESS) {
          if (chunk_timelines)
             queue->drm.timeline_value = last_attempted_point;
@@ -1743,17 +1762,30 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(anatomy))
       hk_frame_anatomy_prepare(anatomy, dev, payload.data, payload.size);
 
+   struct hk_cmd_pending *pending = NULL;
+   if (agx_chip_g17_m5(dev->dev.chip) && !dev->dev.is_virtio) {
+      unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
+      VkResult pin_result = hk_cmd_pending_begin(dev, submit, chunks, &pending);
+      if (pin_result != VK_SUCCESS) {
+         util_dynarray_fini(&payload);
+         /* Sync ordinals were already resolved above; this is not retryable
+          * without rolling them back. No GPU submission has happened. */
+         return vk_device_set_lost(&dev->vk, "Command-memory pin allocation failed");
+      }
+   }
    VkResult result;
    if (command_count <= max_commands_per_submit(dev)) {
       if (unlikely(anatomy))
          hk_frame_anatomy_note_barriers(anatomy, payload.data, 0, payload.size);
       result =
-         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx);
+         queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx, pending);
    } else {
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
                                    queue->drm.virt_ring_idx, prior_base,
-                                   chunk_timelines, first_chunk_point, anatomy);
+                                   chunk_timelines, first_chunk_point, anatomy,
+                                   pending);
    }
+   hk_cmd_pending_end(dev, pending);
    if (cumulative_signals && !kernel_cumulative) {
       /* The kernel can publish an error fence even when submission fails.
        * Forward it when present, without waiting for a missing queue point
@@ -1935,10 +1967,11 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 void
 hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
+   /* Stop/join the submit worker before releasing anything it can use. */
+   vk_queue_finish(&queue->vk);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
-   vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);
 }

@@ -1077,6 +1077,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
+   simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
+   list_inithead(&dev->cmd_pending);
+   list_inithead(&dev->cmd_pending_failed);
+   dev->cmd_pending_ready = true;
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
    for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {
       list_inithead(&dev->vdm.slabs[class]);
@@ -1183,6 +1187,10 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    vk_device_finish(&dev->vk);
 
+   /* All submit workers/queues are gone. No command bytes can be handed to
+    * a new recording during teardown. Kernel job pins retain failed work. */
+   hk_cmd_pending_finish(dev);
+   simple_mtx_destroy(&dev->cmd_pending_lock);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);
 

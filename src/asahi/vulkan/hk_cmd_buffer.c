@@ -268,6 +268,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
+   hk_cmd_pending_reap(dev);
 
    /* The cached span is only valid while this recording owns its leases. */
    cmd->g17p_vdm_last_allocation = NULL;
