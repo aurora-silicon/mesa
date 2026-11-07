@@ -55,6 +55,9 @@ unsigned hk_drm_submit_command_limit(bool batch_enabled,
 
 uint16_t hk_drm_render_command_size(bool native, bool exact_prior);
 
+bool hk_drm_few_primitives_eligible(uint64_t primitive_bound,
+                                    bool pass_begins, bool pass_ends);
+
 void hk_drm_attachment_set_init(struct hk_drm_attachment_set *set);
 
 bool hk_drm_attachment_set_add(struct hk_drm_attachment_set *set,

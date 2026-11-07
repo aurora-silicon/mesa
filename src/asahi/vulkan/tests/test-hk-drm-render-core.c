@@ -139,6 +139,18 @@ test_submit_command_limit(void)
 }
 
 static void
+test_few_primitives_policy(void)
+{
+   for (uint64_t count = 0; count <= 4; ++count)
+      assert(hk_drm_few_primitives_eligible(count, true, true));
+
+   assert(!hk_drm_few_primitives_eligible(5, true, true));
+   assert(!hk_drm_few_primitives_eligible(UINT64_MAX, true, true));
+   assert(!hk_drm_few_primitives_eligible(1, false, true));
+   assert(!hk_drm_few_primitives_eligible(1, true, false));
+}
+
+static void
 test_g17p_zls_pixels_follow_backing_storage(void)
 {
    /* Native M5 color has no ZLS dimensions; D32 clear/store is ff00ff.
@@ -307,6 +319,7 @@ main(void)
    test_exact_g17p_specs();
    test_field_order_and_flag_clear();
    test_submit_command_limit();
+   test_few_primitives_policy();
    test_g17p_zls_pixels_follow_backing_storage();
    test_g17p_inactive_zls_uses_neutral_depth();
    test_fragment_attachment_ranges();

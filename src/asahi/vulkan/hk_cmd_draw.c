@@ -12420,9 +12420,8 @@ hk_g17p_note_layer_zero_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 /* An upper bound of the primitives one view of an API draw submits, or
  * UINT64_MAX when recording cannot bound it: an indirect count, or geometry
  * and tessellation stages, whose amplification is not bounded cheaply.
- * Primitive restart only lowers the true count; adjacency topologies (which
- * without a geometry shader rasterize their base primitives) are counted as
- * one primitive per vertex. */
+ * Primitive restart only lowers the true count. Adjacency topologies without
+ * a geometry shader rasterize their base line or triangle primitives. */
 static inline uint64_t
 hk_draw_primitive_bound(const struct hk_cmd_buffer *cmd,
                         const struct agx_draw *draw)
@@ -12441,12 +12440,24 @@ hk_draw_primitive_bound(const struct hk_cmd_buffer *cmd,
    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
       primitives = n >= 1 ? n - 1 : 0;
       break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+      primitives = n / 4;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+      primitives = n >= 3 ? n - 3 : 0;
+      break;
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
       primitives = n / 3;
       break;
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
       primitives = n >= 2 ? n - 2 : 0;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+      primitives = n / 6;
+      break;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+      primitives = n >= 4 ? (n - 4) / 2 : 0;
       break;
    case VK_PRIMITIVE_TOPOLOGY_PATCH_LIST:
       return UINT64_MAX;

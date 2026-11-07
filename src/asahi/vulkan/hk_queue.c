@@ -262,8 +262,9 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
     * stream's bound counts every draw of the whole pass, so it proves that. */
    if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_FEW_PRIMITIVES) &&
-       cs->g17p_pass_begins && cs->g17p_pass_ends &&
-       cs->g17p_primitive_bound <= 4) {
+       hk_drm_few_primitives_eligible(cs->g17p_primitive_bound,
+                                      cs->g17p_pass_begins,
+                                      cs->g17p_pass_ends)) {
       c->flags |= DRM_ASAHI_RENDER_FEW_PRIMITIVES;
    }
 

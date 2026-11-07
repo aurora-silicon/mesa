@@ -119,6 +119,15 @@ hk_drm_render_command_size(bool native, bool exact_prior)
                  : offsetof(struct drm_asahi_cmd_render, bg_eot_rsrc_spec_hi);
 }
 
+bool
+hk_drm_few_primitives_eligible(uint64_t primitive_bound,
+                               bool pass_begins, bool pass_ends)
+{
+   /* UINT64_MAX is the recording-time sentinel for indirect, mesh, and other
+    * work whose complete primitive count is not known. */
+   return pass_begins && pass_ends && primitive_bound <= 4;
+}
+
 void
 hk_drm_attachment_set_init(struct hk_drm_attachment_set *set)
 {
