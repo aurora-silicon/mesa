@@ -1052,6 +1052,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       HK_INIT_FAIL(fail_mem_cache, "accel-struct-state", 0);
 
+   result = hk_device_reserve_queues(dev);
+   if (result != VK_SUCCESS)
+      HK_INIT_FAIL(fail_accel_struct, "queue-reserve", 0);
+
    result = hk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       HK_INIT_FAIL(fail_accel_struct, "meta", 0);

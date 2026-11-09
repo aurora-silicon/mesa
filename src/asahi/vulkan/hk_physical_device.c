@@ -2202,7 +2202,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     */
    if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
        !pdev->dev.is_virtio) {
-#define HK_ADVERTISED_QUEUES 8u
+#define HK_ADVERTISED_QUEUES 2u
       struct drm_asahi_queue_limits limits = {0};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
@@ -2227,8 +2227,18 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * many queues and expect it to succeed. Handing the shared pool out as
        * the guarantee makes any application that asks for queueCount queues
        * fail as soon as other clients hold contexts. Advertise a count we
-       * can deliver; a real guarantee needs a per-client reservation in the
-       * kernel. */
+       * can deliver; hk_device_reserve_queues() then reserves each queue at
+       * vkCreateDevice, so a device the pool cannot serve fails there.
+       *
+       * Every advertised queue is a reservation once a device asks for all of
+       * them, which multi-queue applications and the CTS do: each one holds a
+       * kernel context and a render QID pair for the device's lifetime, used
+       * or not. Eight per device exhausted the M4 Pro (42 logical queues, fewer
+       * render pairs once compute channels are installed) with only four such
+       * clients, and multiplied the context churn of short-lived devices
+       * eightfold. Two queues per family keep a second queue for async compute
+       * or transfer work while a full device costs no more than a desktop
+       * client's lazily created queues did. */
       queue_count = MIN2(limits.max_queues, HK_ADVERTISED_QUEUES);
    }
 
