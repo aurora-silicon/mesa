@@ -1174,22 +1174,80 @@ hk_sparse_submission_updates_sstt(const struct vk_queue_submit *submission)
    return false;
 }
 
-static VkResult
-hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
+/* Whether a submission runs a render with ray queries in its vertex or
+ * fragment stage, which needs the render ray-query scratch reservation.
+ */
+static bool
+hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
 {
-   if (queue->drm.id != UINT32_MAX)
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (cs->type == HK_CS_VDM &&
+             (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq))
+            return true;
+      }
+   }
+
+   return false;
+}
+
+/* Destroy the replaced kernel queue once all its work is complete, which
+ * returns its render free list to the kernel.
+ */
+static void
+hk_queue_reap_retired(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (queue->drm.retired_id == UINT32_MAX)
+      return;
+
+   uint64_t point = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) ||
+       point < queue->drm.retired_point)
+      return;
+
+   agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
+   queue->drm.retired_id = UINT32_MAX;
+}
+
+/* Create the kernel queue for the first GPU submission, or replace it with
+ * one that reserves render ray-query scratch when the first render using ray
+ * queries arrives. *replaced says whether a kernel queue was replaced: the
+ * caller then orders the submission after every earlier one on the queue
+ * timeline, and queue-local command ordinals start again.
+ */
+static VkResult
+hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
+                    bool render_rq, bool *replaced)
+{
+   *replaced = false;
+   render_rq = render_rq && (dev->gen1_native_graphics_rq ||
+                             dev->gen1_native_fragment_rq);
+   if (queue->drm.id != UINT32_MAX && (queue->drm.render_rq || !render_rq))
       return VK_SUCCESS;
 
    /* The common queue submit path serializes submissions to this queue.
     * A logical queue, including one used only for host synchronization, does
     * not need a kernel scheduling context until it actually submits work. */
    const uint64_t layouts[2] = {
-      dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
-      dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
-   queue->drm.id = agx_create_command_queue_with_render_scs(
+      render_rq && dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
+      render_rq && dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
+   const uint32_t id = agx_create_command_queue_with_render_scs(
       &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
-   if (queue->drm.id != UINT32_MAX)
+   if (id != UINT32_MAX) {
+      if (queue->drm.id != UINT32_MAX) {
+         /* Earlier work may still run on the old kernel queue. */
+         assert(queue->drm.retired_id == UINT32_MAX);
+         queue->drm.retired_id = queue->drm.id;
+         queue->drm.retired_point = queue->drm.timeline_value;
+         *replaced = true;
+      }
+      queue->drm.id = id;
+      queue->drm.render_rq = render_rq;
       return VK_SUCCESS;
+   }
 
    const int error = errno;
    const VkResult result =
@@ -1199,6 +1257,21 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue)
       VK_ERROR_INITIALIZATION_FAILED;
    return vk_errorf(dev, result, "DRM_IOCTL_ASAHI_QUEUE_CREATE failed: %s",
                     strerror(error));
+}
+
+/* Queue-local ordering state restarts with a new kernel queue. The
+ * submission that starts it waits for every earlier submission, so nothing
+ * recorded before it can still be pending.
+ */
+static void
+hk_queue_restart_sync(struct hk_queue *queue)
+{
+   const struct hk_sync_queue old = queue->sync;
+   memset(&queue->sync, 0, sizeof(queue->sync));
+   queue->sync.exact_prior = old.exact_prior;
+   queue->sync.serialize = old.serialize;
+   queue->sync.precise_tile_evictions = old.precise_tile_evictions;
+   queue->sync.direct_single_footprints = old.direct_single_footprints;
 }
 
 static VkResult
@@ -1245,9 +1318,18 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       return queue_submit_empty(dev, queue, submit);
    }
 
-   VkResult queue_result = hk_queue_ensure_drm(dev, queue);
+   hk_queue_reap_retired(dev, queue);
+
+   bool replaced;
+   VkResult queue_result = hk_queue_ensure_drm(
+      dev, queue, hk_submit_needs_render_rq(submit), &replaced);
    if (queue_result != VK_SUCCESS)
       return queue_result;
+
+   /* The new kernel queue starts after all work of the one it replaces. */
+   const uint64_t replaced_point = queue->drm.timeline_value;
+   if (replaced)
+      hk_queue_restart_sync(queue);
 
    const uint64_t prior_base[HK_SYNC_NUM_SQ] = {
       queue->sync.submitted[HK_SYNC_VDM], queue->sync.submitted[HK_SYNC_CDM],
@@ -1282,8 +1364,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    queue->drm.timeline_value += point_count;
    unsigned wait_count = 0;
    struct drm_asahi_sync *syncs =
-      alloca((submit->wait_count + kernel_signal_count + 1) *
+      alloca((submit->wait_count + kernel_signal_count + 2) *
              sizeof(struct drm_asahi_sync));
+
+   if (replaced) {
+      syncs[wait_count++] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+         .handle = queue->drm.syncobj,
+         .timeline_value = replaced_point,
+      };
+   }
 
    for (unsigned i = 0; i < submit->wait_count; ++i) {
       /* The kernel rejects the submission if we try to wait on the same
@@ -1927,6 +2017,8 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
    queue->drm.id = UINT32_MAX;
+   queue->drm.retired_id = UINT32_MAX;
+   queue->drm.render_rq = false;
    queue->drm.virt_ring_idx = drm_priority + 1;
 
    if (drmSyncobjCreate(dev->dev.fd, 0, &queue->drm.syncobj)) {
@@ -1985,6 +2077,8 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
+   if (queue->drm.retired_id != UINT32_MAX)
+      agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
    vk_free(&dev->vk.alloc, queue);
 }
