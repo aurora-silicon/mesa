@@ -79,6 +79,27 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  # Compressed M4 Pro depth arrays through every transfer, clear and
+  # attachment path; recorded and submitted, not executed.
+  test(
+    'hk-g16s-layered-depth',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      g17p_vulkan_layered_depth,
+      '--shim',
+      '--expect-compressed',
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g16s',
+      'ASAHI_MESA_DEBUG=perf',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Mip chains on compressed images take compute dispatches, no render pass.
   test(
     'hk-g17p-compressed-mip-blit',

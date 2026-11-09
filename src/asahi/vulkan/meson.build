@@ -940,6 +940,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  g17p_vulkan_layered_depth = executable(
+    'g17p-vulkan-layered-depth',
+    files('tests/g17p_vulkan_layered_depth.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_m],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
 endif
 
 if with_tests
