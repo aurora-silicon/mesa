@@ -286,7 +286,13 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   if (agx_native_graphics(&dev->dev)) {
+   /* A deferred stream (hk_query_oq.c) is judged at the end of the command
+    * buffer, when it is no longer current: a post-graphics dispatch would
+    * open a new stream after every later command, a query copy or reset
+    * included. Write into the stream itself, as native AGX3 does. */
+   const bool pin = agx_native_graphics(&dev->dev) ||
+                    (cs != cmd->current_cs.post_gfx && cs != cmd->current_cs.cs);
+   if (pin) {
       /* End-of-stream writes belong to this exact post-graphics stream.
        * Pin it while the common native helper obtains its CDM stream; it
        * must not move availability ahead of the VDM producer. */
