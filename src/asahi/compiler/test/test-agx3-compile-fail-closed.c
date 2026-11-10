@@ -935,6 +935,52 @@ check_device_atomic_compute(enum agx_isa_encoding encoding)
 }
 
 static bool
+check_uniform_atomic_tcs(enum agx_isa_encoding encoding)
+{
+   static const struct {
+      nir_atomic_op op;
+      unsigned value;
+   } cases[] = {
+      {nir_atomic_op_iadd, 2}, {nir_atomic_op_imin, 3},
+      {nir_atomic_op_imax, 4}, {nir_atomic_op_iand, 0},
+      {nir_atomic_op_ior, 7},  {nir_atomic_op_ixor, 4},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_TESS_CTRL, &agx_nir_options, "uniform TCS atomic");
+      b.shader->info.workgroup_size[0] = 1;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      /* Software TCS keeps its API stage while running as a kernel. Unlike
+       * compute with a 1x1x1 workgroup, its uniform-address atomics go through
+       * nir_opt_uniform_atomics, including constant exclusive scans. Images
+       * have already been lowered to global addresses at this point. */
+      nir_def *old = nir_global_atomic(
+         &b, 32, nir_imm_int64(&b, 0x1000), nir_imm_int(&b, cases[i].value),
+         .atomic_op = cases[i].op);
+      nir_store_global(&b, old, nir_imm_int64(&b, 0x2000), .align_mul = 4);
+      agx_preprocess_nir(b.shader);
+
+      struct agx_shader_key key = {0};
+      key.dev.encoding = encoding;
+      struct agx_shader_part part = {0};
+      bool valid = agx_compile_shader_nir(b.shader, &key, &part);
+      valid &= part.binary != NULL && part.info.main_size > 0;
+      if (!valid)
+         fprintf(stderr, "uniform TCS atomic op %u rejected (encoding %u)\n",
+                 cases[i].op, encoding);
+      free(part.binary);
+      ralloc_free(b.shader);
+      if (!valid)
+         return false;
+   }
+
+   return true;
+}
+
+static bool
 check_shared_atomic_compute(enum agx_isa_encoding encoding)
 {
    static const uint8_t end[] = {0x0e, 0x00, 0x00, 0x00};
@@ -2558,6 +2604,8 @@ main(int argc, char **argv)
       for (unsigned i = 0; i < ARRAY_SIZE(encodings); ++i) {
          if (!check_device_atomic_compute(encodings[i]))
             return 1;
+         if (!check_uniform_atomic_tcs(encodings[i]))
+            return 1;
       }
       return 0;
    }
@@ -2657,6 +2705,8 @@ main(int argc, char **argv)
       if (!check_device_rmw_compute(encodings[i]))
          return 1;
       if (!check_device_atomic_compute(encodings[i]))
+         return 1;
+      if (!check_uniform_atomic_tcs(encodings[i]))
          return 1;
       if (!check_shared_atomic_compute(encodings[i]))
          return 1;

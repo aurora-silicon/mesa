@@ -397,10 +397,15 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
           I->op == AGX_OPCODE_STORE_OBJECT_CHILDCOUNT_M5)
          continue;
 
-      /* M5 reductions read a register even when every active lane contributes
-       * the same constant, as for the active invocation count. */
-      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          I->op == AGX_OPCODE_SIMD_REDUCE)
+      /* AGX3 reductions and scans read a register even when every active
+       * lane contributes the same constant. Uniform-address atomics can
+       * introduce exclusive scans of constants; inlining those constants
+       * leaves an operand the subgroup encoder cannot encode. */
+      if (ctx->key && agx_isa_is_agx3(ctx->key->dev.encoding) &&
+          (I->op == AGX_OPCODE_SIMD_REDUCE ||
+           I->op == AGX_OPCODE_SIMD_PREFIX ||
+           I->op == AGX_OPCODE_QUAD_REDUCE ||
+           I->op == AGX_OPCODE_QUAD_PREFIX))
          continue;
 
       /* Coverage-stack address/data operands, traversal addresses, and UVB
