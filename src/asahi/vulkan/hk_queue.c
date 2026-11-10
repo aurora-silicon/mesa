@@ -134,7 +134,8 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
                       (dev->dev.params.features &
                        DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                    ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
-                   : 0),
+                   : 0) |
+               (cs->visible_completion ? DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION : 0),
       .cdm_ctrl_stream_base = cs->addr,
       .cdm_ctrl_stream_end = cs->addr + len,
 
