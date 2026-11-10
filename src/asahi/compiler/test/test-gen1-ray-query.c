@@ -5,11 +5,12 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/glsl_types.h"
 #include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 static void
 standard_ray_query(unsigned count, unsigned array, bool instances, bool candidates,
-                   bool wrapper)
+                   bool wrapper, bool force_opaque_hw_commit)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "Gen1 standard ray query");
@@ -44,6 +45,7 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
       nir_def *rq = &deref->def;
       rqs[i] = rq;
       nir_rq_initialize(&b, rq, nir_imm_int64(&b, 0x10002000000ull),
+                        force_opaque_hw_commit ? nir_imm_int(&b, 1) :
                         candidates ? nir_ishl_imm(&b,nir_iand_imm(&b,nir_load_local_invocation_index(&b),1),1) : nir_imm_int(&b, 1), nir_imm_int(&b, 255),
                         nir_imm_vec3(&b, 0, 0, -1), nir_imm_float(&b, 0),
                         nir_imm_vec3(&b, 0, 0, 1), nir_imm_float(&b, 10));
@@ -110,6 +112,7 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
       .status_uniform = candidates ? 128 : instances ? 130 : 128,
       .instance_traversal=instances,.candidates=candidates,
       .launch_header = candidates ? 0x210000 : 0x110000,
+      .test_force_opaque_hw_commit = force_opaque_hw_commit,
    };
    struct agx_gen1_ray_query_layout bad_layout = layout;
    bad_layout.payload_uniform++;
@@ -178,24 +181,30 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
    struct agx_shader_part part = {0};
    assert(agx_compile_shader_nir(b.shader, &key, &part));
    assert(part.info.uses_ray_traversal && part.info.main_size);
+   uint64_t binary_hash = UINT64_C(1469598103934665603);
+   for (unsigned i = 0; i < part.info.main_size; ++i) {
+      binary_hash ^= ((const uint8_t *)part.binary)[i];
+      binary_hash *= UINT64_C(1099511628211);
+   }
    free(part.binary);
    ralloc_free(b.shader);
-   printf("Gen1_STANDARD_RAY_QUERY_PASS count=%u array=%u candidates=%u wrapper=%u\n", count, array, candidates, wrapper);
+   printf("Gen1_STANDARD_RAY_QUERY_PASS count=%u array=%u candidates=%u wrapper=%u opaque_hw=%u hash=%016" PRIx64 "\n", count, array, candidates, wrapper, force_opaque_hw_commit, binary_hash);
 }
 
 int main(void) {
  setbuf(stdout, NULL);
  glsl_type_singleton_init_or_ref();
- standard_ray_query(1, 0, false, false, false);
- standard_ray_query(2, 0, false, false, false);
- standard_ray_query(8, 0, false, false, false);
- standard_ray_query(4, 1, false, false, false);
- standard_ray_query(8, 1, false, false, false);
- standard_ray_query(8, 2, false, false, false);
- standard_ray_query(1, 0, true, false, false);
- standard_ray_query(8, 2, true, false, false);
- standard_ray_query(1, 0, true, true, false);
- standard_ray_query(1, 0, true, true, true);
+ standard_ray_query(1, 0, false, false, false, false);
+ standard_ray_query(2, 0, false, false, false, false);
+ standard_ray_query(8, 0, false, false, false, false);
+ standard_ray_query(4, 1, false, false, false, false);
+ standard_ray_query(8, 1, false, false, false, false);
+ standard_ray_query(8, 2, false, false, false, false);
+ standard_ray_query(1, 0, true, false, false, false);
+ standard_ray_query(8, 2, true, false, false, false);
+ standard_ray_query(1, 0, true, true, false, false);
+ standard_ray_query(1, 0, true, true, true, false);
+ standard_ray_query(1, 0, true, true, false, true);
  glsl_type_singleton_decref();
  return 0;
 }

@@ -2973,6 +2973,8 @@ static struct agx_gen1_ray_query_layout
 hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
                          VkShaderStageFlags next_stage_mask)
 {
+   const unsigned perf_arm = hk_g17p_rt_perf_arm(&dev->dev);
+
    return (struct agx_gen1_ray_query_layout){
       .payload_uniform = dev->gen1_rq_candidates ? 118 : 124,
       .bvh_uniform = 96,
@@ -2995,6 +2997,8 @@ hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
       .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
                         dev->gen1_vertex_directory != NULL,
       .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
+      .test_force_opaque_hw_commit =
+         perf_arm & HK_G17P_RT_PERF_OPAQUE_HW_COMMIT,
       .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
          ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
    };

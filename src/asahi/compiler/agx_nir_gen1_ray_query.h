@@ -12,6 +12,7 @@ struct agx_gen1_ray_query_layout {
    bool compute_kernel;
    bool position_fetch;
    bool diagnostic_features;
+   bool test_force_opaque_hw_commit;
 };
 #define AGX_GEN1_VERTEX_DIRECTORY_VA UINT64_C(0x10040000000)
 #define AGX_GEN1_VERTEX_DIRECTORY_BYTES 0x8000u

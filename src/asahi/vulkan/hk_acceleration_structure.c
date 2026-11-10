@@ -1304,6 +1304,7 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
          }
          const bool allow_update =
             (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0;
+         const unsigned perf_arm = hk_g17p_rt_perf_arm(&dev->dev);
 
          struct hk_agx3_as_layout native;
          if (!hk_gen1_as_layout_init(state->leaf_node_count, &native)) {
@@ -1334,7 +1335,8 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
                      vk_get_as_geometry_type(state->build_info) ==
                         VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
                      !(state->build_info->flags &
-                       VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR),
+                       VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) &&
+                     !(perf_arm & HK_G17P_RT_PERF_NO_TRI_PAIRS),
          };
          struct hk_agx3_plan_args native_plan = plan;
          native_plan.metadata = hk_gen1_as_metadata_addr_for_id(cmd, plan.resource_id);
@@ -1635,7 +1637,8 @@ hk_native_build_config(VkDevice device,
 {
    VK_FROM_HANDLE(hk_device, dev, device);
    if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_PLOC &&
-       dev->g17p_native_as)
+       dev->g17p_native_as &&
+       !(hk_g17p_rt_perf_arm(&dev->dev) & HK_G17P_RT_PERF_PLOC))
       state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
    if (state->build_info->mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
       state->config.internal_type = VK_INTERNAL_BUILD_TYPE_UPDATE;

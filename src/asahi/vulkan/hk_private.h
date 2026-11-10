@@ -90,6 +90,29 @@ struct hk_addr_range {
 #define HK_G17P_RT_KERNEL_FEATURES                                             \
    (DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
 
+/* Test-only G17P ray-tracing performance arms.  These are deliberately an
+ * environment bitmask rather than production policy: zero is the only
+ * default, and T6040/G16S is excluded even though it shares the G17P
+ * architecture profile.
+ *
+ *  bit 0: let force-opaque queries use the hardware committed-hit path
+ *  bit 1: retain the common builder's PLOC topology instead of HPLOC
+ *  bit 2: keep one triangle per native record (disable sibling pairing)
+ */
+enum hk_g17p_rt_perf_arm {
+   HK_G17P_RT_PERF_OPAQUE_HW_COMMIT = 1u << 0,
+   HK_G17P_RT_PERF_PLOC             = 1u << 1,
+   HK_G17P_RT_PERF_NO_TRI_PAIRS     = 1u << 2,
+};
+
+static inline unsigned
+hk_g17p_rt_perf_arm(const struct agx_device *dev)
+{
+   return agx_is_a18_pro(dev)
+             ? debug_get_num_option("ASAHI_G17P_RT_PERF_ARM", 0)
+             : 0;
+}
+
 static inline bool
 hk_g17p_rt_enabled(const struct agx_device *dev)
 {
