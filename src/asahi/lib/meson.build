@@ -218,6 +218,18 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-i386-layout',
+    executable(
+      'asahi-i386-layout',
+      files('tests/test-i386-layout.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_agx_pack, idep_mesautil, idep_nir],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-usc-base-page',
     executable(
       'asahi-usc-base-page',
