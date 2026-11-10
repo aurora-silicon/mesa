@@ -16,7 +16,12 @@ struct libagx_xfb_counter_copy {
 struct libagx_imm_write {
    DEVICE(uint32_t) address;
    uint32_t value;
+   /* i386 aligns uint64_t to 4 bytes in structs: without this word the host
+    * packs 12-byte elements while libagx_write_u32s reads 16-byte ones. */
+   uint32_t pad;
 };
+static_assert(sizeof(struct libagx_imm_write) == 16,
+              "struct libagx_imm_write must match the device layout");
 
 #define LIBAGX_QUERY_UNAVAILABLE (uint64_t)((int64_t)-1)
 
