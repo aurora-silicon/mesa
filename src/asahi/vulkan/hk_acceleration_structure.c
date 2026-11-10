@@ -3032,6 +3032,25 @@ hk_host_as_execute(struct hk_host_as_run *run)
    struct hk_device *dev = run->dev;
    VkDevice device = hk_device_to_handle(dev);
    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   /* These synchronous host commands use an internal GPU queue. Its fence
+    * orders completion, but the writes must also reach host memory before
+    * returning to the caller. In particular, a G17P strong CDM flush without
+    * memory scope can leave the AS in GPU caches after the fence signals.
+    * Use the normal host-read dependency to publish builds and copies alike.
+    */
+   const VkMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+      .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+      .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT,
+   };
+   const VkDependencyInfo dependency = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &barrier,
+   };
+   disp->CmdPipelineBarrier2(run->cmd, &dependency);
    VkResult result = disp->EndCommandBuffer(run->cmd);
    if (result != VK_SUCCESS)
       return result;

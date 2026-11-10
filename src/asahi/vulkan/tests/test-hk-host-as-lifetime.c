@@ -21,6 +21,7 @@ static struct hk_queue queue;
 static atomic_uint active, peak, fences;
 static unsigned fail_stage;
 static _Thread_local unsigned stage;
+static _Thread_local bool host_available;
 static pthread_barrier_t start;
 
 static VkResult step(void)
@@ -83,7 +84,22 @@ begin_cmd(VkCommandBuffer cmd, const VkCommandBufferBeginInfo *ci)
    usleep(1000);
    return step();
 }
-static VkResult VKAPI_CALL end_cmd(VkCommandBuffer cmd) { return step(); }
+static void VKAPI_CALL
+host_barrier(VkCommandBuffer cmd, const VkDependencyInfo *info)
+{
+   assert(info->memoryBarrierCount == 1);
+   const VkMemoryBarrier2 *barrier = info->pMemoryBarriers;
+   assert(barrier->srcStageMask & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   assert(barrier->srcAccessMask & VK_ACCESS_2_SHADER_WRITE_BIT);
+   assert(barrier->dstStageMask & VK_PIPELINE_STAGE_2_HOST_BIT);
+   assert(barrier->dstAccessMask & VK_ACCESS_2_HOST_READ_BIT);
+   host_available = true;
+}
+static VkResult VKAPI_CALL end_cmd(VkCommandBuffer cmd)
+{
+   assert(host_available);
+   return step();
+}
 static VkResult VKAPI_CALL
 submit(VkQueue q, uint32_t count, const VkSubmitInfo2 *s, VkFence fence)
 { return step(); }
@@ -99,6 +115,7 @@ void __wrap_hk_meta_end(struct hk_cmd_buffer *c, struct hk_meta_save *s, VkPipel
 static VkResult run(VkDeferredOperationKHR deferred)
 {
    stage = 0;
+   host_available = false;
    return hk_BuildAccelerationStructuresKHR(hk_device_to_handle(&dev), deferred, 0, NULL, NULL);
 }
 
@@ -124,6 +141,7 @@ int main(void)
    dev.vk.dispatch_table.FreeCommandBuffers = free_cmd;
    dev.vk.dispatch_table.BeginCommandBuffer = begin_cmd;
    dev.vk.dispatch_table.EndCommandBuffer = end_cmd;
+   dev.vk.dispatch_table.CmdPipelineBarrier2 = host_barrier;
    dev.vk.dispatch_table.QueueSubmit2 = submit;
    dev.vk.dispatch_table.WaitForFences = wait_fences;
 
