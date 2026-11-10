@@ -169,10 +169,15 @@ gen1_rq_committed_instance_pointer(nir_builder *b, nir_def *query, nir_def *lane
 }
 
 static nir_def *
-gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags)
+gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags,
+                   bool force_opaque)
 {
+   unsigned software_flags = GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS;
+   if (force_opaque)
+      software_flags &= ~1u;
+
    return nir_inot(b, nir_test_mask(b, nir_load_deref(b, flags),
-                                    GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS));
+                                    software_flags));
 }
 
 /* Committed values beyond the hit words and distance that a merged hardware
@@ -216,9 +221,10 @@ static void
 gen1_rq_merge_hw_commit(nir_builder *b, nir_def *id, nir_def *query,
                         nir_def *lane, nir_deref_instr *flags,
                         nir_deref_instr *active,
-                        nir_deref_instr *result[4], unsigned fields)
+                        nir_deref_instr *result[4], unsigned fields,
+                        bool force_opaque)
 {
-   nir_push_if(b, gen1_rq_hw_commits(b, flags));
+   nir_push_if(b, gen1_rq_hw_commits(b, flags, force_opaque));
    nir_def *distance = nir_load_scs_uniform_agx(b, 1, 32, nir_load_preamble(b, 1, 64, .base = 118),
       nir_ishl_imm(b, id, 5), .base = 24, .format = PIPE_FORMAT_R32_UINT, .component = 0);
    nir_def *hit = nir_load_scs_indexed_agx(b, 2, 32, query, lane, .base = 256, .component = 3);
@@ -253,7 +259,7 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
                      nir_deref_instr *flags,nir_deref_instr *minimum,
                      nir_deref_instr *result[4],nir_deref_instr *candidate[4],
                      nir_deref_instr *refills,nir_variable *more,
-                     unsigned hw_fields)
+                     unsigned hw_fields, bool force_opaque)
 {
    nir_def *id=nir_load_scs_thread_index_agx(b),*lane=nir_iand_imm(b,id,31);
    nir_def *query=nir_iadd_imm(b,nir_imul_imm(b,nir_ushr_imm(b,id,5),304*32),0x2f8000);
@@ -299,7 +305,8 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
    nir_pop_if(b,NULL);
    nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
    nir_store_deref(b,active,completed,1);
-   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields);
+   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields,
+                           force_opaque);
    nir_break_if(b,nir_inot(b,nir_load_deref(b,active)));
    nir_store_deref(b,cursor,nir_imm_int(b,0),1);
    nir_pop_if(b,NULL);nir_pop_loop(b,NULL);
@@ -664,7 +671,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_store_scs_uniform_agx(&b,words[i],base,index,
                .base=16*i,.format=PIPE_FORMAT_R32_UINT,.component=0);
          nir_def *query_control = layout->candidates
-            ? nir_bcsel(&b, gen1_rq_hw_commits(&b, flags), nir_imm_int(&b, 0x9942), nir_imm_int(&b, 0x9142))
+            ? nir_bcsel(&b, gen1_rq_hw_commits(&b, flags,
+                                                layout->test_force_opaque_hw_commit),
+                        nir_imm_int(&b, 0x9942), nir_imm_int(&b, 0x9142))
             : nir_imm_int(&b, 0x4922);
          nir_store_scs_indexed_agx(&b,nir_vec2(&b,query_control,
             nir_load_deref(&b,tmin)),query,lane,.base=0,.component=3);
@@ -685,7 +694,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if(layout->candidates) {
             nir_store_deref(&b,started,nir_imm_true(&b),1);
             nir_store_deref(&b,active,completed,1);
-            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,hw_fields);
+            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,
+                                    hw_fields,
+                                    layout->test_force_opaque_hw_commit);
          } else {
          nir_push_if(&b,completed);
          for(unsigned i=0;i<2;i++)
@@ -727,7 +738,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if (layout->candidates) {
             nir_pop_if(&b, NULL);
             nir_push_if(&b, nir_load_deref(&b, active));
-            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,refills,more,hw_fields);
+            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,
+                                refills,more,hw_fields,
+                                layout->test_force_opaque_hw_commit);
             nir_pop_if(&b, NULL);
          }
          nir_pop_if(&b, NULL);
