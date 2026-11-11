@@ -3193,9 +3193,9 @@ static const struct wl_callback_listener frame_listener = {
 };
 
 static bool
-set_application_driven_timestamp(struct wsi_wl_swapchain *chain,
-                                 uint64_t *timestamp,
-                                 uint64_t *correction)
+set_initial_timestamp(struct wsi_wl_swapchain *chain,
+                      uint64_t *timestamp,
+                      uint64_t *correction)
 {
    if (chain->timing_request.serial && chain->timing_request.time) {
       /* Absolute time is requested before we have been able to report a reasonable refresh rate
@@ -3210,9 +3210,26 @@ set_application_driven_timestamp(struct wsi_wl_swapchain *chain,
       *correction = 0;
       chain->present_ids.last_target_time = chain->timing_request.time;
       return true;
-   } else {
-      return false;
    }
+
+   /* Even the first untimed FIFO present needs the empty commit emitted by
+    * queue_present() to retire an occluded image. Otherwise an application
+    * polling presentation timing before submitting another image can wait
+    * forever for feedback, and we never learn the refresh rate either.
+    * Use the compositor's clock without inventing a refresh interval.
+    */
+   struct timespec now;
+   if (clock_gettime(chain->wsi_wl_surface->display->presentation_clock_id,
+                     &now) != 0)
+      return false;
+
+   wp_commit_timer_v1_set_timestamp(chain->commit_timer,
+                                    (uint64_t)now.tv_sec >> 32, now.tv_sec,
+                                    now.tv_nsec);
+   *timestamp = timespec_to_nsec(&now);
+   *correction = 0;
+   chain->present_ids.last_target_time = *timestamp;
+   return true;
 }
 
 /* The present_ids lock must be held */
@@ -3228,17 +3245,17 @@ set_timestamp(struct wsi_wl_swapchain *chain,
    int32_t error = 0;
 
    if (!chain->present_ids.valid_refresh_nsec)
-      return set_application_driven_timestamp(chain, timestamp, correction);
+      return set_initial_timestamp(chain, timestamp, correction);
 
    displayed_time = chain->present_ids.displayed_time;
    refresh = chain->present_ids.refresh_nsec;
 
    /* If refresh is 0, presentation feedback has informed us we have no
-    * fixed refresh cycle. In that case we can't generate sensible
-    * timestamps at all, so bail out.
+    * fixed refresh cycle. Use the initial timestamp path rather than
+    * predicting the next refresh.
     */
    if (!refresh)
-      return set_application_driven_timestamp(chain, timestamp, correction);
+      return set_initial_timestamp(chain, timestamp, correction);
 
    /* We assume we're being fed at the display's refresh rate, but
     * if that doesn't happen our timestamps fall into the past.
