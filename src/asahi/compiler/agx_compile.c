@@ -7736,8 +7736,13 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
           * a700540203002200f0106100: f30=8 f57=6). agx3_alu_bfeil() already
           * encodes that immediate form; only this materialization of the
           * offset into a register (an extra LDIMM) stood in the way. */
+         /* M5 has the same form (agx3_alu_bfeil_m5): its SRL takes the
+          * offset as an immediate with or without a width. G18G keeps the
+          * register offset. */
          const bool immediate_extract =
-            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+             (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+              !ctx->key->dev.emit_agx3d)) &&
             I->op == AGX_OPCODE_BFEIL && I->bfi_mask >= 1 &&
             I->bfi_mask <= 31 && I->src[0].type == AGX_INDEX_IMMEDIATE &&
             I->src[0].value == 0 && I->src[1].size == AGX_SIZE_32 &&
