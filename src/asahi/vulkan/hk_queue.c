@@ -2135,6 +2135,49 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    }
 }
 
+/* Submit from the caller unless enough earlier work is still executing on
+ * this queue to hide the submit thread's wakeup. Submissions without GPU
+ * work are cheap, so they never go to the thread. Every submission
+ * advances the queue timeline by at least one point, so counting points
+ * never under-counts submissions. Called with nothing queued for the submit
+ * thread, so the timeline cursor is stable. */
+static bool
+hk_queue_submit_inline(struct vk_queue *vk_queue,
+                       const struct vk_queue_submit *submit)
+{
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   struct hk_device *dev = hk_queue_device(queue);
+
+   /* Sparse binds update the VM on the CPU; keep them on the caller as
+    * without a submit thread. */
+   if (vk_queue_submit_has_bind(submit))
+      return true;
+
+   bool work = false;
+   for (unsigned i = 0; i < submit->command_buffer_count && !work; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+      work = !list_is_empty(&cmdbuf->control_streams);
+   }
+   if (!work)
+      return true;
+
+   /* The last completed point seen bounds the pending count from above, so
+    * the timeline only needs to be read once that bound reaches the limit. */
+   const uint64_t submitted = queue->drm.timeline_value;
+   if (submitted - MIN2(queue->submit_completed, submitted) <
+       queue->submit_inline_max_pending)
+      return true;
+
+   uint64_t completed;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &completed, 1))
+      return true;
+
+   queue->submit_completed = MIN2(completed, submitted);
+   return submitted - queue->submit_completed <
+          queue->submit_inline_max_pending;
+}
+
 VkResult
 hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
               uint32_t index_in_family)
@@ -2249,6 +2292,17 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
    }
 
    hk_queue_share(dev, queue);
+
+   queue->submit_inline_max_pending =
+      debug_get_num_option("HK_SUBMIT_INLINE_MAX", 0);
+   if (queue->submit_inline_max_pending && !vk_queue_is_emulated(&queue->vk)) {
+      queue->vk.driver_submit_inline = hk_queue_submit_inline;
+      result = vk_queue_enable_submit_thread(&queue->vk);
+      if (result != VK_SUCCESS) {
+         hk_queue_finish(dev, queue);
+         return result;
+      }
+   }
 
    /* Permission for an elevated class must be checked during device
     * creation, while the application can still fall back to MEDIUM. Delaying

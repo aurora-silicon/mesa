@@ -758,7 +758,8 @@ vk_queue_submit_final(struct vk_queue *queue,
        * requires; the deferred and threaded callers lose the queue anyway.
        */
       if (result == VK_ERROR_DEVICE_LOST || vk_queue_is_lost(queue) ||
-          queue->submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE) {
+          (queue->submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE &&
+           !submit->_caller_thread)) {
          result = vk_queue_set_lost(queue, "queue::driver_submit failed");
          vk_queue_submit_signal_dropped(queue, submit);
       }
@@ -1175,6 +1176,99 @@ vk_queue_submit_move_binary_waits_to_temps(struct vk_device *device,
    return VK_SUCCESS;
 }
 
+/* Submits from the calling thread.  Always consumes the submission. */
+static VkResult
+vk_queue_submit_immediate(struct vk_queue *queue,
+                          struct vk_queue_submit *submit)
+{
+   struct vk_device *device = queue->base.device;
+   VkResult result;
+
+   /* If threaded submit is possible on this device, we need to ensure that
+    * binary semaphore payloads get reset so that any other threads can
+    * properly wait on them for dependency checking.  Because we don't
+    * currently have a submit thread, we can directly reset most binary
+    * semaphore payloads.  However, for shared semaphores the loop below
+    * doesn't work because we we can't reliably check that a wait was never
+    * signaled since two different vk_sync structs can refer to the same
+    * underlying sync primitive.  For shared semaphores, we have to fall
+    * back to moving them to temporaries like we do in the threaded case.
+    */
+   if (vk_device_supports_threaded_submit(device)) {
+      result = vk_queue_submit_move_binary_waits_to_temps(device, submit, false);
+      if (unlikely(result != VK_SUCCESS))
+         goto fail;
+   }
+
+   submit->_caller_thread = true;
+   result = vk_queue_submit_final(queue, submit);
+   if (unlikely(result != VK_SUCCESS))
+      goto fail;
+
+   /* If threaded submit is possible on this device, we need to ensure that
+    * binary semaphore payloads get reset so that any other threads can
+    * properly wait on them for dependency checking.  Because we don't
+    * currently have a submit thread, we can directly reset that binary
+    * semaphore payloads.
+    *
+    * If we the vk_sync is in our signal set, we can consider it to have
+    * been both reset and signaled by queue_submit_final().  A reset in
+    * this case would be wrong because it would throw away our signal
+    * operation.  If we don't signal the vk_sync, then we need to reset it.
+    */
+   if (vk_device_supports_threaded_submit(device) &&
+       submit->_has_binary_permanent_semaphore_wait) {
+      for (uint32_t i = 0; i < submit->wait_count; i++) {
+         if ((submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) ||
+             submit->_wait_temps[i] != NULL)
+            continue;
+
+         bool was_signaled = false;
+         for (uint32_t j = 0; j < submit->signal_count; j++) {
+            if (submit->signals[j].sync == submit->waits[i].sync) {
+               was_signaled = true;
+               break;
+            }
+         }
+
+         if (!was_signaled) {
+            result = vk_sync_reset(queue->base.device,
+                                   submit->waits[i].sync);
+            if (unlikely(result != VK_SUCCESS))
+               goto fail;
+         }
+      }
+   }
+
+   vk_queue_submit_destroy(queue, submit);
+   return result;
+
+fail:
+   vk_queue_submit_destroy(queue, submit);
+   return result;
+}
+
+/* Whether a submission on a threaded queue may be made from the calling
+ * thread: nothing is queued for the submit thread, so ordering is kept and
+ * driver_submit cannot run concurrently; the driver prefers it; and every
+ * wait already has its signal operation submitted, which is all the submit
+ * thread would wait for.  Caller holds submit.mutex.
+ */
+static bool
+vk_queue_submit_inline_locked(struct vk_queue *queue,
+                              struct vk_queue_submit *submit)
+{
+   if (!list_is_empty(&queue->submit.submits) || queue->_lost.lost)
+      return false;
+
+   if (!queue->driver_submit_inline(queue, submit))
+      return false;
+
+   return vk_sync_wait_many(queue->base.device,
+                            submit->wait_count, submit->waits,
+                            VK_SYNC_WAIT_PENDING, 0) == VK_SUCCESS;
+}
+
 static VkResult
 vk_queue_submit(struct vk_queue *queue,
                 struct vk_queue_submit *submit)
@@ -1204,69 +1298,23 @@ vk_queue_submit(struct vk_queue *queue,
 
    switch (queue->submit.mode) {
    case VK_QUEUE_SUBMIT_MODE_IMMEDIATE:
-      /* If threaded submit is possible on this device, we need to ensure that
-       * binary semaphore payloads get reset so that any other threads can
-       * properly wait on them for dependency checking.  Because we don't
-       * currently have a submit thread, we can directly reset most binary
-       * semaphore payloads.  However, for shared semaphores the loop below
-       * doesn't work because we we can't reliably check that a wait was never
-       * signaled since two different vk_sync structs can refer to the same
-       * underlying sync primitive.  For shared semaphores, we have to fall
-       * back to moving them to temporaries like we do in the threaded case.
-       */
-      if (vk_device_supports_threaded_submit(device)) {
-         result = vk_queue_submit_move_binary_waits_to_temps(device, submit, false);
-         if (unlikely(result != VK_SUCCESS))
-            goto fail;
-      }
-
-      result = vk_queue_submit_final(queue, submit);
-      if (unlikely(result != VK_SUCCESS))
-         goto fail;
-
-      /* If threaded submit is possible on this device, we need to ensure that
-       * binary semaphore payloads get reset so that any other threads can
-       * properly wait on them for dependency checking.  Because we don't
-       * currently have a submit thread, we can directly reset that binary
-       * semaphore payloads.
-       *
-       * If we the vk_sync is in our signal set, we can consider it to have
-       * been both reset and signaled by queue_submit_final().  A reset in
-       * this case would be wrong because it would throw away our signal
-       * operation.  If we don't signal the vk_sync, then we need to reset it.
-       */
-      if (vk_device_supports_threaded_submit(device) &&
-          submit->_has_binary_permanent_semaphore_wait) {
-         for (uint32_t i = 0; i < submit->wait_count; i++) {
-            if ((submit->waits[i].sync->flags & VK_SYNC_IS_TIMELINE) ||
-                submit->_wait_temps[i] != NULL)
-               continue;
-
-            bool was_signaled = false;
-            for (uint32_t j = 0; j < submit->signal_count; j++) {
-               if (submit->signals[j].sync == submit->waits[i].sync) {
-                  was_signaled = true;
-                  break;
-               }
-            }
-
-            if (!was_signaled) {
-               result = vk_sync_reset(queue->base.device,
-                                      submit->waits[i].sync);
-               if (unlikely(result != VK_SUCCESS))
-                  goto fail;
-            }
-         }
-      }
-
-      vk_queue_submit_destroy(queue, submit);
-      return result;
+      return vk_queue_submit_immediate(queue, submit);
 
    case VK_QUEUE_SUBMIT_MODE_DEFERRED:
       vk_queue_push_submit(queue, submit);
       return vk_device_flush(queue->base.device);
 
    case VK_QUEUE_SUBMIT_MODE_THREADED:
+      if (queue->driver_submit_inline) {
+         mtx_lock(&queue->submit.mutex);
+         if (vk_queue_submit_inline_locked(queue, submit)) {
+            result = vk_queue_submit_immediate(queue, submit);
+            mtx_unlock(&queue->submit.mutex);
+            return result;
+         }
+         mtx_unlock(&queue->submit.mutex);
+      }
+
       result = vk_queue_submit_move_binary_waits_to_temps(device, submit, true);
       if (unlikely(result != VK_SUCCESS))
          goto fail;

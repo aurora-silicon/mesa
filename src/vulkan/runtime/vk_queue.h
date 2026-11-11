@@ -71,6 +71,22 @@ struct vk_queue {
    VkResult (*driver_submit)(struct vk_queue *queue,
                              struct vk_queue_submit *submit);
 
+   /** Optional driver hook for queues with a submit thread
+    *
+    * When set and the queue is in `VK_QUEUE_SUBMIT_MODE_THREADED`, a
+    * submission is made from the calling thread, as in
+    * `VK_QUEUE_SUBMIT_MODE_IMMEDIATE`, if nothing is queued for the submit
+    * thread, every wait already has its signal operation submitted and this
+    * hook returns true.  Any other submission goes to the submit thread.
+    * Drivers return false when enough earlier work is still executing to
+    * hide the submit thread's wakeup, so the thread's overlap with the
+    * caller costs no latency.  It is called with `submit.mutex` held while
+    * nothing is queued for the submit thread, so it never runs concurrently
+    * with `driver_submit` on this queue.
+    */
+   bool (*driver_submit_inline)(struct vk_queue *queue,
+                                const struct vk_queue_submit *submit);
+
    struct {
       /** Current submit mode
        *
@@ -96,6 +112,7 @@ struct vk_queue {
 
       bool thread_run;
       thrd_t thread;
+
    } submit;
 
    struct {
@@ -306,6 +323,10 @@ struct vk_queue_submit {
    /* Set once the signals of a submission that never reached the driver were
     * signalled on the CPU (lost queue); see vk_queue_submit_signal_dropped. */
    bool _signals_dropped;
+
+   /* Submitted from the calling thread of vkQueueSubmit even though the queue
+    * has a submit thread; failures are reported as in immediate mode. */
+   bool _caller_thread;
    struct vk_sync **_wait_temps;
    struct vk_sync_timeline_point **_wait_points;
    struct vk_sync_timeline_point **_signal_points;

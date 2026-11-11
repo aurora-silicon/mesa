@@ -16,6 +16,14 @@ struct hk_device;
 struct hk_queue {
    struct vk_queue vk;
 
+   /* With a submit thread, submissions are made from the caller while fewer
+    * than this many earlier ones are still executing (0: no submit thread
+    * unless the runtime starts one). */
+   uint32_t submit_inline_max_pending;
+
+   /* Highest queue timeline point seen complete by the inline check. */
+   uint64_t submit_completed;
+
    struct {
       /* Asahi kernel queue ID, UINT32_MAX until the first GPU submission. */
       uint32_t id;
