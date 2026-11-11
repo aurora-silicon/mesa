@@ -444,7 +444,7 @@ hk_get_device_features(
       .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixPerElementOperationsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixTensorAddressing = supported_extensions->NV_cooperative_matrix2,
-      .cooperativeMatrixBlockLoads = false,
+      .cooperativeMatrixBlockLoads = supported_extensions->NV_cooperative_matrix2,
 
       .shaderInt8 = true,
       .descriptorIndexing = true,

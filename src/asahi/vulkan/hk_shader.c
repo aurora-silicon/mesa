@@ -446,7 +446,8 @@ void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
    /* Matrices of flexible dimensions become 16x16 pieces, then tensor loads
-    * and stores are lowered, while matrices are still matrices. */
+    * and stores are lowered: they inline the decode functions they call,
+    * which the rest of the lowering must then see. */
    if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)) {
       bool split = false;
       NIR_PASS(split, nir, agx_nir_lower_cmat_flexible);

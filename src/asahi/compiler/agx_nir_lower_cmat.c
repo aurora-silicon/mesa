@@ -1005,7 +1005,7 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
  * Tensor loads and stores of VK_NV_cooperative_matrix2 (cmat_call
  * tensor_load/tensor_store), lowered to memory accesses and cmat_insert or
  * cmat_extract while the matrices are still cooperative matrix types, so that
- * the lowering of the rest of the shader sees the result.
+ * a decode function's calls can be inlined before the shader's other lowering.
  *
  * The common case, a 2D tensor layout with element strides (1 along the inner
  * dimension), unit blocks and either no view or a view that only transposes,
@@ -1205,7 +1205,7 @@ tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
                       struct glsl_cmat_description desc,
                       struct tensor_fast *fast)
 {
-   if (info->spans->num_components != 2 ||
+   if (info->decode_fnptr || info->spans->num_components != 2 ||
        tl.split_row_index || tl.split_col_index)
       return NULL;
 
@@ -1429,8 +1429,11 @@ tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
       nir_def *v = nir_calc_tensor_derefs(b, info, nir_iadd_imm(b, r0, dr),
                                           nir_iadd_imm(b, c0, dc), &d);
       if (load) {
-         v = load_unless(b, d, info->skip,
-                         info->skip ? nir_u2uN(b, info->skip_value, bits) : NULL);
+         /* A decoded element is skipped by the common addressing. */
+         if (!info->decode_fnptr) {
+            v = load_unless(b, d, info->skip,
+                            info->skip ? nir_u2uN(b, info->skip_value, bits) : NULL);
+         }
       } else {
          nir_push_if(b, nir_inot(b, info->do_clamp));
          nir_store_deref(b, d, values[e], 1);
@@ -1465,7 +1468,12 @@ lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
    struct nir_calc_tensor_info info = {0};
    nir_calc_tensor_derefs_init(b, &info, call);
 
-   assert(!info.decode_fnptr);
+   /* A decode function takes a global pointer to its block. */
+   if (info.decode_fnptr && nir_deref_mode_is(ptr, nir_var_mem_ssbo)) {
+      nir_def *addr = nir_deref_buffer_address(b, 1, 64, &ptr->def);
+      ptr = nir_build_deref_cast(b, addr, nir_var_mem_global, ptr->type,
+                                 bits / 8);
+   }
 
    nir_def *values[8] = {NULL};
    if (!load) {
@@ -1502,6 +1510,21 @@ lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
    return true;
 }
 
+static bool
+function_is_called(nir_shader *nir, nir_function *func)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_cmat_call &&
+                nir_instr_as_cmat_call(instr)->callee == func)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 bool
 agx_nir_lower_cmat_tensor(nir_shader *nir)
 {
@@ -1516,11 +1539,6 @@ agx_nir_lower_cmat_tensor(nir_shader *nir)
          if (instr->type != nir_instr_type_cmat_call)
             continue;
          nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
-         /* A block load (with a decode function) is not taken yet: it stays
-          * a call, which agx_nir_cmat_supported() refuses.
-          */
-         if (call->callee)
-            continue;
          /* A matrix of a size the lowering lacks stays a call, which
           * agx_nir_cmat_supported() refuses.
           */
@@ -1530,7 +1548,21 @@ agx_nir_lower_cmat_tensor(nir_shader *nir)
             progress |= lower_tensor_call(&b, call);
       }
    }
-   return nir_progress(progress, impl, nir_metadata_none);
+   if (!progress)
+      return nir_no_progress(impl);
+
+   nir_progress(true, impl, nir_metadata_none);
+
+   /* Inline the decode functions' calls, then drop the functions no
+    * cooperative matrix call refers to any more.
+    */
+   NIR_PASS(_, nir, nir_lower_returns);
+   NIR_PASS(_, nir, nir_inline_functions);
+   nir_foreach_function_safe(func, nir) {
+      if (!func->is_entrypoint && !function_is_called(nir, func))
+         exec_node_remove(&func->node);
+   }
+   return true;
 }
 
 static bool
