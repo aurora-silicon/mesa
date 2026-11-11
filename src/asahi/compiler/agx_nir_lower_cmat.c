@@ -1193,23 +1193,36 @@ load_unless(nir_builder *b, nir_deref_instr *d, nir_def *skip,
 
 struct tensor_fast {
    bool transposed;
-   nir_def *y0, *x0, *stride, *dim0, *dim1;
+   unsigned row_offset, col_offset;
+   nir_def *stride, *dim0, *dim1;
 };
+
+/* The lane's element 0, in rows and columns of the whole matrix: a matrix
+ * of flexible dimensions is lowered to 16x16 pieces, each with its offset.
+ */
+static void
+lane_origin(nir_builder *b, struct glsl_cmat_description desc,
+            struct tensor_fast *fast, nir_def **r0, nir_def **c0)
+{
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   *r0 = nir_iadd_imm(b, matrix_row(b, lane, desc, 0), fast->row_offset);
+   *c0 = nir_iadd_imm(b, matrix_col(b, lane, desc, 0), fast->col_offset);
+}
 
 /* Whether the common case applies, as a condition that folds when the
  * layout's spans, strides and block sizes are constants; NULL if it cannot.
  */
 static nir_def *
 tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
-                      struct nir_cmat_tensor_load tl,
                       struct glsl_cmat_description desc,
                       struct tensor_fast *fast)
 {
-   if (info->spans->num_components != 2 ||
-       tl.split_row_index || tl.split_col_index)
+   if (info->spans->num_components != 2)
       return NULL;
 
    fast->transposed = false;
+   fast->row_offset = info->row_imm_offset;
+   fast->col_offset = info->col_imm_offset;
    nir_def *cond = nir_imm_true(b);
    if (info->view) {
       if (info->view_has_dims)
@@ -1306,8 +1319,8 @@ tensor_fast_access(nir_builder *b, struct nir_calc_tensor_info *info,
                    struct glsl_cmat_description desc, bool load,
                    nir_def **values, unsigned count)
 {
-   nir_def *lane = nir_load_subgroup_invocation(b);
-   nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
+   nir_def *r0, *c0;
+   lane_origin(b, desc, fast, &r0, &c0);
    nir_def *y0 = nir_iadd(b, nir_channel(b, info->offsets, 0),
                           fast->transposed ? c0 : r0);
    nir_def *x0 = nir_iadd(b, nir_channel(b, info->offsets, 1),
@@ -1487,8 +1500,8 @@ tensor_fast_decode(nir_builder *b, struct nir_calc_tensor_info *info,
 {
    nir_function *fn = info->decode_fnptr;
    nir_deref_instr *param = decode_block_deref(fn->impl);
-   nir_def *lane = nir_load_subgroup_invocation(b);
-   nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
+   nir_def *r0, *c0;
+   lane_origin(b, desc, fast, &r0, &c0);
    nir_def *y0 = nir_iadd(b, nir_channel(b, info->offsets, 0),
                           fast->transposed ? c0 : r0);
    nir_def *x0 = nir_iadd(b, nir_channel(b, info->offsets, 1),
@@ -1616,7 +1629,6 @@ lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
    nir_deref_instr *ptr = nir_src_as_deref(call->params[load ? 1 : 0]);
    nir_deref_instr *clip = load ? nir_src_as_deref(call->params[4]) : NULL;
    struct glsl_cmat_description desc = *glsl_get_cmat_description(mat->type);
-   struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
    unsigned count = desc.rows * desc.cols / 32;
    unsigned bits = glsl_base_type_bit_size(desc.element_type);
 
@@ -1638,8 +1650,10 @@ lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
          values[e] = nir_cmat_extract(b, bits, &mat->def, nir_imm_int(b, e));
    }
 
+   /* The shape tests are of the whole matrix; desc is this piece's. */
+   struct glsl_cmat_description whole = nir_cmat_call_cmat_desc(call);
    struct tensor_fast fast = {0};
-   nir_def *cond = tensor_fast_condition(b, &info, tl, desc, &fast);
+   nir_def *cond = tensor_fast_condition(b, &info, whole, &fast);
    if (cond) {
       nir_def *fast_values[8], *slow_values[8];
       memcpy(fast_values, values, sizeof(values));
