@@ -125,6 +125,157 @@ matrix_col(nir_builder *b, nir_def *lane,
                          element);
 }
 
+/* Where a matrix's elements are: bit i of an element's index within its lane
+ * and bit j of its lane's subgroup invocation each hold one bit of its row
+ * (ROW(k)) or of its column (COL(k)), as matrix_row() and matrix_col() place
+ * them. The accumulator and B layouts of a 16x16 matrix are the same; A
+ * differs only in where its column bits are. All uses of an 8x8 matrix share
+ * one layout.
+ */
+#define ROW(k)       (k)
+#define COL(k)       (8 + (k))
+#define COORD_BIT(c) ((c) & 7)
+#define TRANSPOSED(c) ((c) ^ 8)
+
+struct cmat_layout {
+   unsigned element_bits;
+   uint8_t element[3];
+   uint8_t lane[5];
+};
+
+static const struct cmat_layout layout_16_a = {
+   3, {COL(1), COL(2), ROW(0)}, {COL(3), ROW(1), ROW(2), COL(0), ROW(3)},
+};
+static const struct cmat_layout layout_16 = {
+   3, {COL(0), COL(1), ROW(0)}, {COL(2), ROW(1), ROW(2), COL(3), ROW(3)},
+};
+static const struct cmat_layout layout_8 = {
+   1, {COL(0)}, {COL(1), ROW(0), ROW(1), COL(2), ROW(2)},
+};
+
+static const struct cmat_layout *
+matrix_layout(struct glsl_cmat_description desc)
+{
+   assert((desc.rows == 8 || desc.rows == 16) && desc.cols == desc.rows);
+   if (desc.rows == 8)
+      return &layout_8;
+   return desc.use == GLSL_CMAT_USE_A ? &layout_16_a : &layout_16;
+}
+
+static int
+find_element_bit(const struct cmat_layout *l, unsigned coord)
+{
+   for (unsigned i = 0; i < l->element_bits; ++i) {
+      if (l->element[i] == coord)
+         return i;
+   }
+   return -1;
+}
+
+static int
+find_lane_bit(const struct cmat_layout *l, unsigned coord)
+{
+   for (unsigned j = 0; j < 5; ++j) {
+      if (l->lane[j] == coord)
+         return j;
+   }
+   return -1;
+}
+
+/* out[i] = subgroupShuffleXor(in[i], mask). The 16-bit values go two to a
+ * 32-bit shuffle, which is one instruction for a constant mask.
+ */
+static void
+shuffle_xor_values(nir_builder *b, nir_def **in, nir_def **out, unsigned count,
+                   unsigned mask)
+{
+   nir_def *m = nir_imm_int(b, mask);
+   for (unsigned i = 0; i < count; ++i) {
+      if (in[i]->bit_size == 32) {
+         out[i] = nir_shuffle_xor(b, in[i], m);
+      } else if (i + 1 < count) {
+         nir_def *pair = nir_shuffle_xor(b, nir_pack_32_2x16_split(b, in[i], in[i + 1]), m);
+         out[i] = nir_unpack_32_2x16_split_x(b, pair);
+         out[++i] = nir_unpack_32_2x16_split_y(b, pair);
+      } else {
+         out[i] = nir_u2u16(b, nir_shuffle_xor(b, nir_u2u32(b, in[i]), m));
+      }
+   }
+}
+
+/* Swap what element bit i and lane bit j of the matrix in v hold: of each pair
+ * of elements differing in bit i, a lane keeps the one that stays and trades
+ * the other with the lane differing in bit j.
+ */
+static void
+exchange_bits(nir_builder *b, nir_def **v, struct cmat_layout *l, unsigned i,
+              unsigned j, nir_def *lane)
+{
+   unsigned count = 1 << l->element_bits, pairs = 0;
+   nir_def *upper = nir_i2b(b, nir_iand_imm(b, lane, 1 << j));
+   nir_def *send[4], *recv[4];
+   for (unsigned e = 0; e < count; ++e) {
+      if (!(e & (1 << i)))
+         send[pairs++] = nir_bcsel(b, upper, v[e], v[e | (1 << i)]);
+   }
+   shuffle_xor_values(b, send, recv, pairs, 1 << j);
+   pairs = 0;
+   for (unsigned e = 0; e < count; ++e) {
+      if (e & (1 << i))
+         continue;
+      v[e] = nir_bcsel(b, upper, recv[pairs], v[e]);
+      v[e | (1 << i)] = nir_bcsel(b, upper, v[e | (1 << i)], recv[pairs]);
+      pairs++;
+   }
+   uint8_t tmp = l->element[i];
+   l->element[i] = l->lane[j];
+   l->lane[j] = tmp;
+}
+
+/* Move a matrix's elements from layout `from` to layout `to` (with the same
+ * coordinates). Each lane bit that holds the wrong coordinate trades it with
+ * the element bit that holds the right one; a coordinate that is in another
+ * lane bit goes through an element bit first. What is left is a renaming of
+ * the elements within each lane.
+ */
+static nir_def *
+permute_matrix(nir_builder *b, nir_def *value, struct cmat_layout from,
+               const struct cmat_layout *to)
+{
+   nir_def *v[8], *out[8];
+   unsigned count = 1 << from.element_bits;
+   assert(value->num_components == count && to->element_bits == from.element_bits);
+   for (unsigned e = 0; e < count; ++e)
+      v[e] = nir_channel(b, value, e);
+
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   for (unsigned j = 0; j < 5; ++j) {
+      while (from.lane[j] != to->lane[j]) {
+         int i = find_element_bit(&from, to->lane[j]);
+         if (i >= 0) {
+            exchange_bits(b, v, &from, i, j, lane);
+            continue;
+         }
+         /* Bring it in from lane bit k, through the element bit whose
+          * coordinate lane bit k wants if there is one.
+          */
+         int k = find_lane_bit(&from, to->lane[j]);
+         assert(k > (int)j);
+         i = find_element_bit(&from, to->lane[k]);
+         exchange_bits(b, v, &from, i >= 0 ? i : 0, k, lane);
+      }
+   }
+   for (unsigned e = 0; e < count; ++e) {
+      unsigned src = 0;
+      for (unsigned i = 0; i < from.element_bits; ++i) {
+         if (e & (1 << i))
+            src |= 1 << find_element_bit(&from, to->element[i]);
+      }
+      out[e] = v[src];
+   }
+   return nir_vec(b, out, count);
+}
+
 /* The memory of matrix element `element` of this lane, or of the one `skip`
  * elements after it along its row (a column, for a column-major layout).
  */
@@ -317,12 +468,32 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
       b->fp_math_ctrl = nir_fp_fast_math;
       break;
    }
-   case nir_intrinsic_cmat_convert: {
+   case nir_intrinsic_cmat_convert:
+   case nir_intrinsic_cmat_transpose: {
       struct glsl_cmat_description src = matrix_desc(intr->src[1]);
       struct glsl_cmat_description dst = matrix_desc(intr->src[0]);
+      struct cmat_layout from = *matrix_layout(src);
+      const struct cmat_layout *to = matrix_layout(dst);
+      bool transpose = intr->intrinsic == nir_intrinsic_cmat_transpose;
+      if (transpose) {
+         for (unsigned i = 0; i < from.element_bits; ++i)
+            from.element[i] = TRANSPOSED(from.element[i]);
+         for (unsigned j = 0; j < 5; ++j)
+            from.lane[j] = TRANSPOSED(from.lane[j]);
+      }
+      bool move = memcmp(&from, to, sizeof(from)) != 0;
+      /* Convert where the elements are narrower */
+      bool convert_first = glsl_base_type_bit_size(dst.element_type) <
+                           glsl_base_type_bit_size(src.element_type);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
-      store_matrix(b, intr->src[0], convert_matrix_value(b,
-         load_matrix(b, intr->src[1]), src.element_type, dst.element_type));
+      nir_def *value = load_matrix(b, intr->src[1]);
+      if (convert_first)
+         value = convert_matrix_value(b, value, src.element_type, dst.element_type);
+      if (move)
+         value = permute_matrix(b, value, from, to);
+      if (!convert_first)
+         value = convert_matrix_value(b, value, src.element_type, dst.element_type);
+      store_matrix(b, intr->src[0], value);
       b->fp_math_ctrl = nir_fp_fast_math;
       break;
    }
