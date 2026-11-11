@@ -459,6 +459,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 
    /* Must lower before io to temps */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, nir_mask_ballots_after_terminate);
       NIR_PASS(_, nir, nir_lower_terminate_to_demote);
       NIR_PASS(_, nir, nir_lower_halt_to_return);
       NIR_PASS(_, nir, nir_lower_returns);

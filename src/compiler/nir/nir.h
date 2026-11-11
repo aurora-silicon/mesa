@@ -6881,6 +6881,7 @@ typedef enum {
 bool nir_lower_discard_if(nir_shader *shader, nir_lower_discard_if_options options);
 
 bool nir_lower_terminate_to_demote(nir_shader *nir);
+bool nir_mask_ballots_after_terminate(nir_shader *nir);
 
 bool nir_lower_memory_model(nir_shader *shader);
 bool nir_lower_disordered_control_barriers(nir_shader *shader);

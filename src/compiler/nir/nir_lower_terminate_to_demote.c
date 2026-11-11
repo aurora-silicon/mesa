@@ -7,6 +7,90 @@
 #include "nir_builder.h"
 
 static bool
+impl_has_intrinsic(nir_function_impl *impl, nir_intrinsic_op needle)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == needle)
+            return true;
+      }
+   }
+
+   return false;
+}
+
+/** Masks subgroup ballots against invocations terminated earlier
+ *
+ * Some hardware keeps demoted fragment lanes running as helpers so derivatives
+ * and quad operations continue to see a full quad.  When terminate is lowered
+ * to that same mechanism, terminated invocations must nevertheless stop
+ * contributing to later subgroup ballots after reconvergence.
+ *
+ * This pass must run before nir_lower_terminate_to_demote(), while terminate
+ * is still distinguishable from demote.  Track only termination, not helper
+ * state: with maximal reconvergence, rasterizer helpers and invocations demoted
+ * explicitly remain active for subgroup operations.  Quad operations are
+ * deliberately left alone so full_quads retains their helper-lane values.
+ */
+bool
+nir_mask_ballots_after_terminate(nir_shader *shader)
+{
+   if (shader->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, shader) {
+      const bool has_terminate =
+         impl_has_intrinsic(impl, nir_intrinsic_terminate) ||
+         impl_has_intrinsic(impl, nir_intrinsic_terminate_if);
+      if (!has_terminate ||
+          !impl_has_intrinsic(impl, nir_intrinsic_ballot))
+         continue;
+
+      nir_variable *terminated = nir_local_variable_create(
+         impl, glsl_bool_type(), "terminated_invocation");
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      nir_store_var(&b, terminated, nir_imm_false(&b), 1);
+
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            b.cursor = nir_before_instr(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_terminate:
+               nir_store_var(&b, terminated, nir_imm_true(&b), 1);
+               break;
+            case nir_intrinsic_terminate_if:
+               nir_store_var(&b, terminated,
+                             nir_ior(&b, nir_load_var(&b, terminated),
+                                     intr->src[0].ssa),
+                             1);
+               break;
+            case nir_intrinsic_ballot: {
+               nir_def *active = nir_inot(
+                  &b, nir_load_var(&b, terminated));
+               nir_src_rewrite(&intr->src[0],
+                               nir_iand(&b, intr->src[0].ssa, active));
+               break;
+            }
+            default:
+               break;
+            }
+         }
+      }
+
+      nir_progress(true, impl, nir_metadata_none);
+      progress = true;
+   }
+
+   return progress;
+}
+
+static bool
 nir_lower_terminate_cf_list(nir_builder *b, struct exec_list *cf_list)
 {
    bool progress = false;
