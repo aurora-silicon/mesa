@@ -445,7 +445,19 @@ hk_nir_has_m5_native_query(const struct hk_device *dev, nir_shader *nir)
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
-   /* Before anything lowers the shader: the functions of matrix
+   /* Matrices of flexible dimensions become 16x16 pieces first. */
+   if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)) {
+      bool split = false;
+      NIR_PASS(split, nir, agx_nir_lower_cmat_flexible);
+      if (split) {
+         NIR_PASS(_, nir, nir_opt_deref);
+         NIR_PASS(_, nir, nir_opt_dce);
+         NIR_PASS(_, nir, nir_remove_dead_variables,
+                  nir_var_function_temp | nir_var_shader_temp, NULL);
+      }
+   }
+
+   /* Then, before anything else lowers the shader: the functions of matrix
     * per-element operations and reductions are inlined here.
     */
    if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip))
@@ -7135,7 +7147,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "mesh gl_NumWorkGroups under a task stage needs the task record");
       }
-      /* Only the matrix sizes the device lists (no flexible dimensions) */
+      /* Matrices of flexible dimensions are 16x16 pieces by now. What is left
+       * must be a size and an operation the lowering takes. */
       if (agx_chip_g17_m5(dev->dev.chip) &&
           nir->info.stage == MESA_SHADER_COMPUTE &&
           !agx_nir_cmat_supported(nir)) {

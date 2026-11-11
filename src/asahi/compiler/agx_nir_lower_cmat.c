@@ -999,3 +999,55 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
    _mesa_set_destroy(live, NULL);
    return true;
 }
+
+static bool
+type_needs_split(const struct glsl_type *type, bool *splittable)
+{
+   type = glsl_without_array(type);
+   if (glsl_type_is_struct(type)) {
+      bool split = false;
+      for (unsigned i = 0; i < glsl_get_length(type); ++i)
+         split |= type_needs_split(glsl_get_struct_field(type, i), splittable);
+      return split;
+   }
+   if (!glsl_type_is_cmat(type))
+      return false;
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
+   /* An 8x8 or 16x16 matrix stays whole beside the split ones. */
+   if (desc.rows <= 16 && desc.cols <= 16)
+      return false;
+   if (desc.rows % 16 || desc.cols % 16)
+      *splittable = false;
+   return true;
+}
+
+/*
+ * Matrices of flexible dimensions (VK_NV_cooperative_matrix2
+ * cooperativeMatrixFlexibleDimensions), multiples of 16 in each dimension at
+ * subgroup scope, as 16x16 pieces (nir_lower_cooperative_matrix_flexible_
+ * dimensions). A shader whose matrices are all 16x16 or 8x8 is left alone,
+ * and such matrices stay whole in a shader that has larger ones.
+ */
+bool
+agx_nir_lower_cmat_flexible(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
+      return false;
+
+   bool split = false, splittable = true;
+   nir_foreach_variable_in_shader(var, nir)
+      split |= type_needs_split(var->type, &splittable);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_function_temp_variable(var, impl)
+         split |= type_needs_split(var->type, &splittable);
+   }
+   if (!split || !splittable)
+      return false;
+
+   const struct nir_lower_coopmat_args args = {
+      .m_gran = 16,
+      .n_gran = 16,
+      .k_gran = 16,
+   };
+   return nir_lower_cooperative_matrix_flexible_dimensions(nir, &args);
+}
