@@ -647,16 +647,24 @@ split_cmat_reduce_row_col(nir_builder *b,
             call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
          }
       } else if (reduce & NIR_CMAT_REDUCE_ROW) {
-         for (unsigned i = 1; i < src_split->box.outer_cols; i++) {
-            nir_deref_instr *second_deref = temp_derefs[i];
-            b->cursor = nir_before_instr(instr);
-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+         /* each row of splits into its first split */
+         for (unsigned r = 0; r < src_split->box.outer_rows; r++) {
+            nir_deref_instr *first_deref = temp_derefs[r * src_split->box.outer_cols];
+            for (unsigned i = 1; i < src_split->box.outer_cols; i++) {
+               nir_deref_instr *second_deref = temp_derefs[r * src_split->box.outer_cols + i];
+               b->cursor = nir_before_instr(instr);
+               call_reduce_finish(b, call, reduce, &first_deref->def, &first_deref->def, &second_deref->def);
+            }
          }
       } else if (reduce & NIR_CMAT_REDUCE_COLUMN) {
-         for (unsigned i = 1; i < src_split->box.outer_rows; i++) {
-            nir_deref_instr *second_deref = temp_derefs[i * src_split->box.outer_cols];
-            b->cursor = nir_before_instr(instr);
-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+         /* each column of splits into its first split */
+         for (unsigned c = 0; c < src_split->box.outer_cols; c++) {
+            nir_deref_instr *first_deref = temp_derefs[c];
+            for (unsigned i = 1; i < src_split->box.outer_rows; i++) {
+               nir_deref_instr *second_deref = temp_derefs[i * src_split->box.outer_cols + c];
+               b->cursor = nir_before_instr(instr);
+               call_reduce_finish(b, call, reduce, &first_deref->def, &first_deref->def, &second_deref->def);
+            }
          }
       }
    }
@@ -671,7 +679,7 @@ split_cmat_reduce_row_col(nir_builder *b,
             if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) == (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
                idx = 0;
             else if (reduce & NIR_CMAT_REDUCE_ROW)
-               idx = r % (src_split ? src_split->box.outer_rows : 1);
+               idx = src_split ? (r % src_split->box.outer_rows) * src_split->box.outer_cols : 0;
             else if (reduce & NIR_CMAT_REDUCE_COLUMN)
                idx = c % (src_split ? src_split->box.outer_cols : 1);
             else
