@@ -10,6 +10,7 @@
 #include "hk_queue.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
+#include "hk_instance.h"
 #include "hk_physical_device.h"
 
 #include "asahi/lib/agx_bo.h"
@@ -283,12 +284,15 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * pHostPointer-01749, VUID-VkMemoryAllocateInfo-allocationSize-01745).
        * Memory the kernel cannot pin for writing (a read-only mapping of a
        * file) is refused: nothing in the API keeps a buffer bound to it from
-       * being a transfer destination or a storage buffer the GPU writes.
+       * being a transfer destination or a storage buffer the GPU writes. An
+       * application that only reads such memory on the GPU asks for it with
+       * hk_host_memory_read_only.
        */
       assert(host_info->handleType ==
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
-      mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
-                                       pAllocateInfo->allocationSize);
+      mem->bo = agx_bo_import_host_ptr(
+         &dev->dev, host_info->pHostPointer, pAllocateInfo->allocationSize,
+         hk_physical_device_instance(pdev)->drirc.misc.host_memory_read_only);
       if (mem->bo == NULL) {
          const int err = errno;
          result = vk_errorf(dev,
@@ -450,6 +454,13 @@ hk_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
    if (mem->map != NULL) {
       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
                        "Memory object already mapped.");
+   }
+
+   /* Host memory the kernel could only pin read-only has no mapping the
+    * application may write through, and Vulkan has no read-only mapping. */
+   if ((mem->bo->flags & AGX_BO_HOST_PTR) && (mem->bo->flags & AGX_BO_READONLY)) {
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "read-only host memory cannot be mapped");
    }
 
    /* Bound a placed mapping by the memory object, not the BO: the BO cache

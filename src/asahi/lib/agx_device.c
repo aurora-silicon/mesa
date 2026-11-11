@@ -467,12 +467,13 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
 
 static int
 agx_drm_bo_userptr(struct agx_device *dev, void *ptr, size_t size,
-                   uint32_t *handle)
+                   bool read_only, uint32_t *handle)
 {
    struct drm_asahi_gem_userptr args = {
       .userptr = (uintptr_t)ptr,
       .size = size,
-      .flags = DRM_ASAHI_GEM_VM_PRIVATE,
+      .flags = DRM_ASAHI_GEM_VM_PRIVATE |
+               (read_only ? DRM_ASAHI_GEM_USERPTR_READ_ONLY : 0),
       .vm_id = dev->vm_id,
    };
 
@@ -489,17 +490,28 @@ agx_drm_bo_userptr(struct agx_device *dev, void *ptr, size_t size,
  * for writing: the GPU may write the memory wherever the API lets it. NULL,
  * with errno set, when the kernel refuses the range (EFAULT for memory the
  * application cannot write, a read-only mapping of a file, say).
+ *
+ * With allow_read_only, memory the kernel can only pin for reading is taken
+ * too: the BO, flagged AGX_BO_READONLY, is bound read-only for the GPU. A
+ * GPU write to it is not performed: it is discarded where the kernel has
+ * soft faults, and faults the job otherwise.
  */
 struct agx_bo *
-agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size)
+agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
+                       bool allow_read_only)
 {
    if (!agx_has_userptr(dev)) {
       errno = EOPNOTSUPP;
       return NULL;
    }
 
+   enum agx_bo_flags flags = AGX_BO_HOST_PTR | AGX_BO_NO_CACHE;
    uint32_t handle = 0;
-   int ret = agx_drm_bo_userptr(dev, ptr, size, &handle);
+   int ret = agx_drm_bo_userptr(dev, ptr, size, false, &handle);
+   if (ret == -EFAULT && allow_read_only) {
+      ret = agx_drm_bo_userptr(dev, ptr, size, true, &handle);
+      flags |= AGX_BO_READONLY;
+   }
    if (ret) {
       errno = -ret;
       return NULL;
@@ -516,7 +528,7 @@ agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size)
    bo->dev = dev;
    bo->size = size;
    bo->align = AIL_PAGESIZE;
-   bo->flags = AGX_BO_HOST_PTR | AGX_BO_NO_CACHE;
+   bo->flags = flags;
    bo->handle = bo->uapi_handle = handle;
    bo->prime_fd = -1;
    bo->label = "Host memory";
@@ -534,8 +546,11 @@ agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size)
       return NULL;
    }
 
-   if (agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0,
-                   DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
+   uint32_t bind = DRM_ASAHI_BIND_READ;
+   if (!(flags & AGX_BO_READONLY))
+      bind |= DRM_ASAHI_BIND_WRITE;
+
+   if (agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0, bind)) {
       int err = errno;
       agx_bo_free(dev, bo);
       errno = err;
