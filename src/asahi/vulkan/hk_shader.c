@@ -7129,6 +7129,16 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "mesh gl_NumWorkGroups under a task stage needs the task record");
       }
+      /* Only the matrix sizes the device lists (no flexible dimensions) */
+      if (agx_chip_g17_m5(dev->dev.chip) &&
+          nir->info.stage == MESA_SHADER_COMPUTE &&
+          !agx_nir_cmat_supported(nir)) {
+         for (uint32_t j = 0; j < shader_count; j++)
+            ralloc_free(infos[j].nir);
+         memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
+         return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                          "cooperative matrix size or operation not supported");
+      }
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->next_stage_mask, info->set_layout_count,
                     info->set_layouts, hk_features);

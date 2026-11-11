@@ -367,3 +367,45 @@ agx_nir_lower_cmat(nir_shader *nir)
    _mesa_hash_table_destroy(types, NULL);
    return true;
 }
+
+static bool
+type_is_supported(const struct glsl_type *type)
+{
+   if (glsl_type_is_cmat(type)) {
+      const struct glsl_cmat_description *desc = glsl_get_cmat_description(type);
+      return (desc->rows == 8 || desc->rows == 16) && desc->cols == desc->rows &&
+             desc->scope == SCOPE_SUBGROUP;
+   } else if (glsl_type_is_array(type)) {
+      return type_is_supported(glsl_get_array_element(type));
+   } else if (glsl_type_is_struct(type)) {
+      for (unsigned i = 0; i < glsl_get_length(type); i++) {
+         if (!type_is_supported(glsl_get_struct_field(type, i)))
+            return false;
+      }
+   }
+   return true;
+}
+
+/* Whether the lowering can take every cooperative matrix of the shader: only
+ * subgroup-scope 8x8 and 16x16 ones, and no matrix call left
+ * (agx_nir_lower_cmat_calls() leaves those it cannot lower, and none of the
+ * others is lowered at all).
+ */
+bool
+agx_nir_cmat_supported(nir_shader *nir)
+{
+   if (!nir->info.cs.has_cooperative_matrix)
+      return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_deref &&
+                !type_is_supported(nir_instr_as_deref(instr)->type))
+               return false;
+            if (instr->type == nir_instr_type_cmat_call)
+               return false;
+         }
+      }
+   }
+   return true;
+}
