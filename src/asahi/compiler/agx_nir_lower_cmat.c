@@ -8,6 +8,7 @@
 #include "agx_nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 
 static const struct glsl_type *
 remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
@@ -539,6 +540,124 @@ agx_nir_lower_cmat(nir_shader *nir)
    return true;
 }
 
+/* Calls `callee`, whose first parameter is where it returns a value of type
+ * `type`, with the rest of `args`.
+ */
+static nir_def *
+call_returning(nir_builder *b, nir_function *callee, const struct glsl_type *type,
+               nir_def **args, unsigned count)
+{
+   nir_variable *ret = nir_local_variable_create(b->impl, type, "cmat_call_ret");
+   nir_deref_instr *deref = nir_build_deref_var(b, ret);
+   nir_call_instr *call = nir_call_instr_create(b->shader, callee);
+   call->params[0] = nir_src_for_ssa(&deref->def);
+   for (unsigned i = 0; i < count; ++i)
+      call->params[i + 1] = nir_src_for_ssa(args[i]);
+   nir_builder_instr_insert(b, &call->instr);
+   return nir_load_deref(b, deref);
+}
+
+/* Store the elements in `values` as the matrix `dst` */
+static void
+build_matrix(nir_builder *b, nir_deref_instr *dst, nir_def **values, unsigned count)
+{
+   nir_cmat_construct(b, &dst->def, values[0]);
+   for (unsigned e = 1; e < count; ++e)
+      nir_cmat_insert(b, &dst->def, values[e], &dst->def, nir_imm_int(b, e));
+}
+
+/* coopMatReduceNV. The rows and columns being combined are partly element
+ * bits, combined within the lane, and partly lane bits, combined with the
+ * lane across each in turn. Each lane then has the result of every row
+ * (column, 2x2 block) it holds elements of, and holds the same ones in the
+ * result matrix (the result of a 2x2 reduction is half the size, its row k
+ * and column k bits where the source's k + 1 bits are).
+ */
+static void
+lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[1]);
+   struct glsl_cmat_description sd = *glsl_get_cmat_description(src->type);
+   struct glsl_cmat_description dd = *glsl_get_cmat_description(dst->type);
+   const struct cmat_layout *sl = matrix_layout(sd), *dl = matrix_layout(dd);
+   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+   const struct glsl_type *type = glsl_scalar_type(sd.element_type);
+   unsigned bits = glsl_base_type_bit_size(sd.element_type);
+   unsigned count = 1 << sl->element_bits;
+
+   /* The source coordinates combined, and the shift from a result
+    * coordinate's bit to its source's.
+    */
+   uint32_t combined = 0;
+   unsigned shift = 0;
+   if (reduce & NIR_CMAT_REDUCE_2X2) {
+      combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
+      shift = 1;
+   }
+   if (reduce & NIR_CMAT_REDUCE_ROW)
+      combined |= BITFIELD_RANGE(COL(0), util_logbase2(sd.cols));
+   if (reduce & NIR_CMAT_REDUCE_COLUMN)
+      combined |= BITFIELD_RANGE(ROW(0), util_logbase2(sd.rows));
+
+   nir_def *v[8];
+   for (unsigned e = 0; e < count; ++e)
+      v[e] = nir_cmat_extract(b, bits, &src->def, nir_imm_int(b, e));
+
+   /* Within the lane: element e then holds the result for every element
+    * that differs from it only in the bits of `done`.
+    */
+   unsigned done = 0;
+   for (unsigned i = 0; i < sl->element_bits; ++i) {
+      if (!(combined & BITFIELD_BIT(sl->element[i])))
+         continue;
+      for (unsigned e = 0; e < count; ++e) {
+         if (!(e & (done | (1 << i)))) {
+            nir_def *args[2] = {v[e], v[e | (1 << i)]};
+            v[e] = call_returning(b, call->callee, type, args, 2);
+         }
+      }
+      done |= 1 << i;
+   }
+
+   /* Across lanes */
+   for (unsigned j = 0; j < 5; ++j) {
+      if (!(combined & BITFIELD_BIT(sl->lane[j])))
+         continue;
+      nir_def *mine[8], *other[8];
+      unsigned n = 0;
+      for (unsigned e = 0; e < count; ++e) {
+         if (!(e & done))
+            mine[n++] = v[e];
+      }
+      shuffle_xor_values(b, mine, other, n, 1 << j);
+      n = 0;
+      for (unsigned e = 0; e < count; ++e) {
+         if (!(e & done)) {
+            nir_def *args[2] = {mine[n], other[n]};
+            v[e] = call_returning(b, call->callee, type, args, 2);
+            n++;
+         }
+      }
+   }
+
+   unsigned dst_count = 1 << dl->element_bits;
+   nir_def *values[8] = {NULL};
+   for (unsigned e = 0; e < dst_count; ++e) {
+      unsigned from = 0;
+      for (unsigned i = 0; i < dl->element_bits; ++i) {
+         unsigned coord = dl->element[i] + shift;
+         if (!(e & (1 << i)) || (combined & BITFIELD_BIT(coord)))
+            continue;
+         int k = find_element_bit(sl, coord);
+         if (k >= 0)
+            from |= 1 << k;
+      }
+      values[e] = v[from & ~done];
+   }
+   build_matrix(b, dst, values, dst_count);
+}
+
 static bool
 type_is_supported(const struct glsl_type *type)
 {
@@ -553,6 +672,17 @@ type_is_supported(const struct glsl_type *type)
          if (!type_is_supported(glsl_get_struct_field(type, i)))
             return false;
       }
+   }
+   return true;
+}
+
+static bool
+matrices_supported(nir_cmat_call_instr *call)
+{
+   for (unsigned i = 0; i < call->num_params; ++i) {
+      nir_deref_instr *deref = nir_src_as_deref(call->params[i]);
+      if (deref && !type_is_supported(deref->type))
+         return false;
    }
    return true;
 }
@@ -578,5 +708,87 @@ agx_nir_cmat_supported(nir_shader *nir)
          }
       }
    }
+   return true;
+}
+
+static bool
+reduce_layouts_match(nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[1]);
+   const struct cmat_layout *sl = matrix_layout(*glsl_get_cmat_description(src->type));
+   const struct cmat_layout *dl = matrix_layout(*glsl_get_cmat_description(dst->type));
+   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+   if ((reduce & NIR_CMAT_REDUCE_ROW) && (reduce & NIR_CMAT_REDUCE_COLUMN))
+      return true;
+
+   /* What the result needs is where it goes: each lane bit of the result
+    * matrix holds the coordinate it holds in the source, after reduction.
+    */
+   unsigned shift = (reduce & NIR_CMAT_REDUCE_2X2) ? 1 : 0;
+   for (unsigned j = 0; j < 5; ++j) {
+      bool src_kept = (reduce & NIR_CMAT_REDUCE_2X2)
+         ? COORD_BIT(sl->lane[j]) != 0
+         : (reduce & NIR_CMAT_REDUCE_ROW) ? sl->lane[j] < COL(0)
+                                          : sl->lane[j] >= COL(0);
+      bool dst_kept = (reduce & NIR_CMAT_REDUCE_2X2) ||
+         ((reduce & NIR_CMAT_REDUCE_ROW) ? dl->lane[j] < COL(0)
+                                         : dl->lane[j] >= COL(0));
+      if (src_kept != dst_kept || (src_kept && dl->lane[j] + shift != sl->lane[j]))
+         return false;
+   }
+   return true;
+}
+
+/* Lower coopMatReduceNV to calls of its function on the elements, and inline
+ * those. This runs before anything else lowers the
+ * shader, while the functions are still separate.
+ */
+bool
+agx_nir_lower_cmat_calls(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
+      return false;
+
+   bool progress = false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block_safe(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_cmat_call)
+            continue;
+         nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+         b.cursor = nir_before_instr(instr);
+         if (!matrices_supported(call)) {
+            continue;
+         } else if (call->op == nir_cmat_call_op_reduce && reduce_layouts_match(call)) {
+            lower_reduce(&b, call);
+         } else {
+            continue;
+         }
+         nir_instr_remove(instr);
+         progress = true;
+      }
+   }
+   if (!progress)
+      return nir_no_progress(impl);
+
+   nir_progress(true, impl, nir_metadata_none);
+   nir_inline_functions(nir);
+
+   /* Keep only the functions other matrix calls still name */
+   struct set *live = _mesa_pointer_set_create(NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_cmat_call &&
+             nir_instr_as_cmat_call(instr)->callee)
+            _mesa_set_add(live, nir_instr_as_cmat_call(instr)->callee);
+      }
+   }
+   nir_foreach_function_safe(func, nir) {
+      if (!func->is_entrypoint && !_mesa_set_search(live, func))
+         exec_node_remove(&func->node);
+   }
+   _mesa_set_destroy(live, NULL);
    return true;
 }

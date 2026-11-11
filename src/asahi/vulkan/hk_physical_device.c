@@ -440,7 +440,7 @@ hk_get_device_features(
        * implemented. */
       .cooperativeMatrixWorkgroupScope = false,
       .cooperativeMatrixFlexibleDimensions = false,
-      .cooperativeMatrixReductionsNV = false,
+      .cooperativeMatrixReductionsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixPerElementOperationsNV = false,
       .cooperativeMatrixTensorAddressing = false,
