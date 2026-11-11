@@ -626,47 +626,26 @@ lower_per_element(nir_builder *b, nir_cmat_call_instr *call)
    STACK_ARRAY_FINISH(args);
 }
 
-/* coopMatReduceNV. The rows and columns being combined are partly element
- * bits, combined within the lane, and partly lane bits, combined with the
- * lane across each in turn. Each lane then has the result of every row
- * (column, 2x2 block) it holds elements of, and holds the same ones in the
- * result matrix (the result of a 2x2 reduction is half the size, its row k
- * and column k bits where the source's k + 1 bits are).
+/* Combine with `callee` the elements of the matrix `src` (layout `sl`) whose
+ * coordinates differ only in the bits of `combined`: partly element bits,
+ * combined within the lane, and partly lane bits, combined with the lane
+ * across each in turn. Element e of v then holds the result for every
+ * element of every lane that differs from it only in those bits, for each e
+ * with none of the returned element bits set.
  */
-static void
-lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
+static unsigned
+reduce_elements(nir_builder *b, nir_function *callee, nir_deref_instr *src,
+                const struct cmat_layout *sl, uint32_t combined, nir_def **v)
 {
-   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
-   nir_deref_instr *src = nir_src_as_deref(call->params[1]);
    struct glsl_cmat_description sd = *glsl_get_cmat_description(src->type);
-   struct glsl_cmat_description dd = *glsl_get_cmat_description(dst->type);
-   const struct cmat_layout *sl = matrix_layout(sd), *dl = matrix_layout(dd);
-   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
    const struct glsl_type *type = glsl_scalar_type(sd.element_type);
    unsigned bits = glsl_base_type_bit_size(sd.element_type);
    unsigned count = 1 << sl->element_bits;
 
-   /* The source coordinates combined, and the shift from a result
-    * coordinate's bit to its source's.
-    */
-   uint32_t combined = 0;
-   unsigned shift = 0;
-   if (reduce & NIR_CMAT_REDUCE_2X2) {
-      combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
-      shift = 1;
-   }
-   if (reduce & NIR_CMAT_REDUCE_ROW)
-      combined |= BITFIELD_RANGE(COL(0), util_logbase2(sd.cols));
-   if (reduce & NIR_CMAT_REDUCE_COLUMN)
-      combined |= BITFIELD_RANGE(ROW(0), util_logbase2(sd.rows));
-
-   nir_def *v[8];
    for (unsigned e = 0; e < count; ++e)
       v[e] = nir_cmat_extract(b, bits, &src->def, nir_imm_int(b, e));
 
-   /* Within the lane: element e then holds the result for every element
-    * that differs from it only in the bits of `done`.
-    */
+   /* Within the lane */
    unsigned done = 0;
    for (unsigned i = 0; i < sl->element_bits; ++i) {
       if (!(combined & BITFIELD_BIT(sl->element[i])))
@@ -674,7 +653,7 @@ lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
       for (unsigned e = 0; e < count; ++e) {
          if (!(e & (done | (1 << i)))) {
             nir_def *args[2] = {v[e], v[e | (1 << i)]};
-            v[e] = call_returning(b, call->callee, type, args, 2);
+            v[e] = call_returning(b, callee, type, args, 2);
          }
       }
       done |= 1 << i;
@@ -695,11 +674,45 @@ lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
       for (unsigned e = 0; e < count; ++e) {
          if (!(e & done)) {
             nir_def *args[2] = {mine[n], other[n]};
-            v[e] = call_returning(b, call->callee, type, args, 2);
+            v[e] = call_returning(b, callee, type, args, 2);
             n++;
          }
       }
    }
+   return done;
+}
+
+/* coopMatReduceNV. Each lane has the result of every row (column, 2x2
+ * block) it holds elements of, and holds the same ones in the result matrix
+ * (the result of a 2x2 reduction is half the size, its row k and column k
+ * bits where the source's k + 1 bits are).
+ */
+static void
+lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[1]);
+   struct glsl_cmat_description sd = *glsl_get_cmat_description(src->type);
+   struct glsl_cmat_description dd = *glsl_get_cmat_description(dst->type);
+   const struct cmat_layout *sl = matrix_layout(sd), *dl = matrix_layout(dd);
+   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+
+   /* The source coordinates combined, and the shift from a result
+    * coordinate's bit to its source's.
+    */
+   uint32_t combined = 0;
+   unsigned shift = 0;
+   if (reduce & NIR_CMAT_REDUCE_2X2) {
+      combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
+      shift = 1;
+   }
+   if (reduce & NIR_CMAT_REDUCE_ROW)
+      combined |= BITFIELD_RANGE(COL(0), util_logbase2(sd.cols));
+   if (reduce & NIR_CMAT_REDUCE_COLUMN)
+      combined |= BITFIELD_RANGE(ROW(0), util_logbase2(sd.rows));
+
+   nir_def *v[8];
+   unsigned done = reduce_elements(b, call->callee, src, sl, combined, v);
 
    unsigned dst_count = 1 << dl->element_bits;
    nir_def *values[8] = {NULL};
@@ -716,6 +729,75 @@ lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
       values[e] = v[from & ~done];
    }
    build_matrix(b, dst, values, dst_count);
+}
+
+/* What nir_lower_cooperative_matrix_flexible_dimensions() makes of a
+ * reduction of a matrix it splits into 16x16 pieces: each piece is reduced
+ * alone, then a reduce_finish combines two pieces' results element by
+ * element (same type: an element of each holds the reduction of its row or
+ * column over its own piece).
+ */
+static void
+lower_reduce_finish(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *x = nir_src_as_deref(call->params[1]);
+   nir_deref_instr *y = nir_src_as_deref(call->params[2]);
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(x->type);
+   unsigned count = 1 << matrix_layout(desc)->element_bits;
+   unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   nir_def *values[8];
+
+   for (unsigned e = 0; e < count; ++e) {
+      nir_def *args[2] = {
+         nir_cmat_extract(b, bits, &x->def, nir_imm_int(b, e)),
+         nir_cmat_extract(b, bits, &y->def, nir_imm_int(b, e)),
+      };
+      values[e] = call_returning(b, call->callee, glsl_scalar_type(desc.element_type),
+                                 args, 2);
+   }
+   build_matrix(b, dst, values, count);
+}
+
+/* The split's 2x2 reduction: four 16x16 pieces, top left, top right, bottom
+ * left, bottom right, into one 16x16 result. Each piece reduces 2x2 into an
+ * 8x8 quarter of the result held as lower_reduce() holds it (its lane bits
+ * those of the piece, one coordinate down; one element bit left); the four
+ * quarters' elements together are a matrix whose other two element bits are
+ * the result's row 3 and column 3, moved to the result's layout.
+ */
+static void
+lower_reduce_2x2(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   const struct cmat_layout *sl =
+      matrix_layout(*glsl_get_cmat_description(nir_src_as_deref(call->params[1])->type));
+   const struct cmat_layout *dl =
+      matrix_layout(*glsl_get_cmat_description(dst->type));
+   uint32_t combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
+   struct cmat_layout quarters = {.element_bits = 3};
+   nir_def *w[8];
+
+   for (unsigned q = 0; q < 4; ++q) {
+      nir_def *v[8];
+      unsigned done = reduce_elements(b, call->callee,
+                                      nir_src_as_deref(call->params[1 + q]),
+                                      sl, combined, v);
+      unsigned k = ffs(~done & BITFIELD_MASK(sl->element_bits)) - 1;
+      w[2 * q] = v[0];
+      w[2 * q + 1] = v[1 << k];
+      quarters.element[0] = sl->element[k] - 1;
+   }
+   quarters.element[1] = COL(3);
+   quarters.element[2] = ROW(3);
+   for (unsigned j = 0; j < 5; ++j)
+      quarters.lane[j] = sl->lane[j] - 1;
+
+   nir_def *value = permute_matrix(b, nir_vec(b, w, 8), quarters, dl);
+   nir_def *values[8];
+   for (unsigned e = 0; e < 8; ++e)
+      values[e] = nir_channel(b, value, e);
+   build_matrix(b, dst, values, 8);
 }
 
 static bool
@@ -818,8 +900,46 @@ reduce_layouts_match(nir_cmat_call_instr *call)
    return true;
 }
 
-/* Lower coopMatPerElementNV and coopMatReduceNV to calls of their functions on
- * the elements, and inline those. This runs before anything else lowers the
+/* reduce_finish combines the same element of two pieces of one type */
+static bool
+reduce_finish_layouts_match(nir_cmat_call_instr *call)
+{
+   const struct glsl_type *type = nir_src_as_deref(call->params[1])->type;
+   return nir_src_as_deref(call->params[0])->type == type &&
+          nir_src_as_deref(call->params[2])->type == type;
+}
+
+/* reduce_2x2 takes four 16x16 pieces of one layout whose 2x2 reduction
+ * lower_reduce_2x2() can place: none of their lane bits holds row 0 or
+ * column 0, and one element bit is left after them.
+ */
+static bool
+reduce_2x2_layouts_match(nir_cmat_call_instr *call)
+{
+   const struct glsl_type *type = nir_src_as_deref(call->params[1])->type;
+   struct glsl_cmat_description sd = *glsl_get_cmat_description(type);
+   struct glsl_cmat_description dd =
+      *glsl_get_cmat_description(nir_src_as_deref(call->params[0])->type);
+   if (sd.rows != 16 || dd.rows != 16)
+      return false;
+   for (unsigned q = 2; q < 5; ++q) {
+      if (nir_src_as_deref(call->params[q])->type != type)
+         return false;
+   }
+   const struct cmat_layout *sl = matrix_layout(sd);
+   unsigned left = 0;
+   for (unsigned i = 0; i < sl->element_bits; ++i)
+      left += COORD_BIT(sl->element[i]) != 0;
+   for (unsigned j = 0; j < 5; ++j) {
+      if (COORD_BIT(sl->lane[j]) == 0)
+         return false;
+   }
+   return left == 1;
+}
+
+/* Lower coopMatPerElementNV and coopMatReduceNV (and the partial reductions
+ * of split matrices) to calls of their functions on the elements, and inline
+ * those. This runs before anything else lowers the
  * shader, while the functions are still separate.
  */
 bool
@@ -844,6 +964,12 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
             lower_per_element(&b, call);
          } else if (call->op == nir_cmat_call_op_reduce && reduce_layouts_match(call)) {
             lower_reduce(&b, call);
+         } else if (call->op == nir_cmat_call_op_reduce_finish &&
+                    reduce_finish_layouts_match(call)) {
+            lower_reduce_finish(&b, call);
+         } else if (call->op == nir_cmat_call_op_reduce_2x2 &&
+                    reduce_2x2_layouts_match(call)) {
+            lower_reduce_2x2(&b, call);
          } else {
             continue;
          }
