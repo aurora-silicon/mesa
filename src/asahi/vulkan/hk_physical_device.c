@@ -435,6 +435,17 @@ hk_get_device_features(
       .shaderBFloat16Type = supported_extensions->KHR_shader_bfloat16,
       .shaderBFloat16CooperativeMatrix = supported_extensions->KHR_shader_bfloat16,
       .shaderBFloat16DotProduct = false,
+
+      /* VK_NV_cooperative_matrix2: each feature is enabled where it is
+       * implemented. */
+      .cooperativeMatrixWorkgroupScope = false,
+      .cooperativeMatrixFlexibleDimensions = false,
+      .cooperativeMatrixReductionsNV = false,
+      .cooperativeMatrixConversionsNV = false,
+      .cooperativeMatrixPerElementOperationsNV = false,
+      .cooperativeMatrixTensorAddressing = false,
+      .cooperativeMatrixBlockLoads = false,
+
       .shaderInt8 = true,
       .descriptorIndexing = true,
       .shaderInputAttachmentArrayDynamicIndexing = true,
@@ -2054,6 +2065,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_cooperative_matrix &&
       debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
 
+   supported_extensions.NV_cooperative_matrix2 =
+      supported_extensions.KHR_cooperative_matrix;
+
    /* Hardware-qualified on M5 only. */
    supported_extensions.EXT_primitives_generated_query =
       agx_chip_g17_m5(pdev->dev.chip);
@@ -2530,5 +2544,17 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
          }
       }
    }
+   return vk_outarray_status(&out);
+}
+
+/* No flexible-dimension configurations while cooperativeMatrixFlexibleDimensions
+ * is not supported. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixFlexibleDimensionsPropertiesNV *pProperties)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixFlexibleDimensionsPropertiesNV,
+                          out, pProperties, pPropertyCount);
    return vk_outarray_status(&out);
 }
