@@ -1205,7 +1205,7 @@ tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
                       struct glsl_cmat_description desc,
                       struct tensor_fast *fast)
 {
-   if (info->decode_fnptr || info->spans->num_components != 2 ||
+   if (info->spans->num_components != 2 ||
        tl.split_row_index || tl.split_col_index)
       return NULL;
 
@@ -1241,9 +1241,14 @@ tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
       cond = nir_iand(b, cond, nir_ult_imm(b, nir_channel(b, info->spans, 1),
                                            (uint64_t)longest + 1));
    }
-   cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->block_sizes, 0), 1));
-   cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->block_sizes, 1), 1));
-   cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->strides, 1), 1));
+   /* Runs of elements need unit blocks and strides; decoded elements are
+    * addressed one by one, through their blocks.
+    */
+   if (!info->decode_fnptr) {
+      cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->block_sizes, 0), 1));
+      cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->block_sizes, 1), 1));
+      cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->strides, 1), 1));
+   }
    fast->stride = nir_channel(b, info->strides, 0);
    if (info->layout_dims) {
       fast->dim0 = nir_channel(b, info->layout_dims, 0);
@@ -1407,6 +1412,158 @@ tensor_fast_access(nir_builder *b, struct nir_calc_tensor_info *info,
    }
 }
 
+/* The cast of the decode function's block pointer parameter
+ * (nir_calc_tensor_derefs does the same), whose type is the block's.
+ */
+static nir_deref_instr *
+decode_block_deref(nir_function_impl *impl)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *deref = nir_instr_as_deref(instr);
+         if (deref->deref_type == nir_deref_type_cast &&
+             nir_def_is_intrinsic(deref->parent.ssa)) {
+            nir_intrinsic_instr *param = nir_def_as_intrinsic(deref->parent.ssa);
+            if (param->intrinsic == nir_intrinsic_load_param &&
+                nir_intrinsic_param_idx(param) == 1)
+               return deref;
+         }
+      }
+   }
+   return NULL;
+}
+
+/* One call of the decode function, for the element at `at` in the block at
+ * block coordinates `block`, whose index in the tensor is idx.
+ */
+static nir_def *
+decode_element(nir_builder *b, nir_function *fn, nir_deref_instr *param,
+               nir_deref_instr *ptr, nir_def *idx, nir_def **block,
+               nir_def **at)
+{
+   nir_def *block_ptr;
+   if (param) {
+      nir_deref_instr *d = nir_build_deref_cast(
+         b, &ptr->def, ptr->modes, param->type,
+         glsl_get_explicit_size(param->type, true));
+      d = nir_build_deref_ptr_as_array(b, d, nir_u2uN(b, idx, ptr->def.bit_size));
+      block_ptr = &d->def;
+   } else {
+      block_ptr = nir_undef(b, fn->params[1].num_components,
+                            fn->params[1].bit_size);
+   }
+
+   nir_variable *out = nir_local_variable_create(
+      b->impl, glsl_get_bare_type(fn->params[0].type), "decoded");
+   nir_deref_instr *out_deref = nir_build_deref_var(b, out);
+   nir_call_instr *call = nir_call_instr_create(b->shader, fn);
+   call->params[0] = nir_src_for_ssa(&out_deref->def);
+   call->params[1] = nir_src_for_ssa(block_ptr);
+   for (unsigned dim = 0; dim < 2; ++dim) {
+      call->params[2 + dim] = nir_src_for_ssa(block[dim]);
+      call->params[4 + dim] = nir_src_for_ssa(at[dim]);
+   }
+   nir_builder_instr_insert(b, &call->instr);
+   return nir_load_deref(b, out_deref);
+}
+
+/* The common case with a decode function: each element's block found
+ * directly from its tensor coordinates, with no branch around its call.
+ * When the lane's elements are inside the tensor and those of each tensor
+ * row are in one block (a lane's are at most seven apart), the elements of
+ * a row share the block's address and coordinates, so the decode function's
+ * loads of the block and of what it finds by the block's coordinates (a
+ * scale, say) are the same loads, which the optimizer then merges when the
+ * memory is read-only. Otherwise each element is clamped as the layout says
+ * and finds its own block.
+ */
+static void
+tensor_fast_decode(nir_builder *b, struct nir_calc_tensor_info *info,
+                   struct tensor_fast *fast, nir_deref_instr *ptr,
+                   struct glsl_cmat_description desc, nir_def **values,
+                   unsigned count)
+{
+   nir_function *fn = info->decode_fnptr;
+   nir_deref_instr *param = decode_block_deref(fn->impl);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
+   nir_def *y0 = nir_iadd(b, nir_channel(b, info->offsets, 0),
+                          fast->transposed ? c0 : r0);
+   nir_def *x0 = nir_iadd(b, nir_channel(b, info->offsets, 1),
+                          fast->transposed ? r0 : c0);
+   unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   bool checked = info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED;
+   nir_def *bs0 = nir_channel(b, info->block_sizes, 0);
+   nir_def *bs1 = nir_channel(b, info->block_sizes, 1);
+   nir_def *stride1 = nir_channel(b, info->strides, 1);
+
+   unsigned dy[8], dx[8], max_dy = 0, max_dx = 0, min_dx = ~0u;
+   for (unsigned e = 0; e < count; ++e) {
+      unsigned dr, dc;
+      element_offset(desc, e, &dr, &dc);
+      dy[e] = fast->transposed ? dc : dr;
+      dx[e] = fast->transposed ? dr : dc;
+      max_dy = MAX2(max_dy, dy[e]);
+      max_dx = MAX2(max_dx, dx[e]);
+      min_dx = MIN2(min_dx, dx[e]);
+   }
+
+   nir_def *x_first = nir_iadd_imm(b, x0, min_dx);
+   nir_def *x_last = nir_iadd_imm(b, x0, max_dx);
+   nir_def *bx = nir_udiv(b, x_first, bs1);
+   nir_def *shared = nir_ieq(b, bx, nir_udiv(b, x_last, bs1));
+   if (checked) {
+      shared = nir_iand(b, shared, coords_inside(b, y0, 0, max_dy, fast->dim0));
+      shared = nir_iand(b, shared, coords_inside(b, x0, min_dx, max_dx, fast->dim1));
+   }
+
+   nir_def *shared_values[8], *own_values[8];
+   nir_if *nif = nir_push_if(b, shared);
+   {
+      nir_def *ix = nir_umod(b, x_first, bs1);
+      for (unsigned e = 0; e < count; ++e) {
+         nir_def *y = nir_iadd_imm(b, y0, dy[e]);
+         nir_def *block[2] = {nir_udiv(b, y, bs0), bx};
+         nir_def *at[2] = {nir_umod(b, y, bs0), nir_iadd_imm(b, ix, dx[e] - min_dx)};
+         nir_def *idx = nir_iadd(b, nir_imul(b, block[0], fast->stride),
+                                 nir_imul(b, bx, stride1));
+         shared_values[e] = decode_element(b, fn, param, ptr, idx, block, at);
+      }
+   }
+   nir_push_else(b, nif);
+   for (unsigned e = 0; e < count; ++e) {
+      nir_def *y = nir_iadd_imm(b, y0, dy[e]);
+      nir_def *x = nir_iadd_imm(b, x0, dx[e]);
+      nir_def *in = NULL;
+      if (checked) {
+         in = nir_iand(b, coord_inside(b, y, fast->dim0),
+                       coord_inside(b, x, fast->dim1));
+         y = nir_bcsel(b, in, y, clamp_coord(b, info->clamp_mode, y, fast->dim0));
+         x = nir_bcsel(b, in, x, clamp_coord(b, info->clamp_mode, x, fast->dim1));
+      }
+      nir_def *block[2] = {nir_udiv(b, y, bs0), nir_udiv(b, x, bs1)};
+      nir_def *at[2] = {nir_umod(b, y, bs0), nir_umod(b, x, bs1)};
+      nir_def *idx = nir_iadd(b, nir_imul(b, block[0], fast->stride),
+                              nir_imul(b, block[1], stride1));
+      nir_def *skip = checked ? clamp_skip(b, info, in, fast->dim0, fast->dim1) : NULL;
+      if (skip) {
+         /* No call: the decode function would read the block. */
+         nir_def *skipped = clamp_skip_value(b, info, bits);
+         nir_if *call = nir_push_if(b, nir_inot(b, skip));
+         nir_def *v = decode_element(b, fn, param, ptr, idx, block, at);
+         nir_pop_if(b, call);
+         own_values[e] = nir_if_phi(b, v, skipped);
+      } else {
+         own_values[e] = decode_element(b, fn, param, ptr, idx, block, at);
+      }
+   }
+   nir_pop_if(b, nif);
+   for (unsigned e = 0; e < count; ++e)
+      values[e] = nir_if_phi(b, shared_values[e], own_values[e]);
+}
+
 /* Any other layout: each element through the common addressing. */
 static void
 tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
@@ -1488,7 +1645,10 @@ lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
       memcpy(fast_values, values, sizeof(values));
       memcpy(slow_values, values, sizeof(values));
       nir_if *nif = nir_push_if(b, cond);
-      tensor_fast_access(b, &info, &fast, ptr, desc, load, fast_values, count);
+      if (info.decode_fnptr)
+         tensor_fast_decode(b, &info, &fast, ptr, desc, fast_values, count);
+      else
+         tensor_fast_access(b, &info, &fast, ptr, desc, load, fast_values, count);
       nir_push_else(b, nif);
       tensor_generic_access(b, &info, ptr, clip, desc, load, slow_values, count);
       nir_pop_if(b, nif);
