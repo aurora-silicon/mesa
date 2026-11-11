@@ -1726,11 +1726,12 @@ agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
          continue;
 
       /* Integer abs means zero extension. Keep the intermediate signed
-       * word when G17P later zero-extends it: narrowing that operand would
+       * word when the operation later zero-extends it (the unsigned 64-bit
+       * product of a sign-extended half): narrowing that operand would
        * change the value for negative halves. The native legalization pass
        * already knows how to materialize SIGNEXT without a signed-half
        * source modifier. */
-      if (ctx->key && ctx->key->dev.chip == AGX_CHIP_G17P && src.abs)
+      if (src.abs)
          continue;
 
       agx_replace_src(I, s, def->src[0]);

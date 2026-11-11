@@ -4860,6 +4860,37 @@ agx_lower_m5_alu_operands(agx_context *ctx)
          continue;
       }
 
+      /* A 64-bit product multiplies a word register by a word register, a
+       * half register or a small constant. When neither factor is a word
+       * register (two halves, a half and a constant), extend one to a word:
+       * a plain half is signed and abs selects zero extension, and the word
+       * keeps that modifier for its own extension to the product's width. */
+      if (I->op == AGX_OPCODE_IMAD && I->nr_dests == 1 && I->nr_srcs == 3 &&
+          I->dest[0].size == AGX_SIZE_64 && !agx_is_g18g(&ctx->key->dev)) {
+         const bool immediate0 = I->src[0].type == AGX_INDEX_IMMEDIATE;
+         const bool immediate1 = I->src[1].type == AGX_INDEX_IMMEDIATE;
+         if ((!immediate0 && I->src[0].size == AGX_SIZE_32) ||
+             (!immediate1 && I->src[1].size == AGX_SIZE_32))
+            continue;
+
+         const unsigned s = immediate0 && !immediate1 ? 1 : 0;
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         agx_index src = I->src[s];
+         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+         if (src.type == AGX_INDEX_IMMEDIATE) {
+            agx_mov_imm_to(&b, wide, src.value);
+         } else {
+            wide.abs = src.abs;
+            src.abs = false;
+            if (wide.abs)
+               agx_mov_to(&b, wide, src);
+            else
+               agx_signext_to(&b, wide, src);
+         }
+         I->src[s] = wide;
+         continue;
+      }
+
       if (I->op != AGX_OPCODE_IMAD || I->nr_dests != 1 || I->nr_srcs != 3 ||
           I->saturate || I->shift || I->dest[0].size != AGX_SIZE_32)
          continue;
@@ -9557,16 +9588,25 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
    nir->options = saved_options;
 }
 
+/* M5 multiplies two 32-bit registers into a 64-bit pair in one instruction
+ * (imadd64, which the division lowering's umul_high already uses), so a
+ * 32x32->64 product stays whole there and a 64x64 one is built on it.
+ */
 static bool
-agx_nir_lower_imul64_filter(const nir_instr *instr, const void *_)
+agx_nir_lower_imul64_filter(const nir_instr *instr, const void *data)
 {
+   const bool *native_2x32 = data;
+
    if (instr->type != nir_instr_type_alu)
       return false;
 
    const nir_alu_instr *alu = nir_instr_as_alu(instr);
-   return (alu->op == nir_op_imul || alu->op == nir_op_umul_2x32_64 ||
-           alu->op == nir_op_imul_2x32_64) &&
-          alu->def.bit_size == 64;
+   if (alu->def.bit_size != 64)
+      return false;
+
+   return alu->op == nir_op_imul ||
+          (!*native_2x32 && (alu->op == nir_op_umul_2x32_64 ||
+                             alu->op == nir_op_imul_2x32_64));
 }
 
 static nir_def *
@@ -9591,8 +9631,9 @@ agx_nir_umul_high32(nir_builder *b, nir_def *x, nir_def *y)
 }
 
 static nir_def *
-agx_nir_lower_imul64_instr(nir_builder *b, nir_instr *instr, void *_)
+agx_nir_lower_imul64_instr(nir_builder *b, nir_instr *instr, void *data)
 {
+   const bool *native_2x32 = data;
    nir_alu_instr *alu = nir_instr_as_alu(instr);
    nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
    nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
@@ -9609,18 +9650,26 @@ agx_nir_lower_imul64_instr(nir_builder *b, nir_instr *instr, void *_)
    nir_def *xh = nir_unpack_64_2x32_split_y(b, x);
    nir_def *yl = nir_unpack_64_2x32_split_x(b, y);
    nir_def *yh = nir_unpack_64_2x32_split_y(b, y);
-   nir_def *hi = nir_iadd(
-      b, agx_nir_umul_high32(b, xl, yl),
-      nir_iadd(b, nir_imul(b, xl, yh), nir_imul(b, xh, yl)));
+   nir_def *cross = nir_iadd(b, nir_imul(b, xl, yh), nir_imul(b, xh, yl));
+
+   if (*native_2x32) {
+      nir_def *low = nir_umul_2x32_64(b, xl, yl);
+      return nir_pack_64_2x32_split(
+         b, nir_unpack_64_2x32_split_x(b, low),
+         nir_iadd(b, nir_unpack_64_2x32_split_y(b, low), cross));
+   }
+
+   nir_def *hi = nir_iadd(b, agx_nir_umul_high32(b, xl, yl), cross);
 
    return nir_pack_64_2x32_split(b, nir_imul(b, xl, yl), hi);
 }
 
 static bool
-agx_nir_lower_imul64(nir_shader *nir)
+agx_nir_lower_imul64(nir_shader *nir, bool native_2x32)
 {
    return nir_shader_lower_instructions(
-      nir, agx_nir_lower_imul64_filter, agx_nir_lower_imul64_instr, NULL);
+      nir, agx_nir_lower_imul64_filter, agx_nir_lower_imul64_instr,
+      &native_2x32);
 }
 
 static bool
@@ -10355,7 +10404,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * Lower remaining multiplies before fusion turns x * 3 into one; the
     * normal late multiply pass cannot recognize fused backend opcodes. */
    if (byte_indices)
-      NIR_PASS(_, nir, agx_nir_lower_imul64);
+      NIR_PASS(_, nir, agx_nir_lower_imul64, false);
 
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
@@ -15630,6 +15679,8 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    const bool is_agx3 = key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
                        key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    const bool is_g17p = key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   const bool m5_wide_product =
+      key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d;
 
    /* Shared addresses arrive as byte offsets; AGX3 local memory instructions
     * scale scalar element indices by their access width. */
@@ -15697,7 +15748,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
        * idempotent, and it still covers a 64-bit multiply created during
        * optimization rather than present in the source. */
       if (source_imul64)
-         NIR_PASS(_, nir, agx_nir_lower_imul64);
+         NIR_PASS(_, nir, agx_nir_lower_imul64, m5_wide_product);
    } else if (agx_is_g18g(&key->dev) && source_iadd64) {
       /* G18G's generated geometry shaders also add full-width addresses.
        * Apple G17G-family ulong addition uses low/add, carry and high/add;
@@ -15785,7 +15836,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, agx_nir_lower_g18_tile_samples, key->fs.nr_samples);
 
    if (is_agx3 && source_imul64)
-      NIR_PASS(_, nir, agx_nir_lower_imul64);
+      NIR_PASS(_, nir, agx_nir_lower_imul64, m5_wide_product);
 
    if (is_agx3)
       nir->options = original_options;
