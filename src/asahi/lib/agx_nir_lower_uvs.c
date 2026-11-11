@@ -309,8 +309,18 @@ agx_assign_uvs(struct agx_varyings_vs *varyings,
 {
    *varyings = (struct agx_varyings_vs){0};
 
-   /* Layer/viewport always flat-shaded, no other special varyings are */
-   flat_mask &= BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
+   /* Layer/viewport are always flat-shaded. Of the other special varyings
+    * only the legacy GL ones can be: glShadeModel(GL_FLAT) makes the
+    * colours flat (the state tracker lowers it to flat COL0/COL1 inputs),
+    * and compatibility GLSL may redeclare them, the back colours, fog or the
+    * texture coordinates flat. Counting such a slot as smooth gives a VARYING
+    * COUNTS word that disagrees with its flat CF binding, which the HAL300
+    * single-mode varying record cannot express. Position, point size and
+    * clip/cull distances are never flat. */
+   flat_mask &= BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32) |
+                BITFIELD64_RANGE(VARYING_SLOT_COL0,
+                                 VARYING_SLOT_TEX7 - VARYING_SLOT_COL0 + 1) |
+                VARYING_BIT_BFC0 | VARYING_BIT_BFC1;
    flat_mask |= VARYING_BIT_LAYER | VARYING_BIT_VIEWPORT;
    if (layout->mesh_primitive_page)
       flat_mask |= BITFIELD64_BIT(AGX_MESH_PRIMITIVE_PAGE_SLOT);

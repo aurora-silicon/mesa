@@ -11083,8 +11083,24 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
                  ((counts >> 16) & 0xff) == vs->uvs.user_size
          : counts == (vs->uvs.user_size << interpolation_shift);
       if (batch->generate_primitive_id ||
-          batch->linked_varyings.counts_16.opaque[0] != 0 || !counts_ok)
+          batch->linked_varyings.counts_16.opaque[0] != 0 || !counts_ok) {
+         /* Every other refusal in this profile is named; this one used to
+          * drop the draw silently (glxgears' flat-shaded faces). */
+         static bool reported;
+         if (!reported) {
+            reported = true;
+            mesa_loge("G17G Gallium draw refused: varying counts %#x (16-bit "
+                      "%#x) do not fit the %s colour binding over %u "
+                      "components%s",
+                      counts, batch->linked_varyings.counts_16.opaque[0],
+                      color->perspective ? "perspective"
+                      : color->smooth    ? "noperspective"
+                                         : "flat",
+                      vs->uvs.user_size,
+                      batch->generate_primitive_id ? ", primitive ID" : "");
+         }
          return NULL;
+      }
       batch->varyings = t.gpu;
    }
 
@@ -11168,6 +11184,11 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
          ((UINT32_C(1) << clip_dist_words) - 1),
       .cull_mode = rast->base.cull_face,
       .front_face_ccw = rast->base.front_ccw, .point_size_output = psiz,
+      /* The same provoking vertex as the VDM selector above. Honeykrisp
+       * programs both on M5 (46478b5cfdc: with the PPP selector left at 0,
+       * clipped last-vertex triangles took their flat inputs from vertex 0),
+       * and the G18G captures carry 2 here for GL's last-vertex default. */
+      .flat_shading_vertex = rast->base.flatshade_first ? 0 : 2,
       .clip_distance_words = clip_dist_words,
       .object_type = batch->reduced_prim == MESA_PRIM_POINTS
                         ? AGX_PPP_HAL300_POINTS
