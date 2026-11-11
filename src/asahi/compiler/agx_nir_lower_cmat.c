@@ -11,6 +11,7 @@
 #include "util/hash_table.h"
 #include "util/set.h"
 #include "util/stack_array.h"
+#include "util/u_dynarray.h"
 
 static const struct glsl_type *
 remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
@@ -1016,11 +1017,29 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
  * consecutive rows of each of four columns of a transposed operand (four
  * loads of two).
  * A lane whose elements reach past the tensor's edge reads each of them at
- * its clamped coordinates, so nothing outside the tensor is read; with the
+ * its clamped coordinates, so no address outside the tensor is read; with the
  * clamp mode undefined there is no bounds test. An element index is 32 bits
  * wide and wraps, which a run's does not: a lane with a run across the wrap
  * reads each element at its own index too. Everything else goes through the
  * common per-element addressing (nir_calc_tensor_derefs).
+ *
+ * K paired 64 deep. A product's sum over K may be taken in any order, so the
+ * 16-deep pieces of an A (M x K) or B (K x N) matrix of flexible dimensions
+ * whose K is a multiple of 64 need not each hold 16 consecutive K: piece
+ * 4 g + s holds, for its column (A) or row (B) c,
+ *
+ *    k = 64 g + 8 (c >> 1) + 2 s + (c & 1),
+ *
+ * the same for A and B, so their products pair as before. A lane's elements
+ * of the four pieces of a 64-deep group then lie in whole 8-element vectors
+ * of K: a transposed B operand (B^T row-major, K contiguous) is one 16-byte
+ * load per column for four multiplies where K order needs four 4-byte loads
+ * for each, an A operand one 16-byte load per row for each multiply, all of
+ * it used, and a decoded block of eight codes along K is one block per lane
+ * and column for four multiplies. The pieces' tensor loads are lowered
+ * together. The pairing is only taken where nothing can tell it from K order
+ * (agx_nir_lower_cmat_flexible): no coopMatLoad or coopMatStore of such a
+ * matrix, no operation that gives an element's place.
  */
 
 /* The offset of element e of a lane from its element 0, in matrix rows and
@@ -1037,6 +1056,32 @@ element_offset(struct glsl_cmat_description desc, unsigned e,
       *dr = 0;
       *dc = e;
    }
+}
+
+/* The K of a piece's column (A) or row (B) c, less 64 g + 2 s (above). */
+static nir_def *
+paired_k(nir_builder *b, nir_def *c)
+{
+   return nir_ior(b, nir_ishl_imm(b, nir_ushr_imm(b, c, 1), 3),
+                  nir_iand_imm(b, c, 1));
+}
+
+/* Whether a piece of a matrix of K paired 64 deep, and its group and step. */
+static bool
+piece_paired(nir_cmat_call_instr *call, struct glsl_cmat_description piece,
+             bool pairing, unsigned *g, unsigned *s)
+{
+   struct glsl_cmat_description whole = nir_cmat_call_cmat_desc(call);
+   if (!pairing || piece.rows != 16 || piece.cols != 16 ||
+       !((whole.use == GLSL_CMAT_USE_A && whole.cols % 64 == 0) ||
+         (whole.use == GLSL_CMAT_USE_B && whole.rows % 64 == 0)))
+      return false;
+   struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
+   unsigned t = whole.use == GLSL_CMAT_USE_A ? tl.split_col_index
+                                             : tl.split_row_index;
+   *g = t / 4;
+   *s = t % 4;
+   return true;
 }
 
 /* A clamp mode applied to tensor coordinate c of a dimension of size dim.
@@ -1197,18 +1242,6 @@ struct tensor_fast {
    nir_def *stride, *dim0, *dim1;
 };
 
-/* The lane's element 0, in rows and columns of the whole matrix: a matrix
- * of flexible dimensions is lowered to 16x16 pieces, each with its offset.
- */
-static void
-lane_origin(nir_builder *b, struct glsl_cmat_description desc,
-            struct tensor_fast *fast, nir_def **r0, nir_def **c0)
-{
-   nir_def *lane = nir_load_subgroup_invocation(b);
-   *r0 = nir_iadd_imm(b, matrix_row(b, lane, desc, 0), fast->row_offset);
-   *c0 = nir_iadd_imm(b, matrix_col(b, lane, desc, 0), fast->col_offset);
-}
-
 /* Whether the common case applies, as a condition that folds when the
  * layout's spans, strides and block sizes are constants; NULL if it cannot.
  */
@@ -1270,34 +1303,171 @@ tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
    return cond;
 }
 
+/* A lane's elements of one load (of the four pieces of a group, with K
+ * paired), in tensor coordinates: element i at (y0 + dy[i], x0 + dx[i]), x
+ * along the tensor's inner dimension. Element i is element i % per_piece of
+ * piece i / per_piece.
+ */
+#define TENSOR_MAX_ELEMENTS 32
+
+struct tensor_items {
+   unsigned count, per_piece;
+   unsigned dy[TENSOR_MAX_ELEMENTS], dx[TENSOR_MAX_ELEMENTS];
+   unsigned min_dx, max_dx, max_dy;
+   nir_def *y0, *x0;
+   /* An A operand's lane holds every other column from an odd or an even
+    * one: 1 if x0 is the odd one, for loads that begin at the even one.
+    */
+   nir_def *parity;
+};
+
+static void
+tensor_items(nir_builder *b, struct nir_calc_tensor_info *info,
+             struct tensor_fast *fast, struct glsl_cmat_description desc,
+             unsigned pieces, unsigned group, struct tensor_items *it)
+{
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
+   bool a = desc.use == GLSL_CMAT_USE_A;
+   nir_def *row, *col;
+   if (pieces > 1 && a) {
+      row = nir_iadd_imm(b, r0, fast->row_offset);
+      col = nir_iadd_imm(b, paired_k(b, c0), 64 * group);
+   } else if (pieces > 1) {
+      row = nir_iadd_imm(b, paired_k(b, r0), 64 * group);
+      col = nir_iadd_imm(b, c0, fast->col_offset);
+   } else {
+      row = nir_iadd_imm(b, r0, fast->row_offset);
+      col = nir_iadd_imm(b, c0, fast->col_offset);
+   }
+
+   it->per_piece = desc.rows * desc.cols / 32;
+   it->count = pieces * it->per_piece;
+   it->min_dx = ~0u;
+   it->max_dx = it->max_dy = 0;
+   for (unsigned p = 0; p < pieces; ++p) {
+      for (unsigned e = 0; e < it->per_piece; ++e) {
+         unsigned dr, dc, i = p * it->per_piece + e;
+         element_offset(desc, e, &dr, &dc);
+         /* A's columns c0 + dc, dc even, and B's rows r0 + dr, r0 even. */
+         if (pieces > 1 && a)
+            dc = 2 * p + 4 * dc;
+         else if (pieces > 1)
+            dr = 2 * p + dr;
+         it->dy[i] = fast->transposed ? dc : dr;
+         it->dx[i] = fast->transposed ? dr : dc;
+         it->min_dx = MIN2(it->min_dx, it->dx[i]);
+         it->max_dx = MAX2(it->max_dx, it->dx[i]);
+         it->max_dy = MAX2(it->max_dy, it->dy[i]);
+      }
+   }
+   it->y0 = nir_iadd(b, nir_channel(b, info->offsets, 0),
+                     fast->transposed ? col : row);
+   it->x0 = nir_iadd(b, nir_channel(b, info->offsets, 1),
+                     fast->transposed ? row : col);
+   it->parity = a && !fast->transposed && desc.rows == 16
+                   ? nir_iand_imm(b, c0, 1) : NULL;
+}
+
+/* A run: the lane's unread elements of one tensor row within four columns of
+ * the lowest of them, which need not include `first` (with K paired a row's
+ * elements interleave the pieces'): callers take runs until `first` is read.
+ */
+static unsigned
+next_run(struct tensor_items *it, unsigned first, uint32_t *done,
+         unsigned *members, unsigned *places, unsigned *start, unsigned *width)
+{
+   *start = ~0u;
+   for (unsigned i = first; i < it->count; ++i) {
+      if (it->dy[i] == it->dy[first] && !(*done & BITFIELD_BIT(i)))
+         *start = MIN2(*start, it->dx[i]);
+   }
+   unsigned n = 0;
+   *width = 0;
+   for (unsigned i = first; i < it->count; ++i) {
+      if (it->dy[i] == it->dy[first] && !(*done & BITFIELD_BIT(i)) &&
+          it->dx[i] < *start + 4) {
+         members[n] = i;
+         places[n++] = it->dx[i] - *start;
+         *width = MAX2(*width, it->dx[i] - *start + 1);
+         *done |= BITFIELD_BIT(i);
+      }
+   }
+   return n;
+}
+
+static unsigned
+count_runs(struct tensor_items *it)
+{
+   uint32_t done = 0;
+   unsigned runs = 0, members[4], places[4], start, width;
+   for (unsigned i = 0; i < it->count;) {
+      if (done & BITFIELD_BIT(i)) {
+         ++i;
+         continue;
+      }
+      next_run(it, i, &done, members, places, &start, &width);
+      runs++;
+   }
+   return runs;
+}
+
+/* The 16-byte vectors (eight 16-bit elements) holding the lane's elements,
+ * from the even column at or before x0, or 0 if one of them cannot be read
+ * so: a lane with odd columns takes the high halves of the vectors' words.
+ * Returns their count and the highest vector.
+ */
+static unsigned
+count_vectors(struct tensor_items *it, unsigned *last)
+{
+   uint32_t seen[TENSOR_MAX_ELEMENTS] = {0};
+   unsigned vectors = 0;
+   *last = 0;
+   for (unsigned i = 0; i < it->count; ++i) {
+      if (it->parity && (it->dx[i] & 1))
+         return 0;
+      unsigned v = it->dx[i] / 8;
+      if (it->dy[i] >= TENSOR_MAX_ELEMENTS || v >= 32)
+         return 0;
+      if (!(seen[it->dy[i]] & BITFIELD_BIT(v))) {
+         seen[it->dy[i]] |= BITFIELD_BIT(v);
+         vectors++;
+      }
+      *last = MAX2(*last, v);
+   }
+   return vectors;
+}
+
 /* Whether the element indices of the lane's elements of each tensor row
  * count up from the row's first without wrapping, so that they can be read
- * or written as runs: an index is 32 bits wide, and each element's wraps
- * alone. One comparison, of the highest of the rows' first indices with the
- * last index that leaves room for the longest row.
+ * or written as runs (as the 16-byte vectors of count_vectors, with
+ * `vectors`): an index is 32 bits wide, and each element's wraps alone. One
+ * comparison, of the highest of the rows' first indices with the last index
+ * that leaves room for the longest row.
  */
 static nir_def *
-rows_unwrapped(nir_builder *b, nir_def *y0, nir_def *x0, nir_def *stride,
-               const unsigned *dy, const unsigned *dx, unsigned count)
+rows_unwrapped(nir_builder *b, struct tensor_items *it, nir_def *stride,
+               bool vectors)
 {
+   nir_def *x = vectors && it->parity ? nir_isub(b, it->x0, it->parity) : it->x0;
    nir_def *highest = NULL;
    unsigned longest = 0;
-   uint8_t done = 0;
-   for (unsigned first = 0; first < count; ++first) {
+   uint32_t done = 0;
+   for (unsigned first = 0; first < it->count; ++first) {
       if (done & BITFIELD_BIT(first))
          continue;
       unsigned lo = ~0u, hi = 0;
-      for (unsigned e = first; e < count; ++e) {
-         if (dy[e] != dy[first])
+      for (unsigned i = first; i < it->count; ++i) {
+         if (it->dy[i] != it->dy[first])
             continue;
-         done |= BITFIELD_BIT(e);
-         lo = MIN2(lo, dx[e]);
-         hi = MAX2(hi, dx[e]);
+         done |= BITFIELD_BIT(i);
+         lo = MIN2(lo, vectors ? it->dx[i] & ~7u : it->dx[i]);
+         hi = MAX2(hi, vectors ? it->dx[i] | 7u : it->dx[i]);
       }
       if (hi == lo)
          continue;
-      nir_def *y = nir_iadd_imm(b, y0, dy[first]);
-      nir_def *idx = nir_iadd(b, nir_imul(b, y, stride), nir_iadd_imm(b, x0, lo));
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[first]);
+      nir_def *idx = nir_iadd(b, nir_imul(b, y, stride), nir_iadd_imm(b, x, lo));
       highest = highest ? nir_umax(b, highest, idx) : idx;
       longest = MAX2(longest, hi - lo);
    }
@@ -1306,123 +1476,244 @@ rows_unwrapped(nir_builder *b, nir_def *y0, nir_def *x0, nir_def *stride,
    return nir_ult_imm(b, highest, (uint64_t)UINT32_MAX - longest + 1);
 }
 
-/* The common case: a lane's elements in runs of up to four along the
- * tensor's inner dimension. One test covers all of the lane's elements, so
- * that its loads (or stores) issue together; a lane whose elements reach
- * past the tensor's edge (when the clamp mode is not undefined), or whose
- * indices wrap within a row, reads each element at its clamped coordinates
- * and its own index instead.
+/* The lane's elements one by one, each at its own index. */
+static void
+load_each(nir_builder *b, struct tensor_items *it, nir_def *stride,
+          nir_deref_instr *ptr, struct glsl_cmat_description desc,
+          nir_def **values)
+{
+   for (unsigned i = 0; i < it->count; ++i) {
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[i]);
+      nir_def *x = nir_iadd_imm(b, it->x0, it->dx[i]);
+      nir_def *idx = nir_iadd(b, nir_imul(b, y, stride), x);
+      values[i] = nir_load_deref(b, tensor_elements(b, ptr, desc, idx, 1));
+   }
+}
+
+/* The lane's elements in runs of up to four along the tensor's rows. */
+static void
+load_runs(nir_builder *b, struct tensor_items *it, nir_def *stride,
+          nir_deref_instr *ptr, struct glsl_cmat_description desc,
+          nir_def **values)
+{
+   uint32_t done = 0;
+   unsigned members[4], places[4], start, width;
+   for (unsigned first = 0; first < it->count;) {
+      if (done & BITFIELD_BIT(first)) {
+         ++first;
+         continue;
+      }
+      unsigned n = next_run(it, first, &done, members, places, &start, &width);
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[first]);
+      nir_def *idx = nir_iadd(b, nir_imul(b, y, stride),
+                              nir_iadd_imm(b, it->x0, start));
+      nir_def *v = nir_load_deref(b, tensor_elements(b, ptr, desc, idx, width));
+      for (unsigned i = 0; i < n; ++i)
+         values[members[i]] = nir_channel(b, v, places[i]);
+   }
+}
+
+/* The lane's 16-bit elements by 16-byte loads (count_vectors), the tensor's
+ * rows 4-byte aligned. All loads are issued before any element is taken
+ * from them: a thread waits at the first use of a loaded value.
  */
 static void
-tensor_fast_access(nir_builder *b, struct nir_calc_tensor_info *info,
-                   struct tensor_fast *fast, nir_deref_instr *ptr,
-                   struct glsl_cmat_description desc, bool load,
-                   nir_def **values, unsigned count)
+load_vectors(nir_builder *b, struct tensor_items *it, nir_def *stride,
+             nir_deref_instr *ptr, nir_def **values)
 {
-   nir_def *r0, *c0;
-   lane_origin(b, desc, fast, &r0, &c0);
-   nir_def *y0 = nir_iadd(b, nir_channel(b, info->offsets, 0),
-                          fast->transposed ? c0 : r0);
-   nir_def *x0 = nir_iadd(b, nir_channel(b, info->offsets, 1),
-                          fast->transposed ? r0 : c0);
+   nir_def *x = it->parity ? nir_isub(b, it->x0, it->parity) : it->x0;
+   nir_def *shift = it->parity ? nir_ishl_imm(b, it->parity, 4) : NULL;
+   nir_def *words[TENSOR_MAX_ELEMENTS];
+   unsigned vector_of[TENSOR_MAX_ELEMENTS], vectors = 0;
+   uint32_t done = 0;
+   for (unsigned first = 0; first < it->count; ++first) {
+      if (done & BITFIELD_BIT(first))
+         continue;
+      unsigned v = it->dx[first] / 8;
+      /* Indexed by words, as the load scales its index. */
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[first]);
+      nir_def *idx = nir_iadd(b, nir_imul(b, y, stride), nir_iadd_imm(b, x, 8 * v));
+      nir_deref_instr *d =
+         nir_build_deref_cast(b, &ptr->def, ptr->modes, glsl_uint_type(), 4);
+      d = nir_build_deref_ptr_as_array(
+         b, d, nir_u2uN(b, nir_ushr_imm(b, idx, 1), ptr->def.bit_size));
+      d = nir_build_deref_cast_with_alignment(b, &d->def, d->modes,
+                                              glsl_vector_type(GLSL_TYPE_UINT, 4),
+                                              0, 4, 0);
+      words[vectors] = nir_load_deref(b, d);
+      for (unsigned i = first; i < it->count; ++i) {
+         if (it->dy[i] == it->dy[first] && it->dx[i] / 8 == v) {
+            done |= BITFIELD_BIT(i);
+            vector_of[i] = vectors;
+         }
+      }
+      vectors++;
+   }
+   /* Vector by vector, so that each is dead once taken apart. */
+   for (unsigned v = 0; v < vectors; ++v) {
+      for (unsigned i = 0; i < it->count; ++i) {
+         if (vector_of[i] != v)
+            continue;
+         nir_def *word = nir_channel(b, words[v], (it->dx[i] % 8) / 2);
+         if (shift)
+            values[i] = nir_unpack_32_2x16_split_x(b, nir_ushr(b, word, shift));
+         else if (it->dx[i] & 1)
+            values[i] = nir_unpack_32_2x16_split_y(b, word);
+         else
+            values[i] = nir_unpack_32_2x16_split_x(b, word);
+      }
+   }
+}
+
+/* The common case's loads: a lane inside the tensor reads its runs, a lane
+ * reaching past the tensor's edge each element at its clamped coordinates.
+ * One test covers all of a lane's elements, so that its loads issue
+ * together. Where 16-byte vectors take fewer loads, a lane reads them if the
+ * tensor's rows are 4-byte aligned (the same test), its runs otherwise. A
+ * lane whose indices wrap within a row (the same test again) reads each
+ * element at its own index.
+ */
+static void
+tensor_fast_load(nir_builder *b, struct nir_calc_tensor_info *info,
+                 struct tensor_fast *fast, nir_deref_instr *ptr,
+                 struct glsl_cmat_description desc, struct tensor_items *it,
+                 nir_def **values)
+{
    unsigned bits = glsl_base_type_bit_size(desc.element_type);
    bool checked = info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED;
-   nir_tensor_clamp_mode mode = load ? info->clamp_mode : NIR_TENSOR_CLAMP_CONSTANT;
 
-   unsigned dy[8], dx[8], max_dy = 0, max_dx = 0;
-   for (unsigned e = 0; e < count; ++e) {
-      unsigned dr, dc;
-      element_offset(desc, e, &dr, &dc);
-      dy[e] = fast->transposed ? dc : dr;
-      dx[e] = fast->transposed ? dr : dc;
-      max_dy = MAX2(max_dy, dy[e]);
-      max_dx = MAX2(max_dx, dx[e]);
-   }
+   unsigned last_vector = 0;
+   unsigned vectors = bits == 16 && nir_deref_mode_is(ptr, nir_var_mem_global)
+                         ? count_vectors(it, &last_vector) : 0;
+   /* Only a group's vectors are all used: a lane of an A operand in K order
+    * uses half of each, and two loads of three elements are faster.
+    */
+   bool wide = it->count > it->per_piece && vectors && vectors < count_runs(it);
 
-   nir_def *runs_ok = rows_unwrapped(b, y0, x0, fast->stride, dy, dx, count);
+   nir_def *fast_ok = nir_imm_true(b);
    if (checked) {
-      nir_def *inside = nir_iand(b, coords_inside(b, y0, 0, max_dy, fast->dim0),
-                                 coords_inside(b, x0, 0, max_dx, fast->dim1));
+      fast_ok = nir_iand(b, coords_inside(b, it->y0, 0, it->max_dy, fast->dim0),
+                         coords_inside(b, it->x0, it->min_dx, it->max_dx, fast->dim1));
+   }
+   if (wide) {
+      /* The vectors begin at the even column at or before x0, and end
+       * within the tensor where it has bounds (with none, within the slice
+       * the load reads, by the vectors' place in it).
+       */
+      nir_def *x = it->parity ? nir_isub(b, it->x0, it->parity) : it->x0;
+      nir_def *addr = global_address(b, ptr);
+      fast_ok = nir_iand(b, fast_ok, nir_ieq_imm(
+         b, nir_iand_imm(b, nir_ior(b, nir_unpack_64_2x32_split_x(b, addr),
+                                    nir_ishl_imm(b, nir_ior(b, fast->stride, x), 1)),
+                         3), 0));
+      if (checked) {
+         fast_ok = nir_iand(b, fast_ok,
+                            coords_inside(b, x, 0, 8 * last_vector + 7,
+                                          fast->dim1));
+      }
+   }
+   fast_ok = nir_iand(b, fast_ok, rows_unwrapped(b, it, fast->stride, wide));
+
+   nir_def *fast_values[TENSOR_MAX_ELEMENTS], *other_values[TENSOR_MAX_ELEMENTS];
+   nir_if *nif = nir_push_if(b, fast_ok);
+   if (wide)
+      load_vectors(b, it, fast->stride, ptr, fast_values);
+   else
+      load_runs(b, it, fast->stride, ptr, desc, fast_values);
+   nir_push_else(b, nif);
+   if (!checked && wide) {
+      /* Rows not 4-byte aligned, or indices that wrap within a vector. */
+      nir_def *run_values[TENSOR_MAX_ELEMENTS];
+      nir_if *runs = nir_push_if(b, rows_unwrapped(b, it, fast->stride, false));
+      load_runs(b, it, fast->stride, ptr, desc, run_values);
+      nir_push_else(b, runs);
+      load_each(b, it, fast->stride, ptr, desc, other_values);
+      nir_pop_if(b, runs);
+      for (unsigned i = 0; i < it->count; ++i)
+         other_values[i] = nir_if_phi(b, run_values[i], other_values[i]);
+   } else if (!checked) {
+      load_each(b, it, fast->stride, ptr, desc, other_values);
+   } else {
+      for (unsigned i = 0; i < it->count; ++i) {
+         nir_def *y = nir_iadd_imm(b, it->y0, it->dy[i]);
+         nir_def *x = nir_iadd_imm(b, it->x0, it->dx[i]);
+         nir_def *in = nir_iand(b, coord_inside(b, y, fast->dim0),
+                                coord_inside(b, x, fast->dim1));
+         nir_def *cy = nir_bcsel(b, in, y, clamp_coord(b, info->clamp_mode, y, fast->dim0));
+         nir_def *cx = nir_bcsel(b, in, x, clamp_coord(b, info->clamp_mode, x, fast->dim1));
+         nir_deref_instr *d = tensor_elements(
+            b, ptr, desc, nir_iadd(b, nir_imul(b, cy, fast->stride), cx), 1);
+         other_values[i] = load_unless(
+            b, d, clamp_skip(b, info, in, fast->dim0, fast->dim1),
+            clamp_skip_value(b, info, bits));
+      }
+   }
+   nir_pop_if(b, nif);
+   for (unsigned i = 0; i < it->count; ++i)
+      values[i] = nir_if_phi(b, fast_values[i], other_values[i]);
+}
+
+/* The common case's store: inside the tensor, the lane's runs; past its
+ * edge, each element inside it. A lane whose indices wrap within a row
+ * stores each element at its own index too.
+ */
+static void
+tensor_fast_store(nir_builder *b, struct nir_calc_tensor_info *info,
+                  struct tensor_fast *fast, nir_deref_instr *ptr,
+                  struct glsl_cmat_description desc, struct tensor_items *it,
+                  nir_def **values)
+{
+   unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   bool checked = info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED;
+
+   nir_def *runs_ok = rows_unwrapped(b, it, fast->stride, false);
+   if (checked) {
+      nir_def *inside =
+         nir_iand(b, coords_inside(b, it->y0, 0, it->max_dy, fast->dim0),
+                  coords_inside(b, it->x0, it->min_dx, it->max_dx, fast->dim1));
       runs_ok = nir_iand(b, inside, runs_ok);
    }
    nir_if *edge = nir_push_if(b, runs_ok);
 
-   nir_def *run_values[8];
-   uint8_t done = 0;
-   for (unsigned first = 0; first < count; ++first) {
-      if (done & BITFIELD_BIT(first))
+   uint32_t done = 0;
+   unsigned members[4], places[4], start, width;
+   for (unsigned first = 0; first < it->count;) {
+      if (done & BITFIELD_BIT(first)) {
+         ++first;
          continue;
-
-      /* The run from the lowest unread element of this row of the tensor:
-       * at most four elements wide, its elements' places within it.
-       */
-      unsigned start = ~0u;
-      for (unsigned e = first; e < count; ++e) {
-         if (dy[e] == dy[first] && !(done & BITFIELD_BIT(e)))
-            start = MIN2(start, dx[e]);
       }
-      unsigned members[4], places[4], n = 0, width = 0;
-      for (unsigned e = first; e < count; ++e) {
-         if (dy[e] == dy[first] && !(done & BITFIELD_BIT(e)) &&
-             dx[e] < start + 4) {
-            members[n] = e;
-            places[n++] = dx[e] - start;
-            width = MAX2(width, dx[e] - start + 1);
-            done |= BITFIELD_BIT(e);
-         }
-      }
-
-      nir_def *y = nir_iadd_imm(b, y0, dy[first]);
+      unsigned n = next_run(it, first, &done, members, places, &start, &width);
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[first]);
       nir_def *idx = nir_iadd(b, nir_imul(b, y, fast->stride),
-                              nir_iadd_imm(b, x0, start));
+                              nir_iadd_imm(b, it->x0, start));
       nir_deref_instr *d = tensor_elements(b, ptr, desc, idx, width);
-      if (load) {
-         nir_def *v = nir_load_deref(b, d);
-         for (unsigned i = 0; i < n; ++i)
-            run_values[members[i]] = nir_channel(b, v, places[i]);
-      } else {
-         nir_def *channels[4];
-         unsigned mask = 0;
-         for (unsigned i = 0; i < width; ++i)
-            channels[i] = nir_undef(b, 1, bits);
-         for (unsigned i = 0; i < n; ++i) {
-            channels[places[i]] = values[members[i]];
-            mask |= BITFIELD_BIT(places[i]);
-         }
-         nir_store_deref(b, d, nir_vec(b, channels, width), mask);
+      nir_def *channels[4];
+      unsigned mask = 0;
+      for (unsigned i = 0; i < width; ++i)
+         channels[i] = nir_undef(b, 1, bits);
+      for (unsigned i = 0; i < n; ++i) {
+         channels[places[i]] = values[members[i]];
+         mask |= BITFIELD_BIT(places[i]);
       }
+      nir_store_deref(b, d, nir_vec(b, channels, width), mask);
    }
 
    nir_push_else(b, edge);
-   nir_def *edge_values[8];
-   for (unsigned e = 0; e < count; ++e) {
-      nir_def *y = nir_iadd_imm(b, y0, dy[e]), *x = nir_iadd_imm(b, x0, dx[e]);
-      nir_def *in = NULL;
+   for (unsigned i = 0; i < it->count; ++i) {
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[i]);
+      nir_def *x = nir_iadd_imm(b, it->x0, it->dx[i]);
+      nir_if *in = NULL;
       if (checked) {
-         in = nir_iand(b, coord_inside(b, y, fast->dim0),
-                       coord_inside(b, x, fast->dim1));
-         y = nir_bcsel(b, in, y, clamp_coord(b, mode, y, fast->dim0));
-         x = nir_bcsel(b, in, x, clamp_coord(b, mode, x, fast->dim1));
+         in = nir_push_if(b, nir_iand(b, coord_inside(b, y, fast->dim0),
+                                      coord_inside(b, x, fast->dim1)));
       }
       nir_deref_instr *d = tensor_elements(
          b, ptr, desc, nir_iadd(b, nir_imul(b, y, fast->stride), x), 1);
-      if (load) {
-         edge_values[e] = load_unless(
-            b, d, checked ? clamp_skip(b, info, in, fast->dim0, fast->dim1) : NULL,
-            clamp_skip_value(b, info, bits));
-      } else {
-         if (checked)
-            nir_push_if(b, in);
-         nir_store_deref(b, d, values[e], 1);
-         if (checked)
-            nir_pop_if(b, NULL);
-      }
+      nir_store_deref(b, d, values[i], 1);
+      if (checked)
+         nir_pop_if(b, in);
    }
    nir_pop_if(b, edge);
-   if (load) {
-      for (unsigned e = 0; e < count; ++e)
-         values[e] = nir_if_phi(b, run_values[e], edge_values[e]);
-   }
 }
 
 /* The cast of the decode function's block pointer parameter
@@ -1485,70 +1776,56 @@ decode_element(nir_builder *b, nir_function *fn, nir_deref_instr *param,
 /* The common case with a decode function: each element's block found
  * directly from its tensor coordinates, with no branch around its call.
  * When the lane's elements are inside the tensor and those of each tensor
- * row are in one block (a lane's are at most seven apart), the elements of
- * a row share the block's address and coordinates, so the decode function's
- * loads of the block and of what it finds by the block's coordinates (a
- * scale, say) are the same loads, which the optimizer then merges when the
- * memory is read-only. Otherwise each element is clamped as the layout says
- * and finds its own block.
+ * row fall in one block, they share the block's address and coordinates, so
+ * the decode function's loads of the block, and of what it finds by the
+ * block's coordinates (a scale, say), are the same loads, which the optimizer
+ * merges when the memory is read-only: with K paired, the eight elements of
+ * a lane's column of a 64-deep group are one block of eight. Otherwise each
+ * element is clamped as the layout says and finds its own block.
  */
 static void
 tensor_fast_decode(nir_builder *b, struct nir_calc_tensor_info *info,
                    struct tensor_fast *fast, nir_deref_instr *ptr,
-                   struct glsl_cmat_description desc, nir_def **values,
-                   unsigned count)
+                   struct glsl_cmat_description desc, struct tensor_items *it,
+                   nir_def **values)
 {
    nir_function *fn = info->decode_fnptr;
    nir_deref_instr *param = decode_block_deref(fn->impl);
-   nir_def *r0, *c0;
-   lane_origin(b, desc, fast, &r0, &c0);
-   nir_def *y0 = nir_iadd(b, nir_channel(b, info->offsets, 0),
-                          fast->transposed ? c0 : r0);
-   nir_def *x0 = nir_iadd(b, nir_channel(b, info->offsets, 1),
-                          fast->transposed ? r0 : c0);
    unsigned bits = glsl_base_type_bit_size(desc.element_type);
    bool checked = info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED;
    nir_def *bs0 = nir_channel(b, info->block_sizes, 0);
    nir_def *bs1 = nir_channel(b, info->block_sizes, 1);
    nir_def *stride1 = nir_channel(b, info->strides, 1);
 
-   unsigned dy[8], dx[8], max_dy = 0, max_dx = 0, min_dx = ~0u;
-   for (unsigned e = 0; e < count; ++e) {
-      unsigned dr, dc;
-      element_offset(desc, e, &dr, &dc);
-      dy[e] = fast->transposed ? dc : dr;
-      dx[e] = fast->transposed ? dr : dc;
-      max_dy = MAX2(max_dy, dy[e]);
-      max_dx = MAX2(max_dx, dx[e]);
-      min_dx = MIN2(min_dx, dx[e]);
-   }
-
-   nir_def *x_first = nir_iadd_imm(b, x0, min_dx);
-   nir_def *x_last = nir_iadd_imm(b, x0, max_dx);
+   nir_def *x_first = nir_iadd_imm(b, it->x0, it->min_dx);
+   nir_def *x_last = nir_iadd_imm(b, it->x0, it->max_dx);
    nir_def *bx = nir_udiv(b, x_first, bs1);
    nir_def *shared = nir_ieq(b, bx, nir_udiv(b, x_last, bs1));
    if (checked) {
-      shared = nir_iand(b, shared, coords_inside(b, y0, 0, max_dy, fast->dim0));
-      shared = nir_iand(b, shared, coords_inside(b, x0, min_dx, max_dx, fast->dim1));
+      shared = nir_iand(b, shared,
+                        coords_inside(b, it->y0, 0, it->max_dy, fast->dim0));
+      shared = nir_iand(b, shared,
+                        coords_inside(b, it->x0, it->min_dx, it->max_dx, fast->dim1));
    }
 
-   nir_def *shared_values[8], *own_values[8];
+   nir_def *shared_values[TENSOR_MAX_ELEMENTS], *own_values[TENSOR_MAX_ELEMENTS];
    nir_if *nif = nir_push_if(b, shared);
    {
       nir_def *ix = nir_umod(b, x_first, bs1);
-      for (unsigned e = 0; e < count; ++e) {
-         nir_def *y = nir_iadd_imm(b, y0, dy[e]);
+      for (unsigned i = 0; i < it->count; ++i) {
+         nir_def *y = nir_iadd_imm(b, it->y0, it->dy[i]);
          nir_def *block[2] = {nir_udiv(b, y, bs0), bx};
-         nir_def *at[2] = {nir_umod(b, y, bs0), nir_iadd_imm(b, ix, dx[e] - min_dx)};
+         nir_def *at[2] = {nir_umod(b, y, bs0),
+                           nir_iadd_imm(b, ix, it->dx[i] - it->min_dx)};
          nir_def *idx = nir_iadd(b, nir_imul(b, block[0], fast->stride),
                                  nir_imul(b, bx, stride1));
-         shared_values[e] = decode_element(b, fn, param, ptr, idx, block, at);
+         shared_values[i] = decode_element(b, fn, param, ptr, idx, block, at);
       }
    }
    nir_push_else(b, nif);
-   for (unsigned e = 0; e < count; ++e) {
-      nir_def *y = nir_iadd_imm(b, y0, dy[e]);
-      nir_def *x = nir_iadd_imm(b, x0, dx[e]);
+   for (unsigned i = 0; i < it->count; ++i) {
+      nir_def *y = nir_iadd_imm(b, it->y0, it->dy[i]);
+      nir_def *x = nir_iadd_imm(b, it->x0, it->dx[i]);
       nir_def *in = NULL;
       if (checked) {
          in = nir_iand(b, coord_inside(b, y, fast->dim0),
@@ -1567,37 +1844,52 @@ tensor_fast_decode(nir_builder *b, struct nir_calc_tensor_info *info,
          nir_if *call = nir_push_if(b, nir_inot(b, skip));
          nir_def *v = decode_element(b, fn, param, ptr, idx, block, at);
          nir_pop_if(b, call);
-         own_values[e] = nir_if_phi(b, v, skipped);
+         own_values[i] = nir_if_phi(b, v, skipped);
       } else {
-         own_values[e] = decode_element(b, fn, param, ptr, idx, block, at);
+         own_values[i] = decode_element(b, fn, param, ptr, idx, block, at);
       }
    }
    nir_pop_if(b, nif);
-   for (unsigned e = 0; e < count; ++e)
-      values[e] = nir_if_phi(b, shared_values[e], own_values[e]);
+   for (unsigned i = 0; i < it->count; ++i)
+      values[i] = nir_if_phi(b, shared_values[i], own_values[i]);
 }
 
-/* Any other layout: each element through the common addressing. */
+/* Any other layout: each element through the common addressing. A piece of
+ * a matrix of K paired 64 deep (step s of group g) gives the common
+ * addressing its elements' whole coordinates.
+ */
 static void
 tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
                       nir_deref_instr *ptr, nir_deref_instr *clip,
                       struct glsl_cmat_description desc, bool load,
-                      nir_def **values, unsigned count)
+                      nir_def **values, unsigned count, bool paired,
+                      unsigned g, unsigned s)
 {
    nir_def *lane = nir_load_subgroup_invocation(b);
    nir_def *r0 = matrix_row(b, lane, desc, 0), *c0 = matrix_col(b, lane, desc, 0);
    unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   bool a = desc.use == GLSL_CMAT_USE_A;
+   if (paired) {
+      if (a)
+         info->col_imm_offset = 0;
+      else
+         info->row_imm_offset = 0;
+   }
 
    for (unsigned e = 0; e < count; ++e) {
       unsigned dr, dc;
       element_offset(desc, e, &dr, &dc);
       nir_def *clip_value = load && info->view
          ? nir_cmat_extract(b, bits, &clip->def, nir_imm_int(b, e)) : NULL;
+      nir_def *row = nir_iadd_imm(b, r0, dr), *col = nir_iadd_imm(b, c0, dc);
+      if (paired && a)
+         col = nir_iadd_imm(b, paired_k(b, col), 64 * g + 2 * s);
+      else if (paired)
+         row = nir_iadd_imm(b, paired_k(b, row), 64 * g + 2 * s);
 
       info->clipped_if = NULL;
       nir_deref_instr *d = ptr;
-      nir_def *v = nir_calc_tensor_derefs(b, info, nir_iadd_imm(b, r0, dr),
-                                          nir_iadd_imm(b, c0, dc), &d);
+      nir_def *v = nir_calc_tensor_derefs(b, info, row, col, &d);
       if (load) {
          /* A decoded element is skipped by the common addressing. */
          if (!info->decode_fnptr) {
@@ -1621,21 +1913,32 @@ tensor_generic_access(nir_builder *b, struct nir_calc_tensor_info *info,
    }
 }
 
+/* A tensor load or store, of one matrix or (K paired) of the four pieces
+ * calls[0..pieces) of one 64-deep group of a matrix, steps 0 to 3 in order:
+ * lowered at the last call.
+ */
 static bool
-lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
+lower_tensor_calls(nir_builder *b, nir_cmat_call_instr **calls,
+                   unsigned pieces, bool pairing)
 {
+   nir_cmat_call_instr *call = calls[pieces - 1];
    const bool load = call->op == nir_cmat_call_op_tensor_load;
-   nir_deref_instr *mat = nir_src_as_deref(call->params[load ? 0 : 1]);
+   nir_deref_instr *mats[TENSOR_MAX_ELEMENTS / 8], *clips[TENSOR_MAX_ELEMENTS / 8];
+   for (unsigned p = 0; p < pieces; ++p) {
+      mats[p] = nir_src_as_deref(calls[p]->params[load ? 0 : 1]);
+      clips[p] = load ? nir_src_as_deref(calls[p]->params[4]) : NULL;
+   }
    nir_deref_instr *ptr = nir_src_as_deref(call->params[load ? 1 : 0]);
-   nir_deref_instr *clip = load ? nir_src_as_deref(call->params[4]) : NULL;
-   struct glsl_cmat_description desc = *glsl_get_cmat_description(mat->type);
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(mats[0]->type);
    unsigned count = desc.rows * desc.cols / 32;
    unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   unsigned g = 0, s = 0;
+   bool paired = piece_paired(calls[0], desc, pairing, &g, &s);
 
    b->cursor = nir_before_instr(&call->instr);
 
    struct nir_calc_tensor_info info = {0};
-   nir_calc_tensor_derefs_init(b, &info, call);
+   nir_calc_tensor_derefs_init(b, &info, calls[0]);
 
    /* A decode function takes a global pointer to its block. */
    if (info.decode_fnptr && nir_deref_mode_is(ptr, nir_var_mem_ssbo)) {
@@ -1644,43 +1947,69 @@ lower_tensor_call(nir_builder *b, nir_cmat_call_instr *call)
                                  bits / 8);
    }
 
-   nir_def *values[8] = {NULL};
+   nir_def *values[TENSOR_MAX_ELEMENTS] = {NULL};
    if (!load) {
-      for (unsigned e = 0; e < count; ++e)
-         values[e] = nir_cmat_extract(b, bits, &mat->def, nir_imm_int(b, e));
+      for (unsigned p = 0; p < pieces; ++p) {
+         for (unsigned e = 0; e < count; ++e) {
+            values[p * count + e] =
+               nir_cmat_extract(b, bits, &mats[p]->def, nir_imm_int(b, e));
+         }
+      }
    }
 
    /* The shape tests are of the whole matrix; desc is this piece's. */
    struct glsl_cmat_description whole = nir_cmat_call_cmat_desc(call);
    struct tensor_fast fast = {0};
    nir_def *cond = tensor_fast_condition(b, &info, whole, &fast);
-   if (cond) {
-      nir_def *fast_values[8], *slow_values[8];
+   /* A piece of K paired 64 deep has the common case only with its group. */
+   if (cond && (paired ? load && pieces == 4 : true)) {
+      struct tensor_items it;
+      tensor_items(b, &info, &fast, desc, pieces, g, &it);
+      nir_def *fast_values[TENSOR_MAX_ELEMENTS], *slow_values[TENSOR_MAX_ELEMENTS];
       memcpy(fast_values, values, sizeof(values));
       memcpy(slow_values, values, sizeof(values));
       nir_if *nif = nir_push_if(b, cond);
-      if (info.decode_fnptr)
-         tensor_fast_decode(b, &info, &fast, ptr, desc, fast_values, count);
+      if (!load)
+         tensor_fast_store(b, &info, &fast, ptr, desc, &it, fast_values);
+      else if (info.decode_fnptr)
+         tensor_fast_decode(b, &info, &fast, ptr, desc, &it, fast_values);
       else
-         tensor_fast_access(b, &info, &fast, ptr, desc, load, fast_values, count);
+         tensor_fast_load(b, &info, &fast, ptr, desc, &it, fast_values);
       nir_push_else(b, nif);
-      tensor_generic_access(b, &info, ptr, clip, desc, load, slow_values, count);
+      for (unsigned p = 0; p < pieces; ++p) {
+         struct nir_calc_tensor_info piece_info = info;
+         nir_calc_tensor_derefs_init(b, &piece_info, calls[p]);
+         piece_paired(calls[p], desc, pairing, &g, &s);
+         tensor_generic_access(b, &piece_info, ptr, clips[p], desc, load,
+                               slow_values + p * count, count, paired, g, s);
+      }
       nir_pop_if(b, nif);
       if (load) {
-         for (unsigned e = 0; e < count; ++e)
-            values[e] = nir_if_phi(b, fast_values[e], slow_values[e]);
+         for (unsigned i = 0; i < pieces * count; ++i)
+            values[i] = nir_if_phi(b, fast_values[i], slow_values[i]);
       }
    } else {
-      tensor_generic_access(b, &info, ptr, clip, desc, load, values, count);
+      for (unsigned p = 0; p < pieces; ++p) {
+         struct nir_calc_tensor_info piece_info = info;
+         if (p > 0)
+            nir_calc_tensor_derefs_init(b, &piece_info, calls[p]);
+         piece_paired(calls[p], desc, pairing, &g, &s);
+         tensor_generic_access(b, &piece_info, ptr, clips[p], desc, load,
+                               values + p * count, count, paired, g, s);
+      }
    }
 
    if (load) {
-      for (unsigned e = 0; e < count; ++e) {
-         nir_cmat_insert(b, &mat->def, values[e], &mat->def, nir_imm_int(b, e));
+      for (unsigned p = 0; p < pieces; ++p) {
+         for (unsigned e = 0; e < count; ++e) {
+            nir_cmat_insert(b, &mats[p]->def, values[p * count + e],
+                            &mats[p]->def, nir_imm_int(b, e));
+         }
       }
    }
 
-   nir_instr_remove(&call->instr);
+   for (unsigned p = 0; p < pieces; ++p)
+      nir_instr_remove(&calls[p]->instr);
    return true;
 }
 
@@ -1699,8 +2028,125 @@ function_is_called(nir_shader *nir, nir_function *func)
    return false;
 }
 
+/* Whether two tensor loads are pieces of one load (of a matrix split into
+ * 16x16 pieces), differing only in their piece.
+ */
+static bool
+same_tensor_load(nir_cmat_call_instr *a, nir_cmat_call_instr *b)
+{
+   if (a->op != nir_cmat_call_op_tensor_load || b->op != a->op ||
+       a->callee != b->callee)
+      return false;
+   for (unsigned i = 1; i <= 3; ++i) {
+      if (a->params[i].ssa != b->params[i].ssa)
+         return false;
+   }
+   struct nir_cmat_tensor_load ta = nir_cmat_call_tensor_load_info(a);
+   struct nir_cmat_tensor_load tb = nir_cmat_call_tensor_load_info(b);
+   ta.split_row_index = tb.split_row_index = 0;
+   ta.split_col_index = tb.split_col_index = 0;
+   struct glsl_cmat_description da = nir_cmat_call_cmat_desc(a);
+   struct glsl_cmat_description db = nir_cmat_call_cmat_desc(b);
+   return !memcmp(&ta, &tb, sizeof(ta)) && !memcmp(&da, &db, sizeof(da));
+}
+
+/* Whether only derefs and arithmetic lie between two instructions of a
+ * block: nothing that reads a matrix or touches memory.
+ */
+static bool
+only_addressing_between(nir_instr *from, nir_instr *to)
+{
+   for (nir_instr *instr = nir_instr_next(from); instr != to;
+        instr = nir_instr_next(instr)) {
+      if (!instr || (instr->type != nir_instr_type_deref &&
+                     instr->type != nir_instr_type_alu &&
+                     instr->type != nir_instr_type_load_const &&
+                     instr->type != nir_instr_type_undef))
+         return false;
+   }
+   return true;
+}
+
+/* The piece's index across K (with g and s) and along the other dimension. */
+static bool
+paired_piece(nir_cmat_call_instr *call, bool pairing, unsigned *g, unsigned *s,
+             unsigned *other)
+{
+   if (call->op != nir_cmat_call_op_tensor_load)
+      return false;
+   nir_deref_instr *mat = nir_src_as_deref(call->params[0]);
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(mat->type);
+   if (!piece_paired(call, desc, pairing, g, s))
+      return false;
+   struct nir_cmat_tensor_load tl = nir_cmat_call_tensor_load_info(call);
+   *other = desc.use == GLSL_CMAT_USE_A ? tl.split_row_index : tl.split_col_index;
+   return true;
+}
+
+static bool
+lower_tensor_block(nir_builder *b, nir_block *block, bool pairing)
+{
+   struct util_dynarray calls;
+   util_dynarray_init(&calls, NULL);
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_cmat_call)
+         continue;
+      nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+      /* A matrix of a size the lowering lacks stays a call, which
+       * agx_nir_cmat_supported() refuses.
+       */
+      if ((call->op == nir_cmat_call_op_tensor_load ||
+           call->op == nir_cmat_call_op_tensor_store) &&
+          matrices_supported(call))
+         util_dynarray_append(&calls, call);
+   }
+   unsigned n = util_dynarray_num_elements(&calls, nir_cmat_call_instr *);
+   nir_cmat_call_instr **list = util_dynarray_begin(&calls);
+
+   for (unsigned i = 0; i < n;) {
+      /* The run of pieces of one load from list[i]. */
+      unsigned end = i + 1;
+      while (pairing && end < n && same_tensor_load(list[i], list[end]) &&
+             only_addressing_between(&list[end - 1]->instr, &list[end]->instr))
+         end++;
+
+      /* The four steps of each 64-deep group, together. */
+      bool done[64] = {false};
+      if (end - i > 64)
+         end = i + 64;
+      for (unsigned j = i; j < end; ++j) {
+         unsigned g, s, other;
+         if (!paired_piece(list[j], pairing, &g, &s, &other) || s != 0)
+            continue;
+         nir_cmat_call_instr *group[4] = {list[j]};
+         unsigned found = 1, at[4] = {j};
+         for (unsigned k = j + 1; k < end && found < 4; ++k) {
+            unsigned g2, s2, other2;
+            if (!done[k - i] && paired_piece(list[k], pairing, &g2, &s2, &other2) &&
+                g2 == g && other2 == other && s2 == found) {
+               group[found] = list[k];
+               at[found++] = k;
+            }
+         }
+         if (found == 4) {
+            lower_tensor_calls(b, group, 4, pairing);
+            for (unsigned p = 0; p < 4; ++p)
+               done[at[p] - i] = true;
+         }
+      }
+      for (unsigned j = i; j < end; ++j) {
+         if (!done[j - i])
+            lower_tensor_calls(b, &list[j], 1, pairing);
+      }
+      i = end;
+   }
+
+   util_dynarray_fini(&calls);
+   return n > 0;
+}
+
 bool
-agx_nir_lower_cmat_tensor(nir_shader *nir)
+agx_nir_lower_cmat_tensor(nir_shader *nir, bool pairing)
 {
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
@@ -1708,20 +2154,8 @@ agx_nir_lower_cmat_tensor(nir_shader *nir)
    bool progress = false;
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_create(impl);
-   nir_foreach_block_safe(block, impl) {
-      nir_foreach_instr_safe(instr, block) {
-         if (instr->type != nir_instr_type_cmat_call)
-            continue;
-         nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
-         /* A matrix of a size the lowering lacks stays a call, which
-          * agx_nir_cmat_supported() refuses.
-          */
-         if ((call->op == nir_cmat_call_op_tensor_load ||
-              call->op == nir_cmat_call_op_tensor_store) &&
-             matrices_supported(call))
-            progress |= lower_tensor_call(&b, call);
-      }
-   }
+   nir_foreach_block_safe(block, impl)
+      progress |= lower_tensor_block(&b, block, pairing);
    if (!progress)
       return nir_no_progress(impl);
 
@@ -1760,16 +2194,105 @@ type_needs_split(const struct glsl_type *type, bool *splittable)
    return true;
 }
 
+/* Whether a type holds an A or B matrix whose K is a multiple of 64. */
+static bool
+type_pairs_k(const struct glsl_type *type)
+{
+   type = glsl_without_array(type);
+   if (glsl_type_is_struct(type)) {
+      for (unsigned i = 0; i < glsl_get_length(type); ++i) {
+         if (type_pairs_k(glsl_get_struct_field(type, i)))
+            return true;
+      }
+      return false;
+   }
+   if (!glsl_type_is_cmat(type))
+      return false;
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
+   return (desc.use == GLSL_CMAT_USE_A && desc.cols % 64 == 0) ||
+          (desc.use == GLSL_CMAT_USE_B && desc.rows % 64 == 0);
+}
+
+static bool
+src_pairs_k(nir_src *src, void *data)
+{
+   if (nir_src_is_deref(*src) && type_pairs_k(nir_src_as_deref(*src)->type)) {
+      *(bool *)data = true;
+      return false;
+   }
+   return true;
+}
+
+/* Whether the shader could tell K paired 64 deep (the tensor loads' comment)
+ * from K in order: a matrix of such a K loaded or stored by coopMatLoad or
+ * coopMatStore, or under an operation that gives an element's place or moves
+ * elements between places. Elementwise operations, element access by index,
+ * products and tensor loads and stores cannot.
+ */
+static bool
+k_order_visible(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            bool visible = false;
+            if (instr->type == nir_instr_type_intrinsic) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_cmat_convert:
+                  /* A conversion between uses (an accumulator to an A
+                   * operand, say) puts its source's elements in K order.
+                   */
+                  if (matrix_desc(intr->src[0]).use != matrix_desc(intr->src[1]).use)
+                     nir_foreach_src(instr, src_pairs_k, &visible);
+                  break;
+               case nir_intrinsic_cmat_construct:
+               case nir_intrinsic_cmat_copy:
+               case nir_intrinsic_cmat_length:
+               case nir_intrinsic_cmat_insert:
+               case nir_intrinsic_cmat_extract:
+               case nir_intrinsic_cmat_unary_op:
+               case nir_intrinsic_cmat_binary_op:
+               case nir_intrinsic_cmat_scalar_op:
+               case nir_intrinsic_cmat_bitcast:
+               case nir_intrinsic_cmat_muladd:
+               case nir_intrinsic_load_deref:
+               case nir_intrinsic_store_deref:
+               case nir_intrinsic_copy_deref:
+                  break;
+               default:
+                  nir_foreach_src(instr, src_pairs_k, &visible);
+                  break;
+               }
+            } else if (instr->type == nir_instr_type_cmat_call) {
+               nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+               if (call->op != nir_cmat_call_op_tensor_load &&
+                   call->op != nir_cmat_call_op_tensor_store)
+                  nir_foreach_src(instr, src_pairs_k, &visible);
+            } else if (instr->type == nir_instr_type_call) {
+               nir_foreach_src(instr, src_pairs_k, &visible);
+            }
+            if (visible)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 /*
  * Matrices of flexible dimensions (VK_NV_cooperative_matrix2
  * cooperativeMatrixFlexibleDimensions), multiples of 16 in each dimension at
  * subgroup scope, as 16x16 pieces (nir_lower_cooperative_matrix_flexible_
  * dimensions). A shader whose matrices are all 16x16 or 8x8 is left alone,
  * and such matrices stay whole in a shader that has larger ones.
+ * *pairing is whether the pieces of A and B matrices whose K is a multiple of
+ * 64 take K paired 64 deep (the tensor loads' comment).
  */
 bool
-agx_nir_lower_cmat_flexible(nir_shader *nir)
+agx_nir_lower_cmat_flexible(nir_shader *nir, bool *pairing)
 {
+   *pairing = false;
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
 
@@ -1782,6 +2305,8 @@ agx_nir_lower_cmat_flexible(nir_shader *nir)
    }
    if (!split || !splittable)
       return false;
+
+   *pairing = !k_order_visible(nir);
 
    const struct nir_lower_coopmat_args args = {
       .m_gran = 16,

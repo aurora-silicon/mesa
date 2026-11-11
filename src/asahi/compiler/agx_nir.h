@@ -278,8 +278,8 @@ struct nir_def *agx_nir_fma_rte_fixup(struct nir_builder *b, struct nir_def *a,
 bool agx_nir_lower_cmat(struct nir_shader *s);
 bool agx_nir_lower_cmat_calls(struct nir_shader *s);
 bool agx_nir_cmat_supported(struct nir_shader *s);
-bool agx_nir_lower_cmat_tensor(struct nir_shader *s);
-bool agx_nir_lower_cmat_flexible(struct nir_shader *s);
+bool agx_nir_lower_cmat_tensor(struct nir_shader *s, bool pairing);
+bool agx_nir_lower_cmat_flexible(struct nir_shader *s, bool *pairing);
 
 bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
