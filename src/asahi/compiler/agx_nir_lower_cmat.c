@@ -1015,12 +1015,12 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
  * two rows of an A operand (two loads of three per row), or a pair of
  * consecutive rows of each of four columns of a transposed operand (four
  * loads of two).
- * A run that crosses the tensor's edge is read element by element with the
- * clamp mode applied, so nothing outside the tensor is read; with the clamp
- * mode undefined there is no bounds test. An element index is 32 bits wide
- * and wraps, which a run's does not: a run across the wrap is read element
- * by element too. Everything else goes through the common per-element
- * addressing (nir_calc_tensor_derefs).
+ * A lane whose elements reach past the tensor's edge reads each of them at
+ * its clamped coordinates, so nothing outside the tensor is read; with the
+ * clamp mode undefined there is no bounds test. An element index is 32 bits
+ * wide and wraps, which a run's does not: a lane with a run across the wrap
+ * reads each element at its own index too. Everything else goes through the
+ * common per-element addressing (nir_calc_tensor_derefs).
  */
 
 /* The offset of element e of a lane from its element 0, in matrix rows and
@@ -1224,8 +1224,9 @@ tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
       cond = nir_iand(b, cond, nir_uge_imm(b, info->clip_col_span, desc.cols));
    }
 
-   /* The span's inner dimension is the matrix's rows (columns, transposed)
-    * and its outer one holds all of the other.
+   /* A row of the matrix lies along the span's inner dimension (its outer
+    * one, transposed), which must be exactly a row long; the other must hold
+    * all of the matrix's rows.
     */
    unsigned inner = fast->transposed ? 0 : 1;
    cond = nir_iand(b, cond, nir_ieq_imm(b, nir_channel(b, info->spans, inner),
@@ -1251,8 +1252,48 @@ tensor_fast_condition(nir_builder *b, struct nir_calc_tensor_info *info,
    return cond;
 }
 
+/* Whether the element indices of the lane's elements of each tensor row
+ * count up from the row's first without wrapping, so that they can be read
+ * or written as runs: an index is 32 bits wide, and each element's wraps
+ * alone. One comparison, of the highest of the rows' first indices with the
+ * last index that leaves room for the longest row.
+ */
+static nir_def *
+rows_unwrapped(nir_builder *b, nir_def *y0, nir_def *x0, nir_def *stride,
+               const unsigned *dy, const unsigned *dx, unsigned count)
+{
+   nir_def *highest = NULL;
+   unsigned longest = 0;
+   uint8_t done = 0;
+   for (unsigned first = 0; first < count; ++first) {
+      if (done & BITFIELD_BIT(first))
+         continue;
+      unsigned lo = ~0u, hi = 0;
+      for (unsigned e = first; e < count; ++e) {
+         if (dy[e] != dy[first])
+            continue;
+         done |= BITFIELD_BIT(e);
+         lo = MIN2(lo, dx[e]);
+         hi = MAX2(hi, dx[e]);
+      }
+      if (hi == lo)
+         continue;
+      nir_def *y = nir_iadd_imm(b, y0, dy[first]);
+      nir_def *idx = nir_iadd(b, nir_imul(b, y, stride), nir_iadd_imm(b, x0, lo));
+      highest = highest ? nir_umax(b, highest, idx) : idx;
+      longest = MAX2(longest, hi - lo);
+   }
+   if (!highest)
+      return nir_imm_true(b);
+   return nir_ult_imm(b, highest, (uint64_t)UINT32_MAX - longest + 1);
+}
+
 /* The common case: a lane's elements in runs of up to four along the
- * tensor's inner dimension.
+ * tensor's inner dimension. One test covers all of the lane's elements, so
+ * that its loads (or stores) issue together; a lane whose elements reach
+ * past the tensor's edge (when the clamp mode is not undefined), or whose
+ * indices wrap within a row, reads each element at its clamped coordinates
+ * and its own index instead.
  */
 static void
 tensor_fast_access(nir_builder *b, struct nir_calc_tensor_info *info,
@@ -1270,14 +1311,25 @@ tensor_fast_access(nir_builder *b, struct nir_calc_tensor_info *info,
    bool checked = info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED;
    nir_tensor_clamp_mode mode = load ? info->clamp_mode : NIR_TENSOR_CLAMP_CONSTANT;
 
-   unsigned dy[8], dx[8];
+   unsigned dy[8], dx[8], max_dy = 0, max_dx = 0;
    for (unsigned e = 0; e < count; ++e) {
       unsigned dr, dc;
       element_offset(desc, e, &dr, &dc);
       dy[e] = fast->transposed ? dc : dr;
       dx[e] = fast->transposed ? dr : dc;
+      max_dy = MAX2(max_dy, dy[e]);
+      max_dx = MAX2(max_dx, dx[e]);
    }
 
+   nir_def *runs_ok = rows_unwrapped(b, y0, x0, fast->stride, dy, dx, count);
+   if (checked) {
+      nir_def *inside = nir_iand(b, coords_inside(b, y0, 0, max_dy, fast->dim0),
+                                 coords_inside(b, x0, 0, max_dx, fast->dim1));
+      runs_ok = nir_iand(b, inside, runs_ok);
+   }
+   nir_if *edge = nir_push_if(b, runs_ok);
+
+   nir_def *run_values[8];
    uint8_t done = 0;
    for (unsigned first = 0; first < count; ++first) {
       if (done & BITFIELD_BIT(first))
@@ -1303,79 +1355,55 @@ tensor_fast_access(nir_builder *b, struct nir_calc_tensor_info *info,
       }
 
       nir_def *y = nir_iadd_imm(b, y0, dy[first]);
-      nir_def *x = nir_iadd_imm(b, x0, start);
-      nir_def *row_at = nir_imul(b, y, fast->stride);
-      nir_def *idx = nir_iadd(b, row_at, x);
-
-      /* The run's elements are at the indices that follow idx, each of
-       * which wraps alone.
-       */
-      nir_def *run_ok = nir_imm_true(b);
-      if (width > 1) {
-         run_ok = nir_ult_imm(b, idx, (uint64_t)UINT32_MAX - (width - 1) + 1);
-      }
-      if (checked) {
-         nir_def *inside = nir_iand(b, coord_inside(b, y, fast->dim0),
-                                    coords_inside(b, x0, start,
-                                                  start + width - 1,
-                                                  fast->dim1));
-         run_ok = nir_iand(b, inside, run_ok);
-      }
-      nir_if *edge = nir_push_if(b, run_ok);
-
-      nir_def *run[4];
+      nir_def *idx = nir_iadd(b, nir_imul(b, y, fast->stride),
+                              nir_iadd_imm(b, x0, start));
       nir_deref_instr *d = tensor_elements(b, ptr, desc, idx, width);
       if (load) {
          nir_def *v = nir_load_deref(b, d);
          for (unsigned i = 0; i < n; ++i)
-            run[i] = nir_channel(b, v, places[i]);
+            run_values[members[i]] = nir_channel(b, v, places[i]);
       } else {
          nir_def *channels[4];
+         unsigned mask = 0;
          for (unsigned i = 0; i < width; ++i)
             channels[i] = nir_undef(b, 1, bits);
-         for (unsigned i = 0; i < n; ++i)
+         for (unsigned i = 0; i < n; ++i) {
             channels[places[i]] = values[members[i]];
-         unsigned mask = 0;
-         for (unsigned i = 0; i < n; ++i)
             mask |= BITFIELD_BIT(places[i]);
+         }
          nir_store_deref(b, d, nir_vec(b, channels, width), mask);
       }
+   }
 
-      nir_push_else(b, edge);
-      nir_def *slow[4];
-      for (unsigned i = 0; i < n; ++i) {
-         nir_def *ey = y, *ex = nir_iadd_imm(b, x0, dx[members[i]]);
-         nir_def *in = NULL;
-         if (checked) {
-            in = nir_iand(b, coord_inside(b, ey, fast->dim0),
-                          coord_inside(b, ex, fast->dim1));
-            ey = nir_bcsel(b, in, ey, clamp_coord(b, mode, ey, fast->dim0));
-            ex = nir_bcsel(b, in, ex, clamp_coord(b, mode, ex, fast->dim1));
-         }
-         nir_deref_instr *ed = tensor_elements(
-            b, ptr, desc, nir_iadd(b, nir_imul(b, ey, fast->stride), ex), 1);
-         if (load) {
-            slow[i] = load_unless(
-               b, ed, checked ? clamp_skip(b, info, in, fast->dim0, fast->dim1) : NULL,
-               clamp_skip_value(b, info, bits));
-         } else {
-            if (checked)
-               nir_push_if(b, in);
-            nir_store_deref(b, ed, values[members[i]], 1);
-            if (checked)
-               nir_pop_if(b, NULL);
-         }
+   nir_push_else(b, edge);
+   nir_def *edge_values[8];
+   for (unsigned e = 0; e < count; ++e) {
+      nir_def *y = nir_iadd_imm(b, y0, dy[e]), *x = nir_iadd_imm(b, x0, dx[e]);
+      nir_def *in = NULL;
+      if (checked) {
+         in = nir_iand(b, coord_inside(b, y, fast->dim0),
+                       coord_inside(b, x, fast->dim1));
+         y = nir_bcsel(b, in, y, clamp_coord(b, mode, y, fast->dim0));
+         x = nir_bcsel(b, in, x, clamp_coord(b, mode, x, fast->dim1));
       }
-      nir_pop_if(b, edge);
+      nir_deref_instr *d = tensor_elements(
+         b, ptr, desc, nir_iadd(b, nir_imul(b, y, fast->stride), x), 1);
       if (load) {
-         for (unsigned i = 0; i < n; ++i)
-            run[i] = nir_if_phi(b, run[i], slow[i]);
+         edge_values[e] = load_unless(
+            b, d, checked ? clamp_skip(b, info, in, fast->dim0, fast->dim1) : NULL,
+            clamp_skip_value(b, info, bits));
+      } else {
+         if (checked)
+            nir_push_if(b, in);
+         nir_store_deref(b, d, values[e], 1);
+         if (checked)
+            nir_pop_if(b, NULL);
       }
-
-      if (load) {
-         for (unsigned i = 0; i < n; ++i)
-            values[members[i]] = run[i];
-      }
+   }
+   nir_pop_if(b, edge);
+   if (load) {
+      for (unsigned e = 0; e < count; ++e)
+         values[e] = nir_if_phi(b, run_values[e], edge_values[e]);
    }
 }
 
