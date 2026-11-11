@@ -560,6 +560,24 @@ agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
    return bo;
 }
 
+/* Asks the kernel to release a BO's memory after that of the VM's other
+ * BOs when it reclaims the VM's idle memory, or withdraws the request. A
+ * hint: see struct drm_asahi_gem_residency. */
+int
+agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep)
+{
+   if (!agx_has_residency_control(dev))
+      return -EOPNOTSUPP;
+
+   struct drm_asahi_gem_residency args = {
+      .handle = bo->uapi_handle,
+      .flags = keep ? DRM_ASAHI_GEM_RESIDENCY_KEEP : 0,
+   };
+
+   return drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_RESIDENCY, &args) ? -errno
+                                                                   : 0;
+}
+
 static void
 agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
             size_t length)
