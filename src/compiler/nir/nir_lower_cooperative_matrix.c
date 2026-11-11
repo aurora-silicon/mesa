@@ -1305,9 +1305,15 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
    for (unsigned dim = 0; dim < nc; dim++) {
       nir_def *c = nir_iadd(b, span_coord[dim], nir_channel(b, info->offsets, dim));
 
+      /* The coordinate is signed and the dimension unsigned: a coordinate
+       * that is not negative is compared with it unsigned, and the repeating
+       * clamp modes divide the coordinate's magnitude (2^31 for INT32_MIN).
+       */
+      nir_def *negative = nir_ilt_imm(b, c, 0);
+      nir_def *magnitude = nir_bcsel(b, negative, nir_ineg(b, c), c);
       nir_def *this_clamp;
       if (info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED) {
-         this_clamp = nir_ior(b, nir_ilt_imm(b, c, 0), nir_ige(b, c, nir_channel(b, info->layout_dims, dim)));
+         this_clamp = nir_ior(b, negative, nir_uge(b, c, nir_channel(b, info->layout_dims, dim)));
          info->do_clamp = nir_ior(b, info->do_clamp, this_clamp);
       } else
          this_clamp = nir_imm_false(b);
@@ -1319,16 +1325,28 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
          c_clamped = nir_imm_int(b, 0);
          break;
       case NIR_TENSOR_CLAMP_EDGE:
-         c_clamped = nir_imin(b, nir_imax_imm(b, c, 0), nir_iadd_imm(b, nir_channel(b, info->layout_dims, dim), -1));
+         c_clamped = nir_umin(b, nir_imax_imm(b, c, 0), nir_iadd_imm(b, nir_channel(b, info->layout_dims, dim), -1));
          break;
-      case NIR_TENSOR_CLAMP_REPEAT:
-         c_clamped = nir_imod(b, c, nir_channel(b, info->layout_dims, dim));
-         break;
-      case NIR_TENSOR_CLAMP_REPEAT_MIRRORED: {
+      case NIR_TENSOR_CLAMP_REPEAT: {
+         /* the remainder of the floored division: dimX - rem below zero */
          nir_def *dimX = nir_channel(b, info->layout_dims, dim);
-         c_clamped = nir_imod(b, c, nir_iadd_imm(b, nir_imul_imm(b, dimX, 2), -2));
-         nir_def *val = nir_isub(b, nir_iadd_imm(b, nir_imul_imm(b, dimX, 2), -2), c_clamped);
-         c_clamped = nir_bcsel(b, nir_ige(b, c_clamped, dimX), val, c_clamped);
+         nir_def *rem = nir_umod(b, magnitude, dimX);
+         nir_def *below = nir_iand(b, negative, nir_ine_imm(b, rem, 0));
+         c_clamped = nir_bcsel(b, below, nir_isub(b, dimX, rem), rem);
+         break;
+      }
+      case NIR_TENSOR_CLAMP_REPEAT_MIRRORED: {
+         /* The period, 2 * dimX - 2, may not fit in 32 bits. The reflection
+          * of c is that of -c, and |c| lies in pass |c| / (dimX - 1) over
+          * the dimension: forwards in the even passes, backwards in the odd
+          * ones. A dimension of one repeats its only element.
+          */
+         nir_def *last = nir_iadd_imm(b, nir_channel(b, info->layout_dims, dim), -1);
+         nir_def *length = nir_umax_imm(b, last, 1);
+         nir_def *pass = nir_udiv(b, magnitude, length);
+         nir_def *rem = nir_isub(b, magnitude, nir_imul(b, pass, length));
+         c_clamped = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, pass, 1), 0),
+                               nir_isub(b, last, rem), rem);
          break;
       }
       }
