@@ -520,13 +520,16 @@ agx_chip_cdm_wide_visibility(enum agx_chip chip)
 
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
- * explicit barriers, and Apple's G15 encoder emits none between independent
- * dispatches; every other record (internal or indirect launch, cache flush,
- * link, stream end) still follows a barrier. */
+ * explicit barriers; every other record (internal or indirect launch, cache
+ * flush, link, stream end) still follows a barrier.  On the M5 Max (G17C)
+ * the barrier holds the next launch until every kernel launched before it
+ * has finished; without it the threadgroups of consecutive launches run
+ * side by side.  G17G and G17S keep the barrier: the change is not measured
+ * there. */
 static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
-   return agx_chip_native_g15(chip);
+   return agx_chip_native_g15(chip) || chip == AGX_CHIP_G17C;
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15

@@ -1565,6 +1565,12 @@ hk_dispatch_precomp_g17p(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    cs->stats.cmds++;
 }
 
+/* Largest per-thread scratch frame of a kernel that may overlap the
+ * application dispatches around it. 64 unordered dispatches of 4096 threads
+ * take as long as ordered ones with 512 bytes per thread and five times as
+ * long with 1 KB. */
+#define HK_M5_OVERLAP_MAX_SCRATCH_B 512
+
 static void
 hk_m5_compute_resources(struct hk_cs *cs, uint32_t scratch_B,
                         uint32_t secondary_B, uint32_t shared_B, uint32_t threads)
@@ -2132,6 +2138,26 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       cs->stats.cmds++;
       return;
    }
+   /* Two application dispatches in a row need no barrier between them: drop
+    * the previous one's weak tail, which nothing else has followed or
+    * strengthened, and let this launch's own tail end the stream instead.
+    * The two then run side by side; a barrier recorded after them waits for
+    * both. Indirect launches and ray-tracing kernels keep their barrier, and
+    * so does a kernel with a large per-thread scratch frame: it runs slower
+    * the more of its threads are in flight, so it stays alone. */
+   const bool app_dispatch =
+      !cmd->in_meta && !internal && !agx_is_indirect(grid) &&
+      !s->b.info.uses_ray_traversal &&
+      !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
+      desc.scratch_size <= HK_M5_OVERLAP_MAX_SCRATCH_B &&
+      agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
+   if (app_dispatch && cs->app_dispatch_end &&
+       cs->current == cs->app_dispatch_end &&
+       cs->current == cs->weak_barrier_end) {
+      cs->current = (uint32_t *)((uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE);
+      sink.data = (uint8_t *)cs->current;
+      sink.capacity += AGX3_CDM_BARRIER_SIZE;
+   }
    const bool appended = agx_is_indirect(grid)
       ? agx3_m5_native_indirect_dispatch_append(
            &launch, grid.ptr,
@@ -2141,6 +2167,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       goto refused;
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
    cs->weak_barrier_end = cs->current;
+   cs->app_dispatch_end = app_dispatch ? cs->current : NULL;
    hk_m5_compute_resources(cs, desc.scratch_size,
                            s->b.info.uses_ray_traversal ? 128 : 0,
                            desc.threadgroup_memory_size_B,
