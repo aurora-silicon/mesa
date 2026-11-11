@@ -125,8 +125,12 @@ matrix_col(nir_builder *b, nir_def *lane,
                          element);
 }
 
+/* The memory of matrix element `element` of this lane, or of the one `skip`
+ * elements after it along its row (a column, for a column-major layout).
+ */
 static nir_deref_instr *
-matrix_memory(nir_builder *b, nir_intrinsic_instr *intr, unsigned element)
+matrix_memory_at(nir_builder *b, nir_intrinsic_instr *intr, unsigned element,
+                 unsigned skip)
 {
    const bool store = intr->intrinsic == nir_intrinsic_cmat_store;
    struct glsl_cmat_description desc = matrix_desc(intr->src[store ? 1 : 0]);
@@ -147,7 +151,14 @@ matrix_memory(nir_builder *b, nir_intrinsic_instr *intr, unsigned element)
    ptr = nir_build_deref_cast(b, &ptr->def, ptr->modes,
                               glsl_scalar_type(desc.element_type),
                               glsl_base_type_bit_size(desc.element_type) / 8);
-   return nir_build_deref_ptr_as_array(b, ptr, nir_u2uN(b, col, bits));
+   return nir_build_deref_ptr_as_array(
+      b, ptr, nir_u2uN(b, nir_iadd_imm(b, col, skip), bits));
+}
+
+static nir_deref_instr *
+matrix_memory(nir_builder *b, nir_intrinsic_instr *intr, unsigned element)
+{
+   return matrix_memory_at(b, intr, element, 0);
 }
 
 static nir_def *
@@ -202,6 +213,31 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
          : (!row_major ? 2 : desc.use == GLSL_CMAT_USE_A ? 1 : 4);
       unsigned component_step = desc.rows == 16 && !row_major ? 4 : 1;
       unsigned component_mask = (width - 1) * component_step;
+      /* A lane's four elements of a row of a 16x16 A operand are every other
+       * one of seven consecutive columns (matrix_col), so they are in two
+       * four-element loads that start at the first and at the fourth of the
+       * seven: the first load's elements 0 and 2, the second's 1 and 3.
+       * Neither reads outside the lane's seven columns. A store cannot
+       * overlap its neighbours' columns and stays scalar.
+       */
+      if (!store && desc.rows == 16 && row_major &&
+          desc.use == GLSL_CMAT_USE_A) {
+         unsigned bytes = glsl_base_type_bit_size(desc.element_type) / 8;
+         for (unsigned i = 0; i < count; i += 4) {
+            for (unsigned half = 0; half < 2; ++half) {
+               nir_deref_instr *ptr = matrix_memory_at(b, intr, i, half * 3);
+               ptr = nir_build_deref_cast_with_alignment(
+                  b, &ptr->def, ptr->modes,
+                  glsl_vector_type(desc.element_type, 4), 0, bytes, 0);
+               nir_def *loaded = nir_load_deref(b, ptr);
+               values[i + half * 2] = nir_channel(b, loaded, half);
+               values[i + half * 2 + 1] = nir_channel(b, loaded, half + 2);
+            }
+         }
+         store_matrix(b, intr->src[0], nir_vec(b, values, count));
+         break;
+      }
+
       for (unsigned i = 0; i < count; ++i) {
          if (i & component_mask)
             continue;
