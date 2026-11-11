@@ -4301,6 +4301,16 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
       return agx_quad_shuffle_to(b, dst, data, lane);
    }
 
+   case nir_intrinsic_shuffle_xor:
+      /* Only constant masks reach here, see agx_nir_lower_subgroups_m5() */
+      if (!nir_src_is_const(instr->src[1])) {
+         b->shader->unsupported_instruction = true;
+         return NULL;
+      }
+
+      return agx_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
+                                agx_immediate(nir_src_as_uint(instr->src[1])));
+
    case nir_intrinsic_quad_swap_horizontal: {
       return agx_quad_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
                                      agx_immediate(1));
@@ -10060,6 +10070,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    agx_optimize_loop_nir(nir, m5, g17p);
 
+   /* Loops are unrolled now: a subgroup XOR shuffle whose mask is still not
+    * a constant takes the general lowering (agx_nir_lower_subgroups.c).
+    */
+   if (m5 && !g18_scans) {
+      bool lowered = false;
+      NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
+      if (lowered)
+         agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.
     */
@@ -10135,7 +10155,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (byte_indices)
          NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
       else if (m5)
-         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5);
+         NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18_scans);
       else
          NIR_PASS(_, nir, agx_nir_lower_subgroups);
    }
@@ -13564,7 +13584,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    if (g17p)
       NIR_PASS(_, nir, agx_nir_lower_subgroups_g17p);
    else if (m5)
-      NIR_PASS(_, nir, agx_nir_lower_subgroups_m5);
+      NIR_PASS(_, nir, agx_nir_lower_subgroups_m5, !g18g);
    else
       NIR_PASS(_, nir, agx_nir_lower_subgroups);
    NIR_PASS(_, nir, nir_lower_all_phis_to_scalar);
