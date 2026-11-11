@@ -192,6 +192,10 @@ struct agx_device {
 
    /* Global queue handle */
    uint32_t queue_id;
+   /* Watchdog allowance of the compute commands of the queues this device
+    * creates, in ms; 0 keeps the kernel's default. Sent only to a kernel with
+    * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT. */
+   uint32_t compute_timeout_ms;
    /* AGX_DBG_1QUEUE: render SCS layouts the shared queue was created with. */
    uint64_t queue_layouts[2];
    enum drm_asahi_priority queue_priority;
