@@ -9,6 +9,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "util/hash_table.h"
 #include "util/set.h"
+#include "util/stack_array.h"
 
 static const struct glsl_type *
 remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
@@ -181,6 +182,28 @@ find_lane_bit(const struct cmat_layout *l, unsigned coord)
          return j;
    }
    return -1;
+}
+
+/* The row (or column) of a lane's element `element` */
+static nir_def *
+layout_coord(nir_builder *b, const struct cmat_layout *l, nir_def *lane,
+             unsigned element, bool col)
+{
+   unsigned imm = 0;
+   for (unsigned i = 0; i < l->element_bits; ++i) {
+      if ((l->element[i] >= COL(0)) == col && (element & (1 << i)))
+         imm |= 1 << COORD_BIT(l->element[i]);
+   }
+   nir_def *coord = nir_imm_int(b, imm);
+   for (unsigned j = 0; j < 5; ++j) {
+      if ((l->lane[j] >= COL(0)) != col)
+         continue;
+      nir_def *bit = nir_iand_imm(b, lane, 1 << j);
+      unsigned to = COORD_BIT(l->lane[j]);
+      bit = to >= j ? nir_ishl_imm(b, bit, to - j) : nir_ushr_imm(b, bit, j - to);
+      coord = nir_ior(b, coord, bit);
+   }
+   return coord;
 }
 
 /* out[i] = subgroupShuffleXor(in[i], mask). The 16-bit values go two to a
@@ -566,6 +589,43 @@ build_matrix(nir_builder *b, nir_deref_instr *dst, nir_def **values, unsigned co
       nir_cmat_insert(b, &dst->def, values[e], &dst->def, nir_imm_int(b, e));
 }
 
+/* coopMatPerElementNV: the function of each element, its row, its column and
+ * the same element of any matrix among the extra arguments.
+ */
+static void
+lower_per_element(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[3]);
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(src->type);
+   const struct cmat_layout *l = matrix_layout(desc);
+   unsigned count = 1 << l->element_bits;
+   unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *values[8];
+   STACK_ARRAY(nir_def *, args, call->num_params - 1);
+
+   for (unsigned e = 0; e < count; ++e) {
+      args[0] = nir_iadd(b, layout_coord(b, l, lane, e, false), call->params[1].ssa);
+      args[1] = nir_iadd(b, layout_coord(b, l, lane, e, true), call->params[2].ssa);
+      args[2] = nir_cmat_extract(b, bits, &src->def, nir_imm_int(b, e));
+      for (unsigned p = 4; p < call->num_params; ++p) {
+         nir_deref_instr *arg = nir_src_as_deref(call->params[p]);
+         if (arg && glsl_type_is_cmat(arg->type)) {
+            struct glsl_cmat_description arg_desc = *glsl_get_cmat_description(arg->type);
+            args[p - 1] = nir_cmat_extract(b, glsl_base_type_bit_size(arg_desc.element_type),
+                                           &arg->def, nir_imm_int(b, e));
+         } else {
+            args[p - 1] = call->params[p].ssa;
+         }
+      }
+      values[e] = call_returning(b, call->callee, glsl_scalar_type(desc.element_type),
+                                 args, call->num_params - 1);
+   }
+   build_matrix(b, dst, values, count);
+   STACK_ARRAY_FINISH(args);
+}
+
 /* coopMatReduceNV. The rows and columns being combined are partly element
  * bits, combined within the lane, and partly lane bits, combined with the
  * lane across each in turn. Each lane then has the result of every row
@@ -711,6 +771,24 @@ agx_nir_cmat_supported(nir_shader *nir)
    return true;
 }
 
+/* coopMatPerElementNV passes element e of each matrix argument with element
+ * e of the source, so every matrix of the call must lie over the lanes as the
+ * source does.
+ */
+static bool
+per_element_layouts_match(nir_cmat_call_instr *call)
+{
+   const struct cmat_layout *l =
+      matrix_layout(*glsl_get_cmat_description(nir_src_as_deref(call->params[3])->type));
+   for (unsigned p = 0; p < call->num_params; ++p) {
+      nir_deref_instr *deref = nir_src_as_deref(call->params[p]);
+      if (deref && glsl_type_is_cmat(deref->type) &&
+          matrix_layout(*glsl_get_cmat_description(deref->type)) != l)
+         return false;
+   }
+   return true;
+}
+
 static bool
 reduce_layouts_match(nir_cmat_call_instr *call)
 {
@@ -740,8 +818,8 @@ reduce_layouts_match(nir_cmat_call_instr *call)
    return true;
 }
 
-/* Lower coopMatReduceNV to calls of its function on the elements, and inline
- * those. This runs before anything else lowers the
+/* Lower coopMatPerElementNV and coopMatReduceNV to calls of their functions on
+ * the elements, and inline those. This runs before anything else lowers the
  * shader, while the functions are still separate.
  */
 bool
@@ -761,6 +839,9 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
          b.cursor = nir_before_instr(instr);
          if (!matrices_supported(call)) {
             continue;
+         } else if (call->op == nir_cmat_call_op_per_element_op &&
+                    per_element_layouts_match(call)) {
+            lower_per_element(&b, call);
          } else if (call->op == nir_cmat_call_op_reduce && reduce_layouts_match(call)) {
             lower_reduce(&b, call);
          } else {

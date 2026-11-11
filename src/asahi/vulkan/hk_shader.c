@@ -446,7 +446,7 @@ void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
    /* Before anything lowers the shader: the functions of matrix
-    * reductions are inlined here.
+    * per-element operations and reductions are inlined here.
     */
    if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip))
       NIR_PASS(_, nir, agx_nir_lower_cmat_calls);
