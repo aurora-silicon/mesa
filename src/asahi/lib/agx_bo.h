@@ -46,6 +46,10 @@ enum agx_bo_flags {
     * including objects which fail before their first successful export. */
    AGX_BO_NO_CACHE = 1 << 7,
 
+   /* BO over memory the application owns (DRM_IOCTL_ASAHI_GEM_USERPTR): _map
+    * is the application's pointer, which is never unmapped or moved, and the
+    * BO is never cached. Implies AGX_BO_NO_CACHE. */
+   AGX_BO_HOST_PTR = 1 << 8,
 };
 
 enum agx_va_flags {
@@ -164,6 +168,8 @@ void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
 
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
+struct agx_bo *agx_bo_import_host_ptr(struct agx_device *dev, void *ptr,
+                                      size_t size);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
 bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 

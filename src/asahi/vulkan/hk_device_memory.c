@@ -17,7 +17,12 @@
 #include "util/u_debug.h"
 #include "vk_common_entrypoints.h"
 
+#include "asahi/lib/agx_device.h"
+#include "util/log.h"
+
+#include <errno.h>
 #include <inttypes.h>
+#include <string.h>
 #include <sys/mman.h>
 
 /* Supports opaque fd only */
@@ -38,6 +43,13 @@ const VkExternalMemoryProperties hk_dma_buf_mem_props = {
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
    .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+};
+
+/* Host allocations can be imported, nothing can be exported from them. */
+const VkExternalMemoryProperties hk_host_ptr_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes = 0,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
 };
 
 static enum agx_bo_flags
@@ -161,6 +173,36 @@ hk_GetMemoryFdPropertiesKHR(VkDevice device,
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetMemoryHostPointerPropertiesEXT(
+   VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer,
+   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+       !agx_has_userptr(&dev->dev))
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   const uint64_t alignment =
+      pdev->vk.properties.minImportedHostPointerAlignment;
+   if ((uintptr_t)pHostPointer % alignment)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   /* The application's own mapping is cacheable, and the GPU coherent with
+    * it: offer the cached types. */
+   uint32_t type_bits = 0;
+   for (unsigned t = 0; t < pdev->mem_type_count; t++) {
+      if (pdev->mem_types[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+         type_bits |= 1u << t;
+   }
+
+   pMemoryHostPointerProperties->memoryTypeBits = type_bits;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
 hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
 {
@@ -176,6 +218,8 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info =
       vk_find_struct_const(pAllocateInfo->pNext,
                            MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+   const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
+      pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
 
    VkExternalMemoryHandleTypeFlagBits handle_types = 0;
@@ -233,6 +277,28 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          goto fail_alloc;
       }
       assert(!(flags & ~mem->bo->flags));
+   } else if (host_info && host_info->handleType) {
+      /* The pointer and the size are multiples of
+       * minImportedHostPointerAlignment (VUID-VkImportMemoryHostPointerInfoEXT-
+       * pHostPointer-01749, VUID-VkMemoryAllocateInfo-allocationSize-01745).
+       * Memory the kernel cannot pin for writing (a read-only mapping of a
+       * file) is refused: nothing in the API keeps a buffer bound to it from
+       * being a transfer destination or a storage buffer the GPU writes.
+       */
+      assert(host_info->handleType ==
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
+      mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
+                                       pAllocateInfo->allocationSize);
+      if (mem->bo == NULL) {
+         const int err = errno;
+         result = vk_errorf(dev,
+                            err == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                                          : VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "importing %" PRIu64 " bytes of host memory at %p: %s",
+                            (uint64_t)pAllocateInfo->allocationSize,
+                            host_info->pHostPointer, strerror(err));
+         goto fail_alloc;
+      }
    } else {
       enum agx_bo_flags flags = 0;
       if (handle_types)
@@ -442,6 +508,13 @@ hk_UnmapMemory2KHR(VkDevice device,
       mem->map = NULL;
       mem->map_size = 0;
       mem->map_owned = false;
+      return VK_SUCCESS;
+   }
+
+   /* Imported host memory stays mapped where the application put it
+    * (VUID-VkMemoryUnmapInfo-flags-09579 excludes reserving it). */
+   if (mem->bo->flags & AGX_BO_HOST_PTR) {
+      mem->map = NULL;
       return VK_SUCCESS;
    }
 

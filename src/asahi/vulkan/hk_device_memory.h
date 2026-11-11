@@ -39,3 +39,4 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,
 
 extern const VkExternalMemoryProperties hk_opaque_fd_mem_props;
 extern const VkExternalMemoryProperties hk_dma_buf_mem_props;
+extern const VkExternalMemoryProperties hk_host_ptr_mem_props;

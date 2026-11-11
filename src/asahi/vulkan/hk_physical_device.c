@@ -245,6 +245,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
+      .EXT_external_memory_host = agx_has_userptr(dev),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -1503,6 +1504,10 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
+
+      /* VK_EXT_external_memory_host: whole pages of both the CPU and the
+       * GPU, which binds in 16 KiB pages. */
+      .minImportedHostPointerAlignment = MAX2(os_page_size, 16384),
 
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT16_MAX,

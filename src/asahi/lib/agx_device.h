@@ -376,6 +376,10 @@ agx_bo_map_size(const struct agx_bo *bo)
 static inline void *
 agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr, size_t length)
 {
+   /* Application memory is mapped where the application put it. */
+   if (bo->flags & AGX_BO_HOST_PTR)
+      return fixed_addr && fixed_addr != bo->_map ? NULL : bo->_map;
+
    /* The BO cache deliberately preserves CPU mappings.  A Vulkan allocation
     * may therefore inherit a mapping from an earlier allocation even though
     * the new VkDeviceMemory object has never been mapped.  A placed map must
@@ -414,7 +418,7 @@ static inline void *
 agx_bo_map_owned(struct agx_bo *bo, void *fixed_addr, size_t length,
                  size_t *size)
 {
-   if (!bo->dev->ops.bo_mmap_independent)
+   if (!bo->dev->ops.bo_mmap_independent || (bo->flags & AGX_BO_HOST_PTR))
       return NULL;
 
    struct agx_bo copy = *bo;
@@ -432,6 +436,14 @@ agx_bo_unmap_owned(struct agx_bo *bo, void *map, size_t size)
    copy._map = map;
    copy._map_size = size;
    bo->dev->ops.bo_munmap(bo->dev, &copy);
+}
+
+/* The kernel can create BOs over application memory (GEM_USERPTR). */
+static inline bool
+agx_has_userptr(const struct agx_device *dev)
+{
+   return !dev->is_virtio &&
+          (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
 }
 
 static inline bool

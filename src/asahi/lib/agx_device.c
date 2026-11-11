@@ -125,7 +125,8 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
 {
    const uint64_t handle = bo->handle;
 
-   if (bo->_map)
+   /* The application owns the mapping of a host-pointer BO. */
+   if (bo->_map && !(bo->flags & AGX_BO_HOST_PTR))
       dev->ops.bo_munmap(dev, bo);
 
    if (bo->g17p_vdm_alias) {
@@ -458,6 +459,86 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
          return bo;
 
       agx_bo_free(dev, bo);
+      return NULL;
+   }
+
+   return bo;
+}
+
+static int
+agx_drm_bo_userptr(struct agx_device *dev, void *ptr, size_t size,
+                   uint32_t *handle)
+{
+   struct drm_asahi_gem_userptr args = {
+      .userptr = (uintptr_t)ptr,
+      .size = size,
+      .flags = DRM_ASAHI_GEM_VM_PRIVATE,
+      .vm_id = dev->vm_id,
+   };
+
+   if (drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_USERPTR, &args))
+      return -errno;
+
+   *handle = args.handle;
+   return 0;
+}
+
+/*
+ * A BO over `size` bytes of application memory at `ptr`, both multiples of
+ * the page size, without a copy. The kernel pins the pages for the BO's life,
+ * for writing: the GPU may write the memory wherever the API lets it. NULL,
+ * with errno set, when the kernel refuses the range (EFAULT for memory the
+ * application cannot write, a read-only mapping of a file, say).
+ */
+struct agx_bo *
+agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size)
+{
+   if (!agx_has_userptr(dev)) {
+      errno = EOPNOTSUPP;
+      return NULL;
+   }
+
+   uint32_t handle = 0;
+   int ret = agx_drm_bo_userptr(dev, ptr, size, &handle);
+   if (ret) {
+      errno = -ret;
+      return NULL;
+   }
+
+   simple_mtx_lock(&dev->bo_map_lock);
+   struct agx_bo *bo = agx_lookup_bo(dev, handle);
+   agx_include_bo_handle(dev, handle);
+   simple_mtx_unlock(&dev->bo_map_lock);
+
+   /* Fresh handle */
+   assert(!memcmp(bo, &((struct agx_bo){}), sizeof(*bo)));
+
+   bo->dev = dev;
+   bo->size = size;
+   bo->align = AIL_PAGESIZE;
+   bo->flags = AGX_BO_HOST_PTR | AGX_BO_NO_CACHE;
+   bo->handle = bo->uapi_handle = handle;
+   bo->prime_fd = -1;
+   bo->label = "Host memory";
+   bo->_map = ptr;
+   bo->_map_size = size;
+   p_atomic_set(&bo->refcnt, 1);
+
+   if (dev->debug & (AGX_DBG_TRACE | AGX_DBG_ASYNCTRACE))
+      agxdecode_track_alloc(dev->agxdecode, bo);
+
+   bo->va = agx_va_alloc(dev, size, bo->align, 0, 0);
+   if (!bo->va) {
+      agx_bo_free(dev, bo);
+      errno = ENOMEM;
+      return NULL;
+   }
+
+   if (agx_bo_bind(dev, bo, bo->va->addr, bo->size, 0,
+                   DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE)) {
+      int err = errno;
+      agx_bo_free(dev, bo);
+      errno = err;
       return NULL;
    }
 
