@@ -1020,8 +1020,10 @@ agx_nir_lower_cmat_calls(nir_shader *nir)
  * its clamped coordinates, so no address outside the tensor is read; with the
  * clamp mode undefined there is no bounds test. An element index is 32 bits
  * wide and wraps, which a run's does not: a lane with a run across the wrap
- * reads each element at its own index too. Everything else goes through the
- * common per-element addressing (nir_calc_tensor_derefs).
+ * reads each element at its own index too. With a constant clamp, a lane
+ * whose rows are all past the tensor reads the zero page instead (global
+ * memory). Everything else goes through the common per-element addressing
+ * (nir_calc_tensor_derefs).
  *
  * K paired 64 deep. A product's sum over K may be taken in any order, so the
  * 16-deep pieces of an A (M x K) or B (K x N) matrix of flexible dimensions
@@ -1614,12 +1616,45 @@ tensor_fast_load(nir_builder *b, struct nir_calc_tensor_info *info,
    }
    fast_ok = nir_iand(b, fast_ok, rows_unwrapped(b, it, fast->stride, wide));
 
+   /* With a constant clamp in global memory, a lane whose rows are all past
+    * the tensor's (the rows of a tile past a matrix's) takes the clamp value
+    * where its runs read the zero page, instead of each element apart: its
+    * first row is at or after the tensor's last, or its last row before the
+    * tensor's first.
+    */
+   struct tensor_items read = *it;
+   nir_deref_instr *tensor = ptr;
+   nir_def *stride = fast->stride, *rows_out = NULL;
+   if (info->clamp_mode == NIR_TENSOR_CLAMP_CONSTANT &&
+       nir_deref_mode_is(ptr, nir_var_mem_global)) {
+      nir_def *reads = fast_ok;
+      rows_out = nir_ior(b, nir_iand(b, nir_ige_imm(b, it->y0, 0),
+                                     nir_uge(b, it->y0, fast->dim0)),
+                         nir_ilt_imm(b, it->y0, -(int)it->max_dy));
+      fast_ok = nir_ior(b, fast_ok, rows_out);
+      nir_def *zero = nir_imm_int(b, 0);
+      tensor = nir_build_deref_cast(
+         b, nir_bcsel(b, reads, global_address(b, ptr),
+                      nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS)),
+         nir_var_mem_global, glsl_scalar_type(desc.element_type), bits / 8);
+      stride = nir_bcsel(b, reads, stride, zero);
+      read.y0 = nir_bcsel(b, reads, it->y0, zero);
+      read.x0 = nir_bcsel(b, reads, it->x0, it->parity ? it->parity : zero);
+   }
+
    nir_def *fast_values[TENSOR_MAX_ELEMENTS], *other_values[TENSOR_MAX_ELEMENTS];
    nir_if *nif = nir_push_if(b, fast_ok);
    if (wide)
-      load_vectors(b, it, fast->stride, ptr, fast_values);
+      load_vectors(b, &read, stride, tensor, fast_values);
    else
-      load_runs(b, it, fast->stride, ptr, desc, fast_values);
+      load_runs(b, &read, stride, tensor, desc, fast_values);
+   if (rows_out) {
+      nir_def *replace = nir_iand(b, rows_out, nir_ine_imm(b, info->clamp_value, 0));
+      for (unsigned i = 0; i < it->count; ++i) {
+         fast_values[i] = nir_bcsel(b, replace, nir_u2uN(b, info->clamp_value, bits),
+                                    fast_values[i]);
+      }
+   }
    nir_push_else(b, nif);
    if (!checked && wide) {
       /* Rows not 4-byte aligned, or indices that wrap within a vector. */
