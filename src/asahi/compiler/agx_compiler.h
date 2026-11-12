@@ -1329,6 +1329,7 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
 bool agx3_interp_coords_from_itrcoords(const agx_context *ctx);
+bool agx3_merge_unread_pixel_waits(agx_context *ctx);
 const char *agx3_last_pack_refusal(void);
 
 #ifndef NDEBUG

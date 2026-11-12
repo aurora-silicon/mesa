@@ -12163,7 +12163,7 @@ agx3_drop_unchanged_tile_stores(agx_context *ctx)
  * the next write wait of its block, or drop the colour waits when nothing is
  * stored either.
  */
-static bool
+bool
 agx3_merge_unread_pixel_waits(agx_context *ctx)
 {
    if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
