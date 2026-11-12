@@ -402,8 +402,11 @@ struct hk_agx3_plan_args {
    uint64_t retained_offset;
    uint32_t build_flags;
    uint32_t keep_retained;
-   /* Nonzero to encode sibling triangle leaves that share an edge as one
-    * native record (see hk_agx3_shared_edge); triangle geometry only. */
+   /* HK_AGX3_PAIRS_SIBLINGS to encode sibling triangle leaves that share
+    * an edge as one native record (see hk_agx3_shared_edge);
+    * HK_AGX3_PAIRS_IR_QUADS when the common builder already paired
+    * triangles into IR quads (late pair compression) before building the
+    * tree. Triangle geometry only. */
    uint32_t pairs;
    /* Nonzero to give each wide inner node the children chosen by opening
     * its largest-area binary descendants (agx3_plan.comp wide_children())
@@ -462,6 +465,13 @@ struct hk_agx3_batch_args {
 #define HK_AGX3_PLAN_PAIR_OPAQUE 0x40000000u
 /* Set in a leaf job's triangle offset when it names such an internal node. */
 #define HK_AGX3_LEAF_PAIR_OFFSET 1u
+/* Set in a leaf job's triangle offset when it names an IR triangle leaf
+ * that carries a vk_ir_triangle_node_quad (it may hold a second triangle). */
+#define HK_AGX3_LEAF_QUAD_OFFSET 2u
+/* hk_agx3_plan_args.pairs */
+#define HK_AGX3_PAIRS_NONE 0u
+#define HK_AGX3_PAIRS_SIBLINGS 1u
+#define HK_AGX3_PAIRS_IR_QUADS 2u
 #define HK_AGX3_PLAN_INDEX 1
 #define HK_AGX3_PLAN_CYCLE 2
 #define HK_AGX3_PLAN_ALLOCATION 4

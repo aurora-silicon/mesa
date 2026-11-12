@@ -374,6 +374,32 @@ main()
             else
                arrange_pair(p, my_primitive, my_primitive1, b, edges,
                             DEREF(second).triangle_id);
+         } else if ((job.triangle_offsets[lane] & HK_AGX3_LEAF_QUAD_OFFSET) != 0u) {
+            /* An IR quad: the second triangle shares edge e0 of the first,
+             * running the other way as its own edge e1, and adds the vertex
+             * opposite that edge. */
+            REF(vk_ir_triangle_node_quad) quad = REF(vk_ir_triangle_node_quad)(
+               OFFSET(job.intermediate_bvh, offset + SIZEOF(vk_ir_triangle_node)));
+            uint quad_id = DEREF(quad).triangle_id;
+            if (quad_id != VK_QUAD_TRIANGLE_ID_UNUSED) {
+               uint e0 = (quad_id >> 28) & 3u, e1 = (quad_id >> 30) & 3u;
+               vec3 a[3] = vec3[3](p[0], p[1], p[2]), b[3];
+               vec3 extra = vec3(DEREF(quad).coords[0], DEREF(quad).coords[1],
+                                 DEREF(quad).coords[2]);
+               if (e0 > 2u || e1 > 2u) {
+                  my_bad |= HK_AGX3_LEAF_RANGE;
+               } else {
+                  b[e1] = a[(e0 + 1u) % 3u];
+                  b[(e1 + 1u) % 3u] = a[e0];
+                  b[(e1 + 2u) % 3u] = extra;
+                  uint edges = hk_agx3_shared_edge(a, b);
+                  if (edges == ~0u)
+                     my_bad |= HK_AGX3_LEAF_RANGE;
+                  else
+                     arrange_pair(p, my_primitive, my_primitive1, b, edges,
+                                  quad_id & 0x0fffffffu);
+               }
+            }
          }
          for (uint v = 0; v < 4; ++v) {
             for (uint a = 0; a < 3; ++a)

@@ -49,7 +49,10 @@ leaf_size()
    return args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
              ? SIZEOF(vk_ir_instance_node)
              : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                ? SIZEOF(vk_ir_aabb_node) : SIZEOF(vk_ir_triangle_node);
+                ? SIZEOF(vk_ir_aabb_node)
+                : SIZEOF(vk_ir_triangle_node) +
+                     (args.pairs == HK_AGX3_PAIRS_IR_QUADS
+                         ? SIZEOF(vk_ir_triangle_node_quad) : 0u);
 }
 
 uint
@@ -572,7 +575,10 @@ emit(uint id)
          source_offset(selected[c]) |
          (leaf && selected[c] >= args.leaf_bound ? HK_AGX3_LEAF_PAIR_OFFSET : 0u);
 #else
-      DEREF(job).triangle_offsets[c] = source_offset(selected[c]);
+      DEREF(job).triangle_offsets[c] =
+         source_offset(selected[c]) |
+         (leaf && args.pairs == HK_AGX3_PAIRS_IR_QUADS ? HK_AGX3_LEAF_QUAD_OFFSET
+                                                        : 0u);
 #endif
       if (!leaf) {
          uint child_job =

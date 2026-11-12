@@ -917,7 +917,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
          return result;
    }
 
-   const unsigned plan = args->pairs ? 4 : 0;
+   const unsigned plan = args->pairs == HK_AGX3_PAIRS_SIBLINGS ? 4 : 0;
    vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipeline[plan]);
    const VkMemoryBarrier barrier = {
@@ -1256,7 +1256,9 @@ hk_vertex_table_build(VkCommandBuffer commandBuffer,
       .leaf_count = table.primitives,
       .geometry_count = table.geometry_count,
       .vertices_offset = table.vertices_offset,
-      .leaf_stride = sizeof(struct vk_ir_triangle_node),
+      .leaf_stride = sizeof(struct vk_ir_triangle_node) +
+                     (state->config.late_pair_compression
+                         ? sizeof(struct vk_ir_triangle_node_quad) : 0),
    };
    vk_common_CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
    vk_common_CmdPushConstants(commandBuffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
@@ -1331,12 +1333,15 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
              * triangle per record, so only triangle structures that cannot
              * be updated pair triangles; and not those preferring a fast
              * build, where finding pairs costs more than it saves. */
-            .pairs = !allow_update &&
-                     vk_get_as_geometry_type(state->build_info) ==
-                        VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
-                     !(state->build_info->flags &
-                       VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) &&
-                     !(perf_arm & HK_G17P_RT_PERF_NO_TRI_PAIRS),
+            .pairs = state->config.late_pair_compression
+                        ? HK_AGX3_PAIRS_IR_QUADS
+                     : !allow_update &&
+                       vk_get_as_geometry_type(state->build_info) ==
+                          VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+                       !(state->build_info->flags &
+                         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) &&
+                       !(perf_arm & HK_G17P_RT_PERF_NO_TRI_PAIRS)
+                        ? HK_AGX3_PAIRS_SIBLINGS : HK_AGX3_PAIRS_NONE,
             .wide_children = !allow_update &&
                              (perf_arm & HK_G17P_RT_PERF_WIDE_CHILDREN),
          };
@@ -1646,6 +1651,18 @@ hk_native_build_config(VkDevice device,
       state->config.internal_type = VK_INTERNAL_BUILD_TYPE_UPDATE;
    state->config.updateable =
       (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0;
+   /* Pair triangles into IR quads before the tree is built, so the tree
+    * partitions records rather than single triangles. Only for native
+    * fast-trace triangle BLASes that cannot be updated: updates refit one
+    * triangle per record. */
+   state->config.late_pair_compression =
+      dev->g17p_native_as &&
+      (hk_g17p_rt_perf_arm(&dev->dev) & HK_G17P_RT_PERF_IR_QUADS) &&
+      !state->config.updateable &&
+      state->build_info->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+      vk_get_as_geometry_type(state->build_info) == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+      !(state->build_info->flags &
+        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR);
 }
 
 static VkDeviceSize
