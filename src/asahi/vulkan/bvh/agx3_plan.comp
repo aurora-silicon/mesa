@@ -816,8 +816,12 @@ finish(uint id)
       REF(vk_ir_node)(OFFSET(args.intermediate_bvh, source_offset(root)));
    job.output_bvh = args.output_bvh;
    job.end_slot = DEREF(args.state).next_slot;
+   /* After late pair compression active_leaf_count counts IR records; the
+    * triangles are those that entered it. */
    job.primitive_count =
-      DEREF(args.state).error == 0 ? DEREF(args.header).active_leaf_count : 0;
+      DEREF(args.state).error != 0 ? 0
+      : args.pairs == HK_AGX3_PAIRS_IR_QUADS ? DEREF(args.header).tmp_active_leaf_count
+      : DEREF(args.header).active_leaf_count;
    job.node_count = DEREF(args.state).job_count;
    job.depth = DEREF(args.state).depth;
    job.opaque_build_word = DEREF(args.state).error == HK_AGX3_PLAN_EMPTY
