@@ -23,6 +23,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#extension GL_KHR_memory_scope_semantics : require
 #include "hk_build_interface.h"
 
 layout(local_size_x = 64) in;
@@ -298,6 +299,215 @@ wide_children(uint root, out uint list[8])
    return count;
 }
 
+/* HK_AGX3_WIDE_SAH: choose the children of each wide node to minimise the
+ * surface-area estimate of traversal cost over the binary tree's own
+ * partition (as in Ylitie, Karras and Laine, "Efficient Incoherent Ray
+ * Traversal on GPUs Through Compressed Wide BVHs", HPG 2017). A subtree of at
+ * most eight records stays one leaf cluster and a larger one is always a
+ * wide inner node, as with the fixed collapse; the cost only decides how
+ * deep each wide node reaches into each part of its subtree.
+ *
+ * A ray reaches a node with probability proportional to its parent's
+ * bounds' area. Visiting a native node tests all its child boxes at once;
+ * a leaf cluster then tests the records whose boxes the ray hits. */
+#define WIDE_NODE_COST 1.0
+#define WIDE_RECORD_COST 1.0
+
+REF(hk_agx3_plan_cost)
+cost_record(uint index)
+{
+   return INDEX(hk_agx3_plan_cost, args.nodes + uint64_t(args.node_bound) *
+                                        uint64_t(SIZEOF(hk_agx3_plan_node)),
+                index);
+}
+
+float
+subtree_cost(uint index, uint children)
+{
+   return DEREF(cost_record(index)).cost[children - 1u];
+}
+
+/* Leaf-cluster cost: one node visit plus the records' tests. */
+float
+cluster_cost(uint start)
+{
+   uint stack[9], sp = 1, steps = 0;
+   float records = 0.0;
+   stack[0] = start;
+   while (sp != 0) {
+      if (++steps > 64u) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return 0.0;
+      }
+      uint index = stack[--sp];
+      bool record = index < args.leaf_bound;
+#ifdef HK_AGX3_PLAN_PAIRS
+      record = record || is_pair(index);
+#endif
+      if (record) {
+         records += node_area(index);
+         continue;
+      }
+      uvec2 pair = children(index);
+      for (uint c = 0; c < 2; c++)
+         if (pair[c] != VK_BVH_INVALID_NODE) {
+            uint child = source_index(pair[c]);
+            if (child == 0xffffffffu || sp == 9) {
+               fail(HK_AGX3_PLAN_SHAPE);
+               return 0.0;
+            }
+            stack[sp++] = child;
+         }
+   }
+   return node_area(start) * WIDE_NODE_COST + records * WIDE_RECORD_COST;
+}
+
+/* The k in [1, total - 1] for which a's cost as k children plus b's as
+ * total - k is least; the first such k. */
+uint
+best_split(uint a, uint b, uint total, out float best)
+{
+   uint k_best = 1;
+   best = subtree_cost(a, 1) + subtree_cost(b, total - 1u);
+   for (uint k = 2; k < total; k++) {
+      float c = subtree_cost(a, k) + subtree_cost(b, total - k);
+      if (c < best) {
+         best = c;
+         k_best = k;
+      }
+   }
+   return k_best;
+}
+
+/* Phase HK_AGX3_PLAN_PHASE_COST: from every leaf-cluster root up to the
+ * root, the last of a node's children to finish computes its costs. */
+void
+compute_costs(uint id)
+{
+   if (id >= args.node_bound || id == root_index())
+      return;
+   hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.nodes, id));
+   if (node.parent == 0xffffffffu || node.leaf_count > 8 ||
+       DEREF(INDEX(hk_agx3_plan_node, args.nodes, node.parent)).leaf_count <= 8)
+      return;
+   float leaf = cluster_cost(id);
+   for (uint i = 0; i < 8; i++)
+      DEREF(cost_record(id)).cost[i] = leaf;
+   uint cursor = node.parent;
+   for (uint steps = 0; steps <= args.node_bound; steps++) {
+      uvec2 pair = children(cursor);
+      uint valid = (pair[0] != VK_BVH_INVALID_NODE ? 1u : 0u) +
+                   (pair[1] != VK_BVH_INVALID_NODE ? 1u : 0u);
+      uint arrived = atomicAdd(DEREF(cost_record(cursor)).arrivals, 1u,
+         gl_ScopeDevice, gl_StorageSemanticsBuffer,
+         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable |
+            gl_SemanticsMakeVisible);
+      if (arrived + 1u < valid)
+         return;
+      float own = node_area(cursor) * WIDE_NODE_COST;
+      float dist[8];
+      if (valid == 1u) {
+         uint only = source_index(pair[0] != VK_BVH_INVALID_NODE ? pair[0] : pair[1]);
+         for (uint i = 0; i < 8; i++)
+            dist[i] = subtree_cost(only, i + 1u);
+      } else {
+         uint a = source_index(pair[0]), b = source_index(pair[1]);
+         dist[0] = 1e30;
+         for (uint j = 2; j <= 8; j++)
+            best_split(a, b, j, dist[j - 1u]);
+      }
+      float costs[8];
+      costs[0] = dist[7] + own;
+      for (uint i = 1; i < 8; i++)
+         costs[i] = min(dist[i], costs[i - 1u]);
+      for (uint i = 0; i < 8; i++)
+         DEREF(cost_record(cursor)).cost[i] = costs[i];
+      memoryBarrierBuffer();
+      if (cursor == root_index())
+         return;
+      cursor = DEREF(INDEX(hk_agx3_plan_node, args.nodes, cursor)).parent;
+      if (cursor >= args.node_bound) {
+         fail(HK_AGX3_PLAN_INDEX);
+         return;
+      }
+   }
+   fail(HK_AGX3_PLAN_CYCLE);
+}
+
+/* The children of the wide inner node over `root` under HK_AGX3_WIDE_SAH,
+ * in the binary tree's left-to-right order. Returns the count, 0 on a
+ * malformed tree. */
+uint
+sah_children(uint root, out uint list[8])
+{
+   uint stack_node[8], stack_count[8], sp = 0, count = 0;
+   uvec2 pair = children(root);
+   if (pair[0] == VK_BVH_INVALID_NODE || pair[1] == VK_BVH_INVALID_NODE) {
+      uint only = pair[0] != VK_BVH_INVALID_NODE ? pair[0] : pair[1];
+      if (only == VK_BVH_INVALID_NODE)
+         return 0;
+      stack_node[0] = source_index(only);
+      stack_count[0] = 8;
+      sp = 1;
+   } else {
+      uint a = source_index(pair[0]), b = source_index(pair[1]);
+      if (a == 0xffffffffu || b == 0xffffffffu)
+         return 0;
+      float c;
+      uint k = best_split(a, b, 8, c);
+      stack_node[0] = b;
+      stack_count[0] = 8u - k;
+      stack_node[1] = a;
+      stack_count[1] = k;
+      sp = 2;
+   }
+   for (uint steps = 0; sp != 0 && steps < 64u; steps++) {
+      uint node = stack_node[--sp], total = stack_count[sp];
+      if (node == 0xffffffffu)
+         return 0;
+      /* The fewest children that cost as little as `total` may. */
+      uint used = total;
+      if (openable(node))
+         while (used > 1u &&
+                subtree_cost(node, used - 1u) == subtree_cost(node, total))
+            used--;
+      else
+         used = 1;
+      if (used == 1u) {
+         if (count == 8u)
+            return 0;
+         list[count++] = node;
+         continue;
+      }
+      pair = children(node);
+      if (pair[0] == VK_BVH_INVALID_NODE || pair[1] == VK_BVH_INVALID_NODE) {
+         uint only = pair[0] != VK_BVH_INVALID_NODE ? pair[0] : pair[1];
+         if (sp == 8u)
+            return 0;
+         stack_node[sp] = source_index(only);
+         stack_count[sp++] = used;
+         continue;
+      }
+      uint a = source_index(pair[0]), b = source_index(pair[1]);
+      if (a == 0xffffffffu || b == 0xffffffffu || sp > 6u)
+         return 0;
+      float c;
+      uint k = best_split(a, b, used, c);
+      stack_node[sp] = b;
+      stack_count[sp++] = used - k;
+      stack_node[sp] = a;
+      stack_count[sp++] = k;
+   }
+   return sp == 0 ? count : 0u;
+}
+
+uint
+collapse_children(uint root, out uint list[8])
+{
+   return args.wide_children == HK_AGX3_WIDE_SAH ? sah_children(root, list)
+                                                 : wide_children(root, list);
+}
+
 /* Binary ancestors of one node by depth, a window at a time. */
 uint path_window[32];
 uint path_base;
@@ -332,7 +542,7 @@ wide_level(uint id, uint id_depth, uint root)
       if (node == id)
          return level;
       uint list[8];
-      uint count = wide_children(node, list);
+      uint count = collapse_children(node, list);
       if (count == 0u)
          return ~0u;
       uint next = ~0u;
@@ -370,6 +580,8 @@ initialize(uint id)
       node.job = 0xffffffffu;
 #endif
       DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)) = node;
+      if (args.wide_children == HK_AGX3_WIDE_SAH)
+         DEREF(cost_record(id)).arrivals = 0;
    }
    if (id == 0) {
       hk_agx3_plan_state state;
@@ -509,7 +721,7 @@ emit(uint id)
    stack[0] = id;
    level[0] = 0;
    if (!leaf && args.wide_children != 0u) {
-      count = wide_children(id, selected);
+      count = collapse_children(id, selected);
       if (count == 0u) {
          fail(HK_AGX3_PLAN_SHAPE);
          return;
@@ -641,6 +853,8 @@ main()
       return;
    if (args.phase == 1)
       link_and_count(id);
+   if (args.phase == HK_AGX3_PLAN_PHASE_COST)
+      compute_costs(id);
    if (args.phase == 2)
       classify(id);
    if (args.phase == 3)

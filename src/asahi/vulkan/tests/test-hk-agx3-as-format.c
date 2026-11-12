@@ -51,7 +51,8 @@ check_layout(enum hk_agx3_as_format format, uint32_t leaves,
    const uint64_t nodes = (uint64_t)leaves + (leaves > 1 ? leaves : 2) - 1;
    const uint64_t slots = (uint64_t)leaves * 4 + 1;
    assert(l->node_bound == nodes && l->slot_bound == slots);
-   assert(l->jobs == nodes * 16 && l->envelope == l->jobs + nodes * 64);
+   assert(l->jobs == nodes * (16 + (format == HK_AGX3_AS_FORMAT_GEN1 ? 40 : 0)) &&
+          l->envelope == l->jobs + nodes * 64);
    assert(l->state == l->envelope + 48);
    /* GEN1's plan writes the indirect encode dispatch after its state. */
    assert(l->node_status == l->state + tail);

@@ -374,9 +374,20 @@ struct hk_agx3_plan_state {
    uint32_t saved_positions;
 };
 
+/* GEN1 wide collapse by cost (HK_AGX3_WIDE_SAH): after the node_bound plan
+ * nodes, one record per node. cost[i - 1] is the least expected cost of
+ * the node's subtree as at most i children of a wide node, in units of
+ * the root's surface area times one node visit. */
+struct hk_agx3_plan_cost {
+   float cost[8];
+   uint32_t arrivals;
+   uint32_t reserved;
+};
+
 #ifdef VULKAN
 TYPE(hk_agx3_plan_node, 4);
 TYPE(hk_agx3_plan_state, 4);
+TYPE(hk_agx3_plan_cost, 4);
 #endif
 
 struct hk_agx3_plan_args {
@@ -408,10 +419,10 @@ struct hk_agx3_plan_args {
     * triangles into IR quads (late pair compression) before building the
     * tree. Triangle geometry only. */
    uint32_t pairs;
-   /* Nonzero to give each wide inner node the children chosen by opening
-    * its largest-area binary descendants (agx3_plan.comp wide_children())
-    * instead of a fixed three binary levels. Not for builds that allow
-    * updates: their refit levels follow the fixed collapse. */
+   /* How a wide inner node picks its children (HK_AGX3_WIDE_*): a fixed
+    * three binary levels, opening its largest-area binary descendants, or
+    * the least expected cost. Not for builds that allow updates: their
+    * refit levels follow the fixed collapse. */
    uint32_t wide_children;
 };
 
@@ -472,6 +483,13 @@ struct hk_agx3_batch_args {
 #define HK_AGX3_PAIRS_NONE 0u
 #define HK_AGX3_PAIRS_SIBLINGS 1u
 #define HK_AGX3_PAIRS_IR_QUADS 2u
+/* hk_agx3_plan_args.wide_children */
+#define HK_AGX3_WIDE_LEVELS 0u
+#define HK_AGX3_WIDE_AREA 1u
+#define HK_AGX3_WIDE_SAH 2u
+/* The plan phase that fills the hk_agx3_plan_cost records, between phases
+ * 1 and 2. */
+#define HK_AGX3_PLAN_PHASE_COST 5u
 #define HK_AGX3_PLAN_INDEX 1
 #define HK_AGX3_PLAN_CYCLE 2
 #define HK_AGX3_PLAN_ALLOCATION 4

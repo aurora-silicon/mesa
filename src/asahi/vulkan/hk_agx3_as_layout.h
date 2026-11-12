@@ -36,7 +36,9 @@ hk_agx3_as_layout_init_format(enum hk_agx3_as_format format, uint32_t leaves,
     * jobs and leaves-1 inner jobs, end_slot <= 4*leaves+1 (including slots0..2).
     */
    const uint64_t slots = (uint64_t)leaves * 4 + 1;
-   const uint64_t jobs = nodes * 16;
+   /* GEN1 keeps a collapse cost record (hk_agx3_plan_cost) per node after
+    * the plan nodes. */
+   const uint64_t jobs = nodes * (16 + (format == HK_AGX3_AS_FORMAT_GEN1 ? 40 : 0));
    const uint64_t envelope = jobs + nodes * 64;
    const uint64_t state = envelope + 48;
    /* GEN1 keeps the indirect encode arguments after the plan state. */

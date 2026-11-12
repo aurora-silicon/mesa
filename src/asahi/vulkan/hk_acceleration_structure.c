@@ -926,7 +926,13 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
-   for (unsigned phase = 0; phase < 5; ++phase) {
+   /* The cost phase runs between linking (1) and classification (2). */
+   static const unsigned phases[] = {0, 1, HK_AGX3_PLAN_PHASE_COST, 2, 3, 4};
+   for (unsigned p = 0; p < ARRAY_SIZE(phases); ++p) {
+      const unsigned phase = phases[p];
+      if (phase == HK_AGX3_PLAN_PHASE_COST &&
+          args->wide_children != HK_AGX3_WIDE_SAH)
+         continue;
       struct hk_agx3_plan_args push = *args;
       push.phase = phase;
       vk_common_CmdPushConstants(command_buffer, layout[plan],
@@ -1342,8 +1348,10 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
                          VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) &&
                        !(perf_arm & HK_G17P_RT_PERF_NO_TRI_PAIRS)
                         ? HK_AGX3_PAIRS_SIBLINGS : HK_AGX3_PAIRS_NONE,
-            .wide_children = !allow_update &&
-                             (perf_arm & HK_G17P_RT_PERF_WIDE_CHILDREN),
+            .wide_children = allow_update ? HK_AGX3_WIDE_LEVELS
+                             : (perf_arm & HK_G17P_RT_PERF_WIDE_SAH) ? HK_AGX3_WIDE_SAH
+                             : (perf_arm & HK_G17P_RT_PERF_WIDE_CHILDREN) ? HK_AGX3_WIDE_AREA
+                             : HK_AGX3_WIDE_LEVELS,
          };
          struct hk_agx3_plan_args native_plan = plan;
          native_plan.metadata = hk_gen1_as_metadata_addr_for_id(cmd, plan.resource_id);

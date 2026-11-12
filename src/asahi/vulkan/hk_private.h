@@ -100,6 +100,7 @@ struct hk_addr_range {
  *  bit 2: keep one triangle per native record (disable sibling pairing)
  *  bit 3: choose wide-node children by surface area (wide_children)
  *  bit 4: pair triangles into IR quads before the tree build
+ *  bit 5: choose wide-node children by least SAH cost
  */
 enum hk_g17p_rt_perf_arm {
    HK_G17P_RT_PERF_OPAQUE_HW_COMMIT = 1u << 0,
@@ -107,6 +108,7 @@ enum hk_g17p_rt_perf_arm {
    HK_G17P_RT_PERF_NO_TRI_PAIRS     = 1u << 2,
    HK_G17P_RT_PERF_WIDE_CHILDREN    = 1u << 3,
    HK_G17P_RT_PERF_IR_QUADS         = 1u << 4,
+   HK_G17P_RT_PERF_WIDE_SAH         = 1u << 5,
 };
 
 static inline unsigned
