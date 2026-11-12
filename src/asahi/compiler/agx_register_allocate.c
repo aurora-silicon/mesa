@@ -25,6 +25,19 @@ DEBUG_GET_ONCE_BOOL_OPTION(m5_wide_scalar_sources,
 #include "agx_opcodes.h"
 #include "shader_enums.h"
 
+/* The eight scalars collected into an operand of a 16x16x16 matrix
+ * multiply-accumulate, as the phi webs they belong to. The instruction takes
+ * each operand from an aligned run of registers, so the webs want consecutive
+ * registers of one such run: then the collect, the phis around it and the
+ * copy into the accumulator the instruction overwrites are all in place.
+ */
+struct matrix_group {
+   uint32_t root[8];
+
+   /* Registers (16-bit halves) of each member */
+   uint8_t size;
+};
+
 /* SSA-based register allocator */
 struct phi_web_node {
    /* Parent index, or circular for root */
@@ -114,6 +127,12 @@ struct ra_ctx {
    agx_instr **src_to_collect_phi;
    BITSET_WORD *early_scalar_export;
    struct phi_web_node *phi_web;
+
+   /* Matrix operand groups, and for each phi web root its group plus one
+    * (zero for none).
+    */
+   const struct matrix_group *matrix_groups;
+   const uint16_t *web_matrix_group;
 
    /* If bit i of used_regs is set, and register i is the first consecutive
     * register holding an SSA value, then reg_to_ssa[i] is the SSA index of the
@@ -1289,6 +1308,34 @@ reserve_live_in(struct ra_ctx *rctx)
    }
 }
 
+/* The first web of a matrix operand to get a register picks the run of
+ * registers for all eight (see struct matrix_group).
+ */
+static void
+place_matrix_group(struct ra_ctx *rctx, unsigned root, unsigned minimum,
+                   unsigned limit)
+{
+   if (!rctx->web_matrix_group || !rctx->web_matrix_group[root] ||
+       rctx->phi_web[root].assigned)
+      return;
+
+   const struct matrix_group *group =
+      &rctx->matrix_groups[rctx->web_matrix_group[root] - 1];
+   const unsigned run = 8 * group->size;
+   unsigned base;
+
+   if (!find_regs_simple(rctx, RA_GPR, run, run, minimum, limit, &base))
+      return;
+
+   for (unsigned k = 0; k < 8; ++k) {
+      struct phi_web_node *node = &rctx->phi_web[group->root[k]];
+      if (!node->assigned) {
+         node->reg = base + k * group->size;
+         node->assigned = true;
+      }
+   }
+}
+
 static void
 assign_regs(struct ra_ctx *rctx, agx_index v, unsigned reg)
 {
@@ -1307,9 +1354,17 @@ assign_regs(struct ra_ctx *rctx, agx_index v, unsigned reg)
 
    BITSET_SET_COUNT(rctx->used_regs[cls], reg, nr);
 
-   /* Phi webs need to remember which register they're assigned to */
-   struct phi_web_node *node =
-      &rctx->phi_web[phi_web_find(rctx->phi_web, v.value)];
+   /* Phi webs need to remember which register they're assigned to. A web of a
+    * matrix operand remembers its place in the operand's run instead, if one
+    * is free: this value may be elsewhere (a component of a vector load, in
+    * place), but the phis it reaches then gather the operand where the
+    * instruction wants it.
+    */
+   const unsigned root = phi_web_find(rctx->phi_web, v.value);
+   struct phi_web_node *node = &rctx->phi_web[root];
+
+   if (cls == RA_GPR)
+      place_matrix_group(rctx, root, 0, rctx->bound[cls]);
 
    if (!node->assigned) {
       node->reg = reg;
@@ -1671,6 +1726,12 @@ pick_regs(struct ra_ctx *rctx, agx_instr *I, unsigned d)
 
    /* Try to allocate entire phi webs compatibly */
    unsigned phi_idx = phi_web_find(rctx->phi_web, idx.value);
+
+   if (cls == RA_GPR) {
+      place_matrix_group(rctx, phi_idx, dest_minimum(rctx, I, d),
+                         dest_limit(rctx, I, d));
+   }
+
    if (rctx->phi_web[phi_idx].assigned) {
       unsigned reg = rctx->phi_web[phi_idx].reg;
       if ((reg % align) == 0 && reg + align < rctx->bound[cls] &&
@@ -3242,6 +3303,72 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       }
    }
 
+   /* Group the phi webs that make up the operands of matrix multiplies */
+   struct util_dynarray matrix_groups;
+   util_dynarray_init(&matrix_groups, NULL);
+   uint16_t *web_matrix_group = NULL;
+   bool any_matrix = false;
+   agx_foreach_instr_global(ctx, I)
+      any_matrix |= I->op == AGX_OPCODE_MATMAD16_AGX3;
+
+   if (any_matrix) {
+      agx_instr **defs = calloc(ctx->alloc, sizeof(*defs));
+      web_matrix_group = calloc(ctx->alloc, sizeof(*web_matrix_group));
+
+      agx_foreach_instr_global(ctx, I) {
+         agx_foreach_ssa_dest(I, d)
+            defs[I->dest[d].value] = I;
+      }
+
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op != AGX_OPCODE_MATMAD16_AGX3)
+            continue;
+
+         agx_foreach_ssa_src(I, s) {
+            /* The accumulator is a copy (agx_lower_agx3_matrix_sources) */
+            agx_instr *def = defs[I->src[s].value];
+            if (def && def->op == AGX_OPCODE_MOV &&
+                def->src[0].type == AGX_INDEX_NORMAL)
+               def = defs[def->src[0].value];
+
+            if (!def || def->op != AGX_OPCODE_COLLECT || def->nr_srcs != 8)
+               continue;
+
+            struct matrix_group group = {0};
+            bool valid = true;
+            for (unsigned k = 0; k < 8 && valid; ++k) {
+               const agx_index src = def->src[k];
+               valid = src.type == AGX_INDEX_NORMAL && !src.memory &&
+                       agx_channels(src) == 1 &&
+                       src.size == def->src[0].size &&
+                       (src.size == AGX_SIZE_16 || src.size == AGX_SIZE_32);
+               if (!valid)
+                  break;
+
+               group.root[k] = phi_web_find(phi_web, src.value);
+               valid = !web_matrix_group[group.root[k]];
+               for (unsigned j = 0; j < k; ++j)
+                  valid &= group.root[j] != group.root[k];
+            }
+            if (!valid)
+               continue;
+
+            group.size = agx_size_align_16(def->src[0].size);
+            util_dynarray_append(&matrix_groups, group);
+            const unsigned id = util_dynarray_num_elements(
+               &matrix_groups, struct matrix_group);
+            if (id > UINT16_MAX) {
+               (void)util_dynarray_pop(&matrix_groups, struct matrix_group);
+               continue;
+            }
+            for (unsigned k = 0; k < 8; ++k)
+               web_matrix_group[group.root[k]] = id;
+         }
+      }
+
+      free(defs);
+   }
+
    uint8_t *ncomps = calloc(ctx->alloc, sizeof(uint8_t));
    uint8_t *ncomps_unrounded = calloc(ctx->alloc, sizeof(uint8_t));
    enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
@@ -3577,6 +3704,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          .src_to_collect_phi = src_to_collect_phi,
          .early_scalar_export = early_scalar_export,
          .phi_web = phi_web,
+         .matrix_groups = matrix_groups.data,
+         .web_matrix_group = web_matrix_group,
          .ncomps = ncomps,
          .ncomps_unrounded = ncomps_unrounded,
          .sizes = sizes,
@@ -3748,6 +3877,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    }
 
    free(phi_web);
+   util_dynarray_fini(&matrix_groups);
+   free(web_matrix_group);
    free(low_gpr);
    free(split_source);
    free(texture_gpr);
