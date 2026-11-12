@@ -474,7 +474,7 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
        * the packer refused the whole shader (Cyberpunk 2077's benchmark
        * vertex shaders: ffma r32, #k16, #k16, r32). Keep the second constant
        * multiplicand in its register. */
-      if (ctx->key && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+      if (ctx->key && agx_encoding_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_FFMA && s < 2 &&
           I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;

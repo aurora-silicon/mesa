@@ -12974,7 +12974,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       agx_validate(ctx, "cube-array scratch");
 
    /* Interpolation tokens are checked on SSA: RA may move them. */
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+   if (agx_encoding_is_agx3(ctx->key->dev.encoding) &&
        ctx->stage == MESA_SHADER_FRAGMENT &&
        !agx3_interp_coords_from_itrcoords(ctx)) {
       agx_set_refusal(ctx, "interpolation token without its ITRCOORDS",
