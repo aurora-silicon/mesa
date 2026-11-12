@@ -22,7 +22,30 @@ nir_udiv_round_up(nir_builder *b, nir_def *n, nir_def *d)
 struct agx_subgroup_lower_options {
    bool optimize_ballot_count;
    bool g17p_clustered_float;
+   bool native_shuffle_xor;
 };
+
+/* M5 shuffles a 32-bit value across the subgroup by a constant lane XOR in
+ * one instruction (simd_shuffle_xor with an immediate), where the general
+ * shuffle is four broadcasts and three selects. The mask is usually a
+ * constant only once loops are unrolled, so such shuffles are kept through
+ * the early lowering and agx_nir_lower_dynamic_shuffle_xor() lowers the ones
+ * that are left with any other mask.
+ */
+static bool
+is_native_shuffle_xor(const nir_intrinsic_instr *intr)
+{
+   return intr->intrinsic == nir_intrinsic_shuffle_xor &&
+          intr->def.num_components == 1 && intr->def.bit_size == 32;
+}
+
+static bool
+has_native_shuffle_xor_mask(const nir_intrinsic_instr *intr)
+{
+   return nir_src_is_const(intr->src[1]) &&
+          nir_src_as_uint(intr->src[1]) >= 1 &&
+          nir_src_as_uint(intr->src[1]) <= 31;
+}
 
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -187,6 +210,9 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    const struct agx_subgroup_lower_options *agx_options = data;
    unsigned cluster = 0;
 
+   if (agx_options->native_shuffle_xor && is_native_shuffle_xor(intr))
+      return false;
+
    /* Use default behaviour for everything but scans */
    if (intr->intrinsic != nir_intrinsic_exclusive_scan &&
        intr->intrinsic != nir_intrinsic_inclusive_scan &&
@@ -234,11 +260,13 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 
 static bool
 agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
-                                bool optimize_ballot_count)
+                                bool optimize_ballot_count,
+                                bool native_shuffle_xor)
 {
    const struct agx_subgroup_lower_options agx_options = {
       .optimize_ballot_count = optimize_ballot_count,
       .g17p_clustered_float = g17p_clustered_float,
+      .native_shuffle_xor = native_shuffle_xor,
    };
 
    /* First, do as much common lowering as we can */
@@ -270,18 +298,49 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
 bool
 agx_nir_lower_subgroups(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, false, true);
+   return agx_nir_lower_subgroups_internal(s, false, true, false);
 }
 
 bool
 agx_nir_lower_subgroups_g17p(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, true, false);
+   return agx_nir_lower_subgroups_internal(s, true, false, false);
 }
 
 bool
-agx_nir_lower_subgroups_m5(nir_shader *s)
+agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor)
 {
    return agx_nir_lower_subgroups_internal(
-      s, false, s->info.stage != MESA_SHADER_FRAGMENT);
+      s, false, s->info.stage != MESA_SHADER_FRAGMENT,
+      native_shuffle_xor && s->info.stage == MESA_SHADER_COMPUTE);
+}
+
+static bool
+dynamic_shuffle_xor_filter(const nir_intrinsic_instr *intr, const void *data)
+{
+   return is_native_shuffle_xor(intr) && !has_native_shuffle_xor_mask(intr);
+}
+
+/*
+ * Lower the shuffles agx_nir_lower_subgroups_m5() kept whose mask did not
+ * become a constant the instruction can hold.
+ */
+bool
+agx_nir_lower_dynamic_shuffle_xor(nir_shader *s)
+{
+   const struct agx_subgroup_lower_options agx_options = {0};
+   const nir_lower_subgroups_options opts = {
+      .filter = dynamic_shuffle_xor_filter,
+      .lower_relative_shuffle = true,
+      .ballot_components = 1,
+      .ballot_bit_size = 32,
+      .subgroup_size = 32,
+   };
+
+   if (!nir_lower_subgroups(s, &opts))
+      return false;
+
+   nir_shader_intrinsics_pass(s, lower, nir_metadata_control_flow,
+                              (void *)&agx_options);
+   return true;
 }

@@ -798,6 +798,34 @@ TEST_F(Optimizer, AddSourceSignExtend)
       agx_iadd_to(b, out, wx, hy, 1));
 }
 
+TEST_F(Optimizer, ProductSourceSignExtend)
+{
+   /* A signed 64-bit product extends the half itself. */
+   CASE64(
+      {
+         agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+         agx_signext_to(b, t, hy);
+         agx_imad_to(b, out, t, wx, agx_zero(), 0);
+      },
+      agx_imad_to(b, out, hy, wx, agx_zero(), 0));
+
+   /* An unsigned one zero-extends its sources (abs), so the sign-extended
+    * word stays: the half in its place would lose bits 16..31. */
+   NEGCASE(
+      {
+         agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+         agx_signext_to(b, t, hy);
+         agx_imad_to(b, out, agx_abs(t), agx_abs(wx), agx_zero(), 0);
+      },
+      64);
+
+   NEGCASE32({
+      agx_index t = agx_temp(b->shader, AGX_SIZE_32);
+      agx_signext_to(b, t, hy);
+      agx_iadd_to(b, out, wx, agx_abs(t), 0);
+   });
+}
+
 TEST_F(Optimizer, SubInlineImmediate)
 {
    CASE16(agx_iadd_to(b, out, hx, agx_mov_imm(b, 16, -2), 0),
