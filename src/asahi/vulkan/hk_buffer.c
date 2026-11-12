@@ -448,6 +448,14 @@ hk_GetPhysicalDeviceExternalBufferProperties(
       pExternalBufferProperties->externalMemoryProperties =
          hk_dma_buf_mem_props;
       return;
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: {
+      VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+      if (!pdev->vk.supported_extensions.EXT_external_memory_host)
+         goto unsupported;
+      pExternalBufferProperties->externalMemoryProperties =
+         hk_host_ptr_mem_props;
+      return;
+   }
    default:
       goto unsupported;
    }

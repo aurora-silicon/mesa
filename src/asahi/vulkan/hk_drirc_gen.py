@@ -28,6 +28,13 @@ def declare_options():
           "Report sparseResidencyNonResidentStrict on G13, G14 and G17P, "
           "where a write to an unbound page can still be read back",
           c_name="sparse_strict_residency"),
+        B("hk_host_memory_read_only", False,
+          "Import host memory the kernel can only pin for reading (a "
+          "read-only file mapping) and bind it read-only for the GPU, "
+          "instead of failing the allocation. A GPU write to such memory is "
+          "not performed: it is discarded, or faults the job on a kernel "
+          "without soft faults",
+          c_name="host_memory_read_only"),
         B("hk_d3d_nearest_mip", False,
           "Round a nearest mip selection halfway between levels up, as "
           "Direct3D does, rather than down, as Vulkan does",
