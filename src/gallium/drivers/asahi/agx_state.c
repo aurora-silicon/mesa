@@ -6194,12 +6194,8 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
       agx_upload_samplers(batch, cs, stage);
 
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
-   /* Stop before the G18G-only fields that follow custom_border_compare_func;
-    * no other chip reads them. */
    const size_t size =
-      agx_shadow_gather_custom_border(agx_device(ctx->base.screen)->chip)
-         ? offsetof(struct agx_stage_uniforms, custom_border_compare)
-         : offsetof(struct agx_stage_uniforms, custom_border_compare_func);
+      agx_stage_uniforms_size(agx_device(ctx->base.screen)->chip);
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
       agx_pool_upload_aligned(&batch->pool, unif, size, 16);
@@ -6430,7 +6426,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
        * fixed driver allocation, so prove that adjacent half is in bounds. */
       if ((length & 1) && push->table == AGX_SYSVAL_STAGE(stage)) {
          if ((uint64_t)push->offset + ((uint64_t)length + 1) * 2 >
-             sizeof(struct agx_stage_uniforms))
+             agx_stage_uniforms_size(dev->chip))
             return 0;
          ++length;
       }
@@ -6684,7 +6680,7 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
            push->table == AGX_SYSVAL_TABLE_ROOT)) {
          const size_t table_size = push->table == AGX_SYSVAL_TABLE_ROOT
                                       ? sizeof(struct agx_draw_uniforms)
-                                      : sizeof(struct agx_stage_uniforms);
+                                      : agx_stage_uniforms_size(dev->chip);
          if ((uint64_t)push->offset + ((uint64_t)length + 1) * 2 >
              table_size)
             AGX3_PROGRAM_REFUSE("a 16-bit sysval sits at the end of its "
@@ -7127,7 +7123,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
                            push->table == AGX_SYSVAL_TABLE_ROOT)) {
          const size_t table_size = push->table == AGX_SYSVAL_TABLE_ROOT
                                       ? sizeof(struct agx_draw_uniforms)
-                                      : sizeof(struct agx_stage_uniforms);
+                                      : agx_stage_uniforms_size(dev->chip);
          if ((uint64_t)push->offset + ((uint64_t)length + 1) * 2 > table_size)
             AGX3_PROGRAM_REFUSE("odd stage uniform at the table end");
          ++length;
