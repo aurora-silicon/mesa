@@ -604,7 +604,9 @@ agx_cmd_header(bool compute, uint16_t barrier_vdm, uint16_t barrier_cdm)
  * every render must follow a DRM_ASAHI_SET_RENDER_RESOURCES(_V2) list in its
  * submission (SUBMIT fails with EINVAL otherwise), and compute commands take
  * a DRM_ASAHI_SET_COMPUTE_RESOURCES list when the kernel reports
- * DRM_ASAHI_FEATURE_COMPUTE_RESOURCES. The M5 (G17G) runtime reports neither.
+ * DRM_ASAHI_FEATURE_COMPUTE_RESOURCES. The M5 (G17G) takes the same lists
+ * where it runs on the G17 runtime (integration/aurora); the M5 runtime of
+ * older kernels reports neither.
  */
 static inline bool
 agx_m5_render_resources(const struct agx_device *dev)

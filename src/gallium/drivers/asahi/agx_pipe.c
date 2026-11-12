@@ -70,6 +70,7 @@ static const char *const agx_env_flag_names[AGX_ENV_FLAG_COUNT] = {
    [AGX_ENV_NEO_UNIFORM_DIAGNOSTICS] = "NEO_AGX_UNIFORM_DIAGNOSTICS",
    [AGX_ENV_NEO_BINARY_DIAGNOSTICS] = "NEO_AGX_BINARY_DIAGNOSTICS",
    [AGX_ENV_G18_RESOURCE_TRACE] = "ASAHI_G18_RESOURCE_TRACE",
+   [AGX_ENV_NO_STAGED_BUFFER_WRITES] = "ASAHI_NO_STAGED_BUFFER_WRITES",
 };
 
 bool
@@ -1065,6 +1066,62 @@ agx_blit_to_staging(struct pipe_context *pctx, struct agx_transfer *trans)
    agx_blit(pctx, &blit);
 }
 
+/*
+ * glBufferSubData and glMapBufferRange(GL_MAP_INVALIDATE_RANGE_BIT) into a
+ * buffer that unfinished batches use. Writing it on the CPU means waiting for
+ * those batches, and buffers too large to shadow (a game's 128 MiB vertex
+ * heap) have no other way out, so every such upload drained the GPU. Instead,
+ * write a staging copy and copy it into place on the GPU at unmap, after the
+ * batches already recorded and before any later one.
+ */
+static bool
+agx_stage_buffer_write(struct agx_context *ctx, struct agx_resource *rsrc,
+                       unsigned usage, const struct pipe_box *box)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+
+   if (rsrc->base.target != PIPE_BUFFER ||
+       (usage & (PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE)) !=
+          (PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE) ||
+       (usage & (PIPE_MAP_READ | PIPE_MAP_UNSYNCHRONIZED | PIPE_MAP_PERSISTENT |
+                 PIPE_MAP_COHERENT | PIPE_MAP_DIRECTLY |
+                 PIPE_MAP_DISCARD_WHOLE_RESOURCE)))
+      return false;
+
+   /* G17G copies buffers on the CPU (no precompiled kernels) */
+   if (agx_chip_g17_m5(dev->chip) || (dev->debug & AGX_DBG_NOSHADOW) ||
+       agx_env_flag(AGX_ENV_NO_STAGED_BUFFER_WRITES))
+      return false;
+
+   if (rsrc->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE))
+      return false;
+
+   /* A range nothing wrote yet can be written directly */
+   if (!util_ranges_intersect(&rsrc->valid_buffer_range, box->x,
+                              box->x + box->width))
+      return false;
+
+   /* A whole-buffer write can rename the storage instead */
+   if (box->x == 0 && box->width == rsrc->base.width0 &&
+       !(rsrc->base.flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT))
+      return false;
+
+   /* Where agx_prepare_for_map can shadow, keep doing so: a CPU copy of a
+    * small buffer adds no GPU work, while a copy between two frames' passes
+    * would stop them overlapping. Stage only what would otherwise wait.
+    */
+   if (rsrc->layout.size_B <= MAX_SHADOW_BYTES &&
+       rsrc->shadowed_bytes < MAX_TOTAL_SHADOW_BYTES &&
+       !(rsrc->base.flags & PIPE_RESOURCE_FLAG_MAP_PERSISTENT))
+      return false;
+
+   /* Batches stay listed until a later sync retires them, so this can be
+    * stale. That costs a copy, while asking the kernel would cost a call on
+    * every upload.
+    */
+   return agx_any_batch_uses_resource(ctx, rsrc);
+}
+
 static void *
 agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
                  unsigned level,
@@ -1074,6 +1131,34 @@ agx_transfer_map(struct pipe_context *pctx, struct pipe_resource *resource,
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_resource *rsrc = agx_resource(resource);
+
+   if (agx_stage_buffer_write(ctx, rsrc, usage, box)) {
+      /* Match the destination's alignment within 16 bytes so the copy can
+       * be vectorized.
+       */
+      unsigned misalign = box->x & 0xf;
+      struct pipe_resource *staging = NULL;
+      unsigned offset = 0;
+      void *map = NULL;
+
+      u_upload_alloc_ref(pctx->stream_uploader, 0, box->width + misalign, 16,
+                         &offset, &staging, &map);
+      if (staging) {
+         util_range_add(resource, &rsrc->valid_buffer_range, box->x,
+                        box->x + box->width);
+
+         struct agx_transfer *transfer = CALLOC_STRUCT(agx_transfer);
+         transfer->base.level = level;
+         transfer->base.usage = usage;
+         transfer->base.box = *box;
+         pipe_resource_reference(&transfer->base.resource, resource);
+         u_box_1d(offset + misalign, box->width, &transfer->staging.box);
+         transfer->staging.rsrc = staging;
+         *out_transfer = &transfer->base;
+
+         return (uint8_t *)map + misalign;
+      }
+   }
 
    /* Can't map tiled/compressed directly */
    if ((usage & PIPE_MAP_DIRECTLY) && rsrc->modifier != DRM_FORMAT_MOD_LINEAR)
@@ -1262,7 +1347,11 @@ agx_transfer_unmap(struct pipe_context *pctx, struct pipe_transfer *transfer)
    struct pipe_resource *prsrc = transfer->resource;
    struct agx_resource *rsrc = (struct agx_resource *)prsrc;
 
-   if (trans->staging.rsrc && (transfer->usage & PIPE_MAP_WRITE)) {
+   if (trans->staging.rsrc && prsrc->target == PIPE_BUFFER) {
+      /* A staged buffer write, see agx_stage_buffer_write */
+      agx_copy_buffer_range(pctx, prsrc, transfer->box.x, trans->staging.rsrc,
+                            trans->staging.box.x, transfer->box.width);
+   } else if (trans->staging.rsrc && (transfer->usage & PIPE_MAP_WRITE)) {
       assert(prsrc->target != PIPE_BUFFER);
       agx_blit_from_staging(pctx, trans);
       agx_flush_readers(agx_context(pctx), agx_resource(trans->staging.rsrc),

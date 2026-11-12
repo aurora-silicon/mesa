@@ -279,10 +279,6 @@ struct agx_shader_info {
    uint16_t agx3_preamble_staging_halfs;
    bool agx3_preamble_staging_known;
 
-   /* Live uniform inputs after optimization, lowering, and register allocation.
-    * Retained separately from resource sizes and hardware entry policy. */
-   struct agx_ioto_cprog_inputs agx3_preamble_encoded_inputs;
-
    /* Output mask set during driver lowering */
    uint64_t outputs;
 
@@ -333,7 +329,6 @@ struct agx_precompiled_kernel_info {
    uint16_t agx3_staging_halfs;
    bool agx3_preamble_staging_known;
    uint16_t agx3_preamble_staging_halfs;
-   struct agx_ioto_cprog_inputs agx3_preamble_encoded_inputs;
 
    /* AGX3 kernels read the printf buffer address from a 64-bit uniform at this
     * half, the first multiple of 4 after their arguments, or 0 if they do not
@@ -374,7 +369,6 @@ agx_compact_kernel_info(struct agx_shader_info *info)
       .agx3_staging_halfs = info->agx3_staging_halfs,
       .agx3_preamble_staging_known = info->agx3_preamble_staging_known,
       .agx3_preamble_staging_halfs = info->agx3_preamble_staging_halfs,
-      .agx3_preamble_encoded_inputs = info->agx3_preamble_encoded_inputs,
       .agx3_tps_size =
          MAX2(info->scratch_size, info->agx3_spectpr_scratch_size),
    };
@@ -513,6 +507,11 @@ struct agx_shader_key {
    /* Uniform half containing the indexed texture heap; sampler follows at+4. */
    uint16_t g17p_texture_uniform_base;
 
+   /* G17P state-0 storage image read and written by the shader: the state-0
+    * pointer names its texture/PBE descriptor pair, so the store's PBE is
+    * record 1 of it (a write-only image's pointer names the PBE itself). */
+   bool g17p_storage_image_pair;
+
    /* Whether scratch memory is available in the given shader stage */
    bool has_scratch;
 
@@ -594,20 +593,6 @@ struct agx_shader_key {
     * single-sample target on every path except VK_ATTACHMENT_STORE_OP_STORE. */
    bool g17p_rt0_eot_multisample;
 
-   /* These selectors retain the separately witnessed G17G EOT ABI. */
-   /* Select the native R5G6B5 imgwblk tail (0x35). RGB565 has three logical
-    * F16 imageblock lanes spanning two words and lowers to a raw I16 block
-    * store, but it does not share RGBA16F's selector. */
-   bool g17p_rt0_eot_rgb565;
-
-   /* Select the native normalized-16 imgwblk tail (0x95). Scalar R16 and
-    * RG16 are both one imageblock word, so word count alone is insufficient. */
-   bool g17p_rt0_eot_norm16_selector_95;
-
-   /* Select the separately grounded 84-byte signed two-word I16 builtin.
-    * RGBA16_SINT is not byte-compatible with the unsigned I16 EOT. */
-   bool g17p_rt0_eot_i16_signed_two_words;
-
    /* Authorize the exact I32 G17P EOT builtin. Set only for logical formats
     * whose I32 store shape and PBE descriptor are both grounded. */
    bool g17p_rt0_eot_i32;
@@ -619,14 +604,6 @@ struct agx_shader_key {
 
    /* Authorize the signed four-word I32 builtin, which stays single-sample. */
    bool g17p_rt0_eot_i32_signed_four_words;
-
-   /* Select the native 0x15 imgwblk variant for an I32 store. This is
-    * independently grounded only for the two-word R32G32 SINT layout. */
-   bool g17p_rt0_eot_i32_selector_15;
-
-   /* Select the native 0x75 imgwblk variant for an I32 store. This is
-    * independently grounded only for the two-word R32G32 UINT layout. */
-   bool g17p_rt0_eot_i32_selector_75;
 
    /* Authorize the G17G native single-sample, single-layer RT0 builtin. The
     * program itself is picked by the store-shape fields above, which describe

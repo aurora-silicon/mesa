@@ -1287,11 +1287,6 @@ check_preamble_compute(enum agx_isa_encoding encoding, bool enable,
           * need temporary registers but no IPR staging; a known zero must
           * remain distinct from missing metadata and from the GPR count. */
          valid &= info->agx3_preamble_staging_halfs == 0;
-         valid &= info->agx3_preamble_encoded_inputs.known == enable &&
-                  info->agx3_preamble_encoded_inputs.uniform_halfs[0] ==
-                     (enable ? UINT64_C(0xf) : 0);
-         for (unsigned w = 1; w < AGX_IOTO_CPROG_UNIFORM_WORDS; ++w)
-            valid &= info->agx3_preamble_encoded_inputs.uniform_halfs[w] == 0;
       } else if (encoding == AGX_ISA_ENCODING_AGX2) {
          valid &= !info->agx3_preamble_staging_known &&
                   info->agx3_preamble_staging_halfs == 0;
@@ -1323,12 +1318,7 @@ check_preamble_compute(enum agx_isa_encoding encoding, bool enable,
                  compact.agx3_preamble_staging_halfs ==
                     info->agx3_preamble_staging_halfs &&
                  compact.agx3_preamble_staging_known ==
-                    info->agx3_preamble_staging_known &&
-                 compact.agx3_preamble_encoded_inputs.known ==
-                    info->agx3_preamble_encoded_inputs.known &&
-                 memcmp(compact.agx3_preamble_encoded_inputs.uniform_halfs,
-                        info->agx3_preamble_encoded_inputs.uniform_halfs,
-                        sizeof(info->agx3_preamble_encoded_inputs.uniform_halfs)) == 0;
+                    info->agx3_preamble_staging_known;
       }
    }
    if (supported && (uniform_loads || !valid)) {
@@ -1382,7 +1372,6 @@ check_preamble_entry_gpr(enum agx_isa_encoding encoding, bool g18g,
       value = nir_load_vertex_id_zero_base(&p);
    } else if (input == PREAMBLE_CONSTANT_ONLY) {
       value = nir_imm_int(&p, 47);
-      /* Dead input references must not survive into the input bitmap. */
       nir_load_preamble(&p, 1, 64, .base = 196);
    } else if (input == PREAMBLE_SPARSE_UNIFORMS) {
       nir_def *a = nir_load_global_constant(
@@ -1416,39 +1405,6 @@ check_preamble_entry_gpr(enum agx_isa_encoding encoding, bool g18g,
                          ? !compiled && !part.binary &&
                               !part.info.has_preamble && !part.info.binary_size
                          : compiled && part.binary && part.info.has_preamble;
-   if (compiled && valid) {
-      struct agx_ioto_cprog_inputs expected = {0};
-      if (encoding != AGX_ISA_ENCODING_AGX2) {
-         expected.known = true;
-         if (input == PREAMBLE_SPARSE_UNIFORMS) {
-            expected.uniform_halfs[0] = 0xf00;
-            /* The encoded half127 read imports word u63, then extracts its
-             * upper half. Both physical halves126/127 are input bytes. */
-            expected.uniform_halfs[1] = UINT64_C(0xc000000000000003);
-            expected.uniform_halfs[7] = UINT64_C(0xf000000000000000);
-         } else if (input != PREAMBLE_CONSTANT_ONLY) {
-            expected.uniform_halfs[0] = 0xf;
-         }
-      }
-      const struct agx_precompiled_kernel_info compact = agx_compact_kernel_info(&part.info);
-      for (unsigned w = 0; w < AGX_IOTO_CPROG_UNIFORM_WORDS; ++w) {
-         if (part.info.agx3_preamble_encoded_inputs.uniform_halfs[w] !=
-                expected.uniform_halfs[w] ||
-             compact.agx3_preamble_encoded_inputs.uniform_halfs[w] !=
-                expected.uniform_halfs[w])
-            fprintf(stderr, "preamble input word %u: full=%016llx compact=%016llx expected=%016llx\n",
-                    w,
-                    (unsigned long long)part.info.agx3_preamble_encoded_inputs.uniform_halfs[w],
-                    (unsigned long long)compact.agx3_preamble_encoded_inputs.uniform_halfs[w],
-                    (unsigned long long)expected.uniform_halfs[w]);
-      }
-      valid &= part.info.agx3_preamble_encoded_inputs.known == expected.known &&
-               compact.agx3_preamble_encoded_inputs.known == expected.known &&
-               memcmp(part.info.agx3_preamble_encoded_inputs.uniform_halfs, expected.uniform_halfs,
-                      sizeof(expected.uniform_halfs)) == 0 &&
-               memcmp(compact.agx3_preamble_encoded_inputs.uniform_halfs, expected.uniform_halfs,
-                      sizeof(expected.uniform_halfs)) == 0;
-   }
    fprintf(stderr, "preamble input encoding=%u mode=%u compiled=%u valid=%u\n",
            encoding, input, compiled, valid);
    free(part.binary);

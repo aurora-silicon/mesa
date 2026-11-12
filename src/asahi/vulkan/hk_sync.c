@@ -234,6 +234,8 @@ records_replace_stream(struct hk_cmd_buffer *cmd, struct hk_cs *from,
       cmd->sync.pass_tile_first = to;
    if (cmd->sync.pass_tile_last == from)
       cmd->sync.pass_tile_last = to;
+   if (cmd->sync.suspended_last == from)
+      cmd->sync.suspended_last = to;
 }
 
 /*
@@ -837,8 +839,13 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          struct hk_sync_dep cont[HK_SYNC_NUM_SQ] = {0};
          if (st->pass_tile_last)
             cont[hk_sync_sq(st->pass_tile_last)].cut = st->pass_tile_last;
-         if (st->resume_pending)
+         /* An empty suspended instance may have been replaced by compute
+          * clears (hk_optimize_empty_vdm()), so graphics work on either
+          * subqueue can be a producer of what this instance continues. */
+         if (st->resume_pending) {
             cont[HK_SYNC_VDM].prior = HK_SYNC_GFX;
+            cont[HK_SYNC_CDM].prior = HK_SYNC_GFX;
+         }
          hk_sync_stream_wait(cs, cont);
          st->resume_pending = false;
       }
@@ -1407,6 +1414,13 @@ hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = NULL;
+
+   /* A resuming instance is the same render pass instance as the suspended
+    * one before it: its first stream waits on that instance's last producer,
+    * which can be a compute stream on the other subqueue. */
+   if (resuming)
+      st->pass_tile_last = st->suspended_last;
+   st->suspended_last = NULL;
 }
 
 void
@@ -1421,10 +1435,11 @@ hk_sync_first_render_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
-hk_sync_end_rendering(struct hk_cmd_buffer *cmd)
+hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending)
 {
    struct hk_sync_state *st = &cmd->sync;
    st->epoch++;
+   st->suspended_last = suspending ? st->pass_tile_last : NULL;
    pass_footprints_commit(cmd);
    st->in_pass = false;
    memset(st->pass_req, 0, sizeof(st->pass_req));
@@ -1474,6 +1489,7 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = cs;
+   st->suspended_last = NULL;
 }
 
 void

@@ -75,17 +75,16 @@ enum agx_isa {
  *
  * One instruction set, three encodings. The first two were established by
  * decoding a 274-kernel corpus compiled for the ten AGX3 families known at the
- * time with each of Apple's own encoder tables, recovered from
- * libapplegpu-nt.dylib. Every family decodes 100% under exactly one table and
- * 0-1.8% under any other -- no intermediate values:
+ * time with each of the AGX3 instruction encoding tables. Every family
+ * decodes 100% under exactly one table and 0-1.8% under any other -- no
+ * intermediate values:
  *
- *   agx3b (Apple variant 0): g15g, g15s, g15d, g16g, g16p, g16s, g17p
- *   agx3c (Apple variant 1): g17g, g17s, g18p
+ *   agx3b (variant 0): g15g, g15s, g15d, g16g, g16p, g16s, g17p
+ *   agx3c (variant 1): g17g, g17s, g18p
  *
- * The third is the macOS 27 toolchain's "g18g-encodings" subtarget feature,
- * next to "g17g-encodings":
+ * The third is new with the macOS 27 toolchain:
  *
- *   agx3d (Apple variant 2): g18g, g18m, g19p
+ *   agx3d (variant 2): g18g, g18m, g19p
  *
  * Compiling one probe with metal-nt for every AGX3 arch gives byte-identical
  * code within that row and code unlike either row above, and 41 of 41 G18G
@@ -94,8 +93,8 @@ enum agx_isa {
  * still AGX3 (the applegpu_g18g Mach-O cpusubtype 0x1c3 has low nibble 3), and
  * roughly a fifth of the instructions keep their agx3c bytes, but the common
  * ALU, memory, control and texture forms are re-encoded with different
- * lengths. Its table is recovered (agx3_compose/agx3d_tables.c and
- * src/asahi/isa/AGX3d.xml, variant 2 of libapplegpu-nt.dylib), but only the
+ * lengths. Its table is in the tree (agx3_compose/agx3d_tables.c and
+ * src/asahi/isa/AGX3d.xml, variant 2), but only the
  * instruction forms a core encoder has grounded against Apple's G18G output
  * are emitted for it; see agx_chip_codegen_supported.
  *
@@ -292,9 +291,9 @@ agx_encoding_is_agx3(enum agx_isa_encoding encoding)
  *
  * Use this for machine behaviour -- scoreboard slot counts, register and
  * uniform limits, the IR lowerings Apple's G17 compiler also performs -- and
- * never for byte layout. agx3c and agx3d share Apple's anonymous field ids and
- * operand semantics (the G18 scheduling-unit list in libapplegpu-nt.dylib is
- * the G17 one, MXU included; __GPU_ARCH_LD_MD is identical for 41 of 41
+ * never for byte layout. agx3c and agx3d share the tables' anonymous field ids
+ * and operand semantics (the G18 scheduling-unit list is the G17 one, MXU
+ * included; __GPU_ARCH_LD_MD is identical for 41 of 41
  * G17G/G18G metal-nt pairs; G17G field vectors composed with the variant-2
  * table reproduce 1,111 of 1,547 aligned G18G instructions, the rest being
  * compiler choices), but their encoding points, lengths and bit positions

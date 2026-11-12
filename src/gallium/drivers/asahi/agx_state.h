@@ -47,6 +47,7 @@ enum agx_env_flag {
    AGX_ENV_NEO_UNIFORM_DIAGNOSTICS,
    AGX_ENV_NEO_BINARY_DIAGNOSTICS,
    AGX_ENV_G18_RESOURCE_TRACE,
+   AGX_ENV_NO_STAGED_BUFFER_WRITES,
    AGX_ENV_FLAG_COUNT,
 };
 
@@ -1612,6 +1613,10 @@ void agx_resource_copy_region(struct pipe_context *pctx,
                               unsigned dstx, unsigned dsty, unsigned dstz,
                               struct pipe_resource *src, unsigned src_level,
                               const struct pipe_box *src_box);
+
+void agx_copy_buffer_range(struct pipe_context *pctx, struct pipe_resource *dst,
+                           unsigned dst_offset, struct pipe_resource *src,
+                           unsigned src_offset, unsigned size);
 
 /* Batch logic */
 

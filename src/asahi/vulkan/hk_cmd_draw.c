@@ -103,9 +103,6 @@ DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_msaa_pass_merge, "ASAHI_M5_MSAA_PASS_MERGE", true)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_tile_loader, "AGX_M5_VERIFY_TILE_LOADER",
                            false)
-DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_primitive_address,
-                           "ASAHI_MESH_NATIVE_PRIMITIVE_ADDRESS_DIAGNOSTIC",
-                           false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_m5_wclamp,
                            "ASAHI_MESH_NATIVE_M5_WCLAMP_DIAGNOSTIC", false)
 DEBUG_GET_ONCE_BOOL_OPTION(mesh_native_raster_enable,
@@ -5587,12 +5584,13 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
       .pStencilAttachment = &vk_stencil_att,
    };
 
-   if (render->flags & VK_RENDERING_SUSPENDING_BIT)
+   const bool suspending = render->flags & VK_RENDERING_SUSPENDING_BIT;
+   if (suspending)
       need_resolve = false;
 
    memset(render, 0, sizeof(*render));
 
-   hk_sync_end_rendering(cmd);
+   hk_sync_end_rendering(cmd, suspending);
 
    /* Classic upstream submits each render after its predecessor. In
     * particular, coherent advanced blending in a later render pass must
@@ -5867,10 +5865,16 @@ hk_rast_prim(struct hk_cmd_buffer *cmd)
    }
 }
 
+static struct hk_api_shader *
+hk_bound_fs_obj(struct hk_graphics_state *gfx)
+{
+   return gfx->mesh_fs ? gfx->mesh_fs : gfx->shaders[MESA_SHADER_FRAGMENT];
+}
+
 static struct hk_shader *
 hk_bound_fs(struct hk_cmd_buffer *cmd)
 {
-   return hk_fs_variant(cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT],
+   return hk_fs_variant(hk_bound_fs_obj(&cmd->state.gfx),
                         cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
 }
 
@@ -6549,18 +6553,45 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
 }
 
+/* A G17P fragment shader compiled without its mesh shader draws with the
+ * twin built for that mesh shader's per-primitive records. */
+static void
+hk_select_mesh_fs(struct hk_cmd_buffer *cmd)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_api_shader *fs = gfx->shaders[MESA_SHADER_FRAGMENT];
+   struct hk_api_shader *mesh = gfx->shaders[MESA_SHADER_MESH];
+   struct hk_api_shader *twin = NULL;
+
+   /* A twin compiles custom-border emulation in, so it has no border twin. */
+   if (fs->mesh_source && mesh) {
+      twin = hk_mesh_fs_twin(dev, fs, hk_main_mesh_variant(mesh));
+      if (!twin)
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   if (gfx->mesh_fs != twin) {
+      gfx->mesh_fs = twin;
+      gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+   }
+}
+
 static void
 hk_flush_shaders(struct hk_cmd_buffer *cmd)
 {
-   struct hk_api_shader *fs_obj =
-       cmd->state.gfx.shaders[MESA_SHADER_FRAGMENT];
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->shaders_dirty & (BITFIELD_BIT(MESA_SHADER_FRAGMENT) |
+                             BITFIELD_BIT(MESA_SHADER_MESH)))
+      hk_select_mesh_fs(cmd);
+
+   struct hk_api_shader *fs_obj = hk_bound_fs_obj(gfx);
    const bool sample_variant_dirty = fs_obj->g17p_sample_variants &&
       BITSET_TEST(cmd->vk.dynamic_graphics_state.dirty,
                   MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
-   if (cmd->state.gfx.shaders_dirty == 0 && !sample_variant_dirty)
+   if (gfx->shaders_dirty == 0 && !sample_variant_dirty)
       return;
 
-   struct hk_graphics_state *gfx = &cmd->state.gfx;
    if (sample_variant_dirty)
       gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_FRAGMENT);
 
@@ -8537,7 +8568,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
 
    struct agx_ppp_hal200_graphics_core fs_record;
    struct agx_ppp_hal200_fragment_fields fs_fields = {
-      /* HAL200 finalize 0x3f04e4..0x3f0508 puts iteration count at bit 16.
+      /* The HAL200 fragment record puts the iteration count at bit 16.
        * The packer merges the complete VIT address, including its high bits. */
       .resource_counts = linked_fs->b.cf.nr_bindings << 16,
       .varying_table = gfx->varyings,
@@ -8555,11 +8586,10 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
 
    struct agx_ppp_hal200_graphics_core output_record;
    struct agx_ppp_hal200_graphics_fields output_fields = {
-      /* Native vertex update 0x481be8..0x481c2c writes zero at
-       * context+0x1f90 and viewport_count-1 at +0x1f94; both are zero
-       * for this single-viewport layout. VIT supplies interpolation.
-       * FragmentProgramVariant 0x373eb4..0x373ee0 sets output-select bit16
-       * for nonempty iteration metadata, merged by 0x4824fc..0x482518. */
+      /* The vertex state holds zero and viewport_count-1; both are zero for
+       * this single-viewport layout. VIT supplies interpolation. Output-select
+       * bit16 is set for nonempty iteration metadata in the fragment program.
+       */
       .words = {output_select,
                 0, 0, output_size,
                 AGX_PPP_HAL200_PRIMARY_FACE_HEADER, 0},
@@ -8695,8 +8725,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       dev->dev.chip == AGX_CHIP_G17P &&
       vs->info.stage == MESA_SHADER_MESH &&
       vs->info.uvs.mesh_primitive_page &&
-      vs->info.mesh.primitive_stride_B != 0 &&
-      debug_get_option_mesh_native_primitive_address();
+      vs->info.mesh.primitive_stride_B != 0;
    const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
       .w_clamp_raw = dev->dev.chip == AGX_CHIP_G17P &&
                      vs->info.stage == MESA_SHADER_MESH &&
@@ -8818,9 +8847,8 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    }
    const struct agx_ppp_hal200_raster_state *raster_state = &raster_states[0];
 
-   /* Native update 0x46c6ac..0x46c6dc stores pass type at context+0x1f78.
-    * The 0x46ff78 path emits it in SECONDARY header 0x02000048's first
-    * payload word, masked by 0xe6600000 and ORed with 0x200. It is not the
+   /* The pass type goes in SECONDARY header 0x02000048's first payload word,
+    * within the 0xe6600000 field mask and ORed with 0x200. It is not the
     * older-generation FRAGMENT_CONTROL location in our PRIMARY record.
     */
    uint32_t linked_fragment_control =
@@ -8906,7 +8934,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
          (pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH &&
           render->tilebuffer.nr_samples > 1),
 
-      /* encodeISPPrimitiveType selects the runtime override for points,
+      /* The ISP primitive type selects the runtime override for points,
        * lines, and non-filled triangles, then applies it to both controls. */
       .primitive_tri_merge_disable =
          object_type != AGX_OBJECT_TYPE_TRIANGLE ||
@@ -9566,13 +9594,13 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       const unsigned fragment_pass = linked ? linked->b.fragment_control.opaque[0] >> 29 : 0;
       const bool has_zs_attachment =
          render->depth_att.iview || render->stencil_att.iview;
-      /* v70 depth928 and depth/stencil945 use the ordinary four-sample
-       * 32x16 ZLS profile. The native ZLS struct/stride producer is sample
-       * independent; kext selects both four/eight-sample tile geometry.
-       * Native G17G DEPTHF writes select one covered sample per word,
-       * preserving SR39's API-mask byte. Depth/stencil resolves run through
-       * hk_meta_resolve_rendering after the multisample source is stored;
-       * their presence does not change this draw's ZLS profile. */
+      /* v70 depth928 and depth/stencil945 use the ordinary four-sample 32x16
+       * ZLS profile. The native ZLS struct/stride producer is sample
+       * independent; the kernel side selects the four/eight-sample tile
+       * geometry. Native G17G DEPTHF writes select one covered sample per
+       * word, preserving SR39's API-mask byte. Depth/stencil resolves run
+       * through hk_meta_resolve_rendering after the multisample source is
+       * stored; their presence does not change this draw's ZLS profile. */
       const bool plain_ms_zs =
          (render->tilebuffer.nr_samples == 2 ||
           render->tilebuffer.nr_samples == 4 ||
@@ -10815,10 +10843,11 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                          : AGX_VDM_STATE_UPDATE_DRAW_INDIRECT_NONINDEXED)
          : (draw.indexed ? AGX_VDM_STATE_UPDATE_DRAW_DIRECT_INDEXED
                          : AGX_VDM_STATE_UPDATE_DRAW_DIRECT_NONINDEXED);
-   /* RenderPipeline+0x2f0 selects the native vertex template. TES and GS
-    * raster variants can write external memory just like API vertex shaders
-    * and software XFB. Keep that program live when rasterization is discarded;
-    * the independently packed PPP discard bits still suppress fragments. */
+   /* The pipeline's rasterization-enabled bit selects the native vertex
+    * template. TES and GS raster variants can write external memory just like
+    * API vertex shaders and software XFB. Keep that program live when
+    * rasterization is discarded; the independently packed PPP discard bits
+    * still suppress fragments. */
    const bool rasterization_enabled = hk_native_vertex_template_enabled(
       hk_rast_discard(cmd), hw_vs->info.writes_external_memory,
       hk_g17p_xfb_vertex_side_effects(cmd, hw_vs));
@@ -12372,12 +12401,12 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
       w[n++] = draw_state_offset;
 
    if (draw.indexed) {
-      /* Native direct indexed 0x47e57c..0x47e678: a restart State Update
-       * precedes every indexed draw (restart disabled or not), the index
-       * buffer is relocated to the first index, and its remaining length is
-       * rounded up to dwords minus one. The whole requested span must lie
-       * inside the bound range, except the one-dword zero page that stands in
-       * for a null index buffer. */
+      /* Native direct indexed draws: a restart State Update precedes every
+       * indexed draw (restart disabled or not), the index buffer is relocated
+       * to the first index, and its remaining length is rounded up to dwords
+       * minus one. The whole requested span must lie inside the bound range,
+       * except the one-dword zero page that stands in for a null index buffer.
+       */
       const unsigned index_size_B = agx_index_size_to_B(draw.index_size);
       const uint64_t range_B = draw.index_buffer_range_B;
       const uint64_t offset_B = (uint64_t)draw.start * index_size_B;

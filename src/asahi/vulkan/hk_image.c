@@ -549,6 +549,27 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
                          "ASAHI_M5_STORAGE_COMPRESSION", 8191)
 
+/* G17P storage images compress only in the formats that stay bit-exact
+ * through every access path. Image CTS on the Neo found RGBA32F, integer and
+ * normalized views of compressed 16/32-bit data, mutable images read through
+ * views of another type, and RGBA8 UNORM images written texel by texel over
+ * reused memory wrong, so on G17P a storage image compresses only when it is
+ * neither mutable nor mipmapped and is RGBA16F, RG16F, R16F, R32F or RG32F. */
+static bool
+hk_g17p_storage_compression_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R16G16B16A16_SFLOAT:
+   case VK_FORMAT_R16G16_SFLOAT:
+   case VK_FORMAT_R16_SFLOAT:
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32G32_SFLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
                                  const VkImageCreateInfo *info,
@@ -567,7 +588,13 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       ext->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO &&
       !ext->pNext;
 
-   if (dev->chip != AGX_CHIP_G17S || plane ||
+   if (dev->chip == AGX_CHIP_G17P &&
+       ((info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ||
+        info->mipLevels != 1 ||
+        !hk_g17p_storage_compression_format(info->format)))
+      return false;
+
+   if ((dev->chip != AGX_CHIP_G17S && dev->chip != AGX_CHIP_G17P) || plane ||
        (info->pNext && !format_list_only) ||
        (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||

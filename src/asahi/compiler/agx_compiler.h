@@ -634,6 +634,9 @@ typedef struct {
    /* Does the shader statically use scratch memory? */
    bool any_scratch;
 
+   /* Interlock waits guard memory, not the tilebuffer, so keep them. */
+   bool any_interlock;
+
    /* Mask of pixel fences we've definitely already waited for. */
    uint16_t already_pixel_waited;
 
@@ -1325,6 +1328,7 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * encoding. */
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+bool agx3_interp_coords_from_itrcoords(const agx_context *ctx);
 const char *agx3_last_pack_refusal(void);
 
 #ifndef NDEBUG

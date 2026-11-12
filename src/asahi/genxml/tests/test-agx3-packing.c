@@ -37,7 +37,7 @@ word64(const uint32_t *packed, unsigned index)
 static void
 test_m5_live_descriptors(void)
 {
-   /* Live AGXG17XFamilyTexture readout for a 256x128 RGBA8 texture. */
+   /* Live G17X texture descriptor readout for a 256x128 RGBA8 texture. */
    static const uint8_t expected_texture[32] = {
       0x22, 0x0a, 0x88, 0xf6, 0x0f, 0xf8, 0x03, 0x20,
       0x00, 0x80, 0x00, 0x00, 0x10, 0x00, 0x00, 0x80,

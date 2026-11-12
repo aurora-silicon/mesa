@@ -227,7 +227,7 @@ asahi_compute_blit_supported(enum agx_chip chip,
 {
    /* Gallium's compute blitter reaches agx_launch_grid() and therefore
     * agx_cdm_launch(), whose packet is the AGX2 compute command format, and
-    * agx_upload_textures()'s legacy storage PBE descriptor. CommandEncodingNext
+    * agx_upload_textures()'s legacy storage PBE descriptor. AGX3-encoding
     * parts need the native Ioto program/launch path Honeykrisp already uses;
     * on HAL200 the internal block-image kernel aborts in
     * agx_native_descriptor_rejected("storage PBE") before it is ever
@@ -959,6 +959,52 @@ try_copy_via_blit(struct pipe_context *pctx, struct pipe_resource *dst,
    }
 }
 
+/* Copy between buffers on the GPU, in the context's submission order. */
+void
+agx_copy_buffer_range(struct pipe_context *pctx, struct pipe_resource *dst,
+                      unsigned dst_offset, struct pipe_resource *src,
+                      unsigned src_offset, unsigned size)
+{
+   struct agx_batch *batch = agx_get_compute_batch(agx_context(pctx));
+   agx_batch_init_state(batch);
+
+   uint64_t dst_addr = agx_map_gpu(agx_resource(dst)) + dst_offset;
+   uint64_t src_addr = agx_map_gpu(agx_resource(src)) + src_offset;
+
+   agx_batch_reads(batch, agx_resource(src));
+   agx_batch_writes_range(batch, agx_resource(dst), dst_offset, size);
+
+   /* Bring dst to 16 bytes so the bulk can use vectorized copies, which need
+    * dst, src and size aligned. Failing to check for alignment causes subtle
+    * and hard-to-debug issues!
+    */
+   unsigned head = MIN2((16 - (dst_addr & 0xf)) & 0xf, size);
+   if (head && ((src_addr + head) & 0xf) == 0) {
+      libagx_copy_uchar(batch, agx_1d(head), AGX_BARRIER_ALL, dst_addr,
+                        src_addr);
+      dst_addr += head;
+      src_addr += head;
+      size -= head;
+   }
+
+   if (size >= 16 && (dst_addr & 0xf) == 0 && (src_addr & 0xf) == 0) {
+      unsigned uint4s = size / 16;
+      unsigned bytes = uint4s * 16;
+
+      libagx_copy_uint4(batch, agx_1d(uint4s), AGX_BARRIER_ALL, dst_addr,
+                        src_addr);
+
+      dst_addr += bytes;
+      src_addr += bytes;
+      size -= bytes;
+   }
+
+   if (size) {
+      libagx_copy_uchar(batch, agx_1d(size), AGX_BARRIER_ALL, dst_addr,
+                        src_addr);
+   }
+}
+
 void
 agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
                          unsigned dst_level, unsigned dstx, unsigned dsty,
@@ -977,36 +1023,11 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
    }
 
    if (dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
-      struct agx_batch *batch = agx_get_compute_batch(agx_context(pctx));
-      agx_batch_init_state(batch);
       assert(dst->format == src->format);
       unsigned bs = util_format_get_blocksize(dst->format);
-      unsigned size = bs * src_box->width;
-      unsigned dst_offset = dstx * bs;
-      uint64_t dst_addr = agx_map_gpu(agx_resource(dst)) + dst_offset;
-      uint64_t src_addr = agx_map_gpu(agx_resource(src)) + src_box->x * bs;
 
-      agx_batch_reads(batch, agx_resource(src));
-      agx_batch_writes_range(batch, agx_resource(dst), dst_offset, size);
-      /* Use vectorized copies for as much of the buffer as possible. This requires
-       * that dst, src, and size are all properly aligned. Failing to check for
-       * alignment on the buffers causes subtle and hard-to-debug issues!
-       */
-      if (size >= 16 && (dst_addr & 0xf) == 0 && (src_addr & 0xf) == 0) {
-         unsigned uint4s = size / 16;
-         unsigned bytes = uint4s * 16;
-
-         libagx_copy_uint4(batch, agx_1d(uint4s), AGX_BARRIER_ALL, dst_addr, src_addr);
-
-         dst_addr += bytes;
-         src_addr += bytes;
-         size -= bytes;
-      }
-
-      if (size) {
-         libagx_copy_uchar(batch, agx_1d(size), AGX_BARRIER_ALL, dst_addr, src_addr);
-      }
-
+      agx_copy_buffer_range(pctx, dst, dstx * bs, src, src_box->x * bs,
+                            bs * src_box->width);
       return;
    }
 

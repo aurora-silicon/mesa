@@ -246,6 +246,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_userptr(dev),
+      .EXT_fragment_shader_interlock = agx_native_graphics(dev),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -671,6 +672,16 @@ hk_get_device_features(
       .inheritedConditionalRendering =
          supported_extensions->EXT_conditional_rendering,
 
+      /* VK_EXT_fragment_shader_interlock */
+      .fragmentShaderSampleInterlock =
+         supported_extensions->EXT_fragment_shader_interlock,
+      /* Pixel ordering covers only the samples a fragment covers, so two
+       * pixel-rate fragments splitting one MSAA pixel overlap
+       * (fragment_shader_interlock.basic.*.pixel_*.4xaa.no_sample_shading).
+       */
+      .fragmentShaderPixelInterlock = false,
+      .fragmentShaderShadingRateInterlock = false,
+
       /* VK_EXT_custom_border_color */
       .customBorderColors = true,
       .customBorderColorWithoutFormat = true,
@@ -1039,6 +1050,9 @@ hk_get_device_properties(const struct agx_device *dev,
    const bool texel_buffer_single_texel_alignment =
       hk_descriptor_generation_is_agx2(descriptor_generation) ||
       agx_chip_native_agx3(dev->chip);
+   /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
+    * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
+   const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
@@ -1228,8 +1242,8 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxTaskPayloadAndSharedMemorySize = 32768,
       .maxMeshWorkGroupTotalCount = 1u << 22,
       .maxMeshWorkGroupCount = {65535, 65535, 65535},
-      .maxMeshWorkGroupInvocations = 1024,
-      .maxMeshWorkGroupSize = {1024, 1024, 1024},
+      .maxMeshWorkGroupInvocations = mesh_threads,
+      .maxMeshWorkGroupSize = {mesh_threads, mesh_threads, mesh_threads},
       .maxMeshSharedMemorySize = 28672,
       .maxMeshPayloadAndSharedMemorySize = 28672 + 16384,
       .maxMeshOutputMemorySize = 32768,

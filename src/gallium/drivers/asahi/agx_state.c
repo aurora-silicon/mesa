@@ -2633,11 +2633,14 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       if (g18_shared_uniform_base)
          uniform_base = MAX2(uniform_base, AGX_ABI_G18_SHARED_UNIFORM_HALFS);
 
-      /* G17P's Ioto loader moves uniform dwords: lay the ranges out so
-       * that each starts at an even half and covers an even count. */
+      /* The native Ioto loaders (G17P, the M5 family, G18G) move uniform
+       * dwords: lay the ranges out so that each starts at an even half and
+       * covers an even count. The M5 family's program builder refuses any
+       * other shape, which dropped most GL fragment programs there. */
       NIR_PASS(_, nir, agx_nir_layout_uniforms, compiled,
                &key.reserved_preamble, uniform_base,
-               agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G);
+               agx_native_graphics(dev) || agx_chip_g17_m5(dev->chip) ||
+                  dev->chip == AGX_CHIP_G18G);
       if (agx_native_graphics(dev))
          NIR_PASS(_, nir, agx_nir_lower_g17p_storage_records,
                   texture_descriptor_size);
@@ -5290,8 +5293,6 @@ agx_gallium_g17p_tile_layout_supported(struct agx_tilebuffer_layout *tib)
     * that allocation through the same bounded RT0 contract Honeykrisp uses. */
    struct agx_tilebuffer_layout physical = *tib;
    physical.layered = false;
-   if (tib->layered && agx_g17p_rgba8_mrt_mask(&physical) > 1)
-      return false;
    return agx_g17p_rt0_tile_layout_supported(&physical);
 }
 
@@ -6218,9 +6219,11 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
       agx_upload_samplers(batch, cs, stage);
 
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
+   /* Stop before the G18G-only fields that follow custom_border_compare_func;
+    * no other chip reads them. */
    const size_t size =
       agx_shadow_gather_custom_border(agx_device(ctx->base.screen)->chip)
-         ? sizeof(*unif)
+         ? offsetof(struct agx_stage_uniforms, custom_border_compare)
          : offsetof(struct agx_stage_uniforms, custom_border_compare_func);
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
@@ -8189,9 +8192,9 @@ agx_g18_append_compute(struct agx_batch *batch,
                           ? 3
                        : grid.count[1] != 1 || wg.y != 1 ? 2 : 1,
       };
-      /* G18 performEnqueueKernel normalizes the template for a 1D grid.
-       * The raw native append helper does not apply the semantic packer's
-       * bits17..19 mask. Keep bit23 and higher-dimensional launches intact. */
+      /* A G18 launch normalizes the template for a 1D grid. The raw native
+       * append helper does not apply the semantic packer's bits17..19 mask.
+       * Keep bit23 and higher-dimensional launches intact. */
       if (dev->chip == AGX_CHIP_G18G &&
           direct.size[1] < 2 && direct.size[2] < 2)
          g17g_launch.launch_template.word0 &= UINT32_C(0xfff1ffff);
@@ -11583,10 +11586,10 @@ static bool
 agx_g18_viewports_overlap(const struct pipe_viewport_state *viewports,
                           unsigned count)
 {
-   /* Native597 RasterToken::setViewports (0x219547508..0x2195475e4)
-    * sets control bit 0 when any two viewport rectangles overlap. Use
-    * double precision for their endpoints, as the native comparison does.
-    * Negative scales reverse the transform without changing its bounds. */
+   /* Native597: control bit 0 is set when any two viewport rectangles overlap.
+    * Use double precision for their endpoints, which matches the native
+    * results. Negative scales reverse the transform without changing its
+    * bounds. */
    for (unsigned i = 1; i < count; ++i) {
       const double ix = viewports[i].translate[0];
       const double iy = viewports[i].translate[1];
@@ -11638,8 +11641,8 @@ agx_g17g_viewport_scissor_records(struct agx_batch *batch,
       if (maxx > UINT16_MAX || maxy > UINT16_MAX ||
           !agx_ppp_hal300_scissor_record_pack(dev->chip, &scissor_fields, &scissor))
          return false;
-      /* Native597 handleScissorUpdates uploads consecutive 16-byte records
-       * at 0x21963ace8..0x21963ad48, including each viewport's depth range. */
+      /* Native597 uploads consecutive 16-byte scissor records,
+       * including each viewport's depth range. */
       memcpy(scissors + i * AGX_PPP_HAL300_SCISSOR_RECORD_LENGTH,
              scissor.bytes, AGX_PPP_HAL300_SCISSOR_RECORD_LENGTH);
       uint8_t region_clip[AGX_REGION_CLIP_LENGTH];
@@ -11670,8 +11673,8 @@ agx_g17g_viewport_scissor_records(struct agx_batch *batch,
    float bias = bias_active ? rast->base.offset_units * 2.0f : 0.0f;
    if (bias_active && batch->key.zsbuf.texture &&
        agx_resource(batch->key.zsbuf.texture)->layout.format == PIPE_FORMAT_Z16_UNORM) {
-      /* Native G18 handleDepthBiasUpdates (0x21963a8d8..0x21963a8fc)
-       * pairs integer ISP bias with normalized Z16 depth units. */
+      /* Native G18 depth bias pairs integer ISP bias with normalized Z16 depth
+       * units. */
       const float resolution = 1.0f / 65535.0f;
       bias = fmaf(rast->base.offset_units, resolution,
                   copysignf(resolution, rast->base.offset_units));
@@ -12419,10 +12422,9 @@ agx_encode_g17g_state(struct agx_batch *batch, uint8_t *out)
    if (dropped_vertex || dropped_fragment)
       return NULL;
 
-   /* Apple's renderer picks the rasterization-disabled VertexProgramVariant
-    * for a pipeline built with rasterizationEnabled = NO (26A428
-    * AGXMetalG18G VertexProgramVariant::finalize 0x21954f540..6b0, selected
-    * at 0x219634e14..e2c). */
+   /* A pipeline built with Metal's rasterizationEnabled = NO uses the
+    * rasterization-disabled vertex program variant; native G18 does the
+    * same. */
    const struct agx_vdm_state_update_draw_info draw_info = {
       .source_layout = AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT,
       .draw_path = AGX_VDM_STATE_UPDATE_DRAW_DIRECT_NONINDEXED,
@@ -14849,6 +14851,13 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 
    if (info->mode == MESA_PRIM_PATCHES) {
+      /* The M5 GPUs tessellate only on the CPU (agx_swtnl_applies()): a patch
+       * draw that path cannot take (indirect, or images before rasterization)
+       * has no encoding here. */
+      if (agx_chip_g17_m5(agx_device(ctx->base.screen)->chip)) {
+         agx_native_descriptor_reject_batch(batch, "tessellation outside the CPU path");
+         return;
+      }
       agx_draw_patches(ctx, info, drawid_offset, indirect, draws, num_draws);
       return;
    }

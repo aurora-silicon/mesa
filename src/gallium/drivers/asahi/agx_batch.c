@@ -279,6 +279,35 @@ agx_append_m5_compute_resources(struct agx_device *dev,
    return true;
 }
 
+/* Compute commands for the recorded dispatches first..end-1 of the batch's
+ * count, one command each (see agx_batch_submit()). Each waits on the one
+ * before it in its submission, the first on the queue's earlier submissions
+ * (barrier 0). The batch's compute timestamps bracket all of its commands,
+ * across submissions. */
+static void
+agx_append_m5_compute_commands(struct agx_batch *batch,
+                               const struct drm_asahi_cmd_compute *compute,
+                               unsigned first, unsigned end, unsigned count,
+                               struct util_dynarray *cmdbuf)
+{
+   const struct agx_cdm_dispatch *cdm_dispatch = batch->cdm_dispatch.data;
+   const uint64_t cdm_base = batch->cdm.bo->va->addr;
+
+   for (unsigned i = first; i < end; ++i) {
+      struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, i - first);
+      struct drm_asahi_cmd_compute one = *compute;
+      one.cdm_ctrl_stream_base = cdm_base + cdm_dispatch[i].start;
+      one.cdm_ctrl_stream_end = cdm_base + cdm_dispatch[i].end;
+      if (i != 0)
+         memset(&one.ts.start, 0, sizeof(one.ts.start));
+      if (i + 1 != count)
+         memset(&one.ts.end, 0, sizeof(one.ts.end));
+
+      util_dynarray_append(cmdbuf, header);
+      util_dynarray_append(cmdbuf, one);
+   }
+}
+
 /* DRM_ASAHI_SET_RENDER_RESOURCES(_V2) for the render that follows: the tile
  * record, then every linked program the render's draws ran. V2 kernels take
  * the 104-byte records through command 7; on others each record is cut to its
@@ -1841,50 +1870,113 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
     *
     * One submission per dispatch. When a render follows, it is the tail
     * submission and owns the output syncs; with no render the final dispatch
-    * takes that role, so the loop below stops one short. */
+    * takes that role, so the loop below stops one short.
+    *
+    * The G17 runtime that runs G17S and G17C has none of that restriction:
+    * it takes a mixed command array and orders it with barriers, so the
+    * recorded dispatches go as separate commands of this one submission. So
+    * does G17G where it runs on that runtime (agx_m5_render_resources); only
+    * on the M5 runtime of older kernels does it take one dispatch per
+    * submission. */
+   const bool m5_compute_commands = agx_m5_render_resources(dev) && compute;
    const bool m5_split_prepass =
-      (dev->chip == AGX_CHIP_G17G || dev->chip == AGX_CHIP_G18G) && compute;
+      (dev->chip == AGX_CHIP_G17G || dev->chip == AGX_CHIP_G18G) && compute &&
+      !m5_compute_commands;
    const unsigned m5_split_count =
       !m5_split_prepass  ? 0
       : render           ? cdm_dispatch_count
       : cdm_dispatch_count ? cdm_dispatch_count - 1
                                   : 0;
 
-   /* The G17 runtime that runs G17S and G17C has none of that restriction:
-    * it takes a mixed command array and orders it with barriers, so the
-    * recorded dispatches go as separate commands of this one submission. */
-   const bool m5_compute_commands = agx_m5_render_resources(dev) && compute;
-
    /* Compute commands in this submission, which the render waits on. */
    unsigned compute_commands = 0;
 
    /* Submit! */
    if (compute && !split_compute && m5_compute_commands) {
-      /* The G17 runtime (M5 Pro, M5 Max) takes a mixed command array, so
-       * each recorded dispatch is its own compute command here, the
-       * single-dispatch stream the Gallium M5 compute path builds and G17G
-       * submits one ioctl at a time. Command i waits on the i before it and
-       * on all earlier work; the storage list precedes them all. */
+      /* The G17 runtime (M5 Pro, M5 Max, and M5 on it) takes a mixed
+       * command array, so each recorded dispatch is its own compute command
+       * here, the single-dispatch stream the Gallium M5 compute path builds
+       * and the M5 runtime takes one ioctl at a time. Command i waits on the
+       * i before it and on all earlier work; the storage list precedes them
+       * all.
+       *
+       * The kernel takes at most max_commands_per_submission render and
+       * compute commands in one submission (64) and refuses a longer one
+       * with EINVAL, and a batch records a command per dispatch. The
+       * leading dispatches then go in submissions of their own, as many as
+       * fit in each, each with the storage list. Barrier 0 on their first
+       * command keeps the chain in order, and this submission keeps the
+       * last dispatches and the render. */
+      const unsigned limit = MAX2(dev->params.max_commands_per_submission, 2);
+      const unsigned tail = limit - (render ? 1 : 0);
+      unsigned first = 0;
+
+      while (cdm_dispatch_count - first > tail) {
+         const unsigned n = MIN2(limit, cdm_dispatch_count - first - tail);
+         struct util_dynarray chunk = UTIL_DYNARRAY_INIT;
+         struct drm_asahi_sync *chunk_syncs =
+            malloc((in_sync_count + 1) * sizeof(*chunk_syncs));
+         int ret = -1;
+
+         if (chunk_syncs &&
+             (compute_syncobj ||
+              !drmSyncobjCreate(dev->fd, 0, &compute_syncobj))) {
+            memcpy(chunk_syncs, syncs, in_sync_count * sizeof(*syncs));
+            chunk_syncs[in_sync_count] = (struct drm_asahi_sync){
+               .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
+               .handle = compute_syncobj,
+            };
+
+            ASSERTED bool encoded =
+               agx_append_m5_compute_resources(dev, batch, &chunk);
+            assert(encoded);
+            agx_append_m5_compute_commands(batch, compute, first, first + n,
+                                           cdm_dispatch_count, &chunk);
+
+            struct drm_asahi_submit chunk_submit = {
+               .flags = 0,
+               .queue_id = ctx->queue_id,
+               .in_sync_count = in_sync_count,
+               .out_sync_count = 1,
+               .syncs = (uint64_t)(uintptr_t)chunk_syncs,
+               .cmdbuf = (uint64_t)(uintptr_t)chunk.data,
+               .cmdbuf_size = chunk.size,
+            };
+
+            if (unlikely(dev->debug & AGX_DBG_PERF))
+               ctx->submit_perf.submits++;
+            ret = dev->ops.submit(dev, &chunk_submit, &virt);
+            if (unlikely((dev->debug & AGX_DBG_PERF) && ret))
+               ctx->submit_perf.failures++;
+         }
+
+         const int chunk_errno =
+            ret < -1 ? -ret : (ret ? (errno ? errno : EIO) : 0);
+         free(chunk_syncs);
+         util_dynarray_fini(&chunk);
+
+         if (ret) {
+            fprintf(stderr, "DRM_IOCTL_ASAHI_SUBMIT compute failed: %s\n",
+                    strerror(chunk_errno));
+            drmSyncobjDestroy(dev->fd, submit_syncobj);
+            u_rwlock_rdunlock(&screen->destroy_lock);
+            /* Earlier chunks are in flight: their fence is the accepted
+             * one. Without them the syncobj holds no fence. */
+            agx_retire_failed_submit(ctx, batch, syncs, shared_bos,
+                                     shared_bo_count, virt.extres, &cmdbuf,
+                                     chunk_errno, first ? compute_syncobj : 0,
+                                     first ? 0 : compute_syncobj);
+            return;
+         }
+         first += n;
+      }
+
       ASSERTED bool encoded =
          agx_append_m5_compute_resources(dev, batch, &cmdbuf);
       assert(encoded);
-
-      const uint64_t cdm_base = batch->cdm.bo->va->addr;
-      for (unsigned i = 0; i < cdm_dispatch_count; ++i) {
-         struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, i);
-         struct drm_asahi_cmd_compute one = *compute;
-         one.cdm_ctrl_stream_base = cdm_base + cdm_dispatch[i].start;
-         one.cdm_ctrl_stream_end = cdm_base + cdm_dispatch[i].end;
-         /* The batch's compute timestamps bracket all of its commands. */
-         if (i != 0)
-            memset(&one.ts.start, 0, sizeof(one.ts.start));
-         if (i + 1 != cdm_dispatch_count)
-            memset(&one.ts.end, 0, sizeof(one.ts.end));
-
-         util_dynarray_append(&cmdbuf, header);
-         util_dynarray_append(&cmdbuf, one);
-      }
-      compute_commands = cdm_dispatch_count;
+      agx_append_m5_compute_commands(batch, compute, first, cdm_dispatch_count,
+                                     cdm_dispatch_count, &cmdbuf);
+      compute_commands = cdm_dispatch_count - first;
    } else if (compute && !split_compute) {
       /* Barrier on previous submission */
       struct drm_asahi_cmd_header header = agx_cmd_header(true, 0, 0);

@@ -490,10 +490,9 @@ agx_gallium_pack_native_pbe_impl(
         * address >> 4 in word1[43:0] and stride - 16 from bit 40.
         *
         * On G18G it is also the J873 bgra8/gears/colour end-of-tile PBE
-        * (ffc60a02 00007f80 00005800 0003f010 for BGRA8 256x256, pitch
-        * 1024), which the codec reproduces; AGXMetalG18G's StateFields
-        * writes pitch/16-1 at word1[59:44] (0x219546d98). hk already admits
-        * it (8295c0d67c5). */
+        * (ffc60a02 00007f80 00005800 0003f010 for BGRA8 256x256, pitch 1024),
+        * which the codec reproduces; on G18G the PBE holds pitch/16-1 at
+        * word1[59:44]. hk already admits it (8295c0d67c5). */
        (legacy->layout == AGX_LAYOUT_LINEAR &&
         (legacy->level != 0 || legacy->levels != 1 ||
          legacy->unk_mipmapped)) ||

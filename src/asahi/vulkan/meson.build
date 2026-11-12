@@ -155,6 +155,15 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'hk_g17p_storage_image',
+    executable(
+      'hk_g17p_storage_image_test',
+      files('tests/test-hk-g17p-storage-image.c'),
+      include_directories : include_directories('.'),
+    ),
+    suite : ['asahi'],
+  )
 
   test(
     'hk_gen1_query_state',
@@ -610,6 +619,12 @@ if with_tests
       '-Wl,--wrap=hk_get_cgroup_memory_available', '-Wl,--wrap=__vk_errorf']),
     suite : ['asahi'])
   test('hk_tes_query', executable('hk_tes_query_test', files('tests/test-hk-tes-query.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_coherent_image', executable('hk_coherent_image_test',
+    files('tests/test-hk-coherent-image.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
