@@ -37,6 +37,7 @@ hk_g17p_storage_image_pointers(uint64_t set_va, uint32_t texture_offset_B,
       return true;
    }
 
+   /* 32-byte record stride, asserted in hk_descriptor_set.h. */
    if (!txf_sampler_va || pbe_offset_B != texture_offset_B + 32)
       return false;
 
