@@ -609,6 +609,11 @@ asahi_g17p_compute_validate(
 {
    struct asahi_g17p_compute_stats local = {0};
    bool need_barrier = false;
+   /* need_barrier was set by a direct launch. Honeykrisp's batched
+    * tessellation stages (hk_tess_batch.h) put the direct launches of one
+    * stage back to back; anything else after a launch still needs a barrier
+    * first. */
+   bool direct_tail = false;
    bool followed_link = false;
 
    if (stats)
@@ -662,6 +667,7 @@ asahi_g17p_compute_validate(
 
          local.launches++;
          need_barrier = true;
+         direct_tail = false;
          cursor += AGX3_CDM_INDIRECT_LAUNCH_SIZE;
          continue;
       }
@@ -673,7 +679,8 @@ asahi_g17p_compute_validate(
 
       switch (record.kind) {
       case AGX3_CDM_RECORD_LAUNCH: {
-         if (need_barrier || (record.data.launch.word0_payload >> 27) != 0 ||
+         if ((need_barrier && !direct_tail) ||
+             (record.data.launch.word0_payload >> 27) != 0 ||
              (record.data.launch.pipeline & 63) ||
              !record.data.launch.pipeline ||
              record.length != G17P_CDM_DIRECT_LAUNCH_SIZE ||
@@ -694,10 +701,12 @@ asahi_g17p_compute_validate(
             return fail_at(cursor, "compute launch Ioto program is invalid");
 
          local.launches++;
+         local.unbarriered_launches += need_barrier;
          local.two_dimensional_launches +=
             record.data.launch.global_size[1] > 1 &&
             record.data.launch.global_size[2] == 1;
          need_barrier = true;
+         direct_tail = true;
          break;
       }
 
