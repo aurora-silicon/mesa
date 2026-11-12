@@ -9,7 +9,7 @@
  * Preserve the common builder's spatial partition and order. Built twice:
  * HK_AGX3_PLAN_PAIRS forms pairs (see hk_agx3_plan_args.pairs).
  * A global atomic allocator compacts jobs/child regions; it never changes
- * traversal order. The five phases are separated by dispatch barriers.
+ * traversal order. The planner phases are separated by dispatch barriers.
  * An update does not plan: it encodes from the retained jobs (see
  * hk_agx3_retained_job).
  */
@@ -23,6 +23,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
+#ifdef HK_AGX3_PLAN_SAH
+#extension GL_KHR_memory_scope_semantics : require
+#endif
 #include "hk_build_interface.h"
 
 layout(local_size_x = 64) in;
@@ -222,6 +225,335 @@ count_leaves(uint start)
    return count;
 }
 
+#ifdef HK_AGX3_PLAN_SAH
+/* Surface area of an IR node's bounds. */
+float
+node_area(uint index)
+{
+   REF(vk_ir_node)
+   node = REF(vk_ir_node)(OFFSET(args.intermediate_bvh, source_offset(index)));
+   vec3 extent = max(DEREF(node).aabb.max - DEREF(node).aabb.min, vec3(0.0));
+   return extent.x * extent.y + extent.y * extent.z + extent.z * extent.x;
+}
+
+/* Whether a wide inner node may open binary node `index` into its two
+ * children: an internal node that is neither a leaf cluster nor a pair. */
+bool
+openable(uint index)
+{
+   return index >= args.leaf_bound &&
+          DEREF(INDEX(hk_agx3_plan_node, args.nodes, index)).leaf_count > 8;
+}
+
+/* The SAH variant chooses the children of each wide node to minimise the
+ * surface-area estimate of traversal cost over the binary tree's own
+ * partition (as in Ylitie, Karras and Laine, "Efficient Incoherent Ray
+ * Traversal on GPUs Through Compressed Wide BVHs", HPG 2017). A subtree of at
+ * most eight records stays one leaf cluster and a larger one is always a
+ * wide inner node, as with the fixed collapse; the cost only decides how
+ * deep each wide node reaches into each part of its subtree.
+ *
+ * A ray reaches a node with probability proportional to its parent's
+ * bounds' area. Visiting a native node tests all its child boxes at once;
+ * a leaf cluster then tests the records whose boxes the ray hits. */
+#define WIDE_NODE_COST 1.0
+/* One record test costs one node visit in the tuned traversal model. */
+#define WIDE_RECORD_COST 1.0
+
+REF(hk_agx3_plan_cost)
+cost_record(uint index)
+{
+   return INDEX(hk_agx3_plan_cost, args.nodes + uint64_t(args.node_bound) *
+                                        uint64_t(SIZEOF(hk_agx3_plan_node)),
+                index);
+}
+
+float
+subtree_cost(uint index, uint children)
+{
+   return DEREF(cost_record(index)).cost[children - 1u];
+}
+
+/* Leaf-cluster cost: one node visit plus the records' tests. */
+float
+cluster_cost(uint start)
+{
+   uint stack[9], sp = 1, steps = 0;
+   float records = 0.0;
+   stack[0] = start;
+   while (sp != 0) {
+      if (++steps > 64u) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return 0.0;
+      }
+      uint index = stack[--sp];
+      bool record = index < args.leaf_bound;
+#ifdef HK_AGX3_PLAN_PAIRS
+      record = record || is_pair(index);
+#endif
+      if (record) {
+         records += node_area(index);
+         continue;
+      }
+      uvec2 pair = children(index);
+      for (uint c = 0; c < 2; c++)
+         if (pair[c] != VK_BVH_INVALID_NODE) {
+            uint child = source_index(pair[c]);
+            if (child == ~0u || sp == 9) {
+               fail(HK_AGX3_PLAN_SHAPE);
+               return 0.0;
+            }
+            stack[sp++] = child;
+         }
+   }
+   return node_area(start) * WIDE_NODE_COST + records * WIDE_RECORD_COST;
+}
+
+/* The k in [1, total - 1] for which a's cost as k children plus b's as
+ * total - k is least; the first such k. */
+uint
+best_split(uint a, uint b, uint total, out float best)
+{
+   uint k_best = 1;
+   best = subtree_cost(a, 1) + subtree_cost(b, total - 1u);
+   for (uint k = 2; k < total; k++) {
+      float c = subtree_cost(a, k) + subtree_cost(b, total - k);
+      if (c < best) {
+         best = c;
+         k_best = k;
+      }
+   }
+   return k_best;
+}
+
+/* Phase HK_AGX3_PLAN_PHASE_COST: from every leaf-cluster root up to the
+ * root, the last of a node's children to finish computes its costs. */
+void
+compute_costs(uint id)
+{
+   if (id >= args.node_bound || id == root_index())
+      return;
+   hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.nodes, id));
+   if (node.parent == ~0u || node.leaf_count > 8 ||
+       DEREF(INDEX(hk_agx3_plan_node, args.nodes, node.parent)).leaf_count <= 8)
+      return;
+   float leaf = cluster_cost(id);
+   for (uint i = 0; i < 8; i++)
+      DEREF(cost_record(id)).cost[i] = leaf;
+   uint cursor = node.parent;
+   for (uint steps = 0; steps <= args.node_bound; steps++) {
+      uvec2 pair = children(cursor);
+      uint valid = (pair[0] != VK_BVH_INVALID_NODE ? 1u : 0u) +
+                   (pair[1] != VK_BVH_INVALID_NODE ? 1u : 0u);
+      uint arrived = atomicAdd(DEREF(cost_record(cursor)).arrivals, 1u,
+         gl_ScopeDevice, gl_StorageSemanticsBuffer,
+         gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable |
+            gl_SemanticsMakeVisible);
+      if (arrived + 1u < valid)
+         return;
+      float own = node_area(cursor) * WIDE_NODE_COST;
+      float dist[8];
+      if (valid == 1u) {
+         uint only = source_index(pair[0] != VK_BVH_INVALID_NODE ? pair[0] : pair[1]);
+         for (uint i = 0; i < 8; i++)
+            dist[i] = subtree_cost(only, i + 1u);
+      } else {
+         uint a = source_index(pair[0]), b = source_index(pair[1]);
+         dist[0] = 1e30;
+         for (uint j = 2; j <= 8; j++)
+            best_split(a, b, j, dist[j - 1u]);
+      }
+      float costs[8];
+      costs[0] = dist[7] + own;
+      for (uint i = 1; i < 8; i++)
+         costs[i] = min(dist[i], costs[i - 1u]);
+      for (uint i = 0; i < 8; i++)
+         DEREF(cost_record(cursor)).cost[i] = costs[i];
+      memoryBarrierBuffer();
+      if (cursor == root_index())
+         return;
+      cursor = DEREF(INDEX(hk_agx3_plan_node, args.nodes, cursor)).parent;
+      if (cursor >= args.node_bound) {
+         fail(HK_AGX3_PLAN_INDEX);
+         return;
+      }
+   }
+   fail(HK_AGX3_PLAN_CYCLE);
+}
+
+/* The children of the wide inner node over `root` in the SAH variant,
+ * in the binary tree's left-to-right order. Returns the count, 0 on a
+ * malformed tree. */
+uint
+sah_children(uint root, out uint list[8])
+{
+   uint stack_node[8], stack_count[8], sp = 0, count = 0;
+   uvec2 pair = children(root);
+   if (pair[0] == VK_BVH_INVALID_NODE || pair[1] == VK_BVH_INVALID_NODE) {
+      uint only = pair[0] != VK_BVH_INVALID_NODE ? pair[0] : pair[1];
+      if (only == VK_BVH_INVALID_NODE)
+         return 0;
+      stack_node[0] = source_index(only);
+      stack_count[0] = 8;
+      sp = 1;
+   } else {
+      uint a = source_index(pair[0]), b = source_index(pair[1]);
+      if (a == ~0u || b == ~0u)
+         return 0;
+      float c;
+      uint k = best_split(a, b, 8, c);
+      stack_node[0] = b;
+      stack_count[0] = 8u - k;
+      stack_node[1] = a;
+      stack_count[1] = k;
+      sp = 2;
+   }
+   for (uint steps = 0; sp != 0 && steps < 64u; steps++) {
+      uint node = stack_node[--sp], total = stack_count[sp];
+      if (node == ~0u)
+         return 0;
+      /* The fewest children that cost as little as `total` may. */
+      uint used = total;
+      if (openable(node))
+         while (used > 1u &&
+                subtree_cost(node, used - 1u) == subtree_cost(node, total))
+            used--;
+      else
+         used = 1;
+      if (used == 1u) {
+         if (count == 8u)
+            return 0;
+         list[count++] = node;
+         continue;
+      }
+      pair = children(node);
+      if (pair[0] == VK_BVH_INVALID_NODE || pair[1] == VK_BVH_INVALID_NODE) {
+         uint only = pair[0] != VK_BVH_INVALID_NODE ? pair[0] : pair[1];
+         if (sp == 8u)
+            return 0;
+         stack_node[sp] = source_index(only);
+         stack_count[sp++] = used;
+         continue;
+      }
+      uint a = source_index(pair[0]), b = source_index(pair[1]);
+      if (a == ~0u || b == ~0u || sp > 6u)
+         return 0;
+      float c;
+      uint k = best_split(a, b, used, c);
+      stack_node[sp] = b;
+      stack_count[sp++] = used - k;
+      stack_node[sp] = a;
+      stack_count[sp++] = k;
+   }
+   return sp == 0 ? count : 0u;
+}
+
+/* Reconstruct 64 left/right steps starting at `base` for the exact fallback
+ * on a binary tree deeper than 64 levels. Normal trees carry their complete
+ * path in one uint64_t built by classify()'s existing parent walk. */
+uint64_t
+sah_deep_path(uint id, uint id_depth, uint base)
+{
+   uint64_t path = 0ul;
+   uint cursor = id;
+   for (uint d = id_depth; d > base; d--) {
+      uint parent = DEREF(INDEX(hk_agx3_plan_node, args.nodes, cursor)).parent;
+      if (parent >= args.node_bound) {
+         fail(HK_AGX3_PLAN_INDEX);
+         return 0ul;
+      }
+      if (d - 1u < base + 64u) {
+         uvec2 pair = children(parent);
+         uint left = pair[0] == VK_BVH_INVALID_NODE ? ~0u
+                                                    : source_index(pair[0]);
+         uint right = pair[1] == VK_BVH_INVALID_NODE ? ~0u
+                                                     : source_index(pair[1]);
+         if (cursor == right)
+            path |= 1ul << (d - 1u - base);
+         else if (cursor != left) {
+            fail(HK_AGX3_PLAN_SHAPE);
+            return 0ul;
+         }
+      }
+      cursor = parent;
+   }
+   return path;
+}
+
+/* Return the smallest budget that has the same cost as `total`. A budget of
+ * one makes the node a child of the current wide node; a larger budget opens
+ * it inside that wide node. */
+uint
+sah_used(uint node, uint total)
+{
+   if (!openable(node))
+      return 1u;
+   uint used = total;
+   while (used > 1u &&
+          subtree_cost(node, used - 1u) == subtree_cost(node, total))
+      used--;
+   return used;
+}
+
+/* The wide level of `id`, or ~0u when an ancestor opens it. Follow only the
+ * binary ancestry path to `id`, carrying the optimal number of slots assigned
+ * to that path. This is O(binary depth) scalar work without private arrays for
+ * normal trees; deeper malformed or adversarial trees use exact 64-level
+ * windows. Unlike the old replay it never reconstructs preceding wide nodes. */
+uint
+sah_level(uint id, uint id_depth, uint root, uint64_t shallow_path)
+{
+   uint node = root, depth = 0u, level = 0u, budget = 8u;
+   uint64_t deep_path = 0ul;
+   uint deep_base = 0u;
+   for (uint guard = 0; guard < id_depth; guard++) {
+      uvec2 pair = children(node);
+      if (id_depth > 64u && (depth & 63u) == 0u) {
+         deep_base = depth;
+         deep_path = sah_deep_path(id, id_depth, deep_base);
+      }
+      bool right_path = id_depth <= 64u
+         ? ((shallow_path >> (id_depth - 1u - depth)) & 1ul) != 0ul
+         : ((deep_path >> (depth - deep_base)) & 1ul) != 0ul;
+      uint next, child_budget;
+      if (pair[0] == VK_BVH_INVALID_NODE || pair[1] == VK_BVH_INVALID_NODE) {
+         uint only = source_index(pair[0] != VK_BVH_INVALID_NODE ? pair[0]
+                                                                : pair[1]);
+         if (only == ~0u)
+            return ~0u;
+         next = only;
+         child_budget = budget;
+      } else {
+         uint a = source_index(pair[0]), b = source_index(pair[1]);
+         next = right_path ? b : a;
+         if (a == ~0u || b == ~0u ||
+             (next != a && next != b))
+            return ~0u;
+         float cost;
+         uint left = best_split(a, b, budget, cost);
+         child_budget = next == a ? left : budget - left;
+      }
+      node = next;
+      depth++;
+      uint used = sah_used(node, child_budget);
+      if (used == 1u) {
+         level++;
+         if (node == id)
+            return level;
+         budget = 8u;
+      } else {
+         if (node == id)
+            return ~0u;
+         budget = used;
+      }
+      if (budget == 0u)
+         return ~0u;
+   }
+   fail(HK_AGX3_PLAN_CYCLE);
+   return ~0u;
+}
+#endif
+
 void
 initialize(uint id)
 {
@@ -239,6 +571,10 @@ initialize(uint id)
       node.job = 0xffffffffu;
 #endif
       DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)) = node;
+#ifdef HK_AGX3_PLAN_SAH
+      if (id < args.node_bound)
+         DEREF(cost_record(id)).arrivals = 0;
+#endif
    }
    if (id == 0) {
       hk_agx3_plan_state state;
@@ -303,6 +639,35 @@ classify(uint id)
    if (id != root && node.parent == 0xffffffffu)
       return; /* inactive IR leaf */
    uint cursor = id, depth = 0;
+#ifdef HK_AGX3_PLAN_SAH
+   uint64_t sah_path = 0ul;
+   while (cursor != root) {
+      if (depth++ >= args.node_bound) {
+         fail(HK_AGX3_PLAN_CYCLE);
+         return;
+      }
+      uint child = cursor;
+      uint parent = DEREF(INDEX(hk_agx3_plan_node, args.nodes, child)).parent;
+      if (parent >= args.node_bound) {
+         fail(HK_AGX3_PLAN_INDEX);
+         return;
+      }
+      if (depth <= 64u) {
+         uvec2 pair = children(parent);
+         uint left = pair[0] == VK_BVH_INVALID_NODE ? ~0u
+                                                    : source_index(pair[0]);
+         uint right = pair[1] == VK_BVH_INVALID_NODE ? ~0u
+                                                     : source_index(pair[1]);
+         if (child == right)
+            sah_path |= 1ul << (depth - 1u);
+         else if (child != left) {
+            fail(HK_AGX3_PLAN_SHAPE);
+            return;
+         }
+      }
+      cursor = parent;
+   }
+#else
    while (cursor != root) {
       if (depth++ >= args.node_bound) {
          fail(HK_AGX3_PLAN_CYCLE);
@@ -314,6 +679,7 @@ classify(uint id)
          return;
       }
    }
+#endif
 #ifdef HK_AGX3_PLAN_PAIRS
    DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).depth =
       depth | (node.depth & (HK_AGX3_PLAN_PAIR | HK_AGX3_PLAN_PAIR_OPAQUE));
@@ -325,9 +691,27 @@ classify(uint id)
       selected = node.leaf_count <= 8
                     ? DEREF(INDEX(hk_agx3_plan_node, args.nodes, node.parent))
                             .leaf_count > 8
-                    : depth % 3 == 0;
+                    :
+#ifdef HK_AGX3_PLAN_SAH
+                      true;
+#else
+                      depth % 3 == 0;
+#endif
    if (!selected)
       return;
+#ifdef HK_AGX3_PLAN_SAH
+   /* Native levels below and including this node's. */
+   uint levels = 1u;
+   if (node.leaf_count > 8) {
+      /* A leaf cluster always has a wide parent, which accounts for its
+       * level in emit(); an inner node is a wide node unless opened. */
+      uint level = id == root ? 0u : sah_level(id, depth, root, sah_path);
+      if (level == ~0u)
+         return;
+      DEREF(cost_record(id)).reserved = level;
+      levels = level + 1u;
+   }
+#endif
    uint job = atomicAdd(DEREF(args.state).job_count, 1);
    if (job >= args.node_bound) {
       fail(HK_AGX3_PLAN_ALLOCATION);
@@ -350,7 +734,12 @@ classify(uint id)
    for (uint i = 0; i < 8; i++)
       output_job.triangle_offsets[i] = 0;
    DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = output_job;
+#ifdef HK_AGX3_PLAN_SAH
+   if (node.leaf_count > 8 || id == root)
+      atomicMax(DEREF(args.state).depth, levels);
+#else
    atomicMax(DEREF(args.state).depth, (depth + 2u) / 3u + 1u);
+#endif
 }
 
 void
@@ -365,6 +754,18 @@ emit(uint id)
    uint stack[9], level[9], selected[8], sp = 1, count = 0, steps = 0;
    stack[0] = id;
    level[0] = 0;
+#ifdef HK_AGX3_PLAN_SAH
+   if (!leaf) {
+      count = sah_children(id, selected);
+      if (count == 0u) {
+         fail(HK_AGX3_PLAN_SHAPE);
+         return;
+      }
+      sp = 0;
+      /* Its children are one level down. */
+      atomicMax(DEREF(args.state).depth, DEREF(cost_record(id)).reserved + 2u);
+   }
+#endif
    while (sp != 0) {
       if (++steps > args.node_bound * 2u) {
          fail(HK_AGX3_PLAN_CYCLE);
@@ -487,6 +888,10 @@ main()
       return;
    if (args.phase == 1)
       link_and_count(id);
+#ifdef HK_AGX3_PLAN_SAH
+   if (args.phase == HK_AGX3_PLAN_PHASE_COST)
+      compute_costs(id);
+#endif
    if (args.phase == 2)
       classify(id);
    if (args.phase == 3)

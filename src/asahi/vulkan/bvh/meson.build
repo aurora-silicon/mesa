@@ -39,6 +39,9 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
              ['agx3_envelope.comp', 'hk_agx3_gen1_envelope'],
              ['agx3_plan.comp', 'hk_agx3_gen1_plan'],
              ['agx3_plan.comp', 'hk_agx3_gen1_plan_pairs', '-DHK_AGX3_PLAN_PAIRS=1'],
+             ['agx3_plan.comp', 'hk_agx3_gen1_plan_sah', '-DHK_AGX3_PLAN_SAH=1'],
+             ['agx3_plan.comp', 'hk_agx3_gen1_plan_sah_pairs',
+              '-DHK_AGX3_PLAN_SAH=1', '-DHK_AGX3_PLAN_PAIRS=1'],
              ['vertex_table.comp', 'hk_vertex_table']]
   command = [
     prog_glslang, '-V',
@@ -48,6 +51,7 @@ foreach s : [['encode.comp', 'hk_encode'], ['write.comp', 'hk_bvh_write'],
     '--target-env', 'spirv1.5', '-x', '-o', '@OUTPUT@', '@INPUT@',
   ]
   command += s.length() > 2 ? [s[2]] : []
+  command += s.length() > 3 ? [s[3]] : []
   command += glslang_quiet
   command += vk_glsl_shader_preamble
 

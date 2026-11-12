@@ -374,9 +374,20 @@ struct hk_agx3_plan_state {
    uint32_t saved_positions;
 };
 
+/* GEN1 wide collapse by cost: after the node_bound plan
+ * nodes, one record per node. cost[i - 1] is the least expected cost of
+ * the node's subtree as at most i children of a wide node, in units of
+ * the root's surface area times one node visit. */
+struct hk_agx3_plan_cost {
+   float cost[8];
+   uint32_t arrivals;
+   uint32_t reserved;
+};
+
 #ifdef VULKAN
 TYPE(hk_agx3_plan_node, 4);
 TYPE(hk_agx3_plan_state, 4);
+TYPE(hk_agx3_plan_cost, 4);
 #endif
 
 struct hk_agx3_plan_args {
@@ -405,6 +416,8 @@ struct hk_agx3_plan_args {
    /* Nonzero to encode sibling triangle leaves that share an edge as one
     * native record (see hk_agx3_shared_edge); triangle geometry only. */
    uint32_t pairs;
+   /* Host-only selector for the separate SAH-collapse plan variant. The
+    * fixed shader retains this ABI word as padding. */
    uint32_t padding;
 };
 
@@ -458,6 +471,9 @@ struct hk_agx3_batch_args {
 #define HK_AGX3_PLAN_PAIR_OPAQUE 0x40000000u
 /* Set in a leaf job's triangle offset when it names such an internal node. */
 #define HK_AGX3_LEAF_PAIR_OFFSET 1u
+/* The plan phase that fills the hk_agx3_plan_cost records, between phases
+ * 1 and 2. */
+#define HK_AGX3_PLAN_PHASE_COST 5u
 #define HK_AGX3_PLAN_INDEX 1
 #define HK_AGX3_PLAN_CYCLE 2
 #define HK_AGX3_PLAN_ALLOCATION 4

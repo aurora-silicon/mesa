@@ -80,6 +80,14 @@ static const uint32_t agx3_plan_pairs_spv[] = {
 #include "bvh/hk_agx3_gen1_plan_pairs.spv.h"
 };
 
+static const uint32_t agx3_plan_sah_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_sah.spv.h"
+};
+
+static const uint32_t agx3_plan_sah_pairs_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_sah_pairs.spv.h"
+};
+
 static const uint32_t agx3_node_pairs_spv[] = {
 #include "bvh/hk_agx3_gen1_leaf_pairs.spv.h"
 };
@@ -896,19 +904,35 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                        sizeof(struct hk_agx3_leaf_args)}
       : (struct stage){"hk-agx3-node-encode", agx3_node_spv,
                        sizeof(agx3_node_spv), sizeof(struct hk_agx3_leaf_args)};
+   const bool pairs = args->pairs;
+   const bool sah = args->padding;
+   struct stage plan_stage;
+   if (sah && pairs) {
+      plan_stage = (struct stage){"hk-agx3-plan-sah-pairs",
+                                  agx3_plan_sah_pairs_spv,
+                                  sizeof(agx3_plan_sah_pairs_spv),
+                                  sizeof(*args)};
+   } else if (sah) {
+      plan_stage = (struct stage){"hk-agx3-plan-sah", agx3_plan_sah_spv,
+                                  sizeof(agx3_plan_sah_spv), sizeof(*args)};
+   } else if (pairs) {
+      plan_stage = (struct stage){"hk-agx3-plan-pairs", agx3_plan_pairs_spv,
+                                  sizeof(agx3_plan_pairs_spv), sizeof(*args)};
+   } else {
+      plan_stage = (struct stage){"hk-agx3-plan", agx3_plan_spv,
+                                  sizeof(agx3_plan_spv), sizeof(*args)};
+   }
    const struct stage stages[] = {
-      {"hk-agx3-plan", agx3_plan_spv, sizeof(agx3_plan_spv), sizeof(*args)},
+      plan_stage,
       node_encode,
       {"hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
        sizeof(struct hk_agx3_envelope_args)},
       /* Planning and node encoding that pair triangles. */
       {"hk-agx3-node-encode-pairs", agx3_node_pairs_spv,
        sizeof(agx3_node_pairs_spv), sizeof(struct hk_agx3_leaf_args)},
-      {"hk-agx3-plan-pairs", agx3_plan_pairs_spv, sizeof(agx3_plan_pairs_spv),
-       sizeof(*args)},
    };
-   VkPipeline pipeline[5];
-   VkPipelineLayout layout[5];
+   VkPipeline pipeline[4];
+   VkPipelineLayout layout[4];
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       VkResult result = get_pipeline_spv(
          dev, stages[i].name, stages[i].code, stages[i].size,
@@ -917,19 +941,23 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
          return result;
    }
 
-   const unsigned plan = args->pairs ? 4 : 0;
    vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline[plan]);
+                            pipeline[0]);
    const VkMemoryBarrier barrier = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
       .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
       .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
                        VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
    };
-   for (unsigned phase = 0; phase < 5; ++phase) {
+   /* The cost phase runs between linking (1) and classification (2). */
+   static const unsigned phases[] = {0, 1, HK_AGX3_PLAN_PHASE_COST, 2, 3, 4};
+   for (unsigned p = 0; p < ARRAY_SIZE(phases); ++p) {
+      const unsigned phase = phases[p];
+      if (phase == HK_AGX3_PLAN_PHASE_COST && !sah)
+         continue;
       struct hk_agx3_plan_args push = *args;
       push.phase = phase;
-      vk_common_CmdPushConstants(command_buffer, layout[plan],
+      vk_common_CmdPushConstants(command_buffer, layout[0],
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                                 &push);
       hk_cmd_dispatch_unaligned(command_buffer,
@@ -956,7 +984,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
    for (unsigned step = 0; step < 2; ++step) {
       bool envelope = instances ? step == 0 : step == 1;
       unsigned stage = envelope ? 2
-                     : args->pairs ? 3 : 1;
+                     : pairs ? 3 : 1;
       vk_common_CmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                                pipeline[stage]);
       vk_common_CmdPushConstants(command_buffer, layout[stage],
@@ -1335,6 +1363,7 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
                         VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
                      !(state->build_info->flags &
                        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR),
+            .padding = !allow_update && dev->dev.chip == AGX_CHIP_G17P,
          };
          struct hk_agx3_plan_args native_plan = plan;
          native_plan.metadata = hk_gen1_as_metadata_addr_for_id(cmd, plan.resource_id);

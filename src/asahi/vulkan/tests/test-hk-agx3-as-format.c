@@ -10,6 +10,7 @@
 #undef NDEBUG
 #include "hk_acceleration_structure.h"
 #include "hk_agx3_as_layout.h"
+#include "bvh/hk_build_interface.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -51,7 +52,8 @@ check_layout(enum hk_agx3_as_format format, uint32_t leaves,
    const uint64_t nodes = (uint64_t)leaves + (leaves > 1 ? leaves : 2) - 1;
    const uint64_t slots = (uint64_t)leaves * 4 + 1;
    assert(l->node_bound == nodes && l->slot_bound == slots);
-   assert(l->jobs == nodes * 16 && l->envelope == l->jobs + nodes * 64);
+   assert(l->jobs == nodes * (16 + (format == HK_AGX3_AS_FORMAT_GEN1 ? 40 : 0)) &&
+          l->envelope == l->jobs + nodes * 64);
    assert(l->state == l->envelope + 48);
    /* GEN1's plan writes the indirect encode dispatch after its state. */
    assert(l->node_status == l->state + tail);
@@ -126,7 +128,9 @@ main(void)
    /* The layouts differ exactly where the formats do. */
    struct hk_agx3_as_layout g, m;
    assert(hk_gen1_as_layout_init(64, &g) && hk_agx3_as_layout_init(64, &m));
-   assert(g.state == m.state && g.node_status == m.node_status + 16);
+   const uint32_t costs = g.node_bound * sizeof(struct hk_agx3_plan_cost);
+   assert(g.state == m.state + costs &&
+          g.node_status == m.node_status + costs + 16);
    assert(m.as_bytes == g.as_bytes + 1023);
 
    printf("hk_agx3_as_format: %u M5 and %u GEN1 chips, each with its own "
