@@ -98,11 +98,13 @@ struct hk_addr_range {
  *  bit 0: let force-opaque queries use the hardware committed-hit path
  *  bit 1: retain the common builder's PLOC topology instead of HPLOC
  *  bit 2: keep one triangle per native record (disable sibling pairing)
+ *  bit 3: choose wide-node children by surface area (wide_children)
  */
 enum hk_g17p_rt_perf_arm {
    HK_G17P_RT_PERF_OPAQUE_HW_COMMIT = 1u << 0,
    HK_G17P_RT_PERF_PLOC             = 1u << 1,
    HK_G17P_RT_PERF_NO_TRI_PAIRS     = 1u << 2,
+   HK_G17P_RT_PERF_WIDE_CHILDREN    = 1u << 3,
 };
 
 static inline unsigned

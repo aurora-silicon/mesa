@@ -1337,6 +1337,8 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
                      !(state->build_info->flags &
                        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) &&
                      !(perf_arm & HK_G17P_RT_PERF_NO_TRI_PAIRS),
+            .wide_children = !allow_update &&
+                             (perf_arm & HK_G17P_RT_PERF_WIDE_CHILDREN),
          };
          struct hk_agx3_plan_args native_plan = plan;
          native_plan.metadata = hk_gen1_as_metadata_addr_for_id(cmd, plan.resource_id);

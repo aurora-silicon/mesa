@@ -405,7 +405,11 @@ struct hk_agx3_plan_args {
    /* Nonzero to encode sibling triangle leaves that share an edge as one
     * native record (see hk_agx3_shared_edge); triangle geometry only. */
    uint32_t pairs;
-   uint32_t padding;
+   /* Nonzero to give each wide inner node the children chosen by opening
+    * its largest-area binary descendants (agx3_plan.comp wide_children())
+    * instead of a fixed three binary levels. Not for builds that allow
+    * updates: their refit levels follow the fixed collapse. */
+   uint32_t wide_children;
 };
 
 /* Independent ASs share dispatches, not their writable records. The planner

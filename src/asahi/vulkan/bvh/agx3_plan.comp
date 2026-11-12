@@ -222,6 +222,134 @@ count_leaves(uint start)
    return count;
 }
 
+/* Surface area of an IR node's bounds, the open order of wide_children(). */
+float
+node_area(uint index)
+{
+   REF(vk_ir_node)
+   node = REF(vk_ir_node)(OFFSET(args.intermediate_bvh, source_offset(index)));
+   vec3 extent = max(DEREF(node).aabb.max - DEREF(node).aabb.min, vec3(0.0));
+   return extent.x * extent.y + extent.y * extent.z + extent.z * extent.x;
+}
+
+/* Whether a wide inner node may open binary node `index` into its two
+ * children: an internal node that is neither a leaf cluster nor a pair. */
+bool
+openable(uint index)
+{
+   return index >= args.leaf_bound &&
+          DEREF(INDEX(hk_agx3_plan_node, args.nodes, index)).leaf_count > 8;
+}
+
+/* With args.wide_children, the children of the wide inner node over binary
+ * node `root`. Start from its binary children, then open the openable child
+ * of largest surface area while the node has room for one more. The child
+ * that a ray is most likely to enter goes one level further down, rather
+ * than every child down a fixed three levels, so nodes fill up and
+ * low-probability subtrees stay shallow. Opening replaces the child by its
+ * own children in place, so the binary tree's left-to-right order holds.
+ * Returns the child count, 0 on a malformed tree. */
+uint
+wide_children(uint root, out uint list[8])
+{
+   uint count = 0;
+   uvec2 pair = children(root);
+   for (uint c = 0; c < 2; c++)
+      if (pair[c] != VK_BVH_INVALID_NODE) {
+         uint child = source_index(pair[c]);
+         if (child == 0xffffffffu)
+            return 0;
+         list[count++] = child;
+      }
+   for (uint steps = 0; steps < 64u && count < 8u; steps++) {
+      uint best = 8u;
+      float best_area = -1.0;
+      for (uint c = 0; c < count; c++)
+         if (openable(list[c])) {
+            float area = node_area(list[c]);
+            if (area > best_area) {
+               best = c;
+               best_area = area;
+            }
+         }
+      if (best == 8u)
+         break;
+      pair = children(list[best]);
+      uint first = source_index(pair[0]), second = source_index(pair[1]);
+      if (pair[0] == VK_BVH_INVALID_NODE || pair[1] == VK_BVH_INVALID_NODE) {
+         /* One child: open in place. */
+         uint only = pair[0] != VK_BVH_INVALID_NODE ? first : second;
+         if (only == 0xffffffffu)
+            return 0;
+         list[best] = only;
+         continue;
+      }
+      if (first == 0xffffffffu || second == 0xffffffffu)
+         return 0;
+      for (uint c = count; c > best + 1u; c--)
+         list[c] = list[c - 1u];
+      list[best] = first;
+      list[best + 1u] = second;
+      count++;
+   }
+   return count;
+}
+
+/* Binary ancestors of one node by depth, a window at a time. */
+uint path_window[32];
+uint path_base;
+
+uint
+ancestor_at(uint id, uint id_depth, uint depth)
+{
+   if (depth < path_base || depth >= path_base + 32u) {
+      path_base = depth;
+      uint cursor = id;
+      for (uint d = id_depth; d >= depth; d--) {
+         if (d < depth + 32u)
+            path_window[d - depth] = cursor;
+         if (d == 0u)
+            break;
+         cursor = DEREF(INDEX(hk_agx3_plan_node, args.nodes, cursor)).parent;
+      }
+   }
+   return path_window[depth - path_base];
+}
+
+/* With args.wide_children: the wide level of the native node over binary
+ * node `id` at binary depth `id_depth`, or ~0u if `id` gets no native node
+ * (a wide node above opened it). Replays wide_children() from the root down
+ * the path to `id`, as emit() will. */
+uint
+wide_level(uint id, uint id_depth, uint root)
+{
+   uint node = root, depth = 0, level = 0;
+   path_base = 0xffffffffu;
+   for (uint guard = 0; guard <= id_depth; guard++) {
+      if (node == id)
+         return level;
+      uint list[8];
+      uint count = wide_children(node, list);
+      if (count == 0u)
+         return ~0u;
+      uint next = ~0u;
+      for (uint d = depth + 1u; d <= id_depth && next == ~0u; d++) {
+         uint step = ancestor_at(id, id_depth, d);
+         for (uint c = 0; c < count; c++)
+            if (list[c] == step) {
+               next = step;
+               depth = d;
+            }
+      }
+      if (next == ~0u)
+         return ~0u;
+      node = next;
+      level++;
+   }
+   fail(HK_AGX3_PLAN_CYCLE);
+   return ~0u;
+}
+
 void
 initialize(uint id)
 {
@@ -325,9 +453,21 @@ classify(uint id)
       selected = node.leaf_count <= 8
                     ? DEREF(INDEX(hk_agx3_plan_node, args.nodes, node.parent))
                             .leaf_count > 8
-                    : depth % 3 == 0;
+                    : args.wide_children != 0u || depth % 3 == 0;
    if (!selected)
       return;
+   /* Native levels below and including this node's. */
+   uint levels = (depth + 2u) / 3u + 1u;
+   if (args.wide_children != 0u) {
+      uint level = wide_level(id, depth, root);
+      if (level == ~0u) {
+         /* A leaf cluster always has a wide parent; an opened node has none. */
+         if (node.leaf_count <= 8)
+            fail(HK_AGX3_PLAN_SHAPE);
+         return;
+      }
+      levels = level + 1u;
+   }
    uint job = atomicAdd(DEREF(args.state).job_count, 1);
    if (job >= args.node_bound) {
       fail(HK_AGX3_PLAN_ALLOCATION);
@@ -350,7 +490,7 @@ classify(uint id)
    for (uint i = 0; i < 8; i++)
       output_job.triangle_offsets[i] = 0;
    DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = output_job;
-   atomicMax(DEREF(args.state).depth, (depth + 2u) / 3u + 1u);
+   atomicMax(DEREF(args.state).depth, levels);
 }
 
 void
@@ -365,6 +505,14 @@ emit(uint id)
    uint stack[9], level[9], selected[8], sp = 1, count = 0, steps = 0;
    stack[0] = id;
    level[0] = 0;
+   if (!leaf && args.wide_children != 0u) {
+      count = wide_children(id, selected);
+      if (count == 0u) {
+         fail(HK_AGX3_PLAN_SHAPE);
+         return;
+      }
+      sp = 0;
+   }
    while (sp != 0) {
       if (++steps > args.node_bound * 2u) {
          fail(HK_AGX3_PLAN_CYCLE);
