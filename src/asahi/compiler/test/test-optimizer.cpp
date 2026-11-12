@@ -260,6 +260,45 @@ TEST_F(Optimizer, G18GPreservesEpilogConversions)
 }
 
 /*
+ * The projective multiply and reciprocal only have a plain 32-bit destination
+ * and no saturating form. A mediump perspective varying narrows the product to
+ * 16 bits and clamp() saturates it; both moves have to stay separate on every
+ * AGX3 encoding (G17S refused `persp_mul_agx3 d16, r32, r32`).
+ */
+TEST_F(Optimizer, AGX3KeepsMovesAfterProjectiveMultiply)
+{
+   const struct {
+      enum agx_isa_encoding encoding;
+      bool emit_agx3d;
+   } targets[] = {
+      {AGX_ISA_ENCODING_AGX3B, false},
+      {AGX_ISA_ENCODING_AGX3C, false},
+      {AGX_ISA_ENCODING_AGX3C, true},
+   };
+
+   for (const auto &target : targets) {
+      for (bool saturate : {false, true}) {
+         agx_builder *actual = agx_test_builder(mem_ctx);
+         agx_builder *expected = agx_test_builder(mem_ctx);
+         struct agx_shader_key key = {};
+         key.dev.encoding = target.encoding;
+         key.dev.emit_agx3d = target.emit_agx3d;
+         for (agx_builder *b : {actual, expected}) {
+            b->shader->key = &key;
+            agx_index rcp = agx_persp_rcp_agx3(b, wx, 3);
+            agx_index product = agx_persp_mul_agx3(b, wy, rcp, 4);
+            agx_index out =
+               agx_temp(b->shader, saturate ? AGX_SIZE_32 : AGX_SIZE_16);
+            agx_fmov_to(b, out, product)->saturate = saturate;
+            agx_unit_test(b, out);
+         }
+         agx_optimize_and_dce(actual->shader);
+         ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+      }
+   }
+}
+
+/*
  * AGX3 has no select form without a register compare operand, so a select of
  * two immediates -- here fused out of a compare of two constants -- has to
  * fold to the chosen operand.

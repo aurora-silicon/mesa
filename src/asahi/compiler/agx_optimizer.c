@@ -654,6 +654,20 @@ agx_optimizer_fmov_rev(agx_context *ctx, agx_instr *I, agx_instr *use)
        (I->op == AGX_OPCODE_RCP || I->op == AGX_OPCODE_RSQRT))
       return false;
 
+   /* AGX3's projective reciprocal and multiply are the native f32rcp and
+    * f32mul.ep4 forms that carry a coefficient index. Their only grounded
+    * destination is a plain 32-bit register and neither has a saturating
+    * form, so the packer refuses anything else and the whole shader with it.
+    * AGX3B already keeps the move (only FMUL narrows there, and no producer
+    * absorbs a saturate); AGX3C did not, so on G17S every perspective
+    * fragment input narrowed to 16 bits -- each mediump varying of a GLES
+    * shader -- was refused as `persp_mul_agx3 d16, r32, r32` and its draws
+    * were skipped (es2gears, Firefox WebRender text). Keep the explicit
+    * f32-to-f16 or saturating move on every encoding. */
+   if (I->op == AGX_OPCODE_PERSP_MUL_AGX3 ||
+       I->op == AGX_OPCODE_PERSP_RCP_AGX3)
+      return false;
+
    /* We can fold f2f16 into 32-bit instructions, but we can't fold f2f32 into
     * 16-bit instructions, since the latter would implicitly promote to a 32-bit
     * instruction which is not exact.
