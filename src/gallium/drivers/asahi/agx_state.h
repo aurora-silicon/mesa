@@ -1469,12 +1469,15 @@ agx_shadow_gather_custom_border(enum agx_chip chip)
    return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
 }
 
-/* Bytes of struct agx_stage_uniforms uploaded as the stage sysval table. Stop
- * before the G18G-only fields that follow custom_border_compare_func; no
- * other chip reads them. */
+/* Bytes of struct agx_stage_uniforms uploaded as the stage sysval table. Other
+ * chips stop before the G18G-only fields that follow
+ * custom_border_compare_func; they never read them. */
 static inline size_t
 agx_stage_uniforms_size(enum agx_chip chip)
 {
+   if (chip == AGX_CHIP_G18G)
+      return sizeof(struct agx_stage_uniforms);
+
    /* One word past lod_bias gives a lone lod_bias[31] the padding half that
     * Ioto's dword upload reads. */
    return agx_shadow_gather_custom_border(chip)
