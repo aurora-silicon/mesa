@@ -1907,8 +1907,10 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                (cs->sync.barrier_ta[HK_SYNC_CDM] !=
                    cs->sync.barrier[HK_SYNC_CDM] ||
                 cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
-            if (g17p_staged)
+            if (g17p_staged) {
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "G17P staged render");
+            }
 
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
