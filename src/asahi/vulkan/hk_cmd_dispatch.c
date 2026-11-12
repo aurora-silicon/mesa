@@ -2877,17 +2877,19 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        * g18_compute_stream_max (64 KiB with the G18 admission patch); at
        * the cap the stream terminates and seals, and the next dispatch
        * rotates to a fresh stream (dispatch_grid's g18_dispatch_sealed
-       * check). The default 8 is the validated ceiling for real-model
-       * graphs: larger flat grids stall the firmware's multi-launch
-       * completion accounting above 9 launches per stream
-       * (G18_RECOVERY_PB restart loop -> G18_APP_JOB_FAILED EIO), while
-       * small grids survive any batch. Raise the default only after that
-       * stall is root-caused. */
+       * check). The default 64 is where decode throughput stops rising:
+       * 7B Q4_0 on a G18G measured 1.83 (batch 8), 3.14 (32), 3.44 (64),
+       * 3.43 (128) and 3.40 (256) tokens per second, with identical output
+       * and no G18 failure lines. The older ceiling of 8 came from a
+       * firmware stall above 9 launches per stream on large flat grids
+       * (G18_RECOVERY_PB restart loop -> G18_APP_JOB_FAILED EIO); it did
+       * not reproduce at batch 10 to 256 (decode) or at batch 64 on 512-
+       * and 2048-token prefill with -ub 512 and -ub 2048. */
       /* Clamped to 1400 so the stream stays under the kernel's 64 KiB
        * g18_compute_stream_max even with an oversized user value
        * (w7Q PR-10 smaller finding). */
       const uint32_t batch_limit =
-         MIN2(debug_get_num_option("HK_G18_BATCH", 8), 1400);
+         MIN2(debug_get_num_option("HK_G18_BATCH", 64), 1400);
       /* rel31 (w7C's plan rule + w7P's validator semantics): the kernel
        * sizes the stream's compute plan (pool/SMA/counters) from these
        * resource words alone, and last-wins under-sizes a stream whose
