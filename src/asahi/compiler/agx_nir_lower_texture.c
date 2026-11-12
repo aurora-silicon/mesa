@@ -2080,6 +2080,108 @@ lower_lod_clamp(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    return false;
 }
 
+/*
+ * On G13/G14, image loads go through the texture cache and image stores
+ * through the PBE. Neither is coherent with the other across GPU clusters,
+ * and the barrier train does not make a store from one cluster visible to a
+ * texture read on another (multi-cluster G13S/G13C/G13D only: the
+ * single-cluster G14G passes the same CTS cases). Memory-model accesses
+ * that must be coherent at device scope (coherent or atomic loads and
+ * stores) therefore use the image's memory directly, the way image atomics
+ * already do, for formats whose texels are stored as plain 32-bit channels.
+ */
+static bool
+coherent_image_access(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_load:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_bindless_image_store:
+      break;
+   default:
+      return false;
+   }
+
+   if (!(nir_intrinsic_access(intr) & (ACCESS_COHERENT | ACCESS_ATOMIC)) ||
+       nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_MS ||
+       nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_SUBPASS ||
+       nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_SUBPASS_MS)
+      return false;
+
+   switch (nir_intrinsic_format(intr)) {
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32_UINT:
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32_UINT:
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+lower_coherent_image_access(nir_builder *b, nir_intrinsic_instr *intr,
+                            void *data)
+{
+   if (!coherent_image_access(intr))
+      return false;
+
+   const bool load = intr->intrinsic == nir_intrinsic_image_load ||
+                     intr->intrinsic == nir_intrinsic_bindless_image_load;
+   const bool bindless = intr->intrinsic == nir_intrinsic_bindless_image_load ||
+                         intr->intrinsic == nir_intrinsic_bindless_image_store;
+   const enum pipe_format format = nir_intrinsic_format(intr);
+   const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+   const unsigned components = util_format_get_blocksize(format) / 4;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *address = nir_image_texel_address(
+      b, 64, intr->src[0].ssa, intr->src[1].ssa, intr->src[2].ssa,
+      .image_dim = nir_intrinsic_image_dim(intr),
+      .image_array = nir_intrinsic_image_array(intr), .format = format,
+      .access = access);
+   nir_intrinsic_instr *address_intr = nir_def_as_intrinsic(address);
+   if (bindless)
+      address_intr->intrinsic = nir_intrinsic_bindless_image_texel_address;
+   else
+      nir_intrinsic_set_range_base(address_intr,
+                                   nir_intrinsic_range_base(intr));
+
+   if (load) {
+      nir_def *v = nir_load_global(b, components, 32, address, .align_mul = 4,
+                                   .access = access);
+      const bool is_float =
+         nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) ==
+         nir_type_float;
+      nir_def *one = is_float ? nir_imm_float(b, 1.0) : nir_imm_int(b, 1);
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_def *chans[4];
+      for (unsigned c = 0; c < 4; ++c)
+         chans[c] = c < components ? nir_channel(b, v, c)
+                                   : (c == 3 ? one : zero);
+      nir_def_replace(&intr->def,
+                      nir_vec(b, chans, intr->def.num_components));
+   } else {
+      nir_store_global(b, nir_trim_vector(b, intr->src[3].ssa, components),
+                       address, .align_mul = 4,
+                       .write_mask = BITFIELD_MASK(components),
+                       .access = access);
+      /* Later texture reads of this image in the shader must see it. */
+      if (!(access & ACCESS_NON_READABLE))
+         nir_fence_mem_to_tex_agx(b);
+      nir_instr_remove(&intr->instr);
+   }
+
+   b->shader->info.use_lowered_image_to_global = true;
+   return true;
+}
+
 static bool
 lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
               bool robust_formatless_images, bool robust_texel_fetch,
@@ -2114,6 +2216,10 @@ lower_texture(nir_shader *s, unsigned generation, bool buffer_metadata,
    /* Insert fences before lowering image atomics, since image atomics need
     * different fencing than other image operations.
     */
+   if (!options.gen9 && !options.gen10)
+      NIR_PASS(progress, s, nir_shader_intrinsics_pass,
+               lower_coherent_image_access, nir_metadata_control_flow, NULL);
+
    NIR_PASS(progress, s, nir_shader_intrinsics_pass, fence_image,
             nir_metadata_control_flow, NULL);
 

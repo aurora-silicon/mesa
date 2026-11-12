@@ -69,3 +69,63 @@ TEST(ImageAtomicMetadata, AddressLoadsFollowDescriptorABI)
       }
    }
 }
+
+static unsigned
+count_global_access(nir_shader *s)
+{
+   unsigned n = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(s)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             (nir_instr_as_intrinsic(instr)->intrinsic ==
+                 nir_intrinsic_load_global ||
+              nir_instr_as_intrinsic(instr)->intrinsic ==
+                 nir_intrinsic_store_global))
+            n++;
+      }
+   }
+   return n;
+}
+
+static unsigned
+lowered_global_access(unsigned generation, enum gl_access_qualifier access)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "coherent image");
+   nir_def *coord =
+      nir_pad_vector(&b, nir_load_global_invocation_id(&b, 32), 4);
+   nir_def *v = nir_bindless_image_load(
+      &b, 4, 32, nir_imm_int(&b, 1), coord, nir_imm_int(&b, 0),
+      nir_imm_int(&b, 0), .image_dim = GLSL_SAMPLER_DIM_2D,
+      .format = PIPE_FORMAT_R32_UINT, .access = access,
+      .dest_type = nir_type_uint32);
+   nir_bindless_image_store(&b, nir_imm_int(&b, 2), coord, nir_imm_int(&b, 0),
+                            v, nir_imm_int(&b, 0),
+                            .image_dim = GLSL_SAMPLER_DIM_2D,
+                            .format = PIPE_FORMAT_R32_UINT, .access = access,
+                            .src_type = nir_type_uint32);
+
+   agx_nir_lower_texture_for_generation(b.shader, generation);
+   nir_validate_shader(b.shader, "coherent image lowering");
+   unsigned n = count_global_access(b.shader);
+   ralloc_free(b.shader);
+   return n;
+}
+
+/* G13/G14 (descriptor generation 7): coherent and atomic image loads and
+ * stores of plain 32-bit formats address the image memory directly, since the
+ * texture cache and the PBE are not coherent across GPU clusters there. Plain
+ * accesses and later generations keep the image instructions. */
+TEST(ImageAtomicMetadata, CoherentImageAccessUsesMemoryOnLegacyGenerations)
+{
+   for (unsigned generation : {7u, 9u}) {
+      SCOPED_TRACE(generation);
+      const unsigned plain =
+         lowered_global_access(generation, (enum gl_access_qualifier)0);
+      const unsigned extra = generation < 9 ? 2 : 0;
+      EXPECT_EQ(lowered_global_access(generation, ACCESS_COHERENT),
+                plain + extra);
+      EXPECT_EQ(lowered_global_access(generation, ACCESS_ATOMIC),
+                plain + extra);
+   }
+}
