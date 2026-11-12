@@ -311,7 +311,11 @@ wide_children(uint root, out uint list[8])
  * bounds' area. Visiting a native node tests all its child boxes at once;
  * a leaf cluster then tests the records whose boxes the ray hits. */
 #define WIDE_NODE_COST 1.0
-#define WIDE_RECORD_COST 1.0
+/* Test-only: bits 8..15 of wide_children give the record cost in quarters
+ * of a node visit (0 = one). */
+#define WIDE_RECORD_COST \
+   ((args.wide_children >> 8) != 0u ? float(args.wide_children >> 8) * 0.25 : 1.0)
+#define WIDE_MODE (args.wide_children & 0xffu)
 
 REF(hk_agx3_plan_cost)
 cost_record(uint index)
@@ -504,7 +508,7 @@ sah_children(uint root, out uint list[8])
 uint
 collapse_children(uint root, out uint list[8])
 {
-   return args.wide_children == HK_AGX3_WIDE_SAH ? sah_children(root, list)
+   return WIDE_MODE == HK_AGX3_WIDE_SAH ? sah_children(root, list)
                                                  : wide_children(root, list);
 }
 
@@ -580,7 +584,7 @@ initialize(uint id)
       node.job = 0xffffffffu;
 #endif
       DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)) = node;
-      if (args.wide_children == HK_AGX3_WIDE_SAH)
+      if (WIDE_MODE == HK_AGX3_WIDE_SAH)
          DEREF(cost_record(id)).arrivals = 0;
    }
    if (id == 0) {
@@ -673,14 +677,13 @@ classify(uint id)
       return;
    /* Native levels below and including this node's. */
    uint levels = (depth + 2u) / 3u + 1u;
-   if (args.wide_children != 0u) {
+   if (args.wide_children != 0u && node.leaf_count > 8) {
+      /* A leaf cluster always has a wide parent, which accounts for its
+       * level in emit(); an inner node is a wide node unless opened. */
       uint level = wide_level(id, depth, root);
-      if (level == ~0u) {
-         /* A leaf cluster always has a wide parent; an opened node has none. */
-         if (node.leaf_count <= 8)
-            fail(HK_AGX3_PLAN_SHAPE);
+      if (level == ~0u)
          return;
-      }
+      DEREF(cost_record(id)).reserved = level;
       levels = level + 1u;
    }
    uint job = atomicAdd(DEREF(args.state).job_count, 1);
@@ -727,6 +730,8 @@ emit(uint id)
          return;
       }
       sp = 0;
+      /* Its children are one level down. */
+      atomicMax(DEREF(args.state).depth, DEREF(cost_record(id)).reserved + 2u);
    }
    while (sp != 0) {
       if (++steps > args.node_bound * 2u) {

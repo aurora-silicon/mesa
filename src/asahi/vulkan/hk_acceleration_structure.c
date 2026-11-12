@@ -931,7 +931,7 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
    for (unsigned p = 0; p < ARRAY_SIZE(phases); ++p) {
       const unsigned phase = phases[p];
       if (phase == HK_AGX3_PLAN_PHASE_COST &&
-          args->wide_children != HK_AGX3_WIDE_SAH)
+          (args->wide_children & 0xff) != HK_AGX3_WIDE_SAH)
          continue;
       struct hk_agx3_plan_args push = *args;
       push.phase = phase;
@@ -1349,7 +1349,9 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
                        !(perf_arm & HK_G17P_RT_PERF_NO_TRI_PAIRS)
                         ? HK_AGX3_PAIRS_SIBLINGS : HK_AGX3_PAIRS_NONE,
             .wide_children = allow_update ? HK_AGX3_WIDE_LEVELS
-                             : (perf_arm & HK_G17P_RT_PERF_WIDE_SAH) ? HK_AGX3_WIDE_SAH
+                             : (perf_arm & HK_G17P_RT_PERF_WIDE_SAH)
+                                ? HK_AGX3_WIDE_SAH |
+                                  (debug_get_num_option("ASAHI_G17P_RT_SAH_RECORD_QUARTERS", 0) & 0xff) << 8
                              : (perf_arm & HK_G17P_RT_PERF_WIDE_CHILDREN) ? HK_AGX3_WIDE_AREA
                              : HK_AGX3_WIDE_LEVELS,
          };
