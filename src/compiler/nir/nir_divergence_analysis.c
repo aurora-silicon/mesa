@@ -710,6 +710,10 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM);
       break;
 
+   case nir_intrinsic_deref_buffer_offset:
+      is_divergent = src_divergent(instr->src[0], state);
+      break;
+
    case nir_intrinsic_image_samples_identical:
    case nir_intrinsic_image_deref_samples_identical:
    case nir_intrinsic_bindless_image_samples_identical:

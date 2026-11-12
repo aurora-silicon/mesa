@@ -7697,6 +7697,8 @@ void nir_calc_tensor_derefs_init(nir_builder *b, struct nir_calc_tensor_info *in
 nir_def *nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
                                 nir_def *row, nir_def *col,
                                 nir_deref_instr **iter_deref_p);
+nir_def *nir_cap_tensor_index(nir_builder *b, nir_deref_instr *ptr,
+                              nir_def *idx, unsigned bytes, unsigned count);
 
 #include "nir_inline_helpers.h"
 

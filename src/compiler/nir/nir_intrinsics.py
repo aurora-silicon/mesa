@@ -483,6 +483,11 @@ intrinsic("deref_buffer_array_length", src_comp=[-1], dest_comp=1,
 intrinsic("deref_buffer_address", src_comp=[-1], dest_comp=0,
           indices=[ACCESS], flags=[CAN_ELIMINATE, CAN_REORDER])
 
+# Gets the 32-bit byte offset of a buffer deref in its binding, as its
+# address holds it (zero in address formats that hold no such offset)
+intrinsic("deref_buffer_offset", src_comp=[-1], dest_comp=1,
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
 # Gets the length of an unsized array
 intrinsic("deref_implicit_array_length", src_comp=[-1], dest_comp=1,
           flags=[CAN_ELIMINATE, CAN_REORDER])
