@@ -437,18 +437,12 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
       }
       user += v->clip_count;
    }
-   unsigned hidden = 0;
+   /* The CLIP_DIST slots are user words, in front of the clip group. */
    for (unsigned slot = 0; slot < 64; ++slot) {
       if (!v->components[slot])
          continue;
       if (slot == VARYING_SLOT_PSIZ)
          continue;
-      if ((MESH_CLIP_SLOTS & BITFIELD64_BIT(slot)) && v->clip_count &&
-          v->first[slot] >= v->clip_first &&
-          v->first[slot] + v->components[slot] <= v->clip_first + v->clip_count) {
-         hidden += v->components[slot];
-         continue;
-      }
       if ((!((USER_VARYINGS | MESH_CLIP_SLOTS) & BITFIELD64_BIT(slot)) &&
            !(slot == AGX_MESH_PRIMITIVE_PAGE_SLOT && v->primitive_stride_B != 0 &&
              v->components[slot] == page_carrier_words())) || v->components[slot] > 4 ||
@@ -460,7 +454,7 @@ varyings_valid(const struct agx_m5_mesh_varyings *v)
       }
       user += v->components[slot];
    }
-   return user + hidden + 4 == v->size;
+   return user + 4 == v->size;
 }
 
 bool
