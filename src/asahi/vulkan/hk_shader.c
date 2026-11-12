@@ -7078,16 +7078,18 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
                                  NULL, false, -1, shader_out);
 }
 
-static struct hk_api_shader *
+static VkResult
 hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                 const struct hk_border_source *src,
-                const struct agx_m5_mesh_varyings *mesh_fs)
+                const struct agx_m5_mesh_varyings *mesh_fs,
+                struct hk_api_shader **built)
 {
+   *built = NULL;
    struct blob_reader reader;
    blob_reader_init(&reader, src->nir, src->nir_size);
    nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
    if (!nir)
-      return NULL;
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    struct vk_shader_compile_info info = {
       .stage = obj->vk.stage,
@@ -7097,11 +7099,11 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
       .robustness = &src->robustness,
       .set_layout_count = src->set_layout_count,
    };
-   struct hk_api_shader *built = NULL;
-   if (hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src, mesh_fs,
-                              false, -1, &built) != VK_SUCCESS)
-      return NULL;
-   return built;
+   struct hk_api_shader *shader = NULL;
+   VkResult result = hk_compile_shader_impl(dev, &info, NULL, NULL, NULL, src,
+                                            mesh_fs, false, -1, &shader);
+   *built = result == VK_SUCCESS ? shader : NULL;
+   return result;
 }
 
 struct hk_api_shader *
@@ -7113,30 +7115,36 @@ hk_border_twin(struct hk_device *dev, struct hk_api_shader *obj)
       return twin;
 
    simple_mtx_lock(&src->lock);
-   if (!src->twin)
-      p_atomic_set(&src->twin, hk_compile_twin(dev, obj, src, NULL));
+   if (!src->twin) {
+      hk_compile_twin(dev, obj, src, NULL, &twin);
+      p_atomic_set(&src->twin, twin);
+   }
    twin = src->twin;
    simple_mtx_unlock(&src->lock);
    return twin;
 }
 
-struct hk_api_shader *
+VkResult
 hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
-                const struct hk_shader *mesh)
+                const struct hk_shader *mesh, struct hk_api_shader **out)
 {
    struct hk_border_source *src = obj->mesh_source;
    const uint8_t *comps = mesh->g17p_mesh_primitive_comps;
+   VkResult result = VK_SUCCESS;
 
    simple_mtx_lock(&src->lock);
    struct hk_mesh_fs_twin *twin = obj->mesh_twins;
    while (twin && memcmp(twin->comps, comps, sizeof(twin->comps)))
       twin = twin->next;
-   if (!twin && (twin = calloc(1, sizeof(*twin)))) {
+   if (!twin && !(twin = calloc(1, sizeof(*twin)))) {
+      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   } else if (!twin->shader) {
+      /* A listed twin always has a shader, so this one is new. */
       struct agx_m5_mesh_varyings layout = {0};
       memcpy(layout.primitive_comps, comps, sizeof(twin->comps));
       agx_gen1_mesh_record_layout(&layout);
-      twin->shader = hk_compile_twin(dev, obj, src, &layout);
-      if (twin->shader) {
+      result = hk_compile_twin(dev, obj, src, &layout, &twin->shader);
+      if (result == VK_SUCCESS) {
          memcpy(twin->comps, comps, sizeof(twin->comps));
          twin->next = obj->mesh_twins;
          obj->mesh_twins = twin;
@@ -7146,7 +7154,8 @@ hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
       }
    }
    simple_mtx_unlock(&src->lock);
-   return twin ? twin->shader : NULL;
+   *out = twin ? twin->shader : NULL;
+   return result;
 }
 
 static void

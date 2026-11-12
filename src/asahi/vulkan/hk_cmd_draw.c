@@ -6572,9 +6572,16 @@ hk_select_mesh_fs(struct hk_cmd_buffer *cmd)
 
    /* A twin compiles custom-border emulation in, so it has no border twin. */
    if (fs->mesh_source && mesh) {
-      twin = hk_mesh_fs_twin(dev, fs, hk_main_mesh_variant(mesh));
-      if (!twin)
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      VkResult result =
+         hk_mesh_fs_twin(dev, fs, hk_main_mesh_variant(mesh), &twin);
+      /* vkEndCommandBuffer may only report memory errors or VK_ERROR_UNKNOWN;
+       * the refusal itself was logged by vk_error. */
+      if (result != VK_SUCCESS)
+         vk_command_buffer_set_error(
+            &cmd->vk, result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+                            result == VK_ERROR_OUT_OF_DEVICE_MEMORY
+                         ? result
+                         : VK_ERROR_UNKNOWN);
    }
 
    if (gfx->mesh_fs != twin) {

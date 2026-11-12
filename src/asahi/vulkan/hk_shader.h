@@ -446,10 +446,10 @@ struct hk_api_shader *hk_border_twin(struct hk_device *dev,
 
 /* The twin of a fragment shader with a mesh source that reads per-primitive
  * inputs from the records of this G17P mesh variant, built on first use.
- * Thread-safe; NULL if it cannot be built. */
-struct hk_api_shader *hk_mesh_fs_twin(struct hk_device *dev,
-                                      struct hk_api_shader *obj,
-                                      const struct hk_shader *mesh);
+ * Thread-safe; *out is NULL if it cannot be built. */
+VkResult hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
+                         const struct hk_shader *mesh,
+                         struct hk_api_shader **out);
 
 /* Make the `samples` variant of a dynamic-sample-count G17P fragment shader
  * available to hk_fs_variant(). Thread-safe; a no-op for other shaders. */
