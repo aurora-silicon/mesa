@@ -7684,6 +7684,11 @@ struct nir_calc_tensor_info {
    nir_tensor_clamp_mode clamp_mode;
    nir_if *clipped_if;
    nir_def *do_clamp;
+   /* Where the element must not be accessed, and a load's value there (NULL
+    * with the clamp mode undefined).
+    */
+   nir_def *skip;
+   nir_def *skip_value;
    nir_function *decode_fnptr;
 };
 

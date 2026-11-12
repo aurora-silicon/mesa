@@ -1302,6 +1302,7 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
    nir_def *coord_in_block[5];
 
    info->do_clamp = nir_imm_false(b);
+   nir_def *empty = nir_imm_false(b);
    for (unsigned dim = 0; dim < nc; dim++) {
       nir_def *c = nir_iadd(b, span_coord[dim], nir_channel(b, info->offsets, dim));
 
@@ -1315,6 +1316,7 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
       if (info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED) {
          this_clamp = nir_ior(b, negative, nir_uge(b, c, nir_channel(b, info->layout_dims, dim)));
          info->do_clamp = nir_ior(b, info->do_clamp, this_clamp);
+         empty = nir_ior(b, empty, nir_ieq_imm(b, nir_channel(b, info->layout_dims, dim), 0));
       } else
          this_clamp = nir_imm_false(b);
 
@@ -1358,6 +1360,27 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
       block_coord[dim] = nir_udiv(b, c, nir_channel(b, info->block_sizes, dim));
    }
 
+   /* An element outside the tensor with a constant clamp is neither read
+    * nor written (nor decoded): the clamp value replaces it, a store is
+    * discarded. With clamp to edge, repeat or mirrored repeat, a tensor with
+    * a dimension of zero has no element to clamp to; such an element is not
+    * read either, and a load gives zero.
+    */
+   switch (info->clamp_mode) {
+   case NIR_TENSOR_CLAMP_UNDEFINED:
+      info->skip = NULL;
+      info->skip_value = NULL;
+      break;
+   case NIR_TENSOR_CLAMP_CONSTANT:
+      info->skip = info->do_clamp;
+      info->skip_value = info->clamp_value;
+      break;
+   default:
+      info->skip = empty;
+      info->skip_value = nir_imm_int(b, 0);
+      break;
+   }
+
    /* tensorCoordToLinear */
    idx = nir_imm_int(b, 0);
    for (unsigned dim = 0; dim < nc; dim++) {
@@ -1392,8 +1415,16 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
          call->params[2 + dim] = nir_src_for_ssa(block_coord[dim]);
          call->params[2 + nc + dim] = nir_src_for_ssa(coord_in_block[dim]);
       }
+      const struct glsl_type *out_type = decode_out_tmp->type;
+      nir_def *skipped = info->skip
+         ? nir_u2uN(b, info->skip_value, glsl_get_bit_size(out_type)) : NULL;
+      nir_if *nif = info->skip ? nir_push_if(b, nir_inot(b, info->skip)) : NULL;
       nir_builder_instr_insert(b, &call->instr);
       idx = nir_load_deref(b, decode_out_tmp_deref);
+      if (nif) {
+         nir_pop_if(b, nif);
+         idx = nir_if_phi(b, idx, skipped);
+      }
    } else {
       *iter_deref_p = nir_build_deref_ptr_as_array(b, iter_deref, nir_u2uN(b, idx, iter_deref->def.bit_size));
    }
