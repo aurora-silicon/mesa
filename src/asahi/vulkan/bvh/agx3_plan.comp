@@ -708,7 +708,8 @@ classify(uint id)
    for (uint i = 0; i < 8; i++)
       output_job.triangle_offsets[i] = 0;
    DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = output_job;
-   atomicMax(DEREF(args.state).depth, levels);
+   if (args.wide_children == 0u || node.leaf_count > 8 || id == root)
+      atomicMax(DEREF(args.state).depth, levels);
 }
 
 void
