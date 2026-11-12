@@ -876,7 +876,7 @@ lower_payload(nir_builder *b,nir_intrinsic_instr *i,void *data)
    /* G17P exposes no task stage, and a mesh shader may dynamically read only
     * a payload a task shader emitted (VUID-RuntimeSpirv-MeshEXT-12380): any
     * read left in a mesh shader is never executed. */
-   if (b->shader->info.stage==MESA_SHADER_MESH) {
+   if (!store && b->shader->info.stage==MESA_SHADER_MESH) {
       nir_def_replace(&i->def,nir_undef(b,i->def.num_components,i->def.bit_size));
       return true;
    }
