@@ -1300,6 +1300,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    memset(&queue->sync, 0, sizeof(queue->sync));
    queue->sync.exact_prior = old.exact_prior;
    queue->sync.serialize = old.serialize;
+   queue->sync.stage_overlap = old.stage_overlap;
    queue->sync.precise_tile_evictions = old.precise_tile_evictions;
    queue->sync.direct_single_footprints = old.direct_single_footprints;
 }
@@ -1640,7 +1641,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * A kernel advertising per-command waits needs no such execution edge.
     * A serialized queue without exact priors replaces every field below
     * (hk_drm_serialize_prefix), and keeps no ordinals, so it skips this. */
-   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior;
+   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior ||
+                        queue->sync.stage_overlap;
    if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, flush_sstt,
@@ -1882,6 +1884,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                 cs->sync.prior_ta[HK_SYNC_VDM] == 0 &&
                 (cs->sync.barrier[HK_SYNC_VDM] != DRM_ASAHI_BARRIER_NONE ||
                  cs->sync.prior[HK_SYNC_VDM] != 0))
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+
+            /* Serialized queue (G13/G14): the header keeps both engines'
+             * whole prefixes, but when the recorded dependencies show that
+             * the vertex half reads nothing an earlier render produced, the
+             * kernel may order only the fragment half after the render
+             * prefix. The fragment queue keeps pass order and each
+             * fragment half still waits for its own vertex half. */
+            if (queue->sync.stage_overlap &&
+                (cs->sync.ta_split
+                    ? cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                         cs->sync.prior_ta[HK_SYNC_VDM] == 0
+                    : cs->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                         cs->sync.prior[HK_SYNC_VDM] == 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
             /* Likewise for compute: when the vertex half depends on less
@@ -2228,6 +2244,10 @@ hk_queue_create(struct hk_device *dev,
     * ordinals carry no information there. They only make the kernel resolve
     * a historical dependency per engine for every command, which costs
     * single-submission latency on G13 and G14. Keep upstream's payload. */
+   queue->sync.stage_overlap =
+      queue->sync.serialize &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+      debug_get_bool_option("HK_G13_STAGE_OVERLAP", true);
    queue->sync.exact_prior =
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
