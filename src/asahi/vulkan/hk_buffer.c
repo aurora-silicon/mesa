@@ -127,6 +127,22 @@ hk_get_bda_replay_addr(const VkBufferCreateInfo *pCreateInfo)
          break;
       }
 
+      case VK_STRUCTURE_TYPE_OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT: {
+         /* VK_EXT_descriptor_buffer replay: hk_GetBufferOpaqueCapture-
+          * DescriptorDataEXT() recorded the buffer's own VA. */
+         if (!(pCreateInfo->flags &
+               VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT))
+            break;
+         const VkOpaqueCaptureDescriptorDataCreateInfoEXT *info = ext;
+         struct hk_buffer_capture capture;
+         memcpy(&capture, info->opaqueCaptureDescriptorData, sizeof(capture));
+         if (capture.va != 0) {
+            assert(addr == 0 || capture.va == addr);
+            addr = capture.va;
+         }
+         break;
+      }
+
       default:
          break;
       }
@@ -227,9 +243,11 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       assert(alignment >= 16384);
       uint64_t vma_size_B = align64(buffer->vk.size, alignment);
 
+      /* A buffer with its own VA replays it for descriptor buffers too. */
       const bool bda_capture_replay =
          buffer->vk.create_flags &
-         VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+         (VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT |
+          VK_BUFFER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT);
 
       enum agx_va_flags flags = 0;
       uint64_t bda_fixed_addr = 0;
@@ -509,7 +527,7 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
       } else {
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
-            mem->bo->va->addr + pBindInfos[i].memoryOffset;
+            hk_device_memory_addr(mem) + pBindInfos[i].memoryOffset;
       }
 
       VK_FROM_HANDLE(hk_device, dev, device);
@@ -524,6 +542,22 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
       if (status != NULL && status->pResult != NULL)
          *status->pResult = VK_SUCCESS;
    }
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetBufferOpaqueCaptureDescriptorDataEXT(
+   VkDevice device, const VkBufferCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_buffer, buffer, pInfo->buffer);
+
+   /* A buffer bound to memory takes the memory's (replayed) address; only a
+    * VA of its own needs replaying. */
+   const struct hk_buffer_capture capture = {
+      .va = buffer->va ? buffer->va->addr : 0,
+   };
+   memcpy(pData, &capture, sizeof(capture));
    return VK_SUCCESS;
 }
 

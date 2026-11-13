@@ -20,6 +20,8 @@
 #include "hk_buffer.h"
 #include "hk_buffer_view.h"
 #include "hk_descriptor_set_layout.h"
+#include "hk_image_view.h"
+#include "hk_sampler.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
@@ -720,7 +722,8 @@ hk_get_device_features(
        * layout, and push descriptors keep their own command-buffer storage.
        */
       .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
-      .descriptorBufferCaptureReplay = false,
+      .descriptorBufferCaptureReplay =
+         supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferImageLayoutIgnored =
          supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferPushDescriptors =
@@ -1534,10 +1537,16 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxSamplerDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
       .maxEmbeddedImmutableSamplerBindings = HK_MAX_DESCRIPTOR_BUFFERS,
       .maxEmbeddedImmutableSamplers = 2032,
-      .bufferCaptureReplayDescriptorDataSize = 0,
-      .imageCaptureReplayDescriptorDataSize = 0,
-      .imageViewCaptureReplayDescriptorDataSize = 0,
-      .samplerCaptureReplayDescriptorDataSize = 0,
+      /* Capture/replay: memory, buffers and images keep their addresses, an
+       * image view its heap textures and a sampler its heap samplers. An
+       * acceleration structure descriptor is its buffer's address. */
+      .bufferCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_buffer_capture),
+      .imageCaptureReplayDescriptorDataSize = sizeof(struct hk_image_capture),
+      .imageViewCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_image_view_capture),
+      .samplerCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_sampler_capture),
       .accelerationStructureCaptureReplayDescriptorDataSize = 0,
       .EDBsamplerDescriptorSize =
          hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_SAMPLER),

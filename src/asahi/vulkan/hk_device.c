@@ -319,7 +319,7 @@ hk_destroy_sampler_heap(struct hk_device *dev, struct hk_sampler_heap *h)
 static VkResult
 hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
                            const struct hk_native_sampler_descriptor *desc,
-                           struct hk_rc_sampler **out)
+                           bool capture, struct hk_rc_sampler **out)
 {
    /* Only the first eight bytes carry recovered sampler state.  The sparse
     * tail is required to be zero, so the packed word is a complete dedup key;
@@ -342,6 +342,7 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
 
       assert((*out)->refcount != 0);
       (*out)->refcount++;
+      (*out)->replay |= capture;
 
       return VK_SUCCESS;
    }
@@ -352,7 +353,10 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
 
    uint32_t index;
    VkResult result =
-      hk_descriptor_table_add(dev, &h->table, desc, h->table.desc_size, &index);
+      capture ? hk_descriptor_table_add_replay(dev, &h->table, desc,
+                                               h->table.desc_size, &index)
+              : hk_descriptor_table_add(dev, &h->table, desc,
+                                        h->table.desc_size, &index);
    if (result != VK_SUCCESS) {
       ralloc_free(rc);
       return result;
@@ -362,6 +366,7 @@ hk_sampler_heap_add_locked(struct hk_device *dev, struct hk_sampler_heap *h,
       .key = key,
       .refcount = 1,
       .index = index,
+      .replay = capture,
    };
 
    _mesa_hash_table_insert(h->ht, &rc->key, rc);
@@ -378,7 +383,22 @@ hk_sampler_heap_add(struct hk_device *dev,
    struct hk_sampler_heap *h = &dev->samplers;
 
    simple_mtx_lock(&h->lock);
-   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, out);
+   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, false, out);
+   simple_mtx_unlock(&h->lock);
+
+   return result;
+}
+
+/* For a sampler created to be captured (VK_EXT_descriptor_buffer). */
+VkResult
+hk_sampler_heap_add_capture(struct hk_device *dev,
+                            const struct hk_native_sampler_descriptor *desc,
+                            struct hk_rc_sampler **out)
+{
+   struct hk_sampler_heap *h = &dev->samplers;
+
+   simple_mtx_lock(&h->lock);
+   VkResult result = hk_sampler_heap_add_locked(dev, h, desc, true, out);
    simple_mtx_unlock(&h->lock);
 
    return result;
@@ -402,6 +422,7 @@ hk_sampler_heap_add_at(struct hk_device *dev,
    if (ent != NULL && ((struct hk_rc_sampler *)ent->data)->index == index) {
       *out = ent->data;
       (*out)->refcount++;
+      (*out)->replay = true;
       simple_mtx_unlock(&h->lock);
       return VK_SUCCESS;
    }
@@ -420,6 +441,7 @@ hk_sampler_heap_add_at(struct hk_device *dev,
       .key = key,
       .refcount = 1,
       .index = index,
+      .replay = true,
    };
    if (ent == NULL)
       _mesa_hash_table_insert(h->ht, &rc->key, rc);
@@ -437,7 +459,10 @@ hk_sampler_heap_remove_locked(struct hk_device *dev, struct hk_sampler_heap *h,
    rc->refcount--;
 
    if (rc->refcount == 0) {
-      hk_descriptor_table_remove(dev, &h->table, rc->index);
+      if (rc->replay)
+         hk_descriptor_table_remove_replay(dev, &h->table, rc->index);
+      else
+         hk_descriptor_table_remove(dev, &h->table, rc->index);
       /* A replayed sampler may share its key with the dedup entry. */
       struct hash_entry *ent = _mesa_hash_table_search(h->ht, &rc->key);
       if (ent != NULL && ent->data == rc)

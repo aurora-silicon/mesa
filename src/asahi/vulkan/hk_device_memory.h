@@ -9,6 +9,7 @@
 
 #include "hk_private.h"
 
+#include "asahi/lib/agx_bo.h"
 #include "vk_device_memory.h"
 
 #include "util/list.h"
@@ -26,6 +27,11 @@ struct hk_device_memory {
     * the fixed VA that determines their device address. */
    uint64_t opaque_capture_address;
 
+   /* VK_EXT_descriptor_buffer capture/replay (hk_AllocateMemory()): a second
+    * mapping of the BO at an address that replays, which buffers and images
+    * bound to this memory take as its address. NULL otherwise. */
+   struct agx_va *replay_va;
+
    void *map;
 
    /* map is this object's own mapping of map_size bytes rather than the
@@ -39,6 +45,13 @@ struct hk_device_memory {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
+
+/* The device address of the start of the memory object */
+static inline uint64_t
+hk_device_memory_addr(const struct hk_device_memory *mem)
+{
+   return mem->replay_va ? mem->replay_va->addr : mem->bo->va->addr;
+}
 
 extern const VkExternalMemoryProperties hk_opaque_fd_mem_props;
 extern const VkExternalMemoryProperties hk_dma_buf_mem_props;

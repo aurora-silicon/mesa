@@ -30,6 +30,11 @@ struct hk_buffer {
    uint32_t sparse_map_entries;
 };
 
+/* VK_EXT_descriptor_buffer capture/replay data of a buffer */
+struct hk_buffer_capture {
+   uint64_t va;
+};
+
 struct hk_sparse_buffer_map_header {
    uint64_t resource_base;
    uint32_t page_count;

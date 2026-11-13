@@ -69,6 +69,20 @@ struct hk_image_plane {
     * secondary page table. Otherwise, this map is NULL.
     */
    struct agx_bo *sparse_map;
+
+   /* The address texture descriptors give the sparse map: its own, or for
+    * VK_EXT_descriptor_buffer capture/replay a mapping of it at an address
+    * that replays (sparse_map_va). */
+   uint64_t sparse_map_addr;
+   struct agx_va *sparse_map_va;
+};
+
+/* VK_EXT_descriptor_buffer capture/replay data of an image: the VAs of a
+ * sparse image's planes and residency maps (memory-bound planes take the
+ * memory's address, which replays by itself). */
+struct hk_image_capture {
+   uint64_t plane_va[3];
+   uint64_t sparse_map_va[3];
 };
 
 struct hk_image {
