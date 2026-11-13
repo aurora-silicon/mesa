@@ -130,6 +130,11 @@ struct agx_vs_prolog_key {
    /* If !hw and the draw call is indexed, the index size */
    uint8_t sw_index_size_B;
 
+   /* If !hw, fetch by the instance ID plus poly_vertex_params::instance_offset
+    * while still exporting the dispatch's instance ID.
+    */
+   bool sw_instance_offset;
+
    /* Adjacency primitive to emulate */
    enum mesa_prim adjacency;
 

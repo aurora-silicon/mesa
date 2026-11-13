@@ -1035,6 +1035,14 @@ struct agx_context {
 
    bool in_tess;
 
+   /* M5: the part of a patch draw being drawn, when one render cannot hold
+    * all of it (agx_draw_patches_split). Zero otherwise.
+    */
+   struct {
+      unsigned first_patch;
+      unsigned first_instance;
+   } tess_split;
+
    struct blitter_context *blitter;
    struct asahi_blitter compute_blitter;
 
@@ -1183,6 +1191,7 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
 
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
+bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);
 void agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                     const struct pipe_draw_start_count_bias *draw);

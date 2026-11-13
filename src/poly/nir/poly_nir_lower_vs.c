@@ -36,6 +36,16 @@ poly_nir_load_vertex_id(nir_builder *b, nir_def *id)
    return nir_iadd(b, effective_id, nir_load_first_vertex(b));
 }
 
+/* poly_vertex_params::instance_offset, for drivers that draw in parts */
+nir_def *
+poly_nir_load_instance_offset(nir_builder *b)
+{
+   nir_def *addr =
+      nir_iadd_imm(b, nir_load_vertex_param_buffer_poly(b),
+                   offsetof(struct poly_vertex_params, instance_offset));
+   return nir_load_global_constant(b, 1, 32, addr, .align_mul = 4);
+}
+
 static bool
 lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {

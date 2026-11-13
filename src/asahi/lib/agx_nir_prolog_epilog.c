@@ -284,6 +284,20 @@ lower_adjacency(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* A software VS fetches for the draw's instance, not the dispatch's. */
+static bool
+lower_sw_instance_offset(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_instance_id)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *id = nir_channel(b, nir_load_global_invocation_id(b, 32), 1);
+   nir_def_replace(&intr->def,
+                   nir_iadd(b, id, poly_nir_load_instance_offset(b)));
+   return true;
+}
+
 static void
 agx_nir_vs_prolog_impl(nir_builder *b, const void *key_, bool native_raw)
 {
@@ -318,7 +332,17 @@ agx_nir_vs_prolog_impl(nir_builder *b, const void *key_, bool native_raw)
    }
 
    nir_export_agx(b, nir_load_vertex_id(b), .base = AGX_ABI_VIN_VERTEX_ID);
-   nir_export_agx(b, nir_load_instance_id(b), .base = AGX_ABI_VIN_INSTANCE_ID);
+
+   /* With an instance offset the exported ID stays the dispatch's: the main
+    * shader lays its outputs out by it, and adds the offset to the ID it
+    * reads itself.
+    */
+   const bool instance_offset = !key->hw && key->sw_instance_offset;
+   nir_export_agx(b,
+                  instance_offset
+                     ? nir_channel(b, nir_load_global_invocation_id(b, 32), 1)
+                     : nir_load_instance_id(b),
+                  .base = AGX_ABI_VIN_INSTANCE_ID);
 
    /* Now lower the resulting program using the key */
    if (!key->static_vi) {
@@ -336,6 +360,10 @@ agx_nir_vs_prolog_impl(nir_builder *b, const void *key_, bool native_raw)
 
    if (!key->hw) {
       b->cursor = nir_before_impl(nir_shader_get_entrypoint(b->shader));
+      /* Only the fetches still read the instance ID here. */
+      if (instance_offset)
+         nir_shader_intrinsics_pass(b->shader, lower_sw_instance_offset,
+                                    nir_metadata_control_flow, NULL);
       poly_nir_lower_sw_vs(b->shader);
    } else if (key->adjacency) {
       nir_shader_intrinsics_pass(b->shader, lower_adjacency,
