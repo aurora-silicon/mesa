@@ -109,6 +109,16 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+/* These devices never map memory at a second address, so the real
+ * function adds no flush either.
+ */
+void
+hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+}
+
 /* No tessellation is batched here. */
 void
 hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
