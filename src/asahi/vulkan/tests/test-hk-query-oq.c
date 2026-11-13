@@ -45,6 +45,16 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    ndispatched++;
 }
 
+/* These devices never map memory at a second address, so the real
+ * function adds no flush either.
+ */
+void
+hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+}
+
 /* hk_sync.c references these for recording paths these fixtures never take. */
 void
 hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs)

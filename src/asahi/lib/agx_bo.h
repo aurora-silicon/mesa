@@ -168,8 +168,19 @@ void agx_bo_reference(struct agx_bo *bo);
 void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
 
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
+/* Which application memory agx_bo_import_host_ptr() takes. */
+enum agx_host_ptr_access {
+   /* Memory the kernel can pin for writing, bound read-write. */
+   AGX_HOST_PTR_WRITABLE,
+   /* That, or else memory it can pin for reading, bound read-only. */
+   AGX_HOST_PTR_ANY,
+   /* Only memory the kernel cannot pin for writing, bound read-only. */
+   AGX_HOST_PTR_READ_ONLY,
+};
+
 struct agx_bo *agx_bo_import_host_ptr(struct agx_device *dev, void *ptr,
-                                      size_t size, bool allow_read_only);
+                                      size_t size,
+                                      enum agx_host_ptr_access access);
 int agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
 bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);

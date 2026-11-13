@@ -126,8 +126,9 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
                             &src_kinds, &dst_kinds);
 
    /* The wait orders later work behind this stream's source work, but on
-    * G17P a read through another address of the same memory also needs
-    * the source writes flushed with memory scope (hk_cdm_alias_scope()). */
+    * G17P and M5 a read through another address of the same memory also
+    * needs the source writes flushed with memory scope
+    * (hk_cdm_alias_scope()). */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_cs *cs = cmd->current_cs.cs;
    if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&

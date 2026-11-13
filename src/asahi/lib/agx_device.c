@@ -491,14 +491,16 @@ agx_drm_bo_userptr(struct agx_device *dev, void *ptr, size_t size,
  * with errno set, when the kernel refuses the range (EFAULT for memory the
  * application cannot write, a read-only mapping of a file, say).
  *
- * With allow_read_only, memory the kernel can only pin for reading is taken
+ * With AGX_HOST_PTR_ANY, memory the kernel can only pin for reading is taken
  * too: the BO, flagged AGX_BO_READONLY, is bound read-only for the GPU. A
  * GPU write to it is not performed: it is discarded where the kernel has
- * soft faults, and faults the job otherwise.
+ * soft faults, and faults the job otherwise. AGX_HOST_PTR_READ_ONLY takes
+ * only such memory and refuses memory the kernel can pin for writing
+ * (EACCES), so the GPU writes no memory imported this way.
  */
 struct agx_bo *
 agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
-                       bool allow_read_only)
+                       enum agx_host_ptr_access access)
 {
    if (!agx_has_userptr(dev)) {
       errno = EOPNOTSUPP;
@@ -508,7 +510,12 @@ agx_bo_import_host_ptr(struct agx_device *dev, void *ptr, size_t size,
    enum agx_bo_flags flags = AGX_BO_HOST_PTR | AGX_BO_NO_CACHE;
    uint32_t handle = 0;
    int ret = agx_drm_bo_userptr(dev, ptr, size, false, &handle);
-   if (ret == -EFAULT && allow_read_only) {
+   if (ret == 0 && access == AGX_HOST_PTR_READ_ONLY) {
+      agx_drm_bo_close(dev, handle);
+      errno = EACCES;
+      return NULL;
+   }
+   if (ret == -EFAULT && access != AGX_HOST_PTR_WRITABLE) {
       ret = agx_drm_bo_userptr(dev, ptr, size, true, &handle);
       flags |= AGX_BO_READONLY;
    }

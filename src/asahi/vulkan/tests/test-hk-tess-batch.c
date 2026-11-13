@@ -571,6 +571,16 @@ hk_sync_forget_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+/* These devices never map memory at a second address, so the real
+ * function adds no flush either.
+ */
+void
+hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+}
+
 bool
 hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 {

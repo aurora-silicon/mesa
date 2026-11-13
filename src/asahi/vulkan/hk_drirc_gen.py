@@ -35,6 +35,15 @@ def declare_options():
           "not performed: it is discarded, or faults the job on a kernel "
           "without soft faults",
           c_name="host_memory_read_only"),
+        B("hk_host_memory_import_read_only", False,
+          "Accept a host import only for a range the kernel cannot pin for "
+          "writing (a read-only file mapping, say), bound read-only for the "
+          "GPU, and refuse a range it pins for writing, also when "
+          "hk_host_memory_read_only is set. The application may still write "
+          "the same pages through another mapping, but the GPU writes "
+          "through no host import, so on the M5 the extension does not keep "
+          "compute barriers from skipping the write-back to memory",
+          c_name="host_memory_import_read_only"),
         B("hk_d3d_nearest_mip", False,
           "Round a nearest mip selection halfway between levels up, as "
           "Direct3D does, rather than down, as Vulkan does",

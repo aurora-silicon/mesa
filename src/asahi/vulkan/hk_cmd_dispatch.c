@@ -546,12 +546,12 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
 }
 
 /* Whether a strong flush recorded for `dev` with this request has memory
- * scope: always on M5, on request on G17P. */
+ * scope: on request on G17P and M5. */
 static bool
 hk_cdm_flush_has_memory_scope(const struct hk_device *dev, bool memory)
 {
-   return agx_chip_g17_m5(dev->dev.chip) ||
-          (memory && dev->dev.chip == AGX_CHIP_G17P);
+   return memory && (dev->dev.chip == AGX_CHIP_G17P ||
+                     agx_chip_g17_m5(dev->dev.chip));
 }
 
 bool
@@ -562,8 +562,7 @@ hk_cdm_visibility_flush_needed(const struct hk_device *dev,
       return false;
    if (cs->current != cs->strong_flush_end)
       return true;
-   /* M5's strong flushes already have memory scope. */
-   return memory && dev->dev.chip == AGX_CHIP_G17P &&
+   return hk_cdm_flush_has_memory_scope(dev, memory) &&
           cs->current != cs->memory_flush_end;
 }
 
@@ -586,13 +585,11 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 
       /* A strong flush already ends the stream: every launch has one in its
        * tail, and a second barrier with no launch between them is not a
-       * shape Apple's CDM emitter produces. On M5 that flush already has
-       * memory scope; on G17P a request for it strengthens the record in
-       * place below. */
+       * shape Apple's CDM emitter produces. A request for memory scope the
+       * flush lacks strengthens the record in place below. */
       const bool upgrade_strong = cs->current == cs->strong_flush_end;
       if (upgrade_strong &&
-          (!memory_scope || agx_chip_g17_m5(dev->dev.chip) ||
-           cs->current == cs->memory_flush_end))
+          (!memory_scope || cs->current == cs->memory_flush_end))
          return;
 
       /* G18G grounds exactly one CDM barrier word, the flag-free 0x60000160
@@ -671,13 +668,36 @@ hk_cdm_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 void
 hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 {
-   hk_cdm_flush(dev, cs, false);
+   /* The driver's own flushes keep the memory scope M5 always gave them;
+    * application dependencies ask for it (hk_cdm_visibility_flush()). */
+   hk_cdm_flush(dev, cs, agx_chip_g17_m5(dev->dev.chip));
 }
 
 void
 hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 {
    hk_cdm_flush(dev, cs, memory);
+}
+
+void
+hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   /* A dependency recorded while no compute stream holding work is open
+    * records no flush: the first barrier of a command buffer, or one after a
+    * timestamp closed the stream. The writes of this stream may then be read
+    * through another address of the same memory by the next stream, in this
+    * command buffer or in a later one of the same submission. While memory
+    * may be mapped at a second address, end the stream with memory scope.
+    * Usually this only strengthens the last launch's ordering record in
+    * place. */
+   if (!hk_cdm_alias_scope(dev) || cs->stats.cmds == 0 ||
+       !hk_cdm_visibility_flush_needed(dev, cs, true))
+      return;
+
+   hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+   hk_cdm_visibility_flush(dev, cs, true);
 }
 
 void
@@ -1730,7 +1750,9 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    }
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
    if (flags == 5) {
+      /* M5's strong launch tail has memory scope. */
       cs->strong_flush_end = cs->current;
+      cs->memory_flush_end = cs->current;
       cs->weak_barrier_end = NULL;
    } else {
       cs->weak_barrier_end = cs->current;

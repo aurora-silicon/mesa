@@ -306,6 +306,16 @@ hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+/* These devices never map memory at a second address, so the real
+ * function adds no flush either.
+ */
+void
+hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+}
+
 /* Reset-stream fixtures model the ordering, without emitting reset payloads. */
 void
 hk_flush_query_resets(struct hk_cmd_buffer *cmd, struct hk_cs *cs)

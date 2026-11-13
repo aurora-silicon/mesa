@@ -1117,8 +1117,9 @@ struct hk_cs {
    void *weak_barrier_end;
 
    /* AGX3 CDM: the value of current just after a strong flush that also has
-    * memory scope (AGX3_CDM_BARRIER_FLUSH_MEMORY). On M5 every strong flush
-    * has it; on G17P only the flushes hk_cdm_visibility_flush() asks for. */
+    * memory scope (AGX3_CDM_BARRIER_FLUSH_MEMORY): on G17P and M5 the
+    * flushes hk_cdm_visibility_flush() asks for, and on M5 also the driver's
+    * own (hk_cdm_cache_flush()). */
    void *memory_flush_end;
 
    /* AGX3 CDM: the value of current just after a standalone barrier that is
@@ -2376,6 +2377,10 @@ bool hk_g17p_smooth_varyings_supported(
 void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
                                        void *current);
 
+/* Ends a compute stream holding launches with a flush that has memory scope
+ * while hk_cdm_alias_scope() asks for it. */
+void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
@@ -2397,6 +2402,8 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
          }
          hk_dispatch_imm_writes(cmd, cs);
       }
+
+      hk_cdm_end_stream_flush(cmd, cs);
 
       /* A transformed draw may reserve a pre-graphics stream and then prove
        * that it has no vertices to process. Do not leave an empty CDM job in
@@ -2645,11 +2652,11 @@ void hk_usc_upload_spilled_rt_descs(struct agx_usc_builder *b,
 void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
 
 /* As hk_cdm_cache_flush(), for a flush an application dependency asks for.
- * With `memory`, the flush also has memory scope on G17P (M5 flushes always
- * do): needed for host availability, and for device dependencies once the
- * same memory may be reached through more than one virtual address
- * (hk_cdm_alias_scope()). A trailing strong flush without memory scope is
- * upgraded in place. The caller ensures space for one barrier record. */
+ * With `memory`, the flush also has memory scope on G17P and M5: needed for
+ * host availability, and for device dependencies once the same memory may be
+ * reached through more than one virtual address (hk_cdm_alias_scope()). A
+ * trailing strong flush without memory scope is upgraded in place. The caller
+ * ensures space for one barrier record. */
 void hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs,
                              bool memory);
 
