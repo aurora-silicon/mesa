@@ -310,7 +310,8 @@ struct hk_device {
 
    bool cmd_pending_ready;
    simple_mtx_t cmd_pending_lock;
-   struct list_head cmd_pending;
+   /* Queues with pending submissions (hk_queue::cmd_link). */
+   struct list_head cmd_pending_queues;
    /* Submissions that completed with an error: kept until destruction. */
    struct list_head cmd_pending_failed;
    /* Completion syncobjs of retired submissions, for reuse. */
