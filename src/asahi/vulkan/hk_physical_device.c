@@ -1014,6 +1014,11 @@ hk_get_device_features(
    }
 }
 
+#define HK_RAY_TRACING_STAGES                                                 \
+   (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |         \
+    VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |       \
+    VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR)
+
 /* Stages a pipeline or shader object may contain on this device. Every
  * shader-stage mask reported in the properties must stay inside this set.
  */
@@ -1037,6 +1042,11 @@ hk_supported_shader_stages(const struct vk_features *features)
 
    if (features->meshShader)
       stages |= VK_SHADER_STAGE_MESH_BIT_EXT;
+
+   /* Ray tracing stages are inlined into compute kernels, which run subgroup
+    * operations like any other compute code. */
+   if (features->rayTracingPipeline)
+      stages |= HK_RAY_TRACING_STAGES;
 
    return stages;
 }
@@ -1440,8 +1450,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .minSubgroupSize = 32,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
-      /* The only subgroup size is 32, so requiring it is always satisfied. */
-      .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
+      /* The only subgroup size is 32, so requiring it is always satisfied,
+       * also in ray tracing stages, which are inlined into compute kernels. */
+      .requiredSubgroupSizeStages =
+         VK_SHADER_STAGE_COMPUTE_BIT |
+         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0),
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
