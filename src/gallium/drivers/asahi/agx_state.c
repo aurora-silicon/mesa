@@ -3087,7 +3087,25 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          /* Use the same export layout and static sample copies as Vulkan.
           * The epilog consumes each sample's exports in the matching order.
           */
-         NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
+         /* A fragment tests its coverage once. Lowered before the unroll,
+          * the testing update that follows the last discard is cloned with
+          * the body, and the fragment then tests once per sample; a pass of
+          * such fragments can stall the GPU when another context's fragment
+          * work runs beside it. So unroll the demotes -- each copy keeps its
+          * own sample's -- and lower them afterwards: every copy kills its
+          * sample where it discards, and one update after the last copy
+          * tests whatever is left of the pixel, as in a per-pixel shader
+          * that discards several times.
+          *
+          * Forced-early fragments test once at the start already (the
+          * unroll hoists that update ahead of the copies) and keep their
+          * order. AGX_G17P_SAMPLE_KILL_TEST_ONCE=0 keeps the per-sample
+          * tests, for comparison. */
+         const bool test_once =
+            !nir->info.fs.early_fragment_tests &&
+            debug_get_bool_option("AGX_G17P_SAMPLE_KILL_TEST_ONCE", true);
+         if (!test_once)
+            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
          if (!agx_nir_lower_g17p_sample_shading(nir, &epilog_key,
                                                 key->nr_samples)) {
             mesa_loge("asahi: G17P per-sample colour exports exceed the register file");
@@ -3097,6 +3115,12 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             failed->failed = true;
             ralloc_free(nir);
             return failed;
+         }
+         if (test_once) {
+            /* The copies' one-hot sample masks, so that the lowering sees
+             * each demote's constant sample. */
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
          }
       } else if (nir->info.fs.uses_sample_shading) {
          /* Ensure the sample ID is preserved in register */
