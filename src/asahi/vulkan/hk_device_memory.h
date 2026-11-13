@@ -32,6 +32,9 @@ struct hk_device_memory {
     * BO's shared one: the BO may be aliased by other memory objects. */
    size_t map_size;
    bool map_owned;
+
+   /* Residency preference the kernel accepted (memory priority 1.0). */
+   bool keep_resident;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_device_memory, vk.base, VkDeviceMemory,

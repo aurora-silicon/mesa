@@ -21,6 +21,7 @@
 #include "hk_entrypoints.h"
 #include "hk_instance.h"
 #include "hk_native_sampler.h"
+#include "hk_ray_tracing_pipeline.h"
 #include "hk_physical_device.h"
 #include "hk_shader.h"
 
@@ -936,6 +937,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
+   dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
 
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps
@@ -1230,6 +1232,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_shader_binary_cache_finish(dev);
    hk_g17p_compute_program_cache_finish(dev);
    hk_device_finish_accel_struct_state(dev);
+   hk_rt_device_finish(dev);
    hk_destroy_internal_shaders(dev, &dev->kernels, false);
    hk_destroy_internal_shaders(dev, &dev->prolog_epilog, true);
 

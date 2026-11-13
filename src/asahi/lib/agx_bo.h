@@ -181,6 +181,7 @@ enum agx_host_ptr_access {
 struct agx_bo *agx_bo_import_host_ptr(struct agx_device *dev, void *ptr,
                                       size_t size,
                                       enum agx_host_ptr_access access);
+int agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
 bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 

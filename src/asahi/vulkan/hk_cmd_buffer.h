@@ -1255,6 +1255,11 @@ struct hk_cs {
    /* A query copy or reset was recorded into this stream. */
    bool query_access;
 
+   /* The stream ends with a strong, memory-scoped flush
+    * (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+    */
+   bool visible_completion;
+
    /* Statistics */
    struct {
       uint32_t calls, cmds, flushes, merged;

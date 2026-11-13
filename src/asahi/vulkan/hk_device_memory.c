@@ -173,6 +173,37 @@ hk_GetMemoryFdPropertiesKHR(VkDevice device,
    return VK_SUCCESS;
 }
 
+/* Memory priority 1.0 asks the kernel to release the memory after the VM's
+ * other BOs when it reclaims idle memory; any other priority leaves it to the
+ * kernel's default policy. */
+static void
+hk_set_memory_priority(struct hk_device *dev, struct hk_device_memory *mem,
+                       float priority)
+{
+   const bool keep = priority >= 1.0f;
+   if (keep == mem->keep_resident)
+      return;
+
+   int ret = agx_bo_set_resident(&dev->dev, mem->bo, keep);
+   if (ret) {
+      mesa_logw("memory priority %.2f: GEM_RESIDENCY failed: %s", priority,
+                strerror(-ret));
+      return;
+   }
+
+   mem->keep_resident = keep;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_SetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory,
+                              float priority)
+{
+   VK_FROM_HANDLE(hk_device, dev, device);
+   VK_FROM_HANDLE(hk_device_memory, mem, memory);
+
+   hk_set_memory_priority(dev, mem, priority);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_GetMemoryHostPointerPropertiesEXT(
    VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
@@ -221,6 +252,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                            MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
    const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
       pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+   const VkMemoryPriorityAllocateInfoEXT *priority_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
 
    VkExternalMemoryHandleTypeFlagBits handle_types = 0;
@@ -356,6 +390,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
 
+   if (priority_info)
+      hk_set_memory_priority(dev, mem, priority_info->priority);
+
    uint64_t heap_used = p_atomic_add_return(heap->used, mem->bo->size);
    if (heap_used > heap->size) {
       hk_FreeMemory(device, hk_device_memory_to_handle(mem), pAllocator);
@@ -410,6 +447,9 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
     * the BO; an owned one belongs to this object alone. */
    if (mem->map_owned)
       agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+
+   /* The BO may outlive this object in the BO cache. */
+   hk_set_memory_priority(dev, mem, 0.5f);
 
    agx_bo_unreference(&dev->dev, mem->bo);
 

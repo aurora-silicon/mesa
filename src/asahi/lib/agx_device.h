@@ -192,6 +192,10 @@ struct agx_device {
 
    /* Global queue handle */
    uint32_t queue_id;
+   /* Watchdog allowance of the compute commands of the queues this device
+    * creates, in ms; 0 keeps the kernel's default. Sent only to a kernel with
+    * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT. */
+   uint32_t compute_timeout_ms;
    /* AGX_DBG_1QUEUE: render SCS layouts the shared queue was created with. */
    uint64_t queue_layouts[2];
    enum drm_asahi_priority queue_priority;
@@ -444,6 +448,14 @@ agx_has_userptr(const struct agx_device *dev)
 {
    return !dev->is_virtio &&
           (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
+}
+
+/* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
+static inline bool
+agx_has_residency_control(const struct agx_device *dev)
+{
+   return !dev->is_virtio &&
+          (dev->params.features & DRM_ASAHI_FEATURE_GEM_RESIDENCY);
 }
 
 static inline bool

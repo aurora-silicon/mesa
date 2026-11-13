@@ -1081,6 +1081,20 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
        * with ENOTSUPP ("G18 compute admission rejected ... stream_bytes=52").
        */
       if (cs->type == HK_CS_CDM && !cs->g18_dispatch_sealed) {
+         /* Where the kernel lets another queue's kick wait for this stream's
+          * completion in firmware, which a weak tail reports before the
+          * stream's writes are visible, end the stream with the strong
+          * memory-scoped flush, upgrading the weak record in place, and say
+          * so in the command (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+          */
+         if (agx_chip_g17_m5(dev->dev.chip) &&
+             (dev->dev.params.features &
+              DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION)) {
+            if (cs->current == cs->weak_barrier_end)
+               hk_cdm_visibility_flush(dev, cs, true);
+            cs->visible_completion = cs->current == cs->strong_flush_end &&
+                                     cs->current == cs->memory_flush_end;
+         }
          cs->current = hk_cmd_buffer_emit_cdm_terminate(cmd, cs->current);
       }
    }

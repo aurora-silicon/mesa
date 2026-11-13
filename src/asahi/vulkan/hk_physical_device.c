@@ -265,9 +265,11 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = native_agx3,
+      .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_non_seamless_cube_map = true,
+      .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
       .EXT_pipeline_creation_feedback = true,
       .EXT_pipeline_protected_access = true,
@@ -770,6 +772,12 @@ hk_get_device_features(
       .memoryMapRangePlaced = false,
       .memoryUnmapReserve = true,
 
+      /* VK_EXT_memory_priority */
+      .memoryPriority = agx_has_residency_control(dev),
+
+      /* VK_EXT_pageable_device_local_memory */
+      .pageableDeviceLocalMemory = agx_has_residency_control(dev),
+
       /* VK_EXT_multi_draw */
       .multiDraw = true,
 
@@ -1014,6 +1022,11 @@ hk_get_device_features(
    }
 }
 
+#define HK_RAY_TRACING_STAGES                                                 \
+   (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |         \
+    VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |       \
+    VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR)
+
 /* Stages a pipeline or shader object may contain on this device. Every
  * shader-stage mask reported in the properties must stay inside this set.
  */
@@ -1037,6 +1050,11 @@ hk_supported_shader_stages(const struct vk_features *features)
 
    if (features->meshShader)
       stages |= VK_SHADER_STAGE_MESH_BIT_EXT;
+
+   /* Ray tracing stages are inlined into compute kernels, which run subgroup
+    * operations like any other compute code. */
+   if (features->rayTracingPipeline)
+      stages |= HK_RAY_TRACING_STAGES;
 
    return stages;
 }
@@ -1167,10 +1185,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .minAccelerationStructureScratchOffsetAlignment = 128,
 
       /* VK_KHR_ray_tracing_pipeline.  shaderGroupHandleSize is fixed at 32 by
-       * the specification.  The base and handle alignments are the
-       * specification's minima -- nothing in the megakernel's SBT fetch
-       * requires more, because every record address arrives as a device
-       * address the shader adds a stride to.
+       * the specification.  The base alignment is the largest the
+       * specification allows. G17P's SBT fetch takes records at any byte
+       * address (hk_load_sbt_entry), so it reports a handle alignment of 1;
+       * other chips keep the largest allowed, 32.
        *
        * Trace recursion is unrolled into the megakernel at compile time.
        * G17P supports three levels until trace continuations can be shared.
@@ -1186,7 +1204,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
-      .shaderGroupHandleAlignment = 32,
+      .shaderGroupHandleAlignment = dev->chip == AGX_CHIP_G17P ? 1 : 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
 
       .rayTracingInvocationReorderReorderingHint =
@@ -1440,8 +1458,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .minSubgroupSize = 32,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
-      /* The only subgroup size is 32, so requiring it is always satisfied. */
-      .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
+      /* The only subgroup size is 32, so requiring it is always satisfied,
+       * also in ray tracing stages, which are inlined into compute kernels. */
+      .requiredSubgroupSizeStages =
+         VK_SHADER_STAGE_COMPUTE_BIT |
+         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0),
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
