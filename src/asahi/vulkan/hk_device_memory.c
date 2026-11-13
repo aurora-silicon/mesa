@@ -286,13 +286,21 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * file) is refused: nothing in the API keeps a buffer bound to it from
        * being a transfer destination or a storage buffer the GPU writes. An
        * application that only reads such memory on the GPU asks for it with
-       * hk_host_memory_read_only.
+       * hk_host_memory_read_only. With hk_host_memory_import_read_only only
+       * such a range is taken, and a range the kernel can pin for writing is
+       * refused, also with hk_host_memory_read_only: the GPU then writes
+       * through no host import (hk_cdm_alias_scope()).
        */
       assert(host_info->handleType ==
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
-      mem->bo = agx_bo_import_host_ptr(
-         &dev->dev, host_info->pHostPointer, pAllocateInfo->allocationSize,
-         hk_physical_device_instance(pdev)->drirc.misc.host_memory_read_only);
+      const struct hk_instance *instance = hk_physical_device_instance(pdev);
+      const enum agx_host_ptr_access access =
+         instance->drirc.misc.host_memory_import_read_only
+            ? AGX_HOST_PTR_READ_ONLY
+         : instance->drirc.misc.host_memory_read_only ? AGX_HOST_PTR_ANY
+                                                       : AGX_HOST_PTR_WRITABLE;
+      mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
+                                       pAllocateInfo->allocationSize, access);
       if (mem->bo == NULL) {
          const int err = errno;
          result = vk_errorf(dev,
