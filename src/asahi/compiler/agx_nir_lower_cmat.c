@@ -2208,20 +2208,28 @@ agx_nir_lower_cmat_tensor(nir_shader *nir, bool pairing)
    return true;
 }
 
+/* Whether a type holds a matrix larger than 16x16, and whether its matrices
+ * split into 16x16 pieces (*splittable) or into 8x8 ones (*splittable_8).
+ */
 static bool
-type_needs_split(const struct glsl_type *type, bool *splittable)
+type_needs_split(const struct glsl_type *type, bool *splittable,
+                 bool *splittable_8)
 {
    type = glsl_without_array(type);
    if (glsl_type_is_struct(type)) {
       bool split = false;
       for (unsigned i = 0; i < glsl_get_length(type); ++i)
-         split |= type_needs_split(glsl_get_struct_field(type, i), splittable);
+         split |= type_needs_split(glsl_get_struct_field(type, i), splittable,
+                                   splittable_8);
       return split;
    }
    if (!glsl_type_is_cmat(type))
       return false;
    struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
-   /* An 8x8 or 16x16 matrix stays whole beside the split ones. */
+   /* 8x8 pieces split every dimension longer than 8. */
+   if ((desc.rows > 8 && desc.rows % 8) || (desc.cols > 8 && desc.cols % 8))
+      *splittable_8 = false;
+   /* Up to 16x16 needs no split of its own (8x8 pieces still divide it). */
    if (desc.rows <= 16 && desc.cols <= 16)
       return false;
    if (desc.rows % 16 || desc.cols % 16)
@@ -2315,12 +2323,41 @@ k_order_visible(nir_shader *nir)
    return false;
 }
 
+/* Whether the shader has an operation only 16x16 matrices take: a product
+ * of A and B operands of different types, or a 2x2 reduction.
+ */
+static bool
+needs_16x16_pieces(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_cmat_call &&
+                nir_instr_as_cmat_call(instr)->op == nir_cmat_call_op_reduce_2x2)
+               return true;
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_cmat_muladd &&
+                matrix_desc(intr->src[1]).element_type !=
+                   matrix_desc(intr->src[2]).element_type)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 /*
  * Matrices of flexible dimensions (VK_NV_cooperative_matrix2
  * cooperativeMatrixFlexibleDimensions), multiples of 16 in each dimension at
  * subgroup scope, as 16x16 pieces (nir_lower_cooperative_matrix_flexible_
  * dimensions). A shader whose matrices are all 16x16 or 8x8 is left alone,
- * and such matrices stay whole in a shader that has larger ones.
+ * and with 16x16 pieces such matrices stay whole beside larger ones.
+ * A shader with a larger matrix that is a multiple of 8 but not of 16 (the
+ * result of a reduction of an 8x8 matrix that changes its dimensions, say)
+ * is split into 8x8 pieces instead, unless it has products of mixed types
+ * or 2x2 reductions, which need 16x16 matrices.
  * *pairing is whether the pieces of A and B matrices whose K is a multiple of
  * 64 take K paired 64 deep (the tensor loads' comment).
  */
@@ -2331,22 +2368,29 @@ agx_nir_lower_cmat_flexible(nir_shader *nir, bool *pairing)
    if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
       return false;
 
-   bool split = false, splittable = true;
+   bool split = false, splittable = true, splittable_8 = true;
    nir_foreach_variable_in_shader(var, nir)
-      split |= type_needs_split(var->type, &splittable);
+      split |= type_needs_split(var->type, &splittable, &splittable_8);
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_function_temp_variable(var, impl)
-         split |= type_needs_split(var->type, &splittable);
+         split |= type_needs_split(var->type, &splittable, &splittable_8);
    }
-   if (!split || !splittable)
+   if (!split)
       return false;
 
-   *pairing = !k_order_visible(nir);
+   unsigned gran = 16;
+   if (!splittable) {
+      if (!splittable_8 || needs_16x16_pieces(nir))
+         return false;
+      gran = 8;
+   }
+
+   *pairing = gran == 16 && !k_order_visible(nir);
 
    const struct nir_lower_coopmat_args args = {
-      .m_gran = 16,
-      .n_gran = 16,
-      .k_gran = 16,
+      .m_gran = gran,
+      .n_gran = gran,
+      .k_gran = gran,
    };
    return nir_lower_cooperative_matrix_flexible_dimensions(nir, &args);
 }
