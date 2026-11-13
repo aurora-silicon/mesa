@@ -7369,8 +7369,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "mesh gl_NumWorkGroups under a task stage needs the task record");
       }
-      /* Matrices of flexible dimensions are 16x16 pieces by now. What is left
-       * must be a size and an operation the lowering takes. */
+      /* Matrices of flexible dimensions are 16x16 or 8x8 pieces by now. What
+       * is left must be a size and an operation the lowering takes. */
       if (agx_chip_g17_m5(dev->dev.chip) &&
           nir->info.stage == MESA_SHADER_COMPUTE &&
           !agx_nir_cmat_supported(nir)) {
