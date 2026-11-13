@@ -81,7 +81,7 @@ int main(void)
    static const struct { unsigned flags; uint32_t control; } cases[] = {
       /* Nothing software has to decide for an opaque triangle: the hardware
        * commits those and queues the rest. */
-      {0, 0x9942}, {4, 0x9942}, {8, 0x9942}, {0x200, 0x9942}, {0x20c, 0x9942},
+      {0, 0x0142}, {4, 0x0142}, {8, 0x0142}, {0x200, 0x0142}, {0x20c, 0x0142},
       /* Opaque rays commit every triangle hit: the hardware commits them
        * all and queues none. */
       {1, 0x4942}, {5, 0x4942}, {9, 0x4942}, {0x201, 0x4942}, {0x20d, 0x4942},

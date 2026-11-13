@@ -149,17 +149,22 @@ gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
  * ray flags, so it may commit only when none of them is set. */
 #define GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS 0x1f2
 
-/* Candidate control words. QUEUE hands every triangle hit to the software
- * candidate loop. COMMIT_OPAQUE lets the hardware commit opaque triangle hits
- * itself: it lowers the tmax in payload word +24 to the hit distance, keeps
- * the hit words in query words 256/512, and keeps the hit's instance pointer
- * in the halfwords just before the current instance's (8960 rather than
- * 9152). The current instance is wherever traversal stopped, which can be
- * past the hit. COMMIT_ALL has the hardware commit every triangle hit the
- * same way and queue none, which is all an Opaque ray needs; its triangle
- * tests then take about half the GPU time they take with QUEUE. */
+/* Candidate control words: what a triangle hit does. QUEUE hands every hit
+ * to the software candidate loop, whatever the geometry says. COMMIT_ALL has
+ * the hardware commit every hit itself, which is all an Opaque ray needs.
+ * COMMIT_OPAQUE leaves it to the geometry and the instance: the hardware
+ * commits hits on opaque triangles and queues the others, and an instance's
+ * force-opaque or force-no-opaque flag decides for the whole instance.
+ *
+ * A hardware commit lowers the tmax in payload word +24 to the hit distance,
+ * keeps the hit words in query words 256/512, and keeps the hit's instance
+ * pointer in the halfwords just before the current instance's (8960 rather
+ * than 9152). The current instance is wherever traversal stopped, which can
+ * be past the hit. A queued hit sends traversal back to the calling shader
+ * once per leaf, so a query whose hits are committed takes about half the
+ * GPU time. */
 #define GEN1_RQ_CONTROL_QUEUE          0x9142
-#define GEN1_RQ_CONTROL_COMMIT_OPAQUE  0x9942
+#define GEN1_RQ_CONTROL_COMMIT_OPAQUE  0x0142
 #define GEN1_RQ_CONTROL_COMMIT_ALL     0x4942
 
 static nir_def *
