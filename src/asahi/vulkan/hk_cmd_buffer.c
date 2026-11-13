@@ -1095,23 +1095,42 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmd->vk);
 }
 
+/* Whether one barrier of a dependency reaches the host: it names a host
+ * access, or MEMORY_READ or MEMORY_WRITE with the host stage in its
+ * destination scope. Those stand for every read or write valid in the scope,
+ * the host's too. ALL_COMMANDS does not include the host stage. A host write
+ * needs the earlier device writes written back first as much as a host read
+ * does: a line written back after it would overwrite it. */
 static bool
-hk_dependency_has_host_read(const VkDependencyInfo *info)
+hk_barrier_has_host_access(VkPipelineStageFlags2 dst_stages,
+                           VkAccessFlags2 dst_access)
+{
+   if (dst_access & (VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_HOST_WRITE_BIT))
+      return true;
+
+   return (dst_stages & VK_PIPELINE_STAGE_2_HOST_BIT) &&
+          (dst_access &
+           (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT));
+}
+
+static bool
+hk_dependency_has_host_access(const VkDependencyInfo *info)
 {
    for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
-      if (info->pMemoryBarriers[i].dstAccessMask & VK_ACCESS_2_HOST_READ_BIT)
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
          return true;
    }
 
    for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
-      if (info->pBufferMemoryBarriers[i].dstAccessMask &
-          VK_ACCESS_2_HOST_READ_BIT)
+      const VkBufferMemoryBarrier2 *b = &info->pBufferMemoryBarriers[i];
+      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
          return true;
    }
 
    for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
-      if (info->pImageMemoryBarriers[i].dstAccessMask &
-          VK_ACCESS_2_HOST_READ_BIT)
+      const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[i];
+      if (hk_barrier_has_host_access(b->dstStageMask, b->dstAccessMask))
          return true;
    }
 
@@ -1222,7 +1241,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* Host availability is recorded against the work already recorded. */
    if (cmd->state.deferred_clear_count &&
-       hk_dependency_has_host_read(pDependencyInfo))
+       hk_dependency_has_host_access(pDependencyInfo))
       hk_flush_deferred_clears(cmd);
 
    /* In-pass dependencies stay scoped to the API pass, even when its
@@ -1274,13 +1293,13 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
    /* A barrier-only command buffer otherwise records no GPU work, so it
     * cannot make a preceding fragment store visible to the host. Emit the
     * native strong CDM cache-maintenance record only when the API requests
-    * host-read availability, in a stream ordered after the source scope.
-    * The host reads memory, so on G17P the record has memory scope: a strong
-    * flush alone leaves the data in the GPU caches, and the end of the
-    * command does not reliably write it back before completion is reported
-    * when render work shares the queue. */
+    * host availability, in a stream ordered after the source scope. The
+    * host accesses memory, so the record has memory scope: a strong flush
+    * alone leaves the data in the GPU caches, and the end of the command
+    * does not reliably write it back before completion is reported when
+    * render work shares the queue. */
    if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
-       hk_dependency_has_host_read(pDependencyInfo)) {
+       hk_dependency_has_host_access(pDependencyInfo)) {
       struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
       hk_sync_src_dep(cmd, src_kinds, cmd->current_cs.cs, dep);
 
