@@ -755,24 +755,6 @@ agx_chip_g17_m5(enum agx_chip chip)
           chip == AGX_CHIP_G17C;
 }
 
-/* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
- * cooperative matrix (see hk_physical_device.c), but the extension is only
- * advertised by default on parts whose dEQP-VK.compute.*cooperative_matrix*
- * run has passed on real silicon. Every other AGX3B part stays opt-in via
- * ASAHI_AGX3B_COOPERATIVE_MATRIX=1 until it earns its own hardware CTS pass. */
-static inline bool
-agx_chip_cooperative_matrix_qualified(enum agx_chip chip)
-{
-   switch (chip) {
-   case AGX_CHIP_G16S:
-      /* M4 Pro (J616s): dEQP coopmat A/B 1269 pass / 0 fail, 0 regressions,
-       * matrixmuladd 240/240. */
-      return true;
-   default:
-      return false;
-   }
-}
-
 /* Stable name for diagnostics, e.g. "G15X". Never NULL. */
 const char *agx_chip_name(enum agx_chip chip);
 

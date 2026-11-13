@@ -2072,18 +2072,21 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * encoding; only the M5-exclusive 16x16 GEMM needs the kernel
     * DRM_ASAHI_FEATURE_COMPUTE_MATRIX, and the 8x8 matmad dispatch never sets
     * uses_matrix16, so AGX3B coopmat is purely a userspace capability. The
-    * default is decided per chip: a part advertises coopmat only once its
-    * dEQP-VK.compute.*cooperative_matrix* run has passed on real silicon
-    * (agx_chip_cooperative_matrix_qualified, G16S today); every other AGX3B
-    * part stays opt-in via ASAHI_AGX3B_COOPERATIVE_MATRIX=1. The env var
-    * overrides the default either way. M5 behaviour is unchanged. */
+    * default is decided per product, not per ISA encoding: a part advertises
+    * coopmat only once its dEQP-VK.compute.*cooperative_matrix* run has passed
+    * on real silicon. The M4 Pro (T6040, agx_is_m4_pro) has -- 1269 pass / 0
+    * fail, 0 regressions, matmad 240/240 on a J616s. It cannot be keyed on the
+    * agx_chip enum alone: the M4 Pro and the (untested) A18 Pro share the
+    * AGX_CHIP_G17P enum and differ only by chip_id, so the gate keys on the
+    * chip_id-precise predicate. Every other AGX3B part stays opt-in via
+    * ASAHI_AGX3B_COOPERATIVE_MATRIX=1 until it earns its own hardware CTS pass.
+    * The env var overrides the default either way. M5 behaviour is unchanged. */
    const bool m5_cmat = agx_chip_g17_m5(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_COOPERATIVE_MATRIX", true);
    const bool agx3b_cmat =
       agx_chip_isa_encoding(pdev->dev.chip) == AGX_ISA_ENCODING_AGX3B &&
-      debug_get_bool_option(
-         "ASAHI_AGX3B_COOPERATIVE_MATRIX",
-         agx_chip_cooperative_matrix_qualified(pdev->dev.chip));
+      debug_get_bool_option("ASAHI_AGX3B_COOPERATIVE_MATRIX",
+                            agx_is_m4_pro(&pdev->dev));
    supported_extensions.KHR_cooperative_matrix = m5_cmat || agx3b_cmat;
 
    /* bf16 inputs ride the same 8x8 form, but no AGX3B bf16 matmad has been
