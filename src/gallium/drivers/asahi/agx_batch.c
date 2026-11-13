@@ -421,6 +421,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->heap = 0;
    batch->initialized = false;
    batch->native_rejected = false;
+   batch->compute_dropped = false;
    batch->draws_refused = 0;
    batch->draws = 0;
    batch->g17g_prims = 0;
@@ -507,7 +508,7 @@ agx_batch_cleanup(struct agx_context *ctx, struct agx_batch *batch, bool reset)
    if (batch->timestamps.size) {
       struct agx_timestamps *ts = agx_batch_timestamps(batch);
 
-      if (batch->cdm.bo) {
+      if (batch->cdm.bo && !batch->compute_dropped) {
          begin_ts = MIN2(begin_ts, ts->comp_start);
          end_ts = MAX2(end_ts, ts->comp_end);
       }
@@ -1079,6 +1080,12 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
     */
    const bool refused = (error == 524);
 
+   /* The G17 runtime validates a whole submission before queueing any of it
+    * and refuses one with EINVAL (a lost VM fails with EIO). Earlier split
+    * submissions of the batch still run, so their wait below stays. */
+   const bool g17 = agx_m5_render_resources(dev);
+   const bool g17_refused = g17 && error == EINVAL;
+
    /* An ioctl error does not cancel accepted commands. Wait for both the
     * failed ioctl's aggregate (if published) and any earlier split compute.
     * Keep both handles alive until completion is established.
@@ -1100,6 +1107,12 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
          drmSyncobjDestroy(dev->fd, accepted_syncobj);
       if (error_syncobj)
          drmSyncobjDestroy(dev->fd, error_syncobj);
+      /* A G17 refusal signals an error fence into every output, and
+       * ctx->syncobj may name this one. A later wait on it would fail as a
+       * cancelled dependency, so replace it with a clean signalled fence:
+       * the slot's earlier work has completed and this batch ran nothing. */
+      if (g17 && (refused || g17_refused))
+         drmSyncobjSignal(dev->fd, &batch->syncobj, 1);
       agx_batch_cleanup(ctx, batch, false);
    } else {
       batch->submit_quarantined = true;
@@ -1110,7 +1123,8 @@ agx_retire_failed_submit(struct agx_context *ctx, struct agx_batch *batch,
       agx_msg("submit completion unknown; quarantining context resources\n");
    }
 
-   if (!refused) {
+   /* A refused batch is lost on its own; the context stays usable. */
+   if (!refused && !(g17_refused && complete)) {
       const bool first_fault = !ctx->any_faults;
       ctx->any_faults = true;
       if (first_fault && ctx->reset.reset)
@@ -1529,6 +1543,28 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       batch->native_rejected = true;
    }
 
+   /* M5 records each dispatch as its own command, so a compute batch with
+    * none (its shader was empty) has no work, and the G17 runtime refuses a
+    * submission without a command. Leave compute out; a render still goes.
+    * With no render, retire the batch: nothing waits on its fences (it took
+    * no timeline point and is neither ctx->syncobj nor a BO's writer), and a
+    * pending server wait stays queued for the next submission. */
+   if (compute && !batch->native_rejected && agx_chip_g17_m5(dev->chip) &&
+       !cdm_dispatch_count) {
+      compute = NULL;
+      batch->compute_dropped = true;
+      if (!render) {
+         batch_debug(batch, "EMPTY");
+         if (ctx->batch == batch)
+            ctx->batch = NULL;
+         /* No GPU timestamps were written for it. */
+         util_dynarray_clear(&batch->timestamps);
+         agx_batch_mark_submitted(batch);
+         agx_batch_cleanup(ctx, batch, false);
+         return;
+      }
+   }
+
    /* The G17 runtime refuses a render without its program storage list, and
     * the list's 16-bit command size bounds it. A list that does not fit is
     * a batch this driver cannot describe to the kernel. */
@@ -1857,6 +1893,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       .sync_type = DRM_ASAHI_SYNC_SYNCOBJ,
       .handle = submit_syncobj,
    };
+
+   /* A G17 refusal fills every output with an error fence, and another
+    * context's timeline wait can find it. Add the screen point only once the
+    * kernel has accepted the batch. */
+   const bool late_point = agx_m5_render_resources(dev);
+   if (late_point)
+      out_syncs[1] = out_syncs[2];
 
    /* G18G's bring-up submit path, like the M5 kernel it follows, admits
     * exactly one hardware command per submission, so every batch that needs
@@ -2227,7 +2270,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       .flags = 0,
       .queue_id = ctx->queue_id,
       .in_sync_count = in_sync_count,
-      .out_sync_count = 3,
+      .out_sync_count = late_point ? 2 : 3,
       .syncs = (uint64_t)(uintptr_t)(m5_split_prepass ? out_syncs : syncs),
       .cmdbuf = (uint64_t)(uintptr_t)(cmdbuf.data),
       .cmdbuf_size = cmdbuf.size,
@@ -2309,6 +2352,17 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    if (compute_syncobj)
       drmSyncobjDestroy(dev->fd, compute_syncobj);
    drmSyncobjDestroy(dev->fd, submit_syncobj);
+
+   /* Add the screen point held back above. Failing that, finish the batch on
+    * the CPU and keep the older point: later work is ordered after it anyway. */
+   bool point_published = true;
+   if (late_point && drmSyncobjTransfer(dev->fd, screen->flush_syncobj, seqid,
+                                        batch->syncobj, 0, 0)) {
+      agx_msg("timeline point transfer failed; waiting for the batch\n");
+      drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX,
+                     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      point_published = false;
+   }
 
    /* Now stash our batch fence into any shared BOs. */
    if (shared_bo_count) {
@@ -2423,7 +2477,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* Update the last seqid in the context (must only happen if the submit
     * succeeded, otherwise the timeline point would not be valid).
     */
-   ctx->flush_last_seqid = seqid;
+   if (point_published)
+      ctx->flush_last_seqid = seqid;
 
    if (ctx->batch == batch)
       ctx->batch = NULL;

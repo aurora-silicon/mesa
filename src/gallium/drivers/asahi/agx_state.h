@@ -599,6 +599,10 @@ struct agx_batch {
     */
    bool native_rejected;
 
+   /* M5 left this batch's compute part out of the submission (it had no
+    * dispatch), so the GPU wrote no compute timestamps. */
+   bool compute_dropped;
+
    /* Draws the G17G profile refused. A batch whose render carries none of its
     * draws has nothing valid to rasterize: its VDM stream never received
     * them, and submitting it anyway fails UAPI translation with a silent
