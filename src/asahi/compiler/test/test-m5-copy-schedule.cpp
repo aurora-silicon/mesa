@@ -109,6 +109,35 @@ loads_before_first_write(agx_block *block)
    return loads;
 }
 
+/* n device loads, each added into a running sum right after it. */
+static void
+emit_load_uses(copy_shader *s, unsigned n)
+{
+   agx_builder *b = s->b;
+   b->cursor = agx_after_block(s->body);
+   agx_index address = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index sum = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   for (unsigned i = 0; i < n; ++i) {
+      agx_index value = agx_temp(b->shader, AGX_SIZE_32);
+      agx_device_load_to(b, value, address, agx_immediate(i * 4),
+                         AGX_FORMAT_I32, 1, 0, false);
+      sum = agx_iadd(b, sum, value, 0);
+   }
+   agx_unit_test(b, sum);
+}
+
+static unsigned
+loads_before_first_add(agx_block *block)
+{
+   unsigned loads = 0;
+   agx_foreach_instr_in_block(block, I) {
+      if (I->op == AGX_OPCODE_IADD)
+         break;
+      loads += I->op == AGX_OPCODE_DEVICE_LOAD;
+   }
+   return loads;
+}
+
 } /* namespace */
 
 TEST(M5CopySchedule, VertexReadsIssueAheadOfWrites)
@@ -171,5 +200,29 @@ TEST(M5CopySchedule, OtherGenerationsUnchanged)
    unsigned first_write;
    EXPECT_EQ(loads_before_first_write(s.body), 1u);
    EXPECT_EQ(max_reads_in_flight(s.body, &first_write), 1u);
+   ralloc_free(s.mem);
+}
+
+/* M5 compute device loads issue ahead of their uses, as samples do. */
+TEST(M5CopySchedule, ComputeDeviceLoadsIssueAheadOfUses)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   emit_load_uses(&s, 6);
+   agx_ilp_schedule(s.b->shader);
+   EXPECT_GT(loads_before_first_add(s.body), 1u);
+   ralloc_free(s.mem);
+}
+
+/* G18G compiles as AGX3C with emit_agx3d and keeps the pressure order. */
+TEST(M5CopySchedule, G18GComputeDeviceLoadsKeepTheirOrder)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.key.dev.chip = AGX_CHIP_G17G;
+   s.key.dev.emit_agx3d = true;
+   emit_load_uses(&s, 6);
+   agx_ilp_schedule(s.b->shader);
+   EXPECT_EQ(loads_before_first_add(s.body), 1u);
    ralloc_free(s.mem);
 }
