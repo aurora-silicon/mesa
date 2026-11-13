@@ -807,6 +807,53 @@ hk_device_init_diag(const void *pdev, const void *dev, const char *stage,
    errno = saved_errno;
 }
 
+/* Whether memory can be mapped at a second GPU virtual address at any time
+ * in the life of `dev`, from what it enabled (hk_cdm_alias_scope()):
+ *
+ * - sparse buffers and images, and capture/replay buffers, have an address
+ *   of their own, and the memory bound to them keeps its own as well;
+ * - an fd import of memory from elsewhere gets an address of its own, and
+ *   another import may map the same pages (two dma-bufs over one memfd, or
+ *   a dma-buf and a host import of its pages);
+ * - a host import gets an address of its own, and the same pages may be
+ *   imported again. With hk_host_memory_import_read_only every host import
+ *   is read-only for the GPU, so the GPU writes no imported page and a read
+ *   through the import cannot miss a write through another address.
+ *
+ * Nothing else maps memory the GPU writes at two addresses: the read-only
+ * shadow of every allocation is read only through sparse and capture/replay
+ * buffers, and the driver's other second mappings (descriptor tables,
+ * acceleration structure tables, shader code) hold memory written by the
+ * CPU alone. The structures of these features may only be used when they
+ * are enabled, so a device that enabled none of them never has such memory.
+ */
+static bool
+hk_device_may_alias_memory(const struct hk_device *dev,
+                           const struct hk_instance *instance)
+{
+   const struct vk_features *f = &dev->vk.enabled_features;
+   const struct vk_device_extension_table *ext = &dev->vk.enabled_extensions;
+
+   if (f->sparseBinding || f->sparseResidencyBuffer ||
+       f->sparseResidencyImage2D || f->sparseResidencyImage3D ||
+       f->sparseResidency2Samples || f->sparseResidency4Samples ||
+       f->sparseResidency8Samples || f->sparseResidency16Samples ||
+       f->sparseResidencyAliased)
+      return true;
+
+   if (f->bufferDeviceAddressCaptureReplay ||
+       f->bufferDeviceAddressCaptureReplayEXT ||
+       f->descriptorBufferCaptureReplay ||
+       f->accelerationStructureCaptureReplay)
+      return true;
+
+   if (ext->KHR_external_memory_fd || ext->EXT_external_memory_dma_buf)
+      return true;
+
+   return ext->EXT_external_memory_host &&
+          !instance->drirc.misc.host_memory_import_read_only;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
@@ -868,6 +915,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
+   dev->may_alias_memory = hk_device_may_alias_memory(dev, instance);
 
    drmDevicePtr drm_device = NULL;
    int ret = drmGetDeviceFromDevId(pdev->render_dev, 0, &drm_device);
