@@ -3,6 +3,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "util/u_dynarray.h"
 #include "util/u_debug.h"
+#include "micromap.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -11,6 +12,9 @@ struct gen1_rq_state {
    nir_variable *query;
    nir_variable *as, *origin, *direction, *tmin, *tmax, *mask, *active;
    nir_variable *result[4], *candidate[4], *started, *cursor, *refills;
+   /* VK_EXT_opacity_micromap: whether the query's TLAS has an instance of a
+    * BLAS with micromaps (the TLAS's OMM directory entry). */
+   nir_variable *omm;
 };
 
 static const struct glsl_type *
@@ -104,11 +108,146 @@ gen1_candidate_supported_load(const nir_intrinsic_instr *intr, bool position_fet
    }
 }
 
+/* VK_EXT_opacity_micromap instance and ray flags. */
+#define GEN1_OMM_INSTANCE_FORCE_2_STATE 0x10u
+#define GEN1_OMM_INSTANCE_DISABLE 0x20u
+#define GEN1_OMM_RAY_FORCE_2_STATE 0x400u
+
+/* The micro-triangle of a subdivision level holding barycentrics (u, v): the
+ * Vulkan spec's reference BarycentricsToSpaceFillingCurveIndex(). Its bit
+ * reversal covers levels up to 16. */
+static nir_def *
+gen1_omm_subtriangle(nir_builder *b, nir_def *uv, nir_def *level)
+{
+   nir_def *n = nir_ishl(b, nir_imm_int(b, 1), level);
+   nir_def *n1 = nir_iadd_imm(b, n, -1);
+   nir_def *scale = nir_u2f32(b, n);
+   nir_def *fu = nir_fmul(b, nir_fsat(b, nir_channel(b, uv, 0)), scale);
+   nir_def *fv = nir_fmul(b, nir_fsat(b, nir_channel(b, uv, 1)), scale);
+   nir_def *iu = nir_f2u32(b, fu), *iv = nir_f2u32(b, fv);
+   nir_def *frac = nir_fadd(b, nir_fsub(b, fu, nir_u2f32(b, iu)),
+                               nir_fsub(b, fv, nir_u2f32(b, iv)));
+   iu = nir_umin(b, iu, n1);
+   iv = nir_umin(b, iv, n1);
+   nir_def *iuv = nir_iadd(b, iu, iv);
+   iu = nir_bcsel(b, nir_uge(b, iuv, n),
+                  nir_isub(b, iu, nir_iadd_imm(b, nir_isub(b, iuv, n), 1)), iu);
+   nir_def *iw = nir_inot(b, nir_iadd(b, iu, iv));
+   iw = nir_bcsel(b, nir_iand(b, nir_fge_imm(b, frac, 1.0), nir_ult(b, iuv, n1)),
+                  nir_iadd_imm(b, iw, -1), iw);
+   nir_def *b0 = nir_iand(b, nir_inot(b, nir_ixor(b, iu, iw)), n1);
+   nir_def *t = nir_iand(b, nir_ixor(b, iu, iv), b0);
+   nir_def *f = t;
+   for (unsigned shift = 1; shift <= 8; shift *= 2)
+      f = nir_ixor(b, f, nir_ushr_imm(b, f, shift));
+   nir_def *b1 = nir_ior(b, nir_iand(b, nir_ixor(b, f, iu), nir_inot(b, b0)), t);
+   static const uint32_t masks[4] = {0x00ff00ff, 0x0f0f0f0f, 0x33333333, 0x55555555};
+   nir_def *bits[2] = {b0, b1};
+   for (unsigned i = 0; i < 2; ++i)
+      for (unsigned s = 0; s < 4; ++s)
+         bits[i] = nir_iand_imm(b, nir_ior(b, bits[i], nir_ishl_imm(b, bits[i], 8 >> s)),
+                                masks[s]);
+   return nir_ior(b, bits[0], nir_ishl_imm(b, bits[1], 1));
+}
+
+/* Micromap state of a triangle candidate, after the 2-state override:
+ * 0 transparent (ignored), 1 opaque, 2 and 3 unknown (non-opaque). *has is
+ * false when the triangle has no micromap, or its instance disables them.
+ * The BLAS's OMM table comes from the OMM directory by AS id (libagx/
+ * micromap.h). An index past the micromap or an invalid record resolves to
+ * unknown-opaque without reading the micromap's data. */
+static nir_def *
+gen1_omm_state(nir_builder *b, nir_def *blas_id, nir_def *iflags,
+               nir_def *ray_flags, nir_def *geometry, nir_def *primitive,
+               nir_def *uv, nir_def **has)
+{
+   nir_variable *has_var = nir_local_variable_create(b->impl, glsl_bool_type(), "omm_has");
+   nir_variable *state_var = nir_local_variable_create(b->impl, glsl_uint_type(), "omm_state");
+   nir_store_var(b, has_var, nir_imm_false(b), 1);
+   nir_store_var(b, state_var, nir_imm_int(b, 3), 1);
+   nir_push_if(b, nir_inot(b, nir_test_mask(b, iflags, GEN1_OMM_INSTANCE_DISABLE)));
+   {
+      nir_def *entry = nir_load_global(b, 4, 32,
+         nir_iadd_imm(b, nir_u2u64(b, nir_imul_imm(b, blas_id,
+                                                   LIBAGX_OMM_DIRECTORY_ENTRY_BYTES)),
+                      AGX_GEN1_OMM_DIRECTORY_VA), .align_mul = 16);
+      nir_def *table = nir_pack_64_2x32(b, nir_channels(b, entry, 3));
+      nir_push_if(b, nir_iand(b, nir_ine_imm(b, table, 0),
+                                 nir_ult(b, geometry, nir_channel(b, entry, 2))));
+      {
+         nir_def *g = nir_load_global(b, 4, 32, nir_iadd(b, table,
+            nir_u2u64(b, nir_iadd_imm(b, nir_imul_imm(b, geometry,
+                                                      LIBAGX_OMM_TABLE_GEOMETRY_BYTES),
+                                      LIBAGX_OMM_TABLE_HEADER_BYTES))), .align_mul = 16);
+         nir_def *micromap = nir_pack_64_2x32(b, nir_channels(b, g, 3));
+         nir_push_if(b, nir_test_mask(b, nir_channel(b, g, 3), LIBAGX_OMM_GEOMETRY_LINKED));
+         {
+            nir_def *index = nir_load_global(b, 1, 32, nir_iadd(b, table,
+               nir_u2u64(b, nir_iadd(b, nir_channel(b, g, 2),
+                                     nir_imul_imm(b, primitive, 4)))), .align_mul = 4);
+            nir_push_if(b, nir_uge_imm(b, index, 0xfffffffcu));
+            {
+               /* VK_OPACITY_MICROMAP_SPECIAL_INDEX_* -1 .. -4 are states 0 .. 3. */
+               nir_store_var(b, has_var, nir_imm_true(b), 1);
+               nir_store_var(b, state_var, nir_inot(b, index), 1);
+            }
+            nir_push_else(b, NULL);
+            nir_push_if(b, nir_ine_imm(b, micromap, 0));
+            {
+               nir_store_var(b, has_var, nir_imm_true(b), 1);
+               nir_def *count = nir_load_global(b, 1, 32,
+                  nir_iadd_imm(b, micromap, 4 * LIBAGX_MICROMAP_WORD_TRIANGLES), .align_mul = 4);
+               nir_push_if(b, nir_ult(b, index, count));
+               {
+                  nir_def *record = nir_load_global(b, 2, 32, nir_iadd(b, micromap,
+                     nir_iadd_imm(b, nir_imul_imm(b, nir_u2u64(b, index),
+                                                  LIBAGX_MICROMAP_RECORD_BYTES),
+                                  LIBAGX_MICROMAP_RECORDS)), .align_mul = 8);
+                  nir_def *level = nir_iand_imm(b, nir_channel(b, record, 1), 0xffff);
+                  nir_def *format = nir_ushr_imm(b, nir_channel(b, record, 1), 16);
+                  nir_push_if(b, nir_iand(b, nir_iand(b, nir_uge_imm(b, format, 1),
+                                                         nir_ule_imm(b, format, 2)),
+                                             nir_ule_imm(b, level, LIBAGX_MICROMAP_MAX_LEVEL)));
+                  {
+                     nir_def *bit = nir_imul(b, gen1_omm_subtriangle(b, uv, level), format);
+                     nir_def *word = nir_load_global(b, 1, 32, nir_iadd(b, micromap,
+                        nir_imul_imm(b, nir_u2u64(b, nir_iadd(b, nir_channel(b, record, 0),
+                                                             nir_ushr_imm(b, bit, 5))), 4)),
+                        .align_mul = 4);
+                     nir_store_var(b, state_var,
+                        nir_iand(b, nir_ushr(b, word, nir_iand_imm(b, bit, 31)),
+                                 nir_bcsel(b, nir_ieq_imm(b, format, 2), nir_imm_int(b, 3),
+                                           nir_imm_int(b, 1))), 1);
+                  }
+                  nir_pop_if(b, NULL);
+               }
+               nir_pop_if(b, NULL);
+            }
+            nir_pop_if(b, NULL);
+            nir_pop_if(b, NULL);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+   *has = nir_load_var(b, has_var);
+   nir_def *state = nir_load_var(b, state_var);
+   /* The 2-state override: unknown-transparent is transparent, unknown-opaque
+    * is opaque. */
+   nir_def *force2 = nir_ior(b,
+      nir_test_mask(b, iflags, GEN1_OMM_INSTANCE_FORCE_2_STATE),
+      nir_test_mask(b, ray_flags, GEN1_OMM_RAY_FORCE_2_STATE));
+   return nir_bcsel(b, force2, nir_iand_imm(b, state, 1), state);
+}
+
 static void
 gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
                       nir_def *cursor,nir_def *flags,nir_def *packet[4],
-                      nir_def **opaque, nir_def **instance_flags)
+                      nir_def **opaque, nir_def **instance_flags,
+                      nir_def *omm_on, nir_def **ignored)
 {
+   const bool omm = omm_on != NULL;
    struct agx_gen1_ray_candidate c=agx_nir_gen1_load_candidate(b,query,lane,cursor);
    nir_def *leaf_type=nir_iand_imm(b,nir_ushr_imm(b,c.flags,11),7);
    nir_def *paired=nir_ieq_imm(b,leaf_type,1);
@@ -122,9 +261,36 @@ gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
    nir_def *node=agx_nir_gen1_candidate_instance_pointer(b,query,lane);
    nir_def *ids=nir_load_global(b,2,32,nir_iadd_imm(b,node,96),.align_mul=4);
    nir_def *marker=nir_load_global(b,1,32,nir_iadd_imm(b,c.compressed_address,-4),.align_mul=4);
-   nir_def *iflags=nir_load_global(b,1,32,nir_iadd_imm(b,node,8),.align_mul=4);
+   nir_def *iflags, *blas_id = NULL;
+   if (omm) {
+      /* encode_instance stores the BLAS's AS id just before the flags. */
+      nir_def *words = nir_load_global(b, 2, 32, nir_iadd_imm(b, node, 4), .align_mul = 4);
+      blas_id = nir_channel(b, words, 0);
+      iflags = nir_channel(b, words, 1);
+   } else {
+      iflags=nir_load_global(b,1,32,nir_iadd_imm(b,node,8),.align_mul=4);
+   }
    *instance_flags = iflags;
-   nir_def *op=nir_bcsel(b,nir_test_mask(b,iflags,8),nir_imm_false(b),nir_bcsel(b,aabb,nir_test_mask(b,geo,0x80000000),nir_ieq_imm(b,nir_iand_imm(b,marker,31),8)));
+   nir_def *op;
+   *ignored = NULL;
+   if (!omm) {
+      op=nir_bcsel(b,nir_test_mask(b,iflags,8),nir_imm_false(b),nir_bcsel(b,aabb,nir_test_mask(b,geo,0x80000000),nir_ieq_imm(b,nir_iand_imm(b,marker,31),8)));
+   } else {
+      nir_def *geometry_opaque = nir_bcsel(b,aabb,nir_test_mask(b,geo,0x80000000),nir_ieq_imm(b,nir_iand_imm(b,marker,31),8));
+      /* A micromap replaces the geometry's opacity; the instance and ray
+       * overrides below still apply. Transparent triangles are ignored. */
+      nir_def *has = NULL;
+      nir_push_if(b, nir_iand(b, nir_inot(b, aabb), omm_on));
+      nir_def *state = gen1_omm_state(b, blas_id, iflags, flags,
+         nir_iand_imm(b, geo, 0xffffff), nir_iand_imm(b, prim, 0x3fffffff),
+         c.barycentrics, &has);
+      nir_pop_if(b, NULL);
+      has = nir_if_phi(b, has, nir_imm_false(b));
+      state = nir_if_phi(b, state, nir_imm_int(b, 3));
+      geometry_opaque = nir_bcsel(b, has, nir_ieq_imm(b, state, 1), geometry_opaque);
+      *ignored = nir_iand(b, has, nir_ieq_imm(b, state, 0));
+      op = nir_bcsel(b, nir_test_mask(b, iflags, 8), nir_imm_false(b), geometry_opaque);
+   }
    op=nir_ior(b,op,nir_test_mask(b,iflags,4));
    *opaque=nir_bcsel(b,nir_test_mask(b,flags,2),nir_imm_false(b),nir_ior(b,op,nir_test_mask(b,flags,1)));
    nir_def *zero=nir_imm_int(b,0);
@@ -179,20 +345,24 @@ gen1_rq_committed_instance_pointer(nir_builder *b, nir_def *query, nir_def *lane
 }
 
 static nir_def *
-gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags)
+gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags, nir_def *omm_on)
 {
-   return nir_inot(b, nir_test_mask(b, nir_load_deref(b, flags),
-                                    GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS));
+   nir_def *commits = nir_inot(b, nir_test_mask(b, nir_load_deref(b, flags),
+                                                GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS));
+   /* A hardware commit would skip the micromap lookup. */
+   return omm_on ? nir_iand(b, commits, nir_inot(b, omm_on)) : commits;
 }
 
+/* omm_on (NULL without micromaps): the query's TLAS has micromap instances,
+ * so every hit is queued for the micromap lookup. */
 static nir_def *
-gen1_rq_control(nir_builder *b, nir_deref_instr *flags)
+gen1_rq_control(nir_builder *b, nir_deref_instr *flags, nir_def *omm_on)
 {
    nir_def *opaque = nir_test_mask(b, nir_load_deref(b, flags), 1);
    nir_def *commit = nir_bcsel(b, opaque,
                                nir_imm_int(b, GEN1_RQ_CONTROL_COMMIT_ALL),
                                nir_imm_int(b, GEN1_RQ_CONTROL_COMMIT_OPAQUE));
-   return nir_bcsel(b, gen1_rq_hw_commits(b, flags), commit,
+   return nir_bcsel(b, gen1_rq_hw_commits(b, flags, omm_on), commit,
                     nir_imm_int(b, GEN1_RQ_CONTROL_QUEUE));
 }
 
@@ -237,9 +407,10 @@ static void
 gen1_rq_merge_hw_commit(nir_builder *b, nir_def *id, nir_def *query,
                         nir_def *lane, nir_deref_instr *flags,
                         nir_deref_instr *active,
-                        nir_deref_instr *result[4], unsigned fields)
+                        nir_deref_instr *result[4], unsigned fields,
+                        nir_def *omm_on)
 {
-   nir_push_if(b, gen1_rq_hw_commits(b, flags));
+   nir_push_if(b, gen1_rq_hw_commits(b, flags, omm_on));
    nir_def *distance = nir_load_scs_uniform_agx(b, 1, 32, nir_load_preamble(b, 1, 64, .base = 118),
       nir_ishl_imm(b, id, 5), .base = 24, .format = PIPE_FORMAT_R32_UINT, .component = 0);
    nir_def *hit = nir_load_scs_indexed_agx(b, 2, 32, query, lane, .base = 256, .component = 3);
@@ -274,8 +445,9 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
                      nir_deref_instr *flags,nir_deref_instr *minimum,
                      nir_deref_instr *result[4],nir_deref_instr *candidate[4],
                      nir_deref_instr *refills,nir_variable *more,
-                     unsigned hw_fields)
+                     unsigned hw_fields, nir_deref_instr *omm)
 {
+   nir_def *omm_on = omm ? nir_load_deref(b, omm) : NULL;
    nir_def *id=nir_load_scs_thread_index_agx(b),*lane=nir_iand_imm(b,id,31);
    nir_def *query=nir_iadd_imm(b,nir_imul_imm(b,nir_ushr_imm(b,id,5),304*32),0x2f8000);
    nir_push_loop(b);
@@ -283,8 +455,9 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
    nir_def *control=nir_load_scs_indexed_agx(b,1,32,query,lane,.base=1792,.component=2);
    nir_def *count=nir_iand_imm(b,nir_ushr_imm(b,control,21),15);
    nir_push_if(b,nir_ult(b,index,count));
-   nir_def *packet[4],*opaque,*instance_flags,*ray_flags=nir_load_deref(b,flags);
-   gen1_candidate_packet(b,query,lane,index,ray_flags,packet,&opaque,&instance_flags);
+   nir_def *packet[4],*opaque,*instance_flags,*ignored,*ray_flags=nir_load_deref(b,flags);
+   gen1_candidate_packet(b,query,lane,index,ray_flags,packet,&opaque,&instance_flags,
+                         omm_on,&ignored);
    nir_store_deref(b,cursor,nir_iadd_imm(b,index,1),1);
    nir_def *distance=nir_channel(b,packet[1],2),*best=nir_channel(b,nir_load_deref(b,result[1]),2);
    nir_def *triangle=nir_ieq_imm(b,nir_ushr_imm(b,nir_channel(b,packet[2],0),30),1);
@@ -298,6 +471,8 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
       nir_test_mask(b, ray_flags, 0x20), nir_test_mask(b, ray_flags, 0x10));
    culled = nir_ior(b, culled, nir_iand(b, triangle,
       nir_iand(b, facing_culled, nir_inot(b, nir_test_mask(b, instance_flags, 1)))));
+   if (ignored)
+      culled = nir_ior(b, culled, ignored);
    nir_push_if(b,nir_iand(b,interval,nir_inot(b,culled)));
 
    nir_def *skip=nir_bcsel(b,triangle,nir_test_mask(b,ray_flags,256),nir_test_mask(b,ray_flags,512));
@@ -320,7 +495,8 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
    nir_pop_if(b,NULL);
    nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
    nir_store_deref(b,active,completed,1);
-   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields);
+   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields,
+                           omm ? nir_load_deref(b, omm) : NULL);
    nir_break_if(b,nir_inot(b,nir_load_deref(b,active)));
    nir_store_deref(b,cursor,nir_imm_int(b,0),1);
    nir_pop_if(b,NULL);nir_pop_loop(b,NULL);
@@ -510,6 +686,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             gen1_rq_field_type(state->query->type, glsl_bool_type()), "rq_active");
       state->started = nir_local_variable_create(impl,
          gen1_rq_field_type(state->query->type, glsl_bool_type()), "rq_started");
+      if (layout->opacity_micromap)
+         state->omm = nir_local_variable_create(impl,
+            gen1_rq_field_type(state->query->type, glsl_bool_type()), "rq_omm");
       state->cursor = nir_local_variable_create(impl,
          gen1_rq_field_type(state->query->type, glsl_uint_type()), "rq_cursor");
       state->refills = nir_local_variable_create(impl,
@@ -552,6 +731,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
       for (unsigned i = 0; i < 4; ++i)
          result[i] = gen1_rq_field_deref(&b, query, state->result[i]);
       nir_deref_instr *started=gen1_rq_field_deref(&b,query,state->started);
+      nir_deref_instr *omm = state->omm ? gen1_rq_field_deref(&b, query, state->omm) : NULL;
       nir_deref_instr *cursor=gen1_rq_field_deref(&b,query,state->cursor);
       nir_deref_instr *refills=gen1_rq_field_deref(&b,query,state->refills);
       nir_deref_instr *candidate[4];
@@ -577,6 +757,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             }
          }
          nir_store_deref(&b,started,nir_imm_false(&b),1);
+         if (omm)
+            nir_store_deref(&b, omm, nir_imm_false(&b), 1);
          nir_store_deref(&b,cursor,nir_imm_int(&b,0),1);
          nir_store_deref(&b,refills,nir_imm_int(&b,0),1);
          nir_store_deref(&b, flags, intr->src[2].ssa, 1);
@@ -684,8 +866,23 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          for(unsigned i=0;i<2;i++)
             nir_store_scs_uniform_agx(&b,words[i],base,index,
                .base=16*i,.format=PIPE_FORMAT_R32_UINT,.component=0);
+         nir_def *omm_on = NULL;
+         if (omm) {
+            /* The TLAS's OMM directory entry holds its build stamp twice when
+             * an instance needs micromaps (libagx/micromap.h). */
+            nir_def *tlas_id = nir_load_global(&b, 1, 32, nir_iadd_imm(&b, address, 176),
+                                               .align_mul = 4);
+            nir_def *entry = nir_load_global(&b, 4, 32,
+               nir_iadd_imm(&b, nir_u2u64(&b, nir_imul_imm(&b, tlas_id,
+                                                         LIBAGX_OMM_DIRECTORY_ENTRY_BYTES)),
+                            AGX_GEN1_OMM_DIRECTORY_VA), .align_mul = 16);
+            omm_on = nir_iand(&b, nir_test_mask(&b, nir_channel(&b, entry, 2),
+                                                LIBAGX_OMM_TLAS_STAMP_BIT),
+                              nir_ieq(&b, nir_channel(&b, entry, 2), nir_channel(&b, entry, 3)));
+            nir_store_deref(&b, omm, omm_on, 1);
+         }
          nir_def *query_control = layout->candidates
-            ? gen1_rq_control(&b, flags)
+            ? gen1_rq_control(&b, flags, omm_on)
             : nir_imm_int(&b, 0x4922);
          nir_store_scs_indexed_agx(&b,nir_vec2(&b,query_control,
             nir_load_deref(&b,tmin)),query,lane,.base=0,.component=3);
@@ -706,7 +903,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if(layout->candidates) {
             nir_store_deref(&b,started,nir_imm_true(&b),1);
             nir_store_deref(&b,active,completed,1);
-            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,hw_fields);
+            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,hw_fields,
+                                    omm_on);
          } else {
          nir_push_if(&b,completed);
          for(unsigned i=0;i<2;i++)
@@ -748,7 +946,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if (layout->candidates) {
             nir_pop_if(&b, NULL);
             nir_push_if(&b, nir_load_deref(&b, active));
-            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,refills,more,hw_fields);
+            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,refills,more,hw_fields,
+                                omm);
             nir_pop_if(&b, NULL);
          }
          nir_pop_if(&b, NULL);

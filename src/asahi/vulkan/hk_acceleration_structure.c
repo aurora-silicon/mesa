@@ -32,6 +32,9 @@
 #include "hk_gen1_rt_indirect_contract.h"
 #include "asahi/lib/agx_va_runtime_hole.h"
 #include "asahi/libagx/gen1_as.h"
+#include "asahi/libagx/micromap.h"
+#include "hk_micromap.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 
 #include "hk_buffer.h"
@@ -45,6 +48,7 @@
 #include "vk_acceleration_structure.h"
 #include "vk_common_entrypoints.h"
 #include "vk_meta.h"
+#include "vk_util.h"
 
 #include "bvh/hk_build_interface.h"
 
@@ -71,6 +75,15 @@ struct hk_vertex_table_args {
    uint64_t leaves, table;
    uint32_t leaf_count, geometry_count, vertices_offset, leaf_stride;
 };
+
+/* A BLAS's OMM table (libagx/micromap.h), after its vertex table if any. */
+struct hk_omm_table_layout {
+   uint64_t offset, bytes;
+   uint32_t geometry_count, primitives;
+};
+static bool hk_omm_table_forget(struct hk_device *dev,
+                                struct vk_acceleration_structure *as,
+                                struct hk_omm_table_layout *out);
 
 static const uint32_t agx3_node_spv[] = {
 #include "bvh/hk_agx3_gen1_leaf.spv.h"
@@ -588,10 +601,18 @@ hk_CreateAccelerationStructureKHR(VkDevice device,
    const uint32_t id = hk_gen1_as_index_to_id(index);
    const bool live_limit = dev->gen1_rq_live_as_table &&
                            id >= HK_GEN1_AS_TABLE_AS_SLOTS;
+   /* An id's OMM directory entry starts cleared (no OMM table). */
+   uint32_t *omm_entry = NULL;
    if (!live_limit && id < HK_GEN1_AS_ID_LIMIT &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_address_pages, id) &&
        hk_gen1_sparse_entry(dev, &dev->gen1_as_table_pages, id) &&
-       hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id)) {
+       hk_gen1_sparse_entry(dev, &dev->gen1_as_metadata_pages, id) &&
+       (!dev->gen1_omm_directory ||
+        (omm_entry = hk_gen1_sparse_entry(dev, &dev->gen1_omm_directory_pages, id)))) {
+      if (omm_entry) {
+         memset(omm_entry, 0, LIBAGX_OMM_DIRECTORY_ENTRY_BYTES);
+         util_post_flush_fence();
+      }
       struct hk_gen1_as_slot *slot = reuse ?
          util_dynarray_element(&dev->gen1_ases, struct hk_gen1_as_slot, index) :
          util_dynarray_grow(&dev->gen1_ases, struct hk_gen1_as_slot, 1);
@@ -637,6 +658,8 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
    VK_FROM_HANDLE(hk_device, dev, device);
    VK_FROM_HANDLE(vk_acceleration_structure, as, handle);
    if (as && dev->g17p_native_as) {
+      if (dev->gen1_omm_directory)
+         hk_omm_table_forget(dev, as, NULL);
       simple_mtx_lock(&dev->gen1_as_lock);
       if (dev->gen1_vertex_tables) {
          struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_vertex_tables, as);
@@ -654,6 +677,14 @@ hk_DestroyAccelerationStructureKHR(VkDevice device, VkAccelerationStructureKHR h
                      struct hk_gen1_as_slot, index);
          assert(slot->as == as);
          hk_gen1_as_publish_address(dev, id, 0, 0);
+         if (dev->gen1_omm_directory) {
+            uint32_t *omm_entry =
+               hk_gen1_sparse_entry(dev, &dev->gen1_omm_directory_pages, id);
+            if (omm_entry) {
+               memset(omm_entry, 0, LIBAGX_OMM_DIRECTORY_ENTRY_BYTES);
+               util_post_flush_fence();
+            }
+         }
          hk_gen1_as_window_release(dev, slot);
          hk_gen1_as_free_slot(dev, index);
          _mesa_hash_table_remove(dev->gen1_as_ids, entry);
@@ -1087,12 +1118,55 @@ hk_vertex_table_layout(const struct hk_device *dev,
    return true;
 }
 
+static const VkAccelerationStructureTrianglesOpacityMicromapEXT *
+hk_omm_linkage(const VkAccelerationStructureBuildGeometryInfoKHR *info, uint32_t g)
+{
+   const VkAccelerationStructureGeometryKHR *geometry =
+      info->pGeometries ? &info->pGeometries[g] : info->ppGeometries[g];
+   if (geometry->geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+      return NULL;
+   return vk_find_struct_const(geometry->geometry.triangles.pNext,
+                               ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT);
+}
+
+/* Only triangle structures with opacity micromap linkage on some geometry
+ * have a table. Its index arrays hold one entry per primitive. */
+static bool
+hk_omm_table_layout(const struct hk_device *dev,
+                    const struct vk_acceleration_structure_build_state *state,
+                    struct hk_omm_table_layout *out)
+{
+   if (!dev->gen1_omm_directory ||
+       vk_get_as_geometry_type(state->build_info) != VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+      return false;
+   bool linked = false;
+   for (uint32_t g = 0; g < state->build_info->geometryCount && !linked; ++g)
+      linked = hk_omm_linkage(state->build_info, g) != NULL;
+   if (!linked)
+      return false;
+   struct hk_vertex_table_layout vertices;
+   const uint64_t base = hk_vertex_table_layout(dev, state, &vertices)
+      ? vertices.offset + vertices.bytes : hk_get_native_as_size(state);
+   if (!base)
+      return false;
+   out->offset = ALIGN_POT(base, UINT64_C(16));
+   out->geometry_count = state->build_info->geometryCount;
+   out->primitives = state->leaf_node_count;
+   out->bytes = LIBAGX_OMM_TABLE_HEADER_BYTES +
+                (uint64_t)out->geometry_count * LIBAGX_OMM_TABLE_GEOMETRY_BYTES +
+                (uint64_t)out->primitives * 4;
+   return true;
+}
+
 static VkDeviceSize
 hk_get_as_size(VkDevice _device,
                const struct vk_acceleration_structure_build_state *state)
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
    if (dev->g17p_native_as) {
+      struct hk_omm_table_layout omm;
+      if (hk_omm_table_layout(dev, state, &omm))
+         return omm.offset + omm.bytes;
       struct hk_vertex_table_layout table;
       if (hk_vertex_table_layout(dev, state, &table))
          return table.offset + table.bytes;
@@ -1267,6 +1341,171 @@ hk_vertex_table_build(VkCommandBuffer commandBuffer,
    hk_vertex_table_publish(commandBuffer, dev, dst, &table);
 }
 
+static uint64_t
+hk_omm_directory_entry(uint32_t id)
+{
+   return AGX_GEN1_OMM_DIRECTORY_VA + (uint64_t)id * LIBAGX_OMM_DIRECTORY_ENTRY_BYTES;
+}
+
+/* Forget a BLAS's OMM table; true if it had one. */
+static bool
+hk_omm_table_forget(struct hk_device *dev, struct vk_acceleration_structure *as,
+                    struct hk_omm_table_layout *out)
+{
+   bool found = false;
+   simple_mtx_lock(&dev->gen1_as_lock);
+   struct hash_entry *entry = dev->gen1_omm_tables
+      ? _mesa_hash_table_search(dev->gen1_omm_tables, as) : NULL;
+   if (entry) {
+      if (out)
+         *out = *(struct hk_omm_table_layout *)entry->data;
+      free(entry->data);
+      _mesa_hash_table_remove(dev->gen1_omm_tables, entry);
+      found = true;
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   return found;
+}
+
+static void
+hk_omm_table_remember(struct hk_device *dev, struct vk_acceleration_structure *as,
+                      const struct hk_omm_table_layout *table)
+{
+   simple_mtx_lock(&dev->gen1_as_lock);
+   struct hash_entry *existing = _mesa_hash_table_search(dev->gen1_omm_tables, as);
+   struct hk_omm_table_layout *copy = existing ? existing->data : malloc(sizeof(*copy));
+   if (copy) {
+      *copy = *table;
+      if (!existing)
+         _mesa_hash_table_insert(dev->gen1_omm_tables, as, copy);
+   }
+   simple_mtx_unlock(&dev->gen1_as_lock);
+}
+
+uint64_t
+hk_omm_table_bytes(struct hk_device *dev, struct vk_acceleration_structure *as)
+{
+   if (!dev->gen1_omm_directory)
+      return 0;
+   uint64_t bytes = 0;
+   simple_mtx_lock(&dev->gen1_as_lock);
+   struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_omm_tables, as);
+   if (entry)
+      bytes = ((struct hk_omm_table_layout *)entry->data)->bytes;
+   simple_mtx_unlock(&dev->gen1_as_lock);
+   return bytes;
+}
+
+/* Resolve a build's or update's OMM linkage into the destination's OMM table
+ * and publish it in the OMM directory. The table copies everything traversal
+ * needs from the build inputs; it references the micromaps. A structure built
+ * without linkage after one with it has its directory entry cleared; any
+ * other build without linkage costs nothing. */
+static void
+hk_omm_table_build(VkCommandBuffer commandBuffer,
+                   const struct vk_acceleration_structure_build_state *state,
+                   struct vk_acceleration_structure *dst)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->gen1_omm_directory)
+      return;
+   const uint32_t id = hk_gen1_as_id(dev, dst);
+   struct hk_omm_table_layout table;
+   if (!hk_omm_table_layout(dev, state, &table)) {
+      if (id && hk_omm_table_forget(dev, dst, NULL))
+         libagx_omm_directory_write(cmd, agx_1d(1), AGX_BARRIER_ALL,
+                                    hk_omm_directory_entry(id), 0, 0, 0);
+      return;
+   }
+   if (!id || table.offset + table.bytes > dst->size) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   const uint32_t geometry_count = table.geometry_count;
+   struct libagx_omm_geometry_desc *desc =
+      calloc(MAX2(geometry_count, 1), sizeof(*desc));
+   if (!desc) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+   for (uint32_t g = 0; g < geometry_count; ++g) {
+      const VkAccelerationStructureTrianglesOpacityMicromapEXT *link =
+         hk_omm_linkage(state->build_info, g);
+      desc[g].count = state->build_range_infos
+         ? state->build_range_infos[g].primitiveCount : UINT32_MAX;
+      if (!link)
+         continue;
+      VK_FROM_HANDLE(hk_micromap, micromap, link->micromap);
+      desc[g].micromap = hk_micromap_va(micromap);
+      desc[g].indices = link->indexBuffer.deviceAddress;
+      desc[g].stride = link->indexStride;
+      desc[g].index_type = link->indexType == VK_INDEX_TYPE_UINT16 ? LIBAGX_OMM_INDEX_U16
+                         : link->indexType == VK_INDEX_TYPE_UINT32 ? LIBAGX_OMM_INDEX_U32
+                                                                   : LIBAGX_OMM_INDEX_NONE;
+      desc[g].base_triangle = link->baseTriangle;
+      desc[g].flags = LIBAGX_OMM_GEOMETRY_LINKED;
+   }
+   const uint64_t descs = hk_pool_upload(cmd, desc,
+      MAX2(geometry_count, 1) * sizeof(*desc), 16);
+   free(desc);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return;
+   const uint64_t table_va = hk_as_native_va(dst) + table.offset;
+   libagx_omm_table_init(cmd, agx_1d(1), AGX_BARRIER_ALL, table_va, table_va,
+                         descs, geometry_count, table.primitives,
+                         state->indirect_addr,
+                         state->indirect_stride, hk_omm_directory_entry(id));
+   libagx_omm_table_resolve(cmd, agx_1d(MAX2(table.primitives, 1)), AGX_BARRIER_ALL,
+                            table_va, descs, table.primitives);
+   hk_omm_table_remember(dev, dst, &table);
+}
+
+static uint32_t
+hk_omm_tlas_stamp(struct hk_device *dev)
+{
+   return LIBAGX_OMM_TLAS_STAMP_BIT |
+          (p_atomic_inc_return(&dev->gen1_omm_tlas_stamp) & ~LIBAGX_OMM_TLAS_STAMP_BIT);
+}
+
+/* Mark whether a TLAS build or update has an instance that needs micromaps,
+ * so queries on TLASes without one keep hardware commits and skip lookups
+ * (LIBAGX_OMM_TLAS_STAMP_BIT). */
+static void
+hk_omm_tlas_scan(VkCommandBuffer commandBuffer,
+                 const struct vk_acceleration_structure_build_state *state,
+                 struct vk_acceleration_structure *dst)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const uint32_t id = hk_gen1_as_id(dev, dst);
+   if (!dev->gen1_omm_directory || !id ||
+       vk_get_as_geometry_type(state->build_info) != VK_GEOMETRY_TYPE_INSTANCES_KHR)
+      return;
+   /* A TLAS reusing a BLAS's id has no table. */
+   hk_omm_table_forget(dev, dst, NULL);
+   libagx_omm_tlas_scan(cmd, agx_1d(MAX2(state->leaf_node_count, 1)), AGX_BARRIER_ALL,
+                        hk_omm_directory_entry(id), hk_as_native_va(dst),
+                        AGX_GEN1_OMM_DIRECTORY_VA, 0, state->leaf_node_count,
+                        hk_omm_tlas_stamp(dev));
+}
+
+/* After a copy into dst: a TLAS (the kernel checks dst's metadata) gets its
+ * own stamp; a BLAS's entry is left to the OMM table logic. Every instance
+ * takes more than 128 bytes of an image. */
+static void
+hk_omm_tlas_scan_copy(struct hk_cmd_buffer *cmd, struct vk_acceleration_structure *dst,
+                      uint32_t id, uint64_t metadata)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!dev->gen1_omm_directory || !id || !metadata)
+      return;
+   libagx_omm_tlas_scan(cmd, agx_1d(MAX2(dst->size / 128, 1)), AGX_BARRIER_ALL,
+                        hk_omm_directory_entry(id), hk_as_native_va(dst),
+                        AGX_GEN1_OMM_DIRECTORY_VA, metadata, UINT32_MAX,
+                        hk_omm_tlas_stamp(dev));
+}
+
 static void
 hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
           struct vk_meta_device *meta,
@@ -1339,6 +1578,8 @@ hk_encode(VkCommandBuffer commandBuffer, struct vk_device *device,
          if (allow_update)
             hk_agx3_refit_save(commandBuffer, state);
          hk_vertex_table_build(commandBuffer, state, dst);
+         hk_omm_table_build(commandBuffer, state, dst);
+         hk_omm_tlas_scan(commandBuffer, state, dst);
       }
       return;
    }
@@ -1702,9 +1943,13 @@ hk_cmd_refit_agx3(VkCommandBuffer commandBuffer, struct vk_device *device,
    }
 
    for (uint32_t i = 0; i < build_count; ++i) {
-      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
-         hk_vertex_table_build(commandBuffer, &states[i],
-            vk_acceleration_structure_from_handle(states[i].build_info->dstAccelerationStructure));
+      if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+      struct vk_acceleration_structure *dst =
+         vk_acceleration_structure_from_handle(states[i].build_info->dstAccelerationStructure);
+      hk_vertex_table_build(commandBuffer, &states[i], dst);
+      hk_omm_table_build(commandBuffer, &states[i], dst);
+      hk_omm_tlas_scan(commandBuffer, &states[i], dst);
    }
    return VK_SUCCESS;
 }
@@ -1942,6 +2187,14 @@ hk_gen1_rq_finish(struct hk_device *dev)
          free(entry->data);
       _mesa_hash_table_destroy(dev->gen1_vertex_tables, NULL);
       dev->gen1_vertex_tables = NULL;
+   }
+   dev->gen1_omm_directory = NULL;
+   hk_gen1_sparse_finish(dev, &dev->gen1_omm_directory_pages);
+   if (dev->gen1_omm_tables) {
+      hash_table_foreach(dev->gen1_omm_tables, entry)
+         free(entry->data);
+      _mesa_hash_table_destroy(dev->gen1_omm_tables, NULL);
+      dev->gen1_omm_tables = NULL;
    }
    if (dev->host_as.pool) {
       dev->vk.dispatch_table.DestroyCommandPool(hk_device_to_handle(dev),
@@ -2386,6 +2639,25 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
          hk_gen1_sparse_finish(dev, &dev->gen1_vertex_directory_pages);
          dev->gen1_vertex_directory = NULL;
          dev->gen1_vertex_directory_va = NULL;
+      }
+      /* Only a device that enables opacity micromaps has an OMM directory;
+       * its shaders look micromaps up through it. */
+      if (dev->vk.enabled_features.micromapEXT) {
+         dev->gen1_omm_tables = _mesa_pointer_hash_table_create(NULL);
+         if (dev->gen1_omm_tables &&
+             hk_gen1_sparse_init(dev, &dev->gen1_omm_directory_pages,
+                                 LIBAGX_OMM_DIRECTORY_ENTRY_BYTES,
+                                 AGX_GEN1_OMM_DIRECTORY_VA, 0,
+                                 DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE,
+                                 "Gen1 OMM table directory") &&
+             hk_gen1_sparse_entry(dev, &dev->gen1_omm_directory_pages, 0)) {
+            dev->gen1_omm_directory = *util_dynarray_element(
+               &dev->gen1_omm_directory_pages.pages, struct agx_bo *, 0);
+         } else {
+            mesa_loge("Gen1 OMM table directory unavailable");
+            hk_gen1_rq_finish(dev);
+            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
       }
       if (dev->gen1_rq_live_as_table) {
          simple_mtx_init(&dev->gen1_as_chunk_cache_lock, mtx_plain);
@@ -2852,6 +3124,39 @@ hk_CmdCopyAccelerationStructureKHR(
       if (found && table.offset + table.bytes <= dst->size)
          hk_vertex_table_publish(commandBuffer, dev, dst, &table);
    }
+   /* A clone or compaction keeps the source's micromap linkage. The OMM table
+    * is not part of the copied image, so it is copied and published here: at
+    * the same offset for a clone, at the end of the destination for a
+    * compaction, whose compacted size includes the table
+    * (hk_omm_table_bytes()). */
+   if (dev->gen1_omm_directory && dst_id) {
+      struct hk_omm_table_layout table;
+      bool found = false;
+      simple_mtx_lock(&dev->gen1_as_lock);
+      struct hash_entry *entry = _mesa_hash_table_search(dev->gen1_omm_tables, src);
+      if (entry) {
+         table = *(struct hk_omm_table_layout *)entry->data;
+         found = true;
+      }
+      simple_mtx_unlock(&dev->gen1_as_lock);
+      const uint64_t src_offset = table.offset;
+      if (found && info->mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR)
+         table.offset = dst->size >= table.bytes + LIBAGX_GEN1_AS_EMPTY_BYTES
+            ? ROUND_DOWN_TO(dst->size - table.bytes, 16) : UINT64_MAX;
+      if (found && table.offset != UINT64_MAX &&
+          table.offset + table.bytes <= dst->size) {
+         libagx_omm_table_copy(cmd, agx_1d(DIV_ROUND_UP(table.bytes, 16)),
+                               AGX_BARRIER_ALL, hk_as_native_va(dst) + table.offset,
+                               hk_as_native_va(src) + src_offset, table.bytes,
+                               hk_omm_directory_entry(dst_id),
+                               hk_as_native_va(dst) + table.offset);
+         hk_omm_table_remember(dev, dst, &table);
+      } else if (hk_omm_table_forget(dev, dst, NULL)) {
+         libagx_omm_directory_write(cmd, agx_1d(1), AGX_BARRIER_ALL,
+                                    hk_omm_directory_entry(dst_id), 0, 0, 0);
+      }
+      hk_omm_tlas_scan_copy(cmd, dst, dst_id, dst_metadata);
+   }
 }
 
 static uint64_t
@@ -2977,6 +3282,12 @@ hk_CmdCopyMemoryToAccelerationStructureKHR(VkCommandBuffer commandBuffer,
    hk_gen1_as_rebase(cmd, hk_as_native_va(dst), false, dst->size,
                      hk_gen1_as_slot_bias(dev, dst), info->src.deviceAddress,
                      true, metadata);
+   /* Serialized structures carry no OMM table: a deserialized one has no
+    * micromap linkage until an update provides it. */
+   if (dev->gen1_omm_directory && id && hk_omm_table_forget(dev, dst, NULL))
+      libagx_omm_directory_write(cmd, agx_1d(1), AGX_BARRIER_ALL,
+                                 hk_omm_directory_entry(id), 0, 0, 0);
+   hk_omm_tlas_scan_copy(cmd, dst, id, metadata);
 }
 
 #define HK_HOST_AS_QUEUE_INDEX 0xffffu

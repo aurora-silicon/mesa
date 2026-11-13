@@ -23,6 +23,7 @@
 #include "hk_image.h"
 #include "hk_instance.h"
 #include "hk_m5_acceleration_structure.h"
+#include "asahi/libagx/micromap.h"
 #include "hk_memory_budget_core.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
@@ -528,6 +529,12 @@ hk_get_device_features(
       /* VK_EXT_ray_tracing_invocation_reorder */
       .rayTracingInvocationReorder =
          supported_extensions->EXT_ray_tracing_invocation_reorder,
+
+      /* VK_EXT_opacity_micromap. Host micromap commands and capture/replay
+       * are optional and not implemented. */
+      .micromapEXT = supported_extensions->EXT_opacity_micromap,
+      .micromapCaptureReplay = false,
+      .micromapHostCommands = false,
       .bufferDeviceAddressMultiDevice = false,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
@@ -1070,6 +1077,17 @@ hk_supported_shader_stages(const struct vk_features *features)
    return stages;
 }
 
+/* Highest advertised opacity micromap subdivision level. Traversal and builds
+ * handle LIBAGX_MICROMAP_MAX_LEVEL; 13 is the deepest level whose one ray per
+ * micro-triangle still fits a storage buffer (maxStorageBufferRange) and the
+ * memory of the smallest G17P machine. */
+static uint32_t
+hk_omm_max_level(void)
+{
+   return CLAMP(debug_get_num_option("ASAHI_OMM_MAX_LEVEL", 13), 0,
+                LIBAGX_MICROMAP_MAX_LEVEL);
+}
+
 static void
 hk_get_device_properties(const struct agx_device *dev,
                          const struct hk_instance *instance,
@@ -1222,6 +1240,11 @@ hk_get_device_properties(const struct agx_device *dev,
 
       .rayTracingInvocationReorderReorderingHint =
          VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_EXT,
+
+      /* VK_EXT_opacity_micromap: traversal and builds handle any level up to
+       * LIBAGX_MICROMAP_MAX_LEVEL. */
+      .maxOpacity2StateSubdivisionLevel = hk_omm_max_level(),
+      .maxOpacity4StateSubdivisionLevel = hk_omm_max_level(),
 
       .maxPerStageDescriptorSamplers = HK_MAX_DESCRIPTORS,
       .maxPerStageDescriptorUniformBuffers = HK_MAX_DESCRIPTORS,
@@ -2083,6 +2106,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.EXT_ray_tracing_invocation_reorder = true;
       supported_extensions.KHR_ray_tracing_maintenance1 = true;
       supported_extensions.KHR_ray_tracing_position_fetch = true;
+      /* Micromaps are looked up by the native query lowering. */
+      supported_extensions.EXT_opacity_micromap = supported_extensions.KHR_ray_query;
    }
 
    /* Explicit bring-up profile; query/pipeline features remain disabled until

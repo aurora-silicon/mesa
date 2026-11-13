@@ -22,6 +22,7 @@
 #include "hk_queue.h"
 #include "hk_shader.h"
 #include "hk_acceleration_structure.h"
+#include "hk_micromap.h"
 
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -58,7 +59,9 @@ hk_is_acceleration_structure_query(VkQueryType type)
    return type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ||
           type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ||
           type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ||
-          type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR;
+          type == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR ||
+          type == VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT ||
+          type == VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT;
 }
 
 static uint16_t *
@@ -84,6 +87,8 @@ hk_reports_per_query(struct hk_query_pool *pool)
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
+   case VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT:
+   case VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT:
       return 1;
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
       return util_bitcount(pool->vk.pipeline_statistics);
@@ -251,11 +256,48 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? 2 : 3);
+         const uint64_t omm_bytes =
+            queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR
+               ? hk_omm_table_bytes(dev, as) : 0;
+         if (omm_bytes)
+            libagx_omm_size_adjust(cmd, agx_1d(1), AGX_BARRIER_ALL,
+                                   hk_query_report_addr(dev, pool, firstQuery + i),
+                                   omm_bytes);
       } else {
          libagx_agx3_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
             ALIGN_POT(vk_acceleration_structure_get_va(as), UINT64_C(1024)),
             hk_query_report_addr(dev, pool, firstQuery + i), kind);
       }
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      hk_queue_write(cmd, hk_query_available_addr(pool, firstQuery + i), 1, false);
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdWriteMicromapsPropertiesEXT(VkCommandBuffer commandBuffer,
+                                  uint32_t micromapCount,
+                                  const VkMicromapEXT *pMicromaps,
+                                  VkQueryType queryType, VkQueryPool queryPool,
+                                  uint32_t firstQuery)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if ((queryType != VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT &&
+        queryType != VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT) ||
+       pool->vk.query_type != queryType || firstQuery > pool->vk.query_count ||
+       micromapCount > pool->vk.query_count - firstQuery) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!micromapCount || !hk_query_command_cs(cmd))
+      return;
+   for (uint32_t i = 0; i < micromapCount; ++i) {
+      VK_FROM_HANDLE(hk_micromap, micromap, pMicromaps[i]);
+      libagx_micromap_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
+         hk_micromap_va(micromap), hk_query_report_addr(dev, pool, firstQuery + i),
+         queryType == VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT);
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
       hk_queue_write(cmd, hk_query_available_addr(pool, firstQuery + i), 1, false);

@@ -12,10 +12,15 @@ struct agx_gen1_ray_query_layout {
    bool compute_kernel;
    bool position_fetch;
    bool diagnostic_features;
+   /* VK_EXT_opacity_micromap: triangle candidates look up their micromap
+    * state, and the hardware never commits a hit itself. */
+   bool opacity_micromap;
 };
 #define AGX_GEN1_VERTEX_DIRECTORY_VA UINT64_C(0x10040000000)
 #define AGX_GEN1_VERTEX_DIRECTORY_BYTES 0x8000u
 #define AGX_GEN1_VERTEX_TABLE_MAGIC 0x534f5056u
+/* One 16-byte entry per AS id: its OMM table address (libagx/micromap.h). */
+#define AGX_GEN1_OMM_DIRECTORY_VA UINT64_C(0x10044000000)
 nir_def *agx_nir_gen1_vertex_position_address(struct nir_builder *b, nir_def *instance,
                                               nir_def *geometry, nir_def *primitive);
 bool agx_nir_lower_gen1_ray_query(nir_shader *shader,
