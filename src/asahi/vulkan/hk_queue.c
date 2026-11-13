@@ -22,6 +22,7 @@
 #include "agx_vdm_hal200_bind_tail_core.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
+#include "hk_compute_kick.h"
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -134,7 +135,8 @@ asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
                       (dev->dev.params.features &
                        DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS)
                    ? DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS
-                   : 0),
+                   : 0) |
+               (cs->visible_completion ? DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION : 0),
       .cdm_ctrl_stream_base = cs->addr,
       .cdm_ctrl_stream_end = cs->addr + len,
 
@@ -1299,6 +1301,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
    memset(&queue->sync, 0, sizeof(queue->sync));
    queue->sync.exact_prior = old.exact_prior;
    queue->sync.serialize = old.serialize;
+   queue->sync.stage_overlap = old.stage_overlap;
    queue->sync.precise_tile_evictions = old.precise_tile_evictions;
    queue->sync.direct_single_footprints = old.direct_single_footprints;
 }
@@ -1639,7 +1642,8 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
     * A kernel advertising per-command waits needs no such execution edge.
     * A serialized queue without exact priors replaces every field below
     * (hk_drm_serialize_prefix), and keeps no ordinals, so it skips this. */
-   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior;
+   const bool resolve = !queue->sync.serialize || queue->sync.exact_prior ||
+                        queue->sync.stage_overlap;
    if (resolve && !hk_sync_resolve_submit(queue,
                           (struct hk_cmd_buffer *const *)submit->command_buffers,
                           submit->command_buffer_count, flush_sstt,
@@ -1883,6 +1887,20 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                  cs->sync.prior[HK_SYNC_VDM] != 0))
                cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
 
+            /* Serialized queue (G13/G14): the header keeps both engines'
+             * whole prefixes, but when the recorded dependencies show that
+             * the vertex half reads nothing an earlier render produced, the
+             * kernel may order only the fragment half after the render
+             * prefix. The fragment queue keeps pass order and each
+             * fragment half still waits for its own vertex half. */
+            if (queue->sync.stage_overlap &&
+                (cs->sync.ta_split
+                    ? cs->sync.barrier_ta[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                         cs->sync.prior_ta[HK_SYNC_VDM] == 0
+                    : cs->sync.barrier[HK_SYNC_VDM] == DRM_ASAHI_BARRIER_NONE &&
+                         cs->sync.prior[HK_SYNC_VDM] == 0))
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_FRAGMENT_BARRIERS;
+
             /* Likewise for compute: when the vertex half depends on less
              * compute work than the fragment half (image-only producers
              * ordered by image barriers, fragment-only destinations), the
@@ -2023,6 +2041,22 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    return result;
 }
 
+static bool
+hk_submit_has_compute(const struct vk_queue_submit *submit)
+{
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (cs->type == HK_CS_CDM)
+            return true;
+      }
+   }
+
+   return false;
+}
+
 static VkResult
 hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -2032,9 +2066,17 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
+   /* Look at the command buffers before they are submitted: once the work is
+    * with the kernel it can complete, and the application may then free or
+    * reset them while this callback is still running on a submit thread. */
+   const bool has_compute =
+      queue->kick.watched && hk_submit_has_compute(submit);
+
    VkResult result = queue_submit(dev, queue, submit);
    if (result != VK_SUCCESS)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
+   else if (has_compute)
+      hk_compute_kick_note(dev, queue);
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
@@ -2137,9 +2179,10 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    }
 }
 
-VkResult
-hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
-              uint32_t index_in_family)
+static VkResult
+hk_queue_create(struct hk_device *dev,
+                const VkDeviceQueueCreateInfo *pCreateInfo,
+                uint32_t index_in_family, bool kick, struct hk_queue **out)
 {
    struct hk_physical_device *pdev = hk_device_physical(dev);
    VkResult result;
@@ -2185,6 +2228,12 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       return result;
    }
 
+   /* The kicker owns a kick queue: keep it out of the walks of the
+    * application's queues (vkDeviceWaitIdle, lost-device quiescing, queue
+    * sharing). Only the kicker thread submits to it. */
+   if (kick)
+      list_delinit(&queue->vk.link);
+
    queue->vk.driver_submit = hk_queue_submit;
    queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
    queue->sync.direct_single_footprints = agx_is_m4_pro(&dev->dev);
@@ -2196,6 +2245,10 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
     * ordinals carry no information there. They only make the kernel resolve
     * a historical dependency per engine for every command, which costs
     * single-submission latency on G13 and G14. Keep upstream's payload. */
+   queue->sync.stage_overlap =
+      queue->sync.serialize &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+      debug_get_bool_option("HK_G13_STAGE_OVERLAP", true);
    queue->sync.exact_prior =
       !queue->sync.serialize &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
@@ -2231,7 +2284,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 
    if ((dev->dev.chip == AGX_CHIP_G17P ||
         agx_chip_g17_m5(dev->dev.chip)) &&
-       dev->vk.enabled_features.sparseBinding) {
+       dev->vk.enabled_features.sparseBinding && !kick) {
       queue->g17p_sstt_flush_bo =
          agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "SSTT flush stream");
       if (!queue->g17p_sstt_flush_bo) {
@@ -2250,14 +2303,16 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       }
    }
 
-   hk_queue_share(dev, queue);
+   /* A kick queue needs a kernel queue of its own. */
+   if (!kick)
+      hk_queue_share(dev, queue);
 
    /* Permission for an elevated class must be checked during device
     * creation, while the application can still fall back to MEDIUM. Delaying
     * it until submission would consume payloads or turn refusal into device
     * loss. Ordinary queues remain lazy to avoid reserving unused contexts.
     */
-   if (!vk_queue_is_emulated(&queue->vk) &&
+   if (!vk_queue_is_emulated(&queue->vk) && !kick &&
        drm_priority == DRM_ASAHI_PRIORITY_HIGH) {
       /* Without the render ray-query reservation; a render that needs it
        * replaces this kernel queue at submission. */
@@ -2269,7 +2324,43 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       }
    }
 
+   if (out)
+      *out = queue;
    return VK_SUCCESS;
+}
+
+VkResult
+hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
+              uint32_t index_in_family)
+{
+   return hk_queue_create(dev, pCreateInfo, index_in_family, false, NULL);
+}
+
+/* A queue of the given priority class that the application cannot get:
+ * its index is past any family's queue count, it is not in the device's
+ * queue list, and it shares no kernel queue with the application's queues.
+ * Its kernel queue is created at its first submission, like theirs. The
+ * caller finishes it with hk_queue_finish. */
+VkResult
+hk_queue_init_kick(struct hk_device *dev, enum drm_asahi_priority priority,
+                   struct hk_queue **out)
+{
+   const VkDeviceQueueGlobalPriorityCreateInfoKHR priority_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+      .globalPriority = priority == DRM_ASAHI_PRIORITY_LOW
+                           ? VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR
+                        : priority == DRM_ASAHI_PRIORITY_HIGH
+                           ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR
+                           : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+   };
+   const uint32_t index = UINT32_MAX - 1;
+   const VkDeviceQueueCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .pNext = &priority_info,
+      .queueFamilyIndex = 0,
+      .queueCount = index + 1,
+   };
+   return hk_queue_create(dev, &info, index, true, out);
 }
 
 void

@@ -121,6 +121,7 @@ struct hk_gen1_as_window {
    uint32_t live;
 };
 struct hk_frame_anatomy;
+struct hk_compute_kick;
 
 struct hk_device {
    struct vk_device vk;
@@ -144,6 +145,9 @@ struct hk_device {
    /* Opt-in frame anatomy profiler (hk_frame_anatomy.h); NULL unless the
     * HK_FRAME_ANATOMY environment variable is set. */
    struct hk_frame_anatomy *frame_anatomy;
+   /* Compute kick (hk_compute_kick.h); NULL unless G17C with
+    * hk_compute_kick_ms set. */
+   struct hk_compute_kick *compute_kick;
 
    struct hk_descriptor_table occlusion_queries;
    struct hk_sampler_heap samplers;
@@ -236,6 +240,15 @@ struct hk_device {
     * starts at one: zero is the value an unwritten shader binding table
     * record has, and no group may collide with it. */
    uint32_t rt_group_handle_alloc;
+
+   /* Own group handles of each RT pipeline library content key created on
+    * this device, so a library loaded from a pipeline cache takes the handles
+    * an identical library got here rather than ones from another device.
+    * Created on first use (hk_ray_tracing_pipeline.c). */
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *table;
+   } rt_library_handles;
 
    /* Device-lifetime templates for precompiled G17P meta compute programs.
     * The libagx programs and their executable BOs have the same lifetime. */

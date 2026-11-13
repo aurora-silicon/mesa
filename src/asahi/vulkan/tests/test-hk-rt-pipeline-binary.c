@@ -96,6 +96,8 @@ __wrap_ralloc_free(void *ptr)
    __real_ralloc_free(ptr);
 }
 
+static const struct vk_shader_ops fixture_shader_ops;
+
 VkResult __wrap_hk_compile_shader(
    struct hk_device *dev, struct vk_shader_compile_info *info,
    const struct vk_graphics_pipeline_state *state,
@@ -116,6 +118,7 @@ __wrap_hk_compile_shader(struct hk_device *dev,
       return backend_result;
    *out = calloc(1, sizeof(**out));
    CHECK(*out);
+   (*out)->vk.ops = &fixture_shader_ops;
    return VK_SUCCESS;
 }
 
@@ -533,6 +536,60 @@ main(void)
       }
    }
    CHECK(serialized == 6 && restored == 6);
+
+   /* The internal cache is the device's memory cache, weak as hk creates it:
+    * a pipeline built without a pipeline cache is available as a binary while
+    * it exists. */
+   dev.vk.mem_cache = vk_pipeline_cache_create(
+      &dev.vk,
+      &(struct vk_pipeline_cache_create_info){.force_enable = true,
+                                              .skip_disk_cache = true,
+                                              .weak_ref = true},
+      NULL);
+   CHECK(dev.vk.mem_cache);
+   pdev.vk.properties.pipelineBinaryInternalCache = true;
+   /* The last stage above (callable, one general group). */
+   for (unsigned library = 0; library < 2; ++library) {
+      VkRayTracingPipelineCreateInfoKHR ci = info(library ? LIB : 0);
+      VkPipelineCreateInfoKHR w = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_INFO_KHR, .pNext = &ci};
+      VkPipelineBinaryCreateInfoKHR from_cache = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR,
+         .pPipelineCreateInfo = &w};
+      VkPipelineBinaryHandlesInfoKHR out = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+      CHECK(hk_CreatePipelineBinariesKHR(device, &from_cache, &alloc, &out) ==
+            VK_PIPELINE_BINARY_MISSING_KHR);
+      VkPipeline pipeline;
+      CHECK(create(VK_NULL_HANDLE, &ci, &pipeline) == VK_SUCCESS);
+      CHECK(hk_CreatePipelineBinariesKHR(device, &from_cache, &alloc, &out) ==
+            VK_SUCCESS);
+      CHECK(out.pipelineBinaryCount == 1);
+      VkPipelineBinaryKHR binary = VK_NULL_HANDLE;
+      out.pPipelineBinaries = &binary;
+      CHECK(hk_CreatePipelineBinariesKHR(device, &from_cache, &alloc, &out) ==
+            VK_SUCCESS);
+      CHECK(binary);
+      destroy(pipeline);
+      /* The weak entry left with the last pipeline holding it. */
+      VkPipelineBinaryHandlesInfoKHR gone = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
+      CHECK(hk_CreatePipelineBinariesKHR(device, &from_cache, &alloc, &gone) ==
+            VK_PIPELINE_BINARY_MISSING_KHR);
+      VkPipelineBinaryInfoKHR use = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_INFO_KHR,
+         .binaryCount = 1,
+         .pPipelineBinaries = &binary};
+      ci.pNext = &use;
+      unsigned b = backends;
+      CHECK(create(VK_NULL_HANDLE, &ci, &pipeline) == VK_SUCCESS);
+      CHECK(backends == b);
+      destroy(pipeline);
+      vk_common_DestroyPipelineBinaryKHR(device, binary, &alloc);
+   }
+   vk_pipeline_cache_destroy(dev.vk.mem_cache, NULL);
+   dev.vk.mem_cache = NULL;
+   hk_rt_device_finish(&dev);
    CHECK(live_nir == 0 && layout->ref_cnt == 1);
    vk_common_DestroyShaderModule(device, module, NULL);
    vk_pipeline_layout_unref(&dev.vk, layout);

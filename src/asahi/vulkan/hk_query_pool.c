@@ -286,7 +286,13 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   if (agx_native_graphics(&dev->dev)) {
+   /* A deferred stream (hk_query_oq.c) is judged at the end of the command
+    * buffer, when it is no longer current: a post-graphics dispatch would
+    * open a new stream after every later command, a query copy or reset
+    * included. Write into the stream itself, as native AGX3 does. */
+   const bool pin = agx_native_graphics(&dev->dev) ||
+                    (cs != cmd->current_cs.post_gfx && cs != cmd->current_cs.cs);
+   if (pin) {
       /* End-of-stream writes belong to this exact post-graphics stream.
        * Pin it while the common native helper obtains its CDM stream; it
        * must not move availability ahead of the VDM producer. */
@@ -582,11 +588,11 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   /* Native AGX3 occlusion availability lives in 64-bit slots of a bound
-    * timestamp buffer (hk_cmd_end_query_stamped()), on chips whose kernel
-    * writes them at render retirement (hk_oq_render_stamps_supported()). */
-   const bool stamped = occlusion && agx_native_graphics(&dev->dev) &&
-                        hk_oq_render_stamps_supported(dev->dev.chip);
+   /* Occlusion availability lives in 64-bit slots of a bound timestamp
+    * buffer (hk_cmd_end_query_stamped()) on chips whose kernel writes them at
+    * render retirement (hk_oq_render_stamps_supported(): G17P and M5). */
+   const bool stamped =
+      occlusion && hk_oq_render_stamps_supported(dev->dev.chip);
    pool->avail_shift = stamped ? 1 : 0;
 
    /* We place the availability first and then data. Pipeline-statistics pools
@@ -1384,6 +1390,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
       .dst_stride = stride,
       .reports_per_query = hk_reports_per_query(pool),
       .flags = flags,
+      .availability_shift = pool->avail_shift,
    };
 
    libagx_copy_query_struct(cmd, agx_1d(queryCount), AGX_BARRIER_ALL, info);
