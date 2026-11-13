@@ -56,6 +56,12 @@ def declare_options():
           "many ms until it does, which lets other applications' compute "
           "work and rendering run meanwhile (0: off)",
           c_name="compute_kick_ms"),
+        drirc_gen.DrircInt("hk_compute_timeout_ms", 0, 0, 3600000,
+          "Watchdog allowance of each compute command on the device's "
+          "queues, in ms (0: the kernel's default). The kernel clamps the "
+          "request. It is an allowance, not a deadline: the kernel's "
+          "watchdog may let a command run longer before it fails it",
+          c_name="compute_timeout_ms"),
         B("hk_report_honeykrisp_driver_id", False,
           "Report VK_DRIVER_ID_MESA_HONEYKRISP instead of the Borealis ID, "
           "for translation layers that do not know the Borealis ID yet",

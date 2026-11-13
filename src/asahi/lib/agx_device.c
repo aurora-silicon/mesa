@@ -1736,17 +1736,24 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
       }
    }
 
+   const bool timeout = dev->compute_timeout_ms &&
+                        (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT);
    struct drm_asahi_queue_create queue_create = {
       .vm_id = dev->vm_id,
       .priority = priority,
       .usc_exec_base = dev->shader_base,
       .render_scs_layout = {layouts[0], layouts[1]},
+      .compute_timeout_ms = timeout ? dev->compute_timeout_ms : 0,
    };
 
+   /* Older kernels take the struct only up to the fields they know. */
    unsigned request = DRM_IOCTL_ASAHI_QUEUE_CREATE;
-   if (!layouts[0] && !layouts[1])
-      request = _IOC(_IOC_DIR(request), _IOC_TYPE(request), _IOC_NR(request),
-                     offsetof(struct drm_asahi_queue_create, render_scs_layout));
+   unsigned size = sizeof(queue_create);
+   if (!timeout)
+      size = offsetof(struct drm_asahi_queue_create, compute_timeout_ms);
+   if (!timeout && !layouts[0] && !layouts[1])
+      size = offsetof(struct drm_asahi_queue_create, render_scs_layout);
+   request = _IOC(_IOC_DIR(request), _IOC_TYPE(request), _IOC_NR(request), size);
    int ret = dev->ops.simple_ioctl(dev, request, &queue_create);
    if (ret) {
       int saved_errno = errno;
