@@ -393,9 +393,9 @@ enum hk_perftest {
  * command buffers. A barrier recorded with no open compute stream holding
  * work records no flush. This includes the first barrier of a command
  * buffer and barriers after the stream was closed, for example by a
- * timestamp or query copy. Earlier writes read through another address
- * after such a barrier have no memory-scope flush between them. Whether
- * the hardware returns stale data in that case has not been tested. When
+ * timestamp or query copy. While memory may be read through a second
+ * address, the compute and transfer writes before it were flushed with
+ * memory scope at the end of their stream (hk_cdm_end_stream_flush()). When
  * the open stream holds work unrelated to the source, the flush goes at its
  * end, but a graphics destination is still ordered only after the source's
  * stream, so it can start before the flush. Not covered: a

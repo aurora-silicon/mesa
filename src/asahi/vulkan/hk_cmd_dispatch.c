@@ -681,6 +681,28 @@ hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs, bool memory)
 }
 
 void
+hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   /* A dependency recorded while no compute stream holding work is open
+    * records no flush: the first barrier of a command buffer, or one after a
+    * timestamp closed the stream. The writes of this stream may then be read
+    * through another address of the same memory by the next stream, in this
+    * command buffer or in a later one of the same submission. While memory
+    * may be mapped at a second address, end the stream with memory scope;
+    * M5's strong flushes always have it. Usually this only strengthens the
+    * last launch's ordering record in place. */
+   const bool memory = hk_cdm_alias_scope(dev) || agx_chip_g17_m5(dev->dev.chip);
+   if (!memory || cs->stats.cmds == 0 ||
+       !hk_cdm_visibility_flush_needed(dev, cs, true))
+      return;
+
+   hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+   hk_cdm_visibility_flush(dev, cs, true);
+}
+
+void
 hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                             struct agx_cdm_launch_word_0_packed launch,
                             uint32_t usc, struct agx_grid grid,
