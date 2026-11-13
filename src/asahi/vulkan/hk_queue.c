@@ -1332,6 +1332,9 @@ hk_queue_restart_sync(struct hk_queue *queue)
    queue->sync.stage_overlap = old.stage_overlap;
    queue->sync.precise_tile_evictions = old.precise_tile_evictions;
    queue->sync.direct_single_footprints = old.direct_single_footprints;
+   /* The submission that starts it waits for all sibling work too. */
+   memset(queue->sib.submitted[0], 0, sizeof(queue->sib.submitted[0]));
+   queue->sib.used = false;
 }
 
 /* Kernel queues come from a machine-wide pool shared by every client, so
@@ -1441,6 +1444,62 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    return vk_common_QueueBindSparse(_queue, bindInfoCount, pBindInfo, fence);
 }
 
+/* A submission a sibling kernel queue may run (hk_queue::sib): it depends on
+ * no earlier submission (every stream's prior is zero or names a command of
+ * this submission, see resolve_one) and holds only plain compute streams,
+ * without query access, timestamps, scratch or ray queries. Anything that
+ * needs the primary kernel queue's own state stays there. */
+static bool
+hk_sibling_eligible(struct hk_device *dev, const struct vk_queue_submit *submit,
+                    const uint64_t base[HK_SYNC_NUM_SQ], unsigned command_count,
+                    bool kernel_cumulative)
+{
+   if (submit->buffer_bind_count || submit->image_bind_count ||
+       submit->image_opaque_bind_count ||
+       command_count > max_commands_per_submit(dev) ||
+       (submit->signal_count && !kernel_cumulative) ||
+       (dev->dev.debug & (AGX_DBG_SYNC | AGX_DBG_TRACE)))
+      return false;
+
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (cs->type != HK_CS_CDM || cs->query_access ||
+             cs->timestamp.start.handle || cs->timestamp.end.handle ||
+             cs->scratch.cs.main || cs->scratch.cs.preamble ||
+             cs->gen1_native_rq)
+            return false;
+
+         /* A zero barrier names every command of earlier ioctls. */
+         for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+            if ((cs->sync.prior[sq] && cs->sync.prior[sq] <= base[sq]) ||
+                cs->sync.barrier[sq] == 0)
+               return false;
+         }
+      }
+   }
+
+   return true;
+}
+
+/* A stream's prior in the ordinals of the kernel queue it is sent to: a
+ * command of this submission keeps its offset from the submission's first
+ * ordinal; an earlier submission's command becomes every earlier command of
+ * that kernel queue, and the submission also waits for the siblings' work
+ * (*earlier). */
+static inline uint64_t
+hk_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base, bool *earlier)
+{
+   if (prior == 0)
+      return 0;
+   if (prior > base)
+      return kq_base + (prior - base);
+   *earlier = true;
+   return kq_base;
+}
+
 static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit)
@@ -1531,7 +1590,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    queue->drm.timeline_value += point_count;
    unsigned wait_count = 0;
    struct drm_asahi_sync *syncs =
-      alloca((submit->wait_count + kernel_signal_count + 2) *
+      alloca((submit->wait_count + kernel_signal_count + 3) *
              sizeof(struct drm_asahi_sync));
 
    if (replaced) {
@@ -1704,6 +1763,37 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
    }
 
+   /* Sibling kernel queues (hk_queue::sib): an eligible submission takes the
+    * next kernel queue in turn. Once a sibling has run work, the primary's
+    * ordinals differ from sync.submitted: priors are then rewritten for the
+    * kernel queue they go to (hk_sibling_prior), and a submission that
+    * depends on an earlier one also waits for the latest sibling point. */
+   unsigned sib_target = 0;
+   const bool sib_remap = queue->sib.count > 1 && queue->sib.used;
+   bool sib_earlier = false;
+   if (queue->sib.count > 1 && !replaced && !flush_sstt && !unlikely(anatomy) &&
+       hk_sibling_eligible(dev, submit, prior_base, command_count,
+                           kernel_cumulative)) {
+      sib_target = queue->sib.next;
+      queue->sib.next = (queue->sib.next + 1) % queue->sib.count;
+      if (sib_target && queue->sib.id[sib_target] == UINT32_MAX) {
+         queue->sib.id[sib_target] = agx_create_command_queue(
+            &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1));
+         if (queue->sib.id[sib_target] == UINT32_MAX) {
+            /* Out of kernel queues: keep the ones already created. */
+            queue->sib.count = sib_target;
+            queue->sib.next = 0;
+            sib_target = 0;
+         }
+      }
+   }
+   const bool sib_rewrite = sib_remap || sib_target != 0;
+   uint64_t kq_base[HK_SYNC_NUM_SQ] = {prior_base[0], prior_base[1]};
+   if (sib_rewrite) {
+      kq_base[HK_SYNC_VDM] = queue->sib.submitted[sib_target][HK_SYNC_VDM];
+      kq_base[HK_SYNC_CDM] = queue->sib.submitted[sib_target][HK_SYNC_CDM];
+   }
+
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
@@ -1726,6 +1816,15 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          uint64_t command_prior[HK_SYNC_NUM_SQ] = {
             cs->sync.prior[HK_SYNC_VDM], cs->sync.prior[HK_SYNC_CDM],
          };
+         if (sib_rewrite) {
+            for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+               command_prior[sq] = hk_sibling_prior(
+                  command_prior[sq], prior_base[sq], kq_base[sq], &sib_earlier);
+               /* A zero barrier names this kernel queue's earlier ioctls. */
+               if (cs->sync.barrier[sq] == 0)
+                  sib_earlier = true;
+            }
+         }
          /* The same recording can occur twice in a merged submit (for
           * example synchronization2.basic.event.none_set_reset). Assign
           * classic prefixes here, per emitted occurrence. Storing them in
@@ -2044,9 +2143,23 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       agxdecode_next_frame();
    }
 
+   /* Work that depends on an earlier submission also waits for the
+    * siblings' (only a primary submission can). A replaced kernel queue's
+    * first submission already waits for every earlier point. */
+   if (sib_remap && sib_earlier && !replaced) {
+      assert(sib_target == 0);
+      memmove(&syncs[wait_count + 1], &syncs[wait_count],
+              (kernel_signal_count + 1) * sizeof(*syncs));
+      syncs[wait_count++] = (struct drm_asahi_sync){
+         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+         .handle = queue->drm.syncobj,
+         .timeline_value = queue->sib.last_point,
+      };
+   }
+
    struct drm_asahi_submit submit_ioctl = {
       .flags = 0,
-      .queue_id = queue->drm.id,
+      .queue_id = sib_target ? queue->sib.id[sib_target] : queue->drm.id,
       .in_sync_count = wait_count,
       .out_sync_count = kernel_signal_count + 1,
       .cmdbuf_size = payload.size,
@@ -2077,11 +2190,19 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          queue_submit_single(dev, &submit_ioctl, queue->drm.virt_ring_idx, pending);
    } else {
       result = queue_submit_looped(dev, queue, &submit_ioctl, command_count,
-                                   queue->drm.virt_ring_idx, prior_base,
+                                   queue->drm.virt_ring_idx, kq_base,
                                    chunk_timelines, first_chunk_point, anatomy,
                                    pending);
    }
    hk_cmd_pending_end(dev, pending, queue, result);
+   if (queue->sib.count > 1 && result == VK_SUCCESS) {
+      queue->sib.submitted[sib_target][HK_SYNC_VDM] += nr_vdm;
+      queue->sib.submitted[sib_target][HK_SYNC_CDM] += nr_cdm;
+      if (sib_target) {
+         queue->sib.used = true;
+         queue->sib.last_point = queue->drm.timeline_value;
+      }
+   }
    if (cumulative_signals && !kernel_cumulative) {
       /* The kernel can publish an error fence even when submission fails.
        * Forward it when present, without waiting for a missing queue point
@@ -2315,6 +2436,17 @@ hk_queue_create(struct hk_device *dev,
 
    queue->drm.id = UINT32_MAX;
    queue->drm.retired_id = UINT32_MAX;
+   for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
+      queue->sib.id[i] = UINT32_MAX;
+   queue->sib.count = 1;
+   if (dev->dev.chip == AGX_CHIP_G17P && !dev->dev.is_virtio &&
+       queue->sync.exact_prior &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
+       (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
+      queue->sib.count = CLAMP(
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 1), 1,
+         HK_QUEUE_SIBLINGS_MAX);
+   }
    queue->drm.render_rq = false;
    queue->drm.virt_ring_idx = drm_priority + 1;
 
@@ -2434,6 +2566,10 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
    if (queue->drm.retired_id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
+   for (unsigned i = 1; i < HK_QUEUE_SIBLINGS_MAX; ++i) {
+      if (queue->sib.id[i] != UINT32_MAX)
+         agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);
+   }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
    vk_free(&dev->vk.alloc, queue);
 }
