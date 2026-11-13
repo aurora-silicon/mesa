@@ -6394,7 +6394,7 @@ hk_tes_direct_query_threads(struct hk_cmd_buffer *cmd, struct agx_draw draw)
 static __attribute__((hot)) struct agx_draw
 hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                struct agx_draw draw, uint64_t c_prims, uint64_t c_inv,
-               uint64_t prims_generated)
+               uint64_t prims_generated, bool batch)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -6456,7 +6456,10 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
+   if (batch) {
+      hk_launch_tess_batched(cmd, vs, tcs, grid_vs, grid_tcs, grid_tess, info,
+                             state);
+   } else if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       hk_dispatch_with_local_size(cmd, cs, vs, grid_vs,
                                   agx_workgroup(64, 1, 1));
       hk_dispatch_with_local_size(
@@ -6478,14 +6481,16 @@ hk_launch_tess(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    /* First generate counts, then prefix sum them, and then tessellate. */
-   libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX,
-                     info.mode, POLY_TESS_MODE_COUNT, state);
-   libagx_prefix_sum_tess(cmd, agx_1d(1024),
-                          AGX_BARRIER_ALL | AGX_PREGFX, state, c_prims,
-                          c_inv, prims_generated,
-                          c_prims || c_inv || prims_generated);
-   libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX,
-                     info.mode, POLY_TESS_MODE_WITH_COUNTS, state);
+   if (!batch) {
+      libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX,
+                        info.mode, POLY_TESS_MODE_COUNT, state);
+      libagx_prefix_sum_tess(cmd, agx_1d(1024),
+                             AGX_BARRIER_ALL | AGX_PREGFX, state, c_prims,
+                             c_inv, prims_generated,
+                             c_prims || c_inv || prims_generated);
+      libagx_tessellate(cmd, grid_tess, AGX_BARRIER_ALL | AGX_PREGFX,
+                        info.mode, POLY_TESS_MODE_WITH_COUNTS, state);
+   }
 
    return agx_draw_indexed_indirect(gfx->tess.out_draws, dev->heap->va->addr,
                                     dev->heap->size, AGX_INDEX_SIZE_U32, false);
@@ -12845,9 +12850,22 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       cs->stats.calls++;
       hk_upload_stat(cmd, draws, 1);
 
+      /* Without geometry or tessellation the primitives generated are the
+       * assembled primitives, counted like the clipper statistic; the
+       * tessellator and the geometry pipeline count their own outputs. */
+      const uint64_t prims_generated = hk_prims_generated_addr(cmd, 0);
+      const bool tess_batch =
+         tess && hk_tess_batchable(
+                    dev->dev.chip, draw, geom,
+                    cmd->state.gfx.descriptors.root.draw.pipeline_stats_flags ||
+                       prims_generated);
+
       if (geom || tess) {
+         /* A batched draw's stages join the pending ones (hk_launch_tess()). */
+         cmd->tess_batch.recording = tess_batch;
          ccs =
             hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+         cmd->tess_batch.recording = false;
          if (!ccs)
             return;
       }
@@ -12857,10 +12875,6 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
                       stat_c_prims, stat_c_inv);
       }
 
-      /* Without geometry or tessellation the primitives generated are the
-       * assembled primitives, counted like the clipper statistic; the
-       * tessellator and the geometry pipeline count their own outputs. */
-      const uint64_t prims_generated = hk_prims_generated_addr(cmd, 0);
       if (prims_generated && !geom && !tess) {
          hk_ia_update(cmd, draw, AGX_SCRATCH_PAGE_ADDRESS,
                       AGX_SCRATCH_PAGE_ADDRESS, AGX_SCRATCH_PAGE_ADDRESS,
@@ -12872,7 +12886,7 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
             hk_tes_direct_query_threads(cmd, draw);
          draw = hk_launch_tess(cmd, ccs, draw, geom ? 0 : stat_c_prims,
                                geom ? 0 : stat_c_inv,
-                               geom ? 0 : prims_generated);
+                               geom ? 0 : prims_generated, tess_batch);
       }
 
       if (geom)
