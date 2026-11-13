@@ -48,6 +48,7 @@
 #include "hk_g17p_draw_state_upload.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_zls_stride.h"
+#include "hk_g17p_restart_state.h"
 #include "hk_physical_device.h"
 #include "hk_private.h"
 #include "asahi/lib/agx_m5_va.h"
@@ -12394,6 +12395,8 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
                                     (uint8_t *)cs->end - out, &emitted))
          goto refused;
       cs->current = out + emitted;
+      /* An indexed indirect packet carries its own restart State Update. */
+      cs->restart_index_set = false;
       return true;
    }
 
@@ -12402,16 +12405,21 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
 
    uint32_t w[10];
    unsigned n = 0;
+   bool restart_record = false;
+   uint32_t restart_index = 0;
    if (tail_emitted)
       w[n++] = draw_state_offset;
 
    if (draw.indexed) {
-      /* Native direct indexed draws: a restart State Update precedes every
-       * indexed draw (restart disabled or not), the index buffer is relocated
-       * to the first index, and its remaining length is rounded up to dwords
+      /* Native direct indexed draws: Metal puts a restart State Update
+       * before every indexed draw (restart disabled or not). G17P, where this
+       * was tested (T6040), only emits it when the stream's restart index
+       * changes or after a bind tail (hk_g17p_restart_state_needed()); other
+       * native chips keep it on every draw. The index buffer is relocated to
+       * the first index, and its remaining length is rounded up to dwords
        * minus one. The whole requested span must lie inside the bound range,
-       * except the one-dword zero page that stands in for a null index buffer.
-       */
+       * except the one-dword zero page that stands in for a null index
+       * buffer. */
       const unsigned index_size_B = agx_index_size_to_B(draw.index_size);
       const uint64_t range_B = draw.index_buffer_range_B;
       const uint64_t offset_B = (uint64_t)draw.start * index_size_B;
@@ -12428,8 +12436,15 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
          goto refused;
 
       const uint64_t ib = draw.index_buffer + offset_B;
-      w[n++] = UINT32_C(0x40000001);
-      w[n++] = hk_draw_restart_index(cmd, draw);
+      restart_index = hk_draw_restart_index(cmd, draw);
+      restart_record =
+         dev->dev.chip != AGX_CHIP_G17P ||
+         hk_g17p_restart_state_needed(tail_emitted, cs->restart_index_set,
+                                      cs->restart_index, restart_index);
+      if (restart_record) {
+         w[n++] = UINT32_C(0x40000001);
+         w[n++] = restart_index;
+      }
       w[n++] = UINT32_C(0x61f00000) | (uint32_t)((ib >> 32) & 0xff) |
                ((uint32_t)topology << 8) |
                ((uint32_t)draw.index_size << 17) |
@@ -12456,6 +12471,10 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
 
    memcpy(out, w, n * 4);
    cs->current = out + n * 4;
+   if (restart_record) {
+      cs->restart_index = restart_index;
+      cs->restart_index_set = true;
+   }
    return true;
 
 refused:
@@ -13032,6 +13051,9 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
          hk_emit_robust_index(cmd, cs, draw, topology,
                               g17p_native_bind_tail_emitted, batch);
+         /* Its GPU-written indexed indirect packets set the restart index. */
+         if (agx_native_graphics(&dev->dev))
+            cs->restart_index_set = false;
       } else {
          if (agx_native_graphics(&dev->dev)) {
             if (!hk_g17p_emit_draw(cmd, cs, out, draw, topology,
