@@ -634,6 +634,38 @@ vtn_handle_deriv(struct vtn_builder *b, SpvOp opcode, nir_def *src)
    }
 }
 
+/* Converts 32-bit floats to bfloat16 for a conversion decorated with
+ * FPRoundingMode. The rounding of nir_f2bf is up to the backend, so this is
+ * built from integer operations, which every backend and constant folding
+ * evaluate alike, with the results of _mesa_float_to_bfloat16_bits_rte and
+ * _mesa_float_to_bfloat16_bits_rtz. A NaN keeps its sign and top payload bits
+ * and is made quiet, so that neither rounding nor truncation turns it into an
+ * infinity.
+ */
+static nir_def *
+vtn_f2bf_rounded(struct vtn_builder *b, nir_def *src, nir_rounding_mode mode)
+{
+   nir_builder *nb = &b->nb;
+   nir_def *bits = src;
+
+   switch (mode) {
+   case nir_rounding_mode_rtne:
+      /* Adding 0x7fff plus the lowest kept bit rounds ties to even. */
+      bits = nir_iadd(nb, nir_iadd_imm(nb, src, 0x7fff),
+                      nir_iand_imm(nb, nir_ushr_imm(nb, src, 16), 1));
+      break;
+   case nir_rounding_mode_rtz:
+      break;
+   default:
+      vtn_fail("Unsupported rounding mode for a bfloat16 conversion");
+   }
+
+   nir_def *is_nan = nir_ugt_imm(nb, nir_iand_imm(nb, src, 0x7fffffff),
+                                 0x7f800000);
+   nir_def *nan = nir_ior_imm(nb, nir_unpack_32_2x16_split_y(nb, src), 0x40);
+   return nir_bcsel(nb, is_nan, nan, nir_unpack_32_2x16_split_y(nb, bits));
+}
+
 static nir_def *
 vtn_handle_convert(struct vtn_builder *b, SpvOp opcode,
                    struct vtn_value *dest_val,
@@ -665,6 +697,17 @@ vtn_handle_convert(struct vtn_builder *b, SpvOp opcode,
       else
          src_as_float = vtn_handle_convert(b, opcode, dest_val, glsl_float_type(),
                                            glsl_src_type, src);
+
+      /* FPRoundingMode applies to the binary32 to bfloat16 step. */
+      if (glsl_type_is_float(glsl_src_type)) {
+         struct conversion_opts opts = {
+            .rounding_mode = nir_rounding_mode_undef,
+         };
+         vtn_foreach_decoration(b, dest_val, handle_conversion_opts, &opts);
+         if (opts.rounding_mode != nir_rounding_mode_undef)
+            return vtn_f2bf_rounded(b, src_as_float, opts.rounding_mode);
+      }
+
       return nir_f2bf(&b->nb, src_as_float);
    } else if (glsl_type_is_e4m3fn(glsl_src_type)) {
       nir_def *src_as_float = nir_e4m3fn2f(&b->nb, src);
