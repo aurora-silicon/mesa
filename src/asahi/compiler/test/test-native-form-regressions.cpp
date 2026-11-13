@@ -6295,3 +6295,100 @@ TEST(NativeForms, G17PMeshPayloadReadIsUndefined)
    nir_validate_shader(b.shader, "gen1 mesh payload read");
    ralloc_free(b.shader);
 }
+
+/*
+ * The 8x8 cooperative-matrix multiply-add exists on the AGX3B ISA (G15/G16 and
+ * G17P) as well as on M5's AGX3C. These four f32matmad8x8 witnesses are real
+ * Apple G16G captures carried verbatim in the AGX3B half of the compose corpus
+ * (agx3_compose_corpus_vectors.c entries by74/by95/by96/by98), spanning the
+ * c-is-zero and c-present forms with both the destination cache hint and the
+ * operand discard hints. agx3_matrix_encode_mma8() must reproduce each one
+ * byte-for-byte when asked for the AGX3B encoding.
+ */
+TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
+{
+   const struct {
+      const char *tag;
+      struct agx3_matrix_mma8_desc desc;
+      std::vector<uint8_t> bytes; /* real Apple G16G capture */
+   } cases[] = {
+      {"by74 c_zero dest4",
+       {.dest = 4, .a = 4, .b = 8, .c_zero = true,
+        .discard = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 86, 2, 0, 4, 8, 0, 212, 65, 36, 0}},
+      {"by95 c_zero dest12 cache",
+       {.dest = 12, .a = 4, .b = 8, .c_zero = true, .dest_cache = true,
+        .cache = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 86, 6, 1, 132, 9, 0, 84, 64, 36, 0}},
+      {"by96 c_present dest12 cache+discardC",
+       {.dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+        .cache = {true, true, false}, .discard = {false, false, true},
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 84, 6, 1, 132, 9, 9, 84, 66, 36, 1}},
+      {"by98 c_present dest4 discardAll",
+       {.dest = 4, .a = 4, .b = 8, .c = 12, .discard = {true, true, true},
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 84, 2, 0, 4, 8, 9, 212, 67, 36, 1}},
+   };
+   for (const auto &c : cases) {
+      uint8_t out[14], length = 0;
+      ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &c.desc, out,
+                                          &length)) << c.tag;
+      EXPECT_EQ(length, c.bytes.size()) << c.tag;
+      EXPECT_EQ(std::vector<uint8_t>(out, out + length), c.bytes) << c.tag;
+   }
+}
+
+/*
+ * Adding the AGX3B path must not perturb the M5 (AGX3C) encoding. The AGX3C
+ * form is 14 bytes (its two extra selector fields f67/f68 and the wider
+ * scoreboard-wait range are absent on the 12-byte AGX3B form), and its output
+ * for the same descriptors is exactly what the hardware-qualified M5 encoder
+ * emitted before this change. The two encodings therefore never collide.
+ */
+TEST(NativeForms, Agx3cMatmad8x8IsUnchangedByAgx3b)
+{
+   const struct agx3_matrix_mma8_desc c_present = {
+      .dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+      .cache = {true, true, false}, .discard = {false, false, true},
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   const struct agx3_matrix_mma8_desc c_zero = {
+      .dest = 4, .a = 4, .b = 8, .c_zero = true,
+      .discard = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   const std::vector<uint8_t> gold_present =
+      {0x27, 0x80, 0x05, 0x9a, 0x28, 0x20, 0xaf, 0x1a,
+       0x10, 0x08, 0x10, 0x00, 0x90, 0x18};
+   const std::vector<uint8_t> gold_zero =
+      {0x27, 0x00, 0x05, 0x9a, 0x20, 0x20, 0xaf, 0x0a,
+       0x30, 0x06, 0x40, 0x00, 0x10, 0x01};
+   uint8_t out[14], length = 0;
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &c_present, out,
+                                       &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), gold_present);
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &c_zero, out,
+                                       &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), gold_zero);
+}
+
+/*
+ * The AGX3B form only witnesses scoreboard-wait bits 0..4 (fields 69..73);
+ * bits 5..7 map to fields with no Apple witness, so the encoder refuses a wait
+ * mask that sets them rather than emitting an unverified encoding. A wait
+ * within range still encodes.
+ */
+TEST(NativeForms, Agx3bMatmad8x8RefusesUnwitnessedWait)
+{
+   struct agx3_matrix_mma8_desc desc = {
+      .dest = 4, .a = 4, .b = 8, .c = 12, .discard = {true, true, true},
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   uint8_t out[14], length = 0;
+   desc.wait_mask = 0x1f;
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
+                                       &length));
+   desc.wait_mask = 0x20;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
+                                        &length));
+}

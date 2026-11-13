@@ -2067,13 +2067,25 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        * not ray tracing pipelines are exposed. */
       supported_extensions.KHR_pipeline_library |= native_rt;
    }
-   supported_extensions.KHR_cooperative_matrix =
-      agx_chip_g17_m5(pdev->dev.chip) &&
+   /* The 8x8 f16/f32 matmad underlying a subgroup-scope cooperative matrix
+    * exists on the AGX3B ISA (G15/G16/G17P) just as it does on the M5 AGX3C
+    * encoding; only the M5-exclusive 16x16 GEMM needs the kernel
+    * DRM_ASAHI_FEATURE_COMPUTE_MATRIX, and the 8x8 matmad dispatch never sets
+    * uses_matrix16, so AGX3B coopmat is purely a userspace capability. Kept
+    * default-off until dEQP-VK.compute.*cooperative_matrix* is proven on real
+    * G16S/G17P silicon; M5 behaviour is unchanged. */
+   const bool m5_cmat = agx_chip_g17_m5(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_COOPERATIVE_MATRIX", true);
+   const bool agx3b_cmat =
+      agx_chip_isa_encoding(pdev->dev.chip) == AGX_ISA_ENCODING_AGX3B &&
+      debug_get_bool_option("ASAHI_AGX3B_COOPERATIVE_MATRIX", false);
+   supported_extensions.KHR_cooperative_matrix = m5_cmat || agx3b_cmat;
 
+   /* bf16 inputs ride the same 8x8 form, but no AGX3B bf16 matmad has been
+    * witnessed from Apple yet, so KHR_shader_bfloat16 stays M5-only until a
+    * fixture (and bf16 CTS) proves it on AGX3B. */
    supported_extensions.KHR_shader_bfloat16 =
-      supported_extensions.KHR_cooperative_matrix &&
-      debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
+      m5_cmat && debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
 
    /* Hardware-qualified on M5 only. */
    supported_extensions.EXT_primitives_generated_query =
@@ -2510,7 +2522,12 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
             .scope = VK_SCOPE_SUBGROUP_KHR,
          };
       }
-      unsigned max_size = (pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) ? 16 : 8;
+      /* The 16x16 GEMM form that the kernel COMPUTE_MATRIX feature unlocks is
+       * AGX3C (M5) only; AGX3B offers just the 8x8 matmad, so cap it at 8 even
+       * if a kernel were to report the feature there. */
+      unsigned max_size =
+         ((pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) &&
+          agx_chip_isa_encoding(pdev->dev.chip) == AGX_ISA_ENCODING_AGX3C) ? 16 : 8;
       for (unsigned size = max_size; size >= 8; size /= 2) {
          const VkComponentTypeKHR types[] = {VK_COMPONENT_TYPE_FLOAT16_KHR,
             VK_COMPONENT_TYPE_BFLOAT16_KHR};

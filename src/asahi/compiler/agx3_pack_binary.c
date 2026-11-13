@@ -13881,7 +13881,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          if (I->op == AGX_OPCODE_MATMAD8_AGX3) {
             if ((I->matrix_type & 15) != ((I->matrix_type >> 4) & 15))
                AGX3_REFUSE(I);
-            if (enc != AGX_ISA_ENCODING_AGX3C || ctx->is_preamble ||
+            /* 8x8 matmad is available on AGX3B (G15/G16/G17P) as well as M5
+             * (AGX3C); the encoder packs the right form for each. The 16x16
+             * GEMM above stays AGX3C only. */
+            if ((enc != AGX_ISA_ENCODING_AGX3C &&
+                 enc != AGX_ISA_ENCODING_AGX3B) || ctx->is_preamble ||
                 ctx->stage != MESA_SHADER_COMPUTE || I->nr_dests != 1 ||
                 I->nr_srcs != 3 || I->saturate || wait > 0xff ||
                 !agx3_src_is_register(I->dest[0]) || I->dest[0].memory ||

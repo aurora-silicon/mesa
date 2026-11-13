@@ -3197,8 +3197,14 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type2(instr) == nir_type_float32
          ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
       type |= type_b << 4;
-      assert(b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-             stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble);
+      /* The 16x16 GEMM form is M5 (AGX3C) only; the 8x8 matmad also exists on
+       * the AGX3B encoding (G15/G16/G17P), so the 2-component path is allowed
+       * there too. */
+      const enum agx_isa_encoding mm_enc = b->shader->key->dev.encoding;
+      assert(stage == MESA_SHADER_COMPUTE && !b->shader->is_preamble &&
+             (mm_enc == AGX_ISA_ENCODING_AGX3C ||
+              (mm_enc == AGX_ISA_ENCODING_AGX3B &&
+               instr->def.num_components == 2)));
       if (instr->def.num_components == 8) {
          agx_matmad16_agx3_to(b, dst, agx_src_index(&instr->src[0]),
                             agx_src_index(&instr->src[1]),
