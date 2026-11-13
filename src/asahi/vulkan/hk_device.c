@@ -16,6 +16,7 @@
 #include "agx_scratch.h"
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
+#include "hk_compute_kick.h"
 #include "hk_descriptor_table.h"
 #include "hk_entrypoints.h"
 #include "hk_instance.h"
@@ -1099,6 +1100,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    /* Opt-in profiler; never fails device creation. */
    hk_frame_anatomy_init(dev);
+   hk_compute_kick_init(dev, instance->drirc.misc.compute_kick_ms);
 
    if (init_diag)
       hk_device_init_diag(pdev, dev, "success", VK_SUCCESS, 0);
@@ -1167,6 +1169,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
+   /* Its thread and kicks use the queues and the device's kernels. */
+   hk_compute_kick_stop(dev);
+
    util_dynarray_fini(&dev->external_bos.counts);
    util_dynarray_fini(&dev->external_bos.list);
    u_rwlock_destroy(&dev->external_bos.lock);
@@ -1193,6 +1198,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
       hk_queue_finish(dev, queue);
    }
+
+   /* No submit thread is left to call into the kicker. */
+   hk_compute_kick_finish(dev);
 
    vk_device_finish(&dev->vk);
 

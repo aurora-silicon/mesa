@@ -22,6 +22,7 @@
 #include "agx_vdm_hal200_bind_tail_core.h"
 #include "decode.h"
 #include "hk_cmd_buffer.h"
+#include "hk_compute_kick.h"
 #include "hk_frame_anatomy.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -2023,6 +2024,22 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    return result;
 }
 
+static bool
+hk_submit_has_compute(const struct vk_queue_submit *submit)
+{
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (cs->type == HK_CS_CDM)
+            return true;
+      }
+   }
+
+   return false;
+}
+
 static VkResult
 hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
@@ -2032,9 +2049,17 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (vk_device_is_lost_no_report(&dev->vk))
       return VK_ERROR_DEVICE_LOST;
 
+   /* Look at the command buffers before they are submitted: once the work is
+    * with the kernel it can complete, and the application may then free or
+    * reset them while this callback is still running on a submit thread. */
+   const bool has_compute =
+      queue->kick.watched && hk_submit_has_compute(submit);
+
    VkResult result = queue_submit(dev, queue, submit);
    if (result != VK_SUCCESS)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
+   else if (has_compute)
+      hk_compute_kick_note(dev, queue);
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
@@ -2137,9 +2162,10 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    }
 }
 
-VkResult
-hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
-              uint32_t index_in_family)
+static VkResult
+hk_queue_create(struct hk_device *dev,
+                const VkDeviceQueueCreateInfo *pCreateInfo,
+                uint32_t index_in_family, bool kick, struct hk_queue **out)
 {
    struct hk_physical_device *pdev = hk_device_physical(dev);
    VkResult result;
@@ -2184,6 +2210,12 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       vk_free(&dev->vk.alloc, queue);
       return result;
    }
+
+   /* The kicker owns a kick queue: keep it out of the walks of the
+    * application's queues (vkDeviceWaitIdle, lost-device quiescing, queue
+    * sharing). Only the kicker thread submits to it. */
+   if (kick)
+      list_delinit(&queue->vk.link);
 
    queue->vk.driver_submit = hk_queue_submit;
    queue->sync.precise_tile_evictions = agx_is_m4_pro(&dev->dev);
@@ -2231,7 +2263,7 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
 
    if ((dev->dev.chip == AGX_CHIP_G17P ||
         agx_chip_g17_m5(dev->dev.chip)) &&
-       dev->vk.enabled_features.sparseBinding) {
+       dev->vk.enabled_features.sparseBinding && !kick) {
       queue->g17p_sstt_flush_bo =
          agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0, "SSTT flush stream");
       if (!queue->g17p_sstt_flush_bo) {
@@ -2250,14 +2282,16 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       }
    }
 
-   hk_queue_share(dev, queue);
+   /* A kick queue needs a kernel queue of its own. */
+   if (!kick)
+      hk_queue_share(dev, queue);
 
    /* Permission for an elevated class must be checked during device
     * creation, while the application can still fall back to MEDIUM. Delaying
     * it until submission would consume payloads or turn refusal into device
     * loss. Ordinary queues remain lazy to avoid reserving unused contexts.
     */
-   if (!vk_queue_is_emulated(&queue->vk) &&
+   if (!vk_queue_is_emulated(&queue->vk) && !kick &&
        drm_priority == DRM_ASAHI_PRIORITY_HIGH) {
       /* Without the render ray-query reservation; a render that needs it
        * replaces this kernel queue at submission. */
@@ -2269,7 +2303,43 @@ hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
       }
    }
 
+   if (out)
+      *out = queue;
    return VK_SUCCESS;
+}
+
+VkResult
+hk_queue_init(struct hk_device *dev, const VkDeviceQueueCreateInfo *pCreateInfo,
+              uint32_t index_in_family)
+{
+   return hk_queue_create(dev, pCreateInfo, index_in_family, false, NULL);
+}
+
+/* A queue of the given priority class that the application cannot get:
+ * its index is past any family's queue count, it is not in the device's
+ * queue list, and it shares no kernel queue with the application's queues.
+ * Its kernel queue is created at its first submission, like theirs. The
+ * caller finishes it with hk_queue_finish. */
+VkResult
+hk_queue_init_kick(struct hk_device *dev, enum drm_asahi_priority priority,
+                   struct hk_queue **out)
+{
+   const VkDeviceQueueGlobalPriorityCreateInfoKHR priority_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+      .globalPriority = priority == DRM_ASAHI_PRIORITY_LOW
+                           ? VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR
+                        : priority == DRM_ASAHI_PRIORITY_HIGH
+                           ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR
+                           : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+   };
+   const uint32_t index = UINT32_MAX - 1;
+   const VkDeviceQueueCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .pNext = &priority_info,
+      .queueFamilyIndex = 0,
+      .queueCount = index + 1,
+   };
+   return hk_queue_create(dev, &info, index, true, out);
 }
 
 void

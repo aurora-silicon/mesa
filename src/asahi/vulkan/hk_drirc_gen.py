@@ -50,6 +50,12 @@ def declare_options():
           "list is only viewed as itself or its sRGB/UNORM twin, so that it "
           "can be compressed",
           c_name="mutable_format_srgb_pair"),
+        drirc_gen.DrircInt("hk_compute_kick_ms", 10, 0, 1000,
+          "M5 Max: once a queue's compute work has completed nothing for "
+          "50 ms, submit a small compute job on a second queue every this "
+          "many ms until it does, which lets other applications' compute "
+          "work and rendering run meanwhile (0: off)",
+          c_name="compute_kick_ms"),
         B("hk_report_honeykrisp_driver_id", False,
           "Report VK_DRIVER_ID_MESA_HONEYKRISP instead of the Borealis ID, "
           "for translation layers that do not know the Borealis ID yet",

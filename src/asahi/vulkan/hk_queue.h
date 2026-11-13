@@ -56,6 +56,22 @@ struct hk_queue {
 
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
+
+   /* Compute kick (hk_compute_kick.c). watched is set at device creation
+    * for a queue whose priority class has a kick queue. The rest is
+    * protected by the kicker's lock. */
+   struct {
+      bool watched;
+
+      /* Timeline point of the last submission with compute work, 0 once
+       * the kicker has seen it complete. */
+      uint64_t pending;
+
+      /* Kicker thread only: the queue timeline value last seen, and when
+       * the next kick is due if it stays there (0: not yet seen). */
+      uint64_t seen;
+      int64_t due_ns;
+   } kick;
 };
 
 static inline struct hk_device *
@@ -67,6 +83,10 @@ hk_queue_device(struct hk_queue *queue)
 VkResult hk_queue_init(struct hk_device *dev,
                        const VkDeviceQueueCreateInfo *pCreateInfo,
                        uint32_t index_in_family);
+
+VkResult hk_queue_init_kick(struct hk_device *dev,
+                           enum drm_asahi_priority priority,
+                           struct hk_queue **out);
 
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 

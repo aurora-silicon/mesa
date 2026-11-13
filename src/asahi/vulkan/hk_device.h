@@ -121,6 +121,7 @@ struct hk_gen1_as_window {
    uint32_t live;
 };
 struct hk_frame_anatomy;
+struct hk_compute_kick;
 
 struct hk_device {
    struct vk_device vk;
@@ -144,6 +145,9 @@ struct hk_device {
    /* Opt-in frame anatomy profiler (hk_frame_anatomy.h); NULL unless the
     * HK_FRAME_ANATOMY environment variable is set. */
    struct hk_frame_anatomy *frame_anatomy;
+   /* Compute kick (hk_compute_kick.h); NULL unless G17C with
+    * hk_compute_kick_ms set. */
+   struct hk_compute_kick *compute_kick;
 
    struct hk_descriptor_table occlusion_queries;
    struct hk_sampler_heap samplers;
