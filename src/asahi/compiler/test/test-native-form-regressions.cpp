@@ -6304,6 +6304,11 @@ TEST(NativeForms, G17PMeshPayloadReadIsUndefined)
  * c-is-zero and c-present forms with both the destination cache hint and the
  * operand discard hints. agx3_matrix_encode_mma8() must reproduce each one
  * byte-for-byte when asked for the AGX3B encoding.
+ *
+ * by74 and by95 carry a nonzero scoreboard wait: their field 74 (wait slot 5)
+ * is set, i.e. wait_mask 0x20. Field 74 is the sixth wait bit, not a c-is-zero
+ * marker, so the descriptor must request that wait explicitly; by96/by98 have
+ * field 74 clear (wait_mask 0).
  */
 TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
 {
@@ -6312,13 +6317,15 @@ TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
       struct agx3_matrix_mma8_desc desc;
       std::vector<uint8_t> bytes; /* real Apple G16G capture */
    } cases[] = {
-      {"by74 c_zero dest4",
+      {"by74 c_zero dest4 wait_sb5",
        {.dest = 4, .a = 4, .b = 8, .c_zero = true,
-        .discard = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32},
+        .discard = {true, true, false}, .wait_mask = 0x20,
+        .input_type = AGX3_MATRIX_INPUT_F32},
        {207, 2, 86, 2, 0, 4, 8, 0, 212, 65, 36, 0}},
-      {"by95 c_zero dest12 cache",
+      {"by95 c_zero dest12 cache wait_sb5",
        {.dest = 12, .a = 4, .b = 8, .c_zero = true, .dest_cache = true,
-        .cache = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32},
+        .cache = {true, true, false}, .wait_mask = 0x20,
+        .input_type = AGX3_MATRIX_INPUT_F32},
        {207, 2, 86, 6, 1, 132, 9, 0, 84, 64, 36, 0}},
       {"by96 c_present dest12 cache+discardC",
        {.dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
@@ -6373,10 +6380,9 @@ TEST(NativeForms, Agx3cMatmad8x8IsUnchangedByAgx3b)
 }
 
 /*
- * The AGX3B form only witnesses scoreboard-wait bits 0..4 (fields 69..73);
- * bits 5..7 map to fields with no Apple witness, so the encoder refuses a wait
- * mask that sets them rather than emitting an unverified encoding. A wait
- * within range still encodes.
+ * The AGX3B form carries six scoreboard-wait bits (slots 0..5, fields 69..74);
+ * a full 0x3f mask still encodes, while bit 6 (slot 6) has no witness field, so
+ * the encoder refuses rather than emit an unverified encoding.
  */
 TEST(NativeForms, Agx3bMatmad8x8RefusesUnwitnessedWait)
 {
@@ -6385,10 +6391,40 @@ TEST(NativeForms, Agx3bMatmad8x8RefusesUnwitnessedWait)
       .input_type = AGX3_MATRIX_INPUT_F32,
    };
    uint8_t out[14], length = 0;
-   desc.wait_mask = 0x1f;
+   desc.wait_mask = 0x3f;
    EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
                                        &length));
-   desc.wait_mask = 0x20;
+   desc.wait_mask = 0x40;
    EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
                                         &length));
+}
+
+/*
+ * Field 74 (packed bit 17, the second-least bit of byte 2) is AGX3B wait slot
+ * 5, not a c-is-zero marker: it must track wait_mask bit 5 regardless of the
+ * accumulate/c-is-zero choice (which lives in field 59). A c-is-zero op with no
+ * wait leaves field 74 clear; an accumulating op that waits slot 5 sets it.
+ * This guards against the field reverting to a c_zero marker.
+ */
+TEST(NativeForms, Agx3bMatmad8x8Field74IsWaitSlot5NotCZero)
+{
+   uint8_t out[14], length = 0;
+   /* c-is-zero, no wait: field 74 must be 0 (c_zero alone must not set it). */
+   struct agx3_matrix_mma8_desc c_zero_nowait = {
+      .dest = 4, .a = 4, .b = 8, .c_zero = true,
+      .discard = {true, true, false}, .wait_mask = 0,
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &c_zero_nowait,
+                                       out, &length));
+   EXPECT_EQ((out[2] >> 1) & 1, 0);
+   /* accumulate (c present), wait slot 5: field 74 must be 1. */
+   struct agx3_matrix_mma8_desc accum_wait5 = {
+      .dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+      .cache = {true, true, false}, .discard = {false, false, true},
+      .wait_mask = 0x20, .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &accum_wait5,
+                                       out, &length));
+   EXPECT_EQ((out[2] >> 1) & 1, 1);
 }

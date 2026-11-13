@@ -33,12 +33,17 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
       return false;
 
    /*
-    * AGX3B places the scoreboard wait in fields 69..73 (bits 0..4), reusing
-    * field 74 as the c-is-zero marker where AGX3C uses 76. The field vector
-    * for wait bits 5..7 on AGX3B has no Apple witness yet, so refuse rather
-    * than guess; AGX3C keeps its full eight-bit wait in 69..76.
+    * AGX3B carries a six-bit scoreboard wait in fields 69..74 (slots 0..5):
+    * field 74 is wait slot 5, not a c-is-zero marker. The c-is-zero vs
+    * multiply-accumulate choice is field 59 alone (1 = no C operand,
+    * 2 = multiply-accumulate), with the C register zero when absent. Fields
+    * 77..79 are not part of the wait mask and stay clear (no Apple witness),
+    * so refuse a wait above slot 5 rather than guess. AGX3C keeps its full
+    * eight-bit wait in 69..76. Witnessed by Apple G16G compiler output; the
+    * earlier "field 74 == c_zero, wait bits 0..4" reading byte-matched the
+    * compose corpus only because those captures all set wait slot 5.
     */
-   if (agx3b && (d->wait_mask & ~0x1fu))
+   if (agx3b && (d->wait_mask & ~0x3fu))
       return false;
 
    for (unsigned i = 0; i < 3; ++i) {
@@ -62,15 +67,13 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
    fields[count++] = (struct agx3_field_kv){35, d->b};
    fields[count++] = (struct agx3_field_kv){52, d->c};
    fields[count++] = (struct agx3_field_kv){59, d->c_zero ? 1 : 2};
-   if (agx3b)
-      fields[count++] = (struct agx3_field_kv){74, d->c_zero ? 1 : 0};
    fields[count++] = (struct agx3_field_kv){27, d->cache[0]};
    fields[count++] = (struct agx3_field_kv){29, d->discard[0]};
    fields[count++] = (struct agx3_field_kv){44, d->cache[1]};
    fields[count++] = (struct agx3_field_kv){46, d->discard[1]};
    fields[count++] = (struct agx3_field_kv){61, d->cache[2]};
    fields[count++] = (struct agx3_field_kv){63, d->discard[2]};
-   for (unsigned i = 0; i < (agx3b ? 5u : 8u); ++i)
+   for (unsigned i = 0; i < (agx3b ? 6u : 8u); ++i)
       fields[count++] = (struct agx3_field_kv){69 + i,
                                              (d->wait_mask >> i) & 1};
 
