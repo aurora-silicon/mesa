@@ -131,6 +131,48 @@ struct triangle_vertices {
 
 TYPE(float16_t, 2);
 
+/* Double (low word, high word) to float, rounded to nearest even, with 32-bit
+ * integer operations only. */
+float
+vk_f64_bits_to_f32(uint32_t lo, uint32_t hi)
+{
+   const uint32_t exp = (hi >> 20) & 0x7ffu;
+   const int e = int(exp) - 1023;
+   uint32_t bits;
+   if (exp == 0x7ffu) {
+      bits = 0x7f800000u | ((((hi & 0xfffffu) | lo) != 0u) ? 0x400000u : 0u);
+   } else if (exp == 0u || e < -150) {
+      bits = 0u;
+   } else if (e > 127) {
+      bits = 0x7f800000u;
+   } else {
+      /* 24 significand bits, and the 29 below them. */
+      uint32_t m = 0x800000u | ((hi & 0xfffffu) << 3) | (lo >> 29);
+      const uint32_t rest = lo & 0x1fffffffu;
+      if (e >= -126) {
+         if (rest > 0x10000000u || (rest == 0x10000000u && (m & 1u) != 0u))
+            m++;
+         /* A carry out of the significand bumps the exponent, up to inf. */
+         bits = (uint32_t(e + 126) << 23) + m;
+      } else {
+         const uint32_t k = uint32_t(-126 - e);
+         const uint32_t r = m & ((1u << k) - 1u);
+         const uint32_t tie = 1u << (k - 1u);
+         bits = m >> k;
+         if (r > tie || (r == tie && (rest != 0u || (bits & 1u) != 0u)))
+            bits++;
+      }
+   }
+   return uintBitsToFloat(bits | (hi & 0x80000000u));
+}
+
+float
+vk_load_f64_as_f32(VOID_REF ptr, uint32_t index)
+{
+   return vk_f64_bits_to_f32(DEREF(INDEX(uint32_t, ptr, 2 * index)),
+                             DEREF(INDEX(uint32_t, ptr, 2 * index + 1)));
+}
+
 triangle_vertices
 load_vertices(VOID_REF vertices, triangle_indices indices, uint32_t vertex_format, uint32_t stride)
 {
@@ -165,6 +207,7 @@ load_vertices(VOID_REF vertices, triangle_indices indices, uint32_t vertex_forma
          vertex.x = max(-1.0, DEREF(INDEX(int16_t, vertex_ptr, 0)) / float(0x7FFF));
          vertex.y = max(-1.0, DEREF(INDEX(int16_t, vertex_ptr, 1)) / float(0x7FFF));
          break;
+      case VK_FORMAT_R16G16B16_SNORM:
       case VK_FORMAT_R16G16B16A16_SNORM:
          vertex.x = max(-1.0, DEREF(INDEX(int16_t, vertex_ptr, 0)) / float(0x7FFF));
          vertex.y = max(-1.0, DEREF(INDEX(int16_t, vertex_ptr, 1)) / float(0x7FFF));
@@ -174,6 +217,7 @@ load_vertices(VOID_REF vertices, triangle_indices indices, uint32_t vertex_forma
          vertex.x = max(-1.0, DEREF(INDEX(int8_t, vertex_ptr, 0)) / float(0x7F));
          vertex.y = max(-1.0, DEREF(INDEX(int8_t, vertex_ptr, 1)) / float(0x7F));
          break;
+      case VK_FORMAT_R8G8B8_SNORM:
       case VK_FORMAT_R8G8B8A8_SNORM:
          vertex.x = max(-1.0, DEREF(INDEX(int8_t, vertex_ptr, 0)) / float(0x7F));
          vertex.y = max(-1.0, DEREF(INDEX(int8_t, vertex_ptr, 1)) / float(0x7F));
@@ -196,6 +240,16 @@ load_vertices(VOID_REF vertices, triangle_indices indices, uint32_t vertex_forma
          vertex.x = DEREF(INDEX(uint8_t, vertex_ptr, 0)) / float(0xFF);
          vertex.y = DEREF(INDEX(uint8_t, vertex_ptr, 1)) / float(0xFF);
          vertex.z = DEREF(INDEX(uint8_t, vertex_ptr, 2)) / float(0xFF);
+         break;
+      case VK_FORMAT_R64G64_SFLOAT:
+         vertex.x = vk_load_f64_as_f32(vertex_ptr, 0);
+         vertex.y = vk_load_f64_as_f32(vertex_ptr, 1);
+         break;
+      case VK_FORMAT_R64G64B64_SFLOAT:
+      case VK_FORMAT_R64G64B64A64_SFLOAT:
+         vertex.x = vk_load_f64_as_f32(vertex_ptr, 0);
+         vertex.y = vk_load_f64_as_f32(vertex_ptr, 1);
+         vertex.z = vk_load_f64_as_f32(vertex_ptr, 2);
          break;
       case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
          uint32_t data = DEREF(REF(uint32_t)(vertex_ptr));
