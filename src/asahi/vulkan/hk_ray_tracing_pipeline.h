@@ -10,7 +10,10 @@
  * already uses, and the shader binding table selects between the inlined
  * copies with a comparison on the group index.  There is no indirect shader
  * call, no resume shader and no shader-call stack: recursion is bounded by
- * maxPipelineRayRecursionDepth at compile time and unrolled.
+ * maxPipelineRayRecursionDepth at compile time and unrolled.  Pipelines deeper
+ * than HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH instead split their stages at
+ * every call and run them as continuations from one scheduler loop, with
+ * return records on the invocation's scratch stack.
  *
  * This is the shape lavapipe uses, and it is used here for the same reason:
  * the AGX3 backend has no way to branch to an address the command stream

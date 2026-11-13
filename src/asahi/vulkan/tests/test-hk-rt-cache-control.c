@@ -18,6 +18,7 @@
 #include "hk_physical_device.h"
 #include "hk_ray_tracing_pipeline.h"
 #include "hk_shader.h"
+#include "hk_rt_recursion_spv.h"
 #include "nir.h"
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
@@ -42,6 +43,7 @@
 #define EARLY VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT
 
 static unsigned translations, backends, shader_destroys, live_nir;
+static unsigned last_instrs, last_calls;
 static nir_shader *tracked_nir[64];
 static VkResult backend_result = VK_SUCCESS;
 static unsigned fail_translation;
@@ -146,6 +148,16 @@ __wrap_hk_compile_shader(struct hk_device *dev,
                          struct hk_api_shader **out)
 {
    backends++;
+   /* What the last megakernel holds: every call must be inlined. */
+   last_instrs = last_calls = 0;
+   nir_foreach_function_impl(impl, info->nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            last_instrs++;
+            last_calls += instr->type == nir_instr_type_call;
+         }
+      }
+   }
    ralloc_free(info->nir);
    if (backend_result != VK_SUCCESS)
       return backend_result;
@@ -729,6 +741,103 @@ main(void)
    desc.scratch_size = 8193;
    CHECK(!agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &desc, &program));
    puts("PASS: G17P callable-size spill frames and encoding bounds");
+
+   /* Continuation mode: raygen, closest-hit and miss trace from every level,
+    * with an any-hit and a recursive callable. Above depth 3 every stage and
+    * the traversal appear once, so the code size does not grow with the
+    * depth, and the stack grows by one closest-hit/miss frame and record per
+    * level. */
+   {
+      static const struct {
+         const uint32_t *code;
+         size_t size;
+         VkShaderStageFlagBits stage;
+      } spv[] = {
+         {hk_rt_recursion_rgen_spv, sizeof(hk_rt_recursion_rgen_spv),
+          VK_SHADER_STAGE_RAYGEN_BIT_KHR},
+         {hk_rt_recursion_chit_spv, sizeof(hk_rt_recursion_chit_spv),
+          VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR},
+         {hk_rt_recursion_miss_spv, sizeof(hk_rt_recursion_miss_spv),
+          VK_SHADER_STAGE_MISS_BIT_KHR},
+         {hk_rt_recursion_ahit_spv, sizeof(hk_rt_recursion_ahit_spv),
+          VK_SHADER_STAGE_ANY_HIT_BIT_KHR},
+         {hk_rt_recursion_call_spv, sizeof(hk_rt_recursion_call_spv),
+          VK_SHADER_STAGE_CALLABLE_BIT_KHR},
+      };
+      VkShaderModule mods[ARRAY_SIZE(spv)];
+      VkPipelineShaderStageCreateInfo stages[ARRAY_SIZE(spv)];
+      for (unsigned i = 0; i < ARRAY_SIZE(spv); ++i) {
+         VkShaderModuleCreateInfo mi = {
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = spv[i].size,
+            .pCode = spv[i].code,
+         };
+         CHECK(vk_common_CreateShaderModule(device, &mi, NULL, &mods[i]) ==
+               VK_SUCCESS);
+         stages[i] = (VkPipelineShaderStageCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = spv[i].stage,
+            .module = mods[i],
+            .pName = "main",
+         };
+      }
+      VkRayTracingShaderGroupCreateInfoKHR groups[] = {group, group, group, group};
+      groups[1].type = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+      groups[1].generalShader = VK_SHADER_UNUSED_KHR;
+      groups[1].closestHitShader = 1;
+      groups[1].anyHitShader = 3;
+      groups[2].generalShader = 2;
+      groups[3].generalShader = 4;
+
+      const uint32_t depths[] = {3, 4, 8, 31};
+      uint32_t stack[ARRAY_SIZE(depths)], instrs[ARRAY_SIZE(depths)], cm = 0;
+      for (unsigned d = 0; d < ARRAY_SIZE(depths); ++d) {
+         ci = info(0);
+         ci.stageCount = ARRAY_SIZE(stages);
+         ci.pStages = stages;
+         ci.groupCount = ARRAY_SIZE(groups);
+         ci.pGroups = groups;
+         ci.maxPipelineRayRecursionDepth = depths[d];
+         b = backends;
+         CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS);
+         CHECK(backends == b + 1 && last_calls == 0);
+         struct hk_ray_tracing_pipeline *rp =
+            hk_ray_tracing_pipeline_from_handle(p);
+         stack[d] = rp->stack_size;
+         instrs[d] = last_instrs;
+         if (depths[d] > HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH) {
+            CHECK(rp->stack_sizes.closest_hit >= HK_RAY_HIT_ATTRIBS_SIZE);
+            cm = ((MAX2(rp->stack_sizes.closest_hit, rp->stack_sizes.miss) +
+                   15) & ~15u) + HK_RT_RETURN_RECORD_SIZE;
+         }
+         fprintf(stderr, "continuation test: depth %u: %u instructions, "
+                 "stack %u bytes\n", depths[d], last_instrs, stack[d]);
+         destroy(p);
+      }
+      CHECK(stack[3] - stack[2] == 23 * cm && stack[2] - stack[1] == 4 * cm);
+      /* Group handles and the stack limit are constants that differ between
+       * the pipelines, so folding may differ by a few instructions; a copy
+       * per depth level would be orders of magnitude more. */
+#define NEAR(a, b) ((a) <= (b) + (b) / 50 && (b) <= (a) + (a) / 50)
+      CHECK(NEAR(instrs[1], instrs[2]) && NEAR(instrs[1], instrs[3]));
+#undef NEAR
+
+      struct hk_rt_stack_sizes sizes = {
+         .raygen = 40, .closest_hit = 72, .miss = 20, .any_hit = 32,
+         .intersection = 48, .callable = 100,
+      };
+      uint32_t leaf;
+      CHECK(hk_rt_continuation_stack_size(&sizes, 5, false, 0, &leaf) ==
+            32 + (48 + 32) + 5 * (80 + 32) + 112 && leaf == 112);
+      CHECK(hk_rt_continuation_stack_size(&sizes, 5, true, 0, &leaf) ==
+            32 + (48 + 32) + 5 * (80 + 32) + 31 * (112 + 32) + 112);
+      CHECK(hk_rt_continuation_stack_size(&sizes, 5, false, 72, &leaf) ==
+            32 + (48 + 32) + 5 * (80 + 32) + 160 && leaf == 80 + 80);
+      for (unsigned i = 0; i < ARRAY_SIZE(mods); ++i)
+         vk_common_DestroyShaderModule(device, mods[i], NULL);
+      puts("PASS: continuation mode above depth 3: no calls, code size "
+           "independent of depth, linear stack");
+   }
 
    destroy(library);
    CHECK(live_nir == 0 && pipeline_allocs == pipeline_frees);
