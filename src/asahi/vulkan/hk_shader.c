@@ -5015,8 +5015,29 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * lowering fold every demote into the exported sample mask, so the
        * alpha-to-coverage demote would not survive to the coverage update:
        * those shaders keep alpha-to-coverage in the epilog too. */
+      /* A fragment tests its coverage once. G17P unrolls a sample-shaded
+       * main into one copy of its body per sample (below); lowered before
+       * that, the testing coverage update after the last discard is cloned
+       * with the body and the fragment tests once per sample. A pass of such
+       * fragments can stall the GPU when another context's fragment work
+       * runs beside it. So these shaders unroll their demotes -- each copy
+       * keeps its own sample's -- and lower them afterwards: one update
+       * tests whatever the copies left of the pixel, as in a per-pixel
+       * shader that discards several times. Alpha-to-coverage stays in the
+       * epilog for them, as for a shader that never discards.
+       *
+       * Forced-early fragments test once at the start already (the unroll
+       * hoists that update ahead of the copies) and keep their order.
+       * AGX_G17P_SAMPLE_KILL_TEST_ONCE=0 keeps the per-sample tests, for
+       * comparison. */
+      const bool g17p_test_once =
+         dev->dev.chip == AGX_CHIP_G17P && nir->info.fs.uses_sample_shading &&
+         !nir->info.fs.early_fragment_tests &&
+         debug_get_bool_option("AGX_G17P_SAMPLE_KILL_TEST_ONCE", true);
+
       bool a2c_in_main = false;
       if (dev->dev.chip == AGX_CHIP_G17P && key && key->fs.static_a2c &&
+          !g17p_test_once &&
           nir->info.fs.uses_discard && !nir->info.fs.early_fragment_tests &&
           !nir->info.writes_memory &&
           !(nir->info.outputs_written &
@@ -5028,8 +5049,10 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (agx_chip_g17_m5(dev->dev.chip)) {
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
       } else if (dev->dev.chip == AGX_CHIP_G17P) {
-         NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p,
-                  a2c_in_main ? &a2c_in_main : NULL);
+         if (!g17p_test_once) {
+            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p,
+                     a2c_in_main ? &a2c_in_main : NULL);
+         }
          shader->info.fs.a2c_in_main = a2c_in_main;
       } else if (agx_native_graphics(&dev->dev))
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
@@ -5045,11 +5068,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * ones for every draw that can use it. Fold it, leaving the single
        * unconditional testing coverage update of the native form instead of
        * a uniform branch between a testing and a killing one. */
-      if ((agx_chip_native_agx3(dev->dev.chip) ||
-           agx_chip_g17_m5(dev->dev.chip)) &&
-          key && (key->fs.static_tests || a2c_in_main) &&
-          !shader->info.fs.epilog_key.write_z &&
-          !shader->info.fs.epilog_key.write_s) {
+      const bool fold_tests =
+         (agx_chip_native_agx3(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip)) &&
+         key && (key->fs.static_tests || a2c_in_main) &&
+         !shader->info.fs.epilog_key.write_z &&
+         !shader->info.fs.epilog_key.write_s;
+      if (fold_tests && !g17p_test_once) {
          bool folded = false;
          NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
                   hk_fold_tests_zs, nir_metadata_control_flow, NULL);
@@ -5080,6 +5105,19 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                return vk_errorf(dev, VK_ERROR_UNKNOWN,
                                 "G17P: %u-sample colour exports exceed the %u-half register file",
                                 raster_samples, registers);
+            }
+         }
+
+         if (g17p_test_once) {
+            /* The copies' one-hot sample masks, so that the lowering sees
+             * each demote's constant sample. */
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p, NULL);
+            if (fold_tests) {
+               bool folded = false;
+               NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
+                        hk_fold_tests_zs, nir_metadata_control_flow, NULL);
+               shader->info.fs.static_tests = folded;
             }
          }
       } else if (nir->info.fs.uses_sample_shading) {
