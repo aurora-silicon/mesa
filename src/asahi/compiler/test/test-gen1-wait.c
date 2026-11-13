@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "agx_nir_ray_query.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/glsl_types.h"
 #undef NDEBUG
@@ -76,7 +77,7 @@ run_list(struct execution *e, struct exec_list *list)
                      value = e->pending ? 64 : 0;
                   else {
                      assert(nir_intrinsic_base(intr) == 7);
-                     value = nir_intrinsic_flags(intr) == 4 || e->resumes < e->delay ? 64 : 0;
+                     value = e->pending && (nir_intrinsic_flags(intr) == 4 || e->resumes < e->delay) ? 64 : 0;
                   }
                   break;
                case nir_intrinsic_store_scs_base_agx:
@@ -96,10 +97,10 @@ run_list(struct execution *e, struct exec_list *list)
    return false;
 }
 
-static void wait_for(unsigned delay, bool pending)
+static void wait_for(unsigned delay, bool pending, unsigned arms)
 {
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE, NULL, "delayed RayCore");
-   nir_def *completed = agx_nir_gen1_wait_traversal(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0), 128);
+   nir_def *completed = agx_nir_gen1_wait_traversal_perf(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0), 128, arms);
    unsigned vars = 0;
    nir_foreach_function_temp_variable(var, b.impl) var->data.driver_location = vars++;
    assert(vars < 16);
@@ -116,9 +117,14 @@ static void wait_for(unsigned delay, bool pending)
 int main(void)
 {
    glsl_type_singleton_init_or_ref();
-   wait_for(0, false);
+   const unsigned masks[] = {0, AGX_G17P_RT_STATUS_FIRST};
    const unsigned delays[] = {1, 65535, 65536, 65537, 1048576};
-   for (unsigned i = 0; i < ARRAY_SIZE(delays); ++i) wait_for(delays[i], true);
+   for (unsigned m = 0; m < ARRAY_SIZE(masks); ++m) {
+      wait_for(0, false, masks[m]);
+      wait_for(7, false, masks[m]);
+      for (unsigned i = 0; i < ARRAY_SIZE(delays); ++i)
+         wait_for(delays[i], true, masks[m]);
+   }
    glsl_type_singleton_decref();
    puts("PASS: native wait NIR retains pending queries through 1,048,576 resumes");
    return 0;

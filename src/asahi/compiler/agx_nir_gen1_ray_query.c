@@ -1,5 +1,6 @@
 #include "agx_nir_gen1_ray_query.h"
 #include "agx_nir_ray_query.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/u_dynarray.h"
 #include "util/u_debug.h"
@@ -10,7 +11,7 @@ struct gen1_rq_state {
    nir_variable *flags;
    nir_variable *query;
    nir_variable *as, *origin, *direction, *tmin, *tmax, *mask, *active;
-   nir_variable *result[4], *candidate[4], *started, *cursor, *refills;
+   nir_variable *result[4], *candidate[4], *started, *cursor, *refills, *published_tmax;
 };
 
 static const struct glsl_type *
@@ -150,6 +151,10 @@ gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
  * the software path too: they commit every hit anyway, and incoherent ones
  * traced slower with hardware commits. */
 #define GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS 0x1f3
+#define GEN1_RQ_RAY_OPAQUE (1u << 0)
+#define GEN1_RQ_CANDIDATE_CONTROL 0x9142u
+/* Bit 11 changes triangle commit mode from software (2) to hardware (3). */
+#define GEN1_RQ_CONTROL_HW_COMMIT (1u << 11)
 
 /* Candidate control 0x9142 queues every triangle hit for software. Setting
  * field 12:11 (0x9942) lets the hardware commit opaque triangle hits itself:
@@ -169,10 +174,11 @@ gen1_rq_committed_instance_pointer(nir_builder *b, nir_def *query, nir_def *lane
 }
 
 static nir_def *
-gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags)
+gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags, unsigned arms)
 {
    return nir_inot(b, nir_test_mask(b, nir_load_deref(b, flags),
-                                    GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS));
+                                    GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS &
+                                       ~((arms & AGX_G17P_RT_HW_OPAQUE) ? GEN1_RQ_RAY_OPAQUE : 0u)));
 }
 
 /* Committed values beyond the hit words and distance that a merged hardware
@@ -216,9 +222,9 @@ static void
 gen1_rq_merge_hw_commit(nir_builder *b, nir_def *id, nir_def *query,
                         nir_def *lane, nir_deref_instr *flags,
                         nir_deref_instr *active,
-                        nir_deref_instr *result[4], unsigned fields)
+                        nir_deref_instr *result[4], unsigned fields, unsigned arms)
 {
-   nir_push_if(b, gen1_rq_hw_commits(b, flags));
+   nir_push_if(b, gen1_rq_hw_commits(b, flags, arms));
    nir_def *distance = nir_load_scs_uniform_agx(b, 1, 32, nir_load_preamble(b, 1, 64, .base = 118),
       nir_ishl_imm(b, id, 5), .base = 24, .format = PIPE_FORMAT_R32_UINT, .component = 0);
    nir_def *hit = nir_load_scs_indexed_agx(b, 2, 32, query, lane, .base = 256, .component = 3);
@@ -253,13 +259,24 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
                      nir_deref_instr *flags,nir_deref_instr *minimum,
                      nir_deref_instr *result[4],nir_deref_instr *candidate[4],
                      nir_deref_instr *refills,nir_variable *more,
-                     unsigned hw_fields)
+                     unsigned hw_fields, nir_deref_instr *published_tmax,
+                     unsigned arms)
 {
    nir_def *id=nir_load_scs_thread_index_agx(b),*lane=nir_iand_imm(b,id,31);
-   nir_def *query=nir_iadd_imm(b,nir_imul_imm(b,nir_ushr_imm(b,id,5),304*32),0x2f8000);
+   nir_def *query=nir_iadd_imm(b,nir_imul_imm(b,nir_ushr_imm(b,id,5),agx_gen1_rt_driver_bytes(arms)*32),0x2f8000);
+   nir_variable *cached_control = NULL;
+   if (arms & AGX_G17P_RT_CACHE_CONTROL) {
+      /* RayCore owns the queue only during trace/refill. Between refills the
+       * control word is immutable, including across candidate callbacks. */
+      cached_control = nir_local_variable_create(b->impl, glsl_uint_type(),
+                                                 "rq_cached_control");
+      nir_store_var(b, cached_control, nir_load_scs_indexed_agx(b, 1, 32,
+         query, lane, .base = 1792, .component = 2), 1);
+   }
    nir_push_loop(b);
    nir_def *index=nir_load_deref(b,cursor);
-   nir_def *control=nir_load_scs_indexed_agx(b,1,32,query,lane,.base=1792,.component=2);
+   nir_def *control = cached_control ? nir_load_var(b, cached_control) :
+      nir_load_scs_indexed_agx(b,1,32,query,lane,.base=1792,.component=2);
    nir_def *count=nir_iand_imm(b,nir_ushr_imm(b,control,21),15);
    nir_push_if(b,nir_ult(b,index,count));
    nir_def *packet[4],*opaque,*instance_flags,*ray_flags=nir_load_deref(b,flags);
@@ -297,9 +314,19 @@ gen1_candidate_next(nir_builder *b,nir_deref_instr *active,nir_deref_instr *curs
       nir_ugt_imm(b,refill,AGX_GEN1_CANDIDATE_REFILL_BOUND)));
    nir_store_deref(b,active,nir_imm_false(b),1);nir_jump(b,nir_jump_break);
    nir_pop_if(b,NULL);
-   nir_def *completed=agx_nir_gen1_refill_candidate_queue(b,query,lane,id,nir_channel(b,nir_load_deref(b,result[1]),2));
+   nir_def *best_distance = nir_channel(b, nir_load_deref(b, result[1]), 2);
+   nir_def *dirty = (arms & AGX_G17P_RT_DIRTY_TMAX) ?
+      nir_ine(b, best_distance, nir_load_deref(b, published_tmax)) :
+      nir_imm_true(b);
+   nir_def *completed=agx_nir_gen1_refill_candidate_queue_perf(b,query,lane,id,
+      best_distance,dirty,arms);
+   if (arms & AGX_G17P_RT_DIRTY_TMAX)
+      nir_store_deref(b, published_tmax, best_distance, 1);
+   if (cached_control)
+      nir_store_var(b, cached_control, nir_load_scs_indexed_agx(b, 1, 32,
+         query, lane, .base = 1792, .component = 2), 1);
    nir_store_deref(b,active,completed,1);
-   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields);
+   gen1_rq_merge_hw_commit(b,id,query,lane,flags,active,result,hw_fields,arms);
    nir_break_if(b,nir_inot(b,nir_load_deref(b,active)));
    nir_store_deref(b,cursor,nir_imm_int(b,0),1);
    nir_pop_if(b,NULL);nir_pop_loop(b,NULL);
@@ -396,6 +423,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
        (!!layout->context_uniform != !!layout->as_table_uniform))
       return false;
 
+   const unsigned arms = layout->candidates ? layout->perf_arms & AGX_G17P_RT_PERF_ALL : 0;
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    gen1_rq_alias_copies(impl);
    struct util_dynarray queries = UTIL_DYNARRAY_INIT;
@@ -491,6 +519,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          gen1_rq_field_type(state->query->type, glsl_bool_type()), "rq_started");
       state->cursor = nir_local_variable_create(impl,
          gen1_rq_field_type(state->query->type, glsl_uint_type()), "rq_cursor");
+      state->published_tmax = nir_local_variable_create(impl,
+         gen1_rq_field_type(state->query->type, glsl_float_type()), "rq_published_tmax");
       state->refills = nir_local_variable_create(impl,
          gen1_rq_field_type(state->query->type, glsl_uint_type()), "rq_refills");
       for (unsigned i = 0; i < 4; ++i)
@@ -533,6 +563,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
       nir_deref_instr *started=gen1_rq_field_deref(&b,query,state->started);
       nir_deref_instr *cursor=gen1_rq_field_deref(&b,query,state->cursor);
       nir_deref_instr *refills=gen1_rq_field_deref(&b,query,state->refills);
+      nir_deref_instr *published_tmax=gen1_rq_field_deref(&b,query,state->published_tmax);
       nir_deref_instr *candidate[4];
       for(unsigned i=0;i<4;i++) candidate[i]=gen1_rq_field_deref(&b,query,state->candidate[i]);
       nir_def *value = NULL;
@@ -564,6 +595,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          nir_store_deref(&b, direction, intr->src[6].ssa, 7);
          nir_store_deref(&b, tmin, intr->src[5].ssa, 1);
          nir_store_deref(&b, tmax, intr->src[7].ssa, 1);
+         if (arms & AGX_G17P_RT_DIRTY_TMAX)
+            nir_store_deref(&b, published_tmax, intr->src[7].ssa, 1);
          nir_store_deref(&b, mask, intr->src[3].ssa, 1);
          nir_store_deref(&b, active, nir_ine_imm(&b, intr->src[1].ssa, 0), 1);
          for (unsigned i = 0; i < 4; ++i)
@@ -642,7 +675,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          nir_def *index=nir_ishl_imm(&b,id,5);
          nir_def *lane=nir_iand_imm(&b,id,31);
          nir_def *query=nir_iadd_imm(&b,
-            nir_imul_imm(&b,nir_ushr_imm(&b,id,5),layout->candidates ? 304*32 : layout->instance_traversal ? 0xb00 : 0x500),0x2f8000);
+            nir_imul_imm(&b,nir_ushr_imm(&b,id,5),layout->candidates ? agx_gen1_rt_driver_bytes(arms)*32 : layout->instance_traversal ? 0xb00 : 0x500),0x2f8000);
          nir_def *savebase=nir_load_preamble(&b,1,64,.base=layout->candidates ? 116 : 122);
          nir_def *saveindex=nir_imul_imm(&b,nir_ushr_imm(&b,id,5),12);
          nir_store_scs_uniform_agx(&b, nir_imm_ivec4(&b, 0, 0, 0, 0), savebase, saveindex,
@@ -664,7 +697,9 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_store_scs_uniform_agx(&b,words[i],base,index,
                .base=16*i,.format=PIPE_FORMAT_R32_UINT,.component=0);
          nir_def *query_control = layout->candidates
-            ? nir_bcsel(&b, gen1_rq_hw_commits(&b, flags), nir_imm_int(&b, 0x9942), nir_imm_int(&b, 0x9142))
+            ? nir_bcsel(&b, gen1_rq_hw_commits(&b, flags, arms),
+               nir_imm_int(&b, GEN1_RQ_CANDIDATE_CONTROL | GEN1_RQ_CONTROL_HW_COMMIT),
+               nir_imm_int(&b, GEN1_RQ_CANDIDATE_CONTROL))
             : nir_imm_int(&b, 0x4922);
          nir_store_scs_indexed_agx(&b,nir_vec2(&b,query_control,
             nir_load_deref(&b,tmin)),query,lane,.base=0,.component=3);
@@ -679,13 +714,14 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             .base=256,.format=PIPE_FORMAT_R32_UINT,.component=2);
          if(layout->candidates)
             nir_store_scs_indexed_agx(&b,nir_imm_int(&b,8),query,lane,.base=1792,.component=2);
-         nir_def *completed=agx_nir_gen1_trace_opaque_with_status(&b,selector,
+         nir_def *completed=agx_nir_gen1_trace_opaque_with_status_perf(&b,selector,
             nir_load_preamble(&b,1,64,.base=layout->candidates ? 12 : 112),query,lane,
-            nir_iadd_imm(&b,id,layout->launch_header),layout->candidates ? 123 : 126,layout->status_uniform);
+            nir_iadd_imm(&b,id,layout->launch_header),layout->candidates ? 123 : 126,
+            layout->status_uniform,arms);
          if(layout->candidates) {
             nir_store_deref(&b,started,nir_imm_true(&b),1);
             nir_store_deref(&b,active,completed,1);
-            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,hw_fields);
+            gen1_rq_merge_hw_commit(&b,id,query,lane,flags,active,result,hw_fields,arms);
          } else {
          nir_push_if(&b,completed);
          for(unsigned i=0;i<2;i++)
@@ -727,7 +763,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          if (layout->candidates) {
             nir_pop_if(&b, NULL);
             nir_push_if(&b, nir_load_deref(&b, active));
-            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,refills,more,hw_fields);
+            gen1_candidate_next(&b,active,cursor,flags,tmin,result,candidate,refills,more,hw_fields,published_tmax,arms);
             nir_pop_if(&b, NULL);
          }
          nir_pop_if(&b, NULL);
@@ -954,13 +990,40 @@ agx_nir_gen1_refill_candidate_queue(nir_builder *b, nir_def *query,
                                    nir_def *lane, nir_def *id,
                                    nir_def *best_distance)
 {
+   return agx_nir_gen1_refill_candidate_queue_perf(b, query, lane, id,
+      best_distance, nir_imm_true(b), 0);
+}
+
+nir_def *
+agx_nir_gen1_refill_candidate_queue_perf(nir_builder *b, nir_def *query,
+   nir_def *lane, nir_def *id, nir_def *best_distance, nir_def *tmax_dirty,
+   unsigned arms)
+{
    nir_def *control = nir_load_scs_indexed_agx(b, 1, 32, query, lane,
       .base = 1792, .component = 2);
    nir_store_scs_indexed_agx(b, nir_iand_imm(b, control, ~0x1e00001u),
       query, lane, .base = 1792, .component = 2);
+   if (arms & AGX_G17P_RT_DIRTY_TMAX)
+      nir_push_if(b, tmax_dirty);
    nir_store_scs_uniform_agx(b, best_distance,
       nir_load_preamble(b, 1, 64, .base = 118), nir_ishl_imm(b, id, 5),
       .base = 24, .format = PIPE_FORMAT_R32_UINT, .component = 0);
-   nir_continue_ray_gen1_agx(b, id, .base = 1);
-   return agx_nir_gen1_wait_traversal(b, query, lane, 128);
+   if (arms & AGX_G17P_RT_MIRROR_TMAX) {
+      /* Keep the same closest-hit bound in the alternate RayCore bank.
+       * Instance traversal may switch banks before the next candidate batch. */
+      nir_store_scs_uniform_agx(b, best_distance,
+         nir_load_preamble(b, 1, 64, .base = 118),
+         nir_iadd_imm(b, nir_ishl_imm(b, id, 5), AGX_GEN1_RT_CORE_BANK_BYTES),
+         .base = 24, .format = PIPE_FORMAT_R32_UINT, .component = 0);
+   }
+   if (arms & AGX_G17P_RT_DIRTY_TMAX)
+      nir_pop_if(b, NULL);
+   if (arms & AGX_G17P_RT_CLEAR_COMMIT)
+      nir_store_scs_indexed_agx(b, nir_imm_ivec2(b, 0, 0), query, lane,
+                              .base = 256, .component = 3);
+   /* Compare the polling resume's staging/publication form with the normal
+    * queue-refill form, while retaining the same completion wait. */
+   nir_continue_ray_gen1_agx(b, id,
+      .base = (arms & AGX_G17P_RT_REFILL_RESUME) ? 0 : 1);
+   return agx_nir_gen1_wait_traversal_perf(b, query, lane, 128, arms);
 }

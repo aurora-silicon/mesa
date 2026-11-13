@@ -71,6 +71,11 @@ void agx_nir_gen1_ray_core_words(struct nir_builder *b, nir_def *origin,
 
 #define AGX_GEN1_CANDIDATE_REFILL_BOUND (1u << 16)
 
+nir_def *agx_nir_gen1_trace_opaque_with_status_perf(struct nir_builder *b,
+   nir_def *bvh, nir_def *request, nir_def *query_base, nir_def *lane,
+   nir_def *launch, unsigned context_uniform, unsigned status_uniform,
+   unsigned arms);
+
 nir_def *agx_nir_gen1_trace_opaque_with_status(struct nir_builder *b, nir_def *bvh,
                               nir_def *request, nir_def *query_base,
                               nir_def *lane, nir_def *launch,
@@ -83,6 +88,9 @@ void agx_nir_gen1_trace_opaque(struct nir_builder *b, nir_def *bvh,
 #ifdef __cplusplus
 }
 #endif
+
+nir_def *agx_nir_gen1_wait_traversal_perf(struct nir_builder *b,
+   nir_def *query_base, nir_def *lane, unsigned status_uniform, unsigned arms);
 
 nir_def *agx_nir_gen1_wait_traversal(struct nir_builder *b, nir_def *query_base,
                                 nir_def *lane, unsigned status_uniform);

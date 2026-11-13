@@ -10,6 +10,10 @@
 #include "hk_device.h"
 #include "hk_physical_device.h"
 #include "hk_shader.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
+#include "asahi/compiler/agx3_rt_gen1_triangle.h"
+#include "asahi/compiler/agx3_rt_gen1_aabb.h"
+#include "hk_gen1_rt_indirect_contract.h"
 
 /* The driver headers see the same NDEBUG as the linked driver. */
 #undef NDEBUG
@@ -143,6 +147,11 @@ new_device(enum agx_chip chip, uint64_t kernel_features,
    struct hk_device *dev = calloc(1, sizeof(*dev));
    assert(dev);
    dev->dev.chip = chip;
+   if (chip == AGX_CHIP_G17P) {
+      dev->dev.params.chip_id = 0x8140;
+      dev->dev.params.gpu_generation = 17;
+      dev->dev.params.gpu_variant = 'P';
+   }
    dev->dev.params.features = kernel_features;
    if (features)
       dev->vk.enabled_features = *features;
@@ -319,7 +328,27 @@ test_device_with_rt(const char *name, const struct vk_features *features)
               dev->gen1_native_fragment_rq && dev->gen1_native_graphics_rq);
    snprintf(what, sizeof(what), "%s: candidate SCS layout", name);
    T(what, hk_gen1_ray_query_scs_layout(dev) ==
-              UINT64_C(0x0130000060010070));
+              agx_gen1_rt_candidate_layout(agx_g17p_rt_perf_arms(true)));
+   const unsigned arms = agx_g17p_rt_perf_arms(true);
+   struct hk_gen1_rt_indirect_contract contract = {0};
+   T("query profile covers every resident warp",
+     hk_gen1_rt_indirect_contract_init(hk_gen1_ray_query_scs_layout(dev), &contract));
+   T("query slot spacing follows the profile",
+     contract.query_stride == agx_gen1_rt_driver_bytes(arms) * 32);
+   if (dev->gen1_rq_code && dev->gen1_rq_maps) {
+      const uint8_t *code = agx_bo_map(dev->gen1_rq_code);
+      const unsigned slots[] = {AGX3_RT_GEN1_TRIANGLE_SLOT, AGX3_RT_GEN1_AABB_SLOT};
+      const unsigned words[] = {AGX3_RT_GEN1_TRIANGLE_QUEUE_RESERVE_WORD,
+                                AGX3_RT_GEN1_AABB_QUEUE_RESERVE_WORD};
+      const uint32_t expected = (agx_gen1_rt_queue_capacity(arms) - 8) << 21;
+      for (unsigned i = 0; i < ARRAY_SIZE(slots); ++i) {
+         uint32_t reserve;
+         memcpy(&reserve, code + dev->gen1_rq_maps[(slots[i] * 3 + 1) * 3] +
+                words[i] * sizeof(reserve), sizeof(reserve));
+         T("leaf enqueue budget matches the selected queue depth",
+           util_le32_to_cpu(reserve) == expected);
+      }
+   }
    snprintf(what, sizeof(what), "%s: ray query image and code binds", name);
    T(what, code_bos == 1 && dev->gen1_rq_code &&
               dev->gen1_rq_code->size == RQ_CODE_BYTES &&
@@ -439,7 +468,27 @@ main(void)
                           rt_kernel, &rq);
    unsetenv("ASAHI_G17P_RT_DISABLE");
 
+   setenv("ASAHI_G17P_RT_PERF_ARM", "2", 1);
+   T("non-A18 devices ignore RT arms", agx_g17p_rt_perf_arms(false) == 0);
+   test_device_with_rt("eight-record queue", &rq);
+   setenv("ASAHI_G17P_RT_PERF_ARM", "32", 1);
+   test_device_with_rt("padded query slots", &rq);
+   setenv("ASAHI_G17P_RT_PERF_ARM", "511", 1);
+   test_device_with_rt("all RT arms", &rq);
+   unsetenv("ASAHI_G17P_RT_PERF_ARM");
+
    test_cache_key();
+
+   unsetenv("ASAHI_G17P_RT_PERF_ARM");
+   const uint64_t no_arms = hk_codegen_env_hash();
+   for (unsigned bit = 0; bit < 9; ++bit) {
+      char arm[16];
+      snprintf(arm, sizeof(arm), "%u", 1u << bit);
+      setenv("ASAHI_G17P_RT_PERF_ARM", arm, 1);
+      T("RT arm has a separate cache identity", no_arms != hk_codegen_env_hash());
+   }
+   unsetenv("ASAHI_G17P_RT_PERF_ARM");
+   T("RT baseline cache identity returns", no_arms == hk_codegen_env_hash());
 
    /* A noborder run must never replace border-enabled disk-cache entries. */
    unsetenv("HK_PERFTEST");

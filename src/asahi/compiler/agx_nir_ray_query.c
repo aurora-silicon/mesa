@@ -4,6 +4,7 @@
  */
 
 #include "agx_nir_ray_query.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 
 #include <string.h>
 
@@ -200,25 +201,52 @@ agx_nir_gen1_trace_opaque_with_status(nir_builder *b, nir_def *bvh, nir_def *req
                          nir_def *query_base, nir_def *lane,
                          nir_def *launch, unsigned context_uniform, unsigned status_uniform)
 {
+   return agx_nir_gen1_trace_opaque_with_status_perf(b, bvh, request, query_base,
+      lane, launch, context_uniform, status_uniform, 0);
+}
+
+nir_def *
+agx_nir_gen1_trace_opaque_with_status_perf(nir_builder *b, nir_def *bvh,
+   nir_def *request, nir_def *query_base, nir_def *lane, nir_def *launch,
+   unsigned context_uniform, unsigned status_uniform, unsigned arms)
+{
    nir_intersect_ray_gen1_agx(b, bvh, request, launch, nir_imm_int(b,0),
                              .base=context_uniform);
-   return agx_nir_gen1_wait_traversal(b, query_base, lane, status_uniform);
+   return agx_nir_gen1_wait_traversal_perf(b, query_base, lane, status_uniform, arms);
 }
 
 nir_def *
 agx_nir_gen1_wait_traversal(nir_builder *b, nir_def *query_base, nir_def *lane,
                            unsigned status_uniform)
 {
+   return agx_nir_gen1_wait_traversal_perf(b, query_base, lane, status_uniform, 0);
+}
+
+nir_def *
+agx_nir_gen1_wait_traversal_perf(nir_builder *b, nir_def *query_base,
+   nir_def *lane, unsigned status_uniform, unsigned arms)
+{
    nir_variable *completed = nir_local_variable_create(b->impl,
       glsl_bool_type(), "rq_traversal_completed");
    nir_store_var(b, completed, nir_imm_true(b), 1);
-   nir_def *pending = nir_load_scs_base_agx(b,1,16,
+   nir_def *direct_address = NULL;
+   if (arms & AGX_G17P_RT_STATUS_FIRST) {
+      direct_address = nir_iadd(b,
+         nir_iadd(b, query_base, nir_ishl_imm(b, lane, 3)),
+         nir_load_preamble(b, 1, 32, .base = status_uniform));
+   }
+   nir_def *pending = direct_address ? nir_load_scs_base_agx(b, 1, 16,
+      direct_address, .base = 7, .format = PIPE_FORMAT_R8_UINT,
+      .component = 4, .flags = 8) : nir_load_scs_base_agx(b,1,16,
       nir_iadd(b,query_base,nir_ishl_imm(b,lane,3)),
       .base=263,.format=PIPE_FORMAT_R8_UINT,.component=4,.flags=8);
    nir_push_if(b,nir_ine_imm(b,nir_iand_imm(b,pending,64),0));
-   nir_def *status_address=nir_iadd(b,query_base,nir_ishl_imm(b,lane,3));
-   status_address=nir_iadd(b,status_address,
-                          nir_load_preamble(b,1,32,.base=status_uniform));
+   nir_def *status_address = direct_address;
+   if (!status_address) {
+      status_address=nir_iadd(b,query_base,nir_ishl_imm(b,lane,3));
+      status_address=nir_iadd(b,status_address,
+                             nir_load_preamble(b,1,32,.base=status_uniform));
+   }
    /* A continue can suspend while RayCore traverses a large overlapping TLAS.
     * Poll count is not an instance/node limit or a completion indication.
     * Never return an unfinished result as a miss or reuse its live context.

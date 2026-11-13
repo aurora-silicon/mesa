@@ -96,6 +96,7 @@
 #include "util/hash_table.h"
 #include "util/macros.h"
 #include "util/disk_cache.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 #include "util/mesa-blake3.h"
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
@@ -2902,6 +2903,7 @@ hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
                         dev->gen1_rq_instances ? 130 : 128,
       .instance_traversal = dev->gen1_rq_instances,
       .candidates = dev->gen1_rq_candidates,
+      .perf_arms = agx_g17p_rt_perf_arms(agx_is_a18_pro(&dev->dev)),
       .as_table_first = dev->gen1_rq_instances ? HK_GEN1_AS_TABLE_AS_SLOTS : 1,
       .launch_header = dev->gen1_rq_candidates ? 0x210000 : 0x110000,
       .context_uniform = 160,

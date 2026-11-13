@@ -15,6 +15,7 @@
  */
 
 #include "hk_acceleration_structure.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 #include "hk_host_as.h"
 #include "hk_agx3_as_format.h"
 #include "hk_m5_acceleration_structure.h"
@@ -2166,6 +2167,17 @@ hk_gen1_rq_init_generated(struct hk_device *dev)
           !hk_gen1_rq_generated_slot_matches(code, rows, slot, body, body_length, table, table_length))
          goto fail;
    }
+   /* Apply the queue budget only after every generated body/table has
+    * passed its source checks. The physical ten-record buffer is unchanged;
+    * both leaf paths must reserve the same complete eight-candidate burst.
+    */
+   const unsigned arms = agx_g17p_rt_perf_arms(agx_is_a18_pro(&dev->dev));
+   if (arms & AGX_G17P_RT_QUEUE_EIGHT) {
+      agx_gen1_rt_queue_reserve(code + rows[AGX3_RT_GEN1_TRIANGLE_SLOT * 3 + 1][0],
+         AGX3_RT_GEN1_TRIANGLE_QUEUE_RESERVE_WORD, arms);
+      agx_gen1_rt_queue_reserve(code + rows[AGX3_RT_GEN1_AABB_SLOT * 3 + 1][0],
+         AGX3_RT_GEN1_AABB_QUEUE_RESERVE_WORD, arms);
+   }
    {
       const char *dump = getenv("ASAHI_G17P_RQ_IMAGE_DUMP");
       if (dump && *dump) hk_gen1_rq_image_dump(dump, code, agx_bo_map(dev->gen1_rq_ift));
@@ -3308,7 +3320,8 @@ uint64_t
 hk_gen1_ray_query_scs_layout(const struct hk_device *dev)
 {
    if (dev->gen1_rq_candidates)
-      return UINT64_C(0x0130000060010070);
+      return agx_gen1_rt_candidate_layout(
+         agx_g17p_rt_perf_arms(agx_is_a18_pro(&dev->dev)));
    return dev->gen1_rq_instances ? UINT64_C(0x0058000060010070) :
                                   UINT64_C(0x0028000060000070);
 }

@@ -4,6 +4,7 @@
 #ifndef HK_GEN1_RT_INDIRECT_CONTRACT_H
 #define HK_GEN1_RT_INDIRECT_CONTRACT_H
 #include "asahi/lib/agx_scs_layout.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -32,7 +33,8 @@ hk_gen1_rt_indirect_contract_init(uint64_t packed,
                                 struct hk_gen1_rt_indirect_contract *out)
 {
    struct agx_scs_layout_gen2 scs;
-   if (!out || packed != HK_GEN1_RT_CANDIDATE_LAYOUT ||
+   if (!out || (packed != HK_GEN1_RT_CANDIDATE_LAYOUT &&
+                packed != agx_gen1_rt_candidate_layout(AGX_G17P_RT_PAD_QUERY)) ||
        !agx_scs_layout_gen1_init(packed, &scs))
       return false;
    uint64_t cliques = (packed >> 24) & 255;
@@ -40,7 +42,7 @@ hk_gen1_rt_indirect_contract_init(uint64_t packed,
    uint64_t stride = (packed >> 48) * 32;
    uint64_t end = (uint64_t)scs.end[5] + cliques * stride;
    if (cliques != 96 || slots != HK_GEN1_RQ_PHYSICAL_SLOTS ||
-       scs.end[5] != 0x2f8000 || stride != 304 * 32 ||
+       scs.end[5] != 0x2f8000 ||
        end != scs.end[10] || end != scs.end[12] || end > UINT32_MAX)
       return false;
    /* Candidate records, instance pointers and mask/control fields fit every

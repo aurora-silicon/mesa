@@ -1712,9 +1712,12 @@ hk_codegen_env_hash(void)
          for (size_t o = 0; o + l <= name_len && !skip; ++o)
             skip = !strncmp(*e + o, runtime_only[i], l);
       }
-      /* HK_PERFTEST includes code-generation choices such as noborder. */
+      /* These PERF options include code-generation choices. In particular,
+       * ray-query arms must never reuse the baseline pipeline binary. */
       if (!skip || (name_len == strlen("HK_PERFTEST") &&
-                    !strncmp(*e, "HK_PERFTEST", name_len)))
+                    !strncmp(*e, "HK_PERFTEST", name_len)) ||
+          (name_len == strlen("ASAHI_G17P_RT_PERF_ARM") &&
+           !strncmp(*e, "ASAHI_G17P_RT_PERF_ARM", name_len)))
          list[n++] = *e;
    }
    qsort(list, n, sizeof(list[0]), hk_env_cmp);

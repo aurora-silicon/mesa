@@ -4,6 +4,7 @@
 #include "hk_cmd_buffer.h"
 #include "hk_acceleration_structure.h"
 #include "asahi/lib/agx_scs_layout.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
 #include "util/u_debug.h"
 #include <string.h>
 
@@ -89,7 +90,8 @@ hk_gen1_upload_fragment_query_state(struct hk_cmd_buffer *cmd, bool vertex_stage
             0x100,0x10002,0x1ffff,0x20000,0xfffff,0x400000,
             0x1f000001,0x34a00000,0xfe000000,0xfe1ffffe,0xfffe0000,0xfffeff00};
          memcpy((uint8_t*)u.cpu+110*2,constants,sizeof(constants));
-         ((uint32_t*)u.cpu)[104/2]=304;
+         ((uint32_t*)u.cpu)[104/2]=agx_gen1_rt_driver_bytes(
+            agx_g17p_rt_perf_arms(agx_is_a18_pro(&dev->dev)));
       }
       {
          struct agx_ptr profile=hk_pool_alloc(cmd,sizeof(packed),8);

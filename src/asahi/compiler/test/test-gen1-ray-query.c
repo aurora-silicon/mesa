@@ -2,11 +2,17 @@
 #include "agx_debug.h"
 #include "agx_nir.h"
 #include "agx_nir_gen1_ray_query.h"
+#include "asahi/lib/agx_g17p_rt_perf.h"
+#include <inttypes.h>
 #include "compiler/nir/nir_builder.h"
 #include "compiler/glsl_types.h"
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+static unsigned test_arms;
+static int fixed_flags = -1;
+
 static void
 standard_ray_query(unsigned count, unsigned array, bool instances, bool candidates,
                    bool wrapper)
@@ -44,7 +50,7 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
       nir_def *rq = &deref->def;
       rqs[i] = rq;
       nir_rq_initialize(&b, rq, nir_imm_int64(&b, 0x10002000000ull),
-                        candidates ? nir_ishl_imm(&b,nir_iand_imm(&b,nir_load_local_invocation_index(&b),1),1) : nir_imm_int(&b, 1), nir_imm_int(&b, 255),
+                        fixed_flags >= 0 ? nir_imm_int(&b, fixed_flags) : candidates ? nir_ishl_imm(&b,nir_iand_imm(&b,nir_load_local_invocation_index(&b),1),1) : nir_imm_int(&b, 1), nir_imm_int(&b, 255),
                         nir_imm_vec3(&b, 0, 0, -1), nir_imm_float(&b, 0),
                         nir_imm_vec3(&b, 0, 0, 1), nir_imm_float(&b, 10));
    }
@@ -109,6 +115,7 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
       .payload_uniform = candidates ? 118 : 124, .bvh_uniform = 96,
       .status_uniform = candidates ? 128 : instances ? 130 : 128,
       .instance_traversal=instances,.candidates=candidates,
+      .perf_arms = test_arms,
       .launch_header = candidates ? 0x210000 : 0x110000,
    };
    struct agx_gen1_ray_query_layout bad_layout = layout;
@@ -169,6 +176,28 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
          }
       }
    }
+   nir_validate_shader(b.shader, "Gen1 performance arm lowering");
+   if (fixed_flags >= 0) {
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_constant_folding);
+      unsigned controls = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_scs_indexed_agx ||
+                nir_intrinsic_base(intr) != 0 || nir_intrinsic_component(intr) != 3)
+               continue;
+            assert(nir_src_is_const(intr->src[0]));
+            const bool hw = !(fixed_flags &
+               ((test_arms & AGX_G17P_RT_HW_OPAQUE) ? 0x1f2 : 0x1f3));
+            assert(nir_src_comp_as_uint(intr->src[0], 0) == (hw ? 0x9942 : 0x9142));
+            ++controls;
+         }
+      }
+      assert(controls);
+   }
    agx_preprocess_nir(b.shader);
    struct agx_shader_key key = {
       .dev = {.chip = AGX_CHIP_G17P, .encoding = AGX_ISA_ENCODING_AGX3B},
@@ -178,6 +207,11 @@ standard_ray_query(unsigned count, unsigned array, bool instances, bool candidat
    struct agx_shader_part part = {0};
    assert(agx_compile_shader_nir(b.shader, &key, &part));
    assert(part.info.uses_ray_traversal && part.info.main_size);
+   uint64_t hash = UINT64_C(14695981039346656037);
+   for (unsigned i = 0; i < part.info.binary_size; ++i)
+      hash = (hash ^ ((uint8_t *)part.binary)[i]) * UINT64_C(1099511628211);
+   printf("GEN1_BINARY count=%u array=%u instances=%u candidates=%u wrapper=%u arms=%u flags=%d hash=%016" PRIx64 "\n",
+          count, array, instances, candidates, wrapper, test_arms, fixed_flags, hash);
    free(part.binary);
    ralloc_free(b.shader);
    printf("Gen1_STANDARD_RAY_QUERY_PASS count=%u array=%u candidates=%u wrapper=%u\n", count, array, candidates, wrapper);
@@ -196,6 +230,22 @@ int main(void) {
  standard_ray_query(8, 2, true, false, false);
  standard_ray_query(1, 0, true, true, false);
  standard_ray_query(1, 0, true, true, true);
+ fixed_flags = 1;
+ standard_ray_query(1, 0, true, true, false);
+ for (unsigned bit = 0; bit < 9; ++bit) {
+    test_arms = 1u << bit;
+    fixed_flags = 1;
+    standard_ray_query(1, 0, true, true, false);
+ }
+ test_arms = AGX_G17P_RT_PERF_ALL;
+ standard_ray_query(1, 0, true, true, false);
+ /* Hardware commits must still respect NoOpaque, facing/opacity culls,
+  * and SkipTriangles even with ForceOpaque and every experiment enabled. */
+ const unsigned restricted[] = {2, 1 | 16, 1 | 32, 1 | 64, 1 | 128, 1 | 256};
+ for (unsigned i = 0; i < ARRAY_SIZE(restricted); ++i) {
+    fixed_flags = restricted[i];
+    standard_ray_query(1, 0, true, true, false);
+ }
  glsl_type_singleton_decref();
  return 0;
 }

@@ -12,6 +12,7 @@ struct agx_gen1_ray_query_layout {
    bool compute_kernel;
    bool position_fetch;
    bool diagnostic_features;
+   unsigned perf_arms; /* AGX_G17P_RT_* experiments, selected by the driver */
 };
 #define AGX_GEN1_VERTEX_DIRECTORY_VA UINT64_C(0x10040000000)
 #define AGX_GEN1_VERTEX_DIRECTORY_BYTES 0x8000u
@@ -20,6 +21,10 @@ nir_def *agx_nir_gen1_vertex_position_address(struct nir_builder *b, nir_def *in
                                               nir_def *geometry, nir_def *primitive);
 bool agx_nir_lower_gen1_ray_query(nir_shader *shader,
    const struct agx_gen1_ray_query_layout *layout);
+
+nir_def *agx_nir_gen1_refill_candidate_queue_perf(struct nir_builder *b,
+   nir_def *query, nir_def *lane, nir_def *id, nir_def *best_distance,
+   nir_def *tmax_dirty, unsigned arms);
 
 /* Native G17P candidate profile: 20-byte records, ten records per lane.
  * These helpers read an existing queue; they do not proceed or confirm it. */
