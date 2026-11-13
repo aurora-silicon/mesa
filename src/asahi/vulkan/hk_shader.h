@@ -427,6 +427,11 @@ struct hk_api_shader {
     * there, so a cache never hands it out unneeded). */
    bool border_emulating;
 
+   /* Compiled with agx_nir_lower_clip_m1_1 where it rasterizes; a mesh shader
+    * sets it when its device enabled depthClipControl (serialized: a binary
+    * without it is refused by a device that enabled the feature). */
+   bool clip_m1_1;
+
    /* G17P: non-NULL for a fragment shader compiled without its mesh shader
     * that reads per-primitive inputs, gl_PrimitiveID, gl_Layer or
     * gl_ViewportIndex. A mesh shader stores those in per-primitive records

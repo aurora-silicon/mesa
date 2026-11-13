@@ -857,8 +857,11 @@ struct hk_mesh_fs_twin {
 static enum hk_feature_key
 hk_make_feature_key(const struct vk_features *feats)
 {
+   /* Shader objects and internal shaders have no features to go by. A shader
+    * object binary must not depend on the features its device enabled, so
+    * assume every state they can draw with. */
    if (!feats)
-      return HK_FEAT_CUSTOM_BORDER;
+      return HK_FEAT_CUSTOM_BORDER | HK_FEAT_DEPTH_CLIP_CONTROL;
 
    return (feats->customBorderColors ? HK_FEAT_CUSTOM_BORDER : 0) |
           (feats->descriptorBindingSampledImageUpdateAfterBind
@@ -889,6 +892,19 @@ hk_pipeline_has_no_fragment_shader(const struct vk_graphics_pipeline_state *stat
    return state && !(state->shader_stages & VK_SHADER_STAGE_FRAGMENT_BIT) &&
           (state->ial != NULL ||
            BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_INPUT_ATTACHMENT_MAP));
+}
+
+/* Whether the last pre-rasterization stage applies agx_nir_lower_clip_m1_1.
+ * Every shader of a device that enabled depthClipControl needs it, internal
+ * ones included. A shader object applies it wherever the feature exists, so
+ * its binary is the same whether or not its device enabled the feature; the
+ * coefficient is 0 unless negativeOneToOne is set. */
+static bool
+hk_clip_m1_1(const struct hk_device *dev, enum hk_feature_key features)
+{
+   return dev->vk.enabled_features.depthClipControl ||
+          ((features & HK_FEAT_DEPTH_CLIP_CONTROL) &&
+           dev->vk.physical->supported_features.depthClipControl);
 }
 
 /* Whether a mesh shader can draw with negativeOneToOne. Shader objects and
@@ -4052,7 +4068,7 @@ hk_g17p_saturate_layer_viewport(nir_builder *b, nir_intrinsic_instr *intr,
 static void
 hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
                bool kill_psiz, bool layer_as_varying, bool default_layer,
-               bool original_vertex_stage)
+               bool original_vertex_stage, bool clip_m1_1)
 {
    /* Point size must be clamped, excessively large points don't render
     * properly on G13.
@@ -4066,9 +4082,7 @@ hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
                nir_metadata_control_flow, NULL);
    }
 
-   /* Not the feature key: internal shaders such as the passthrough geometry
-    * shader rasterize too, and they compile without features. */
-   if (dev->vk.enabled_features.depthClipControl)
+   if (clip_m1_1)
       NIR_PASS(_, nir, agx_nir_lower_clip_m1_1);
 
    NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL, NULL);
@@ -5143,7 +5157,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             NIR_PASS(_, nir, agx_nir_preserve_position_order);
          hk_lower_hw_vs(dev, nir, shader, kill_psiz,
                         agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                        default_layer, sw_stage == MESA_SHADER_VERTEX);
+                        default_layer, sw_stage == MESA_SHADER_VERTEX,
+                        hk_clip_m1_1(dev, features));
          outputs = nir->info.outputs_written;
       } else {
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
@@ -6365,6 +6380,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    obj->g17p_sample_variants = sample_variant_count;
    obj->border_emulating = border_emulating;
+   /* Mesh shaders decide with the pipeline state (hk_mesh_clip_m1_1()). */
+   obj->clip_m1_1 = info->stage == MESA_SHADER_MESH
+                       ? dev->vk.enabled_features.depthClipControl
+                       : hk_clip_m1_1(dev, features);
 
    if (border_nir) {
       obj->border_source = hk_compile_source_create(
@@ -6795,7 +6814,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       hk_lower_hw_vs(dev, rast, shader, false,
                      agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip),
-                     true, false);
+                     true, false, hk_clip_m1_1(dev, features));
       shader->info.gs = count_variant->info.gs;
       main_variant->info.gs = count_variant->info.gs;
 
@@ -7718,11 +7737,14 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    const bool has_border_source = variant_flags & 8;
    const bool border_emulating = variant_flags & 16;
    const bool has_mesh_source = variant_flags & 64;
-   /* Compiled with or without the depth clip control lowering. */
+   /* Compiled with or without the depth clip control lowering. With it, the
+    * shader is right on any device that has the feature; without it, only on
+    * one that did not enable it. */
    const bool clip_z = variant_flags & 128;
    /* Graphics, compute, task and mesh stages. */
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
-       clip_z != dev->vk.enabled_features.depthClipControl ||
+       (clip_z ? !dev->vk.physical->supported_features.depthClipControl
+               : dev->vk.enabled_features.depthClipControl) ||
        (has_mesh_source && (stage != MESA_SHADER_FRAGMENT ||
                             dev->dev.chip != AGX_CHIP_G17P)) ||
        (has_source && !sample_variants) ||
@@ -7756,6 +7778,7 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
 
    obj->g17p_sample_variants = sample_variant_count;
    obj->border_emulating = border_emulating;
+   obj->clip_m1_1 = clip_z;
 
    hk_foreach_variant(obj, shader) {
       VkResult result;
@@ -7911,6 +7934,7 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
    obj->is_passthrough = src_obj->is_passthrough;
    obj->g17p_sample_variants = src_obj->g17p_sample_variants;
    obj->border_emulating = src_obj->border_emulating;
+   obj->clip_m1_1 = src_obj->clip_m1_1;
    obj->binary_cache_entry = entry;
 
    if (src_obj->sample_source) {
@@ -8156,8 +8180,7 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
                              (obj->border_emulating ? 16 : 0) |
                              (obj->g17p_sample_variants == 4 ? 32 : 0) |
                              (obj->mesh_source ? 64 : 0) |
-                             (vk_dev->enabled_features.depthClipControl ? 128
-                                                                        : 0));
+                             (obj->clip_m1_1 ? 128 : 0));
 
    hk_foreach_variant(obj, shader) {
       const unsigned i = shader - obj->variants;

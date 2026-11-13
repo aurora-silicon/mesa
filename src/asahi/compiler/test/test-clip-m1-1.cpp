@@ -22,6 +22,20 @@ mesh_shader()
                                          "clip m1_1");
 }
 
+/* The lowered z: the lerp where the coefficient is nonzero, else z itself. */
+nir_alu_instr *
+lowered_lerp(nir_def *store_src, unsigned comp, nir_scalar *orig_z)
+{
+   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(store_src, comp));
+   if (!nir_scalar_is_alu(z) || nir_scalar_alu_op(z) != nir_op_bcsel)
+      return NULL;
+   *orig_z = nir_scalar_chase_movs(nir_scalar_chase_alu_src(z, 2));
+   nir_scalar lerp = nir_scalar_chase_movs(nir_scalar_chase_alu_src(z, 1));
+   if (!nir_scalar_is_alu(lerp) || nir_scalar_alu_op(lerp) != nir_op_ffma)
+      return NULL;
+   return nir_def_as_alu(lerp.def);
+}
+
 } // namespace
 
 TEST(ClipM1_1, FullStoreIsLowered)
@@ -34,10 +48,11 @@ TEST(ClipM1_1, FullStoreIsLowered)
    ASSERT_TRUE(agx_nir_lower_clip_m1_1(b.shader));
    nir_validate_shader(b.shader, "clip m1_1");
 
-   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(store->src[0].ssa, 2));
-   ASSERT_TRUE(nir_scalar_is_alu(z));
-   EXPECT_EQ(nir_scalar_alu_op(z), nir_op_ffma);
-   EXPECT_TRUE(nir_alu_instr_no_reassoc(nir_def_as_alu(z.def)));
+   nir_scalar orig_z;
+   nir_alu_instr *lerp = lowered_lerp(store->src[0].ssa, 2, &orig_z);
+   ASSERT_NE(lerp, nullptr);
+   EXPECT_TRUE(nir_alu_instr_no_reassoc(lerp));
+   EXPECT_TRUE(nir_scalar_equal(orig_z, nir_get_scalar(pos, 2)));
    ralloc_free(b.shader);
 }
 
@@ -70,9 +85,8 @@ TEST(ClipM1_1, ZwStoreIsLowered)
    ASSERT_TRUE(agx_nir_lower_clip_m1_1(b.shader));
    nir_validate_shader(b.shader, "clip m1_1");
 
-   nir_scalar z = nir_scalar_chase_movs(nir_get_scalar(zw->src[0].ssa, 0));
-   ASSERT_TRUE(nir_scalar_is_alu(z));
-   EXPECT_EQ(nir_scalar_alu_op(z), nir_op_ffma);
+   nir_scalar orig_z;
+   ASSERT_NE(lowered_lerp(zw->src[0].ssa, 0, &orig_z), nullptr);
    ralloc_free(b.shader);
 }
 

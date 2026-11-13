@@ -50,9 +50,12 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
    nir_def *w = nir_channel(b, pos, zi + 1);
    nir_def *c = nir_load_clip_z_coeff(b);
 
-   /* Lerp. If c = 0, reduces to z. If c = 1/2, reduces to (z + w)/2 */
-   nir_def *new_z = nir_ffma(b, z, nir_fsub(b, nir_imm_float(b, 1.0f), c),
-                             nir_fmul(b, w, c));
+   /* Lerp. If c = 1/2, reduces to (z + w)/2. With c = 0, keep z exactly: the
+    * lerp would turn -0 into +0 and give NaN for an infinite w. */
+   nir_def *lerp = nir_ffma(b, z, nir_fsub(b, nir_imm_float(b, 1.0f), c),
+                            nir_fmul(b, w, c));
+   nir_def *new_z =
+      nir_bcsel(b, nir_fneu(b, c, nir_imm_float(b, 0.0f)), lerp, z);
    nir_src_rewrite(&intr->src[0], nir_vector_insert_imm(b, pos, new_z, zi));
    return true;
 }
