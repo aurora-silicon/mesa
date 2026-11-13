@@ -1,0 +1,8 @@
+Case list for a CTS check of continuation-mode compile time (not for merging).
+
+Build this branch with the Vulkan asahi driver and run every case in lss.txt
+(dEQP-VK.ray_tracing_pipeline.large_shader_set.*) with
+ASAHI_G17P_RT_CONTINUATION=1 in the environment, which forces continuation
+mode at every recursion depth. Cap each case at 90 s.
+Pass bar: every case passes, and each *.4096 case takes well under 90 s
+(before this fix they took 86-307 s in continuation mode).
