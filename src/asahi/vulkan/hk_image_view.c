@@ -507,6 +507,21 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
       cfg.dimension =
          translate_image_view_type(view->vk.view_type, msaa, layers > 1,
                                    usage, usage != HK_DESC_USAGE_SAMPLED);
+
+      /* The M5 and M5 Pro (G17G, G17S) write a layered image as 3D, with the
+       * layer in the z coordinate (agx3_pack_binary.c); only the M5 Max
+       * (G17C) takes a layer operand. Describe those stores as 3D, as
+       * Gallium does: a slice of a 3D image is a layer of the 2D array.
+       * End-of-tile stores use block access and keep their own dimension.
+       */
+      const bool layers_as_3d =
+         generation == 10 && agx_chip_g17_m5(dev->dev.chip) &&
+         dev->dev.chip != AGX_CHIP_G17C && !eot &&
+         layout->tiling != AIL_TILING_LINEAR &&
+         cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      if (layers_as_3d)
+         cfg.dimension = AGX_TEXTURE_DIMENSION_3D;
+
       cfg.layout = agx_translate_layout(layout->tiling);
       cfg.channels = ail_pixel_format[p_format].channels;
       cfg.type = ail_pixel_format[p_format].type;
@@ -581,6 +596,12 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
          } else {
             assert((layout->tiling != AIL_TILING_LINEAR) || (layers == 1));
             cfg.layers = layers;
+
+            /* A 3D image's depth shrinks with the selected level, the layer
+             * count of an array does not: scale the depth so that, at this
+             * level, it still bounds every layer of the view. */
+            if (layers_as_3d && cfg.level)
+               cfg.layers = MIN2((uint64_t)layers << cfg.level, 1u << 16);
          }
 
          cfg.levels = image->vk.mip_levels;
