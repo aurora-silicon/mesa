@@ -1894,6 +1894,13 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       .handle = submit_syncobj,
    };
 
+   /* A G17 refusal fills every output with an error fence, and another
+    * context's timeline wait can find it. Add the screen point only once the
+    * kernel has accepted the batch. */
+   const bool late_point = agx_m5_render_resources(dev);
+   if (late_point)
+      out_syncs[1] = out_syncs[2];
+
    /* G18G's bring-up submit path, like the M5 kernel it follows, admits
     * exactly one hardware command per submission, so every batch that needs
     * a compute prepass before its render -- which is every geometry-shader
@@ -2263,7 +2270,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       .flags = 0,
       .queue_id = ctx->queue_id,
       .in_sync_count = in_sync_count,
-      .out_sync_count = 3,
+      .out_sync_count = late_point ? 2 : 3,
       .syncs = (uint64_t)(uintptr_t)(m5_split_prepass ? out_syncs : syncs),
       .cmdbuf = (uint64_t)(uintptr_t)(cmdbuf.data),
       .cmdbuf_size = cmdbuf.size,
@@ -2345,6 +2352,17 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    if (compute_syncobj)
       drmSyncobjDestroy(dev->fd, compute_syncobj);
    drmSyncobjDestroy(dev->fd, submit_syncobj);
+
+   /* Add the screen point held back above. Failing that, finish the batch on
+    * the CPU and keep the older point: later work is ordered after it anyway. */
+   bool point_published = true;
+   if (late_point && drmSyncobjTransfer(dev->fd, screen->flush_syncobj, seqid,
+                                        batch->syncobj, 0, 0)) {
+      agx_msg("timeline point transfer failed; waiting for the batch\n");
+      drmSyncobjWait(dev->fd, &batch->syncobj, 1, INT64_MAX,
+                     DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+      point_published = false;
+   }
 
    /* Now stash our batch fence into any shared BOs. */
    if (shared_bo_count) {
@@ -2459,7 +2477,8 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    /* Update the last seqid in the context (must only happen if the submit
     * succeeded, otherwise the timeline point would not be valid).
     */
-   ctx->flush_last_seqid = seqid;
+   if (point_published)
+      ctx->flush_last_seqid = seqid;
 
    if (ctx->batch == batch)
       ctx->batch = NULL;
