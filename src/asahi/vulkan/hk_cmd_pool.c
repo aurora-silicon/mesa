@@ -683,12 +683,17 @@ struct hk_cmd_pending {
 
    /* One private binary syncobj per submit ioctl, whether its fence is
     * already known to have signalled without error, and scratch space for
-    * polling the others. Polling holds cmd_pending_lock.
+    * polling the others. Polling holds cmd_pending_lock. A syncobj may be
+    * reused from an earlier submission: a successful ioctl replaces its
+    * fence, so only submissions whose ioctls all succeeded are polled.
     */
    uint32_t *signals;
    uint32_t *unknown;
    bool *succeeded;
    unsigned chunks, attempted;
+
+   /* The queue timeline point its last ioctl signals. */
+   uint64_t point;
 
    unsigned count;
    struct hk_cmd_pin pins[];
@@ -811,6 +816,17 @@ hk_cmd_pending_release(struct hk_device *dev, struct hk_cmd_pending *p,
    vk_free(&dev->vk.alloc, p);
 }
 
+/* Keeps the syncobjs of a submission that completed without error, or that
+ * no ioctl used, for later submissions; release destroys the rest. Called
+ * with cmd_pending_lock held.
+ */
+static void
+hk_cmd_pending_recycle(struct hk_device *dev, struct hk_cmd_pending *p)
+{
+   while (p->chunks && dev->cmd_syncobj_count < HK_CMD_SYNCOBJ_POOL)
+      dev->cmd_syncobjs[dev->cmd_syncobj_count++] = p->signals[--p->chunks];
+}
+
 enum hk_cmd_pending_state {
    HK_PENDING_BUSY,
    HK_PENDING_SUCCEEDED,
@@ -820,15 +836,17 @@ enum hk_cmd_pending_state {
 /* A signalled ERROR is deliberately not completion for ownership purposes.
  * A private binary syncobj keeps the original fence, including its error;
  * exporting a pruned queue timeline point could instead yield a success
- * stub. One zero-timeout wait rejects a submission that is still running;
- * the status of each signalled fence is then read once and remembered.
+ * stub. Unless the queue timeline has already shown that the submission's
+ * fences signalled, one zero-timeout wait rejects a submission that is still
+ * running. The status of each signalled fence is then read once and
+ * remembered.
  */
 static enum hk_cmd_pending_state
-hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p)
+hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
 {
    unsigned unknown_count = 0;
 
-   for (unsigned i = 0; i < p->attempted; ++i) {
+   for (unsigned i = 0; wait && i < p->attempted; ++i) {
       if (!p->succeeded[i])
          p->unknown[unknown_count++] = p->signals[i];
    }
@@ -836,8 +854,8 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p)
    if (unknown_count &&
        drmSyncobjWait(dev->dev.fd, p->unknown, unknown_count, 0,
                       DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL)) {
-      /* A failed ioctl may have left a syncobj without any fence. That
-       * never changes: keep the memory, but stop polling it.
+      /* A syncobj without any fence never gets one: keep the memory, but
+       * stop polling it.
        */
       return errno == EINVAL ? HK_PENDING_FAILED : HK_PENDING_BUSY;
    }
@@ -848,7 +866,7 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p)
 
       int fd = -1;
       if (drmSyncobjExportSyncFile(dev->dev.fd, p->signals[i], &fd))
-         return HK_PENDING_BUSY;
+         return errno == EINVAL ? HK_PENDING_FAILED : HK_PENDING_BUSY;
 
       struct sync_file_info info = {0};
       int ret = ioctl(fd, SYNC_IOC_FILE_INFO, &info);
@@ -864,6 +882,71 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p)
    return HK_PENDING_SUCCEEDED;
 }
 
+/* Reaps after which a queue's oldest submission still blocks its timeline
+ * before later ones are polled, and how many still-running ones a reap
+ * polls then.
+ */
+#define HK_CMD_STALL_REAPS 16
+#define HK_CMD_STALL_POLLS 4
+
+/* A queue's submissions are in timeline order, and a reached timeline point
+ * means every timeline signal up to it has happened. Check the queue's
+ * submissions oldest first and stop at the first one past the reached point.
+ * The point only skips the wait: each submission's own syncobjs are still
+ * read before its memory is released. Fences on the timeline can signal out
+ * of order, so an unfinished submission can hold back finished ones behind
+ * it; once it has done so for a while, a few of them are also polled on each
+ * reap. Finished work behind several long-running submissions stays pinned
+ * until those finish. Called with cmd_pending_lock held.
+ */
+static void
+hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
+                          struct list_head *ready)
+{
+   uint64_t reached = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &reached, 1))
+      reached = 0;
+
+   struct hk_cmd_pending *oldest =
+      list_first_entry(&queue->cmd_pending, struct hk_cmd_pending, link);
+   if (oldest->point <= reached)
+      queue->cmd_stalled = 0;
+   else if (queue->cmd_stalled < HK_CMD_STALL_REAPS)
+      queue->cmd_stalled++;
+
+   unsigned polls =
+      queue->cmd_stalled >= HK_CMD_STALL_REAPS ? HK_CMD_STALL_POLLS : 0;
+
+   list_for_each_entry_safe(struct hk_cmd_pending, p, &queue->cmd_pending,
+                            link) {
+      const bool signalled = p->point <= reached;
+      if (!signalled && !polls)
+         break;
+
+      switch (hk_cmd_pending_poll(dev, p, !signalled)) {
+      case HK_PENDING_BUSY:
+         if (!signalled)
+            polls--;
+         break;
+      case HK_PENDING_SUCCEEDED:
+         list_del(&p->link);
+         hk_cmd_pending_recycle(dev, p);
+         list_addtail(&p->link, ready);
+         break;
+      case HK_PENDING_FAILED:
+         /* Its memory stays out of reuse until device destruction. */
+         list_del(&p->link);
+         list_addtail(&p->link, &dev->cmd_pending_failed);
+         break;
+      }
+   }
+
+   if (list_is_empty(&queue->cmd_pending)) {
+      list_del(&queue->cmd_link);
+      queue->cmd_stalled = 0;
+   }
+}
+
 void
 hk_cmd_pending_reap(struct hk_device *dev)
 {
@@ -875,22 +958,9 @@ hk_cmd_pending_reap(struct hk_device *dev)
    list_inithead(&ready);
 
    simple_mtx_lock(&dev->cmd_pending_lock);
-   list_for_each_entry_safe(struct hk_cmd_pending, p, &dev->cmd_pending,
-                            link) {
-      switch (hk_cmd_pending_poll(dev, p)) {
-      case HK_PENDING_BUSY:
-         break;
-      case HK_PENDING_SUCCEEDED:
-         list_del(&p->link);
-         list_addtail(&p->link, &ready);
-         break;
-      case HK_PENDING_FAILED:
-         /* Its memory stays out of reuse until device destruction. */
-         list_del(&p->link);
-         list_addtail(&p->link, &dev->cmd_pending_failed);
-         break;
-      }
-   }
+   list_for_each_entry_safe(struct hk_queue, queue, &dev->cmd_pending_queues,
+                            cmd_link)
+      hk_cmd_pending_reap_queue(dev, queue, &ready);
    simple_mtx_unlock(&dev->cmd_pending_lock);
 
    /* Releasing a span takes vdm.lock; never do it under the pending lock. */
@@ -931,8 +1001,16 @@ hk_cmd_pending_begin(struct hk_device *dev,
    p->unknown = p->signals + chunks;
    p->succeeded = (bool *)(p->unknown + chunks);
 
+   simple_mtx_lock(&dev->cmd_pending_lock);
+   while (p->chunks < chunks && dev->cmd_syncobj_count)
+      p->signals[p->chunks++] = dev->cmd_syncobjs[--dev->cmd_syncobj_count];
+   simple_mtx_unlock(&dev->cmd_pending_lock);
+
    for (; p->chunks < chunks; ++p->chunks) {
       if (drmSyncobjCreate(dev->dev.fd, 0, &p->signals[p->chunks])) {
+         simple_mtx_lock(&dev->cmd_pending_lock);
+         hk_cmd_pending_recycle(dev, p);
+         simple_mtx_unlock(&dev->cmd_pending_lock);
          hk_cmd_pending_release(dev, p, false);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
@@ -954,19 +1032,60 @@ hk_cmd_pending_signal(struct hk_cmd_pending *p)
    return p->signals[p->attempted++];
 }
 
+/* Called by the queue's serialized submission, after its last ioctl. */
 void
-hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p)
+hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
+                   struct hk_queue *queue, VkResult result)
 {
    if (!p)
       return;
 
+   simple_mtx_lock(&dev->cmd_pending_lock);
    if (!p->attempted) {
-      hk_cmd_pending_release(dev, p, false);
-      return;
+      /* No ioctl used its syncobjs or memory. */
+      hk_cmd_pending_recycle(dev, p);
+   } else if (result != VK_SUCCESS) {
+      /* A failed ioctl may leave a reused syncobj with its earlier fence.
+       * Never judge such a submission by its syncobjs: keep its memory.
+       */
+      list_addtail(&p->link, &dev->cmd_pending_failed);
+   } else {
+      /* The submission's last ioctl signals this point (earlier ioctls do too
+       * with chunk timelines; otherwise only their own syncobjs, which the
+       * reap still reads). Later submissions to the queue signal higher
+       * points.
+       */
+      p->point = queue->drm.timeline_value;
+      if (list_is_empty(&queue->cmd_pending)) {
+         list_addtail(&queue->cmd_link, &dev->cmd_pending_queues);
+      } else {
+         assert(list_last_entry(&queue->cmd_pending, struct hk_cmd_pending,
+                                link)->point < p->point);
+      }
+      list_addtail(&p->link, &queue->cmd_pending);
    }
+   simple_mtx_unlock(&dev->cmd_pending_lock);
+
+   if (!p->attempted)
+      hk_cmd_pending_release(dev, p, false);
+}
+
+/* The queue's timeline goes away with it. As at device destruction, its
+ * pending submissions keep their memory until the device is destroyed.
+ */
+void
+hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue)
+{
+   /* Queues are finished during device-init failure, before any submission. */
+   if (!dev->cmd_pending_ready)
+      return;
 
    simple_mtx_lock(&dev->cmd_pending_lock);
-   list_addtail(&p->link, &dev->cmd_pending);
+   if (!list_is_empty(&queue->cmd_pending)) {
+      list_del(&queue->cmd_link);
+      list_splicetail(&queue->cmd_pending, &dev->cmd_pending_failed);
+      list_inithead(&queue->cmd_pending);
+   }
    simple_mtx_unlock(&dev->cmd_pending_lock);
 }
 
@@ -977,14 +1096,17 @@ hk_cmd_pending_finish(struct hk_device *dev)
     * and kernel queues were destroyed. No application command recording is
     * allowed concurrently with DestroyDevice. This does not claim that queue
     * destruction drained the GPU: outstanding kernel mapping pins must
-    * survive the unbind/close operations below.
+    * survive the unbind/close operations below. Finishing each queue moved
+    * its pending submissions to the failed list.
     */
-   struct list_head *lists[] = {&dev->cmd_pending, &dev->cmd_pending_failed};
-
-   for (unsigned l = 0; l < ARRAY_SIZE(lists); ++l) {
-      list_for_each_entry_safe(struct hk_cmd_pending, p, lists[l], link) {
-         list_del(&p->link);
-         hk_cmd_pending_release(dev, p, true);
-      }
+   assert(list_is_empty(&dev->cmd_pending_queues));
+   list_for_each_entry_safe(struct hk_cmd_pending, p,
+                            &dev->cmd_pending_failed, link) {
+      list_del(&p->link);
+      hk_cmd_pending_release(dev, p, true);
    }
+
+   for (unsigned i = 0; i < dev->cmd_syncobj_count; ++i)
+      drmSyncobjDestroy(dev->dev.fd, dev->cmd_syncobjs[i]);
+   dev->cmd_syncobj_count = 0;
 }

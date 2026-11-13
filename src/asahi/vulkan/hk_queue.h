@@ -50,6 +50,14 @@ struct hk_queue {
       uint64_t signalled_value;
    } drm;
 
+   /* M5 submissions whose command memory is still pinned, oldest first
+    * (hk_cmd_pool.c), and the number of reaps since the oldest was last
+    * seen complete. Guarded by the device's cmd_pending_lock; cmd_link is
+    * in the device's cmd_pending_queues while cmd_pending is not empty. */
+   struct list_head cmd_pending;
+   struct list_head cmd_link;
+   unsigned cmd_stalled;
+
    /* Device-lifetime command storage for the G17P SSTT maintenance encoder.
     * Sparse image remaps submit this record before their signal operations. */
    struct agx_bo *g17p_sstt_flush_bo;

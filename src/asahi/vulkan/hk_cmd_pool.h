@@ -151,11 +151,14 @@ void hk_device_finish_vdm_slabs(struct hk_device *dev);
 
 /* Native M5 command-memory retirement, independent of API semaphores. */
 struct hk_cmd_pending;
+struct hk_queue;
 struct vk_queue_submit;
 VkResult hk_cmd_pending_begin(struct hk_device *dev,
                                const struct vk_queue_submit *submit,
                                unsigned chunks, struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
-void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending);
+void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
+                        struct hk_queue *queue, VkResult result);
 void hk_cmd_pending_reap(struct hk_device *dev);
+void hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue);
 void hk_cmd_pending_finish(struct hk_device *dev);

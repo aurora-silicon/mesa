@@ -2023,7 +2023,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                                    chunk_timelines, first_chunk_point, anatomy,
                                    pending);
    }
-   hk_cmd_pending_end(dev, pending);
+   hk_cmd_pending_end(dev, pending, queue, result);
    if (cumulative_signals && !kernel_cumulative) {
       /* The kernel can publish an error fence even when submission fails.
        * Forward it when present, without waiting for a missing queue point
@@ -2193,6 +2193,8 @@ hk_queue_create(struct hk_device *dev,
                                       8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!queue)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   list_inithead(&queue->cmd_pending);
 
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(pCreateInfo->pNext,
@@ -2368,6 +2370,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
    /* Stop/join the submit worker before releasing anything it can use. */
    vk_queue_finish(&queue->vk);
+   hk_cmd_pending_finish_queue(dev, queue);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
