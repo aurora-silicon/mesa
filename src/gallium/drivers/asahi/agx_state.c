@@ -844,6 +844,17 @@ agx_m5_dispatch_barrier_flags(const struct agx_device *dev)
    return dev->chip == AGX_CHIP_G18G ? 0 : 5;
 }
 
+DEBUG_GET_ONCE_BOOL_OPTION(m5_swtnl_tess, "ASAHI_M5_SWTNL_TESS", false)
+
+/* M5 tessellates on the GPU (agx_draw_patches), as hk does. With
+ * ASAHI_M5_SWTNL_TESS=1 it keeps the CPU path (agx_swtnl.c) instead. */
+bool
+agx_m5_gpu_tess(struct agx_context *ctx)
+{
+   return agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) &&
+          !debug_get_option_m5_swtnl_tess();
+}
+
 /* Room for a program's agx3d re-encoding: twice the G17G bound, which covers
  * every witness (the largest growth is f32mul's 8-byte form becoming 16).
  * The callers still refuse a program longer than what they allocated. */
@@ -2529,11 +2540,11 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
         * dispatches refuse a preamble (the M5 draw profile's "vertex
         * preamble", agx_g17p_append_compute()) and it has no AGX2 fallback
         * to run one, so a tessellation or geometry stage with a preamble
-        * could never launch there. */
+        * could never launch there. M5 likewise, now that its tessellation
+        * and geometry stages run on the GPU too (hk refuses their
+        * preambles on M5 as well). */
        .no_preamble = agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
-                       (agx_chip_g17_m5(dev->chip) &&
-                        (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT ||
-                         stage == MESA_SHADER_COMPUTE)),
+                       agx_chip_g17_m5(dev->chip),
       .g18_native_mixed = g18_native_mixed && dev->chip == AGX_CHIP_G18G,
    };
 
@@ -2589,12 +2600,12 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
        * geometry and tessellation control run as compute, tessellation
        * evaluation as the vertex shader (keeping its API stage for sysvals)
        * -- and both carry the texture and sampler table pointers in uniform
-       * halves 0..7. G17G publishes the same table for its vertex and
-       * compute stages. */
+       * halves 0..7. G17G publishes the same table for every stage but the
+       * fragment one too. */
       compiled->g17p_texture_resources =
-         (((agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G) && stage != MESA_SHADER_FRAGMENT) ||
-          (agx_chip_g17_m5(dev->chip) &&
-           (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_COMPUTE))) &&
+         (agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
+          agx_chip_g17_m5(dev->chip)) &&
+         stage != MESA_SHADER_FRAGMENT &&
          (BITSET_LAST_BIT(nir->info.textures_used) != 0 ||
           BITSET_LAST_BIT(nir->info.images_used) != 0);
       unsigned uniform_base =
@@ -4497,9 +4508,16 @@ agx_update_tcs(struct agx_context *ctx, const struct pipe_draw_info *info)
 {
    assert(info->mode == MESA_PRIM_PATCHES);
 
-   ctx->tcs = _mesa_hash_table_next_entry(
-                 ctx->stage[MESA_SHADER_TESS_CTRL].shader->variants, NULL)
-                 ->data;
+   struct hash_entry *he = _mesa_hash_table_next_entry(
+      ctx->stage[MESA_SHADER_TESS_CTRL].shader->variants, NULL);
+   if (he) {
+      ctx->tcs = he->data;
+      return true;
+   }
+
+   /* M5 compiles its only variant on first use (agx_create_shader_state). */
+   union asahi_shader_key key = {0};
+   agx_update_shader(ctx, &ctx->tcs, MESA_SHADER_TESS_CTRL, &key);
    return true;
 }
 
@@ -7033,11 +7051,14 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
       ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
    const mesa_shader_stage stage = cs->stage;
+   /* A tessellation evaluation shader run as the vertex shader takes the
+    * pair like the vertex shader. */
+   const bool vertex_stage =
+      stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_TESS_EVAL;
    const bool resource_pair =
       batch->texture_count[stage] != 0 &&
       (stage == MESA_SHADER_FRAGMENT ||
-       (stage == MESA_SHADER_VERTEX &&
-        cs->g17p_texture_resources));
+       (vertex_stage && cs->g17p_texture_resources));
 
    /* G17G fragments reserve the same eight-half prefix for their texture
     * and sampler table pointers: Apple's own applegpu_g17g fragment with one
@@ -7082,7 +7103,7 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
       /* Fragment uniform zero is deliberately replaced by the resource pair.
        * A textured VS instead shifts its complete fixed ABI; trimming a VBO
        * or draw-parameter range here would corrupt vertex fetches. */
-      if (resource_pair && stage == MESA_SHADER_VERTEX &&
+      if (resource_pair && vertex_stage &&
           push->uniform < AGX_ABI_G17P_TEXTURE_POINTER_HALFS)
          AGX3_PROGRAM_REFUSE("textured vertex ABI shift");
 
@@ -7577,8 +7598,13 @@ agx_g17p_append_compute(struct agx_batch *batch,
    /* G17G takes the captured M5 direct record and its own program
     * generator; the G17P path below cannot encode it. */
    if (g17g) {
+      /* An indirect-local grid comes only from the geometry prepass of a
+       * tessellated draw (agx_launch_gs_prerast), as in hk. */
       if ((dev->chip != AGX_CHIP_G17P && !g17g) ||
-          (g17g && grid.mode != AGX_CDM_MODE_DIRECT) || !info || !binary ||
+          (g17g && grid.mode != AGX_CDM_MODE_DIRECT &&
+           !(indirect_local && agx_m5_gpu_tess(batch->ctx) &&
+             batch->ctx->in_tess)) ||
+          !info || !binary ||
           (grid.mode != AGX_CDM_MODE_DIRECT && !indirect_local) ||
           (indirect_local &&
            (!grid.ptr || grid.ptr >= (UINT64_C(1) << 48) || (grid.ptr & 3))) ||
@@ -7753,9 +7779,12 @@ agx_g17p_append_compute(struct agx_batch *batch,
       };
       if (indirect_local) {
          /* The kernel that writes this grid is already its own dispatch earlier
-          * in the stream, behind a full barrier, so the launch stands alone. */
-         if (!agx3_g17p_native_indirect_compute_launch_append(&native.launch,
-                                                              grid.ptr, 0, &sink))
+          * in the stream, behind a full barrier, so the launch stands alone.
+          * M5 reads the local size from the grid too (hk_dispatch_m5_native). */
+         if (!(g17g ? agx3_m5_native_indirect_dispatch_append(
+                         &g17g_launch, grid.ptr, NULL, 5, &sink)
+                    : agx3_g17p_native_indirect_compute_launch_append(
+                         &native.launch, grid.ptr, 0, &sink)))
             return false;
       } else {
          const struct agx3_compute_direct_grid direct = {
@@ -8714,6 +8743,180 @@ agx_launch_precomp_m5(struct agx_batch *batch, struct agx_grid grid,
    agx_batch_add_bo(batch, cs->bo);
 }
 
+/* The kernels of the GPU tessellation prepass, and of the geometry prepass
+ * a tessellated draw feeds. Indirect patch draws are read back on the CPU,
+ * so the indirect tessellation setup is never needed. */
+static bool
+agx_m5_precomp_admitted(enum libagx_program program, bool in_tess)
+{
+   switch (program) {
+   case LIBAGX_TESS_ISOLINE_0:
+   case LIBAGX_TESS_ISOLINE_1:
+   case LIBAGX_TESS_TRI_0:
+   case LIBAGX_TESS_TRI_1:
+   case LIBAGX_TESS_QUAD_0:
+   case LIBAGX_TESS_QUAD_1:
+   case LIBAGX_PREFIX_SUM_TESS_0:
+   case LIBAGX_PREFIX_SUM_TESS_1:
+      return true;
+   case LIBAGX_GS_SETUP_INDIRECT:
+   case LIBAGX_PREFIX_SUM_GEOM:
+      return in_tess;
+   default:
+      return false;
+   }
+}
+
+/* A precompiled kernel on G17G, G17S and G17C, as hk_dispatch_precomp_m5()
+ * launches it: the M5 compute program with the kernel's spill frame and
+ * threadgroup memory, and the M5 launch record. Unlike hk, each dispatch is
+ * its own command (agx_batch_submit()), as on the API compute path. */
+static void
+agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
+                          const struct agx_precompiled_shader *cs,
+                          const void *args, size_t arg_size,
+                          uint32_t program_id)
+{
+   struct agx_device *dev = agx_device(batch->ctx->base.screen);
+
+   if (!cs->bo || !cs->info.main_size || !cs->info.nr_gprs ||
+       cs->info.nr_preamble_gprs ||
+       (cs->info.agx3_tps_size &&
+        !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) ||
+       cs->info.local_size > 32768 || !cs->info.agx3_staging_known ||
+       (cs->info.rodata.size_16 && !cs->rodata_offset) ||
+       (cs->info.printf_uniform &&
+        cs->info.printf_uniform < AGX_ABI_AGX3_PRECOMP_ARG_HALFS) ||
+       !args || !arg_size || arg_size > UINT16_MAX * 2u ||
+       cs->entry_offset > UINT64_MAX - cs->ptr ||
+       !cs->b.workgroup.x || !cs->b.workgroup.y || !cs->b.workgroup.z ||
+       (agx_is_indirect(grid) &&
+        (!grid.ptr || grid.ptr >= (UINT64_C(1) << 48) || (grid.ptr & 3)))) {
+      agx_native_descriptor_reject_batch(batch, "precompiled M5 compute program");
+      return;
+   }
+
+   /* grid.count shares storage with grid.ptr. */
+   if (!agx_is_indirect(grid) &&
+       (!grid.count[0] || !grid.count[1] || !grid.count[2]))
+      return;
+
+   struct agx3_ioto_uniform_range ranges[2];
+   unsigned range_count;
+   if (!agx_precomp_agx3_uniform_ranges(batch, cs, args, arg_size, ranges,
+                                        &range_count))
+      return;
+
+   struct agx_bo *program_bo = NULL;
+   struct agx_ptr program = agx_pool_alloc_aligned_with_bo(
+      &batch->pipeline_pool, AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
+      AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
+   const uint64_t shader_va = cs->ptr + cs->entry_offset;
+   const struct agx3_g17p_graphics_program_desc desc = {
+      .program_va = program.gpu,
+      .shader_va = shader_va,
+      .uniform_ranges = ranges,
+      .uniform_range_count = range_count,
+      .shader_binary_size = cs->info.main_size,
+      /* The tessellator spills (agx_launch_precomp's G17P path). */
+      .scratch_size = cs->info.agx3_tps_size,
+      .nr_gprs = cs->info.nr_gprs,
+      .compiler_d_valid = cs->info.agx3_staging_known,
+      .compiler_d = (uint32_t)cs->info.agx3_staging_halfs * 2,
+      /* The prefix sums keep cross-subgroup scratch here; allocate the 4x
+       * strided footprint, as the API and G18G paths do. */
+      .threadgroup_memory_size_B =
+         cs->info.local_size
+            ? MAX2(256u, ALIGN_POT(cs->info.local_size * 4, 64u))
+            : 0,
+   };
+   struct agx3_g17p_native_compute_program_desc bind_desc = {
+      .program_va = program.gpu,
+      .shader_va = shader_va,
+   };
+   struct agx3_g17p_graphics_program generated;
+   struct agx3_compute_program launch;
+   if (!program.cpu || !program_bo ||
+       !agx_va_in_usc_window(dev, program.gpu) ||
+       !agx_va_in_usc_window(dev, shader_va) ||
+       !agx3_cdm_direct_template_sources_compute(false, false, false,
+                                                 &bind_desc.launch_sources) ||
+       !agx3_g17g_compute_program_generate(dev->chip, &desc, &generated) ||
+       generated.length > AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE ||
+       !agx3_m5_native_compute_program_bind(dev->chip, &bind_desc, &launch)) {
+      agx_native_descriptor_reject_batch(batch, "precompiled M5 compute Ioto");
+      return;
+   }
+   memcpy(program.cpu, generated.bytes, generated.length);
+   if (agx_bo_sync_for_device(program_bo, program.gpu - program_bo->va->addr,
+                              generated.length)) {
+      agx_native_descriptor_reject_batch(batch, "precompiled compute upload");
+      return;
+   }
+
+   const uint8_t *cdm_base_map =
+      batch->cdm.bo ? agx_bo_map(batch->cdm.bo) : NULL;
+   if (!cdm_base_map) {
+      agx_native_descriptor_reject_batch(batch, "precompiled compute launch");
+      return;
+   }
+   const uint32_t dispatch_start = batch->cdm.current - cdm_base_map;
+   struct agx3_compute_dispatch_sink sink = {
+      .data = batch->cdm.current,
+      .capacity = batch->cdm.end - batch->cdm.current,
+   };
+   const uint32_t local[3] = {cs->b.workgroup.x, cs->b.workgroup.y,
+                              cs->b.workgroup.z};
+   const uint8_t flags = agx_m5_dispatch_barrier_flags(dev);
+   bool launched;
+   if (agx_is_indirect(grid)) {
+      launched = agx3_m5_native_indirect_dispatch_append(
+         &launch, grid.ptr,
+         grid.mode == AGX_CDM_MODE_INDIRECT_GLOBAL ? local : NULL, flags,
+         &sink);
+   } else {
+      const struct agx3_compute_direct_grid direct = {
+         .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
+         .size = {grid.count[0], grid.count[1], grid.count[2]},
+         .local_size = {local[0], local[1], local[2]},
+         .dimensions = grid.count[2] != 1 || local[2] != 1 ? 3
+                       : grid.count[1] != 1 || local[1] != 1 ? 2 : 1,
+      };
+      launched = agx3_m5_native_compute_dispatch_append(&launch, &direct,
+                                                        flags, &sink);
+   }
+
+   uint8_t terminate[AGX3_CDM_STREAM_TERMINATE_SIZE];
+   if (!launched ||
+       !agx3_cdm_stream_terminate_pack(dev->chip, terminate) ||
+       sink.capacity - sink.length < sizeof(terminate)) {
+      agx_native_descriptor_reject_batch(batch, "precompiled compute launch");
+      return;
+   }
+   memcpy(sink.data + sink.length, terminate, sizeof(terminate));
+   sink.length += sizeof(terminate);
+   batch->cdm.current += sink.length;
+
+   if (!agx_record_cdm_dispatch(batch, dispatch_start,
+                                batch->cdm.current - cdm_base_map, grid,
+                                cs->b.workgroup, shader_va, program_id)) {
+      agx_native_descriptor_reject_batch(batch, "compute dispatch allocation");
+      return;
+   }
+
+   /* The spill frame and threadgroup memory, as hk_m5_compute_resources()
+    * lists them. The check above admits a spill frame on this feature. */
+   if (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES) {
+      const struct drm_asahi_compute_program profile = {
+         .primary_bytes = desc.scratch_size,
+         .threadgroup_bytes = desc.threadgroup_memory_size_B,
+         .threads = local[0] * local[1] * local[2],
+      };
+      agx_batch_note_m5_compute_program(batch, &profile);
+   }
+   agx_batch_add_bo(batch, cs->bo);
+}
+
 void
 agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                    enum agx_barrier barrier, enum libagx_program program,
@@ -8893,10 +9096,15 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
       return;
    }
 
-   /* G17G has no precompiled libagx programs yet: refuse the batch instead
-    * of dereferencing a missing one on the AGX2 path below. */
+   /* M5 launches the tessellation and geometry kernels (as hk does) and
+    * refuses the batch for every other one, instead of dereferencing a
+    * missing program on the AGX2 path below. */
    if (agx_chip_g17_m5(dev->chip)) {
-      agx_native_descriptor_reject_batch(batch, "precompiled compute program");
+      if (cs && agx_m5_gpu_tess(batch->ctx) &&
+          agx_m5_precomp_admitted(program, batch->ctx->in_tess))
+         agx_launch_precomp_g17_m5(batch, grid, cs, args, arg_size, program);
+      else
+         agx_native_descriptor_reject_batch(batch, "precompiled compute program");
       return;
    }
 
@@ -13789,9 +13997,15 @@ agx_needs_passthrough_gs(struct agx_context *ctx,
       return true;
    }
 
-   /* TODO: this is really sloppy, we should add a VDM kernel for this. */
+   /* TODO: this is really sloppy, we should add a VDM kernel for this.
+    *
+    * M5 rasterizes no geometry-shader draw; its tessellation prepass counts
+    * the primitives instead (agx_draw_patches), as hk does.
+    */
    if ((indirect || info->mode == MESA_PRIM_PATCHES) && ctx->active_queries &&
-       ctx->prims_generated[0]) {
+       ctx->prims_generated[0] &&
+       !(agx_m5_gpu_tess(ctx) &&
+         (info->mode == MESA_PRIM_PATCHES || ctx->in_tess))) {
       perf_debug_ctx(ctx, "Using passthrough GS due to indirect prim query");
       return true;
    }
@@ -14053,6 +14267,17 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    size_t draw_stride = 5 * sizeof(uint32_t);
 
    struct agx_batch *batch = agx_get_batch(ctx);
+
+   /* M5 submits each dispatch from where it was recorded, so its control
+    * stream cannot be continued in another buffer: start a new batch first. */
+   const bool m5 = agx_chip_g17_m5(dev->chip);
+   if (m5 && batch->cdm.bo && batch->cdm.end - batch->cdm.current < 0x10000) {
+      agx_flush_batch_for_reason(ctx, batch, "M5 compute stream full");
+      batch = agx_get_batch(ctx);
+      /* Still a render of its own (agx_draw_vbo()). */
+      batch->g17g_prims = AGX_G17G_RENDER_PRIMS;
+   }
+
    agx_batch_init_state(batch);
 
    if (!batch->cdm.bo) {
@@ -14223,27 +14448,44 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    uint64_t c_invs = agx_get_query_address(
       batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_INVOCATIONS]);
 
+   /* Primitives generated: elsewhere a passthrough geometry shader counts
+    * them (agx_needs_passthrough_gs), on M5 the prefix sum does, as in hk.
+    * poly_increment_counters() skips a null pointer. */
+   uint64_t prims_generated =
+      m5 && ctx->active_queries && ctx->prims_generated[0]
+         ? agx_get_query_address(batch, ctx->prims_generated[0])
+         : 0;
+
    /* If there's a geometry shader, it will increment the clipper stats.
     * Otherwise, we do when tessellating.
     */
    if (ctx->stage[MESA_SHADER_GEOMETRY].shader) {
       c_prims = AGX_SCRATCH_PAGE_ADDRESS;
       c_invs = AGX_SCRATCH_PAGE_ADDRESS;
+      prims_generated = 0;
    }
 
    /* Generate counts, then prefix sum them, then finally tessellate. */
    libagx_tessellate(batch, tess_grid, AGX_BARRIER_ALL, mode,
                      POLY_TESS_MODE_COUNT, state);
-   /* No prims_generated counter here: poly_increment_counters() skips a
-    * null pointer, which keeps this call's behaviour from before the kernel
-    * took that argument. */
    libagx_prefix_sum_tess(batch, agx_1d(1024), AGX_BARRIER_ALL, state, c_prims,
-                          c_invs, 0, c_prims || c_invs);
+                          c_invs, prims_generated,
+                          c_prims || c_invs || prims_generated);
    libagx_tessellate(batch, tess_grid, AGX_BARRIER_ALL, mode,
                      POLY_TESS_MODE_WITH_COUNTS, state);
 
    /* Face culling state needs to be specialized for tess */
    ctx->dirty |= AGX_DIRTY_RS;
+
+   /* M5 refuses a draw with rasterization discarded (agx_draw_vbo()): the
+    * prepass above has already counted, and with no geometry shader there
+    * is nothing else to do. */
+   if (m5 && ctx->rast->base.rasterizer_discard &&
+       !ctx->stage[MESA_SHADER_GEOMETRY].shader) {
+      if (unbind_tcs_when_done)
+         ctx->base.bind_tcs_state(&ctx->base, NULL);
+      return;
+   }
 
    /* Run TES as VS */
    void *vs_cso = ctx->stage[MESA_SHADER_VERTEX].shader;
@@ -14733,6 +14975,41 @@ agx_g17g_layered_clear(struct agx_context *ctx, unsigned buffers,
    util_unreference_framebuffer_state(&saved);
 }
 
+/* Most primitives a direct patch draw can tessellate into. A patch cut into
+ * at most n segments per edge yields at most 2 (n + 1)^2 primitives; n is 64
+ * when a control shader writes the levels, else the default levels bound it.
+ */
+static uint64_t
+agx_tess_max_prims(const struct agx_context *ctx,
+                   const struct pipe_draw_info *info,
+                   const struct pipe_draw_start_count_bias *draw)
+{
+   uint64_t segments = 64;
+
+   if (!ctx->stage[MESA_SHADER_TESS_CTRL].shader) {
+      const float levels[6] = {
+         ctx->default_outer_level[0], ctx->default_outer_level[1],
+         ctx->default_outer_level[2], ctx->default_outer_level[3],
+         ctx->default_inner_level[0], ctx->default_inner_level[1],
+      };
+      float level = 1.0f;
+      bool bounded = true;
+
+      /* A NaN or larger level leaves the bound at 64. */
+      for (unsigned i = 0; i < ARRAY_SIZE(levels); ++i) {
+         bounded &= levels[i] <= 63.0f;
+         level = bounded ? MAX2(level, levels[i]) : level;
+      }
+
+      /* Fractional partitioning rounds up to the next odd or even count. */
+      if (bounded)
+         segments = MIN2((uint64_t)level + 2, 64);
+   }
+
+   const uint64_t patches = draw->count / MAX2(ctx->patch_vertices, 1);
+   return patches * info->instance_count * 2 * (segments + 1) * (segments + 1);
+}
+
 static void
 agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              unsigned drawid_offset,
@@ -14879,10 +15156,28 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    /* TODO: stop cheating.
     *
     * libagx supports this, just needs test coverage and gallium side wiring.
+    * M5 reads every indirect patch draw back: its tessellation prepass
+    * launches direct grids only.
     */
-   if (indirect && info->mode == MESA_PRIM_PATCHES && info->index_size) {
+   if (indirect && info->mode == MESA_PRIM_PATCHES &&
+       (info->index_size || agx_m5_gpu_tess(ctx))) {
       perf_debug_ctx(ctx, "indexed indirect with tess");
       util_draw_indirect(pctx, info, drawid_offset, indirect);
+      return;
+   }
+
+   /* The GPU writes a tessellated draw's primitive count, and one M5 render
+    * holds AGX_G17G_RENDER_PRIMS: past that the submission times out. Drop
+    * a draw that could exceed it. */
+   if (info->mode == MESA_PRIM_PATCHES && agx_m5_gpu_tess(ctx) &&
+       (indirect ||
+        agx_tess_max_prims(ctx, info, draws) > AGX_G17G_RENDER_PRIMS)) {
+      static bool reported;
+      if (!reported) {
+         reported = true;
+         mesa_loge("asahi: dropping a tessellated draw that could exceed the "
+                   "M5 primitive budget of one render");
+      }
       return;
    }
 
@@ -14954,11 +15249,15 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     * (tessellation.invariance). Start a new render past the budget. */
    const bool g17g_budget =
       agx_chip_g17_m5(agx_device(pctx->screen)->chip) && !indirect;
+   /* A tessellated draw's output count is unknown here: give it a render of
+    * its own. */
    const uint64_t prims =
-      g17g_budget ? (uint64_t)u_decomposed_prims_for_vertices(info->mode,
-                                                              draws->count) *
-                       info->instance_count
-                  : 0;
+      !g17g_budget ? 0
+      : info->mode == MESA_PRIM_PATCHES
+         ? AGX_G17G_RENDER_PRIMS
+         : (uint64_t)u_decomposed_prims_for_vertices(info->mode,
+                                                     draws->count) *
+              info->instance_count;
    if (g17g_budget && ctx->batch && ctx->batch->g17g_prims &&
        ctx->batch->g17g_prims + prims > AGX_G17G_RENDER_PRIMS)
       agx_flush_batch_for_reason(ctx, ctx->batch, "G17G primitive budget");
@@ -14999,10 +15298,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 
    if (info->mode == MESA_PRIM_PATCHES) {
-      /* The M5 GPUs tessellate only on the CPU (agx_swtnl_applies()): a patch
-       * draw that path cannot take (indirect, or images before rasterization)
-       * has no encoding here. */
-      if (agx_chip_g17_m5(agx_device(ctx->base.screen)->chip)) {
+      /* With ASAHI_M5_SWTNL_TESS the M5 GPUs tessellate only on the CPU
+       * (agx_swtnl_applies()): a patch draw that path cannot take (indirect,
+       * or images before rasterization) has no encoding here. */
+      if (agx_chip_g17_m5(agx_device(ctx->base.screen)->chip) &&
+          !agx_m5_gpu_tess(ctx)) {
          agx_native_descriptor_reject_batch(batch, "tessellation outside the CPU path");
          return;
       }
@@ -15015,7 +15315,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     * shader is unbound by then, so it would count twice). */
    if (ctx->active_queries && ctx->prims_generated[0] &&
        !ctx->stage[MESA_SHADER_GEOMETRY].shader && !ctx->swtnl_inner &&
-       !(ctx->g17g_mrt_split && ctx->g17g_mrt_pass)) {
+       !ctx->in_tess && !(ctx->g17g_mrt_split && ctx->g17g_mrt_pass)) {
 
       assert(!indirect && "we force a passthrough GS for this");
       agx_primitives_update_direct(ctx, info, draws);

@@ -1183,6 +1183,7 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
 
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
+bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);
 void agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                     const struct pipe_draw_start_count_bias *draw);

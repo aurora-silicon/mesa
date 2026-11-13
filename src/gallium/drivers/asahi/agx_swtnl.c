@@ -11,6 +11,9 @@
  * its output vertices on the GPU through a vertex shader that passes them on
  * to the fragment shader. Transform feedback from the last stage is written
  * by the draw module's stream-output stage on the way.
+ *
+ * Tessellation now runs on the GPU (agx_draw_patches) unless
+ * ASAHI_M5_SWTNL_TESS is set.
  */
 
 #include "compiler/nir/nir_builder.h"
@@ -1034,9 +1037,9 @@ agx_swtnl_delete_shader(struct agx_context *ctx, struct agx_uncompiled_shader *s
 }
 
 /*
- * Does this draw take the CPU path? G17G, a geometry or tessellation stage,
- * and nothing the CPU copy does not see: no textures, images or storage
- * buffers before rasterization.
+ * Does this draw take the CPU path? G17G, a geometry stage (or tessellation
+ * with ASAHI_M5_SWTNL_TESS), and nothing the CPU copy does not see: no
+ * textures, images or storage buffers before rasterization.
  */
 bool
 agx_swtnl_applies(struct agx_context *ctx)
@@ -1047,8 +1050,10 @@ agx_swtnl_applies(struct agx_context *ctx)
         !ctx->stage[MESA_SHADER_TESS_EVAL].shader))
       return false;
 
-   /* The draw module tessellates only with LLVM. */
-   if (ctx->stage[MESA_SHADER_TESS_EVAL].shader && getenv("AGX_SWTNL_NO_LLVM"))
+   /* The draw module tessellates only with LLVM, so tessellation runs on the
+    * GPU unless ASAHI_M5_SWTNL_TESS is set (agx_m5_gpu_tess()). */
+   if (ctx->stage[MESA_SHADER_TESS_EVAL].shader &&
+       (getenv("AGX_SWTNL_NO_LLVM") || agx_m5_gpu_tess(ctx)))
       return false;
 
    for (unsigned s = 0; s < MESA_SHADER_FRAGMENT; ++s) {
