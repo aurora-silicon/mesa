@@ -1,4 +1,5 @@
 #include "agx_nir_gen1_ray_query.h"
+#include "agx_nir.h"
 #include "agx_nir_ray_query.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/u_dynarray.h"
@@ -392,6 +393,209 @@ gen1_rq_alias_copies(nir_function_impl *impl)
    return progress;
 }
 
+/* Arm (default off). ASAHI_G17P_RQ_SCS_SWEEP=<mask> ends a candidate-layout
+ * compute kernel with destination-less SCS loads over storage its warp used:
+ * once per thread, after everything else the kernel does, between a traversal
+ * barrier of the scope used ahead of a launch and one of the scope a
+ * traversal program ends with. Every lane issues every load. A row is what a
+ * warp reaches with four words a lane: 512 bytes.
+ *
+ * What such a load does to the storage it names is not established; the arm
+ * is there to measure it. The mask selects the storage:
+ *
+ *   bit 0  the warp's query block, as far as its last instance pointer
+ *   bit 1  the warp's payload records
+ *   bit 2  the warp's saved context
+ *   bit 3  the query context, which every thread of the dispatch shares
+ *   bit 4  address the rows through a per-lane base register and no index,
+ *          as the traversal programs address theirs, not base plus lane
+ *   bit 5  the warp's records of other per-thread storage, named by
+ *          ASAHI_G17P_RQ_SCS_SWEEP_EXTRA=<address>/<bytes>[,...]: <bytes> a
+ *          thread from SCS offset <address>, below the query blocks
+ *
+ * The loads come in the order payload, extra, saved context, query context,
+ * query block.
+ */
+enum gen1_rq_sweep {
+   GEN1_RQ_SWEEP_QUERY = 1 << 0,
+   GEN1_RQ_SWEEP_PAYLOAD = 1 << 1,
+   GEN1_RQ_SWEEP_SAVED = 1 << 2,
+   GEN1_RQ_SWEEP_CONTEXT = 1 << 3,
+   GEN1_RQ_SWEEP_NO_INDEX = 1 << 4,
+   GEN1_RQ_SWEEP_EXTRA = 1 << 5,
+};
+
+/* The candidate layout: 96 warps, their query blocks from this offset on. */
+#define GEN1_RQ_CANDIDATE_THREADS (96 * 32)
+#define GEN1_RQ_QUERY_BLOCKS      0x2f8000
+
+/* The candidate query block ends with a six-byte instance pointer a lane. */
+#define GEN1_RQ_QUERY_USED_BYTES (9152 + 32 * 6)
+#define GEN1_RQ_SWEEP_ROW_BYTES  (32 * 16)
+/* Loads the mask can select (19 + 2 + 3 + 7), and extra rows on top. */
+#define GEN1_RQ_SWEEP_MASK_MAX   31
+#define GEN1_RQ_SWEEP_EXTRA_MAX  32
+
+struct gen1_rq_touch {
+   nir_def *base, *index;
+   uint16_t offset;
+   uint8_t words, shift;
+};
+
+struct gen1_rq_sweep_state {
+   nir_builder *b;
+   nir_def *lane;
+   bool no_index;
+   unsigned count;
+   struct gen1_rq_touch touch[GEN1_RQ_SWEEP_MASK_MAX + GEN1_RQ_SWEEP_EXTRA_MAX];
+};
+
+static void
+gen1_rq_sweep_add(struct gen1_rq_sweep_state *s, nir_def *base, nir_def *index,
+                  unsigned offset, unsigned words, unsigned shift)
+{
+   assert(s->count < ARRAY_SIZE(s->touch));
+   s->touch[s->count++] = (struct gen1_rq_touch){
+      .base = base, .index = index, .offset = offset, .words = words,
+      .shift = shift,
+   };
+}
+
+/* Cover `bytes` of a warp's own storage from `base`: whole rows, then a
+ * remainder of one word a lane. */
+static void
+gen1_rq_sweep_rows(struct gen1_rq_sweep_state *s, nir_def *base, unsigned bytes)
+{
+   nir_builder *b = s->b;
+   const unsigned rows = bytes / GEN1_RQ_SWEEP_ROW_BYTES;
+   const unsigned rest = bytes % GEN1_RQ_SWEEP_ROW_BYTES;
+   assert(rest == 0 || rest == 32 * 4);
+
+   if (rows) {
+      nir_def *row = s->no_index
+         ? nir_iadd(b, base, nir_ishl_imm(b, s->lane, 4)) : base;
+      for (unsigned i = 0; i < rows; ++i)
+         gen1_rq_sweep_add(s, row, s->no_index ? NULL : s->lane,
+                           GEN1_RQ_SWEEP_ROW_BYTES * i, 4, 4);
+   }
+   if (rest) {
+      nir_def *row = s->no_index
+         ? nir_iadd(b, base, nir_ishl_imm(b, s->lane, 2)) : base;
+      gen1_rq_sweep_add(s, row, s->no_index ? NULL : s->lane,
+                        GEN1_RQ_SWEEP_ROW_BYTES * rows, 1, 2);
+   }
+}
+
+struct gen1_rq_sweep_extra {
+   uint32_t address, bytes;
+};
+
+/* Parse the extra per-thread storage list. Anything malformed, storage that
+ * does not end below the query blocks, or more rows than `max_rows`, drops
+ * the whole list: a sweep over storage nobody named is worse than none. */
+static unsigned
+gen1_rq_sweep_extras(struct gen1_rq_sweep_extra *extra, unsigned max,
+                     unsigned max_rows)
+{
+   const char *list = getenv("ASAHI_G17P_RQ_SCS_SWEEP_EXTRA");
+   unsigned count = 0, rows = 0;
+   if (!list || !*list)
+      return 0;
+
+   for (const char *at = list;;) {
+      char *end;
+      const unsigned long long address = strtoull(at, &end, 0);
+      if (end == at || *end != '/')
+         break;
+      at = end + 1;
+      const unsigned long long bytes = strtoull(at, &end, 0);
+      /* Word-aligned storage, in whole rows or with a one-word remainder,
+       * at offsets the access can carry. */
+      if (end == at || (*end && *end != ',') || count == max ||
+          (address & 3) || !bytes || bytes > 256 ||
+          ((bytes % 16) && (bytes % 16) != 4) ||
+          address > GEN1_RQ_QUERY_BLOCKS ||
+          bytes * GEN1_RQ_CANDIDATE_THREADS > GEN1_RQ_QUERY_BLOCKS - address)
+         break;
+      extra[count++] = (struct gen1_rq_sweep_extra){address, bytes};
+      rows += DIV_ROUND_UP(32 * bytes, GEN1_RQ_SWEEP_ROW_BYTES);
+      if (rows > max_rows)
+         break;
+      if (!*end)
+         return count;
+      at = end + 1;
+   }
+
+   fprintf(stderr, "ASAHI_G17P_RQ_SCS_SWEEP_EXTRA: ignoring \"%s\"\n", list);
+   return 0;
+}
+
+static void
+gen1_rq_scs_sweep(nir_builder *b,
+                  const struct agx_gen1_ray_query_layout *layout, unsigned mask)
+{
+   struct gen1_rq_sweep_state s = {
+      .b = b, .no_index = mask & GEN1_RQ_SWEEP_NO_INDEX,
+   };
+   nir_def *id = nir_load_scs_thread_index_agx(b);
+   nir_def *warp = nir_ushr_imm(b, id, 5);
+   /* The warp's first thread: per-thread records start there. */
+   nir_def *first = nir_iand_imm(b, id, ~31u);
+   s.lane = nir_iand_imm(b, id, 31);
+
+   if (mask & GEN1_RQ_SWEEP_PAYLOAD) {
+      /* Thirty-two bytes a thread. */
+      nir_def *payload = nir_iadd(b,
+         nir_load_preamble(b, 1, 32, .base = layout->payload_uniform),
+         nir_ishl_imm(b, first, 5));
+      gen1_rq_sweep_rows(&s, payload, 32 * 32);
+   }
+
+   struct gen1_rq_sweep_extra extra[8];
+   const unsigned extras = !(mask & GEN1_RQ_SWEEP_EXTRA) ? 0 :
+      gen1_rq_sweep_extras(extra, ARRAY_SIZE(extra), GEN1_RQ_SWEEP_EXTRA_MAX);
+   for (unsigned i = 0; i < extras; ++i)
+      gen1_rq_sweep_rows(&s,
+         nir_iadd_imm(b, nir_imul_imm(b, first, extra[i].bytes),
+                      extra[i].address), 32 * extra[i].bytes);
+
+   if (mask & GEN1_RQ_SWEEP_SAVED) {
+      /* The three stores the launch makes, word for word. */
+      nir_def *saved = nir_iadd(b, nir_load_preamble(b, 1, 32, .base = 116),
+                                nir_imul_imm(b, warp, 48));
+      gen1_rq_sweep_add(&s, saved, NULL, 256, 4, 0);
+      gen1_rq_sweep_add(&s, saved, NULL, 272, 4, 0);
+      gen1_rq_sweep_add(&s, saved, NULL, 288, 2, 0);
+   }
+   if (mask & GEN1_RQ_SWEEP_CONTEXT) {
+      /* Likewise the seven stores of the context copy. */
+      nir_def *context = nir_imm_int(b, 0x6000);
+      for (unsigned i = 0; i < 6; ++i)
+         gen1_rq_sweep_add(&s, context, NULL, 16 * i, 4, 0);
+      gen1_rq_sweep_add(&s, context, NULL, 104, 2, 0);
+   }
+   if (mask & GEN1_RQ_SWEEP_QUERY)
+      gen1_rq_sweep_rows(&s,
+         nir_iadd_imm(b, nir_imul_imm(b, warp, 304 * 32),
+                      GEN1_RQ_QUERY_BLOCKS),
+         GEN1_RQ_QUERY_USED_BYTES);
+
+   for (unsigned i = 0; i < s.count; ++i) {
+      const struct gen1_rq_touch *t = &s.touch[i];
+      const unsigned flags = AGX_NIR_SCS_TOUCH |
+         (i == 0 ? AGX_NIR_SCS_TOUCH_FENCE_BEFORE : 0) |
+         (i + 1 == s.count ? AGX_NIR_SCS_TOUCH_FENCE_AFTER : 0);
+      if (t->index)
+         nir_load_scs_indexed_agx(b, t->words, 32, t->base, t->index,
+                                  .base = t->offset, .component = t->shift,
+                                  .flags = flags);
+      else
+         nir_load_scs_base_agx(b, t->words, 32, t->base, .base = t->offset,
+                               .format = PIPE_FORMAT_R32_UINT, .component = 0,
+                               .flags = flags);
+   }
+}
+
 bool
 agx_nir_lower_gen1_ray_query(nir_shader *shader,
                            const struct agx_gen1_ray_query_layout *layout)
@@ -526,6 +730,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    unsigned hw_fields = 0;
    util_dynarray_foreach(&ops, nir_intrinsic_instr *, op)
       hw_fields |= gen1_rq_hw_fields(*op);
+   bool launches = false;
 
    nir_builder b = nir_builder_create(impl);
    util_dynarray_foreach(&ops, nir_intrinsic_instr *, op) {
@@ -596,6 +801,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
                        15);
          break;
       case nir_intrinsic_rq_proceed: {
+         launches = true;
          nir_variable *more=nir_local_variable_create(impl,glsl_bool_type(),"rq_more");
          nir_store_var(&b,more,nir_imm_false(&b),1);
          nir_push_if(&b, nir_load_deref(&b, active));
@@ -900,6 +1106,14 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
       if (value)
          nir_def_rewrite_uses(&intr->def, value);
       nir_instr_remove(&intr->instr);
+   }
+   /* Returns are lowered by now, so every thread reaches the end of the
+    * entrypoint, whether or not it launched a ray. */
+   const unsigned sweep = debug_get_num_option("ASAHI_G17P_RQ_SCS_SWEEP", 0);
+   if (sweep && launches && layout->candidates &&
+       shader->info.stage == MESA_SHADER_COMPUTE) {
+      b.cursor = nir_after_block_before_jump(nir_impl_last_block(impl));
+      gen1_rq_scs_sweep(&b, layout, sweep);
    }
    util_dynarray_fini(&ops);
    util_dynarray_foreach(&queries, struct gen1_rq_state, state)
