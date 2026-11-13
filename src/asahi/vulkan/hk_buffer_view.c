@@ -24,6 +24,24 @@
 #include "hk_physical_device.h"
 #include "vk_acceleration_structure.h"
 
+/* Build shaders read AS positions through load_vertices(), which also decodes
+ * these beyond the common set. Reported where they are tested: G17P. */
+static bool
+hk_as_vtx_format_supported(const struct hk_physical_device *pdev,
+                           VkFormat vk_format)
+{
+   switch (vk_format) {
+   case VK_FORMAT_R8G8B8_SNORM:
+   case VK_FORMAT_R16G16B16_SNORM:
+   case VK_FORMAT_R64G64_SFLOAT:
+   case VK_FORMAT_R64G64B64_SFLOAT:
+   case VK_FORMAT_R64G64B64A64_SFLOAT:
+      return pdev->dev.chip == AGX_CHIP_G17P;
+   default:
+      return vk_acceleration_struct_vtx_format_supported(vk_format);
+   }
+}
+
 VkFormatFeatureFlags2
 hk_get_buffer_format_features(struct hk_physical_device *pdev,
                               VkFormat vk_format)
@@ -31,15 +49,15 @@ hk_get_buffer_format_features(struct hk_physical_device *pdev,
    VkFormatFeatureFlags2 features = 0;
    enum pipe_format p_format = hk_format_to_pipe_format(vk_format);
 
+   if (pdev->vk.supported_extensions.KHR_acceleration_structure &&
+       hk_as_vtx_format_supported(pdev, vk_format))
+      features |= VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
+
    if (p_format == PIPE_FORMAT_NONE)
-      return 0;
+      return features;
 
    if (agx_vbo_supports_format(p_format))
       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
-
-   if (pdev->vk.supported_extensions.KHR_acceleration_structure &&
-       vk_acceleration_struct_vtx_format_supported(vk_format))
-      features |= VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
 
    if (ail_pixel_format[p_format].texturable &&
        !util_format_is_depth_or_stencil(p_format)) {
