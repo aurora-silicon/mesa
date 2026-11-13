@@ -11,6 +11,54 @@ namespace {
 class nir_opt_varyings_test_dead_output : public nir_opt_varyings_test
 {};
 
+static void
+optimize_for_bulk(nir_shader *nir, void *)
+{
+   bool progress;
+   do {
+      progress = nir_opt_copy_prop(nir);
+      progress |= nir_opt_dce(nir);
+      progress |= nir_opt_cse(nir);
+   } while (progress);
+}
+
+TEST_F(nir_opt_varyings_test_dead_output, preraster_library_keeps_unknown_interpolation)
+{
+   create_shaders(MESA_SHADER_VERTEX, MESA_SHADER_GEOMETRY);
+   nir_def *value = load_input(b1, VARYING_SLOT_VAR0, 0, nir_type_float32,
+                               0, INTERP_FLAT);
+   store_output(b1, VARYING_SLOT_VAR0, 0, nir_type_float32, value, 0, false);
+   value = load_input(b2, VARYING_SLOT_VAR0, 0, nir_type_float32, 0, INTERP_FLAT);
+   store_output(b2, VARYING_SLOT_VAR0, 0, nir_type_float32, value, 0, false);
+
+   nir_shader *shaders[] = {b1->shader, b2->shader};
+   nir_opt_varyings_bulk(shaders, 2, true, 4096, 15, optimize_for_bulk, nullptr);
+
+   EXPECT_FALSE(b2->shader->info.known_interpolation_qualifiers);
+   EXPECT_NE(b2->shader->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_VAR0), 0u);
+   nir_validate_shader(b1->shader, "linked vertex producer");
+   nir_validate_shader(b2->shader, "partial pre-rasterization library");
+}
+
+TEST_F(nir_opt_varyings_test_dead_output, complete_pipeline_links_interpolation)
+{
+   create_shaders(MESA_SHADER_VERTEX, MESA_SHADER_FRAGMENT);
+   nir_def *value = load_input(b1, VARYING_SLOT_VAR0, 0, nir_type_float32,
+                               0, INTERP_FLAT);
+   store_output(b1, VARYING_SLOT_VAR0, 0, nir_type_float32, value, 0, false);
+   value = load_input(b2, VARYING_SLOT_VAR0, 0, nir_type_float32,
+                      0, INTERP_PERSP_PIXEL);
+   store_ssbo(b2, value);
+
+   nir_shader *shaders[] = {b1->shader, b2->shader};
+   nir_opt_varyings_bulk(shaders, 2, true, 4096, 15, optimize_for_bulk, nullptr);
+
+   EXPECT_TRUE(b1->shader->info.known_interpolation_qualifiers);
+   EXPECT_NE(b1->shader->info.perspective_varyings, 0u);
+   EXPECT_EQ(b1->shader->info.perspective_varyings,
+             b2->shader->info.perspective_varyings);
+}
+
 #define TEST_DEAD_OUTPUT_REMOVED(producer_stage, consumer_stage, slot, bitsize) \
 TEST_F(nir_opt_varyings_test_dead_output, \
        store_##producer_stage##_##consumer_stage##_##slot##_##bitsize) \
