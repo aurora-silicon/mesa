@@ -69,6 +69,7 @@
 #include "spirv/spirv.h"
 
 #include "util/u_debug.h"
+#include "util/set.h"
 #include "util/u_dynarray.h"
 
 /* ------------------------------------------------------------------------ */
@@ -357,6 +358,8 @@ struct hk_rt_compiler {
    struct hash_table *callable_parts;
    struct hash_table *callable_functions;
    struct hk_rt_callable_context **callable_contexts;
+   /* Megakernel variables backed by a descriptor binding (hk_rt_binding_var). */
+   struct set *binding_vars;
    uint32_t max_depth;
 
    struct hk_rt_stack_sizes sizes;
@@ -453,6 +456,39 @@ hk_ray_traversal_state_init(nir_function_impl *impl,
  * the function on first use so a stage referenced by several groups is emitted
  * once.
  */
+static bool
+hk_rt_has_binding(const nir_variable *var)
+{
+   return var->data.mode & (nir_var_image | nir_var_uniform |
+                            nir_var_mem_ssbo | nir_var_mem_ubo);
+}
+
+/* Every inlined function that names a descriptor binding shares one megakernel
+ * variable for it: the stages, and the parts a callable is split into at its
+ * calls, access the same memory, and both NIR's access inference and
+ * hk_nir_forward_image_stores reason per variable. Declarations of a binding
+ * with another type keep their own variable. */
+static nir_variable *
+hk_rt_binding_var(struct hk_rt_compiler *compiler, const nir_variable *var)
+{
+   if (!hk_rt_has_binding(var))
+      return NULL;
+   set_foreach(compiler->binding_vars, entry) {
+      nir_variable *shared = (nir_variable *)entry->key;
+      if (shared->data.mode == var->data.mode &&
+          shared->data.descriptor_set == var->data.descriptor_set &&
+          shared->data.binding == var->data.binding &&
+          shared->type == var->type &&
+          shared->data.image.format == var->data.image.format) {
+         /* Only the qualifiers every declaration has; whether accesses can
+          * be reordered is decided for the whole megakernel. */
+         shared->data.access &= var->data.access & ~ACCESS_CAN_REORDER;
+         return shared;
+      }
+   }
+   return NULL;
+}
+
 static void
 hk_call_ray_tracing_stage(nir_builder *b, struct hk_rt_compiler *compiler,
                           nir_shader *stage, bool trace_call)
@@ -491,9 +527,15 @@ hk_call_ray_tracing_stage(nir_builder *b, struct hk_rt_compiler *compiler,
             struct hash_entry *var_entry =
                _mesa_hash_table_search(var_remap, deref->var);
             if (!var_entry) {
-               nir_variable *new_var = nir_variable_clone(deref->var,
-                                                          b->shader);
-               nir_shader_add_variable(b->shader, new_var);
+               nir_variable *new_var = hk_rt_binding_var(compiler, deref->var);
+               if (!new_var) {
+                  new_var = nir_variable_clone(deref->var, b->shader);
+                  nir_shader_add_variable(b->shader, new_var);
+                  if (hk_rt_has_binding(new_var)) {
+                     new_var->data.access &= ~ACCESS_CAN_REORDER;
+                     _mesa_set_add(compiler->binding_vars, new_var);
+                  }
+               }
                var_entry = _mesa_hash_table_insert(var_remap, deref->var,
                                                    new_var);
             }
@@ -3210,6 +3252,7 @@ hk_compile_rt_kernel(
    compiler.callable_functions = _mesa_pointer_hash_table_create(b->shader);
    compiler.callable_contexts = rzalloc_array(b->shader,
       struct hk_rt_callable_context *, compiler.max_depth + 1);
+   compiler.binding_vars = _mesa_pointer_set_create(b->shader);
 
    /* A launch is dispatched in whole workgroups, so the trailing workgroup of
     * a width that is not a multiple of the workgroup size runs invocations the
