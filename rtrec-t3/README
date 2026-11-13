@@ -1,0 +1,7 @@
+Case lists for a CTS correctness run of continuation mode (not for merging).
+
+Build this branch with the Vulkan asahi driver, run every case in rq.txt and
+rtp-x-rest2.txt with ASAHI_G17P_RT_CONTINUATION=1 in the environment (it
+forces continuation mode at every recursion depth), and compare the results
+with a run of aurora-wip 164341fa583 on the same machine without the variable.
+Pass bar: no case that passes on the base fails here.
