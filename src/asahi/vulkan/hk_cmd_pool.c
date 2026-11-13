@@ -890,12 +890,14 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
 #define HK_CMD_STALL_POLLS 4
 
 /* A queue's submissions are in timeline order, and a reached timeline point
- * means every fence up to it has signalled. Check the queue's submissions
- * oldest first and stop at the first one past the reached point. Fences on
- * the timeline can signal out of order, so an unfinished submission can hold
- * back finished ones behind it; once it has done so for a while, a few of
- * them are polled one by one on each reap, which keeps that memory bounded.
- * Called with cmd_pending_lock held.
+ * means every timeline signal up to it has happened. Check the queue's
+ * submissions oldest first and stop at the first one past the reached point.
+ * The point only skips the wait: each submission's own syncobjs are still
+ * read before its memory is released. Fences on the timeline can signal out
+ * of order, so an unfinished submission can hold back finished ones behind
+ * it; once it has done so for a while, a few of them are also polled on each
+ * reap. Finished work behind several long-running submissions stays pinned
+ * until those finish. Called with cmd_pending_lock held.
  */
 static void
 hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
@@ -1048,8 +1050,10 @@ hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
        */
       list_addtail(&p->link, &dev->cmd_pending_failed);
    } else {
-      /* Every ioctl signalled a point up to this one, and later
-       * submissions to the queue signal higher points.
+      /* The submission's last ioctl signals this point (earlier ioctls do too
+       * with chunk timelines; otherwise only their own syncobjs, which the
+       * reap still reads). Later submissions to the queue signal higher
+       * points.
        */
       p->point = queue->drm.timeline_value;
       if (list_is_empty(&queue->cmd_pending)) {
