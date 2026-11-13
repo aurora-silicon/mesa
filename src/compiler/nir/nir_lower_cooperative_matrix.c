@@ -1265,72 +1265,6 @@ nir_calc_tensor_view_linear(nir_builder *b,
    return idx;
 }
 
-/* The byte offset of a storage buffer deref in its binding, 64 bits wide so
- * that it does not wrap: the offsets of the members and array elements it
- * names (array indices signed), which the explicit I/O lowering adds in 32
- * bits, from the pointer they start at. A descriptor's pointer is at the
- * start of its binding. Any other pointer (one selected at run time, from a
- * phi, a function parameter or a variable) is at the offset its address
- * holds, 32 bits wide, read at run time.
- */
-static nir_def *
-deref_binding_offset(nir_builder *b, nir_deref_instr *deref)
-{
-   nir_deref_instr *parent = nir_deref_instr_parent(deref);
-   switch (deref->deref_type) {
-   case nir_deref_type_cast: {
-      if (parent)
-         return deref_binding_offset(b, parent);
-      nir_intrinsic_instr *desc = nir_src_as_intrinsic(deref->parent);
-      if (desc && desc->intrinsic == nir_intrinsic_load_vulkan_descriptor)
-         return nir_imm_int64(b, 0);
-      return nir_u2u64(b, nir_deref_buffer_offset(b, 32, &deref->def));
-   }
-   case nir_deref_type_struct:
-      return nir_iadd_imm(b, deref_binding_offset(b, parent),
-                          glsl_get_struct_field_offset(parent->type,
-                                                       deref->strct.index));
-   case nir_deref_type_array:
-   case nir_deref_type_ptr_as_array:
-      return nir_iadd(b, deref_binding_offset(b, parent),
-                      nir_imul_imm(b, nir_i2i64(b, deref->arr.index.ssa),
-                                   nir_deref_instr_array_stride(deref)));
-   default:
-      return nir_imm_int64(b, 0);
-   }
-}
-
-/*
- * The element index to access `count` elements of `bytes` bytes each at
- * element idx from ptr, in memory other than global. Its byte offsets are 32
- * bits wide: the explicit I/O lowering adds idx times bytes to ptr's own
- * offset in its binding (a member's or an array element's) in 32 bits, which
- * wraps into the binding where the elements' end passes 2^32 (or where ptr
- * is before the binding). Such an index is replaced by one whose elements
- * end at 2^32 after that sum, past any binding, so that with robust buffer
- * access the access is out of range (a load gives zero, a store is dropped);
- * without it, the access is past the binding, undefined as it was. Other
- * indices are left as they are.
- */
-nir_def *
-nir_cap_tensor_index(nir_builder *b, nir_deref_instr *ptr, nir_def *idx,
-                     unsigned bytes, unsigned count)
-{
-   assert(util_is_power_of_two_nonzero(bytes) && idx->bit_size == 32);
-   unsigned size = bytes * count;
-   nir_def *base = nir_deref_mode_is(ptr, nir_var_mem_ssbo)
-      ? deref_binding_offset(b, ptr) : nir_imm_int64(b, 0);
-   /* The index whose elements end at 2^32 after the 32-bit sum, which is
-    * the last one whose elements end at or below 2^32 where ptr's offset is
-    * from 0 to 2^32 - size.
-    */
-   nir_def *last = nir_ushr_imm(b, nir_isub(b, nir_imm_int(b, -size),
-                                            nir_u2u32(b, base)),
-                                util_logbase2(bytes));
-   nir_def *base_ok = nir_ult_imm(b, base, (1ull << 32) - size + 1);
-   return nir_bcsel(b, base_ok, nir_umin(b, idx, last), last);
-}
-
 nir_def *
 nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
                        nir_def *row, nir_def *col,
@@ -1368,21 +1302,13 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
    nir_def *coord_in_block[5];
 
    info->do_clamp = nir_imm_false(b);
-   nir_def *empty = nir_imm_false(b);
    for (unsigned dim = 0; dim < nc; dim++) {
       nir_def *c = nir_iadd(b, span_coord[dim], nir_channel(b, info->offsets, dim));
 
-      /* The coordinate is signed and the dimension unsigned: a coordinate
-       * that is not negative is compared with it unsigned, and the repeating
-       * clamp modes divide the coordinate's magnitude (2^31 for INT32_MIN).
-       */
-      nir_def *negative = nir_ilt_imm(b, c, 0);
-      nir_def *magnitude = nir_bcsel(b, negative, nir_ineg(b, c), c);
       nir_def *this_clamp;
       if (info->clamp_mode != NIR_TENSOR_CLAMP_UNDEFINED) {
-         this_clamp = nir_ior(b, negative, nir_uge(b, c, nir_channel(b, info->layout_dims, dim)));
+         this_clamp = nir_ior(b, nir_ilt_imm(b, c, 0), nir_ige(b, c, nir_channel(b, info->layout_dims, dim)));
          info->do_clamp = nir_ior(b, info->do_clamp, this_clamp);
-         empty = nir_ior(b, empty, nir_ieq_imm(b, nir_channel(b, info->layout_dims, dim), 0));
       } else
          this_clamp = nir_imm_false(b);
 
@@ -1393,28 +1319,16 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
          c_clamped = nir_imm_int(b, 0);
          break;
       case NIR_TENSOR_CLAMP_EDGE:
-         c_clamped = nir_umin(b, nir_imax_imm(b, c, 0), nir_iadd_imm(b, nir_channel(b, info->layout_dims, dim), -1));
+         c_clamped = nir_imin(b, nir_imax_imm(b, c, 0), nir_iadd_imm(b, nir_channel(b, info->layout_dims, dim), -1));
          break;
-      case NIR_TENSOR_CLAMP_REPEAT: {
-         /* the remainder of the floored division: dimX - rem below zero */
-         nir_def *dimX = nir_channel(b, info->layout_dims, dim);
-         nir_def *rem = nir_umod(b, magnitude, dimX);
-         nir_def *below = nir_iand(b, negative, nir_ine_imm(b, rem, 0));
-         c_clamped = nir_bcsel(b, below, nir_isub(b, dimX, rem), rem);
+      case NIR_TENSOR_CLAMP_REPEAT:
+         c_clamped = nir_imod(b, c, nir_channel(b, info->layout_dims, dim));
          break;
-      }
       case NIR_TENSOR_CLAMP_REPEAT_MIRRORED: {
-         /* The period, 2 * dimX - 2, may not fit in 32 bits. The reflection
-          * of c is that of -c, and |c| lies in pass |c| / (dimX - 1) over
-          * the dimension: forwards in the even passes, backwards in the odd
-          * ones. A dimension of one repeats its only element.
-          */
-         nir_def *last = nir_iadd_imm(b, nir_channel(b, info->layout_dims, dim), -1);
-         nir_def *length = nir_umax_imm(b, last, 1);
-         nir_def *pass = nir_udiv(b, magnitude, length);
-         nir_def *rem = nir_isub(b, magnitude, nir_imul(b, pass, length));
-         c_clamped = nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, pass, 1), 0),
-                               nir_isub(b, last, rem), rem);
+         nir_def *dimX = nir_channel(b, info->layout_dims, dim);
+         c_clamped = nir_imod(b, c, nir_iadd_imm(b, nir_imul_imm(b, dimX, 2), -2));
+         nir_def *val = nir_isub(b, nir_iadd_imm(b, nir_imul_imm(b, dimX, 2), -2), c_clamped);
+         c_clamped = nir_bcsel(b, nir_ige(b, c_clamped, dimX), val, c_clamped);
          break;
       }
       }
@@ -1424,27 +1338,6 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
       if (info->decode_fnptr)
          coord_in_block[dim] = nir_umod(b, c, nir_channel(b, info->block_sizes, dim));
       block_coord[dim] = nir_udiv(b, c, nir_channel(b, info->block_sizes, dim));
-   }
-
-   /* An element outside the tensor with a constant clamp is neither read
-    * nor written (nor decoded): the clamp value replaces it, a store is
-    * discarded. With clamp to edge, repeat or mirrored repeat, a tensor with
-    * a dimension of zero has no element to clamp to; such an element is not
-    * read either, and a load gives zero.
-    */
-   switch (info->clamp_mode) {
-   case NIR_TENSOR_CLAMP_UNDEFINED:
-      info->skip = NULL;
-      info->skip_value = NULL;
-      break;
-   case NIR_TENSOR_CLAMP_CONSTANT:
-      info->skip = info->do_clamp;
-      info->skip_value = info->clamp_value;
-      break;
-   default:
-      info->skip = empty;
-      info->skip_value = nir_imm_int(b, 0);
-      break;
    }
 
    /* tensorCoordToLinear */
@@ -1481,27 +1374,10 @@ nir_calc_tensor_derefs(nir_builder *b, struct nir_calc_tensor_info *info,
          call->params[2 + dim] = nir_src_for_ssa(block_coord[dim]);
          call->params[2 + nc + dim] = nir_src_for_ssa(coord_in_block[dim]);
       }
-      const struct glsl_type *out_type = decode_out_tmp->type;
-      nir_def *skipped = info->skip
-         ? nir_u2uN(b, info->skip_value, glsl_get_bit_size(out_type)) : NULL;
-      nir_if *nif = info->skip ? nir_push_if(b, nir_inot(b, info->skip)) : NULL;
       nir_builder_instr_insert(b, &call->instr);
       idx = nir_load_deref(b, decode_out_tmp_deref);
-      if (nif) {
-         nir_pop_if(b, nif);
-         idx = nir_if_phi(b, idx, skipped);
-      }
    } else {
-      /* A byte offset in memory other than global is 32 bits wide: an index
-       * whose element's end in the binding passes 2^32 is replaced, so that
-       * it does not wrap into the binding.
-       */
-      nir_def *at = idx;
-      if (!nir_deref_mode_may_be(iter_deref, nir_var_mem_global)) {
-         unsigned bytes = glsl_base_type_bit_size(info->desc.element_type) / 8;
-         at = nir_cap_tensor_index(b, iter_deref, idx, bytes, 1);
-      }
-      *iter_deref_p = nir_build_deref_ptr_as_array(b, iter_deref, nir_u2uN(b, at, iter_deref->def.bit_size));
+      *iter_deref_p = nir_build_deref_ptr_as_array(b, iter_deref, nir_u2uN(b, idx, iter_deref->def.bit_size));
    }
 
    return idx;

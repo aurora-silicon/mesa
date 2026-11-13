@@ -445,20 +445,16 @@ hk_nir_has_m5_native_query(const struct hk_device *dev, nir_shader *nir)
 void
 hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 {
-   /* Matrices of flexible dimensions become 16x16 pieces, then tensor loads
-    * and stores are lowered: they inline the decode functions they call,
-    * which the rest of the lowering must then see. The pieces of a matrix
-    * may pair K 64 deep, which the tensor loads then take. */
+   /* Matrices of flexible dimensions become 16x16 pieces first. */
    if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)) {
-      bool split = false, pairing = false;
-      NIR_PASS(split, nir, agx_nir_lower_cmat_flexible, &pairing);
+      bool split = false;
+      NIR_PASS(split, nir, agx_nir_lower_cmat_flexible);
       if (split) {
          NIR_PASS(_, nir, nir_opt_deref);
          NIR_PASS(_, nir, nir_opt_dce);
          NIR_PASS(_, nir, nir_remove_dead_variables,
                   nir_var_function_temp | nir_var_shader_temp, NULL);
       }
-      NIR_PASS(_, nir, agx_nir_lower_cmat_tensor, pairing);
    }
 
    /* Then, before anything else lowers the shader: the functions of matrix
