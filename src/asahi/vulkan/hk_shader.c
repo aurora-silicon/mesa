@@ -3186,7 +3186,11 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
 
-   if (agx_chip_g17_m5(dev->dev.chip))
+   /* The cooperative-matrix lowering serves the 8x8 matmad on AGX3B
+    * (G15/G16/G17P) as well as M5's AGX3C; it no-ops on shaders that carry no
+    * cooperative matrix, so gating on the encoding is sufficient. */
+   if (agx_chip_g17_m5(dev->dev.chip) ||
+       agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3B)
       NIR_PASS(_, nir, agx_nir_lower_cmat);
 
    /* Turn cache flushes into image coherency bits while we still have derefs */

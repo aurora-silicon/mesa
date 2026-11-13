@@ -11,7 +11,19 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
    unsigned type = d->input_type ? d->input_type : AGX3_MATRIX_INPUT_F16;
    unsigned align_mask = type == AGX3_MATRIX_INPUT_F16 ? 3 : 1;
    unsigned source_max = type == AGX3_MATRIX_INPUT_F32 ? 252 : 254;
-   if (encoding != AGX_ISA_ENCODING_AGX3C || !out || !length ||
+
+   /*
+    * The 8x8 matrix multiply-add (f16/bf16/f32 inputs, f32 accumulator)
+    * exists both on the M5 AGX3C encoding (G17G/G17S) and on the AGX3B
+    * encoding that covers G15/G16 and G17P (M4 Pro, A18 Pro). The shared
+    * "f32matmad8x8" form carries every input type in the type field, so one
+    * builder serves both; only the witnessed selector constants, the
+    * c-is-zero marker and the scoreboard-wait field range differ between the
+    * two encodings. The 16x16 GEMM form (agx3_matrix_encode_gemm16) is M5
+    * only, so this is the sole matrix instruction AGX3B offers.
+    */
+   const bool agx3b = encoding == AGX_ISA_ENCODING_AGX3B;
+   if ((encoding != AGX_ISA_ENCODING_AGX3C && !agx3b) || !out || !length ||
        (type != AGX3_MATRIX_INPUT_F16 && type != AGX3_MATRIX_INPUT_F32 &&
         type != AGX3_MATRIX_INPUT_BF16) ||
        (d->dest & align_mask) || d->dest > 252 ||
@@ -20,16 +32,32 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
        (d->c_zero && (d->c || d->cache[2] || d->discard[2])))
       return false;
 
+   /*
+    * AGX3B carries a six-bit scoreboard wait in fields 69..74 (slots 0..5):
+    * field 74 is wait slot 5, not a c-is-zero marker. The c-is-zero vs
+    * multiply-accumulate choice is field 59 alone (1 = no C operand,
+    * 2 = multiply-accumulate), with the C register zero when absent. Fields
+    * 77..79 are not part of the wait mask and stay clear (no Apple witness),
+    * so refuse a wait above slot 5 rather than guess. AGX3C keeps its full
+    * eight-bit wait in 69..76. Witnessed by Apple G16G compiler output; the
+    * earlier "field 74 == c_zero, wait bits 0..4" reading byte-matched the
+    * compose corpus only because those captures all set wait slot 5.
+    */
+   if (agx3b && (d->wait_mask & ~0x3fu))
+      return false;
+
    for (unsigned i = 0; i < 3; ++i) {
       if (d->cache[i] && d->discard[i])
          return false;
    }
 
-   const struct agx3_field_kv base[] = {
+   struct agx3_field_kv base[] = {
       {9, 2}, {10, 2}, {25, 2}, {26, 1}, {42, 2}, {43, 1},
       {60, 2}, {67, 3}, {68, 61},
    };
-   struct agx3_field_kv fields[23];
+   /* f67/f68 are AGX3C-only selector bits; AGX3B does not carry them. */
+   unsigned nbase = agx3b ? 7 : (sizeof(base) / sizeof(base[0]));
+   struct agx3_field_kv fields[24];
    unsigned count = 0;
    fields[count++] = (struct agx3_field_kv){26, type};
    fields[count++] = (struct agx3_field_kv){43, type};
@@ -45,12 +73,12 @@ agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,
    fields[count++] = (struct agx3_field_kv){46, d->discard[1]};
    fields[count++] = (struct agx3_field_kv){61, d->cache[2]};
    fields[count++] = (struct agx3_field_kv){63, d->discard[2]};
-   for (unsigned i = 0; i < 8; ++i)
+   for (unsigned i = 0; i < (agx3b ? 6u : 8u); ++i)
       fields[count++] = (struct agx3_field_kv){69 + i,
                                              (d->wait_mask >> i) & 1};
 
    return agx3_bind_compose(encoding, "f32matmad8x8", 0, base,
-                            sizeof(base) / sizeof(base[0]), fields, count,
+                            nbase, fields, count,
                             out, length);
 }
 

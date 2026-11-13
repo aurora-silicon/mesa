@@ -6350,3 +6350,166 @@ TEST(NativeForms, G17PMeshPayloadReadIsUndefined)
    nir_validate_shader(b.shader, "gen1 mesh payload read");
    ralloc_free(b.shader);
 }
+
+/*
+ * The 8x8 cooperative-matrix multiply-add exists on the AGX3B ISA (G15/G16 and
+ * G17P) as well as on M5's AGX3C. These four f32matmad8x8 witnesses are real
+ * Apple G16G captures carried verbatim in the AGX3B half of the compose corpus
+ * (agx3_compose_corpus_vectors.c entries by74/by95/by96/by98), spanning the
+ * c-is-zero and c-present forms with both the destination cache hint and the
+ * operand discard hints. agx3_matrix_encode_mma8() must reproduce each one
+ * byte-for-byte when asked for the AGX3B encoding.
+ *
+ * by74 and by95 carry a nonzero scoreboard wait: their field 74 (wait slot 5)
+ * is set, i.e. wait_mask 0x20. Field 74 is the sixth wait bit, not a c-is-zero
+ * marker, so the descriptor must request that wait explicitly; by96/by98 have
+ * field 74 clear (wait_mask 0).
+ */
+TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
+{
+   const struct {
+      const char *tag;
+      struct agx3_matrix_mma8_desc desc;
+      std::vector<uint8_t> bytes; /* real Apple G16G capture */
+   } cases[] = {
+      {"by74 c_zero dest4 wait_sb5",
+       {.dest = 4, .a = 4, .b = 8, .c_zero = true,
+        .discard = {true, true, false}, .wait_mask = 0x20,
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 86, 2, 0, 4, 8, 0, 212, 65, 36, 0}},
+      {"by95 c_zero dest12 cache wait_sb5",
+       {.dest = 12, .a = 4, .b = 8, .c_zero = true, .dest_cache = true,
+        .cache = {true, true, false}, .wait_mask = 0x20,
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 86, 6, 1, 132, 9, 0, 84, 64, 36, 0}},
+      {"by96 c_present dest12 cache+discardC",
+       {.dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+        .cache = {true, true, false}, .discard = {false, false, true},
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 84, 6, 1, 132, 9, 9, 84, 66, 36, 1}},
+      {"by98 c_present dest4 discardAll",
+       {.dest = 4, .a = 4, .b = 8, .c = 12, .discard = {true, true, true},
+        .input_type = AGX3_MATRIX_INPUT_F32},
+       {207, 2, 84, 2, 0, 4, 8, 9, 212, 67, 36, 1}},
+   };
+   for (const auto &c : cases) {
+      uint8_t out[14], length = 0;
+      ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &c.desc, out,
+                                          &length)) << c.tag;
+      EXPECT_EQ(length, c.bytes.size()) << c.tag;
+      EXPECT_EQ(std::vector<uint8_t>(out, out + length), c.bytes) << c.tag;
+   }
+}
+
+/*
+ * Adding the AGX3B path must not perturb the M5 (AGX3C) encoding. The AGX3C
+ * form is 14 bytes (its two extra selector fields f67/f68 and the wider
+ * scoreboard-wait range are absent on the 12-byte AGX3B form), and its output
+ * for the same descriptors is exactly what the hardware-qualified M5 encoder
+ * emitted before this change. The two encodings therefore never collide.
+ */
+TEST(NativeForms, Agx3cMatmad8x8IsUnchangedByAgx3b)
+{
+   const struct agx3_matrix_mma8_desc c_present = {
+      .dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+      .cache = {true, true, false}, .discard = {false, false, true},
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   const struct agx3_matrix_mma8_desc c_zero = {
+      .dest = 4, .a = 4, .b = 8, .c_zero = true,
+      .discard = {true, true, false}, .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   const std::vector<uint8_t> gold_present =
+      {0x27, 0x80, 0x05, 0x9a, 0x28, 0x20, 0xaf, 0x1a,
+       0x10, 0x08, 0x10, 0x00, 0x90, 0x18};
+   const std::vector<uint8_t> gold_zero =
+      {0x27, 0x00, 0x05, 0x9a, 0x20, 0x20, 0xaf, 0x0a,
+       0x30, 0x06, 0x40, 0x00, 0x10, 0x01};
+   uint8_t out[14], length = 0;
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &c_present, out,
+                                       &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), gold_present);
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &c_zero, out,
+                                       &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), gold_zero);
+}
+
+/*
+ * The AGX3B form carries six scoreboard-wait bits (slots 0..5, fields 69..74);
+ * a full 0x3f mask still encodes, while bit 6 (slot 6) has no witness field, so
+ * the encoder refuses rather than emit an unverified encoding.
+ */
+TEST(NativeForms, Agx3bMatmad8x8RefusesUnwitnessedWait)
+{
+   struct agx3_matrix_mma8_desc desc = {
+      .dest = 4, .a = 4, .b = 8, .c = 12, .discard = {true, true, true},
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   uint8_t out[14], length = 0;
+   desc.wait_mask = 0x3f;
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
+                                       &length));
+   desc.wait_mask = 0x40;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &desc, out,
+                                        &length));
+}
+
+/*
+ * Field 74 (packed bit 17, the second-least bit of byte 2) is AGX3B wait slot
+ * 5, not a c-is-zero marker: it must track wait_mask bit 5 regardless of the
+ * accumulate/c-is-zero choice (which lives in field 59). A c-is-zero op with no
+ * wait leaves field 74 clear; an accumulating op that waits slot 5 sets it.
+ * This guards against the field reverting to a c_zero marker.
+ */
+TEST(NativeForms, Agx3bMatmad8x8Field74IsWaitSlot5NotCZero)
+{
+   uint8_t out[14], length = 0;
+   /* c-is-zero, no wait: field 74 must be 0 (c_zero alone must not set it). */
+   struct agx3_matrix_mma8_desc c_zero_nowait = {
+      .dest = 4, .a = 4, .b = 8, .c_zero = true,
+      .discard = {true, true, false}, .wait_mask = 0,
+      .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &c_zero_nowait,
+                                       out, &length));
+   EXPECT_EQ((out[2] >> 1) & 1, 0);
+   /* accumulate (c present), wait slot 5: field 74 must be 1. */
+   struct agx3_matrix_mma8_desc accum_wait5 = {
+      .dest = 12, .a = 4, .b = 8, .c = 12, .dest_cache = true,
+      .cache = {true, true, false}, .discard = {false, false, true},
+      .wait_mask = 0x20, .input_type = AGX3_MATRIX_INPUT_F32,
+   };
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &accum_wait5,
+                                       out, &length));
+   EXPECT_EQ((out[2] >> 1) & 1, 1);
+}
+
+/*
+ * The AGX3B cooperative-matrix default is decided per chip
+ * (agx_chip_cooperative_matrix_qualified, consumed by hk_physical_device.c):
+ * a part advertises coopmat by default only after its own hardware dEQP
+ * coopmat run passes. G16S (J616s, M4 Pro) has one; every other AGX3B part
+ * exposes the same encoder path but stays opt-in via
+ * ASAHI_AGX3B_COOPERATIVE_MATRIX=1 until it earns its own pass. This pins the
+ * table so no part is flipped on by default without a hardware pass, and
+ * confirms each listed part really is an AGX3B encoding (so the hk gate, which
+ * keys on the encoding, actually reaches it).
+ */
+TEST(NativeForms, Agx3bCoopmatDefaultIsPerChipQualified)
+{
+   /* G16S is the only hardware-qualified AGX3B part today, and it is AGX3B. */
+   EXPECT_TRUE(agx_chip_cooperative_matrix_qualified(AGX_CHIP_G16S));
+   EXPECT_EQ(agx_chip_isa_encoding(AGX_CHIP_G16S), AGX_ISA_ENCODING_AGX3B);
+
+   /* Every other AGX3B part is AGX3B (gate-reachable) yet default-off. */
+   for (enum agx_chip chip : {AGX_CHIP_G17P, AGX_CHIP_G17A, AGX_CHIP_G16P,
+                              AGX_CHIP_G16G, AGX_CHIP_G16C, AGX_CHIP_G15G,
+                              AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D}) {
+      EXPECT_EQ(agx_chip_isa_encoding(chip), AGX_ISA_ENCODING_AGX3B);
+      EXPECT_FALSE(agx_chip_cooperative_matrix_qualified(chip));
+   }
+
+   /* M5 (AGX3C) and AGX2 parts never gate on this table. */
+   EXPECT_FALSE(agx_chip_cooperative_matrix_qualified(AGX_CHIP_G17G));
+   EXPECT_FALSE(agx_chip_cooperative_matrix_qualified(AGX_CHIP_G13G));
+}
