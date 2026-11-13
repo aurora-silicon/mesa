@@ -542,7 +542,8 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    /* Optimize but allow copies because we haven't lowered them yet */
    if (agx_native_graphics(&((struct hk_physical_device *)vk_pdev)->dev) &&
        nir->info.stage != MESA_SHADER_MESH)
-      agx_preprocess_nir_g17p(nir);
+      agx_preprocess_nir_native(
+         nir, ((struct hk_physical_device *)vk_pdev)->dev.chip);
    else if (((struct hk_physical_device *)vk_pdev)->dev.chip == AGX_CHIP_G18G)
       agx_preprocess_nir_g18g(nir);
    else if (agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip))
@@ -3534,7 +3535,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (nir->info.stage != MESA_SHADER_MESH &&
        !(nir->info.stage == MESA_SHADER_TASK && agx_chip_g17_m5(dev->dev.chip))) {
       if (agx_native_graphics(&dev->dev))
-         agx_preprocess_nir_g17p(nir);
+         agx_preprocess_nir_native(nir, dev->dev.chip);
       else if (dev->dev.chip == AGX_CHIP_G18G)
          agx_preprocess_nir_g18g(nir);
       else if (agx_chip_g17_m5(dev->dev.chip))
@@ -5975,7 +5976,7 @@ hk_build_predicated_mesh_object(enum agx_chip chip)
    if (agx_chip_g17_m5(chip))
       agx_preprocess_nir_m5(b.shader);
    else
-      agx_preprocess_nir_g17p(b.shader);
+      agx_preprocess_nir_native(b.shader, chip);
    return b.shader;
 }
 
@@ -6587,7 +6588,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (agx_chip_g17_m5(dev->dev.chip))
          agx_preprocess_nir_m5(nir);
       else
-         agx_preprocess_nir_g17p(nir);
+         agx_preprocess_nir_native(nir, dev->dev.chip);
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
                              info->robustness, NULL, features, shader,
                              sw_stage, true, NULL, info->set_layout_count,
@@ -6689,7 +6690,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       if (agx_chip_g17_m5(dev->dev.chip))
          agx_preprocess_nir_m5(nir);
       else
-         agx_preprocess_nir_g17p(nir);
+         agx_preprocess_nir_native(nir, dev->dev.chip);
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
                              info->robustness, NULL, features, &obj->variants[0],
                              sw_stage, true, NULL, info->set_layout_count,

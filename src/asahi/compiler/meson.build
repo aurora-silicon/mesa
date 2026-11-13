@@ -657,6 +657,7 @@ if with_tests
          'test/test-agx3-fsel-uniform.cpp',
          'test/test-agx3-cube-scratch.cpp',
          'test/test-fminmax-constant-denorm.cpp',
+         'test/test-fminmax-signed-zero.cpp',
          'test/test-shared-byte-offsets.cpp',
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',

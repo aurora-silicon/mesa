@@ -684,6 +684,9 @@ uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
 void agx_preprocess_nir_g17p(nir_shader *nir);
+/* For any native AGX3 chip (agx_native_graphics); passes validated on G17P
+ * alone check chip. */
+void agx_preprocess_nir_native(nir_shader *nir, enum agx_chip chip);
 void agx_preprocess_nir_g18g(nir_shader *nir);
 
 /* Access private (scratch) memory in whole 32-bit words, the only width the
