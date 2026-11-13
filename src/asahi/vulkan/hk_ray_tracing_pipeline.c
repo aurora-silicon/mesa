@@ -2349,6 +2349,11 @@ hk_hit_object_load(nir_builder *b, struct hk_rt_compiler *compiler,
  * frame that static TPS offsets can address. */
 #define HK_RT_CONT_MAX_STACK_SIZE (48 * 1024)
 
+/* Diagnostic, default off: ASAHI_G17P_RT_CONTINUATION=1 compiles pipelines of
+ * every depth as continuations, for A/B against the inlined megakernel. */
+DEBUG_GET_ONCE_BOOL_OPTION(hk_rt_continuation, "ASAHI_G17P_RT_CONTINUATION",
+                           false)
+
 static bool
 hk_rt_cont_hoist_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -3809,7 +3814,8 @@ hk_compile_rt_kernel(
 
    /* Deeper pipelines run as continuations unless a ray query or hit object
     * lives across a call; those keep the inlined megakernel. */
-   if (compiler.max_depth > HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH &&
+   if ((compiler.max_depth > HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH ||
+        debug_get_option_hk_rt_continuation()) &&
        hk_rt_cont_split(&compiler, b->shader)) {
       if (compiler.cont_stack_size > HK_RT_CONT_MAX_STACK_SIZE) {
          ralloc_free(b->shader);
