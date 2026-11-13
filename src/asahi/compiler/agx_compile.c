@@ -10120,7 +10120,7 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
-                 bool g18_scans,
+                 bool g18_scans, bool g18_ftz,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info)
@@ -10410,6 +10410,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    NIR_PASS(_, nir, nir_opt_algebraic_late);
    NIR_PASS(_, nir, agx_nir_lower_fminmax, g17p || m5);
+
+   /* G18G fp32 arithmetic preserves denorms and nothing in the encoding
+    * flushes them, so DenormFlushToZero(32) shaders need the flush in
+    * software. Runs after the last float-changing optimization. */
+   if (g18_ftz)
+      NIR_PASS(_, nir, agx_nir_lower_g18_ftz);
 
    /* The AGX3 byte-address backend cannot encode 64-bit shifted adds.
     * Lower remaining multiplies before fusion turns x * 3 into one; the
@@ -15804,12 +15810,16 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
+   const bool g18_ftz =
+      agx_is_g18g(&key->dev) &&
+      nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode, 32);
+
    agx_optimize_nir(
       nir, key->dev.soft_fault, uniform_atomics,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
       key->dev.chip == AGX_CHIP_G17P,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
-      key->dev.emit_agx3d,
+      key->dev.emit_agx3d, g18_ftz,
       form_preamble ? &info->push_count : NULL,
       (form_preamble && key->promote_textures) ? &info->texture_state_count
                                               : NULL,
