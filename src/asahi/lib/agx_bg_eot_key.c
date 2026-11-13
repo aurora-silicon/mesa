@@ -62,6 +62,9 @@ agx_g17p_mrt_eot_selector(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8X8_SRGB:
    case PIPE_FORMAT_R10G10B10A2_UNORM:
    case PIPE_FORMAT_B10G10R10A2_UNORM:
+   /* X2 shares the RGB10A2 tile; only the PBE ignores alpha. */
+   case PIPE_FORMAT_R10G10B10X2_UNORM:
+   case PIPE_FORMAT_B10G10R10X2_UNORM:
       return 0x75;
 
    case PIPE_FORMAT_R8_UINT:
