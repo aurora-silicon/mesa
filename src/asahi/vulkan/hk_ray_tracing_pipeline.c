@@ -168,12 +168,21 @@ hk_load_sbt_entry(nir_builder *b, nir_def *index, uint32_t command_offset)
       addr = nir_iadd(b, addr, nir_u2u64(b, nir_imul(b, index, stride)));
    }
 
+   /* A record is only aligned to shaderGroupHandleAlignment. Read the aligned
+    * eight bytes holding the index and shift it out, without control flow:
+    * callers build around this load while other passes rewrite the shader,
+    * so it must not split their blocks. The second word is still inside the
+    * 32-byte handle. */
+   nir_def *handle_addr = nir_iadd_imm(
+      b, addr, offsetof(struct hk_ray_tracing_group_handle, index));
+   nir_def *words = nir_load_global_constant(
+      b, 2, 32, nir_iand_imm(b, handle_addr, ~UINT64_C(3)), .align_mul = 4);
+   nir_def *shift = nir_ishl_imm(
+      b, nir_iand_imm(b, nir_unpack_64_2x32_split_x(b, handle_addr), 3), 3);
+
    return (struct hk_sbt_entry){
-      .value = nir_load_global_constant(
-         b, 1, 32,
-         nir_iadd_imm(b, addr,
-                      offsetof(struct hk_ray_tracing_group_handle, index)),
-         .align_mul = 4),
+      .value = nir_unpack_64_2x32_split_x(
+         b, nir_ushr(b, nir_pack_64_2x32(b, words), shift)),
       .shader_record_ptr =
          nir_iadd_imm(b, addr, HK_RAY_TRACING_GROUP_HANDLE_SIZE),
    };
