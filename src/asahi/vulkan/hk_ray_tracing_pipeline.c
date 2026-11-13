@@ -2564,6 +2564,95 @@ hk_rt_cont_split(struct hk_rt_compiler *compiler, void *mem_ctx)
    return true;
 }
 
+struct hk_rt_cont_target {
+   uint32_t handle, pc;
+};
+
+static int
+hk_rt_cont_target_cmp(const void *a, const void *b)
+{
+   const struct hk_rt_cont_target *x = a, *y = b;
+   return x->handle < y->handle ? -1 : x->handle > y->handle;
+}
+
+static void
+hk_rt_cont_target_tree(nir_builder *b, nir_variable *out, nir_def *handle,
+                       const struct hk_rt_cont_target *t, unsigned n)
+{
+   if (n <= 8) {
+      nir_def *pc = nir_load_var(b, out);
+      for (unsigned i = 0; i < n; ++i)
+         pc = nir_bcsel(b, nir_ieq_imm(b, handle, t[i].handle),
+                        nir_imm_int(b, t[i].pc), pc);
+      nir_store_var(b, out, pc, 0x1);
+      return;
+   }
+   const unsigned mid = n / 2;
+   nir_push_if(b, nir_ult(b, handle, nir_imm_int(b, t[mid].handle)));
+   hk_rt_cont_target_tree(b, out, handle, t, mid);
+   nir_push_else(b, NULL);
+   hk_rt_cont_target_tree(b, out, handle, t + mid, n - mid);
+   nir_pop_if(b, NULL);
+}
+
+/*
+ * Entry pc of the group whose handle is `handle`, or HK_RT_CONT_PC_DONE.  A
+ * balanced search over the sorted handles: a pipeline with thousands of groups
+ * costs log2(n) compares and no block holds a select per group.
+ */
+static nir_def *
+hk_rt_cont_entry_pc(nir_builder *b, struct hk_rt_compiler *compiler,
+                    nir_def *handle)
+{
+   const struct hk_ray_tracing_pipeline *pipeline = compiler->pipeline;
+   struct hk_rt_cont_target *t =
+      malloc(MAX2(pipeline->group_count, 1) * sizeof(*t));
+   unsigned n = 0;
+
+   for (unsigned i = 0; t && i < pipeline->group_count; ++i) {
+      const struct hk_ray_tracing_group *g = pipeline->groups + i;
+      if (g->recursive_index == VK_SHADER_UNUSED_KHR)
+         continue;
+      struct hash_entry *entry = _mesa_hash_table_search(
+         compiler->cont->entries, pipeline->stages[g->recursive_index]->nir);
+      if (entry)
+         t[n++] = (struct hk_rt_cont_target){
+            .handle = g->handle.index, .pc = (uintptr_t)entry->data,
+         };
+   }
+   qsort(t, n, sizeof(*t), hk_rt_cont_target_cmp);
+
+   nir_variable *out =
+      nir_local_variable_create(b->impl, glsl_uint_type(), "rt.entry_pc");
+   nir_store_var(b, out, nir_imm_int(b, HK_RT_CONT_PC_DONE), 0x1);
+   hk_rt_cont_target_tree(b, out, handle, t, n);
+   free(t);
+   return nir_load_var(b, out);
+}
+
+/* Run the part whose pc is `cur`: a balanced search over the parts, which are
+ * numbered consecutively. */
+static void
+hk_rt_cont_dispatch(nir_builder *b, struct hk_rt_compiler *compiler,
+                    nir_def *cur, struct hk_rt_callable_part *const *parts,
+                    unsigned n)
+{
+   if (n <= 4) {
+      for (unsigned i = 0; i < n; ++i) {
+         nir_push_if(b, nir_ieq_imm(b, cur, parts[i]->pc));
+         hk_call_ray_tracing_stage(b, compiler, parts[i]->nir, false);
+         nir_pop_if(b, NULL);
+      }
+      return;
+   }
+   const unsigned mid = n / 2;
+   nir_push_if(b, nir_ult(b, cur, nir_imm_int(b, parts[mid]->pc)));
+   hk_rt_cont_dispatch(b, compiler, cur, parts, mid);
+   nir_push_else(b, NULL);
+   hk_rt_cont_dispatch(b, compiler, cur, parts + mid, n - mid);
+   nir_pop_if(b, NULL);
+}
+
 /* Push a return record above the caller's frame and enter the callee frame. */
 static void
 hk_rt_cont_push(nir_builder *b, struct hk_rt_compiler *compiler,
@@ -2646,7 +2735,7 @@ hk_rt_cont_execute_callable(nir_builder *b, struct hk_rt_compiler *compiler,
 
    struct hk_sbt_entry entry =
       hk_load_sbt_entry(b, intr->src[0].ssa, HK_RT_CMD_CALLABLE_ADDRESS);
-   nir_def *target = hk_callable_pc(b, compiler, ctx, entry.value);
+   nir_def *target = hk_rt_cont_entry_pc(b, compiler, entry.value);
    nir_def *sp = nir_load_var(b, state->stack_ptr);
    nir_def *next_sp = nir_iadd_imm(b, sp, delta);
 
@@ -2702,7 +2791,7 @@ hk_rt_cont_traverse(nir_builder *b, struct hk_rt_compiler *compiler,
          struct hk_sbt_entry chit_entry = hk_load_sbt_entry(
             b, nir_load_var(b, state->sbt_index), HK_RT_CMD_HIT_ADDRESS);
          nir_store_var(b, target_var,
-                       hk_callable_pc(b, compiler, ctx, chit_entry.value), 0x1);
+                       hk_rt_cont_entry_pc(b, compiler, chit_entry.value), 0x1);
          nir_store_var(b, record_var, chit_entry.shader_record_ptr, 0x1);
       }
       nir_pop_if(b, NULL);
@@ -2712,7 +2801,7 @@ hk_rt_cont_traverse(nir_builder *b, struct hk_rt_compiler *compiler,
       struct hk_sbt_entry miss_entry =
          hk_load_sbt_entry(b, miss_index, HK_RT_CMD_MISS_ADDRESS);
       nir_store_var(b, target_var,
-                    hk_callable_pc(b, compiler, ctx, miss_entry.value), 0x1);
+                    hk_rt_cont_entry_pc(b, compiler, miss_entry.value), 0x1);
       nir_store_var(b, record_var, miss_entry.shader_record_ptr, 0x1);
    }
    nir_pop_if(b, NULL);
@@ -2771,7 +2860,7 @@ hk_rt_cont_build(nir_builder *b, struct hk_rt_compiler *compiler,
                      nir_imm_int(b, (uintptr_t)entry->data),
                      nir_imm_int(b, HK_RT_CONT_PC_DONE));
    } else {
-      pc = hk_callable_pc(b, compiler, ctx, raygen_entry.value);
+      pc = hk_rt_cont_entry_pc(b, compiler, raygen_entry.value);
    }
    nir_store_var(b, ctx->pc, pc, 0x1);
 
@@ -2797,11 +2886,9 @@ hk_rt_cont_build(nir_builder *b, struct hk_rt_compiler *compiler,
                        nir_load_var(b, state->tmax), nir_imm_int(b, 0));
          nir_push_else(b, NULL);
       }
-      util_dynarray_foreach(&ctx->parts, struct hk_rt_callable_part *, part) {
-         nir_push_if(b, nir_ieq_imm(b, cur, (*part)->pc));
-         hk_call_ray_tracing_stage(b, compiler, (*part)->nir, false);
-         nir_pop_if(b, NULL);
-      }
+      hk_rt_cont_dispatch(b, compiler, cur, util_dynarray_begin(&ctx->parts),
+                          util_dynarray_num_elements(
+                             &ctx->parts, struct hk_rt_callable_part *));
       if (compiler->cont_traces)
          nir_pop_if(b, NULL);
 
