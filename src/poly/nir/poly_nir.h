@@ -18,6 +18,8 @@ struct nir_def *poly_load_per_vertex_input(struct nir_builder *b,
 
 nir_def *poly_nir_load_vertex_id(struct nir_builder *b, nir_def *id);
 
+nir_def *poly_nir_load_instance_offset(struct nir_builder *b);
+
 bool poly_nir_lower_sw_vs(struct nir_shader *s);
 
 bool poly_nir_lower_vs_before_gs(struct nir_shader *vs);

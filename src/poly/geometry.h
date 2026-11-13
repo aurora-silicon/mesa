@@ -213,7 +213,11 @@ struct poly_vertex_params {
     */
    uint32_t grid[6];
 
-   uint32_t _pad;
+   /* First instance of a draw drawn in parts, added to the instance ID a
+    * software VS sees (poly_nir_load_instance_offset) but not to its output
+    * layout. Zero otherwise.
+    */
+   uint32_t instance_offset;
 
    /* Output buffer for vertex data */
    uint64_t output_buffer;

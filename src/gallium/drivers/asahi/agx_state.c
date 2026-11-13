@@ -2731,6 +2731,59 @@ agx_gallium_preprocess_nir(struct agx_device *dev, nir_shader *nir)
       agx_preprocess_nir(nir);
 }
 
+/* M5 draws a patch draw too large for one render in parts
+ * (agx_draw_patches_split). Each part numbers its patches from its first
+ * one, so the API patch ID adds poly_tess_params::first_patch: in the
+ * control and evaluation shaders' own reads, and in the patch ID an
+ * evaluation shader hands a geometry shader.
+ */
+static nir_def *
+agx_nir_load_first_patch(nir_builder *b)
+{
+   nir_def *addr = nir_iadd_imm(b, nir_load_tess_param_buffer_poly(b),
+                                offsetof(struct poly_tess_params, first_patch));
+   return nir_load_global_constant(b, 1, 32, addr, .align_mul = 4);
+}
+
+static bool
+agx_nir_offset_patch_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_load_primitive_id) {
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *id = nir_iadd(b, &intr->def, agx_nir_load_first_patch(b));
+      nir_def_rewrite_uses_after(&intr->def, id);
+      return true;
+   }
+
+   if (intr->intrinsic == nir_intrinsic_store_output &&
+       nir_intrinsic_io_semantics(intr).location == VARYING_SLOT_PRIMITIVE_ID) {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_src_rewrite(&intr->src[0], nir_iadd(b, intr->src[0].ssa,
+                                              agx_nir_load_first_patch(b)));
+      return true;
+   }
+
+   return false;
+}
+
+/* Likewise the API instance ID of a software VS adds
+ * poly_vertex_params::instance_offset. Its output layout keeps the
+ * dispatch's instance ID (poly_nir_lower_vs_before_gs), which the prolog
+ * exports unchanged.
+ */
+static bool
+agx_nir_offset_instance_id(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_instance_id)
+      return false;
+
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *id = nir_iadd(b, &intr->def, poly_nir_load_instance_offset(b));
+   nir_def_rewrite_uses_after(&intr->def, id);
+   return true;
+}
+
 /* Does not take ownership of key. Clones if necessary. */
 static struct agx_compiled_shader *
 agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
@@ -2796,7 +2849,15 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       struct asahi_vs_shader_key *key = &key_->vs;
 
       if (nir->info.vs.tes_poly) {
+         const bool split = agx_chip_g17_m5(dev->chip);
+         if (split)
+            NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                     agx_nir_offset_patch_id, nir_metadata_control_flow, NULL);
          NIR_PASS(_, nir, poly_nir_lower_tes, key->hw);
+         /* The patch ID stored for a geometry shader */
+         if (split && !key->hw)
+            NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                     agx_nir_offset_patch_id, nir_metadata_control_flow, NULL);
       } else {
          NIR_PASS(_, nir, agx_nir_gather_vs_inputs, attrib_components_read);
          NIR_PASS(_, nir, agx_nir_lower_vs_input_to_prolog);
@@ -2842,6 +2903,10 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
                      agx_native_graphics(dev));
          }
       } else {
+         if (agx_chip_g17_m5(dev->chip) && !nir->info.vs.tes_poly)
+            NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+                     agx_nir_offset_instance_id, nir_metadata_control_flow,
+                     NULL);
          NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
 
          /* Turn into a compute shader now that we're free of vertexisms */
@@ -2858,6 +2923,9 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
        * copied. Declare the same shape that agx_draw_patches() launches. */
       nir->info.workgroup_size[0] = nir->info.tess.tcs_vertices_out;
       nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+      if (agx_chip_g17_m5(dev->chip))
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_nir_offset_patch_id,
+                  nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, poly_nir_lower_tcs, true);
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       NIR_PASS(_, nir, poly_nir_lower_gs, &gs_count, &gs_copy, &pre_gs,
@@ -4470,6 +4538,8 @@ agx_update_vs(struct agx_batch *batch, unsigned index_size_B)
             ? AGX_ABI_G17P_TEXTURE_POINTER_HALFS
             : 0,
       .prolog.vs.sw_index_size_B = key.hw ? 0 : index_size_B,
+      /* M5 draws large patch draws in instance ranges */
+      .prolog.vs.sw_instance_offset = g17g && !key.hw,
 
       .prolog.vs.robustness.level =
          ctx->robust ? AGX_ROBUSTNESS_GL : AGX_ROBUSTNESS_DISABLED,
@@ -14315,6 +14385,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
    struct poly_vertex_params vp;
    poly_vertex_params_init(&vp, batch->ctx->vs->b.info.outputs, wg_size);
+   vp.instance_offset = ctx->tess_split.first_instance;
 
    if (info->index_size) {
       size_t ib_extent = 0;
@@ -14340,6 +14411,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       .partitioning = partitioning,
       .points_mode = point_mode,
       .isolines = mode == TESS_PRIMITIVE_ISOLINES,
+      .first_patch = ctx->tess_split.first_patch,
    };
 
    if (!point_mode && tes->tess.primitive != TESS_PRIMITIVE_ISOLINES) {
@@ -14360,10 +14432,13 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       if (in_patches == 0)
          return;
 
-      /* TCS invocation counter increments once per-patch */
-      agx_query_increment_cpu(
-         ctx, ctx->pipeline_statistics[PIPE_STAT_QUERY_HS_INVOCATIONS],
-         in_patches);
+      /* TCS invocation counter increments once per-patch. A draw drawn in
+       * parts counts its first instance's parts, as it would whole. */
+      if (!ctx->tess_split.first_instance) {
+         agx_query_increment_cpu(
+            ctx, ctx->pipeline_statistics[PIPE_STAT_QUERY_HS_INVOCATIONS],
+            in_patches);
+      }
 
       unsigned unrolled_patches = in_patches * info->instance_count;
 
@@ -14975,16 +15050,14 @@ agx_g17g_layered_clear(struct agx_context *ctx, unsigned buffers,
    util_unreference_framebuffer_state(&saved);
 }
 
-/* Most primitives a direct patch draw can tessellate into. A patch cut into
- * at most n segments per edge yields at most 2 (n + 1)^2 primitives; n is 64
- * when a control shader writes the levels, else the default levels bound it.
+/* Most primitives one patch can tessellate into. A patch cut into at most n
+ * segments per edge yields at most 2 (n + 1)^2 primitives; n is 64 when a
+ * control shader writes the levels, else the default levels bound it.
  */
-static uint64_t
-agx_tess_max_prims(const struct agx_context *ctx,
-                   const struct pipe_draw_info *info,
-                   const struct pipe_draw_start_count_bias *draw)
+static unsigned
+agx_tess_max_prims_per_patch(const struct agx_context *ctx)
 {
-   uint64_t segments = 64;
+   unsigned segments = 64;
 
    if (!ctx->stage[MESA_SHADER_TESS_CTRL].shader) {
       const float levels[6] = {
@@ -15003,11 +15076,61 @@ agx_tess_max_prims(const struct agx_context *ctx,
 
       /* Fractional partitioning rounds up to the next odd or even count. */
       if (bounded)
-         segments = MIN2((uint64_t)level + 2, 64);
+         segments = MIN2((unsigned)level + 2, 64);
    }
 
-   const uint64_t patches = draw->count / MAX2(ctx->patch_vertices, 1);
-   return patches * info->instance_count * 2 * (segments + 1) * (segments + 1);
+   return 2 * (segments + 1) * (segments + 1);
+}
+
+static_assert(2 * 65 * 65 <= AGX_G17G_RENDER_PRIMS,
+              "one patch fits an M5 render");
+
+/* Draw a direct patch draw in consecutive parts whose worst case each fits
+ * one M5 render (agx_draw_vbo() gives each its own): whole instances when
+ * one instance fits, else patch ranges of one instance. The parts run in API
+ * order and keep the draw's IDs: gl_PrimitiveID counts from the part's first
+ * patch and gl_InstanceID from its first instance (agx_draw_patches), while
+ * start_instance, and with it gl_BaseInstance and instanced fetches, stays.
+ */
+static void
+agx_draw_patches_split(struct agx_context *ctx,
+                       const struct pipe_draw_info *info, unsigned drawid_offset,
+                       const struct pipe_draw_start_count_bias *draw,
+                       unsigned patches, unsigned max_patches)
+{
+   const unsigned patch_vertices = ctx->patch_vertices;
+   const unsigned patch_step = MIN2(patches, max_patches);
+   const unsigned instance_step = max_patches / patch_step;
+
+   struct pipe_draw_info part = *info;
+   struct pipe_draw_start_count_bias part_draw = *draw;
+
+   /* The render condition holds for the whole draw, checked once. */
+   struct pipe_query *cond_query = ctx->cond_query;
+   ctx->cond_query = NULL;
+
+   for (unsigned i = 0; i < info->instance_count;) {
+      part.instance_count = MIN2(instance_step, info->instance_count - i);
+
+      for (unsigned p = 0; p < patches;) {
+         const unsigned n = MIN2(patch_step, patches - p);
+
+         part_draw.start = draw->start + p * patch_vertices;
+         part_draw.count = n * patch_vertices;
+
+         ctx->tess_split.first_patch = p;
+         ctx->tess_split.first_instance = i;
+         ctx->base.draw_vbo(&ctx->base, &part, drawid_offset, NULL,
+                            &part_draw, 1);
+         p += n;
+      }
+
+      i += part.instance_count;
+   }
+
+   ctx->tess_split.first_patch = 0;
+   ctx->tess_split.first_instance = 0;
+   ctx->cond_query = cond_query;
 }
 
 static void
@@ -15167,18 +15290,31 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 
    /* The GPU writes a tessellated draw's primitive count, and one M5 render
-    * holds AGX_G17G_RENDER_PRIMS: past that the submission times out. Drop
-    * a draw that could exceed it. */
-   if (info->mode == MESA_PRIM_PATCHES && agx_m5_gpu_tess(ctx) &&
-       (indirect ||
-        agx_tess_max_prims(ctx, info, draws) > AGX_G17G_RENDER_PRIMS)) {
-      static bool reported;
-      if (!reported) {
-         reported = true;
-         mesa_loge("asahi: dropping a tessellated draw that could exceed the "
-                   "M5 primitive budget of one render");
+    * holds AGX_G17G_RENDER_PRIMS: past that the submission times out. Draw
+    * a patch draw that could exceed it in parts that cannot. Indirect patch
+    * draws were read back above; drop anything that still cannot be split.
+    */
+   if (info->mode == MESA_PRIM_PATCHES && agx_m5_gpu_tess(ctx)) {
+      const unsigned max_patches =
+         AGX_G17G_RENDER_PRIMS / agx_tess_max_prims_per_patch(ctx);
+
+      if (indirect || !max_patches) {
+         static bool reported;
+         if (!reported) {
+            reported = true;
+            mesa_loge("asahi: dropping a tessellated draw that could exceed "
+                      "the M5 primitive budget of one render");
+         }
+         return;
       }
-      return;
+
+      const unsigned patches = draws->count / MAX2(ctx->patch_vertices, 1);
+      if (patches > max_patches ||
+          (patches && info->instance_count > max_patches / patches)) {
+         agx_draw_patches_split(ctx, info, drawid_offset, draws, patches,
+                                max_patches);
+         return;
+      }
    }
 
    if (agx_chip_g17_m5(agx_device(pctx->screen)->chip) &&

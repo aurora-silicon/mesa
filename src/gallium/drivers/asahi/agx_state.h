@@ -1035,6 +1035,14 @@ struct agx_context {
 
    bool in_tess;
 
+   /* M5: the part of a patch draw being drawn, when one render cannot hold
+    * all of it (agx_draw_patches_split). Zero otherwise.
+    */
+   struct {
+      unsigned first_patch;
+      unsigned first_instance;
+   } tess_split;
+
    struct blitter_context *blitter;
    struct asahi_blitter compute_blitter;
 
