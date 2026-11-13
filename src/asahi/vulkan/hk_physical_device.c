@@ -1167,10 +1167,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .minAccelerationStructureScratchOffsetAlignment = 128,
 
       /* VK_KHR_ray_tracing_pipeline.  shaderGroupHandleSize is fixed at 32 by
-       * the specification.  The base and handle alignments are the
-       * specification's minima -- nothing in the megakernel's SBT fetch
-       * requires more, because every record address arrives as a device
-       * address the shader adds a stride to.
+       * the specification.  The base alignment is the largest the
+       * specification allows. G17P's SBT fetch takes records at any byte
+       * address (hk_load_sbt_entry), so it reports a handle alignment of 1;
+       * other chips keep the largest allowed, 32.
        *
        * Trace recursion is unrolled into the megakernel at compile time.
        * G17P supports three levels until trace continuations can be shared.
@@ -1186,7 +1186,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
-      .shaderGroupHandleAlignment = 32,
+      .shaderGroupHandleAlignment = dev->chip == AGX_CHIP_G17P ? 1 : 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
 
       .rayTracingInvocationReorderReorderingHint =
