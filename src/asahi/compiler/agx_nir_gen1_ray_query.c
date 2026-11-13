@@ -146,17 +146,22 @@ gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
 
 /* Ray flags under which software must see every triangle hit: NoOpaque, the
  * facing and opacity culls, and SkipTriangles. The hardware is not given the
- * ray flags, so it may commit only when none of them is set. Opaque rays keep
- * the software path too: they commit every hit anyway, and incoherent ones
- * traced slower with hardware commits. */
-#define GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS 0x1f3
+ * ray flags, so it may commit only when none of them is set. */
+#define GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS 0x1f2
 
-/* Candidate control 0x9142 queues every triangle hit for software. Setting
- * field 12:11 (0x9942) lets the hardware commit opaque triangle hits itself:
- * it lowers the tmax in payload word +24 to the hit distance, keeps the hit
- * words in query words 256/512, and keeps the hit's instance pointer in the
- * halfwords just before the current instance's (8960 rather than 9152). The
- * current instance is wherever traversal stopped, which can be past the hit. */
+/* Candidate control words. QUEUE hands every triangle hit to the software
+ * candidate loop. COMMIT_OPAQUE lets the hardware commit opaque triangle hits
+ * itself: it lowers the tmax in payload word +24 to the hit distance, keeps
+ * the hit words in query words 256/512, and keeps the hit's instance pointer
+ * in the halfwords just before the current instance's (8960 rather than
+ * 9152). The current instance is wherever traversal stopped, which can be
+ * past the hit. COMMIT_ALL has the hardware commit every triangle hit the
+ * same way and queue none, which is all an Opaque ray needs; its triangle
+ * tests then take about half the GPU time they take with QUEUE. */
+#define GEN1_RQ_CONTROL_QUEUE          0x9142
+#define GEN1_RQ_CONTROL_COMMIT_OPAQUE  0x9942
+#define GEN1_RQ_CONTROL_COMMIT_ALL     0x4942
+
 static nir_def *
 gen1_rq_committed_instance_pointer(nir_builder *b, nir_def *query, nir_def *lane)
 {
@@ -173,6 +178,17 @@ gen1_rq_hw_commits(nir_builder *b, nir_deref_instr *flags)
 {
    return nir_inot(b, nir_test_mask(b, nir_load_deref(b, flags),
                                     GEN1_RQ_SOFTWARE_TRIANGLE_FLAGS));
+}
+
+static nir_def *
+gen1_rq_control(nir_builder *b, nir_deref_instr *flags)
+{
+   nir_def *opaque = nir_test_mask(b, nir_load_deref(b, flags), 1);
+   nir_def *commit = nir_bcsel(b, opaque,
+                               nir_imm_int(b, GEN1_RQ_CONTROL_COMMIT_ALL),
+                               nir_imm_int(b, GEN1_RQ_CONTROL_COMMIT_OPAQUE));
+   return nir_bcsel(b, gen1_rq_hw_commits(b, flags), commit,
+                    nir_imm_int(b, GEN1_RQ_CONTROL_QUEUE));
 }
 
 /* Committed values beyond the hit words and distance that a merged hardware
@@ -664,7 +680,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             nir_store_scs_uniform_agx(&b,words[i],base,index,
                .base=16*i,.format=PIPE_FORMAT_R32_UINT,.component=0);
          nir_def *query_control = layout->candidates
-            ? nir_bcsel(&b, gen1_rq_hw_commits(&b, flags), nir_imm_int(&b, 0x9942), nir_imm_int(&b, 0x9142))
+            ? gen1_rq_control(&b, flags)
             : nir_imm_int(&b, 0x4922);
          nir_store_scs_indexed_agx(&b,nir_vec2(&b,query_control,
             nir_load_deref(&b,tmin)),query,lane,.base=0,.component=3);
