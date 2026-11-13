@@ -163,6 +163,10 @@ struct hk_device {
     */
    struct hk_descriptor_table sampled_images;
 
+   /* VK_EXT_descriptor_buffer texel-buffer textures (hk_buffer_view.c),
+    * NULL unless the device enables descriptorBuffer. */
+   struct hk_texel_windows *texel_windows;
+
    struct vk_meta_device meta;
 
    /* Parameters for Mesa's common acceleration-structure builder. */
@@ -446,6 +450,9 @@ VkResult hk_sampler_heap_add(struct hk_device *dev,
                              const struct hk_native_sampler_descriptor *desc,
                              struct hk_rc_sampler **out);
 
+VkResult hk_sampler_heap_add_at(struct hk_device *dev,
+                                const struct hk_native_sampler_descriptor *desc,
+                                uint32_t index, struct hk_rc_sampler **out);
 void hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc);
 
 static inline struct agx_scratch *

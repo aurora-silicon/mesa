@@ -77,6 +77,12 @@ hk_get_buffer_alignment(const struct hk_physical_device *pdev,
                       VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT_KHR))
       alignment = MAX2(alignment, HK_MIN_TEXEL_BUFFER_ALIGNMENT);
 
+   /* Descriptor buffer addresses must meet descriptorBufferOffsetAlignment */
+   if (usage_flags & (VK_BUFFER_USAGE_2_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT |
+                      VK_BUFFER_USAGE_2_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT |
+                      VK_BUFFER_USAGE_2_PUSH_DESCRIPTORS_DESCRIPTOR_BUFFER_BIT_EXT))
+      alignment = MAX2(alignment, HK_MIN_UBO_ALIGNMENT);
+
    if (create_flags & (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
                        VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT))
       alignment = MAX2(alignment, 16384);

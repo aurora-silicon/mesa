@@ -12,6 +12,7 @@
 #include "vk_descriptor_set_layout.h"
 #include "vk_object.h"
 
+struct agx_device;
 struct hk_device;
 struct hk_physical_device;
 struct hk_sampler;
@@ -60,6 +61,15 @@ struct hk_descriptor_set_layout {
    /* Does not contain the size needed for variable count descriptors */
    uint32_t non_variable_descriptor_buffer_size;
 
+   /* VK_EXT_descriptor_buffer: the size with the variable-count binding at
+    * its layout descriptorCount (vkGetDescriptorSetLayoutSizeEXT()). */
+   uint32_t max_buffer_size;
+
+   /* VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT: the
+    * set's descriptors (non_variable_descriptor_buffer_size bytes), uploaded
+    * by vkCmdBindDescriptorBufferEmbeddedSamplers2EXT(). */
+   void *embedded_samplers;
+
    /* Number of bindings in this descriptor set */
    uint32_t binding_count;
 
@@ -82,6 +92,15 @@ void hk_descriptor_stride_align_for_type(
    const struct hk_physical_device *pdev, VkDescriptorType type,
    const VkMutableDescriptorTypeListEXT *type_list, uint32_t *stride,
    uint32_t *alignment);
+
+void hk_descriptor_stride_align_for_layout(
+   const struct hk_physical_device *pdev, VkDescriptorSetLayoutCreateFlags flags,
+   VkDescriptorType type, const VkMutableDescriptorTypeListEXT *type_list,
+   uint32_t *stride, uint32_t *alignment);
+
+/* The size of one descriptor of this type in a descriptor buffer */
+uint32_t hk_descriptor_buffer_size(const struct agx_device *dev,
+                                   VkDescriptorType type);
 
 void hk_descriptor_set_layout_hash(struct hk_descriptor_set_layout *layout);
 

@@ -282,6 +282,89 @@ hk_descriptor_table_add(struct hk_device *dev,
    return result;
 }
 
+/* Back entries [0, count) with memory. */
+static VkResult
+hk_descriptor_table_ensure_locked(struct hk_device *dev,
+                                  struct hk_descriptor_table *table,
+                                  uint32_t count)
+{
+   if (count > table->max_alloc)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   while (table->alloc < count) {
+      /* A single-chunk table is allocated at full capacity */
+      assert(table->va != NULL);
+      VkResult result = hk_descriptor_table_add_chunk_locked(dev, table);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+/* VK_EXT_descriptor_buffer capture/replay: hand out exactly `index`, which a
+ * captured descriptor names. Fails if anything else holds it. */
+VkResult
+hk_descriptor_table_add_at(struct hk_device *dev,
+                           struct hk_descriptor_table *table,
+                           const void *desc_data, size_t desc_size,
+                           uint32_t index)
+{
+   VkResult result = VK_SUCCESS;
+   simple_mtx_lock(&table->mutex);
+
+   if (index >= table->max_alloc) {
+      result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+   } else if (index < table->next_desc) {
+      /* Handed out before: only a freed entry can be taken again. */
+      uint32_t i;
+      for (i = 0; i < table->free_count; i++) {
+         if (table->free_table[i] == index)
+            break;
+      }
+      if (i == table->free_count)
+         result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+      else
+         table->free_table[i] = table->free_table[--table->free_count];
+   } else {
+      result = hk_descriptor_table_ensure_locked(dev, table, index + 1);
+      if (result == VK_SUCCESS) {
+         /* The entries skipped over stay free for later allocations. */
+         for (uint32_t i = table->next_desc; i < index; i++)
+            table->free_table[table->free_count++] = i;
+         table->next_desc = index + 1;
+      }
+   }
+
+   if (result == VK_SUCCESS) {
+      assert(desc_size == table->desc_size);
+      memcpy(hk_descriptor_table_entry(table, index), desc_data,
+             table->desc_size);
+   }
+
+   simple_mtx_unlock(&table->mutex);
+   return result;
+}
+
+/* Hand out `count` consecutive, zeroed entries starting at *first_out, which
+ * the caller fills through hk_descriptor_table_entry() and never removes. */
+VkResult
+hk_descriptor_table_reserve_range(struct hk_device *dev,
+                                  struct hk_descriptor_table *table,
+                                  uint32_t count, uint32_t *first_out)
+{
+   simple_mtx_lock(&table->mutex);
+   VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   if (table->next_desc <= table->max_alloc - count)
+      result = hk_descriptor_table_ensure_locked(dev, table,
+                                                 table->next_desc + count);
+   if (result == VK_SUCCESS) {
+      *first_out = table->next_desc;
+      table->next_desc += count;
+   }
+   simple_mtx_unlock(&table->mutex);
+   return result;
+}
+
 void
 hk_descriptor_table_remove(struct hk_device *dev,
                            struct hk_descriptor_table *table, uint32_t index)

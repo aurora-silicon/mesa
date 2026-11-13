@@ -80,6 +80,16 @@ VkResult hk_descriptor_table_add(struct hk_device *dev,
                                  const void *desc_data, size_t desc_size,
                                  uint32_t *index_out);
 
+VkResult hk_descriptor_table_add_at(struct hk_device *dev,
+                                    struct hk_descriptor_table *table,
+                                    const void *desc_data, size_t desc_size,
+                                    uint32_t index);
+
+VkResult hk_descriptor_table_reserve_range(struct hk_device *dev,
+                                           struct hk_descriptor_table *table,
+                                           uint32_t count,
+                                           uint32_t *first_out);
+
 void hk_descriptor_table_remove(struct hk_device *dev,
                                 struct hk_descriptor_table *table,
                                 uint32_t index);

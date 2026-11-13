@@ -449,6 +449,11 @@ struct hk_descriptor_state {
    struct hk_push_descriptor_set *push[HK_MAX_SETS];
    uint32_t push_dirty;
    uint32_t push_active;
+
+   /* Sets bound from a descriptor buffer (or embedded immutable samplers):
+    * root.sets[] holds their address, and their contents may change until
+    * the commands execute, so recording never reads them. */
+   uint32_t buffer_active;
 };
 
 struct hk_attachment {
@@ -1623,6 +1628,8 @@ struct hk_cmd_buffer {
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
+      /* vkCmdBindDescriptorBuffersEXT() */
+      uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;
       struct hk_compute_state cs;
       struct hk_ray_tracing_state rt;
@@ -2694,6 +2701,10 @@ struct hk_meta_save {
    bool in_meta;
    bool has_push_desc0;
    bool push_active0;
+   /* Set 0 bound from a descriptor buffer */
+   bool buffer_active0;
+   uint64_t buffer_set0;
+   uint32_t buffer_set_size0;
    enum agx_visibility_mode occlusion;
    struct hk_push_descriptor_set push_desc0;
    VkQueryPipelineStatisticFlags pipeline_stats_flags;

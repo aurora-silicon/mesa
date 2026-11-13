@@ -800,6 +800,13 @@ enum hk_feature_key {
 
    /* The last pre-rasterization stage reads the clip z coefficient. */
    HK_FEAT_DEPTH_CLIP_CONTROL = BITFIELD_BIT(7),
+
+   /* Not a device feature: the shader's set layouts are descriptor-buffer
+    * layouts (hk_set_layouts_use_buffers()). Their contents can change until
+    * the commands execute, so G17P keeps the lowerings that decode set
+    * contents when a draw or dispatch is recorded away from them. The layout
+    * hash carries the flag into the shader cache key. */
+   HK_FEAT_DESCRIPTOR_BUFFER = BITFIELD_BIT(8),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -4382,10 +4389,26 @@ hk_m5_uniform_colour(nir_shader *nir)
    return exports != 0;
 }
 
+/* Whether any set layout is a descriptor-buffer layout. */
+static bool
+hk_set_layouts_use_buffers(uint32_t set_layout_count,
+                           struct vk_descriptor_set_layout *const *set_layouts)
+{
+   for (unsigned s = 0; set_layouts && s < set_layout_count; ++s) {
+      if (set_layouts[s] &&
+          (set_layouts[s]->flags &
+           (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)))
+         return true;
+   }
+   return false;
+}
+
 /* The descriptor sets whose buffer descriptors a draw's launch may copy
  * from when it is recorded (AGX3_UNIFORM_DMA_BUFFER): sets no binding of
  * which may be updated after it is bound or while a command buffer using it
- * is pending. Push descriptor sets are recorded too. */
+ * is pending. Push descriptor sets are recorded too; descriptor buffers can
+ * change until the commands execute. */
 static uint8_t
 hk_static_set_mask(uint32_t set_layout_count,
                    struct vk_descriptor_set_layout *const *set_layouts)
@@ -4398,6 +4421,12 @@ hk_static_set_mask(uint32_t set_layout_count,
       if (!set_layouts || !set_layouts[s] ||
           (set_layouts[s]->flags &
            VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
+         continue;
+      if ((set_layouts[s]->flags &
+           (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT)) &&
+          !(set_layouts[s]->flags &
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR))
          continue;
 
       const struct hk_descriptor_set_layout *layout =
@@ -4760,6 +4789,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * so it works on a copy -- made only for a shader it may apply to. */
       nir_shader *candidate =
          !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
+               !(features & HK_FEAT_DESCRIPTOR_BUFFER) &&
                agx_nir_g17p_combined_sampler_candidate(nir)
             ? nir_shader_clone(NULL, nir)
             : NULL;
@@ -4793,9 +4823,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    } else if (agx_native_graphics(&dev->dev) &&
               nir->info.stage == MESA_SHADER_COMPUTE) {
+      /* Descriptor buffers keep only the heap-indexed paths, which never
+       * decode set contents while recording. */
+      const bool record_time_sets = !(features & HK_FEAT_DESCRIPTOR_BUFFER);
       nir_shader *candidate = nir_shader_clone(NULL, nir);
       struct agx_g17p_sampled_storage_binding sampled_storage;
-      if (candidate &&
+      if (candidate && record_time_sets &&
           !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
           agx_nir_lower_g17p_sampled_storage(candidate, &sampled_storage)) {
          ralloc_free(nir);
@@ -4806,7 +4839,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          ralloc_free(candidate);
          candidate = nir_shader_clone(NULL, nir);
          struct agx_g17p_storage_image_binding storage;
-         if (candidate &&
+         if (candidate && record_time_sets &&
              agx_nir_lower_g17p_storage_image(candidate, &storage)) {
             ralloc_free(nir);
             nir = candidate;
@@ -4816,7 +4849,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             ralloc_free(candidate);
             candidate = nir_shader_clone(NULL, nir);
             struct agx_g17p_combined_sampler_binding sampled_binding;
-            if (candidate &&
+            if (candidate && record_time_sets &&
                 !dev->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
                 agx_nir_lower_g17p_combined_sampler(candidate,
                                                     &sampled_binding)) {
@@ -4866,7 +4899,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                   ralloc_free(candidate);
                   candidate = nir_shader_clone(NULL, nir);
                   struct agx_g17p_txf_binding binding;
-                  if (candidate &&
+                  if (candidate && record_time_sets &&
                       agx_nir_lower_g17p_txf(candidate, &binding) &&
                       (!(binding.texture_offset_B &
                          (HK_G17P_TEXTURE_STATE_ALIGN - 1)) ||
@@ -6208,6 +6241,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                           hk_vs_covers_clip_square(info->nir);
    enum hk_feature_key features =
       twin_of ? twin_of->features : hk_make_feature_key(vk_features);
+   if (!twin_of &&
+       hk_set_layouts_use_buffers(info->set_layout_count, info->set_layouts))
+      features |= HK_FEAT_DESCRIPTOR_BUFFER;
    const uint8_t static_set_mask =
       twin_of ? twin_of->static_set_mask
               : hk_static_set_mask(info->set_layout_count, info->set_layouts);

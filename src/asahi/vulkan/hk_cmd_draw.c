@@ -3813,7 +3813,7 @@ hk_xfer_match_descriptors(const struct hk_cmd_buffer *cmd, struct hk_cs *best)
    const unsigned sampled_stride = hk_sampled_image_descriptor_layout(9).stride;
    unsigned budget = HK_XFER_MAX_DESCRIPTORS;
 
-   if (desc->push_active)
+   if (desc->push_active || desc->buffer_active)
       return hk_sync_xfer_match_all(cmd, best);
 
    for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
@@ -4399,6 +4399,8 @@ hk_m5_ordered_refusal(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
       return why;
 
    if (!hk_m5_attachments_exclude_descriptors(cmd, info)) {
+      if (desc->buffer_active)
+         return "descriptor buffer bound";
       for (unsigned s = 0; s < HK_MAX_SETS; ++s) {
          if (desc->sets[s] && !(desc->push_active & BITFIELD_BIT(s)))
             return "descriptor set bound";

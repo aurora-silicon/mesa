@@ -22,6 +22,12 @@ hk_descriptor_set_layout_hash(struct hk_descriptor_set_layout *layout)
    const bool push = layout->vk.flags &
       VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
    BLAKE3_UPDATE_VALUE(push);
+   /* Descriptor-buffer sets are never read on the CPU at record time, so
+    * shaders compile differently for them (HK_FEAT_DESCRIPTOR_BUFFER). */
+   const VkDescriptorSetLayoutCreateFlags buffer_flags = layout->vk.flags &
+      (VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT);
+   BLAKE3_UPDATE_VALUE(buffer_flags);
    BLAKE3_UPDATE_VALUE(layout->descriptor_generation);
    BLAKE3_UPDATE_VALUE(layout->native_sampler_indices);
    BLAKE3_UPDATE_VALUE(layout->non_variable_descriptor_buffer_size);
