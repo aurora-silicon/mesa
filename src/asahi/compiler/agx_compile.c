@@ -8942,6 +8942,7 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
     * staging path. */
    const bool packed_lod =
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      !agx_is_g18g(&b->shader->key->dev) &&
       reused_lod && lod.type != AGX_INDEX_IMMEDIATE &&
       lod.size == AGX_SIZE_16 &&
       instr->op != nir_texop_txf && instr->op != nir_texop_txf_ms &&
