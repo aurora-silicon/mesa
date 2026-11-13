@@ -44,6 +44,10 @@ static inline uint32_t
 __gen_pack_lod(float f, uint32_t start, uint32_t end)
 {
    uint32_t fixed = CLAMP(f * (1 << 6), 0 /* 0.0 */, 0x380 /* 14.0 */);
+   /* As for lod15 below: a positive clamp below one 1/64 step must not pack
+    * as 0, or an explicit-LOD-0 lookup is magnified instead of minified. */
+   if (fixed == 0 && f > 0.0f)
+      fixed = 1;
    return util_bitpack_uint(fixed, start, end);
 }
 
