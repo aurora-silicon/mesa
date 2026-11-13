@@ -2023,7 +2023,7 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                                    chunk_timelines, first_chunk_point, anatomy,
                                    pending);
    }
-   hk_cmd_pending_end(dev, pending);
+   hk_cmd_pending_end(dev, pending, result);
    if (cumulative_signals && !kernel_cumulative) {
       /* The kernel can publish an error fence even when submission fails.
        * Forward it when present, without waiting for a missing queue point

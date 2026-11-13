@@ -37,6 +37,7 @@ struct hk_shader_binary_cache_entry;
 struct vk_pipeline_cache;
 
 #define HK_SHADER_BINARY_CACHE_MAX 16
+#define HK_CMD_SYNCOBJ_POOL 64
 
 typedef void (*hk_internal_builder_t)(struct nir_builder *b, const void *key);
 
@@ -312,6 +313,9 @@ struct hk_device {
    struct list_head cmd_pending;
    /* Submissions that completed with an error: kept until destruction. */
    struct list_head cmd_pending_failed;
+   /* Completion syncobjs of retired submissions, for reuse. */
+   uint32_t cmd_syncobjs[HK_CMD_SYNCOBJ_POOL];
+   unsigned cmd_syncobj_count;
 
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a

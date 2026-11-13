@@ -683,7 +683,9 @@ struct hk_cmd_pending {
 
    /* One private binary syncobj per submit ioctl, whether its fence is
     * already known to have signalled without error, and scratch space for
-    * polling the others. Polling holds cmd_pending_lock.
+    * polling the others. Polling holds cmd_pending_lock. A syncobj may be
+    * reused from an earlier submission: a successful ioctl replaces its
+    * fence, so only submissions whose ioctls all succeeded are polled.
     */
    uint32_t *signals;
    uint32_t *unknown;
@@ -811,6 +813,17 @@ hk_cmd_pending_release(struct hk_device *dev, struct hk_cmd_pending *p,
    vk_free(&dev->vk.alloc, p);
 }
 
+/* Keeps the syncobjs of a submission that completed without error, or that
+ * no ioctl used, for later submissions; release destroys the rest. Called
+ * with cmd_pending_lock held.
+ */
+static void
+hk_cmd_pending_recycle(struct hk_device *dev, struct hk_cmd_pending *p)
+{
+   while (p->chunks && dev->cmd_syncobj_count < HK_CMD_SYNCOBJ_POOL)
+      dev->cmd_syncobjs[dev->cmd_syncobj_count++] = p->signals[--p->chunks];
+}
+
 enum hk_cmd_pending_state {
    HK_PENDING_BUSY,
    HK_PENDING_SUCCEEDED,
@@ -882,6 +895,7 @@ hk_cmd_pending_reap(struct hk_device *dev)
          break;
       case HK_PENDING_SUCCEEDED:
          list_del(&p->link);
+         hk_cmd_pending_recycle(dev, p);
          list_addtail(&p->link, &ready);
          break;
       case HK_PENDING_FAILED:
@@ -931,8 +945,16 @@ hk_cmd_pending_begin(struct hk_device *dev,
    p->unknown = p->signals + chunks;
    p->succeeded = (bool *)(p->unknown + chunks);
 
+   simple_mtx_lock(&dev->cmd_pending_lock);
+   while (p->chunks < chunks && dev->cmd_syncobj_count)
+      p->signals[p->chunks++] = dev->cmd_syncobjs[--dev->cmd_syncobj_count];
+   simple_mtx_unlock(&dev->cmd_pending_lock);
+
    for (; p->chunks < chunks; ++p->chunks) {
       if (drmSyncobjCreate(dev->dev.fd, 0, &p->signals[p->chunks])) {
+         simple_mtx_lock(&dev->cmd_pending_lock);
+         hk_cmd_pending_recycle(dev, p);
+         simple_mtx_unlock(&dev->cmd_pending_lock);
          hk_cmd_pending_release(dev, p, false);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
@@ -955,19 +977,28 @@ hk_cmd_pending_signal(struct hk_cmd_pending *p)
 }
 
 void
-hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p)
+hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *p,
+                   VkResult result)
 {
    if (!p)
       return;
 
-   if (!p->attempted) {
-      hk_cmd_pending_release(dev, p, false);
-      return;
-   }
-
    simple_mtx_lock(&dev->cmd_pending_lock);
-   list_addtail(&p->link, &dev->cmd_pending);
+   if (!p->attempted) {
+      /* No ioctl used its syncobjs or memory. */
+      hk_cmd_pending_recycle(dev, p);
+   } else if (result != VK_SUCCESS) {
+      /* A failed ioctl may leave a reused syncobj with its earlier fence.
+       * Never judge such a submission by its syncobjs: keep its memory.
+       */
+      list_addtail(&p->link, &dev->cmd_pending_failed);
+   } else {
+      list_addtail(&p->link, &dev->cmd_pending);
+   }
    simple_mtx_unlock(&dev->cmd_pending_lock);
+
+   if (!p->attempted)
+      hk_cmd_pending_release(dev, p, false);
 }
 
 void
@@ -987,4 +1018,8 @@ hk_cmd_pending_finish(struct hk_device *dev)
          hk_cmd_pending_release(dev, p, true);
       }
    }
+
+   for (unsigned i = 0; i < dev->cmd_syncobj_count; ++i)
+      drmSyncobjDestroy(dev->dev.fd, dev->cmd_syncobjs[i]);
+   dev->cmd_syncobj_count = 0;
 }
