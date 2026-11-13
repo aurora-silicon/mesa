@@ -13320,6 +13320,21 @@ agx_ensure_cmdbuf_has_space(struct agx_batch *batch, struct agx_encoder *enc,
          return;
 
       memcpy(enc->current, link.bytes, link.length);
+   } else if (vdm && agx_chip_g17_m5(dev->chip)) {
+      /* The M5 command processor adds the render-context base to a Stream
+       * Link target, as it does to a PPP payload pointer: an absolute target
+       * is read 0x1000000000 above the new chunk. Honeykrisp makes the same
+       * translation in hk_cmd_buffer_emit_cs_jump(). */
+      uint64_t compact = 0;
+      struct agx_vdm_stream_link_core link;
+      const bool packed = agx_m5_vdm_compact(T.gpu, &compact) &&
+                          agx_vdm_stream_link_core_pack(dev->chip, compact,
+                                                       &link);
+      assert(packed);
+      if (!packed)
+         return;
+
+      memcpy(enc->current, link.bytes, link.length);
    } else {
       agx_cs_jump((uint32_t *)enc->current, T.gpu, vdm);
    }
