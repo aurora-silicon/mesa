@@ -193,7 +193,8 @@ static const struct drm_asahi_params_global params_g16s_as = {
 static const struct drm_asahi_params_global params_g17p = {
    .features = DRM_ASAHI_FEATURE_SOFT_FAULTS |
                DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
-               DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS,
+               DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+               DRM_ASAHI_FEATURE_RENDER_RAY_QUERY,
    .gpu_generation = 17,
    .gpu_variant = 'P',
    .gpu_revision = 0,

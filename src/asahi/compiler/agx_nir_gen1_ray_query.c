@@ -117,8 +117,12 @@ gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
       nir_u2u64(b,nir_bcsel(b,paired,nir_imm_int(b,48),nir_bcsel(b,aabb,nir_imm_int(b,24),nir_imm_int(b,12))))),.align_mul=4);
    nir_def *primoff=nir_bcsel(b,paired,nir_iadd_imm(b,nir_ishl_imm(b,
       nir_iand_imm(b,nir_ushr_imm(b,c.flags,10),1),2),52),nir_imm_int(b,28));
-   nir_def *prim=nir_load_global(b,1,32,nir_iadd(b,c.compressed_address,
-      nir_u2u64(b,primoff)),.align_mul=4);
+   /* The primitive index is not read here: closest-hit traversal looks at
+    * every candidate but needs the index of only the one it ends up keeping,
+    * and the load sat on each candidate's critical path. Keep its address in
+    * the otherwise unused first two words of packet 1; gen1_rq_primitive()
+    * loads it when application code asks for the index. */
+   nir_def *prim_address=nir_iadd(b,c.compressed_address,nir_u2u64(b,primoff));
    nir_def *node=agx_nir_gen1_candidate_instance_pointer(b,query,lane);
    nir_def *ids=nir_load_global(b,2,32,nir_iadd_imm(b,node,96),.align_mul=4);
    nir_def *marker=nir_load_global(b,1,32,nir_iadd_imm(b,c.compressed_address,-4),.align_mul=4);
@@ -136,12 +140,36 @@ gen1_candidate_packet(nir_builder *b,nir_def *query,nir_def *lane,
    /* AABB queue records carry their entry distance in union word0,
     * not the triangle distance at+16. Native intersection_query.next uses
     * that entry value when pruning a candidate against a committed hit. */
-   packet[1]=nir_vec4(b,zero,zero,
+   packet[1]=nir_vec4(b,nir_unpack_64_2x32_split_x(b,prim_address),
+      nir_unpack_64_2x32_split_y(b,prim_address),
       nir_bcsel(b,aabb,nir_channel(b,c.barycentrics,0),c.distance),zero);
-   packet[2]=nir_vec4(b,nir_ior(b,nir_iand_imm(b,prim,0x3fffffff),nir_bcsel(b,aabb,nir_imm_int(b,0x80000000),nir_imm_int(b,0x40000000))),
+   packet[2]=nir_vec4(b,nir_bcsel(b,aabb,nir_imm_int(b,0x80000000),nir_imm_int(b,0x40000000)),
       nir_ior(b,nir_iand_imm(b,geo,0xffffff),nir_ishl_imm(b,nir_iand_imm(b,c.flags,1u<<8),23)),
       nir_channel(b,ids,1),nir_iand_imm(b,nir_channel(b,ids,0),0xffffff));
    packet[3]=nir_vec4(b,nir_channel(b,c.barycentrics,0),nir_channel(b,c.barycentrics,1),zero,zero);
+}
+
+/* Primitive index of a hit packet. With candidate queues, a packet built by
+ * gen1_candidate_packet() carries the address of the index in words 0-1 of
+ * packet 1 and leaves the low 30 bits of packet 2 word 0 clear; a hit the
+ * hardware committed (gen1_rq_merge_hw_commit()) and the initial packet keep
+ * words 0-1 zero and the index itself in packet 2. Without candidate queues
+ * packet 1 holds payload words, so the index is always in packet 2. */
+static nir_def *
+gen1_rq_primitive(nir_builder *b, nir_deref_instr *result[4], bool deferred)
+{
+   nir_def *inline_index = nir_iand_imm(b,
+      nir_channel(b, nir_load_deref(b, result[2]), 0), 0x3fffffff);
+   if (!deferred)
+      return inline_index;
+   nir_def *words = nir_load_deref(b, result[1]);
+   nir_def *address = nir_pack_64_2x32_split(b, nir_channel(b, words, 0),
+                                             nir_channel(b, words, 1));
+   nir_push_if(b, nir_ine_imm(b, address, 0));
+   nir_def *loaded = nir_iand_imm(b,
+      nir_load_global(b, 1, 32, address, .align_mul = 4), 0x3fffffff);
+   nir_pop_if(b, NULL);
+   return nir_if_phi(b, loaded, inline_index);
 }
 
 /* Ray flags under which software must see every triangle hit: NoOpaque, the
@@ -785,8 +813,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
             value = nir_channel(&b, nir_load_deref(&b, result[1]), 2);
             break;
          case nir_ray_query_value_intersection_primitive_index:
-            value = nir_iand_imm(
-               &b, nir_channel(&b, nir_load_deref(&b, result[2]), 0), 0x3fffffff);
+            value = gen1_rq_primitive(&b, result, layout->candidates);
             break;
          case nir_ray_query_value_intersection_geometry_index:
             value = nir_iand_imm(&b,
@@ -801,8 +828,7 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
          case nir_ray_query_value_intersection_triangle_vertex_positions: {
             nir_def *node = nir_pack_64_2x32(&b,
                nir_channels(&b, nir_load_deref(&b, result[0]), 3));
-            nir_def *primitive = nir_iand_imm(
-               &b, nir_channel(&b, nir_load_deref(&b, result[2]), 0), 0x3fffffff);
+            nir_def *primitive = gen1_rq_primitive(&b, result, layout->candidates);
             nir_def *geometry = nir_iand_imm(&b,
                nir_channel(&b, nir_load_deref(&b, result[2]), 1), 0xffffff);
             value = nir_load_global(&b, 3, 32, nir_iadd_imm(&b,
