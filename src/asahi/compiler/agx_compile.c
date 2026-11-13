@@ -30,6 +30,7 @@
 #include "agx3_matrix_core.h"
 #include "agx_opcodes.h"
 #include "agx3_pack.h"
+#include "agx3_rt_core.h"
 #include "glsl_types.h"
 #include "nir.h"
 #include "util/os_misc.h"
@@ -3180,6 +3181,31 @@ agx_g18_single_sample_target(nir_intrinsic_instr *instr, unsigned samples)
    return false;
 }
 
+/* A load_scs_*_agx carrying AGX_NIR_SCS_TOUCH: access the address without a
+ * destination. The intrinsic's value is never defined. */
+static agx_instr *
+agx_emit_scs_touch(agx_builder *b, nir_intrinsic_instr *instr, bool indexed)
+{
+   const unsigned flags = nir_intrinsic_flags(instr);
+   const unsigned mask = BITFIELD_MASK(instr->def.num_components);
+   const agx_index base = agx_src_index(&instr->src[0]);
+
+   if (flags & AGX_NIR_SCS_TOUCH_FENCE_BEFORE)
+      agx_rt_barrier_gen1(b, AGX3_RT_BARRIER_ENTRY);
+
+   agx_instr *touch = indexed
+      ? agx_scs_touch_register_indexed_agx3(
+           b, base, agx_src_index(&instr->src[1]), nir_intrinsic_base(instr),
+           mask, nir_intrinsic_component(instr))
+      : agx_scs_touch_register_base_agx3(b, base, nir_intrinsic_base(instr),
+                                         mask);
+
+   if (flags & AGX_NIR_SCS_TOUCH_FENCE_AFTER)
+      agx_rt_barrier_gen1(b, AGX3_RT_BARRIER_IN_LOOP);
+
+   return touch;
+}
+
 static agx_instr *
 agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
 {
@@ -4388,6 +4414,8 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                                BITFIELD_MASK(instr->num_components));
 
    case nir_intrinsic_load_scs_indexed_agx: {
+      if (nir_intrinsic_flags(instr) & AGX_NIR_SCS_TOUCH)
+         return agx_emit_scs_touch(b, instr, true);
       agx_instr *load = agx_scs_load_register_indexed_agx3_to(
          b, dst, agx_src_index(&instr->src[0]),
          agx_src_index(&instr->src[1]), nir_intrinsic_base(instr),
@@ -4419,6 +4447,8 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_scs_base_agx: {
       const bool uniform = instr->intrinsic == nir_intrinsic_load_scs_uniform_agx;
       unsigned flags = nir_intrinsic_flags(instr);
+      if (!uniform && (flags & AGX_NIR_SCS_TOUCH))
+         return agx_emit_scs_touch(b, instr, false);
       enum agx_format fmt = agx_format_for_pipe(nir_intrinsic_format(instr));
       unsigned mask = BITFIELD_MASK(instr->def.num_components);
       agx_instr *load = uniform ? agx_scs_load_uniform_indexed_agx3_to(
@@ -15378,6 +15408,21 @@ agx_nir_split_g17p_sample_tests(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* The operands both destination-less SCS forms share: G17P only, one, two or
+ * four 32-bit words at a word-aligned offset from a 32-bit base, and a value
+ * nothing reads, because the access defines none. */
+static bool
+agx_scs_touch_nir_valid(nir_intrinsic_instr *in,
+                        const struct agx_shader_key *key)
+{
+   const unsigned n = in->def.num_components;
+   return key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          !(nir_intrinsic_flags(in) & ~AGX_NIR_SCS_TOUCH_FLAGS) &&
+          in->def.bit_size == 32 && (n == 1 || n == 2 || n == 4) &&
+          nir_def_is_unused(&in->def) &&
+          in->src[0].ssa->bit_size == 32 && !(nir_intrinsic_base(in) & 3);
+}
+
 /* Keep unsupported private SCS forms transactional, before instruction
  * selection. These operations never reinterpret NIR scratch/global memory.
  * M5 launch setup must allocate SCS even for a load/store-only program. */
@@ -15392,7 +15437,7 @@ agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-            bool valid = true, memory = false;
+            bool valid = true, memory = false, touch = false;
             switch (in->intrinsic) {
             case nir_intrinsic_load_scs_agx:
                memory = true;
@@ -15412,6 +15457,14 @@ agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
                const bool store = in->intrinsic == nir_intrinsic_store_scs_indexed_agx;
                const nir_def *value = store ? in->src[0].ssa : &in->def;
                memory = true;
+               if (!store && (nir_intrinsic_flags(in) & AGX_NIR_SCS_TOUCH)) {
+                  touch = true;
+                  valid = agx_scs_touch_nir_valid(in, key) &&
+                          in->src[1].ssa->bit_size == 32 &&
+                          (nir_intrinsic_component(in) == 2 ||
+                           nir_intrinsic_component(in) == 4);
+                  break;
+               }
                valid = (value->bit_size == 32 || (!store && value->bit_size == 16 && value->num_components == 1)) &&
                        value->num_components <= 4 &&
                        in->src[store ? 1 : 0].ssa->bit_size == 32 &&
@@ -15454,6 +15507,13 @@ agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
                                 format == PIPE_FORMAT_R32_UINT ? 32 : 0;
                unsigned flags = store ? 0 : nir_intrinsic_flags(in);
                memory = true;
+               if (in->intrinsic == nir_intrinsic_load_scs_base_agx &&
+                   (flags & AGX_NIR_SCS_TOUCH)) {
+                  touch = true;
+                  valid = agx_scs_touch_nir_valid(in, key) && width == 32 &&
+                          nir_intrinsic_component(in) == 0;
+                  break;
+               }
                valid = width && value->num_components <= 4 &&
                   (width == 32 || value->num_components == 1) &&
                   value->bit_size == ((width == 32 || (flags & 2)) ? 32 : 16) &&
@@ -15497,7 +15557,7 @@ agx_validate_scs_nir(nir_shader *nir, const struct agx_shader_key *key,
             default:
                continue;
             }
-            if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !touch &&
                 (in->intrinsic == nir_intrinsic_load_scs_uniform_agx ||
                  in->intrinsic == nir_intrinsic_load_scs_base_agx ||
                  in->intrinsic == nir_intrinsic_load_scs_indexed_agx))

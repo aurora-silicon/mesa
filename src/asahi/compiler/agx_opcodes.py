@@ -693,3 +693,22 @@ op("sample_mask_agx3", _, dests = 0, srcs = 2, imms = [IMM],
 # assembled before RA and published at staging halves 0 and 2.
 op("zs_emit_agx3", _, dests = 0, srcs = 1, imms = [ZS],
    can_eliminate = False, schedule_class = "coverage")
+
+# G17P destination-less SCS load of MASK 32-bit words at (base, index) or
+# (base). It writes no register and takes no scoreboard slot, so it has no
+# destination to allocate and nothing can wait on it. The low half of the
+# index register is read and scaled by the address selector. Ordered like a
+# barrier: it stays where the lowering put it.
+op("scs_touch_register_indexed_agx3", _, dests = 0, srcs = 2,
+   imms = [IMM, MASK, SCS_ADDRESS_SELECTOR],
+   can_eliminate = False, can_reorder = False, schedule_class = "barrier",
+   agx3_mnemonic = "ldscs")
+op("scs_touch_register_base_agx3", _, dests = 0, srcs = 1,
+   imms = [IMM, MASK],
+   can_eliminate = False, can_reorder = False, schedule_class = "barrier",
+   agx3_mnemonic = "ldscs")
+
+# The G17P traversal barrier on its own. IMM is enum agx3_rt_barrier_scope.
+op("rt_barrier_gen1", _, dests = 0, srcs = 0, imms = [IMM],
+   can_eliminate = False, can_reorder = False, schedule_class = "barrier",
+   agx3_mnemonic = "barrier")
