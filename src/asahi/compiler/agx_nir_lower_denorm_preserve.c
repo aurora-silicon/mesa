@@ -8,8 +8,8 @@
  * FP32 arithmetic flushes denormal operands and results to zero. In a shader
  * that requests DenormPreserve for FP32, an addition or multiplication with a
  * denormal operand, or whose native result is zero or denormal, is computed
- * exactly in integer arithmetic instead. Vulkan derives the precision of fma
- * from a multiplication followed by an addition, so ffma is split into them.
+ * exactly in integer arithmetic instead. ffma stays fused and rounds once, as
+ * OpFmaKHR requires; a fused result is also a valid GLSL fma.
  */
 
 static nir_def *
@@ -48,16 +48,24 @@ unpack(nir_builder *b, nir_def *x, nir_def **sig, nir_def **e)
    *e = nir_bcsel(b, denorm, nir_imm_int(b, 1), biased);
 }
 
+/* Index of the leading one of a nonzero 64-bit p. */
+static nir_def *
+msb64(nir_builder *b, nir_def *p)
+{
+   nir_def *lo = nir_unpack_64_2x32_split_x(b, p);
+   nir_def *hi = nir_unpack_64_2x32_split_y(b, p);
+   return nir_bcsel(b, nir_ine_imm(b, hi, 0),
+                    nir_iadd_imm(b, nir_ufind_msb(b, hi), 32),
+                    nir_ufind_msb(b, lo));
+}
+
 /* p * 2^e rounded to nearest even, as FP32 bits with the given sign bit.
  * Requires 0 < p < 2^63. */
 static nir_def *
 round_pack(nir_builder *b, nir_def *sign, nir_def *p, nir_def *e)
 {
    nir_def *lo = nir_unpack_64_2x32_split_x(b, p);
-   nir_def *hi = nir_unpack_64_2x32_split_y(b, p);
-   nir_def *n = nir_bcsel(b, nir_ine_imm(b, hi, 0),
-                          nir_iadd_imm(b, nir_ufind_msb(b, hi), 32),
-                          nir_ufind_msb(b, lo));
+   nir_def *n = msb64(b, p);
 
    /* A normal result keeps 24 significant bits under its leading one; a
     * denormal one keeps the bits down to 2^-149. Its leading one, if
@@ -194,6 +202,98 @@ lower_mul(nir_builder *b, nir_def *x, nir_def *y)
       result);
 }
 
+/* x * y + z rounded once to nearest even, for finite x, y and z. */
+static nir_def *
+exact_fma(nir_builder *b, nir_def *x, nir_def *y, nir_def *z)
+{
+   nir_def *sign_p = nir_iand_imm(b, nir_ixor(b, x, y), 0x80000000u);
+   nir_def *sign_z = nir_iand_imm(b, z, 0x80000000u);
+   nir_def *sx, *ex, *sy, *ey, *sz, *ez;
+   unpack(b, x, &sx, &ex);
+   unpack(b, y, &sy, &ey);
+   unpack(b, z, &sz, &ez);
+
+   /* The product is p * 2^(ex + ey - 300) with p < 2^48. Shift p and the
+    * significand of z so each leading one is bit 61, at exponent tp or tz. */
+   nir_def *p = nir_imul(b, nir_u2u64(b, sx), nir_u2u64(b, sy));
+   nir_def *p_zero = nir_ieq_imm(b, p, 0);
+   nir_def *z_zero = nir_ieq_imm(b, sz, 0);
+   nir_def *np = msb64(b, nir_bcsel(b, p_zero, nir_imm_int64(b, 1), p));
+   nir_def *nz = nir_ufind_msb(b, nir_bcsel(b, z_zero, nir_imm_int(b, 1), sz));
+   nir_def *ap = nir_ishl(b, p, nir_isub(b, nir_imm_int(b, 61), np));
+   nir_def *az =
+      nir_ishl(b, nir_u2u64(b, sz), nir_isub(b, nir_imm_int(b, 61), nz));
+   nir_def *tp = nir_iadd(b, nir_iadd_imm(b, nir_iadd(b, ex, ey), -300), np);
+   nir_def *tz = nir_iadd(b, nir_iadd_imm(b, ez, -150), nz);
+
+   /* A zero operand is the smaller one, so the other is returned exactly. */
+   nir_def *p_big =
+      nir_ior(b, z_zero, nir_iand(b, nir_inot(b, p_zero), nir_ige(b, tp, tz)));
+   nir_def *big = nir_bcsel(b, p_big, ap, az);
+   nir_def *small = nir_bcsel(b, p_big, az, ap);
+
+   /* Align the smaller one; bits shifted out leave a sticky bit 0. Bits are
+    * lost only 15 or more exponents apart, so the result then keeps 60 bits
+    * and its rounding point is far above bit 0. As the larger one is even,
+    * the sticky bit gives the same rounding as the bits it replaces. */
+   nir_def *d = nir_umin_imm(b, nir_iabs(b, nir_isub(b, tp, tz)), 63);
+   nir_def *shifted = nir_ushr(b, small, d);
+   small = nir_ior(b, shifted,
+                   nir_b2i64(b, nir_ine(b, nir_ishl(b, shifted, d), small)));
+
+   nir_def *same = nir_ieq(b, sign_p, sign_z);
+   nir_def *big_ge = nir_uge(b, big, small);
+   nir_def *mag = nir_bcsel(b, same, nir_iadd(b, big, small),
+                            nir_bcsel(b, big_ge, nir_isub(b, big, small),
+                                      nir_isub(b, small, big)));
+   nir_def *sign = nir_bcsel(b, nir_ior(b, same, big_ge),
+                             nir_bcsel(b, p_big, sign_p, sign_z),
+                             nir_bcsel(b, p_big, sign_z, sign_p));
+
+   nir_def *zero = nir_ieq_imm(b, mag, 0);
+   nir_def *r = round_pack(b, sign, nir_bcsel(b, zero, nir_imm_int64(b, 1), mag),
+                           nir_iadd_imm(b, nir_bcsel(b, p_big, tp, tz), -61));
+   /* An exact zero is -0 only for -0 plus -0, when rounding to nearest. */
+   return nir_bcsel(b, zero, nir_iand(b, sign_p, sign_z), r);
+}
+
+static nir_def *
+lower_fma(nir_builder *b, nir_def *x, nir_def *y, nir_def *z)
+{
+   nir_def *native = nir_ffma(b, x, y, z);
+
+   /* The native fma flushes denormal operands and results tiny before
+    * rounding. It is kept only where the operands and the result are normal
+    * or zero, and the product cannot be below 2^-126. */
+   nir_def *zero_xy = nir_ior(b, is_zero(b, x), is_zero(b, y));
+   nir_def *slow = nir_ior(
+      b, nir_ior(b, is_denorm(b, x), is_denorm(b, y)), is_denorm(b, z));
+   slow = nir_ior(
+      b, slow,
+      nir_iand(b, nir_ieq_imm(b, exponent(b, native), 0),
+               nir_inot(b, nir_iand(b, zero_xy, is_zero(b, z)))));
+   nir_def *tiny =
+      nir_ilt_imm(b, nir_iadd(b, exponent(b, x), exponent(b, y)), 128);
+   slow = nir_ior(b, slow, nir_iand(b, tiny, nir_inot(b, zero_xy)));
+   nir_def *finite = nir_iand(
+      b, nir_iand(b, is_finite(b, x), is_finite(b, y)), is_finite(b, z));
+
+   nir_if *nif = nir_push_if(b, nir_iand(b, slow, finite));
+   nir_def *exact = exact_fma(b, x, y, z);
+   nir_pop_if(b, nif);
+   nir_def *result = nir_if_phi(b, exact, native);
+
+   /* inf * denormal is an infinity; the native fma flushes it to NaN. */
+   nir_def *inf_x = nir_ieq_imm(b, nir_iand_imm(b, x, 0x7fffffff), 0x7f800000);
+   nir_def *inf_y = nir_ieq_imm(b, nir_iand_imm(b, y, 0x7fffffff), 0x7f800000);
+   nir_def *inf_denorm = nir_ior(b, nir_iand(b, inf_x, is_denorm(b, y)),
+                                 nir_iand(b, inf_y, is_denorm(b, x)));
+   nir_def *inf =
+      nir_ior_imm(b, nir_iand_imm(b, nir_ixor(b, x, y), 0x80000000u),
+                  0x7f800000);
+   return nir_bcsel(b, inf_denorm, nir_fadd(b, inf, z), result);
+}
+
 /* The order of x as an unsigned integer, for x not NaN; -0 sorts below +0. */
 static nir_def *
 order_key(nir_builder *b, nir_def *x)
@@ -241,8 +341,7 @@ lower(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
       return false;
 
    b->cursor = nir_before_instr(&alu->instr);
-   /* Keep the native operations apart: refusing contraction also keeps the
-    * fma split. */
+   /* Keep the native operations apart: no contraction into or out of fma. */
    b->fp_math_ctrl = alu->fp_math_ctrl | nir_fp_exact;
    nir_def *r;
 
@@ -256,9 +355,8 @@ lower(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
                     nir_ssa_for_alu_src(b, alu, 1));
       break;
    case nir_op_ffma:
-      r = lower_add(b,
-                    lower_mul(b, nir_ssa_for_alu_src(b, alu, 0),
-                              nir_ssa_for_alu_src(b, alu, 1)),
+      r = lower_fma(b, nir_ssa_for_alu_src(b, alu, 0),
+                    nir_ssa_for_alu_src(b, alu, 1),
                     nir_ssa_for_alu_src(b, alu, 2));
       break;
    case nir_op_fneg:
