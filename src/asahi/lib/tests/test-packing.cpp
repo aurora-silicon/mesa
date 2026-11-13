@@ -24,6 +24,10 @@ const struct {
    {0.0, 0x00},
    {14.0, 0x380},
 
+   /* A positive clamp below one step still minifies */
+   {0.01, 0x01, true},
+   {1.0 / 64.0, 0x01},
+
    /* Upper bound clamp */
    {14.1, 0x380, true},
    {18.1, 0x380, true},
