@@ -364,7 +364,17 @@ gbm_format_to_pipe_format(uint32_t gbm_format)
          return gbm_dri_visuals_table[i].pipe_format;
    }
 
-   return 0;
+   /* Multi-planar YUV: not visuals, but allocatable as lowered per-plane
+    * images by dri_create_image() when the driver lacks native support.
+    */
+   switch (gbm_format) {
+   case DRM_FORMAT_NV12:
+      return PIPE_FORMAT_NV12;
+   case DRM_FORMAT_P010:
+      return PIPE_FORMAT_P010;
+   default:
+      return 0;
+   }
 }
 
 static int

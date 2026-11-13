@@ -46,6 +46,9 @@ dri2_get_mapping_by_fourcc(int fourcc);
 const struct dri2_format_mapping *
 dri2_get_mapping_by_format(int format);
 
+const struct dri2_format_mapping *
+dri2_get_planar_yuv_mapping_by_pipe_format(enum pipe_format format);
+
 bool
 dri2_yuv_dma_buf_supported(struct dri_screen *screen,
                            const struct dri2_format_mapping *map);
