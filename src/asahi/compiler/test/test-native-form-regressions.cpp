@@ -6428,3 +6428,49 @@ TEST(NativeForms, Agx3bMatmad8x8Field74IsWaitSlot5NotCZero)
                                        out, &length));
    EXPECT_EQ((out[2] >> 1) & 1, 1);
 }
+
+/*
+ * VK_KHR_cooperative_matrix is advertised by default across the whole AGX3B
+ * ISA, keyed on the compiler's ISA encoding rather than any chip enum or
+ * chip_id (hk_physical_device.c: agx3b_cmat). The 8x8 matmad is the same
+ * instruction on every AGX3B part, so witnessing it once covers all of them.
+ * This pins that policy: the default is on for every AGX3B part and off for
+ * everything older (AGX2, which has no hardware matmad). The newer AGX3C (M5)
+ * and AGX3D parts are not driven by this gate -- M5 takes its own path -- so
+ * the AGX3B predicate reads false for them here.
+ */
+TEST(NativeForms, Agx3bCooperativeMatrixDefaultsOnForTheWholeAgx3bIsa)
+{
+   const struct {
+      enum agx_chip chip;
+      bool on;
+      const char *name;
+   } chips[] = {
+      /* AGX3B: coopmat on by default. */
+      {AGX_CHIP_G15G, true, "G15G"},
+      {AGX_CHIP_G15S, true, "G15S"},
+      {AGX_CHIP_G15C, true, "G15C"},
+      {AGX_CHIP_G15D, true, "G15D"},
+      {AGX_CHIP_G16P, true, "G16P"},
+      {AGX_CHIP_G16G, true, "G16G"},
+      {AGX_CHIP_G16S, true, "G16S"},
+      {AGX_CHIP_G16C, true, "G16C"},
+      {AGX_CHIP_G17P, true, "G17P"},
+      {AGX_CHIP_G17A, true, "G17A"},
+      /* Older AGX2: no hardware matmad, off. */
+      {AGX_CHIP_G13G, false, "G13G"},
+      {AGX_CHIP_G13X, false, "G13X"},
+      {AGX_CHIP_G14G, false, "G14G"},
+      {AGX_CHIP_G14X, false, "G14X"},
+      {AGX_CHIP_G15P, false, "G15P"},
+      /* Newer AGX3C (M5) / AGX3D: handled by the M5 path, not this gate. */
+      {AGX_CHIP_G17G, false, "G17G"},
+      {AGX_CHIP_G17S, false, "G17S"},
+      {AGX_CHIP_G17C, false, "G17C"},
+      {AGX_CHIP_G18G, false, "G18G"},
+   };
+   for (const auto &c : chips) {
+      bool on = agx_chip_isa_encoding(c.chip) == AGX_ISA_ENCODING_AGX3B;
+      EXPECT_EQ(on, c.on) << c.name;
+   }
+}
