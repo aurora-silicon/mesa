@@ -1716,10 +1716,14 @@ main(void)
       agx_chip_command_stream_generation(dev->chip) == AGX_CS_GENERATION_AGX2;
    int status = 0;
 
-   /* Preserve the public accelerated transfer policy. This shim checks
-    * encoding, while BGRA/RGBA pixel conversion needs a hardware check. */
-   if (screen->caps.texture_transfer_modes != PIPE_TEXTURE_TRANSFER_BLIT) {
-      fprintf(stderr, "Accelerated texture transfers were disabled\n");
+   /* AGX2 keeps blit-based texture transfers. Later generations use mapped
+    * transfers, which convert formats on the CPU. */
+   const unsigned want_transfer_modes =
+      agx2 ? PIPE_TEXTURE_TRANSFER_BLIT : PIPE_TEXTURE_TRANSFER_DEFAULT;
+   if (screen->caps.texture_transfer_modes != want_transfer_modes) {
+      fprintf(stderr, "texture transfer modes %#x on %s, expected %#x\n",
+              screen->caps.texture_transfer_modes, agx_chip_name(dev->chip),
+              want_transfer_modes);
       status = 1;
    }
 
