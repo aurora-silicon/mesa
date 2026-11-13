@@ -103,6 +103,22 @@ lower_pack = [
     (('ibitfield_extract', 'value', 'offset', 0), 0),
 ]
 
+# Vulkan leaves the rounding of a float to bfloat16 conversion to the
+# implementation unless it has an FPRoundingMode decoration (spirv_to_nir
+# builds those from integer operations, so f2bf is never decorated), and the
+# shared lower_bfloat16_conversions rule truncates. Round to nearest even
+# instead, as constant folding of f2bf does (_mesa_float_to_bfloat16_bits_rte):
+# add 0x7fff plus the lowest kept bit and keep the high half. A NaN would carry
+# into the exponent or the sign, so it keeps its sign and top payload bits and
+# becomes quiet. Only bf2f is left to the shared rule, which is exact.
+lower_f2bf_rtne = [
+    (('f2bf', 'a@32'),
+     ('bcsel', ('fneu(preserve_nan_inf)', a, a),
+               ('ior', ('unpack_32_2x16_split_y', a), 0x40),
+               ('unpack_32_2x16_split_y',
+                ('iadd', ('iadd', a, 0x7fff), ('iand', ('ushr', a, 16), 1))))),
+]
+
 lower_selects = []
 for T, sizes, one in [('f', [16, 32], 1.0),
                       ('i', [8, 16, 32], 1),
@@ -471,6 +487,8 @@ agx_selected_f2i32_controls_match(const nir_alu_instr *instr)
     print(nir_algebraic.AlgebraicPass("agx_nir_lower_algebraic_late",
                                       lower_sm5_shift + lower_pack +
                                       lower_selects).render())
+    print(nir_algebraic.AlgebraicPass("agx_nir_lower_f2bf_rtne",
+                                      lower_f2bf_rtne).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_avoid_square_overflow",
                                       avoid_square_overflow).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_selects",
