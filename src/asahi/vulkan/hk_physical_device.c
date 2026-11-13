@@ -234,7 +234,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
-      .EXT_depth_clip_control = false,
+      /* Tested on G17P only. */
+      .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
       .EXT_depth_clip_enable = true,
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
@@ -692,8 +693,8 @@ hk_get_device_features(
       .floatRepresentation = false,
       .depthBiasExact = true,
 
-      /* VK_EXT_depth_clip_control */
-      .depthClipControl = false,
+      /* VK_EXT_depth_clip_control, tested on G17P only */
+      .depthClipControl = dev->chip == AGX_CHIP_G17P,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
@@ -730,7 +731,8 @@ hk_get_device_features(
       .extendedDynamicState3ProvokingVertexMode = true,
       .extendedDynamicState3LineRasterizationMode = true,
       .extendedDynamicState3LineStippleEnable = false,
-      .extendedDynamicState3DepthClipNegativeOneToOne = false,
+      .extendedDynamicState3DepthClipNegativeOneToOne =
+         dev->chip == AGX_CHIP_G17P,
       .extendedDynamicState3ViewportWScalingEnable = false,
       .extendedDynamicState3ViewportSwizzle = false,
       .extendedDynamicState3CoverageToColorEnable = false,
