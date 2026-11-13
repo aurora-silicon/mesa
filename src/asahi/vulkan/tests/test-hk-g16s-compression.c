@@ -328,7 +328,8 @@ check_layered_and_msaa(void)
 /* Preserve the pre-port depth/stencil policy across the shapes observed in
  * depth sampling, feedback loops, host copies and transfer clears. Allocation
  * tests alone did not catch the unsupported colour-alias command paths.
- * The exception is the depth plane at 2x, without feedback-loop use. */
+ * The exceptions are the depth plane at 2x (one layer), without
+ * feedback-loop use, and single-level single-sample arrays. */
 static void
 check_legacy_depth_policy(void)
 {
@@ -351,8 +352,9 @@ check_legacy_depth_policy(void)
                   i.arrayLayers = layers;
                   i.samples = (VkSampleCountFlagBits)samples;
                   const bool expected =
-                     f < 3 && u < 3 && levels == 1 && layers == 1 &&
-                     (samples == 1 || (samples == 2 && u != 1));
+                     f < 3 && u < 3 && levels == 1 &&
+                     (samples == 1 ||
+                      (samples == 2 && layers == 1 && u != 1));
                   CHECK(ELIGIBLE(i) == expected);
                   CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) ==
                         (expected && f == 2 && samples == 1));
@@ -361,6 +363,57 @@ check_legacy_depth_policy(void)
          }
       }
    }
+}
+
+/* Kyty's guest depth targets: shadow-map cascades rendered one layer per
+ * pass, with transfer, sampled and (when enabled) feedback-loop usage. */
+static void
+check_depth_arrays(void)
+{
+   const VkImageUsageFlags kyty = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+   const VkFormat formats[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D16_UNORM,
+                               VK_FORMAT_D32_SFLOAT_S8_UINT};
+   for (unsigned f = 0; f < 3; ++f) {
+      VkImageCreateInfo i = image(formats[f], 1536, 1536, 1, kyty);
+      i.arrayLayers = 4;
+      CHECK(ELIGIBLE(i));
+      CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &i) == (f == 2));
+      /* The Neo policy keeps one layer. */
+      CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
+      i.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+      CHECK(ELIGIBLE(i));
+      i.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+      CHECK(ELIGIBLE(i));
+      i.arrayLayers = 2048;
+      CHECK(ELIGIBLE(i));
+
+      /* Not cube maps, mip chains, multisampled arrays or volumes. */
+      VkImageCreateInfo c = i;
+      c.arrayLayers = 6;
+      c.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+      CHECK(!ELIGIBLE(c));
+      c = i; c.mipLevels = 2;
+      CHECK(!ELIGIBLE(c));
+      c = i; c.samples = VK_SAMPLE_COUNT_2_BIT;
+      c.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+      c.flags = 0;
+      CHECK(!ELIGIBLE(c));
+      c.arrayLayers = 1;
+      CHECK(ELIGIBLE(c)); /* the 2x depth plane, one layer */
+      c = i; c.arrayLayers = 0;
+      CHECK(!ELIGIBLE(c));
+      c = i; c.extent.depth = 2;
+      CHECK(!ELIGIBLE(c));
+      c = i; c.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      CHECK(!ELIGIBLE(c));
+   }
+
+   /* Standalone stencil stays plain. */
+   VkImageCreateInfo s = image(VK_FORMAT_S8_UINT, 1536, 1536, 1, kyty);
+   s.arrayLayers = 4;
+   CHECK(!ELIGIBLE(s));
 }
 
 static void
@@ -689,6 +742,7 @@ main(void)
    check_shape(VK_FORMAT_R16G16B16A16_SFLOAT, false);
    check_shape(VK_FORMAT_R8_UNORM, false);
    check_legacy_depth_policy();
+   check_depth_arrays();
    check_layered_and_msaa();
    check_colour_msaa_spill_policy();
    check_minecraft();

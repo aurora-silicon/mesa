@@ -41,9 +41,10 @@
  *    a NaN field back as zero, however it was written. Rendering NaN into an
  *    R11G11B10F attachment has to keep it, so they stay plain.
  *  - Depth: D16_UNORM, D32_SFLOAT and both planes of D32_SFLOAT_S8_UINT,
- *    one level, one layer, one sample; on M4 Pro also the depth plane at
- *    2x, without input-attachment, feedback-loop or sample-location use
- *    (its S8 plane stays plain). The ZLS unit compresses the S8
+ *    one level, one layer, one sample; on M4 Pro also arrays of one level
+ *    and one sample, and the depth plane at 2x (one layer). The 2x depth
+ *    plane alone excludes input-attachment, feedback-loop and
+ *    sample-location use (its S8 plane stays plain). The ZLS unit compresses the S8
  *    stencil plane with the same metadata layout as depth (stencil
  *    load/store compression bits 4/8), it is read through its R8_UINT
  *    alias, and its clears are metadata fast clears. Zink stores GL Z24S8
@@ -152,11 +153,11 @@ hk_hal200_compression_eligible(enum agx_chip chip, unsigned plane,
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
 
-   /* Keep depth/stencil on the existing single-level/layer/sample policy.
-    * The expanded G16S ZLS allocation shapes also reach colour-alias transfer
-    * and clear paths; those do not yet support every compressed D/S shape.
-    * Admitting them at allocation makes legal commands fail at EndCommandBuffer.
-    * Colour's layered/MSAA packet support is independent of this restriction.
+   /* Keep depth/stencil off the G16S colour shapes: their mip chains and
+    * standalone S8 reach colour-alias transfer paths that refuse them, which
+    * makes legal commands fail at EndCommandBuffer. Single-level depth arrays
+    * are admitted below. Colour's layered/MSAA packet support is independent
+    * of this restriction.
     */
    const bool m4_pro = g16s;
    /* Not B10G11R11_UFLOAT: a compressed tile of its class reads NaN back as
@@ -227,9 +228,17 @@ hk_hal200_compression_eligible(enum agx_chip chip, unsigned plane,
       !(info->usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
                        VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT)) &&
       !(info->flags & VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT);
+   /* Single-sample, single-level depth arrays on M4 Pro. Every access to
+    * one layer addresses its metadata at compression_layer_stride_B: ZLS
+    * (with the metadata layer stride for layered rendering), the metadata
+    * fast clear, the texture and PBE descriptors. The graphics copies, uploads
+    * and blits split into single-layer passes (hk_cmd_meta.c). */
+   const bool depth_array =
+      m4_pro && info->samples == VK_SAMPLE_COUNT_1_BIT &&
+      info->mipLevels == 1 && hk_g17p_compression_depth_format(info->format);
    if (!g16s) {
       if (info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
-          info->arrayLayers != 1 ||
+          !info->arrayLayers || (info->arrayLayers != 1 && !depth_array) ||
           (info->samples != VK_SAMPLE_COUNT_1_BIT && !depth_2x) ||
           info->tiling != VK_IMAGE_TILING_OPTIMAL || info->mipLevels < 1 ||
           (info->flags & ~allowed_flags) || (info->usage & ~allowed_usage) ||
