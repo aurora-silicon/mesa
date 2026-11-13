@@ -28,6 +28,9 @@
  *    <wallbraker@gmail.com> Chia-I Wu <olv@lunarg.com>
  */
 
+#include <limits.h>
+#include <unistd.h>
+
 #include "util/libdrm.h"
 #include "git_sha1.h"
 #include "GL/mesa_glinterop.h"
@@ -895,6 +898,133 @@ dri2_get_modifier_num_planes(struct dri_screen *screen,
    }
 }
 
+/*
+ * Allocate a multi-planar YUV image (NV12, P010) that the driver cannot
+ * create natively.  All planes live in ONE linear buffer, Y first and the
+ * interleaved chroma plane at offset stride * height, with a common stride:
+ * the layout every NV12/P010 DMA-BUF consumer expects, including VA-API
+ * DRM_PRIME (single fd) importers.  The buffer is allocated as a tall
+ * single-plane container (R8 or R16) and then imported back through
+ * dri_create_image_from_winsys() (the dri2_from_dma_bufs() path), so the
+ * resulting image is identical to an imported NV12/P010 DMA-BUF (per-plane
+ * resources chained via pipe_resource::next).
+ */
+static struct dri_image *
+dri_create_lowered_yuv_image(struct dri_screen *screen,
+                             const struct dri2_format_mapping *map,
+                             int width, int height,
+                             const uint64_t *modifiers, unsigned count,
+                             unsigned bind, unsigned int use,
+                             void *loaderPrivate)
+{
+   struct pipe_screen *pscreen = screen->base.screen;
+   const uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+   struct pipe_resource templ, *container;
+   struct winsys_handle whandle;
+   struct dri_image *img;
+   unsigned chroma_rows;
+
+   /* Only the 4:2:0 two-plane layouts with a same-pitch chroma plane, whose
+    * planes are described by fd entries 0 and 1 (here: the same buffer).
+    */
+   if (map->nplanes != 2 || map->planes[0].width_shift != 0 ||
+       map->planes[0].height_shift != 0 || map->planes[1].width_shift != 1 ||
+       map->planes[1].height_shift != 1 ||
+       map->planes[0].buffer_index != 0 || map->planes[1].buffer_index != 1)
+      return NULL;
+
+   /* The import path sizes the chroma plane as width/2 x height/2 (floor),
+    * so only even dimensions describe the whole chroma plane.
+    */
+   if (width <= 0 || height <= 0 || (width & 1) || (height & 1) ||
+       !screen->dmabuf_import)
+      return NULL;
+
+   if (modifiers && count) {
+      bool has_linear = false;
+      for (unsigned i = 0; i < count; i++)
+         has_linear |= modifiers[i] == DRM_FORMAT_MOD_LINEAR;
+      if (!has_linear)
+         return NULL;
+   }
+
+   chroma_rows = height / 2;
+   if ((unsigned)height + chroma_rows > pscreen->caps.max_texture_2d_size)
+      return NULL;
+
+   memset(&templ, 0, sizeof(templ));
+   templ.target = PIPE_TEXTURE_2D;
+   /* Luma plane format; the chroma plane (GR88/GR1616 at half width) has
+    * the same bytes per row.
+    */
+   templ.format = map->planes[0].dri_format;
+   templ.width0 = width;
+   templ.height0 = height + chroma_rows;
+   templ.depth0 = 1;
+   templ.array_size = 1;
+   templ.bind = (bind & (PIPE_BIND_SCANOUT | PIPE_BIND_PROTECTED)) |
+                PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_LINEAR | PIPE_BIND_SHARED;
+
+   if (!pscreen->is_format_supported(pscreen, templ.format, screen->target,
+                                     0, 0, PIPE_BIND_SAMPLER_VIEW))
+      return NULL;
+
+   if (pscreen->resource_create_with_modifiers)
+      container = pscreen->resource_create_with_modifiers(pscreen, &templ,
+                                                          &linear, 1);
+   else
+      container = pscreen->resource_create(pscreen, &templ);
+   if (!container)
+      return NULL;
+
+   memset(&whandle, 0, sizeof(whandle));
+   whandle.type = WINSYS_HANDLE_TYPE_FD;
+   if (!pscreen->resource_get_handle(pscreen, NULL, container, &whandle,
+                                     PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE)) {
+      pipe_resource_reference(&container, NULL);
+      return NULL;
+   }
+   /* The import below takes its own reference to the buffer. */
+   pipe_resource_reference(&container, NULL);
+
+   if (whandle.offset != 0 || whandle.stride == 0 ||
+       (uint64_t)whandle.stride * height > INT_MAX) {
+      close(whandle.handle);
+      return NULL;
+   }
+
+   /* Import both planes from the one buffer, as dri2_from_dma_bufs() does,
+    * but keep the allocation's SCANOUT/PROTECTED binds on the planes.
+    */
+   struct winsys_handle whandles[2];
+   memset(whandles, 0, sizeof(whandles));
+   for (unsigned i = 0; i < 2; i++) {
+      whandles[i].type = WINSYS_HANDLE_TYPE_FD;
+      whandles[i].handle = whandle.handle;
+      whandles[i].stride = whandle.stride;
+      whandles[i].offset = i ? whandle.stride * height : 0;
+      whandles[i].format = map->pipe_format;
+      whandles[i].modifier = DRM_FORMAT_MOD_LINEAR;
+      whandles[i].plane = i;
+   }
+
+   img = dri_create_image_from_winsys(screen, width, height, map, 2,
+                                      whandles,
+                                      bind & (PIPE_BIND_SCANOUT |
+                                              PIPE_BIND_PROTECTED),
+                                      loaderPrivate);
+   close(whandle.handle);
+   if (!img)
+      return NULL;
+
+   /* Same image state as an imported NV12/P010 DMA-BUF. */
+   img->dri_fourcc = map->dri_fourcc;
+   img->dri_format = map->dri_format;
+   img->imported_dmabuf = true;
+   img->use = use;
+   return img;
+}
+
 struct dri_image *
 dri_create_image(struct dri_screen *screen,
                   int width, int height,
@@ -910,7 +1040,12 @@ dri_create_image(struct dri_screen *screen,
    struct pipe_resource templ;
    unsigned tex_usage = 0;
    unsigned count = _count;
+   bool lowered_yuv = false;
 
+   if (!map) {
+      map = dri2_get_planar_yuv_mapping_by_pipe_format(format);
+      lowered_yuv = map != NULL;
+   }
    if (!map)
       return NULL;
 
@@ -930,7 +1065,7 @@ dri_create_image(struct dri_screen *screen,
                                     PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SAMPLER_VIEW_SUBOPTIMAL))
       tex_usage |= PIPE_BIND_SAMPLER_VIEW;
 
-   if (!tex_usage)
+   if (!tex_usage && !lowered_yuv)
       return NULL;
 
    if (use & __DRI_IMAGE_USE_SCANOUT)
@@ -948,6 +1083,13 @@ dri_create_image(struct dri_screen *screen,
       tex_usage |= PIPE_BIND_PRIME_BLIT_DST;
    if (use & __DRI_IMAGE_USE_FRONT_RENDERING)
       tex_usage |= PIPE_BIND_USE_FRONT_RENDERING;
+
+   /* Natively unsupported multi-planar YUV: allocate lowered planes. */
+   if (lowered_yuv && !(tex_usage & (PIPE_BIND_RENDER_TARGET |
+                                     PIPE_BIND_SAMPLER_VIEW)))
+      return dri_create_lowered_yuv_image(screen, map, width, height,
+                                          modifiers, count, tex_usage, use,
+                                          loaderPrivate);
 
    img = CALLOC_STRUCT(dri_image);
    if (!img)
@@ -1558,8 +1700,16 @@ dri2_map_image(struct dri_context *ctx, struct dri_image *image,
    if (!image || !data || *data)
       return NULL;
 
+   /* Multi-planar YUV images (NV12, P010, ...) have no single-plane DRI
+    * format; find their mapping by fourcc instead.
+    */
+   const struct dri2_format_mapping *fmt_map =
+      dri2_get_mapping_by_format(image->dri_format);
+   if (!fmt_map && image->dri_fourcc)
+      fmt_map = dri2_get_mapping_by_fourcc(image->dri_fourcc);
+
    unsigned plane = image->plane;
-   if (plane >= dri2_get_mapping_by_format(image->dri_format)->nplanes)
+   if (!fmt_map || plane >= fmt_map->nplanes)
       return NULL;
 
    /* Wait for glthread to finish because we can't use pipe_context from
@@ -1569,6 +1719,10 @@ dri2_map_image(struct dri_context *ctx, struct dri_image *image,
 
    dri_image_fence_sync(ctx, image);
 
+   /* NV12/P010 from dri_create_lowered_yuv_image() is one linear buffer,
+    * chroma at stride * height. A direct map of plane 0 from (0, 0)
+    * (asahi) reaches the chroma plane through the same linear mapping.
+    */
    struct pipe_resource *resource = image->texture;
    while (plane--)
       resource = resource->next;

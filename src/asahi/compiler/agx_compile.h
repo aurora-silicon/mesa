@@ -717,6 +717,8 @@ bool agx_nir_lower_sample_mask_deferred_m5(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s, bool layer_as_varying);
 bool agx_nir_fix_g17g_constant_interpolation(nir_shader *s);
 
+bool agx_nir_lower_clip_m1_1(struct nir_shader *s);
+bool agx_nir_clip_m1_1_complete(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_vs(struct nir_shader *s);
 bool agx_nir_lower_cull_distance_fs(struct nir_shader *s,
                                     unsigned nr_distances,

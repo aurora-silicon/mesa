@@ -2050,7 +2050,7 @@ hk_sync_resolve_submit(struct hk_queue *queue,
    /* Every footprint of this ioctl stays live on the queue until the
     * timeline point it signals (queue_submit has already advanced it).
     * Serialized queues order the next submission after this one whole. */
-   if (!queue->sync.serialize) {
+   if (!queue->sync.serialize || queue->sync.stage_overlap) {
       if (direct_footprints) {
          util_dynarray_foreach(&cmdbufs[0]->sync_pass_records,
                                struct hk_sync_pass_record, rec) {

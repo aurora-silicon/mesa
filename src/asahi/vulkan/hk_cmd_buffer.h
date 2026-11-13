@@ -280,6 +280,10 @@ struct hk_root_descriptor_table {
     * address of the word libagx_m5_task_dispatch writes (nonzero = execute);
     * zero for every other draw. Appended after every agx3b field. */
    uint64_t mesh_task_flag;
+
+   /* VK_EXT_depth_clip_control: 1/2 maps clip z from [-w, w] to [0, w] in the
+    * last pre-rasterization stage, 0 leaves it (agx_nir_lower_clip_m1_1). */
+   float clip_z_coeff;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
@@ -1249,6 +1253,11 @@ struct hk_cs {
 
    /* A query copy or reset was recorded into this stream. */
    bool query_access;
+
+   /* The stream ends with a strong, memory-scoped flush
+    * (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+    */
+   bool visible_completion;
 
    /* Statistics */
    struct {

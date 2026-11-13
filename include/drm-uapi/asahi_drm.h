@@ -402,6 +402,13 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES ((1ULL) << 32)
 
 /*
+ * DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: M5: compute commands accept
+ * DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION. A feature bit like those of enum
+ * drm_asahi_feature, defined outside it so that the enum keeps its 32-bit type.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION ((1ULL) << 34)
+
+/*
  * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: drm_asahi_queue_create::compute_timeout_ms
  * sets the watchdog allowance of the queue's compute commands. A feature bit
  * like those of enum drm_asahi_feature, defined here like bit 32.
@@ -2013,6 +2020,15 @@ enum drm_asahi_compute_flags {
 	 * the versioned drm_asahi_g18_compute_resources suffix.
 	 */
 	DRM_ASAHI_COMPUTE_G18_RESOURCES = (1L << 19),
+
+	/**
+	 * @DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: M5: the command's control
+	 * stream ends with a strong, memory-scoped cache flush, so its writes
+	 * are visible once it completes. A compute command of another queue may
+	 * then wait for it in firmware rather than on the host. Requires
+	 * DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION.
+	 */
+	DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION = (1L << 20),
 };
 
 /**

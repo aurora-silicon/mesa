@@ -35,6 +35,8 @@ hk_files = files(
   'hk_descriptor_set_layout.h',
   'hk_descriptor_table.c',
   'hk_descriptor_table.h',
+  'hk_compute_kick.c',
+  'hk_compute_kick.h',
   'hk_device.c',
   'hk_device.h',
   'hk_device_memory.c',

@@ -731,6 +731,23 @@ dri2_get_mapping_by_fourcc(int fourcc)
    return NULL;
 }
 
+/* Multi-planar YUV formats have no single-plane DRI format, so look them up
+ * by their aggregate pipe format (as GBM passes it).
+ */
+const struct dri2_format_mapping *
+dri2_get_planar_yuv_mapping_by_pipe_format(enum pipe_format format)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(dri2_format_table); i++) {
+      if (dri2_format_table[i].pipe_format == format &&
+          dri2_format_table[i].dri_format == __DRI_IMAGE_FORMAT_NONE &&
+          dri2_format_table[i].nplanes > 1 &&
+          util_format_is_yuv(format))
+         return &dri2_format_table[i];
+   }
+
+   return NULL;
+}
+
 const struct dri2_format_mapping *
 dri2_get_mapping_by_format(int format)
 {

@@ -50,6 +50,12 @@ def declare_options():
           "list is only viewed as itself or its sRGB/UNORM twin, so that it "
           "can be compressed",
           c_name="mutable_format_srgb_pair"),
+        drirc_gen.DrircInt("hk_compute_kick_ms", 10, 0, 1000,
+          "M5 Max: once a queue's compute work has completed nothing for "
+          "50 ms, submit a small compute job on a second queue every this "
+          "many ms until it does, which lets other applications' compute "
+          "work and rendering run meanwhile (0: off)",
+          c_name="compute_kick_ms"),
         drirc_gen.DrircInt("hk_compute_timeout_ms", 0, 0, 3600000,
           "Watchdog allowance of each compute command on the device's "
           "queues, in ms (0: the kernel's default). The kernel clamps the "
