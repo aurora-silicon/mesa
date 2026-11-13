@@ -54,6 +54,64 @@ TEST(Layout, M5SparseMipTailPageStride)
       EXPECT_EQ(ordinary.level_offsets_B[l], sparse.level_offsets_B[l]);
 }
 
+static struct ail_layout
+m5_array(enum pipe_format format, unsigned layers, unsigned levels,
+         bool writeable)
+{
+   struct ail_layout layout = {};
+   layout.policy = AIL_LAYOUT_POLICY_M5;
+   layout.tiling = AIL_TILING_GPU;
+   layout.format = format;
+   layout.width_px = 16;
+   layout.height_px = 16;
+   layout.depth_px = layers;
+   layout.levels = levels;
+   layout.sample_count_sa = 1;
+   layout.writeable_image = writeable;
+   return layout;
+}
+
+/* A layered store to a mipmapped array is a 3D store whose slice stride
+ * follows a deeper mip chain; page-aligned layers hold it (layout.c). */
+TEST(Layout, M5WriteableMipmappedArrayPageStride)
+{
+   struct ail_layout layout = m5_array(PIPE_FORMAT_R32_UINT, 6, 5, true);
+   ail_make_miptree(&layout);
+   EXPECT_TRUE(layout.page_aligned_layers);
+   EXPECT_EQ(layout.layer_stride_B, AIL_PAGESIZE);
+   EXPECT_EQ(layout.size_B, 6u * AIL_PAGESIZE);
+}
+
+TEST(Layout, M5CompactArrayStrides)
+{
+   /* Not writeable, or a single level: the compact stride stays. */
+   struct ail_layout ro = m5_array(PIPE_FORMAT_R32_UINT, 6, 5, false);
+   struct ail_layout one = m5_array(PIPE_FORMAT_R32_UINT, 6, 1, true);
+   ail_make_miptree(&ro);
+   ail_make_miptree(&one);
+   EXPECT_FALSE(ro.page_aligned_layers);
+   EXPECT_LT(ro.layer_stride_B, AIL_PAGESIZE);
+   EXPECT_FALSE(one.page_aligned_layers);
+   EXPECT_LT(one.layer_stride_B, AIL_PAGESIZE);
+}
+
+TEST(Layout, M5G18GDepthArrayStrides)
+{
+   /* G18G keeps compact depth layers, except for writeable mipmapped
+    * arrays. */
+   struct ail_layout flat = m5_array(PIPE_FORMAT_Z32_FLOAT, 4, 1, true);
+   flat.renderable = true;
+   flat.g18g = true;
+   struct ail_layout mip = flat;
+   mip.levels = 5;
+   ail_make_miptree(&flat);
+   ail_make_miptree(&mip);
+   EXPECT_FALSE(flat.page_aligned_layers);
+   EXPECT_LT(flat.layer_stride_B, AIL_PAGESIZE);
+   EXPECT_TRUE(mip.page_aligned_layers);
+   EXPECT_EQ(mip.layer_stride_B, AIL_PAGESIZE);
+}
+
 TEST(Layout, M5EightSampleGeometry)
 {
    EXPECT_EQ(ail_effective_width_sa(37, 8), 74u);
