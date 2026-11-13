@@ -354,6 +354,20 @@ TEST_F(G17PMSAAEpilog, PerSampleKillsUseOneCoverageUpdate)
       EXPECT_EQ(updates, 1u);
       EXPECT_EQ(kill_only, 0u);
 
+      /* The drivers bind or fold the update's test selector; here the
+       * fragment always tests. */
+      nir_shader_intrinsics_pass(
+         b.shader,
+         [](nir_builder *nb, nir_intrinsic_instr *in, void *) -> bool {
+            if (in->intrinsic != nir_intrinsic_load_shader_part_tests_zs_agx)
+               return false;
+            nb->cursor = nir_before_instr(&in->instr);
+            nir_def_replace(&in->def,
+                            nir_imm_intN_t(nb, UINT16_MAX, in->def.bit_size));
+            return true;
+         },
+         nir_metadata_control_flow, NULL);
+
       agx_preprocess_nir(b.shader);
       agx_shader_key key = {};
       key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
