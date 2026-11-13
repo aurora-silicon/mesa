@@ -2287,9 +2287,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * clears and blits the same way on any family. These families only
     * narrow what the application may record, so they reuse the universal
     * queue implementation, and like it they create their kernel queue on
-    * first submission, in the device's one VM. The G17P and M3 kernels
-    * report independent queues too, but the families are qualified on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
+    * first submission, in the device's one VM. The M3 kernel reports
+    * independent queues too, but the families are qualified on M5 and G17P. */
+   if ((agx_chip_g17_m5(pdev->dev.chip) ||
+        pdev->dev.chip == AGX_CHIP_G17P) &&
        (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES)) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
          .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
