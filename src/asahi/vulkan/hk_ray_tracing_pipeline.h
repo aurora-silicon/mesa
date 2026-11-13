@@ -31,6 +31,7 @@
 extern const struct vk_pipeline_ops hk_ray_tracing_pipeline_ops;
 
 struct hk_api_shader;
+struct vk_pipeline_cache_object;
 struct hk_device;
 struct nir_shader;
 
@@ -50,6 +51,9 @@ struct hk_ray_tracing_pipeline {
    struct vk_pipeline_layout *layout;
 
    uint8_t binary_key[32];
+   /* This pipeline's pipeline cache entry. The device's memory cache holds
+    * entries only while something references them. */
+   struct vk_pipeline_cache_object *cache_object;
 
    uint32_t stage_count;
    uint32_t group_count;
@@ -86,6 +90,8 @@ struct hk_ray_tracing_pipeline {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_ray_tracing_pipeline, base.base, VkPipeline,
                                VK_OBJECT_TYPE_PIPELINE);
+
+void hk_rt_device_finish(struct hk_device *dev);
 
 static inline struct hk_ray_tracing_pipeline *
 hk_pipeline_to_ray_tracing(struct vk_pipeline *pipeline)
