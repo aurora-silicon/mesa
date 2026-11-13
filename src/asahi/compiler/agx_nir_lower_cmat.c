@@ -8,6 +8,8 @@
 #include "agx_nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/hash_table.h"
+#include "util/set.h"
+#include "util/stack_array.h"
 
 static const struct glsl_type *
 remap_matrix_type(struct hash_table *mapping, const struct glsl_type *orig)
@@ -123,6 +125,179 @@ matrix_col(nir_builder *b, nir_def *lane,
    return nir_ior_imm(b, nir_ior(b, nir_ishl_imm(b, nir_iand_imm(b, lane, 1), 1),
                                    nir_iand_imm(b, nir_ushr_imm(b, lane, 1), 4)),
                          element);
+}
+
+/* Where a matrix's elements are: bit i of an element's index within its lane
+ * and bit j of its lane's subgroup invocation each hold one bit of its row
+ * (ROW(k)) or of its column (COL(k)), as matrix_row() and matrix_col() place
+ * them. The accumulator and B layouts of a 16x16 matrix are the same; A
+ * differs only in where its column bits are. All uses of an 8x8 matrix share
+ * one layout.
+ */
+#define ROW(k)       (k)
+#define COL(k)       (8 + (k))
+#define COORD_BIT(c) ((c) & 7)
+#define TRANSPOSED(c) ((c) ^ 8)
+
+struct cmat_layout {
+   unsigned element_bits;
+   uint8_t element[3];
+   uint8_t lane[5];
+};
+
+static const struct cmat_layout layout_16_a = {
+   3, {COL(1), COL(2), ROW(0)}, {COL(3), ROW(1), ROW(2), COL(0), ROW(3)},
+};
+static const struct cmat_layout layout_16 = {
+   3, {COL(0), COL(1), ROW(0)}, {COL(2), ROW(1), ROW(2), COL(3), ROW(3)},
+};
+static const struct cmat_layout layout_8 = {
+   1, {COL(0)}, {COL(1), ROW(0), ROW(1), COL(2), ROW(2)},
+};
+
+static const struct cmat_layout *
+matrix_layout(struct glsl_cmat_description desc)
+{
+   assert((desc.rows == 8 || desc.rows == 16) && desc.cols == desc.rows);
+   if (desc.rows == 8)
+      return &layout_8;
+   return desc.use == GLSL_CMAT_USE_A ? &layout_16_a : &layout_16;
+}
+
+static int
+find_element_bit(const struct cmat_layout *l, unsigned coord)
+{
+   for (unsigned i = 0; i < l->element_bits; ++i) {
+      if (l->element[i] == coord)
+         return i;
+   }
+   return -1;
+}
+
+static int
+find_lane_bit(const struct cmat_layout *l, unsigned coord)
+{
+   for (unsigned j = 0; j < 5; ++j) {
+      if (l->lane[j] == coord)
+         return j;
+   }
+   return -1;
+}
+
+/* The row (or column) of a lane's element `element` */
+static nir_def *
+layout_coord(nir_builder *b, const struct cmat_layout *l, nir_def *lane,
+             unsigned element, bool col)
+{
+   unsigned imm = 0;
+   for (unsigned i = 0; i < l->element_bits; ++i) {
+      if ((l->element[i] >= COL(0)) == col && (element & (1 << i)))
+         imm |= 1 << COORD_BIT(l->element[i]);
+   }
+   nir_def *coord = nir_imm_int(b, imm);
+   for (unsigned j = 0; j < 5; ++j) {
+      if ((l->lane[j] >= COL(0)) != col)
+         continue;
+      nir_def *bit = nir_iand_imm(b, lane, 1 << j);
+      unsigned to = COORD_BIT(l->lane[j]);
+      bit = to >= j ? nir_ishl_imm(b, bit, to - j) : nir_ushr_imm(b, bit, j - to);
+      coord = nir_ior(b, coord, bit);
+   }
+   return coord;
+}
+
+/* out[i] = subgroupShuffleXor(in[i], mask). The 16-bit values go two to a
+ * 32-bit shuffle, which is one instruction for a constant mask.
+ */
+static void
+shuffle_xor_values(nir_builder *b, nir_def **in, nir_def **out, unsigned count,
+                   unsigned mask)
+{
+   nir_def *m = nir_imm_int(b, mask);
+   for (unsigned i = 0; i < count; ++i) {
+      if (in[i]->bit_size == 32) {
+         out[i] = nir_shuffle_xor(b, in[i], m);
+      } else if (i + 1 < count) {
+         nir_def *pair = nir_shuffle_xor(b, nir_pack_32_2x16_split(b, in[i], in[i + 1]), m);
+         out[i] = nir_unpack_32_2x16_split_x(b, pair);
+         out[++i] = nir_unpack_32_2x16_split_y(b, pair);
+      } else {
+         out[i] = nir_u2u16(b, nir_shuffle_xor(b, nir_u2u32(b, in[i]), m));
+      }
+   }
+}
+
+/* Swap what element bit i and lane bit j of the matrix in v hold: of each pair
+ * of elements differing in bit i, a lane keeps the one that stays and trades
+ * the other with the lane differing in bit j.
+ */
+static void
+exchange_bits(nir_builder *b, nir_def **v, struct cmat_layout *l, unsigned i,
+              unsigned j, nir_def *lane)
+{
+   unsigned count = 1 << l->element_bits, pairs = 0;
+   nir_def *upper = nir_i2b(b, nir_iand_imm(b, lane, 1 << j));
+   nir_def *send[4], *recv[4];
+   for (unsigned e = 0; e < count; ++e) {
+      if (!(e & (1 << i)))
+         send[pairs++] = nir_bcsel(b, upper, v[e], v[e | (1 << i)]);
+   }
+   shuffle_xor_values(b, send, recv, pairs, 1 << j);
+   pairs = 0;
+   for (unsigned e = 0; e < count; ++e) {
+      if (e & (1 << i))
+         continue;
+      v[e] = nir_bcsel(b, upper, recv[pairs], v[e]);
+      v[e | (1 << i)] = nir_bcsel(b, upper, v[e | (1 << i)], recv[pairs]);
+      pairs++;
+   }
+   uint8_t tmp = l->element[i];
+   l->element[i] = l->lane[j];
+   l->lane[j] = tmp;
+}
+
+/* Move a matrix's elements from layout `from` to layout `to` (with the same
+ * coordinates). Each lane bit that holds the wrong coordinate trades it with
+ * the element bit that holds the right one; a coordinate that is in another
+ * lane bit goes through an element bit first. What is left is a renaming of
+ * the elements within each lane.
+ */
+static nir_def *
+permute_matrix(nir_builder *b, nir_def *value, struct cmat_layout from,
+               const struct cmat_layout *to)
+{
+   nir_def *v[8], *out[8];
+   unsigned count = 1 << from.element_bits;
+   assert(value->num_components == count && to->element_bits == from.element_bits);
+   for (unsigned e = 0; e < count; ++e)
+      v[e] = nir_channel(b, value, e);
+
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   for (unsigned j = 0; j < 5; ++j) {
+      while (from.lane[j] != to->lane[j]) {
+         int i = find_element_bit(&from, to->lane[j]);
+         if (i >= 0) {
+            exchange_bits(b, v, &from, i, j, lane);
+            continue;
+         }
+         /* Bring it in from lane bit k, through the element bit whose
+          * coordinate lane bit k wants if there is one.
+          */
+         int k = find_lane_bit(&from, to->lane[j]);
+         assert(k > (int)j);
+         i = find_element_bit(&from, to->lane[k]);
+         exchange_bits(b, v, &from, i >= 0 ? i : 0, k, lane);
+      }
+   }
+   for (unsigned e = 0; e < count; ++e) {
+      unsigned src = 0;
+      for (unsigned i = 0; i < from.element_bits; ++i) {
+         if (e & (1 << i))
+            src |= 1 << find_element_bit(&from, to->element[i]);
+      }
+      out[e] = v[src];
+   }
+   return nir_vec(b, out, count);
 }
 
 /* The memory of matrix element `element` of this lane, or of the one `skip`
@@ -317,12 +492,32 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types)
       b->fp_math_ctrl = nir_fp_fast_math;
       break;
    }
-   case nir_intrinsic_cmat_convert: {
+   case nir_intrinsic_cmat_convert:
+   case nir_intrinsic_cmat_transpose: {
       struct glsl_cmat_description src = matrix_desc(intr->src[1]);
       struct glsl_cmat_description dst = matrix_desc(intr->src[0]);
+      struct cmat_layout from = *matrix_layout(src);
+      const struct cmat_layout *to = matrix_layout(dst);
+      bool transpose = intr->intrinsic == nir_intrinsic_cmat_transpose;
+      if (transpose) {
+         for (unsigned i = 0; i < from.element_bits; ++i)
+            from.element[i] = TRANSPOSED(from.element[i]);
+         for (unsigned j = 0; j < 5; ++j)
+            from.lane[j] = TRANSPOSED(from.lane[j]);
+      }
+      bool move = memcmp(&from, to, sizeof(from)) != 0;
+      /* Convert where the elements are narrower */
+      bool convert_first = glsl_base_type_bit_size(dst.element_type) <
+                           glsl_base_type_bit_size(src.element_type);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
-      store_matrix(b, intr->src[0], convert_matrix_value(b,
-         load_matrix(b, intr->src[1]), src.element_type, dst.element_type));
+      nir_def *value = load_matrix(b, intr->src[1]);
+      if (convert_first)
+         value = convert_matrix_value(b, value, src.element_type, dst.element_type);
+      if (move)
+         value = permute_matrix(b, value, from, to);
+      if (!convert_first)
+         value = convert_matrix_value(b, value, src.element_type, dst.element_type);
+      store_matrix(b, intr->src[0], value);
       b->fp_math_ctrl = nir_fp_fast_math;
       break;
    }
@@ -366,4 +561,493 @@ agx_nir_lower_cmat(nir_shader *nir)
    }
    _mesa_hash_table_destroy(types, NULL);
    return true;
+}
+
+/* Calls `callee`, whose first parameter is where it returns a value of type
+ * `type`, with the rest of `args`.
+ */
+static nir_def *
+call_returning(nir_builder *b, nir_function *callee, const struct glsl_type *type,
+               nir_def **args, unsigned count)
+{
+   nir_variable *ret = nir_local_variable_create(b->impl, type, "cmat_call_ret");
+   nir_deref_instr *deref = nir_build_deref_var(b, ret);
+   nir_call_instr *call = nir_call_instr_create(b->shader, callee);
+   call->params[0] = nir_src_for_ssa(&deref->def);
+   for (unsigned i = 0; i < count; ++i)
+      call->params[i + 1] = nir_src_for_ssa(args[i]);
+   nir_builder_instr_insert(b, &call->instr);
+   return nir_load_deref(b, deref);
+}
+
+/* Store the elements in `values` as the matrix `dst` */
+static void
+build_matrix(nir_builder *b, nir_deref_instr *dst, nir_def **values, unsigned count)
+{
+   nir_cmat_construct(b, &dst->def, values[0]);
+   for (unsigned e = 1; e < count; ++e)
+      nir_cmat_insert(b, &dst->def, values[e], &dst->def, nir_imm_int(b, e));
+}
+
+/* coopMatPerElementNV: the function of each element, its row, its column and
+ * the same element of any matrix among the extra arguments.
+ */
+static void
+lower_per_element(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[3]);
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(src->type);
+   const struct cmat_layout *l = matrix_layout(desc);
+   unsigned count = 1 << l->element_bits;
+   unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   nir_def *lane = nir_load_subgroup_invocation(b);
+   nir_def *values[8];
+   STACK_ARRAY(nir_def *, args, call->num_params - 1);
+
+   for (unsigned e = 0; e < count; ++e) {
+      args[0] = nir_iadd(b, layout_coord(b, l, lane, e, false), call->params[1].ssa);
+      args[1] = nir_iadd(b, layout_coord(b, l, lane, e, true), call->params[2].ssa);
+      args[2] = nir_cmat_extract(b, bits, &src->def, nir_imm_int(b, e));
+      for (unsigned p = 4; p < call->num_params; ++p) {
+         nir_deref_instr *arg = nir_src_as_deref(call->params[p]);
+         if (arg && glsl_type_is_cmat(arg->type)) {
+            struct glsl_cmat_description arg_desc = *glsl_get_cmat_description(arg->type);
+            args[p - 1] = nir_cmat_extract(b, glsl_base_type_bit_size(arg_desc.element_type),
+                                           &arg->def, nir_imm_int(b, e));
+         } else {
+            args[p - 1] = call->params[p].ssa;
+         }
+      }
+      values[e] = call_returning(b, call->callee, glsl_scalar_type(desc.element_type),
+                                 args, call->num_params - 1);
+   }
+   build_matrix(b, dst, values, count);
+   STACK_ARRAY_FINISH(args);
+}
+
+/* Combine with `callee` the elements of the matrix `src` (layout `sl`) whose
+ * coordinates differ only in the bits of `combined`: partly element bits,
+ * combined within the lane, and partly lane bits, combined with the lane
+ * across each in turn. Element e of v then holds the result for every
+ * element of every lane that differs from it only in those bits, for each e
+ * with none of the returned element bits set.
+ */
+static unsigned
+reduce_elements(nir_builder *b, nir_function *callee, nir_deref_instr *src,
+                const struct cmat_layout *sl, uint32_t combined, nir_def **v)
+{
+   struct glsl_cmat_description sd = *glsl_get_cmat_description(src->type);
+   const struct glsl_type *type = glsl_scalar_type(sd.element_type);
+   unsigned bits = glsl_base_type_bit_size(sd.element_type);
+   unsigned count = 1 << sl->element_bits;
+
+   for (unsigned e = 0; e < count; ++e)
+      v[e] = nir_cmat_extract(b, bits, &src->def, nir_imm_int(b, e));
+
+   /* Within the lane */
+   unsigned done = 0;
+   for (unsigned i = 0; i < sl->element_bits; ++i) {
+      if (!(combined & BITFIELD_BIT(sl->element[i])))
+         continue;
+      for (unsigned e = 0; e < count; ++e) {
+         if (!(e & (done | (1 << i)))) {
+            nir_def *args[2] = {v[e], v[e | (1 << i)]};
+            v[e] = call_returning(b, callee, type, args, 2);
+         }
+      }
+      done |= 1 << i;
+   }
+
+   /* Across lanes */
+   for (unsigned j = 0; j < 5; ++j) {
+      if (!(combined & BITFIELD_BIT(sl->lane[j])))
+         continue;
+      nir_def *mine[8], *other[8];
+      unsigned n = 0;
+      for (unsigned e = 0; e < count; ++e) {
+         if (!(e & done))
+            mine[n++] = v[e];
+      }
+      shuffle_xor_values(b, mine, other, n, 1 << j);
+      n = 0;
+      for (unsigned e = 0; e < count; ++e) {
+         if (!(e & done)) {
+            nir_def *args[2] = {mine[n], other[n]};
+            v[e] = call_returning(b, callee, type, args, 2);
+            n++;
+         }
+      }
+   }
+   return done;
+}
+
+/* coopMatReduceNV. Each lane has the result of every row (column, 2x2
+ * block) it holds elements of, and holds the same ones in the result matrix
+ * (the result of a 2x2 reduction is half the size, its row k and column k
+ * bits where the source's k + 1 bits are).
+ */
+static void
+lower_reduce(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[1]);
+   struct glsl_cmat_description sd = *glsl_get_cmat_description(src->type);
+   struct glsl_cmat_description dd = *glsl_get_cmat_description(dst->type);
+   const struct cmat_layout *sl = matrix_layout(sd), *dl = matrix_layout(dd);
+   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+
+   /* The source coordinates combined, and the shift from a result
+    * coordinate's bit to its source's.
+    */
+   uint32_t combined = 0;
+   unsigned shift = 0;
+   if (reduce & NIR_CMAT_REDUCE_2X2) {
+      combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
+      shift = 1;
+   }
+   if (reduce & NIR_CMAT_REDUCE_ROW)
+      combined |= BITFIELD_RANGE(COL(0), util_logbase2(sd.cols));
+   if (reduce & NIR_CMAT_REDUCE_COLUMN)
+      combined |= BITFIELD_RANGE(ROW(0), util_logbase2(sd.rows));
+
+   nir_def *v[8];
+   unsigned done = reduce_elements(b, call->callee, src, sl, combined, v);
+
+   unsigned dst_count = 1 << dl->element_bits;
+   nir_def *values[8] = {NULL};
+   for (unsigned e = 0; e < dst_count; ++e) {
+      unsigned from = 0;
+      for (unsigned i = 0; i < dl->element_bits; ++i) {
+         unsigned coord = dl->element[i] + shift;
+         if (!(e & (1 << i)) || (combined & BITFIELD_BIT(coord)))
+            continue;
+         int k = find_element_bit(sl, coord);
+         if (k >= 0)
+            from |= 1 << k;
+      }
+      values[e] = v[from & ~done];
+   }
+   build_matrix(b, dst, values, dst_count);
+}
+
+/* What nir_lower_cooperative_matrix_flexible_dimensions() makes of a
+ * reduction of a matrix it splits into 16x16 pieces: each piece is reduced
+ * alone, then a reduce_finish combines two pieces' results element by
+ * element (same type: an element of each holds the reduction of its row or
+ * column over its own piece).
+ */
+static void
+lower_reduce_finish(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *x = nir_src_as_deref(call->params[1]);
+   nir_deref_instr *y = nir_src_as_deref(call->params[2]);
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(x->type);
+   unsigned count = 1 << matrix_layout(desc)->element_bits;
+   unsigned bits = glsl_base_type_bit_size(desc.element_type);
+   nir_def *values[8];
+
+   for (unsigned e = 0; e < count; ++e) {
+      nir_def *args[2] = {
+         nir_cmat_extract(b, bits, &x->def, nir_imm_int(b, e)),
+         nir_cmat_extract(b, bits, &y->def, nir_imm_int(b, e)),
+      };
+      values[e] = call_returning(b, call->callee, glsl_scalar_type(desc.element_type),
+                                 args, 2);
+   }
+   build_matrix(b, dst, values, count);
+}
+
+/* The split's 2x2 reduction: four 16x16 pieces, top left, top right, bottom
+ * left, bottom right, into one 16x16 result. Each piece reduces 2x2 into an
+ * 8x8 quarter of the result held as lower_reduce() holds it (its lane bits
+ * those of the piece, one coordinate down; one element bit left); the four
+ * quarters' elements together are a matrix whose other two element bits are
+ * the result's row 3 and column 3, moved to the result's layout.
+ */
+static void
+lower_reduce_2x2(nir_builder *b, nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   const struct cmat_layout *sl =
+      matrix_layout(*glsl_get_cmat_description(nir_src_as_deref(call->params[1])->type));
+   const struct cmat_layout *dl =
+      matrix_layout(*glsl_get_cmat_description(dst->type));
+   uint32_t combined = BITFIELD_BIT(ROW(0)) | BITFIELD_BIT(COL(0));
+   struct cmat_layout quarters = {.element_bits = 3};
+   nir_def *w[8];
+
+   for (unsigned q = 0; q < 4; ++q) {
+      nir_def *v[8];
+      unsigned done = reduce_elements(b, call->callee,
+                                      nir_src_as_deref(call->params[1 + q]),
+                                      sl, combined, v);
+      unsigned k = ffs(~done & BITFIELD_MASK(sl->element_bits)) - 1;
+      w[2 * q] = v[0];
+      w[2 * q + 1] = v[1 << k];
+      quarters.element[0] = sl->element[k] - 1;
+   }
+   quarters.element[1] = COL(3);
+   quarters.element[2] = ROW(3);
+   for (unsigned j = 0; j < 5; ++j)
+      quarters.lane[j] = sl->lane[j] - 1;
+
+   nir_def *value = permute_matrix(b, nir_vec(b, w, 8), quarters, dl);
+   nir_def *values[8];
+   for (unsigned e = 0; e < 8; ++e)
+      values[e] = nir_channel(b, value, e);
+   build_matrix(b, dst, values, 8);
+}
+
+static bool
+type_is_supported(const struct glsl_type *type)
+{
+   if (glsl_type_is_cmat(type)) {
+      const struct glsl_cmat_description *desc = glsl_get_cmat_description(type);
+      return (desc->rows == 8 || desc->rows == 16) && desc->cols == desc->rows &&
+             desc->scope == SCOPE_SUBGROUP;
+   } else if (glsl_type_is_array(type)) {
+      return type_is_supported(glsl_get_array_element(type));
+   } else if (glsl_type_is_struct(type)) {
+      for (unsigned i = 0; i < glsl_get_length(type); i++) {
+         if (!type_is_supported(glsl_get_struct_field(type, i)))
+            return false;
+      }
+   }
+   return true;
+}
+
+static bool
+matrices_supported(nir_cmat_call_instr *call)
+{
+   for (unsigned i = 0; i < call->num_params; ++i) {
+      nir_deref_instr *deref = nir_src_as_deref(call->params[i]);
+      if (deref && !type_is_supported(deref->type))
+         return false;
+   }
+   return true;
+}
+
+/* Whether the lowering can take every cooperative matrix of the shader: only
+ * subgroup-scope 8x8 and 16x16 ones, and no matrix call left
+ * (agx_nir_lower_cmat_calls() leaves those it cannot lower, and none of the
+ * others is lowered at all).
+ */
+bool
+agx_nir_cmat_supported(nir_shader *nir)
+{
+   if (!nir->info.cs.has_cooperative_matrix)
+      return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_deref &&
+                !type_is_supported(nir_instr_as_deref(instr)->type))
+               return false;
+            if (instr->type == nir_instr_type_cmat_call)
+               return false;
+         }
+      }
+   }
+   return true;
+}
+
+/* coopMatPerElementNV passes element e of each matrix argument with element
+ * e of the source, so every matrix of the call must lie over the lanes as the
+ * source does.
+ */
+static bool
+per_element_layouts_match(nir_cmat_call_instr *call)
+{
+   const struct cmat_layout *l =
+      matrix_layout(*glsl_get_cmat_description(nir_src_as_deref(call->params[3])->type));
+   for (unsigned p = 0; p < call->num_params; ++p) {
+      nir_deref_instr *deref = nir_src_as_deref(call->params[p]);
+      if (deref && glsl_type_is_cmat(deref->type) &&
+          matrix_layout(*glsl_get_cmat_description(deref->type)) != l)
+         return false;
+   }
+   return true;
+}
+
+static bool
+reduce_layouts_match(nir_cmat_call_instr *call)
+{
+   nir_deref_instr *dst = nir_src_as_deref(call->params[0]);
+   nir_deref_instr *src = nir_src_as_deref(call->params[1]);
+   const struct cmat_layout *sl = matrix_layout(*glsl_get_cmat_description(src->type));
+   const struct cmat_layout *dl = matrix_layout(*glsl_get_cmat_description(dst->type));
+   nir_cmat_reduce reduce = nir_cmat_call_reduce_flags(call);
+   if ((reduce & NIR_CMAT_REDUCE_ROW) && (reduce & NIR_CMAT_REDUCE_COLUMN))
+      return true;
+
+   /* What the result needs is where it goes: each lane bit of the result
+    * matrix holds the coordinate it holds in the source, after reduction.
+    */
+   unsigned shift = (reduce & NIR_CMAT_REDUCE_2X2) ? 1 : 0;
+   for (unsigned j = 0; j < 5; ++j) {
+      bool src_kept = (reduce & NIR_CMAT_REDUCE_2X2)
+         ? COORD_BIT(sl->lane[j]) != 0
+         : (reduce & NIR_CMAT_REDUCE_ROW) ? sl->lane[j] < COL(0)
+                                          : sl->lane[j] >= COL(0);
+      bool dst_kept = (reduce & NIR_CMAT_REDUCE_2X2) ||
+         ((reduce & NIR_CMAT_REDUCE_ROW) ? dl->lane[j] < COL(0)
+                                         : dl->lane[j] >= COL(0));
+      if (src_kept != dst_kept || (src_kept && dl->lane[j] + shift != sl->lane[j]))
+         return false;
+   }
+   return true;
+}
+
+/* reduce_finish combines the same element of two pieces of one type */
+static bool
+reduce_finish_layouts_match(nir_cmat_call_instr *call)
+{
+   const struct glsl_type *type = nir_src_as_deref(call->params[1])->type;
+   return nir_src_as_deref(call->params[0])->type == type &&
+          nir_src_as_deref(call->params[2])->type == type;
+}
+
+/* reduce_2x2 takes four 16x16 pieces of one layout whose 2x2 reduction
+ * lower_reduce_2x2() can place: none of their lane bits holds row 0 or
+ * column 0, and one element bit is left after them.
+ */
+static bool
+reduce_2x2_layouts_match(nir_cmat_call_instr *call)
+{
+   const struct glsl_type *type = nir_src_as_deref(call->params[1])->type;
+   struct glsl_cmat_description sd = *glsl_get_cmat_description(type);
+   struct glsl_cmat_description dd =
+      *glsl_get_cmat_description(nir_src_as_deref(call->params[0])->type);
+   if (sd.rows != 16 || dd.rows != 16)
+      return false;
+   for (unsigned q = 2; q < 5; ++q) {
+      if (nir_src_as_deref(call->params[q])->type != type)
+         return false;
+   }
+   const struct cmat_layout *sl = matrix_layout(sd);
+   unsigned left = 0;
+   for (unsigned i = 0; i < sl->element_bits; ++i)
+      left += COORD_BIT(sl->element[i]) != 0;
+   for (unsigned j = 0; j < 5; ++j) {
+      if (COORD_BIT(sl->lane[j]) == 0)
+         return false;
+   }
+   return left == 1;
+}
+
+/* Lower coopMatPerElementNV and coopMatReduceNV (and the partial reductions
+ * of split matrices) to calls of their functions on the elements, and inline
+ * those. This runs before anything else lowers the
+ * shader, while the functions are still separate.
+ */
+bool
+agx_nir_lower_cmat_calls(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
+      return false;
+
+   bool progress = false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block_safe(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_cmat_call)
+            continue;
+         nir_cmat_call_instr *call = nir_instr_as_cmat_call(instr);
+         b.cursor = nir_before_instr(instr);
+         if (!matrices_supported(call)) {
+            continue;
+         } else if (call->op == nir_cmat_call_op_per_element_op &&
+                    per_element_layouts_match(call)) {
+            lower_per_element(&b, call);
+         } else if (call->op == nir_cmat_call_op_reduce && reduce_layouts_match(call)) {
+            lower_reduce(&b, call);
+         } else if (call->op == nir_cmat_call_op_reduce_finish &&
+                    reduce_finish_layouts_match(call)) {
+            lower_reduce_finish(&b, call);
+         } else if (call->op == nir_cmat_call_op_reduce_2x2 &&
+                    reduce_2x2_layouts_match(call)) {
+            lower_reduce_2x2(&b, call);
+         } else {
+            continue;
+         }
+         nir_instr_remove(instr);
+         progress = true;
+      }
+   }
+   if (!progress)
+      return nir_no_progress(impl);
+
+   nir_progress(true, impl, nir_metadata_none);
+   nir_inline_functions(nir);
+
+   /* Keep only the functions other matrix calls still name */
+   struct set *live = _mesa_pointer_set_create(NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_cmat_call &&
+             nir_instr_as_cmat_call(instr)->callee)
+            _mesa_set_add(live, nir_instr_as_cmat_call(instr)->callee);
+      }
+   }
+   nir_foreach_function_safe(func, nir) {
+      if (!func->is_entrypoint && !_mesa_set_search(live, func))
+         exec_node_remove(&func->node);
+   }
+   _mesa_set_destroy(live, NULL);
+   return true;
+}
+
+static bool
+type_needs_split(const struct glsl_type *type, bool *splittable)
+{
+   type = glsl_without_array(type);
+   if (glsl_type_is_struct(type)) {
+      bool split = false;
+      for (unsigned i = 0; i < glsl_get_length(type); ++i)
+         split |= type_needs_split(glsl_get_struct_field(type, i), splittable);
+      return split;
+   }
+   if (!glsl_type_is_cmat(type))
+      return false;
+   struct glsl_cmat_description desc = *glsl_get_cmat_description(type);
+   /* An 8x8 or 16x16 matrix stays whole beside the split ones. */
+   if (desc.rows <= 16 && desc.cols <= 16)
+      return false;
+   if (desc.rows % 16 || desc.cols % 16)
+      *splittable = false;
+   return true;
+}
+
+/*
+ * Matrices of flexible dimensions (VK_NV_cooperative_matrix2
+ * cooperativeMatrixFlexibleDimensions), multiples of 16 in each dimension at
+ * subgroup scope, as 16x16 pieces (nir_lower_cooperative_matrix_flexible_
+ * dimensions). A shader whose matrices are all 16x16 or 8x8 is left alone,
+ * and such matrices stay whole in a shader that has larger ones.
+ */
+bool
+agx_nir_lower_cmat_flexible(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_COMPUTE || !nir->info.cs.has_cooperative_matrix)
+      return false;
+
+   bool split = false, splittable = true;
+   nir_foreach_variable_in_shader(var, nir)
+      split |= type_needs_split(var->type, &splittable);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_function_temp_variable(var, impl)
+         split |= type_needs_split(var->type, &splittable);
+   }
+   if (!split || !splittable)
+      return false;
+
+   const struct nir_lower_coopmat_args args = {
+      .m_gran = 16,
+      .n_gran = 16,
+      .k_gran = 16,
+   };
+   return nir_lower_cooperative_matrix_flexible_dimensions(nir, &args);
 }

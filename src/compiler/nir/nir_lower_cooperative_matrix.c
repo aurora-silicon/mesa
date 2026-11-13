@@ -116,11 +116,11 @@ get_lower_sizes(struct glsl_cmat_description desc, unsigned m_gran,
 
    get_rowcol_gran(desc, m_gran, n_gran, k_gran, &row_gran, &col_gran);
 
-   if (desc.rows && desc.rows != row_gran) {
+   if (desc.rows > row_gran) {
       split_rows = row_gran;
       assert(desc.rows % split_rows == 0);
    }
-   if (desc.cols && desc.cols != col_gran) {
+   if (desc.cols > col_gran) {
       split_cols = col_gran;
       assert(desc.cols % split_cols == 0);
    }
@@ -647,16 +647,24 @@ split_cmat_reduce_row_col(nir_builder *b,
             call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
          }
       } else if (reduce & NIR_CMAT_REDUCE_ROW) {
-         for (unsigned i = 1; i < src_split->box.outer_cols; i++) {
-            nir_deref_instr *second_deref = temp_derefs[i];
-            b->cursor = nir_before_instr(instr);
-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+         /* each row of splits into its first split */
+         for (unsigned r = 0; r < src_split->box.outer_rows; r++) {
+            nir_deref_instr *first_deref = temp_derefs[r * src_split->box.outer_cols];
+            for (unsigned i = 1; i < src_split->box.outer_cols; i++) {
+               nir_deref_instr *second_deref = temp_derefs[r * src_split->box.outer_cols + i];
+               b->cursor = nir_before_instr(instr);
+               call_reduce_finish(b, call, reduce, &first_deref->def, &first_deref->def, &second_deref->def);
+            }
          }
       } else if (reduce & NIR_CMAT_REDUCE_COLUMN) {
-         for (unsigned i = 1; i < src_split->box.outer_rows; i++) {
-            nir_deref_instr *second_deref = temp_derefs[i * src_split->box.outer_cols];
-            b->cursor = nir_before_instr(instr);
-            call_reduce_finish(b, call, reduce, &temp_derefs[0]->def, &temp_derefs[0]->def, &second_deref->def);
+         /* each column of splits into its first split */
+         for (unsigned c = 0; c < src_split->box.outer_cols; c++) {
+            nir_deref_instr *first_deref = temp_derefs[c];
+            for (unsigned i = 1; i < src_split->box.outer_rows; i++) {
+               nir_deref_instr *second_deref = temp_derefs[i * src_split->box.outer_cols + c];
+               b->cursor = nir_before_instr(instr);
+               call_reduce_finish(b, call, reduce, &first_deref->def, &first_deref->def, &second_deref->def);
+            }
          }
       }
    }
@@ -671,7 +679,7 @@ split_cmat_reduce_row_col(nir_builder *b,
             if ((reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) == (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN))
                idx = 0;
             else if (reduce & NIR_CMAT_REDUCE_ROW)
-               idx = r % (src_split ? src_split->box.outer_rows : 1);
+               idx = src_split ? (r % src_split->box.outer_rows) * src_split->box.outer_cols : 0;
             else if (reduce & NIR_CMAT_REDUCE_COLUMN)
                idx = c % (src_split ? src_split->box.outer_cols : 1);
             else
@@ -729,6 +737,9 @@ split_cmat_call_reduce(nir_builder *b,
    struct split_mat *dst_split = find_call_split(info->split_mats, call, 0);
    struct split_mat *src_split = find_call_split(info->split_mats, call, 1);
 
+   if (!dst_split && !src_split)
+      return false;
+
    if (reduce & (NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)) {
       assert(!(reduce & ~(NIR_CMAT_REDUCE_ROW | NIR_CMAT_REDUCE_COLUMN)));
 
@@ -738,9 +749,13 @@ split_cmat_call_reduce(nir_builder *b,
          src_splits = get_num_splits(src_split);
       nir_deref_instr **temp_derefs = ralloc_array(NULL, nir_deref_instr *, src_splits);
 
-      const struct glsl_type *temp_type = nir_cmat_call_get_var(call, 1)->type;
-      if (src_splits > 1)
-         temp_type = src_split->split_vars[0]->type;
+      /* The partial results have the type of the destination's pieces,
+       * which need not be that of the source's: a reduction may change the
+       * matrix's dimensions.
+       */
+      const struct glsl_type *temp_type = nir_src_as_deref(call->params[0])->type;
+      if (dst_split)
+         temp_type = glsl_without_array(dst_split->split_vars[0]->type);
       for (unsigned i = 0; i < src_splits; i++) {
          nir_variable *temp_var = nir_local_variable_create(impl, temp_type,
                                                             "reduce_split_srcs");

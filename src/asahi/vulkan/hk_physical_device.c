@@ -440,6 +440,17 @@ hk_get_device_features(
       .shaderBFloat16Type = supported_extensions->KHR_shader_bfloat16,
       .shaderBFloat16CooperativeMatrix = supported_extensions->KHR_shader_bfloat16,
       .shaderBFloat16DotProduct = false,
+
+      /* VK_NV_cooperative_matrix2: each feature is enabled where it is
+       * implemented. */
+      .cooperativeMatrixWorkgroupScope = false,
+      .cooperativeMatrixFlexibleDimensions = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixReductionsNV = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixPerElementOperationsNV = supported_extensions->NV_cooperative_matrix2,
+      .cooperativeMatrixTensorAddressing = false,
+      .cooperativeMatrixBlockLoads = false,
+
       .shaderInt8 = true,
       .descriptorIndexing = true,
       .shaderInputAttachmentArrayDynamicIndexing = true,
@@ -1115,6 +1126,8 @@ hk_get_device_properties(const struct agx_device *dev,
    *properties = (struct vk_properties){
       .cooperativeMatrixSupportedStages = features->cooperativeMatrix
          ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+      .cooperativeMatrixFlexibleDimensionsMaxDimension =
+         features->cooperativeMatrixFlexibleDimensions ? 256 : 0,
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
       .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
@@ -2096,6 +2109,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_cooperative_matrix &&
       debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
 
+   supported_extensions.NV_cooperative_matrix2 =
+      supported_extensions.KHR_cooperative_matrix;
+
    /* Hardware-qualified on M5 only. */
    supported_extensions.EXT_primitives_generated_query =
       agx_chip_g17_m5(pdev->dev.chip);
@@ -2570,6 +2586,50 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
                }
             }
          }
+      }
+   }
+   return vk_outarray_status(&out);
+}
+
+/* The 16x16x16 configurations, at subgroup scope, in multiples of 16 in
+ * each dimension: the compiler splits such a matrix into 16x16 pieces.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixFlexibleDimensionsPropertiesNV *pProperties)
+{
+   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixFlexibleDimensionsPropertiesNV,
+                          out, pProperties, pPropertyCount);
+   if (!pdev->vk.supported_features.cooperativeMatrixFlexibleDimensions ||
+       !(pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX))
+      return vk_outarray_status(&out);
+
+   const bool bf16 = pdev->vk.supported_features.shaderBFloat16CooperativeMatrix;
+   const struct {
+      VkComponentTypeKHR a, b, c;
+   } configs[] = {
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
+      if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+                    configs[i].b == VK_COMPONENT_TYPE_BFLOAT16_KHR))
+         continue;
+      vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p) {
+         *p = (VkCooperativeMatrixFlexibleDimensionsPropertiesNV) {
+            .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+            .MGranularity = 16, .NGranularity = 16, .KGranularity = 16,
+            .AType = configs[i].a, .BType = configs[i].b,
+            .CType = configs[i].c, .ResultType = configs[i].c,
+            .saturatingAccumulation = VK_FALSE,
+            .scope = VK_SCOPE_SUBGROUP_KHR,
+            .workgroupInvocations = 0,
+         };
       }
    }
    return vk_outarray_status(&out);
