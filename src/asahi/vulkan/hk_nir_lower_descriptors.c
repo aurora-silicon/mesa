@@ -53,6 +53,9 @@ struct lower_descriptors_ctx {
    /* Coherent image loads and stores access memory directly instead of the
     * texture cache and PBE (see image_access_needs_memory_path()). */
    bool coherent_images_in_memory;
+   /* Layered stores and atomics check the M5 store window record
+    * (lower_m5_store_window()). */
+   bool m5_store_window;
    mesa_shader_stage stage;
 };
 
@@ -653,6 +656,165 @@ lower_image_store_to_memory(nir_builder *b, nir_intrinsic_instr *intr,
    nir_instr_remove(&intr->instr);
 }
 
+/* Interleave the low 16 bits of v with zeros: bit i moves to bit 2i. */
+static nir_def *
+spread_bits_16(nir_builder *b, nir_def *v)
+{
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 8)), 0x00ff00ff);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 4)), 0x0f0f0f0f);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 2)), 0x33333333);
+   v = nir_iand_imm(b, nir_ior(b, v, nir_ishl_imm(b, v, 1)), 0x55555555);
+   return v;
+}
+
+/*
+ * The M5 and M5 Pro (G17G, G17S) store to a layer of an array as a 3D store,
+ * which addresses at most HK_M5_STORE_MAX_SLICES slices. When a storage
+ * view's level needs more, its PBE is a linear window over that level of
+ * every layer of the view, and the descriptor's store window record says so
+ * (hk_native_descriptor.h). Layered stores and atomics check the record: at
+ * zero they take the native path; otherwise they store through the window at
+ * the texel's element index, or update the texel in memory. The index is the
+ * tiled address arithmetic of image atomics (libagx_twiddle_coordinates_gen9)
+ * plus the layer times the layer stride. Texels outside the view are dropped,
+ * as the native store drops them.
+ *
+ * Block stores (image_store_block_agx) are not windowed: on M5 nothing emits
+ * them for an application storage view (meta copies take the tiled or
+ * graphics paths), and a window PBE would take them as linear.
+ */
+static bool
+lower_m5_store_window(nir_builder *b, nir_intrinsic_instr *intr,
+                      const struct lower_descriptors_ctx *ctx)
+{
+   if (!ctx->m5_store_window)
+      return false;
+
+   const bool atomic = intr->intrinsic == nir_intrinsic_image_deref_atomic ||
+                       intr->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+   if (intr->intrinsic != nir_intrinsic_image_deref_store && !atomic)
+      return false;
+
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool is_1d = dim == GLSL_SAMPLER_DIM_1D;
+   if (dim != GLSL_SAMPLER_DIM_CUBE &&
+       !(nir_intrinsic_image_array(intr) &&
+         (is_1d || dim == GLSL_SAMPLER_DIM_2D)))
+      return false;
+
+   uint32_t set, binding;
+   nir_def *unused_index;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   get_resource_deref_binding(b, deref, &set, &binding, &unused_index);
+   if (get_binding_layout(set, binding, ctx)->stride <
+       HK_M5_STORE_WINDOW_OFFSET + HK_M5_STORE_WINDOW_SIZE)
+      return false;
+
+   const struct hk_storage_image_descriptor_layout native =
+      hk_storage_image_descriptor_layout(ctx->descriptor_generation);
+   nir_def *pbe = load_image_handle(b, ctx, intr->src[0], native.pbe);
+   nir_def *window = load_resource_deref_desc(
+      b, 4, 32, deref, HK_M5_STORE_WINDOW_OFFSET, ctx);
+
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *x = nir_channel(b, coord, 0);
+   nir_def *y = is_1d ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
+   nir_def *z = nir_channel(b, coord, is_1d ? 1 : 2);
+
+   nir_def *layer_stride_el = nir_channel(b, window, 0);
+   nir_def *window_result = NULL;
+   nir_push_if(b, nir_ine_imm(b, layer_stride_el, 0));
+   {
+      nir_def *tiles = nir_channel(b, window, 1);
+      nir_def *size = nir_channel(b, window, 2);
+      nir_def *width = nir_iand_imm(b, size, 0xffff);
+      nir_def *height = nir_ushr_imm(b, size, 16);
+      nir_def *layers = nir_channel(b, window, 3);
+      nir_def *in_bounds =
+         nir_iand(b, nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height)),
+                  nir_ult(b, z, layers));
+      nir_def *zero = atomic ? nir_imm_zero(b, 1, intr->def.bit_size) : NULL;
+
+      nir_push_if(b, in_bounds);
+      nir_def *tile_w = nir_ishl(b, nir_imm_int(b, 1),
+                                 nir_iand_imm(b, tiles, 0xf));
+      nir_def *tile_h = nir_ishl(b, nir_imm_int(b, 1),
+                                 nir_ubitfield_extract_imm(b, tiles, 4, 4));
+      nir_def *mask_w = nir_iadd_imm(b, tile_w, -1);
+      nir_def *mask_h = nir_iadd_imm(b, tile_h, -1);
+      nir_def *aligned_width =
+         nir_iand(b, nir_iadd(b, width, mask_w), nir_inot(b, mask_w));
+      nir_def *within =
+         nir_ior(b, spread_bits_16(b, nir_iand(b, x, mask_w)),
+                 nir_ishl_imm(b, spread_bits_16(b, nir_iand(b, y, mask_h)), 1));
+      nir_def *index = nir_iadd(
+         b, nir_imul(b, nir_iand(b, y, nir_inot(b, mask_h)), aligned_width),
+         nir_iadd(b, nir_imul(b, nir_iand(b, x, nir_inot(b, mask_w)), tile_h),
+                  within));
+      index = nir_iadd(b, index, nir_imul(b, z, layer_stride_el));
+
+      nir_def *in_window = NULL;
+      if (atomic) {
+         /* The linear PBE keeps its address >> 4 in the low 40 bits of its
+          * second 64-bit word (agx_pbe_agx3_2d_pack()). */
+         nir_def *pbe_word1 = load_resource_deref_desc(
+            b, 1, 64, deref, native.pbe + 8, ctx);
+         nir_def *base = nir_ishl_imm(
+            b, nir_iand_imm(b, pbe_word1, UINT64_C(0xffffffffff)), 4);
+         const unsigned bit_size = intr->def.bit_size;
+         nir_def *address = nir_iadd(
+            b, base, nir_imul_imm(b, nir_u2u64(b, index), bit_size / 8));
+         const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
+         const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+         if (intr->intrinsic == nir_intrinsic_image_deref_atomic_swap) {
+            in_window = nir_global_atomic_swap(
+               b, bit_size, address, intr->src[3].ssa, intr->src[4].ssa,
+               .atomic_op = op, .access = access);
+         } else {
+            in_window = nir_global_atomic(b, bit_size, address,
+                                          intr->src[3].ssa, .atomic_op = op,
+                                          .access = access);
+         }
+         b->shader->info.use_lowered_image_to_global = true;
+         /* Later texture-path reads of the image in this invocation must see
+          * the update, as after a native image atomic (fence_image()). */
+         if (!(access & ACCESS_NON_READABLE))
+            nir_fence_mem_to_tex_agx(b);
+      } else {
+         nir_def *window_coord = nir_vec4(
+            b, nir_iand_imm(b, index, HK_M5_STORE_WINDOW_WIDTH - 1),
+            nir_ushr_imm(b, index, util_logbase2(HK_M5_STORE_WINDOW_WIDTH)),
+            nir_imm_int(b, 0), nir_imm_int(b, 0));
+         nir_intrinsic_instr *store =
+            nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));
+         nir_builder_instr_insert(b, &store->instr);
+         nir_rewrite_image_intrinsic(store, pbe,
+                                     nir_image_intrinsic_type_bindless);
+         nir_src_rewrite(&store->src[1], window_coord);
+         nir_intrinsic_set_image_dim(store, GLSL_SAMPLER_DIM_2D);
+         nir_intrinsic_set_image_array(store, false);
+      }
+      nir_pop_if(b, NULL);
+      if (atomic)
+         window_result = nir_if_phi(b, in_window, zero);
+   }
+   nir_push_else(b, NULL);
+   nir_intrinsic_instr *native_op =
+      nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));
+   nir_builder_instr_insert(b, &native_op->instr);
+   nir_rewrite_image_intrinsic(native_op, pbe,
+                               nir_image_intrinsic_type_bindless);
+   nir_pop_if(b, NULL);
+
+   if (atomic) {
+      nir_def_replace(&intr->def,
+                      nir_if_phi(b, window_result, &native_op->def));
+   } else {
+      nir_instr_remove(&intr->instr);
+   }
+   return true;
+}
+
 static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
@@ -660,6 +822,9 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
    b->cursor = nir_before_instr(&intr->instr);
 
    if (lower_g17p_r32_3d_diagnostic(b, intr, ctx))
+      return true;
+
+   if (lower_m5_store_window(b, intr, ctx))
       return true;
 
    enum pipe_format memory_format;
@@ -1950,11 +2115,13 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          bool sparse_soft_unmapped,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
                          bool sampler_has_lod_bias, bool d3d_nearest_mip,
-                         bool coherent_images_in_memory)
+                         bool coherent_images_in_memory,
+                         bool m5_store_window)
 {
    struct lower_descriptors_ctx ctx = {
       .stage = nir->info.stage,
       .coherent_images_in_memory = coherent_images_in_memory,
+      .m5_store_window = m5_store_window,
       .scaled_sampling = scaled_sampling,
       .sampler_has_lod_bias = sampler_has_lod_bias,
       .d3d_nearest_mip = d3d_nearest_mip,
@@ -1997,7 +2164,7 @@ hk_nir_lower_descriptors(nir_shader *nir,
     * Apple. This is inherited from NVK.
     */
    const nir_metadata preserved =
-      ctx.coherent_images_in_memory ||
+      ctx.coherent_images_in_memory || ctx.m5_store_window ||
       (ctx.descriptor_generation == 9 &&
        debug_get_bool_option("ASAHI_G17P_R32_3D_ADDRESS_DIAGNOSTIC", false))
          ? nir_metadata_none : nir_metadata_control_flow;

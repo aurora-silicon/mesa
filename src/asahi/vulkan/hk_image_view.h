@@ -44,6 +44,8 @@ struct hk_image_view {
 
       struct hk_native_pbe_descriptor storage, eot, layered_eot, emrt_pbe;
       uint64_t storage_atomic_sw;
+      /* M5 store window record (hk_native_descriptor.h), zero if unused. */
+      uint32_t storage_window[4];
       uint64_t emrt_atomic_sw;
       uint32_t emrt_aligned_width;
       bool storage_pbe_valid, eot_pbe_valid, layered_eot_pbe_valid,

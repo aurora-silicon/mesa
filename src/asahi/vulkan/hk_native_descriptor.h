@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -26,6 +27,77 @@
 
 /* G17P imgwci indexes whole PBE records in the heap it addresses. */
 #define HK_G17P_PBE_RECORD_SIZE         HK_PBE_DESCRIPTOR_AGX3_SIZE
+
+/* The M5 and M5 Pro (G17G, G17S) store to a layer of an array as a 3D store
+ * (agx3_pack_binary.c), and a 3D store addresses at most this many slices.
+ * At mip level L, hk describes a view of N layers as N << L slices deep
+ * (hk_image_view.c), so a level with N << L above the limit cannot be
+ * described that way. Such a storage view instead gets a linear "store
+ * window" PBE over its level, starting at its first layer, and this record in
+ * the descriptor's spare bytes past the atomic word:
+ *
+ *    word 0: layer stride in elements; zero for every other descriptor
+ *    word 1: log2 tile width [0:3], log2 tile height [4:7], in pixels
+ *    word 2: level width [0:15], level height [16:31], in pixels
+ *    word 3: layer count of the view (faces for a cube)
+ *
+ * hk_nir_lower_descriptors() stores through the window at the texel's tiled
+ * element index (the arithmetic image atomics use) when word 0 is nonzero.
+ */
+#define HK_M5_STORE_WINDOW_OFFSET       80
+#define HK_M5_STORE_WINDOW_SIZE         16
+#define HK_M5_STORE_MAX_SLICES          2048
+/* The window is a linear 2D PBE this many elements wide, as texel buffers. */
+#define HK_M5_STORE_WINDOW_WIDTH        16384
+/* Gen10 PBE heights are 15 bits wide. */
+#define HK_M5_STORE_WINDOW_MAX_HEIGHT   32768
+
+static_assert(HK_M5_STORE_WINDOW_OFFSET + HK_M5_STORE_WINDOW_SIZE <=
+                 HK_G17P_STORAGE_STRIDE,
+              "the store window record fits the storage descriptor stride");
+
+/* Fill the store window record of a view of `layers` layers at a level of
+ * width x height pixels with the given tile size, element size and layer
+ * stride, whose level spans level_size_B bytes in each layer. Returns the
+ * window height in rows, or zero if the window cannot address the view.
+ */
+static inline uint32_t
+hk_pack_m5_store_window(uint64_t layer_stride_B, uint64_t level_size_B,
+                        unsigned element_size_B, unsigned width_px,
+                        unsigned height_px, unsigned tile_width_px,
+                        unsigned tile_height_px, unsigned layers,
+                        uint32_t out[4])
+{
+   if (!out || !element_size_B || !layers || !width_px || !height_px ||
+       width_px > UINT16_MAX || height_px > UINT16_MAX ||
+       (layer_stride_B % element_size_B) || !level_size_B ||
+       tile_width_px == 0 || (tile_width_px & (tile_width_px - 1)) ||
+       tile_height_px == 0 || (tile_height_px & (tile_height_px - 1)) ||
+       tile_width_px > (1u << 15) || tile_height_px > (1u << 15))
+      return 0;
+
+   const uint64_t layer_stride_el = layer_stride_B / element_size_B;
+   const uint64_t level_el =
+      (level_size_B + element_size_B - 1) / element_size_B;
+   const uint64_t span_el = (uint64_t)(layers - 1) * layer_stride_el + level_el;
+   const uint64_t rows =
+      (span_el + HK_M5_STORE_WINDOW_WIDTH - 1) / HK_M5_STORE_WINDOW_WIDTH;
+   if (layer_stride_el == 0 || layer_stride_el > UINT32_MAX ||
+       rows > HK_M5_STORE_WINDOW_MAX_HEIGHT)
+      return 0;
+
+   unsigned tile_width_log2 = 0, tile_height_log2 = 0;
+   for (unsigned x = tile_width_px; x > 1; x >>= 1)
+      ++tile_width_log2;
+   for (unsigned x = tile_height_px; x > 1; x >>= 1)
+      ++tile_height_log2;
+
+   out[0] = (uint32_t)layer_stride_el;
+   out[1] = tile_width_log2 | (tile_height_log2 << 4);
+   out[2] = width_px | ((uint32_t)height_px << 16);
+   out[3] = layers;
+   return (uint32_t)rows;
+}
 
 static inline bool
 hk_pack_g17p_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,

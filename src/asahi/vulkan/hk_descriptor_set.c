@@ -456,6 +456,7 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
       hk_storage_image_descriptor_layout(generation);
    bool supported = false;
    bool texture_supported = false;
+   uint32_t store_window[4] = {0};
 
    if (info && info->imageView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(hk_image_view, view, info->imageView);
@@ -495,6 +496,8 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
          const uint8_t plane = 0;
          desc.pbe = view->planes[plane].storage;
          desc.atomic_sw = view->planes[plane].storage_atomic_sw;
+         memcpy(store_window, view->planes[plane].storage_window,
+                sizeof(store_window));
       }
    }
 
@@ -514,6 +517,13 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
    if (stride >= AGX_G17P_IMAGE_ATOMIC_SW_OFFSET + sizeof(desc.atomic_sw))
       memcpy(packed + AGX_G17P_IMAGE_ATOMIC_SW_OFFSET, &desc.atomic_sw,
              sizeof(desc.atomic_sw));
+   /* The M5 store window record; zero (the native store) unless the view's
+    * PBE is a store window. */
+   static_assert(sizeof(store_window) == HK_M5_STORE_WINDOW_SIZE,
+                 "store window record");
+   if (stride >= HK_M5_STORE_WINDOW_OFFSET + HK_M5_STORE_WINDOW_SIZE)
+      memcpy(packed + HK_M5_STORE_WINDOW_OFFSET, store_window,
+             sizeof(store_window));
    write_desc(set, binding, elem, packed, stride);
 }
 
