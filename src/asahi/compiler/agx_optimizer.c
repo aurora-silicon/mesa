@@ -474,7 +474,7 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
        * the packer refused the whole shader (Cyberpunk 2077's benchmark
        * vertex shaders: ffma r32, #k16, #k16, r32). Keep the second constant
        * multiplicand in its register. */
-      if (ctx->key && ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
+      if (ctx->key && agx_encoding_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_FFMA && s < 2 &&
           I->src[1 - s].type == AGX_INDEX_IMMEDIATE)
          continue;
@@ -1746,16 +1746,13 @@ agx_optimizer_signext(agx_context *ctx, agx_instr **defs, agx_instr *I)
       agx_index src = I->src[s];
       agx_instr *def = defs[src.value];
 
-      if (def == NULL || def->op != AGX_OPCODE_SIGNEXT || src.abs)
-         continue;
-
       /* Integer abs means zero extension. Keep the intermediate signed
        * word when the operation later zero-extends it (the unsigned 64-bit
        * product of a sign-extended half): narrowing that operand would
        * change the value for negative halves. The native legalization pass
        * already knows how to materialize SIGNEXT without a signed-half
        * source modifier. */
-      if (src.abs)
+      if (def == NULL || def->op != AGX_OPCODE_SIGNEXT || src.abs)
          continue;
 
       agx_replace_src(I, s, def->src[0]);

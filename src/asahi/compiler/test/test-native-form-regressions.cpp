@@ -6177,6 +6177,61 @@ TEST(NativeForms, G17PSignExtendRetainsZeroExtendedWord)
    }
 }
 
+/* The class-12 wait that begin_invocation_interlock emits orders the critical
+ * section, so it survives in a fragment shader with no tile access. */
+TEST(NativeForms, InterlockWaitSurvivesUnreadPixelWaitMerge)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   agx_builder *b = agx_test_builder(mem);
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_interlock = true;
+   agx_instr *wait = agx_wait_pix(b, 0xc);
+   agx_stop(b);
+   EXPECT_FALSE(agx3_merge_unread_pixel_waits(b->shader));
+   unsigned waits = 0;
+   agx_foreach_instr_global(b->shader, I)
+      waits += I == wait && I->writeout == 0xc;
+   EXPECT_EQ(waits, 1u);
+   ralloc_free(mem);
+}
+
+/* G13 and G14 hit the same fold: before #232 an abs (zero-extend) source on a
+ * SIGNEXT def was narrowed to the half, an assert in debug builds and a wrong
+ * value for negative halves in release builds. */
+TEST(NativeForms, AGX2SignExtendRetainsZeroExtendedWord)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G14G}) {
+      for (bool multiply : {false, true}) {
+         SCOPED_TRACE(chip);
+         SCOPED_TRACE(multiply);
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+         key.dev.chip = chip;
+         b->shader->key = &key;
+         agx_index word = agx_temp(b->shader, AGX_SIZE_32);
+         agx_signext_to(b, word, agx_register(0, AGX_SIZE_16));
+         agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *use =
+            multiply ? agx_imad_to(b, out, agx_abs(word),
+                                   agx_register(2, AGX_SIZE_32), agx_zero(), 0)
+                     : agx_iadd_to(b, out, agx_abs(word),
+                                   agx_register(2, AGX_SIZE_32), 0);
+         agx_unit_test(b, out);
+         agx_optimizer_forward(b->shader);
+         EXPECT_TRUE(agx_is_equiv(use->src[0], word));
+         EXPECT_EQ(use->src[0].size, AGX_SIZE_32);
+         EXPECT_TRUE(use->src[0].abs);
+         ralloc_free(mem);
+      }
+   }
+}
+
 TEST(NativeForms, SignExtendSignedConsumersStillFold)
 {
    for (enum agx_chip chip : {AGX_CHIP_G13G, AGX_CHIP_G17P}) {

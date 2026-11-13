@@ -1655,6 +1655,8 @@ agx_nir_lower_g17p_storage_image(
       }
    }
 
+   /* The texture record sits one 32-byte record before the PBE (asserted in
+    * hk_descriptor_set.h). */
    if (load) {
       if ((texture_offset_B & 7) != 0 ||
           pbe_offset_B != texture_offset_B + 32)

@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 Eryk Wieliczko */
 #include "nir_builder.h"
 #include "poly_nir.h"
+#include "nir_xfb_info.h"
 
 #include <stdio.h>
 
@@ -74,6 +75,51 @@ check_outputs(unsigned components)
    return valid;
 }
 
+/* A line-strip GS whose gl_PointSize transform feedback captures: the
+ * rasterization shader must keep the point size, since its transform feedback
+ * reads it from there (an undefined value was captured before #211). */
+static bool
+check_xfb_point_size(void)
+{
+   static const nir_shader_compiler_options options = {0};
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_GEOMETRY, &options, "line strip capturing point size");
+   b.shader->info.io_lowered = true;
+   b.shader->info.gs.input_primitive = MESA_PRIM_POINTS;
+   b.shader->info.gs.output_primitive = MESA_PRIM_LINE_STRIP;
+   b.shader->info.gs.vertices_in = 1;
+   b.shader->info.gs.vertices_out = 2;
+   b.shader->info.gs.invocations = 1;
+   b.shader->info.gs.active_stream_mask = 1;
+   b.shader->info.xfb_stride[0] = 1;
+   for (unsigned v = 0; v < 2; ++v) {
+      nir_store_output(&b, nir_imm_vec4(&b, v, 0.0, 0.0, 1.0),
+                       nir_imm_int(&b, 0), .src_type = nir_type_float32,
+                       .io_semantics.location = VARYING_SLOT_POS);
+      nir_store_output(&b, nir_imm_float(&b, 4.0), nir_imm_int(&b, 0),
+                       .src_type = nir_type_float32,
+                       .io_semantics.location = VARYING_SLOT_PSIZ,
+                       .io_xfb.out[0] = {.num_components = 1});
+      nir_emit_vertex(&b, 0);
+   }
+   nir_end_primitive(&b, 0);
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   nir_gather_xfb_info_from_intrinsics(b.shader);
+
+   nir_shader *count = NULL, *copy = NULL, *pre = NULL;
+   struct poly_gs_info info;
+   poly_nir_lower_gs(b.shader, &count, &copy, &pre, &info);
+   bool valid = b.shader->xfb_info && copy &&
+                (copy->info.outputs_written & VARYING_BIT_PSIZ);
+   if (!valid)
+      fprintf(stderr, "A captured line-strip point size was dropped\n");
+   ralloc_free(b.shader);
+   ralloc_free(count);
+   ralloc_free(copy);
+   ralloc_free(pre);
+   return valid;
+}
+
 int
 main(void)
 {
@@ -81,6 +127,7 @@ main(void)
    bool valid = true;
    for (unsigned n = 1; n <= 4; ++n)
       valid &= check_outputs(n);
+   valid &= check_xfb_point_size();
    glsl_type_singleton_decref();
    return valid ? 0 : 1;
 }

@@ -82,6 +82,13 @@ struct hk_storage_image_descriptor {
 };
 static_assert(sizeof(struct hk_storage_image_descriptor) == 80,
               "maximum storage descriptor has no holes");
+/* The G17P state-0 read/write pair takes the PBE as record 1 after the
+ * texture: hk_g17p_storage_image_pointers() and
+ * agx_nir_lower_g17p_storage_image() derive one offset from the other. */
+static_assert(offsetof(struct hk_storage_image_descriptor, pbe) -
+                    offsetof(struct hk_storage_image_descriptor, tex) ==
+                 32,
+              "G17P storage descriptor records are 32 bytes apart");
 
 /* This has to match nir_address_format_64bit_bounded_global */
 struct hk_buffer_address {

@@ -7214,6 +7214,30 @@ TEST_F(AGX3PackBinary, InterpolationTokensComeFromTheirITRCOORDS)
    }
 }
 
+/* The SSA check follows a token into another block, which the old post-RA
+ * block-local check refused. */
+TEST_F(AGX3PackBinary, InterpolationTokenFromAnotherBlock)
+{
+   for (enum agx_interpolation interp :
+        {AGX_INTERPOLATION_SAMPLE, AGX_INTERPOLATION_CENTROID}) {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+      b->shader->stage = MESA_SHADER_FRAGMENT;
+      agx_block *first = agx_start_block(b->shader);
+      agx_index input = agx_temp(b->shader, AGX_SIZE_16);
+      agx_get_sr_to(b, input, AGX_SR_INPUT_SAMPLE_MASK);
+      agx_index token = agx_temp(b->shader, AGX_SIZE_32);
+      agx_itrcoords_agx3_to(b, token, input, interp);
+
+      agx_block *second = agx_test_block(b->shader);
+      agx_block_add_successor(first, second);
+      b->cursor = agx_after_block(second);
+      agx_interp_agx3_to(b, agx_temp(b->shader, AGX_SIZE_32),
+                         agx_immediate(3), token, interp, false);
+      agx_stop(b);
+      EXPECT_TRUE(agx3_interp_coords_from_itrcoords(b->shader));
+   }
+}
+
 /* RA may move a token between ITRCOORDS and its consumers; the copy holds
  * the same 32 bits, so the consumer encodes the register it reads. Astro
  * Bot's constant-program fragment variants were refused at this shape. */
