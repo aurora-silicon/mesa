@@ -411,6 +411,16 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_G18_NATIVE_TILE_SAMPLES ((1ULL) << 32)
 
 /*
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: render commands accept
+ * DRM_ASAHI_RENDER_STAGE_PREFIXES as the complete struct
+ * drm_asahi_cmd_render_staged: the 448-byte render command (priors and
+ * ray-query stages included), then struct drm_asahi_render_stage_prefixes.
+ * The kernel's drm_asahi_cmd_render_m5 has the same layout. A feature bit
+ * like those of enum drm_asahi_feature.
+ */
+#define DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 ((1ULL) << 33)
+
+/*
  * DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: M5: compute commands accept
  * DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION. A feature bit like those of enum
  * drm_asahi_feature, defined outside it so that the enum keeps its 32-bit type.
@@ -1895,6 +1905,27 @@ struct drm_asahi_render_ray_query_stage {
 struct drm_asahi_cmd_render_with_ray_query {
 	struct drm_asahi_cmd_render_with_prior legacy;
 	struct drm_asahi_render_ray_query_stage ray_query[2];
+};
+
+/* The tiling half's render and compute prefixes of a staged render
+ * (DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2), each a command index like the
+ * header barriers plus an exact prior ordinal. The reserved fields are zero. */
+struct drm_asahi_render_stage_prefixes {
+	__u16 ta_cdm_barrier;
+	__u16 reserved0;
+	__u32 reserved1;
+	__u64 ta_prior_cdm;
+	__u16 ta_vdm_barrier;
+	__u16 reserved2;
+	__u32 reserved3;
+	__u64 ta_prior_vdm;
+};
+
+/* A render with DRM_ASAHI_RENDER_STAGE_PREFIXES under
+ * DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: 480 bytes. */
+struct drm_asahi_cmd_render_staged {
+	struct drm_asahi_cmd_render_with_ray_query render;
+	struct drm_asahi_render_stage_prefixes stage_prefixes;
 };
 
 /* G18 per-render program demand, maximized over every draw of the render:

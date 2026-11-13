@@ -85,10 +85,14 @@ hk_drm_rebase_prior(struct drm_asahi_cmd_header *h, void *payload,
    h->cdm_barrier = barriers[1];
    if (exact && h->cmd_type == DRM_ASAHI_CMD_RENDER &&
        (r->legacy.flags & DRM_ASAHI_RENDER_STAGE_PREFIXES)) {
-      /* Both tiling prefixes are rebased like the header's. */
-      struct drm_asahi_cmd_render_with_stage_prefixes *s = payload;
-      if (h->size != sizeof(*s))
+      /* Both tiling prefixes are rebased like the header's. The prefix block
+       * ends the payload: M5's form puts it after the priors, G17P's staged
+       * render (drm_asahi_cmd_render_staged) after the ray-query stages. */
+      if (h->size != sizeof(struct drm_asahi_cmd_render_with_stage_prefixes) &&
+          h->size != sizeof(struct drm_asahi_cmd_render_staged))
          return false;
+      struct drm_asahi_render_stage_prefixes *s =
+         (void *)((uint8_t *)payload + h->size - sizeof(*s));
       __u16 *ta[2] = {&s->ta_vdm_barrier, &s->ta_cdm_barrier};
       __u64 *ta_prior[2] = {&s->ta_prior_vdm, &s->ta_prior_cdm};
       for (unsigned sq = 0; sq < 2; ++sq) {

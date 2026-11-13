@@ -120,6 +120,26 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
    return queue_signal_timeline(dev, queue, submit);
 }
 
+/* The ray-query stage state of a G17P render whose vertex or fragment
+ * programs trace rays; the stages that trace none stay zero. */
+static void
+hk_gen1_render_ray_query_stages(struct hk_device *dev, const struct hk_cs *cs,
+                                struct drm_asahi_render_ray_query_stage rq[2])
+{
+   for (unsigned stage = 0; stage < 2; ++stage) {
+      if (!(stage ? cs->gen1_native_fragment_rq : cs->gen1_native_vertex_rq))
+         continue;
+      struct drm_asahi_render_ray_query_stage *rt = &rq[stage];
+      rt->scs_layout = hk_gen1_ray_query_scs_layout(dev);
+      rt->intersection_pool = dev->gen1_rq_ift->va->addr;
+      rt->intersection_pool_bytes = 0x4000;
+      rt->intersection_first = 1;
+      rt->intersection_count = 112;
+      rt->intersection_default = UINT64_C(0x10010020000);
+      rt->intersection_default_control = UINT64_C(0x16000000000);
+   }
+}
+
 static void
 asahi_fill_cdm_command(struct hk_device *dev, struct hk_cs *cs,
                        struct drm_asahi_cmd_compute *cmd)
@@ -1871,13 +1891,34 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
             if (stage_prefixes)
                cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
 
+            /* G17P: a render whose vertex half depends on less compute work
+             * than its fragment half (image-only producers ordered by image
+             * barriers, fragment-only destinations) goes as a staged render:
+             * the kernel orders its tiling kick after the narrower prefixes
+             * alone, so its vertex work overlaps compute work that only its
+             * fragment half waits for. Every other render keeps the forms
+             * below, which the kernel can publish directly. */
+            const bool g17p_staged =
+               dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
+               queue->sync.exact_prior &&
+               (dev->dev.params.features &
+                DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
+               cs->sync.ta_split &&
+               (cs->sync.barrier_ta[HK_SYNC_CDM] !=
+                   cs->sync.barrier[HK_SYNC_CDM] ||
+                cs->sync.prior_ta[HK_SYNC_CDM] != cs->sync.prior[HK_SYNC_CDM]);
+            if (g17p_staged) {
+               cmd.legacy.flags |= DRM_ASAHI_RENDER_STAGE_PREFIXES;
+               perf_debug_dev(&dev->dev, "G17P staged render");
+            }
+
             /* The render's vertex half depends on no earlier render while its
              * fragment half does (hk_sync: every render dependency targets
              * fragment or attachment work alone): let the kernel order only
              * the fragment half after them, so this render's vertex work can
              * overlap their fragment work. Compute dependencies keep ordering
              * the vertex half either way. */
-            if (!stage_prefixes && !queue->sync.serialize &&
+            if (!stage_prefixes && !g17p_staged && !queue->sync.serialize &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
                 cs->sync.ta_split &&
@@ -1929,22 +1970,26 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cmd.prior_vdm = command_prior[HK_SYNC_VDM];
                cmd.prior_cdm = command_prior[HK_SYNC_CDM];
             }
-            if (!agx_chip_g17_m5(dev->dev.chip) &&
+            STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_ray_query) == 448);
+            STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_staged) == 480);
+            if (g17p_staged) {
+               struct drm_asahi_cmd_render_staged staged = {
+                  .render = {.legacy = cmd},
+                  .stage_prefixes = {
+                     .ta_cdm_barrier = cs->sync.barrier_ta[HK_SYNC_CDM],
+                     .ta_prior_cdm = cs->sync.prior_ta[HK_SYNC_CDM],
+                     .ta_vdm_barrier = cs->sync.barrier_ta[HK_SYNC_VDM],
+                     .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
+                  },
+               };
+               hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
+               header.size = sizeof(staged);
+               util_dynarray_append(&payload, header);
+               util_dynarray_append_array(&payload, uint8_t, &staged, header.size);
+            } else if (!agx_chip_g17_m5(dev->dev.chip) &&
                 (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq)) {
                struct drm_asahi_cmd_render_with_ray_query extended = {.legacy = cmd};
-               for (unsigned stage = 0; stage < 2; ++stage) {
-                  if (!(stage ? cs->gen1_native_fragment_rq
-                              : cs->gen1_native_vertex_rq))
-                     continue;
-                  struct drm_asahi_render_ray_query_stage *rt = &extended.ray_query[stage];
-                  rt->scs_layout = hk_gen1_ray_query_scs_layout(dev);
-                  rt->intersection_pool = dev->gen1_rq_ift->va->addr;
-                  rt->intersection_pool_bytes = 0x4000;
-                  rt->intersection_first = 1;
-                  rt->intersection_count = 112;
-                  rt->intersection_default = UINT64_C(0x10010020000);
-                  rt->intersection_default_control = UINT64_C(0x16000000000);
-               }
+               hk_gen1_render_ray_query_stages(dev, cs, extended.ray_query);
                header.size = sizeof(extended);
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &extended, header.size);
