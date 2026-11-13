@@ -1225,21 +1225,28 @@ hk_sparse_submission_updates_sstt(const struct vk_queue_submit *submission)
    return false;
 }
 
-/* Whether a submission runs a render with ray queries in its vertex or
+/* Whether a command buffer runs a render with ray queries in its vertex or
  * fragment stage, which needs the render ray-query scratch reservation.
  */
+static bool
+hk_cmd_buffer_needs_render_rq(struct hk_cmd_buffer *cmdbuf)
+{
+   list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+      if (cs->type == HK_CS_VDM &&
+          (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq))
+         return true;
+   }
+
+   return false;
+}
+
 static bool
 hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
 {
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
-      struct hk_cmd_buffer *cmdbuf =
-         (struct hk_cmd_buffer *)submit->command_buffers[i];
-
-      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
-         if (cs->type == HK_CS_VDM &&
-             (cs->gen1_native_fragment_rq || cs->gen1_native_vertex_rq))
-            return true;
-      }
+      if (hk_cmd_buffer_needs_render_rq(
+             (struct hk_cmd_buffer *)submit->command_buffers[i]))
+         return true;
    }
 
    return false;
@@ -1279,9 +1286,10 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
    if (queue->drm.id != UINT32_MAX && (queue->drm.render_rq || !render_rq))
       return VK_SUCCESS;
 
-   /* M5 admits GPU work at the API entrypoint, before semaphore payloads
-    * move. Other devices retain admission in the serialized driver callback.
-    * Host-only synchronization does not need a kernel scheduling context. */
+   /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
+    * payloads move (hk_queue_admits_at_entry). Other devices retain admission
+    * in the serialized driver callback. Host-only synchronization does not
+    * need a kernel scheduling context. */
    const uint64_t layouts[2] = {
       render_rq && dev->gen1_native_graphics_rq ? hk_gen1_ray_query_scs_layout(dev) : 0,
       render_rq && dev->gen1_native_fragment_rq ? hk_gen1_ray_query_scs_layout(dev) : 0};
@@ -1326,22 +1334,38 @@ hk_queue_restart_sync(struct hk_queue *queue)
    queue->sync.direct_single_footprints = old.direct_single_footprints;
 }
 
+/* Kernel queues come from a machine-wide pool shared by every client, so
+ * creating one can be refused while other clients hold the pool.
+ */
+static bool
+hk_queue_admits_at_entry(const struct hk_device *dev)
+{
+   return agx_chip_g17_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G17P;
+}
+
 /* Admission must precede the common runtime's semaphore payload moves and
  * the first submission of a batch. Failing inside driver_submit is too late
  * to return a retryable allocation error. Keep admission lazy so unused Vulkan
  * queues do not consume the device-wide pool of kernel contexts.
  */
 static VkResult
-hk_queue_admit(struct hk_queue *queue)
+hk_queue_admit(struct hk_queue *queue, bool render_rq)
 {
    /* Admission and callbacks must use the same backing queue and lock. */
    if (queue->vk.real_queue)
       queue = container_of(queue->vk.real_queue, struct hk_queue, vk);
    simple_mtx_lock(&queue->vk.lock);
-   /* M5 renders never reserve ray-query scratch, so this never replaces. */
+   /* Admission only creates a missing kernel queue, with the render ray-query
+    * scratch the call needs (G17P), so a first submission that needs it does
+    * not create a queue only to replace it. Replacing an existing queue
+    * stays in the driver callback, which orders the new queue after the old
+    * one's work. M5 renders never reserve ray-query scratch.
+    */
    bool replaced;
-   VkResult result =
-      hk_queue_ensure_drm(hk_queue_device(queue), queue, false, &replaced);
+   VkResult result = hk_queue_ensure_drm(
+      hk_queue_device(queue), queue,
+      render_rq && queue->drm.id == UINT32_MAX, &replaced);
+   assert(!replaced);
    /* Only allocation errors are retryable here. Keep the existing lost-device
     * behavior for other failures; device-creation errors such as NOT_PERMITTED
     * and INITIALIZATION_FAILED are not valid QueueSubmit return values.
@@ -1361,23 +1385,26 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    struct hk_device *dev = hk_queue_device(queue);
 
-   if (agx_chip_g17_m5(dev->dev.chip)) {
+   if (hk_queue_admits_at_entry(dev)) {
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
 
-      bool needs_queue = false;
-      for (uint32_t i = 0; i < submitCount && !needs_queue; i++) {
+      const bool rq_capable =
+         dev->gen1_native_graphics_rq || dev->gen1_native_fragment_rq;
+      bool needs_queue = false, render_rq = false;
+      for (uint32_t i = 0; i < submitCount; i++) {
          for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
             VK_FROM_HANDLE(hk_cmd_buffer, cmd,
                            pSubmits[i].pCommandBufferInfos[j].commandBuffer);
-            if (!list_is_empty(&cmd->control_streams)) {
-               needs_queue = true;
-               break;
-            }
+            if (list_is_empty(&cmd->control_streams))
+               continue;
+            needs_queue = true;
+            render_rq = render_rq ||
+                        (rq_capable && hk_cmd_buffer_needs_render_rq(cmd));
          }
       }
       if (needs_queue) {
-         VkResult result = hk_queue_admit(queue);
+         VkResult result = hk_queue_admit(queue, render_rq);
          if (result != VK_SUCCESS)
             return result;
       }
@@ -1394,7 +1421,7 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    struct hk_device *dev = hk_queue_device(queue);
 
-   if (agx_chip_g17_m5(dev->dev.chip)) {
+   if (hk_queue_admits_at_entry(dev)) {
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
 
@@ -1403,7 +1430,7 @@ hk_QueueBindSparse(VkQueue _queue, uint32_t bindInfoCount,
        */
       for (uint32_t i = 0; i < bindInfoCount; i++) {
          if (pBindInfo[i].imageOpaqueBindCount || pBindInfo[i].imageBindCount) {
-            VkResult result = hk_queue_admit(queue);
+            VkResult result = hk_queue_admit(queue, false);
             if (result != VK_SUCCESS)
                return result;
             break;
