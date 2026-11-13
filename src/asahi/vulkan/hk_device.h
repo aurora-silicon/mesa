@@ -241,6 +241,15 @@ struct hk_device {
     * record has, and no group may collide with it. */
    uint32_t rt_group_handle_alloc;
 
+   /* Own group handles of each RT pipeline library content key created on
+    * this device, so a library loaded from a pipeline cache takes the handles
+    * an identical library got here rather than ones from another device.
+    * Created on first use (hk_ray_tracing_pipeline.c). */
+   struct {
+      simple_mtx_t lock;
+      struct hash_table *table;
+   } rt_library_handles;
+
    /* Device-lifetime templates for precompiled G17P meta compute programs.
     * The libagx programs and their executable BOs have the same lifetime. */
    struct {

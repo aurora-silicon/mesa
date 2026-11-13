@@ -53,11 +53,13 @@
 #include "vk_common_entrypoints.h"
 #include "vk_nir.h"
 #include "vk_pipeline.h"
+#include "vk_pipeline_cache.h"
 #include "vk_pipeline_layout.h"
 #include "vk_shader_module.h"
 
 #include "asahi/compiler/agx_nir.h"
 #include "util/blob.h"
+#include "util/hash_table.h"
 #include "util/mesa-blake3.h"
 #include "nir.h"
 #include "nir_builder.h"
@@ -2507,6 +2509,9 @@ hk_ray_tracing_pipeline_destroy(struct vk_device *vk_dev,
    struct hk_ray_tracing_pipeline *pipeline =
       hk_pipeline_to_ray_tracing(vk_pipeline);
 
+   if (pipeline->cache_object)
+      vk_pipeline_cache_object_unref(vk_dev, pipeline->cache_object);
+
    if (pipeline->shader)
       hk_api_shader_destroy(vk_dev, &pipeline->shader->vk, pAllocator);
 
@@ -2923,6 +2928,105 @@ hk_compile_ray_tracing_stages(
  * size, below which no process memory can be mapped. */
 #define HK_RT_MIN_REPLAY_HANDLE_ADDRESS 4096
 
+/* Keep new handles above one that came from elsewhere (capture/replay or a
+ * pipeline cache). */
+static void
+hk_rt_handle_alloc_above(struct hk_device *dev, uint32_t index)
+{
+   uint32_t current = p_atomic_read(&dev->rt_group_handle_alloc);
+   while (current < index) {
+      uint32_t seen =
+         p_atomic_cmpxchg(&dev->rt_group_handle_alloc, current, index);
+      if (seen == current)
+         break;
+      current = seen;
+   }
+}
+
+struct hk_rt_library_handles {
+   uint8_t key[BLAKE3_OUT_LEN];
+   uint32_t count;
+   uint32_t index[];
+};
+
+static uint32_t
+hk_rt_library_key_hash(const void *key)
+{
+   return _mesa_hash_data(key, BLAKE3_OUT_LEN);
+}
+
+static bool
+hk_rt_library_key_equal(const void *a, const void *b)
+{
+   return memcmp(a, b, BLAKE3_OUT_LEN) == 0;
+}
+
+/* Remember the own group handles of the latest library with content `key`,
+ * which a library loaded from a cache with that content will take. */
+static void
+hk_rt_library_handles_record(struct hk_device *dev, const uint8_t *key,
+                             const struct hk_ray_tracing_group *groups,
+                             uint32_t count)
+{
+   simple_mtx_lock(&dev->rt_library_handles.lock);
+   if (!dev->rt_library_handles.table) {
+      dev->rt_library_handles.table = _mesa_hash_table_create(
+         NULL, hk_rt_library_key_hash, hk_rt_library_key_equal);
+   }
+   struct hash_table *table = dev->rt_library_handles.table;
+   struct hash_entry *he = table ? _mesa_hash_table_search(table, key) : NULL;
+   struct hk_rt_library_handles *entry = he ? he->data : NULL;
+   if (entry && entry->count != count) {
+      _mesa_hash_table_remove(table, he);
+      free(entry);
+      entry = NULL;
+   }
+   if (!entry && table) {
+      entry = malloc(sizeof(*entry) + count * sizeof(entry->index[0]));
+      if (entry) {
+         memcpy(entry->key, key, sizeof(entry->key));
+         entry->count = count;
+         _mesa_hash_table_insert(table, entry->key, entry);
+      }
+   }
+   if (entry) {
+      for (uint32_t i = 0; i < count; ++i)
+         entry->index[i] = groups[i].handle.index;
+   }
+   simple_mtx_unlock(&dev->rt_library_handles.lock);
+}
+
+static bool
+hk_rt_library_handles_find(struct hk_device *dev, const uint8_t *key,
+                           struct hk_ray_tracing_group *groups, uint32_t count)
+{
+   bool found = false;
+   simple_mtx_lock(&dev->rt_library_handles.lock);
+   struct hash_entry *he = dev->rt_library_handles.table ?
+      _mesa_hash_table_search(dev->rt_library_handles.table, key) : NULL;
+   if (he) {
+      const struct hk_rt_library_handles *entry = he->data;
+      if (entry->count == count) {
+         for (uint32_t i = 0; i < count; ++i)
+            groups[i].handle.index = entry->index[i];
+         found = true;
+      }
+   }
+   simple_mtx_unlock(&dev->rt_library_handles.lock);
+   return found;
+}
+
+void
+hk_rt_device_finish(struct hk_device *dev)
+{
+   if (!dev->rt_library_handles.table)
+      return;
+   hash_table_foreach (dev->rt_library_handles.table, he)
+      free(he->data);
+   _mesa_hash_table_destroy(dev->rt_library_handles.table, NULL);
+   dev->rt_library_handles.table = NULL;
+}
+
 static VkResult
 hk_init_ray_tracing_groups(
    struct hk_device *dev, struct hk_ray_tracing_pipeline *pipeline,
@@ -2987,14 +3091,7 @@ hk_init_ray_tracing_groups(
                              "was never issued", i);
          }
          pipeline->groups[i].handle.index = replay;
-         uint32_t current = p_atomic_read(&dev->rt_group_handle_alloc);
-         while (current < replay) {
-            uint32_t seen = p_atomic_cmpxchg(&dev->rt_group_handle_alloc,
-                                             current, replay);
-            if (seen == current)
-               break;
-            current = seen;
-         }
+         hk_rt_handle_alloc_above(dev, replay);
       } else {
          pipeline->groups[i].handle.index = 0;
       }
@@ -3496,6 +3593,77 @@ hk_rt_binary_serialize(struct hk_device *dev,
    return !blob->out_of_memory;
 }
 
+/* RT pipelines use the pipeline cache on G17P, where they are tested. */
+static bool
+hk_rt_cache_supported(const struct hk_device *dev)
+{
+   return dev->dev.chip == AGX_CHIP_G17P;
+}
+
+static struct vk_pipeline_cache *
+hk_rt_pipeline_cache(struct hk_device *dev, VkPipelineCache handle,
+                     VkPipelineCreateFlags2KHR flags)
+{
+   VK_FROM_HANDLE(vk_pipeline_cache, cache, handle);
+   /* Cached pipelines carry no internal representations. */
+   if (!hk_rt_cache_supported(dev) ||
+       (flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR))
+      return NULL;
+   return cache ? cache : dev->vk.mem_cache;
+}
+
+/* A cache entry holds hk_rt_binary_serialize() data under the pipeline key
+ * (hk_rt_pipeline_key: every input that changes the code) and the shader
+ * binary UUID. An executable pipeline also has the handles of the library
+ * groups it links compiled in, so those must match the libraries' handles. */
+static void
+hk_rt_cache_key(struct hk_device *dev, const uint8_t *binary_key,
+                const VkRayTracingPipelineCreateInfoKHR *info,
+                uint8_t key[BLAKE3_OUT_LEN])
+{
+   static const char tag[] = "hk ray tracing pipeline cache 1";
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   _mesa_blake3_update(&hash, tag, sizeof(tag));
+   _mesa_blake3_update(&hash, dev->vk.physical->properties.shaderBinaryUUID,
+                       VK_UUID_SIZE);
+   _mesa_blake3_update(&hash, binary_key, BLAKE3_OUT_LEN);
+   if (!(vk_rt_pipeline_create_flags(info) &
+         VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) &&
+       info->pLibraryInfo) {
+      for (uint32_t l = 0; l < info->pLibraryInfo->libraryCount; ++l) {
+         VK_FROM_HANDLE(hk_ray_tracing_pipeline, lib,
+                        info->pLibraryInfo->pLibraries[l]);
+         for (uint32_t g = 0; g < lib->group_count; ++g)
+            _mesa_blake3_update(&hash, &lib->groups[g].handle.index,
+                                sizeof(lib->groups[g].handle.index));
+      }
+   }
+   _mesa_blake3_final(&hash, key);
+}
+
+/* One pipeline binary holding hk_rt_binary_serialize() data. */
+static VkResult
+hk_rt_create_binary(VkDevice device, const void *data, size_t size,
+                    const VkAllocationCallbacks *alloc,
+                    VkPipelineBinaryHandlesInfoKHR *out)
+{
+   VkPipelineBinaryKeyKHR key = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
+      .keySize = BLAKE3_OUT_LEN};
+   _mesa_blake3_compute(data, size, key.key);
+   const VkPipelineBinaryDataKHR binary_data = {.dataSize = size,
+                                                .pData = (void *)data};
+   const VkPipelineBinaryKeysAndDataKHR keys = {
+      .binaryCount = 1,
+      .pPipelineBinaryKeys = &key,
+      .pPipelineBinaryData = &binary_data};
+   const VkPipelineBinaryCreateInfoKHR wrapped = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR,
+      .pKeysAndDataInfo = &keys};
+   return vk_common_CreatePipelineBinariesKHR(device, &wrapped, alloc, out);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreatePipelineBinariesKHR(VkDevice device,
                              const VkPipelineBinaryCreateInfoKHR *info,
@@ -3506,12 +3674,42 @@ hk_CreatePipelineBinariesKHR(VkDevice device,
    if (!hk_rt_binaries_native(dev))
       return vk_common_CreatePipelineBinariesKHR(device, info, alloc, out);
 
-   if (info->pPipelineCreateInfo &&
-       vk_find_struct_const(info->pPipelineCreateInfo->pNext,
-                            RAY_TRACING_PIPELINE_CREATE_INFO_KHR)) {
-      /* No RT lookup/insertion path exists in the internal cache. */
-      out->pipelineBinaryCount = 0;
-      return VK_PIPELINE_BINARY_MISSING_KHR;
+   const VkRayTracingPipelineCreateInfoKHR *rt =
+      info->pPipelineCreateInfo
+         ? vk_find_struct_const(info->pPipelineCreateInfo->pNext,
+                                RAY_TRACING_PIPELINE_CREATE_INFO_KHR)
+         : NULL;
+   if (rt) {
+      /* The internal cache is the device's memory cache, as for the common
+       * graphics and compute binaries. */
+      struct vk_pipeline_cache_object *object = NULL;
+      if (hk_rt_cache_supported(dev) && dev->vk.mem_cache &&
+          dev->vk.physical->properties.pipelineBinaryInternalCache) {
+         uint8_t binary_key[BLAKE3_OUT_LEN], cache_key[BLAKE3_OUT_LEN];
+         hk_rt_pipeline_key(dev, rt, binary_key);
+         hk_rt_cache_key(dev, binary_key, rt, cache_key);
+         object = vk_pipeline_cache_lookup_object(
+            dev->vk.mem_cache, cache_key, sizeof(cache_key),
+            &vk_raw_data_cache_object_ops, NULL);
+      }
+      if (!object) {
+         out->pipelineBinaryCount = 0;
+         return VK_PIPELINE_BINARY_MISSING_KHR;
+      }
+      VkResult result;
+      if (!out->pPipelineBinaries) {
+         out->pipelineBinaryCount = 1;
+         result = VK_SUCCESS;
+      } else if (out->pipelineBinaryCount == 0) {
+         result = VK_INCOMPLETE;
+      } else {
+         const struct vk_raw_data_cache_object *data =
+            container_of(object, struct vk_raw_data_cache_object, base);
+         result =
+            hk_rt_create_binary(device, data->data, data->data_size, alloc, out);
+      }
+      vk_pipeline_cache_object_unref(&dev->vk, object);
+      return result;
    }
    VK_FROM_HANDLE(vk_pipeline, base, info->pipeline);
    if (!base || base->ops != &hk_ray_tracing_pipeline_ops)
@@ -3529,20 +3727,7 @@ hk_CreatePipelineBinariesKHR(VkDevice device,
       out->pipelineBinaryCount = 0;
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
-   VkPipelineBinaryKeyKHR key = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR,
-      .keySize = BLAKE3_OUT_LEN};
-   _mesa_blake3_compute(blob.data, blob.size, key.key);
-   const VkPipelineBinaryDataKHR data = {.dataSize = blob.size,
-                                         .pData = blob.data};
-   const VkPipelineBinaryKeysAndDataKHR keys = {.binaryCount = 1,
-                                                .pPipelineBinaryKeys = &key,
-                                                .pPipelineBinaryData = &data};
-   const VkPipelineBinaryCreateInfoKHR wrapped = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR,
-      .pKeysAndDataInfo = &keys};
-   VkResult result =
-      vk_common_CreatePipelineBinariesKHR(device, &wrapped, alloc, out);
+   VkResult result = hk_rt_create_binary(device, blob.data, blob.size, alloc, out);
    blob_finish(&blob);
    return result;
 }
@@ -3565,34 +3750,14 @@ hk_GetPipelineKeyKHR(VkDevice device, const VkPipelineCreateInfoKHR *info,
    return VK_SUCCESS;
 }
 
+/* Fill a newly allocated pipeline from hk_rt_binary_serialize() data. On
+ * failure the pipeline holds partial state and must be destroyed. */
 static VkResult
-hk_rt_binary_deserialize(struct hk_device *dev,
-                         struct hk_ray_tracing_pipeline *pipeline,
-                         VkPipelineBinaryKHR binary,
-                         const VkAllocationCallbacks *alloc)
+hk_rt_binary_load(struct hk_device *dev, struct hk_ray_tracing_pipeline *pipeline,
+                  const void *data, size_t size,
+                  const VkAllocationCallbacks *alloc)
 {
-   const VkPipelineBinaryDataInfoKHR info = {
-      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR,
-      .pipelineBinary = binary};
-   VkPipelineBinaryKeyKHR key = {.sType =
-                                    VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
-   size_t size = 0;
-   VkResult result = vk_common_GetPipelineBinaryDataKHR(
-      hk_device_to_handle(dev), &info, &key, &size, NULL);
-   if (result != VK_SUCCESS)
-      return result;
-   void *data = malloc(size);
-   if (!data)
-      return VK_ERROR_OUT_OF_HOST_MEMORY;
-   result = vk_common_GetPipelineBinaryDataKHR(hk_device_to_handle(dev), &info,
-                                               &key, &size, data);
-   if (result != VK_SUCCESS)
-      goto done;
-   result = VK_ERROR_UNKNOWN;
-   uint8_t digest[BLAKE3_OUT_LEN];
-   _mesa_blake3_compute(data, size, digest);
-   if (key.keySize != sizeof(digest) || memcmp(key.key, digest, sizeof(digest)))
-      goto done;
+   VkResult result = VK_ERROR_UNKNOWN;
    struct blob_reader blob;
    blob_reader_init(&blob, data, size);
    if (blob_read_uint32(&blob) != HK_RT_BINARY_MAGIC ||
@@ -3691,13 +3856,130 @@ hk_rt_binary_deserialize(struct hk_device *dev,
    result =
       blob.overrun || blob.current != blob.end ? VK_ERROR_UNKNOWN : VK_SUCCESS;
 done:
-   free(data);
    return result;
 }
 
 static VkResult
+hk_rt_binary_deserialize(struct hk_device *dev,
+                         struct hk_ray_tracing_pipeline *pipeline,
+                         VkPipelineBinaryKHR binary,
+                         const VkAllocationCallbacks *alloc)
+{
+   const VkPipelineBinaryDataInfoKHR info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_BINARY_DATA_INFO_KHR,
+      .pipelineBinary = binary};
+   VkPipelineBinaryKeyKHR key = {.sType =
+                                    VK_STRUCTURE_TYPE_PIPELINE_BINARY_KEY_KHR};
+   size_t size = 0;
+   VkResult result = vk_common_GetPipelineBinaryDataKHR(
+      hk_device_to_handle(dev), &info, &key, &size, NULL);
+   if (result != VK_SUCCESS)
+      return result;
+   void *data = malloc(size);
+   if (!data)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   result = vk_common_GetPipelineBinaryDataKHR(hk_device_to_handle(dev), &info,
+                                               &key, &size, data);
+   if (result == VK_SUCCESS) {
+      uint8_t digest[BLAKE3_OUT_LEN];
+      _mesa_blake3_compute(data, size, digest);
+      if (key.keySize != sizeof(digest) ||
+          memcmp(key.key, digest, sizeof(digest)))
+         result = VK_ERROR_UNKNOWN;
+      else
+         result = hk_rt_binary_load(dev, pipeline, data, size, alloc);
+   }
+   free(data);
+   return result;
+}
+
+/* The pipeline keeps a reference to its entry, which is what keeps it in a
+ * weak cache such as the device's memory cache. */
+static void
+hk_rt_cache_insert(struct hk_device *dev, struct vk_pipeline_cache *cache,
+                   const uint8_t *key, struct hk_ray_tracing_pipeline *pipeline)
+{
+   struct blob blob;
+   blob_init(&blob);
+   if (hk_rt_binary_serialize(dev, pipeline, &blob)) {
+      struct vk_raw_data_cache_object *object = vk_raw_data_cache_object_create(
+         &dev->vk, key, BLAKE3_OUT_LEN, blob.data, blob.size);
+      if (object)
+         pipeline->cache_object =
+            vk_pipeline_cache_add_object(cache, &object->base);
+   }
+   blob_finish(&blob);
+}
+
+/* Group handles of a pipeline loaded from a cache. An executable keeps the
+ * handles compiled into it. A library takes the handles an identical library
+ * got on this device (or new ones) and those of the libraries it links now,
+ * never handles issued on another device. */
+static bool
+hk_rt_cache_loaded_handles(struct hk_device *dev,
+                           struct hk_ray_tracing_pipeline *pipeline,
+                           const VkRayTracingPipelineCreateInfoKHR *info)
+{
+   const VkPipelineCreateFlags2KHR flags = vk_rt_pipeline_create_flags(info);
+   const uint32_t libs = info->pLibraryInfo ? info->pLibraryInfo->libraryCount : 0;
+   uint32_t group_count = info->groupCount;
+   for (uint32_t l = 0; l < libs; ++l) {
+      VK_FROM_HANDLE(hk_ray_tracing_pipeline, lib,
+                     info->pLibraryInfo->pLibraries[l]);
+      group_count += lib->group_count;
+   }
+   if (group_count != pipeline->group_count)
+      return false;
+
+   if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
+      if (!hk_rt_library_handles_find(dev, pipeline->binary_key,
+                                      pipeline->groups, info->groupCount)) {
+         for (uint32_t i = 0; i < info->groupCount; ++i) {
+            /* Replay handles are part of the key, so the entry has them. */
+            if (!(flags &
+                  VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) ||
+                !info->pGroups[i].pShaderGroupCaptureReplayHandle) {
+               pipeline->groups[i].handle.index =
+                  p_atomic_inc_return(&dev->rt_group_handle_alloc);
+            }
+         }
+         hk_rt_library_handles_record(dev, pipeline->binary_key,
+                                      pipeline->groups, info->groupCount);
+      }
+      uint32_t i = info->groupCount;
+      for (uint32_t l = 0; l < libs; ++l) {
+         VK_FROM_HANDLE(hk_ray_tracing_pipeline, lib,
+                        info->pLibraryInfo->pLibraries[l]);
+         for (uint32_t g = 0; g < lib->group_count; ++g)
+            pipeline->groups[i++].handle = lib->groups[g].handle;
+      }
+   }
+
+   for (uint32_t i = 0; i < pipeline->group_count; ++i)
+      hk_rt_handle_alloc_above(dev, pipeline->groups[i].handle.index);
+   return true;
+}
+
+static struct hk_ray_tracing_pipeline *
+hk_rt_pipeline_alloc(struct hk_device *dev, VkPipelineCreateFlags2KHR flags,
+                     struct vk_pipeline_layout *layout,
+                     const VkAllocationCallbacks *pAllocator)
+{
+   struct hk_ray_tracing_pipeline *pipeline = vk_pipeline_zalloc(
+      &dev->vk, &hk_ray_tracing_pipeline_ops,
+      VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, flags, pAllocator,
+      sizeof(*pipeline));
+   if (pipeline && layout) {
+      vk_pipeline_layout_ref(layout);
+      pipeline->layout = layout;
+   }
+   return pipeline;
+}
+
+static VkResult
 hk_create_ray_tracing_pipeline(
-   struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
+   struct hk_device *dev, struct vk_pipeline_cache *cache,
+   const VkAllocationCallbacks *pAllocator,
    const VkRayTracingPipelineCreateInfoKHR *create_info,
    VkPipeline *out_pipeline)
 {
@@ -3718,17 +4000,10 @@ hk_create_ray_tracing_pipeline(
                        "maxPipelineRayRecursionDepth %u exceeds %u",
                        create_info->maxPipelineRayRecursionDepth, max_depth);
 
-   struct hk_ray_tracing_pipeline *pipeline = vk_pipeline_zalloc(
-      &dev->vk, &hk_ray_tracing_pipeline_ops,
-      VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, flags, pAllocator,
-      sizeof(*pipeline));
+   struct hk_ray_tracing_pipeline *pipeline =
+      hk_rt_pipeline_alloc(dev, flags, layout, pAllocator);
    if (!pipeline)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   if (layout) {
-      vk_pipeline_layout_ref(layout);
-      pipeline->layout = layout;
-   }
 
    const VkPipelineBinaryInfoKHR *binaries =
       vk_find_struct_const(create_info->pNext, PIPELINE_BINARY_INFO_KHR);
@@ -3746,6 +4021,35 @@ hk_create_ray_tracing_pipeline(
    }
    if (hk_rt_binaries_native(dev))
       hk_rt_pipeline_key(dev, create_info, pipeline->binary_key);
+
+   uint8_t cache_key[BLAKE3_OUT_LEN];
+   if (cache) {
+      hk_rt_cache_key(dev, pipeline->binary_key, create_info, cache_key);
+      struct vk_pipeline_cache_object *object = vk_pipeline_cache_lookup_object(
+         cache, cache_key, sizeof(cache_key), &vk_raw_data_cache_object_ops,
+         NULL);
+      if (object) {
+         const struct vk_raw_data_cache_object *data =
+            container_of(object, struct vk_raw_data_cache_object, base);
+         uint8_t binary_key[BLAKE3_OUT_LEN];
+         memcpy(binary_key, pipeline->binary_key, sizeof(binary_key));
+         result = hk_rt_binary_load(dev, pipeline, data->data,
+                                    data->data_size, pAllocator);
+         pipeline->cache_object = object;
+         if (result == VK_SUCCESS &&
+             !memcmp(binary_key, pipeline->binary_key, sizeof(binary_key)) &&
+             hk_rt_cache_loaded_handles(dev, pipeline, create_info)) {
+            *out_pipeline = vk_pipeline_to_handle(&pipeline->base);
+            return VK_SUCCESS;
+         }
+         /* Not a usable entry: build the pipeline instead. */
+         hk_ray_tracing_pipeline_destroy(&dev->vk, &pipeline->base, pAllocator);
+         pipeline = hk_rt_pipeline_alloc(dev, flags, layout, pAllocator);
+         if (!pipeline)
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         memcpy(pipeline->binary_key, binary_key, sizeof(binary_key));
+      }
+   }
 
    pipeline->stage_count = create_info->stageCount;
    pipeline->group_count = create_info->groupCount;
@@ -3788,6 +4092,12 @@ hk_create_ray_tracing_pipeline(
    if (result != VK_SUCCESS)
       goto fail;
 
+   if ((flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) &&
+       hk_rt_cache_supported(dev)) {
+      hk_rt_library_handles_record(dev, pipeline->binary_key, pipeline->groups,
+                                   create_info->groupCount);
+   }
+
    for (uint32_t i = 0; i < pipeline->stage_count; i++)
       pipeline->base.stages |= mesa_to_vk_shader_stage(
          pipeline->stages[i]->nir->info.stage);
@@ -3796,8 +4106,8 @@ hk_create_ray_tracing_pipeline(
     * compiling a megakernel for it would be wasted work. */
    if (!(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)) {
       /* Libraries retain stage NIR, not a compiled megakernel.  Linking an
-       * executable still requires backend compilation, even with no new
-       * stages.  RT pipelines are not retrieved from pipelineCache.
+       * executable without a cache hit still requires backend compilation,
+       * even with no new stages.
        */
       if (flags &
           VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
@@ -3810,6 +4120,9 @@ hk_create_ray_tracing_pipeline(
       if (result != VK_SUCCESS)
          goto fail;
    }
+
+   if (cache)
+      hk_rt_cache_insert(dev, cache, cache_key, pipeline);
 
    *out_pipeline = vk_pipeline_to_handle(&pipeline->base);
    return VK_SUCCESS;
@@ -3832,7 +4145,10 @@ hk_CreateRayTracingPipelinesKHR(
    uint32_t i = 0;
    for (; i < createInfoCount; i++) {
       VkResult one = hk_create_ray_tracing_pipeline(
-         dev, pAllocator, pCreateInfos + i, pPipelines + i);
+         dev,
+         hk_rt_pipeline_cache(dev, pipelineCache,
+                              vk_rt_pipeline_create_flags(&pCreateInfos[i])),
+         pAllocator, pCreateInfos + i, pPipelines + i);
 
       if (one != VK_SUCCESS) {
          result = one;
