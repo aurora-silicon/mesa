@@ -1390,6 +1390,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
       .dst_stride = stride,
       .reports_per_query = hk_reports_per_query(pool),
       .flags = flags,
+      .availability_shift = pool->avail_shift,
    };
 
    libagx_copy_query_struct(cmd, agx_1d(queryCount), AGX_BARRIER_ALL, info);
