@@ -265,9 +265,11 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_load_store_op_none = true,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = native_agx3,
+      .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_non_seamless_cube_map = true,
+      .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
       .EXT_pipeline_creation_feedback = true,
       .EXT_pipeline_protected_access = true,
@@ -769,6 +771,12 @@ hk_get_device_features(
       .memoryMapPlaced = true,
       .memoryMapRangePlaced = false,
       .memoryUnmapReserve = true,
+
+      /* VK_EXT_memory_priority */
+      .memoryPriority = agx_has_residency_control(dev),
+
+      /* VK_EXT_pageable_device_local_memory */
+      .pageableDeviceLocalMemory = agx_has_residency_control(dev),
 
       /* VK_EXT_multi_draw */
       .multiDraw = true,

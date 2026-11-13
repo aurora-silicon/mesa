@@ -30,6 +30,7 @@ bool agx_nir_scalarize_int64(struct nir_shader *shader);
 bool agx_nir_lower_divmod64(struct nir_shader *shader, bool native_add64);
 bool agx_nir_lower_algebraic_late(struct nir_shader *shader);
 bool agx_nir_avoid_square_overflow(struct nir_shader *shader);
+bool agx_nir_lower_f2bf_rtne(struct nir_shader *shader);
 bool agx_nir_lower_g17p_tile_samples(struct nir_shader *s, unsigned nr_samples);
 bool agx_nir_lower_g18_tile_samples(struct nir_shader *s, unsigned nr_samples);
 bool agx_nir_lower_g17p_1x_tile_samples(struct nir_shader *s);

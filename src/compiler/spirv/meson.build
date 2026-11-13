@@ -102,6 +102,7 @@ if with_tests and not with_nir_headers_only
       files(
         'tests/helpers.h',
         'tests/avail_vis.cpp',
+        'tests/bfloat16.cpp',
         'tests/volatile.cpp',
         'tests/cmat.cpp',
         'tests/control_flow_tests.cpp',

@@ -450,6 +450,14 @@ agx_has_userptr(const struct agx_device *dev)
           (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
 }
 
+/* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
+static inline bool
+agx_has_residency_control(const struct agx_device *dev)
+{
+   return !dev->is_virtio &&
+          (dev->params.features & DRM_ASAHI_FEATURE_GEM_RESIDENCY);
+}
+
 static inline bool
 agx_has_soft_fault(const struct agx_device *dev)
 {

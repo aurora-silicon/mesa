@@ -170,6 +170,7 @@ void agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo);
 struct agx_bo *agx_bo_import(struct agx_device *dev, int fd);
 struct agx_bo *agx_bo_import_host_ptr(struct agx_device *dev, void *ptr,
                                       size_t size, bool allow_read_only);
+int agx_bo_set_resident(struct agx_device *dev, struct agx_bo *bo, bool keep);
 int agx_bo_export(struct agx_device *dev, struct agx_bo *bo);
 bool agx_bo_make_shared(struct agx_device *dev, struct agx_bo *bo);
 
