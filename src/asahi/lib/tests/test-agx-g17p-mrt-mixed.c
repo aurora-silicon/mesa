@@ -196,6 +196,8 @@ test_selectors_match_single_target_programs(void)
    CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_B5G5R5A1_UNORM) == 0x15);
    CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_B10G10R10A2_UINT) == 0x15);
    CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_B8G8R8A8_SNORM) == 0x75);
+   CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_R10G10B10X2_UNORM) == 0x75);
+   CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_B10G10R10X2_UNORM) == 0x75);
    CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_R11G11B10_FLOAT) == 0x35);
    CHECK(agx_g17p_mrt_eot_selector(PIPE_FORMAT_R9G9B9E5_FLOAT) == 0x35);
    CHECK(admitted > 40);
