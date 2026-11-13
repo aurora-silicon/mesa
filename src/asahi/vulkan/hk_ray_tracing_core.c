@@ -116,6 +116,38 @@ hk_rt_pipeline_stack_size(const struct hk_rt_stack_sizes *sizes,
    return total;
 }
 
+static uint32_t
+align16(uint32_t x)
+{
+   return (x + 15) & ~15u;
+}
+
+uint32_t
+hk_rt_continuation_stack_size(const struct hk_rt_stack_sizes *sizes,
+                              uint32_t recursion_depth, bool has_callables,
+                              uint32_t traversing_frame, uint32_t *max_frame)
+{
+   const uint32_t chit_miss = align16(max2(sizes->closest_hit, sizes->miss));
+   const uint32_t callable = align16(sizes->callable);
+   const uint32_t traversal =
+      align16(sizes->intersection) + align16(sizes->any_hit);
+
+   uint32_t leaf = max3(chit_miss, callable, traversal);
+   leaf = max2(leaf, align16(sizes->raygen));
+   if (traversing_frame)
+      leaf = max2(leaf, align16(traversing_frame) + traversal);
+
+   uint32_t total = HK_RT_RETURN_RECORD_SIZE;
+   total += align16(sizes->raygen) + HK_RT_RETURN_RECORD_SIZE;
+   total += recursion_depth * (chit_miss + HK_RT_RETURN_RECORD_SIZE);
+   if (has_callables)
+      total += 31 * (callable + HK_RT_RETURN_RECORD_SIZE);
+   total += leaf;
+
+   *max_frame = leaf;
+   return total;
+}
+
 uint32_t
 hk_rt_group_stack_size(const struct hk_rt_stack_sizes *sizes,
                        const struct hk_ray_tracing_group *group,

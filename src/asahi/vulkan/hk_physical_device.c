@@ -1182,10 +1182,10 @@ hk_get_device_properties(const struct agx_device *dev,
        * address (hk_load_sbt_entry), so it reports a handle alignment of 1;
        * other chips keep the largest allowed, 32.
        *
-       * Trace recursion is unrolled into the megakernel at compile time.
-       * G17P supports three levels until trace continuations can be shared.
-       * KHR requires at least one level; legacy generations retain their
-       * limit of three.
+       * Trace recursion is unrolled into the megakernel at compile time up
+       * to three levels. G17P runs deeper pipelines as continuations
+       * (hk_rt_cont_split) and reports the specification's maximum of 31;
+       * legacy generations retain their limit of three.
        *
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */

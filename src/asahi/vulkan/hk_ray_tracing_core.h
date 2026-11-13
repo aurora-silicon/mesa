@@ -54,10 +54,12 @@ extern "C" {
  * decision, not a hardware limit. Keep the legacy limit unchanged.
  */
 #define HK_MAX_RAY_RECURSION_DEPTH 3
-/* KHR requires at least one level (the NV extension required 31).
- * G17P inlines traversal at every depth; three is the supported bound
- * until the compiler can share trace continuations. */
-#define HK_G17P_MAX_RAY_RECURSION_DEPTH 3
+/* Pipelines up to this depth keep the inlined megakernel. Deeper G17P
+ * pipelines run their stages as continuations from one scheduler loop, which
+ * holds one copy of every stage and of traversal at any depth. */
+#define HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH 3
+/* The specification's maximum; KHR requires at least one level. */
+#define HK_G17P_MAX_RAY_RECURSION_DEPTH 31
 /* Defensive ceiling for invalid requests from older stage-library clients. */
 #define HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH 31
 
@@ -147,6 +149,35 @@ struct hk_rt_stack_sizes {
  */
 uint32_t hk_rt_pipeline_stack_size(const struct hk_rt_stack_sizes *sizes,
                                    uint32_t recursion_depth);
+
+/*
+ * A continuation call record: resume pc, caller stack pointer, caller payload
+ * offset, padding, caller shader record pointer, caller vertex position
+ * address. It sits between the caller's frame and the callee's.
+ */
+#define HK_RT_RETURN_RECORD_SIZE 32
+
+/*
+ * Scratch a continuation-mode pipeline reserves above its own frame, for
+ * `sizes` holding the largest frame of each stage kind (a split stage's frame
+ * includes its spills).  The stack starts with one return record for raygen.
+ * Every call pushes the caller's frame, rounded to 16 bytes, and one record:
+ * raygen once, a closest-hit or miss frame at most once per recursion level,
+ * and callables at most 31 times, as in hk_rt_pipeline_stack_size().  The
+ * innermost frame is at most *max_frame, which also covers the intersection
+ * and any-hit frames of a traversal (reserved side by side, as
+ * hk_rt_pipeline_stack_size() does), on top of `traversing_frame` when a
+ * stage of that frame traverses inline (hit objects).
+ *
+ * A call is taken only when the callee's base plus *max_frame stays inside
+ * the reservation, so no call sequence can overflow it; calls within the
+ * declared depth always fit.
+ */
+uint32_t hk_rt_continuation_stack_size(const struct hk_rt_stack_sizes *sizes,
+                                       uint32_t recursion_depth,
+                                       bool has_callables,
+                                       uint32_t traversing_frame,
+                                       uint32_t *max_frame);
 
 /*
  * vkGetRayTracingShaderGroupStackSizeKHR: the scratch one shader of one group
