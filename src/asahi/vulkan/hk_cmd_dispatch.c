@@ -2694,8 +2694,14 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead. */
    const bool app_dispatch =
-      !cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
-      agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
+      (!cmd->in_meta && s && s->info.stage == MESA_SHADER_COMPUTE &&
+       agx_chip_elide_app_dispatch_barrier(dev->dev.chip)) ||
+      /* An acceleration-structure build orders every launch that depends on
+       * another with a pipeline barrier, which strengthens the earlier
+       * launch's tail; launches with none between them (one step of several
+       * builds, the fills after the leaves) run side by side. */
+      (cmd->state.as_build_recording && s && s->info.stage == MESA_SHADER_COMPUTE &&
+       !s->b.info.uses_ray_traversal);
    if (app_dispatch && cs->app_dispatch_end &&
        cs->current == cs->app_dispatch_end &&
        cs->current == cs->weak_barrier_end) {
