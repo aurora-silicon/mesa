@@ -15707,8 +15707,12 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    nir_shader_compiler_options agx3_options;
    if (is_agx3) {
       agx3_options = *original_options;
-      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C)
+      if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+         /* f2bf rounds to nearest even here; the shared lowering, which
+          * truncates, is left only bf2f. */
+         NIR_PASS(_, nir, agx_nir_lower_f2bf_rtne);
          agx3_options.lower_bfloat16_conversions = true;
+      }
       if (is_g17p) {
          agx3_options.lower_iabs = false;
          /* G17P's saturate form is a standalone f32add.ep2 operation. */
