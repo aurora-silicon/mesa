@@ -190,7 +190,33 @@ main(void)
          while (node_count > (range_is_root ? 1 : cluster_threshold)) {
             node_id = VK_BVH_INVALID_NODE;
             vk_aabb node_aabb = node_aabbs[gl_SubgroupInvocationID];
+#ifdef HPLOC_SHUFFLE_SEARCH
+            /* The same candidates and minimum as the shared-atomic search
+             * below: each invocation computes the merged surface area with
+             * each left neighbour and hands it to that neighbour by a
+             * shuffle, so no shared atomics order the steps. Uniform control
+             * flow; past node_count - 1 steps no candidate exists. */
+            uint32_t best_candidate = 0xffffffff;
+            const uint32_t steps = min(uint32_t(SEARCH_RADIUS), node_count - 1);
+            for (uint32_t i = 1; i <= steps; i++) {
+               int32_t index = int32_t(gl_SubgroupInvocationID) - int(i);
+               vk_aabb other;
+               other = node_aabbs[max(index, 0)];
+               vk_aabb shared_bounds;
+               shared_bounds.min = min(other.min, node_aabb.min);
+               shared_bounds.max = max(other.max, node_aabb.max);
+               uint32_t shared_sa = (floatBitsToUint(aabb_surface_area(shared_bounds)) << 1u) & (~(SUBGROUP_SIZE - 1));
+               if (index >= 0)
+                  best_candidate = min(best_candidate, shared_sa | uint32_t(index));
+               /* The invocation i to the right computed this pair's area. */
+               uint32_t right = gl_SubgroupInvocationID + i;
+               uint32_t right_sa = subgroupShuffle(shared_sa, right);
+               if (right < node_count)
+                  best_candidate = min(best_candidate, right_sa | right);
+            }
+#endif
             if (gl_SubgroupInvocationID < node_count) {
+#ifndef HPLOC_SHUFFLE_SEARCH
                candidate_infos[gl_SubgroupInvocationID] = 0xffffffff;
                uint32_t best_candidate = 0xffffffff;
                for (uint32_t i = 1; i <= SEARCH_RADIUS; i++) {
@@ -211,6 +237,7 @@ main(void)
                }
 
                best_candidate = min(best_candidate, candidate_infos[gl_SubgroupInvocationID]);
+#endif
                uint32_t best_index = best_candidate & (SUBGROUP_SIZE - 1);
                uint32_t other_node_id = node_ids[best_index];
 
