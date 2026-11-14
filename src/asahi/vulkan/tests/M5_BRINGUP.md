@@ -2,10 +2,12 @@
 
 The driver admits the exact single-die AGX3 USC/HAL300 kernel contracts for
 T8142/G17G (one cluster), T6050/G17S M5 Pro (two clusters) and T6050/G17C M5 Max
-(four clusters) without an environment override. `ASAHI_M5_BRINGUP=1` retains
-the explicit experimental admission path for other supported bring-up
-topologies. Neither admission path establishes Vulkan conformance; the
-experimental device reports conformance version 0.0.0.0.
+(four clusters) by default. There is no device-admission environment override.
+The implemented native acceleration-structure builder, cooperative matrices,
+bfloat16 and native mesh/task paths are selected automatically by the chip and
+kernel capabilities. Diagnostics and hardware probes remain explicit tools.
+These defaults do not establish Vulkan conformance; the experimental device
+reports conformance version 0.0.0.0.
 
 The driver uses allocator-owned printf storage because the AGX2 fixed address
 overlaps M5's compact driver-owned TA arena. Honeykrisp loads its actual
@@ -50,8 +52,7 @@ cc -DAGX_TEST_DEVICE_ID=0x8142 -DIMAGE_WIDTH=256 -DIMAGE_HEIGHT=256 \
    g17p_render_only.c -ldl -o m5-vulkan-render-only
 ```
 
-Run with an isolated Honeykrisp ICD and `ASAHI_M5_BRINGUP=1
-AGX_RENDER_RECORD_ONLY=1`. This exercises real device/pipeline/recording code
+Run with an isolated Honeykrisp ICD and `AGX_RENDER_RECORD_ONLY=1`. This exercises real device/pipeline/recording code
 without submitting GPU work. The fixture returns failure when recording is
 unsupported. A successful record-only run would still not prove rendering.
 
