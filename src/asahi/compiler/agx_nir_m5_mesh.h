@@ -43,6 +43,12 @@ struct agx_m5_mesh_varyings {
    uint8_t primitive_comps[64];
    /* gl_CullPrimitiveEXT is written (M5: dropped before the export). */
    bool cull_primitive;
+   /* G17P: remap position z from [-w, w] at the export
+    * (agx_nir_lower_gen1_mesh), whatever the shape of the position stores. */
+   bool clip_m1_1;
+   /* G17P lines: root byte offset of the signed line row bias (0: none),
+    * see agx_nir_lower_gen1_mesh. */
+   uint16_t line_bias_root_B;
 };
 
 

@@ -15,6 +15,8 @@ struct mesh_layout {
    unsigned plane_stride, planes, bytes;
    /* One byte per primitive: nonzero when gl_CullPrimitiveEXT is set. */
    unsigned cull;
+   /* One byte per vertex: the vertex ends a line drawn toward +y. */
+   unsigned line_marks;
    bool storage_probe;
    uint64_t primitive_audit_va;
    const struct agx_m5_mesh_varyings *varyings;
@@ -486,6 +488,11 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       layout.cull = layout.output_base + layout.bytes;
       layout.bytes += ALIGN_POT(s->info.mesh.max_primitives_out, 64);
    }
+   const bool line_bias = varyings->line_bias_root_B && prim_vertices(s) == 2;
+   if (line_bias) {
+      layout.line_marks = layout.output_base + layout.bytes;
+      layout.bytes += ALIGN_POT(s->info.mesh.max_vertices_out, 64);
+   }
    if (getenv("ASAHI_MESH_PP_AUDIT") &&
        !strcmp(getenv("ASAHI_MESH_PP_AUDIT"), "1") &&
        (!layout.primitive_audit_va || (layout.primitive_audit_va & 15) ||
@@ -495,7 +502,22 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
       M5_REFUSE();
    if (layout.output_base + layout.bytes > 32768)
       M5_REFUSE();
-   unsigned physical_threads=MAX2(threads,MIN2(s->info.mesh.max_vertices_out,32));
+   /* A per-primitive layer or viewport travels in a vertex word, so
+    * primitives sharing a vertex would share it: give every primitive its own
+    * vertices (as the M5 lowering does), in an export arena after the
+    * layout, when they fit the 256 exported vertices. */
+   const unsigned unweld_vertices = prim_vertices(s) * s->info.mesh.max_primitives_out;
+   const unsigned unweld_stride = ALIGN_POT(unweld_vertices, 4) * 4;
+   const unsigned unweld_base = layout.output_base + layout.bytes;
+   const bool unweld = varyings->lv && unweld_vertices <= 256 &&
+      unweld_base + layout.planes * unweld_stride <= 32768;
+   /* SIMD group 0 exports with one lane per vertex, primitive and index
+    * word of a 32-wide batch, so give it enough lanes for the largest. */
+   const unsigned export_lanes = MAX3(unweld ? unweld_vertices : s->info.mesh.max_vertices_out,
+                                      s->info.mesh.max_primitives_out,
+                                      DIV_ROUND_UP(prim_vertices(s) *
+                                                   s->info.mesh.max_primitives_out, 4));
+   unsigned physical_threads=MAX2(threads,MIN2(export_lanes,32));
    bool counts=false;
    nir_foreach_function_impl(impl,s) {
       nir_foreach_block(block,impl) {
@@ -718,6 +740,134 @@ agx_nir_lower_gen1_mesh(nir_shader *s, const struct agx_m5_mesh_varyings *varyin
    }
    nir_def *p=nir_load_shared(&b,1,16,nir_imm_int(&b,layout.primitive_count),.align_mul=2);
    nir_def *v=nir_load_shared(&b,1,16,nir_imm_int(&b,layout.vertex_count),.align_mul=2);
+   if (varyings->clip_m1_1) {
+      /* As agx_nir_lower_clip_m1_1, on the exported z and w. */
+      const unsigned z_plane = first_plane(varyings, VARYING_SLOT_POS) + 2;
+      const uint32_t fp = b.fp_math_ctrl;
+      b.fp_math_ctrl = nir_fp_no_reassoc | nir_fp_no_transform;
+      nir_def *c = nir_load_clip_z_coeff(&b);
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      for (unsigned vertex = 0; vertex < s->info.mesh.max_vertices_out; vertex += 32) {
+         nir_def *index = nir_iadd_imm(&b, lane, vertex);
+         nir_push_if(&b, nir_ult(&b, index, nir_u2u32(&b, v)));
+         nir_def *addr = nir_iadd_imm(&b, nir_imul_imm(&b, index, 4),
+                                      layout.position + layout.plane_stride * z_plane);
+         nir_def *z = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *w = nir_load_shared(&b, 1, 32,
+            nir_iadd_imm(&b, addr, layout.plane_stride), .align_mul = 4);
+         nir_def *lerp = nir_ffma(&b, z, nir_fsub(&b, nir_imm_float(&b, 1.0f), c),
+                                  nir_fmul(&b, w, c));
+         nir_store_shared(&b, nir_bcsel(&b, nir_fneu(&b, c, nir_imm_float(&b, 0.0f)), lerp, z),
+                          addr, .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      }
+      b.fp_math_ctrl = fp;
+      nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   }
+   if (line_bias) {
+      /* The rasterizer puts a line endpoint that lies exactly on a pixel row
+       * boundary into the row above, where Vulkan's diamond is open: a line
+       * drawn toward +y then covers rows one too high. Move the vertices of
+       * such lines a fraction of a pixel toward +y (the root holds that step
+       * in NDC, signed by the viewport's y direction). A vertex shared with a
+       * line drawn the other way moves too; off a boundary the step changes
+       * nothing. */
+      const unsigned y_plane = first_plane(varyings, VARYING_SLOT_POS) + 1;
+      const unsigned w_plane = y_plane + 2;
+      nir_def *bias = nir_load_global_constant(&b, 1, 32,
+         nir_iadd_imm(&b, nir_load_root_agx(&b), varyings->line_bias_root_B),
+         .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      const unsigned max_v = s->info.mesh.max_vertices_out;
+      for (unsigned vertex = 0; vertex < max_v; vertex += 32) {
+         nir_def *index = nir_iadd_imm(&b, lane, vertex);
+         nir_push_if(&b, nir_ult(&b, index, nir_u2u32(&b, v)));
+         nir_store_shared(&b, nir_imm_intN_t(&b, 0, 8),
+                          nir_iadd_imm(&b, index, layout.line_marks),
+                          .write_mask = 1, .align_mul = 1);
+         nir_pop_if(&b, NULL);
+      }
+      nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      for (unsigned prim = 0; prim < max_primitives; prim += 32) {
+         nir_def *index = nir_iadd_imm(&b, lane, prim);
+         nir_push_if(&b, nir_ult(&b, index, nir_u2u32(&b, p)));
+         nir_def *ends[2], *ndc_y[2], *ok = nir_imm_true(&b);
+         for (unsigned c = 0; c < 2; ++c) {
+            ends[c] = nir_u2u32(&b, nir_load_shared(&b, 1, 8, nir_iadd_imm(&b,
+               nir_imul_imm(&b, index, 2), layout.output_base + c), .align_mul = 1));
+            nir_def *addr = nir_iadd_imm(&b, nir_imul_imm(&b, ends[c], 4),
+                                         layout.position + layout.plane_stride * y_plane);
+            nir_def *y = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
+            nir_def *w = nir_load_shared(&b, 1, 32,
+               nir_iadd_imm(&b, addr, 2 * layout.plane_stride), .align_mul = 4);
+            ok = nir_iand(&b, ok, nir_flt(&b, nir_imm_float(&b, 0.0f), w));
+            ndc_y[c] = nir_fdiv(&b, y, w);
+         }
+         nir_def *toward = nir_flt(&b, nir_imm_float(&b, 0.0f),
+            nir_fmul(&b, nir_fsub(&b, ndc_y[1], ndc_y[0]), bias));
+         nir_push_if(&b, nir_iand(&b, ok, toward));
+         for (unsigned c = 0; c < 2; ++c) {
+            nir_store_shared(&b, nir_imm_intN_t(&b, 1, 8),
+                             nir_iadd_imm(&b, ends[c], layout.line_marks),
+                             .write_mask = 1, .align_mul = 1);
+         }
+         nir_pop_if(&b, NULL);
+         nir_pop_if(&b, NULL);
+      }
+      nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      for (unsigned vertex = 0; vertex < max_v; vertex += 32) {
+         nir_def *index = nir_iadd_imm(&b, lane, vertex);
+         nir_def *marked = nir_ine_imm(&b, nir_u2u32(&b, nir_load_shared(&b, 1, 8,
+            nir_iadd_imm(&b, index, layout.line_marks), .align_mul = 1)), 0);
+         nir_push_if(&b, nir_iand(&b, nir_ult(&b, index, nir_u2u32(&b, v)), marked));
+         nir_def *addr = nir_iadd_imm(&b, nir_imul_imm(&b, index, 4),
+                                      layout.position + layout.plane_stride * y_plane);
+         nir_def *y = nir_load_shared(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *w = nir_load_shared(&b, 1, 32,
+            nir_iadd_imm(&b, addr, (w_plane - y_plane) * layout.plane_stride), .align_mul = 4);
+         nir_store_shared(&b, nir_ffma(&b, bias, w, y), addr, .write_mask = 1, .align_mul = 4);
+         nir_pop_if(&b, NULL);
+      }
+      nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+   }
+   if (unweld) {
+      /* Copy every corner of every kept primitive to its own vertex and make
+       * the index list the identity. Each lane reads and rewrites only the
+       * index bytes of its own vertices. */
+      const unsigned corners = layout.prim_vertices;
+      nir_def *vertices = nir_imul_imm(&b, nir_umin(&b, nir_u2u32(&b, p),
+         nir_imm_int(&b, s->info.mesh.max_primitives_out)), corners);
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      for (unsigned base = 0; base < unweld_vertices; base += 32) {
+         nir_def *j = nir_iadd_imm(&b, lane, base);
+         nir_push_if(&b, nir_ult(&b, j, vertices));
+         nir_def *index = nir_u2u32(&b, nir_load_shared(&b, 1, 8,
+            nir_iadd_imm(&b, j, layout.output_base), .align_mul = 1));
+         nir_def *source = nir_imul_imm(&b, nir_umin(&b, index,
+            nir_imm_int(&b, s->info.mesh.max_vertices_out - 1)), 4);
+         nir_def *target = nir_imul_imm(&b, j, 4);
+         for (unsigned plane = 0; plane < layout.planes; ++plane) {
+            nir_def *value = nir_load_shared(&b, 1, 32, nir_iadd_imm(&b, source,
+               layout.position + layout.plane_stride * plane), .align_mul = 4);
+            nir_store_shared(&b, value, nir_iadd_imm(&b, target,
+               unweld_base + unweld_stride * plane), .write_mask = 1, .align_mul = 4);
+         }
+         nir_store_shared(&b, nir_u2u8(&b, j), nir_iadd_imm(&b, j, layout.output_base),
+                          .write_mask = 1, .align_mul = 1);
+         nir_pop_if(&b, NULL);
+      }
+      nir_barrier(&b, .execution_scope = SCOPE_SUBGROUP, .memory_scope = SCOPE_SUBGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL, .memory_modes = nir_var_mem_shared);
+      v = nir_u2u16(&b, vertices);
+      layout.position = unweld_base;
+      layout.plane_stride = unweld_stride;
+      layout.bytes = unweld_base + layout.planes * unweld_stride - layout.output_base;
+      s->info.mesh.max_vertices_out = unweld_vertices;
+   }
    if (varyings->lv) {
       nir_def *storage = nir_pack_64_2x32(&b, nir_load_mesh_primitive_storage_agx(&b));
       nir_def *lane = nir_load_subgroup_invocation(&b);
