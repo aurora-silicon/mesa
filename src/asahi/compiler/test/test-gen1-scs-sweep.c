@@ -9,6 +9,11 @@
  * are none. Only a thread that launched a query issues them, unless
  * ASAHI_G17P_RQ_SCS_SWEEP_SKIP=0 gives them to every thread.
  *
+ * Launch state: the query context and the constant words of the warp's save
+ * area are stored under a branch on the thread's first launch
+ * (ASAHI_G17P_RQ_CTX_ONCE). Where a kernel's only launch site is outside any
+ * loop the branch folds away, and the kernel is the same with and without it.
+ *
  * Back end: a kernel carrying such loads compiles for G17P, its binary holds
  * exactly those accesses in the destination-less form between the two
  * traversal barriers, and no ordinary SCS load takes their place. The lowered
@@ -33,6 +38,7 @@
 #define SWEEP "ASAHI_G17P_RQ_SCS_SWEEP"
 #define EXTRA "ASAHI_G17P_RQ_SCS_SWEEP_EXTRA"
 #define SKIP "ASAHI_G17P_RQ_SCS_SWEEP_SKIP"
+#define ONCE "ASAHI_G17P_RQ_CTX_ONCE"
 #define RESULT_ADDRESS 0x10004000000ull
 
 struct touch {
@@ -620,7 +626,36 @@ struct thread_kernel {
    unsigned size;        /* compiled bytes */
    unsigned in_last;     /* touches in the block all threads end in */
    unsigned elsewhere;   /* touches anywhere else */
+   unsigned branches;    /* if nodes of the lowered kernel */
+   unsigned context;     /* stores of the query context */
 };
+
+static bool
+is_context_store(const nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   return intr->intrinsic == nir_intrinsic_store_scs_agx &&
+          nir_intrinsic_base(intr) >= 0x6000 &&
+          nir_intrinsic_base(intr) <= 0x6068;
+}
+
+/* The shape of a lowered kernel's launch state. */
+static void
+launch_shape(nir_function_impl *impl, struct thread_kernel *k)
+{
+   nir_foreach_block(block, impl) {
+      nir_cf_node *prev = nir_cf_node_prev(&block->cf_node);
+      k->branches += prev && prev->type == nir_cf_node_if;
+      unsigned stores = 0;
+      nir_foreach_instr(instr, block)
+         stores += is_context_store(instr);
+      /* A copy is seven stores in one block. */
+      CHECK(stores == 0 || stores == 7);
+      k->context += stores;
+   }
+}
 
 /* Lower and compile the two-query kernel under the current environment. A
  * thread sweeps once, however many queries it launched. */
@@ -644,6 +679,8 @@ thread_kernel(const char *what)
    }
    CHECK(launches == 2);
    CHECK(k.in_last + k.elsewhere == count);
+   launch_shape(b.impl, &k);
+   CHECK(k.context == 2 * 7);
 
    agx_preprocess_nir(b.shader);
    struct agx_shader_key key = {
@@ -681,7 +718,26 @@ thread_cases(void)
    CHECK(every.in_last == count && every.elsewhere == 0);
    CHECK(every.size != plain.size);
    unsetenv(SKIP);
-   return 2;
+
+   /* Each launch site carries two more branches for the state a thread's
+    * first launch stores: around the context copy and around the constant
+    * words of the save area. */
+   setenv(ONCE, "0", 1);
+   const struct thread_kernel each = thread_kernel("state at every launch");
+   CHECK(each.branches + 2 * 2 == plain.branches);
+   CHECK(each.elsewhere == count);
+   CHECK(each.size != plain.size);
+   unsetenv(ONCE);
+
+   /* One launch site, outside any loop: no thread can have launched before
+    * it, so the branch folds away and the kernel is the same whether or not
+    * the state is stored once. A site inside a loop keeps the branch. */
+   struct scan found;
+   const unsigned one = compile_kernel(0x43, NULL, NULL, 0, &found);
+   setenv(ONCE, "0", 1);
+   CHECK(compile_kernel(0x43, NULL, NULL, 0, &found) == one);
+   unsetenv(ONCE);
+   return 5;
 }
 
 int
