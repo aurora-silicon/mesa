@@ -2447,9 +2447,6 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       .emit_markers = dev->g17p_native_as && getenv("ASAHI_G17P_AS_PHASE_ADDRESS") != NULL,
       .has_update = dev->g17p_native_as,
       .morton_phase_dispatch = dev->g17p_native_as,
-      /* On G17P the shuffle search is faster up to 4K leaves and slower
-       * from 16K (gpubench rt.asbuild on the Neo). */
-      .hploc_shuffle_max_leaves = dev->g17p_native_as ? 4096 : 0,
    };
 
    dev->vk.as_build_ops = dev->g17p_native_as ? &hk_native_as_build_ops : &hk_as_build_ops;

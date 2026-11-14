@@ -73,10 +73,6 @@ static const uint32_t hploc_spv[] = {
 #include "bvh/hploc_internal.spv.h"
 };
 
-static const uint32_t hploc_shuffle_spv[] = {
-#include "bvh/hploc_internal_shuffle.spv.h"
-};
-
 void
 vk_bvh_build_barrier_compute_to_compute(VkCommandBuffer commandBuffer, bool indirect_dst)
 {
@@ -1188,23 +1184,6 @@ hploc_build_internal(VkCommandBuffer commandBuffer, struct vk_device *device,
    if (result != VK_SUCCESS)
       return result;
 
-   /* Builds of at most args->hploc_shuffle_max_leaves leaves use the
-    * shuffle neighbour search, which builds the same tree. */
-   VkPipeline shuffle_pipeline = VK_NULL_HANDLE;
-   for (uint32_t i = 0; i < build_count && args->hploc_shuffle_max_leaves; ++i) {
-      if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_HPLOC ||
-          (states[i].config.build_flags & VK_HPLOC_BUILD_FLAGS) != build_flags ||
-          states[i].leaf_node_count > args->hploc_shuffle_max_leaves)
-         continue;
-      result = vk_get_bvh_build_pipeline_spv(device, meta, VK_META_OBJECT_KEY_HPLOC_SHUFFLE,
-                                             hploc_shuffle_spv, sizeof(hploc_shuffle_spv),
-                                             sizeof(struct hploc_args), args, build_flags,
-                                             &shuffle_pipeline, false /* unaligned_dispatch */);
-      if (result != VK_SUCCESS)
-         return result;
-      break;
-   }
-
    if (args->emit_markers) {
       struct vk_acceleration_structure_build_marker marker = {
          .step = VK_ACCELERATION_STRUCTURE_BUILD_STEP_HPLOC_BUILD_INTERNAL,
@@ -1215,7 +1194,6 @@ hploc_build_internal(VkCommandBuffer commandBuffer, struct vk_device *device,
    const struct vk_device_dispatch_table *disp = &device->dispatch_table;
    disp->CmdBindPipeline(
       commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-   VkPipeline bound = pipeline;
 
    for (uint32_t i = 0; i < build_count; ++i) {
       if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_HPLOC)
@@ -1224,14 +1202,6 @@ hploc_build_internal(VkCommandBuffer commandBuffer, struct vk_device *device,
          continue;
 
       assert(args->subgroup_size <= 64);
-
-      VkPipeline want = shuffle_pipeline != VK_NULL_HANDLE &&
-                        states[i].leaf_node_count <= args->hploc_shuffle_max_leaves
-                        ? shuffle_pipeline : pipeline;
-      if (want != bound) {
-         disp->CmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, want);
-         bound = want;
-      }
 
       uint64_t scratch_addr = states[i].build_info->scratchData.deviceAddress;
       const struct hploc_args consts = {
