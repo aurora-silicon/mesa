@@ -1050,8 +1050,8 @@ agx_swtnl_applies(struct agx_context *ctx)
         !ctx->stage[MESA_SHADER_TESS_EVAL].shader))
       return false;
 
-   /* The draw module tessellates only with LLVM, so tessellation runs on the
-    * GPU unless ASAHI_M5_SWTNL_TESS is set (agx_m5_gpu_tess()). */
+   /* The draw module tessellates only with LLVM: without it, tessellation
+    * runs on the GPU (agx_m5_gpu_tess()). */
    if (ctx->stage[MESA_SHADER_TESS_EVAL].shader &&
        (getenv("AGX_SWTNL_NO_LLVM") || agx_m5_gpu_tess(ctx)))
       return false;
