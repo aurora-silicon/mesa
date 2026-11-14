@@ -447,8 +447,11 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
 static bool
 pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
          enum hk_desc_usage usage, struct hk_native_pbe_descriptor *out,
-         uint64_t *atomic_sw_out)
+         uint64_t *atomic_sw_out, uint32_t *store_window_out)
 {
+   if (store_window_out)
+      memset(store_window_out, 0, HK_M5_STORE_WINDOW_SIZE);
+
    const unsigned generation =
       agx_chip_descriptor_generation(dev->dev.chip);
    if (!hk_native_pbe_hardware_supported(generation)) {
@@ -522,6 +525,32 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
       if (layers_as_3d)
          cfg.dimension = AGX_TEXTURE_DIMENSION_3D;
 
+      /* That 3D store addresses at most HK_M5_STORE_MAX_SLICES slices, and
+       * the view is described below as layers << level slices deep. When
+       * that is more, describe a linear window over the level instead, which
+       * hk_nir_lower_descriptors() stores through at the texel's tiled
+       * element index (hk_native_descriptor.h), with the tiled arithmetic of
+       * image atomics. Arrays of a 3D image and compressed, block-compressed
+       * or interchange layouts keep the 3D description.
+       */
+      const unsigned window_element_B = util_format_get_blocksize(p_format);
+      uint32_t window_rows = 0;
+      if (layers_as_3d && store_window_out &&
+          usage == HK_DESC_USAGE_STORAGE && !msaa && !layout->mipmapped_z &&
+          (layout->tiling == AIL_TILING_GPU ||
+           layout->tiling == AIL_TILING_TWIDDLED) &&
+          !layout->compressed && denom.x == 1 && denom.y == 1 &&
+          ((uint64_t)layers << level) > HK_M5_STORE_MAX_SLICES &&
+          window_element_B == util_format_get_blocksize(layout->format)) {
+         window_rows = hk_pack_m5_store_window(
+            layout->layer_stride_B,
+            layout->level_offsets_B[level + 1] - layout->level_offsets_B[level],
+            window_element_B, u_minify(layout->width_px, level),
+            u_minify(layout->height_px, level),
+            layout->tilesize_el[level].width_el,
+            layout->tilesize_el[level].height_el, layers, store_window_out);
+      }
+
       cfg.layout = agx_translate_layout(layout->tiling);
       cfg.channels = ail_pixel_format[p_format].channels;
       cfg.type = ail_pixel_format[p_format].type;
@@ -563,6 +592,19 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
          cfg.levels = 1;
 
          cfg.buffer += layout->level_offsets_B[level];
+         cfg.level = 0;
+      } else if (window_rows) {
+         /* The store window: the level's texels of every layer of the view,
+          * as a linear 2D buffer, as texel buffers are written. */
+         cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+         cfg.layout = AGX_LAYOUT_LINEAR;
+         cfg.buffer = base_addr + ail_get_layer_level_B(layout, layer, level);
+         cfg.unk_mipmapped = false;
+         cfg.width = HK_M5_STORE_WINDOW_WIDTH;
+         cfg.height = window_rows;
+         cfg.stride = (cfg.width * window_element_B) - 4;
+         cfg.layers = 1;
+         cfg.levels = 1;
          cfg.level = 0;
       } else {
          if (denom.x > 1) {
@@ -677,8 +719,11 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
                 linear ? 1 : layout->tilesize_el[level].width_el,
                 linear ? 1 : layout->tilesize_el[level].height_el,
                 linear ? 0 : layout->layer_stride_B,
-                msaa ? image->vk.samples : 1, atomic_sw_out))
+                msaa ? image->vk.samples : 1, atomic_sw_out)) {
+            if (store_window_out)
+               memset(store_window_out, 0, HK_M5_STORE_WINDOW_SIZE);
             return false;
+         }
       }
    }
 
@@ -686,7 +731,11 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
     * end-of-tile builtin. Multisample stores instead address the linear
     * buffer descriptor constructed above. */
 
-   return hk_pack_native_pbe(generation, out, &cfg);
+   /* A window record must never describe a PBE that did not pack. */
+   const bool packed = hk_pack_native_pbe(generation, out, &cfg);
+   if (!packed && store_window_out)
+      memset(store_window_out, 0, HK_M5_STORE_WINDOW_SIZE);
+   return packed;
 }
 
 static VkResult
@@ -807,13 +856,14 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
       if (!sampled_only) {
          view->planes[p].storage_pbe_valid = pack_pbe(
             dev, view, p, HK_DESC_USAGE_STORAGE, &view->planes[p].storage,
-            &view->planes[p].storage_atomic_sw);
+            &view->planes[p].storage_atomic_sw,
+            view->planes[p].storage_window);
          view->planes[p].eot_pbe_valid =
             pack_pbe(dev, view, p, HK_DESC_USAGE_BG_EOT, &view->planes[p].eot,
-                     NULL);
+                     NULL, NULL);
          view->planes[p].emrt_pbe_valid = pack_pbe(
             dev, view, p, HK_DESC_USAGE_EMRT, &view->planes[p].emrt_pbe,
-            &view->planes[p].emrt_atomic_sw);
+            &view->planes[p].emrt_atomic_sw, NULL);
          if ((agx_native_graphics(&dev->dev) ||
               agx_chip_g17_m5(dev->dev.chip)) &&
              (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
@@ -832,7 +882,7 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
          }
          view->planes[p].layered_eot_pbe_valid =
             pack_pbe(dev, view, p, HK_DESC_USAGE_LAYERED_BG_EOT,
-                     &view->planes[p].layered_eot, NULL);
+                     &view->planes[p].layered_eot, NULL, NULL);
       }
       if (agx_native_graphics(&dev->dev) &&
           image->vk.image_type == VK_IMAGE_TYPE_3D &&

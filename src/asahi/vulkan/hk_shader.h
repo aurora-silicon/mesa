@@ -756,7 +756,8 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          bool sparse_soft_unmapped,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
                          bool sampler_has_lod_bias, bool d3d_nearest_mip,
-                         bool coherent_images_in_memory);
+                         bool coherent_images_in_memory,
+                         bool m5_store_window);
 
 VkResult hk_compile_shader(struct hk_device *dev,
                            struct vk_shader_compile_info *info,
