@@ -2192,6 +2192,8 @@ hk_hit_object_load(nir_builder *b, struct hk_rt_compiler *compiler,
 /* Keeps the stack and the backend's spills inside the 64 KiB thread-private
  * frame that static TPS offsets can address. */
 #define HK_RT_CONT_MAX_STACK_SIZE (48 * 1024)
+/* That frame: the most scratch an M5 compute launch can address. */
+#define HK_M5_RT_MAX_SCRATCH_B (1u << 16)
 
 static bool
 hk_rt_cont_hoist_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -3735,9 +3737,15 @@ hk_compile_rt_kernel(
     * is small. Reject that expansion before NIR allocates gigabytes and
     * drives the system into reclaim. This is a compiler resource limit, not
     * a substitute for the advertised depth bound. Legacy generations are
-    * unchanged.
+    * unchanged. M5 inlines its software traversal at every level, so its
+    * inlined pipelines up to the legacy depth can exceed this budget yet
+    * compile; there the guard applies only above that depth, where it bounds
+    * the pipelines the continuation split declines (a continuation kernel
+    * holds each stage once and stays well inside it).
     */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if ((dev->dev.chip == AGX_CHIP_G17P ||
+        (agx_chip_g17_m5(dev->dev.chip) &&
+         compiler.max_depth > HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH)) &&
        !hk_rt_inlining_fits(b->shader, 1u << 20)) {
       ralloc_free(b->shader);
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -3865,8 +3873,28 @@ hk_compile_rt_kernel(
       .push_constant_ranges = NULL,
    };
 
-   return hk_compile_shader(dev, &info, NULL, &dev->vk.enabled_features,
-                            pAllocator, &kernel->shader);
+   VkResult result = hk_compile_shader(dev, &info, NULL,
+                                       &dev->vk.enabled_features, pAllocator,
+                                       &kernel->shader);
+
+   /* M5 launches compute with static thread-private addresses, which reach
+    * HK_M5_RT_MAX_SCRATCH_B (hk_dispatch_m5_native). Continuations keep their
+    * stack below it, but an inlined pipeline's stack grows with every level.
+    * Refuse a kernel above it at creation, rather than when a command buffer
+    * records the trace. */
+   if (result == VK_SUCCESS && agx_chip_g17_m5(dev->dev.chip)) {
+      const struct hk_shader *s = hk_only_variant(kernel->shader);
+      if (s->b.info.scratch_size > HK_M5_RT_MAX_SCRATCH_B ||
+          (s->only_linked &&
+           s->only_linked->b.scratch_size > HK_M5_RT_MAX_SCRATCH_B)) {
+         hk_api_shader_destroy(&dev->vk, &kernel->shader->vk, pAllocator);
+         kernel->shader = NULL;
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "RT kernel needs more than %u bytes of scratch",
+                          HK_M5_RT_MAX_SCRATCH_B);
+      }
+   }
+   return result;
 }
 
 /*
@@ -4458,8 +4486,9 @@ hk_create_ray_tracing_pipeline(
       vk_rt_pipeline_create_flags(create_info);
 
    /* Keep the existing defensive ceiling before key construction or NIR
-    * cloning. G17P advertises 31 levels; legacy generations three. */
-   const uint32_t max_depth = dev->dev.chip == AGX_CHIP_G17P ?
+    * cloning. G17P and M5 advertise 31 levels; legacy generations three. */
+   const uint32_t max_depth =
+      dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip) ?
       HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH;
    if (create_info->maxPipelineRayRecursionDepth > max_depth)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,

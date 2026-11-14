@@ -54,7 +54,7 @@ extern "C" {
  * decision, not a hardware limit. Keep the legacy limit unchanged.
  */
 #define HK_MAX_RAY_RECURSION_DEPTH 3
-/* Pipelines up to this depth keep the inlined megakernel. Deeper G17P
+/* Pipelines up to this depth keep the inlined megakernel. Deeper G17P and M5
  * pipelines run their stages as continuations from one scheduler loop, which
  * holds one copy of every stage and of traversal at any depth. */
 #define HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH 3
