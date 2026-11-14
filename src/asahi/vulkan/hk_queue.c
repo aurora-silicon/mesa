@@ -43,6 +43,7 @@
 #include "util/cache_ops.h"
 #include "util/list.h"
 #include "util/macros.h"
+#include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
@@ -2152,6 +2153,35 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    }
 
    return result;
+}
+
+/* Wait, up to timeout_ns in all, for the GPU to finish everything the
+ * application's queues have handed to the kernel, also when the device is
+ * lost: its earlier submissions may still run. Work still queued in the
+ * runtime's submit thread has not reached the kernel and is not waited for.
+ */
+void
+hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns)
+{
+   const int64_t abs_timeout = os_time_get_absolute_timeout(timeout_ns);
+
+   list_for_each_entry(struct vk_queue, iter, &dev->vk.queues, link) {
+      struct hk_queue *queue = container_of(iter, struct hk_queue, vk);
+      uint64_t point = 0;
+
+      /* The last point the kernel accepted, which has a fence: the cursor
+       * may sit past it on a point a failed submission skipped. Failed work
+       * carries an error fence and does not delay this. */
+      if (drmSyncobjQuery2(dev->dev.fd, &queue->drm.syncobj, &point, 1,
+                           DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED) ||
+          !point)
+         continue;
+
+      int ret = drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj, &point,
+                                       1, abs_timeout, 0, NULL);
+      if (ret == -ETIME)
+         mesa_logw("hk: device destroyed while its GPU work was still running");
+   }
 }
 
 void

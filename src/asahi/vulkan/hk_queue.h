@@ -99,6 +99,7 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+void hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns);
 
 VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
