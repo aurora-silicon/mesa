@@ -1083,7 +1083,7 @@ kill_alpha_coverage_at_update(nir_function_impl *impl, nir_def *slot,
 static bool
 lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
                            bool early_update, bool *a2c_in_main,
-                           bool keep_demoted)
+                           bool keep_demoted, bool one_update)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
 
@@ -1169,7 +1169,8 @@ lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
    /* Unconditional top-level demotes are handled where they occur: their
     * block continues in uniform control flow. No dead-quad kill may precede
     * a sampled loop in this late form: every update stays after it. */
-   if (!early_update && !cf_list_has(&impl->body, subgroup_instr) &&
+   if (!early_update && !one_update &&
+       !cf_list_has(&impl->body, subgroup_instr) &&
        !sampled_loop_after_demote) {
       nir_foreach_block(block, impl) {
          if (block->cf_node.parent != &impl->cf_node)
@@ -1219,10 +1220,30 @@ lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
    return true;
 }
 
+/*
+ * A fragment shader unrolled per sample (G17P): every copy demotes only its
+ * own sample. A kill-only coverage update that removes some of a multisampled
+ * pixel's samples leaves those samples without their previous contents: they
+ * resolve as zero instead of keeping what the attachment held. Samples
+ * removed by the testing update keep it. So collect every copy's demotes and
+ * apply them in the single testing update at the end, the form a per-pixel
+ * shader with one unconditional discard gets. No kill-only update is issued,
+ * dead quads included.
+ *
+ * Only for shaders the single final update suits: no forced-early tests, no
+ * depth/stencil export, no memory writes (the callers check).
+ */
+bool
+agx_nir_lower_sample_mask_one_update(nir_shader *shader)
+{
+   assert(!shader->info.fs.early_fragment_tests);
+   return lower_sample_mask_deferred(shader, false, false, NULL, true, true);
+}
+
 bool
 agx_nir_lower_sample_mask_deferred(nir_shader *shader)
 {
-   return lower_sample_mask_deferred(shader, false, false, NULL, false);
+   return lower_sample_mask_deferred(shader, false, false, NULL, false, false);
 }
 
 /* G17P: the final coverage update right after the last demote on each path.
@@ -1231,7 +1252,8 @@ agx_nir_lower_sample_mask_deferred(nir_shader *shader)
 bool
 agx_nir_lower_sample_mask_deferred_g17p(nir_shader *shader, bool *a2c_in_main)
 {
-   return lower_sample_mask_deferred(shader, false, true, a2c_in_main, false);
+   return lower_sample_mask_deferred(shader, false, true, a2c_in_main, false,
+                                     false);
 }
 
 /*
@@ -1250,7 +1272,7 @@ agx_nir_lower_sample_mask(nir_shader *shader)
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    if (shader->info.fs.uses_discard &&
        cf_list_has(&impl->body, subgroup_instr))
-      return lower_sample_mask_deferred(shader, false, false, NULL, true);
+      return lower_sample_mask_deferred(shader, false, false, NULL, true, false);
 
    return lower_sample_mask(shader, false);
 }
@@ -1259,7 +1281,7 @@ agx_nir_lower_sample_mask(nir_shader *shader)
 bool
 agx_nir_lower_sample_mask_deferred_m5(nir_shader *shader)
 {
-   return lower_sample_mask_deferred(shader, true, false, NULL, false);
+   return lower_sample_mask_deferred(shader, true, false, NULL, false, false);
 }
 
 bool
