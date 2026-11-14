@@ -11,7 +11,6 @@
 #include "hk_sampler_index.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
-#include "asahi/lib/agx_scs_layout.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -181,92 +180,9 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-struct hk_m5_rt_state_diag_entry {
-   uint8_t *cpu;
-   uint64_t gpu, size;
-   uint8_t *initial;
-};
-
-/* Opt-in diagnostic (ASAHI_M5_RT_STATE_DIAG=<dir>): remember the initial
- * contents of each SCS state block this recording allocates, so the bytes the
- * GPU changed can be reported once the application has finished with the
- * command buffer. No effect on the recorded commands. */
-void
-hk_m5_rt_state_diag_record(struct hk_cmd_buffer *cmd, struct agx_ptr state,
-                           uint64_t size)
-{
-   struct hk_m5_rt_state_diag_entry e = {
-      .cpu = state.cpu, .gpu = state.gpu, .size = size, .initial = malloc(size),
-   };
-   if (!e.initial)
-      return;
-   memcpy(e.initial, state.cpu, size);
-   util_dynarray_append(&cmd->m5_rt_state.diag, e);
-}
-
-static void
-hk_m5_rt_state_diag_flush(struct hk_cmd_buffer *cmd)
-{
-   const char *dir = os_get_option("ASAHI_M5_RT_STATE_DIAG");
-   static unsigned seq;
-   util_dynarray_foreach(&cmd->m5_rt_state.diag,
-                         struct hk_m5_rt_state_diag_entry, e) {
-      const unsigned n = p_atomic_inc_return(&seq);
-      char path[512];
-      snprintf(path, sizeof(path), "%s/state-%d-%u.txt", dir ? dir : "/tmp",
-               (int)getpid(), n);
-      FILE *f = fopen(path, "w");
-      if (f) {
-         uint64_t changed = 0, ranges = 0, start = UINT64_MAX, last = 0;
-         fprintf(f, "gpu 0x%" PRIx64 " size 0x%" PRIx64 "\n", e->gpu, e->size);
-         for (uint64_t o = 0; o < e->size; o += 16) {
-            if (!memcmp(e->cpu + o, e->initial + o, 16))
-               continue;
-            changed += 16;
-            if (start != UINT64_MAX && o > last + 256) {
-               fprintf(f, "range 0x%" PRIx64 " 0x%" PRIx64 "\n", start, last + 16);
-               ranges++;
-               start = UINT64_MAX;
-            }
-            if (start == UINT64_MAX)
-               start = o;
-            last = o;
-         }
-         if (start != UINT64_MAX) {
-            fprintf(f, "range 0x%" PRIx64 " 0x%" PRIx64 "\n", start, last + 16);
-            ranges++;
-         }
-         fprintf(f, "changed16 %" PRIu64 " ranges %" PRIu64 "\n", changed, ranges);
-         fclose(f);
-      }
-      if (n <= 4) {
-         snprintf(path, sizeof(path), "%s/state-%d-%u.final.bin", dir ? dir : "/tmp",
-                  (int)getpid(), n);
-         f = fopen(path, "wb");
-         if (f) {
-            fwrite(e->cpu, 1, e->size, f);
-            fclose(f);
-         }
-         snprintf(path, sizeof(path), "%s/state-%d-%u.initial.bin", dir ? dir : "/tmp",
-                  (int)getpid(), n);
-         f = fopen(path, "wb");
-         if (f) {
-            fwrite(e->initial, 1, e->size, f);
-            fclose(f);
-         }
-      }
-      free(e->initial);
-   }
-   util_dynarray_fini(&cmd->m5_rt_state.diag);
-   memset(&cmd->m5_rt_state.diag, 0, sizeof(cmd->m5_rt_state.diag));
-}
-
 static void
 hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
-   if (cmd->m5_rt_state.diag.size)
-      hk_m5_rt_state_diag_flush(cmd);
-
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
    hk_cmd_pending_reap(dev);
@@ -2397,71 +2313,6 @@ hk_m5_compute_uniform_dma_ranges(
    return true;
 }
 
-static bool
-hk_m5_graphics_query_uniforms(struct hk_cmd_buffer *cmd, bool vertex,
-                             struct agx3_ioto_uniform_range *range)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const uint64_t packed = UINT64_C(0x01140000600100e8);
-   struct agx_scs_layout_gen2 scs;
-   if (!dev->m5_native_rq || !dev->m5_rq_instances ||
-       !agx_scs_layout_gen2_init(packed, &scs) || !cmd->current_cs.gfx)
-      return false;
-   const uint64_t size = MAX2(UINT64_C(0x800000),
-      ALIGN_POT((uint64_t)scs.end[12], 0x4000));
-   struct agx_ptr state = hk_pool_alloc(cmd, size, 0x4000);
-   struct agx_ptr uniforms = hk_pool_alloc(cmd, 512, 16);
-   uint64_t table = hk_m5_upload_as_table(cmd);
-   if (!state.cpu || !uniforms.cpu || !table)
-      return false;
-   memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
-   if (size > 0x800000)
-      memset((uint8_t *)state.cpu + 0x800000, 0, size - 0x800000);
-   agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
-   memset(uniforms.cpu, 0, 512);
-   memcpy(uniforms.cpu, dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms));
-   uint64_t sizes = (uint64_t)scs.end[6] | ((uint64_t)scs.end[11] << 32);
-   uint64_t driver = scs.end[5];
-   memcpy((uint8_t *)uniforms.cpu + 48*2, &sizes, 8);
-   memcpy((uint8_t *)uniforms.cpu + 52*2, &packed, 8);
-   memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
-   uint64_t query_payload = UINT64_C(0x3fffffff00008000);
-   memcpy((uint8_t *)uniforms.cpu + 152*2, &query_payload, 8);
-   for (unsigned i = 0; i < 80; i += 2) {
-      uint64_t pointer;
-      memcpy(&pointer, (uint8_t *)uniforms.cpu + i*4, 8);
-      if (pointer >= UINT64_C(0x10000000000) && pointer < UINT64_C(0x10000800000)) {
-         pointer += state.gpu - UINT64_C(0x10000000000);
-         memcpy((uint8_t *)uniforms.cpu + i*4, &pointer, 8);
-      }
-   }
-   memcpy((uint8_t *)uniforms.cpu + 32*2, &table, 8);
-   uint32_t context[32] = {0, 0, (uint32_t)packed, (uint32_t)(packed >> 32)};
-   const uint32_t offsets[] = {0x18000,0x18200,0x18400,0x18500,0x18700,0x19b00};
-   for (unsigned i = 0; i < 6; ++i) {
-      uint64_t pointer = i == 4 ? table : state.gpu + offsets[i];
-      memcpy(context + 4 + 2*i, &pointer, 8);
-   }
-   context[20] = scs.end[5];
-   context[22] = scs.end[10] - scs.end[5];
-   const unsigned levels = (packed >> 16) & 0xff;
-   context[23] = (levels + (levels > 1)) * 8;
-   uint64_t extra = state.gpu + 0x80050;
-   memcpy(context + 26, &extra, 8);
-   extra = state.gpu + 0x18900;
-   memcpy(context + 30, &extra, 8);
-   uint64_t ctx = uniforms.gpu + 352;
-   memcpy((uint8_t *)uniforms.cpu + 352, context, sizeof(context));
-   memcpy((uint8_t *)uniforms.cpu + 320, &ctx, 8);
-   memcpy((uint8_t *)uniforms.cpu + 328, &table, 8);
-   *range = (struct agx3_ioto_uniform_range){0, 168, uniforms.gpu};
-   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_code);
-   hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_ift);
-   if (vertex) cmd->current_cs.gfx->gen1_native_vertex_rq = true;
-   else cmd->current_cs.gfx->gen1_native_fragment_rq = true;
-   return true;
-}
-
 /*
  * Publish the uniform DMA spans of `s` (agx_shader_info::agx3_uniform_dma)
  * after the *count_io ranges already collected: root-relative spans from
@@ -2595,9 +2446,8 @@ hk_g17p_graphics_uniform_ranges(
       if (linked->g17p_prolog_uses_root ||
           agx_tilebuffer_spills(&cmd->state.gfx.render.tilebuffer) ||
           hk_cmd_uses_blend_constant(cmd) ||
-          !(agx_chip_g17_m5(dev->dev.chip)
-             ? hk_m5_graphics_query_uniforms(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])
-             : hk_gen1_upload_fragment_query_state(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count])))
+          agx_chip_g17_m5(dev->dev.chip) ||
+          !hk_gen1_upload_fragment_query_state(cmd, s->info.stage != MESA_SHADER_FRAGMENT, &ranges[count]))
          return hk_g17p_graphics_ranges_refused(range_count,count);
       count++;
    }

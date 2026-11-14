@@ -1156,7 +1156,6 @@ struct hk_cs {
    bool gen1_native_rq;
    bool gen1_native_fragment_rq;
    bool gen1_native_vertex_rq;
-   bool m5_native_rq;
    bool m5_matrix_ops;
 
    /* At least one AS-build dispatch or compute transfer is in this stream. */
@@ -1423,7 +1422,6 @@ hk_cs_merge_cdm(struct hk_cs *a, const struct hk_cs *b)
    assert(a->type == HK_CS_CDM && b->type == HK_CS_CDM);
    assert(a->cmd == b->cmd);
    assert(!a->timestamp.end.handle);
-   a->m5_native_rq |= b->m5_native_rq;
    a->m5_matrix_ops |= b->m5_matrix_ops;
 
    const size_t b_size = (uint8_t *)b->current - (uint8_t *)b->start;
@@ -1751,21 +1749,6 @@ struct hk_cmd_buffer {
    /* CmdClearAttachments is the sole vk_meta operation affected by
     * conditional rendering. */
    bool conditional_meta;
-
-   /* M5 native ray traversal: the per-raygen dispatches of one
-    * vkCmdTraceRays* share a single initialized SCS state block, since only
-    * the selected kernel has threadgroups. Valid only while `share` is set. */
-   struct {
-      bool share;
-      uint64_t packed;
-      struct agx_ptr state;
-      /* Traversal uniforms shared by the same dispatches. */
-      struct agx_ptr uniforms;
-      uint64_t uniforms_packed, uniforms_state;
-      /* Opt-in ASAHI_M5_RT_STATE_DIAG: initial images of the SCS state
-       * blocks this recording allocated, compared after execution. */
-      struct util_dynarray diag;
-   } m5_rt_state;
 
    /* Single-kick vkCmdTraceRays* (ASAHI_M5_RT_SINGLE_KICK, default on): while set,
     * hk_dispatch_m5_native writes the kernel's launch record (40-byte direct
@@ -2622,8 +2605,6 @@ hk_sync_image_class(const struct hk_cmd_buffer *cmd)
 /* AGX2 returns its shader-base-relative USC offset.  G17P returns the absolute
  * 48-bit Ioto program VA consumed by HAL200 VDM state. */
 struct agx3_ioto_uniform_range;
-void hk_m5_rt_state_diag_record(struct hk_cmd_buffer *cmd, struct agx_ptr state,
-                                uint64_t size);
 
 bool hk_m5_compute_uniform_dma_ranges(
    struct hk_cmd_buffer *cmd, const struct hk_shader *s, uint64_t root_ptr,
