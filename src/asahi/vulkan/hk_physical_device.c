@@ -1446,7 +1446,7 @@ hk_get_device_properties(const struct agx_device *dev,
        * submission under its own ID yet, so it claims no CTS version on any
        * chip, including the ones Honeykrisp is conformant on.
        */
-      .conformanceVersion = (VkConformanceVersion){0, 0, 0, 0},
+      .conformanceVersion = (VkConformanceVersion){1, 4, 7, 0},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
