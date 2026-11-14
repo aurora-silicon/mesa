@@ -268,6 +268,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_memory_priority = agx_has_residency_control(dev),
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
+      /* Qualified on G17P; the replay of nested secondaries is shared code. */
+      .EXT_nested_command_buffer = dev->chip == AGX_CHIP_G17P,
       .EXT_non_seamless_cube_map = true,
       .EXT_pageable_device_local_memory = agx_has_residency_control(dev),
       .EXT_pipeline_creation_cache_control = true,
@@ -797,6 +799,16 @@ hk_get_device_features(
 
       /* VK_EXT_non_seamless_cube_map */
       .nonSeamlessCubeMap = true,
+
+      /* VK_EXT_nested_command_buffer: secondaries are recorded into the
+       * common command queue and replayed into the primary, so a nested
+       * vkCmdExecuteCommands is one more replayed command at any depth.
+       */
+      .nestedCommandBuffer = supported_extensions->EXT_nested_command_buffer,
+      .nestedCommandBufferRendering =
+         supported_extensions->EXT_nested_command_buffer,
+      .nestedCommandBufferSimultaneousUse =
+         supported_extensions->EXT_nested_command_buffer,
 
       /* VK_EXT_pipeline_protected_access */
       .pipelineProtectedAccess = true,
@@ -1561,6 +1573,9 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT16_MAX,
+
+      /* VK_EXT_nested_command_buffer */
+      .maxCommandBufferNestingLevel = UINT32_MAX,
 
       /* VK_KHR_pipeline_binary
        *
