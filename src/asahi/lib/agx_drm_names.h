@@ -32,10 +32,11 @@ agx_is_native_drm_driver(const char *name)
  * compatible or by its chip name (agx_chip_name()); NULL for a name not
  * given. GL on such a GPU runs through zink over Borealis.
  *
- * The table is the one list of these GPUs, for everything that needs to know
- * them: agx_screen_create() checks the chip of the device it has opened,
- * natively or under virtio, and code that has not opened the device can
- * match the compatible. This header needs only the C library.
+ * The table is the one list of these GPUs. The loader matches a GPU's
+ * compatible, read from sysfs without opening the device, and picks zink for
+ * it (asahi_zink_predicate()); agx_screen_create() checks the chip of the
+ * device it has opened, natively or under virtio. A GPU added here or removed
+ * is refused or driven by both at once.
  */
 static inline bool
 agx_gallium_refuses_gpu(const char *compatible, const char *chip)

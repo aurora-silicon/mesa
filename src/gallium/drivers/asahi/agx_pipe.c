@@ -3095,7 +3095,8 @@ agx_screen_create(int fd, struct renderonly *ro,
 
    /* GL on the M5 Ultra runs through zink over Borealis; this driver's M5
     * paths have not run there. Refuse the GPUs agx_drm_names.h lists, so
-    * zink is the only GL path. */
+    * zink, which the loader picks for them from the same list, is the only
+    * GL path. */
    if (agx_gallium_refuses_gpu(NULL, agx_chip_name(agx_screen->dev.chip))) {
       fprintf(stderr, "Apple %s: GL runs through zink\n",
               agx_chip_name(agx_screen->dev.chip));
