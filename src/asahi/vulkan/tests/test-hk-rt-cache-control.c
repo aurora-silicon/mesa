@@ -43,7 +43,7 @@
 #define EARLY VK_PIPELINE_CREATE_EARLY_RETURN_ON_FAILURE_BIT
 
 static unsigned translations, backends, shader_destroys, live_nir;
-static unsigned last_instrs, last_calls;
+static unsigned last_instrs, last_calls, last_max_block;
 static nir_shader *tracked_nir[64];
 static VkResult backend_result = VK_SUCCESS;
 static unsigned fail_translation;
@@ -149,13 +149,16 @@ __wrap_hk_compile_shader(struct hk_device *dev,
 {
    backends++;
    /* What the last megakernel holds: every call must be inlined. */
-   last_instrs = last_calls = 0;
+   last_instrs = last_calls = last_max_block = 0;
    nir_foreach_function_impl(impl, info->nir) {
       nir_foreach_block(block, impl) {
+         unsigned n = 0;
          nir_foreach_instr(instr, block) {
-            last_instrs++;
+            n++;
             last_calls += instr->type == nir_instr_type_call;
          }
+         last_instrs += n;
+         last_max_block = MAX2(last_max_block, n);
       }
    }
    ralloc_free(info->nir);
@@ -821,6 +824,36 @@ main(void)
 #define NEAR(a, b) ((a) <= (b) + (b) / 50 && (b) <= (a) + (a) / 50)
       CHECK(NEAR(instrs[1], instrs[2]) && NEAR(instrs[1], instrs[3]));
 #undef NEAR
+
+      /* Many callable groups: continuations find a group's entry and a part
+       * by balanced search, so no block grows with the number of groups. */
+      unsigned max_block[2];
+      const unsigned callables[2] = {8, 48};
+      for (unsigned k = 0; k < 2; ++k) {
+         const unsigned n = 3 + callables[k];
+         VkPipelineShaderStageCreateInfo many[3 + 48];
+         VkRayTracingShaderGroupCreateInfoKHR many_groups[3 + 48];
+         for (unsigned i = 0; i < n; ++i) {
+            /* raygen, closest-hit, miss, then the callables */
+            many[i] = stages[i < 3 ? i : 4];
+            many_groups[i] = i < 3 ? groups[i] : groups[3];
+            if (i >= 3)
+               many_groups[i].generalShader = i;
+         }
+         many_groups[1].anyHitShader = VK_SHADER_UNUSED_KHR;
+         ci = info(0);
+         ci.stageCount = n;
+         ci.pStages = many;
+         ci.groupCount = n;
+         ci.pGroups = many_groups;
+         ci.maxPipelineRayRecursionDepth = 4;
+         CHECK(create(VK_NULL_HANDLE, &ci, &p) == VK_SUCCESS && last_calls == 0);
+         max_block[k] = last_max_block;
+         fprintf(stderr, "continuation test: %u callable groups: largest block "
+                 "%u instructions\n", callables[k], max_block[k]);
+         destroy(p);
+      }
+      CHECK(max_block[1] <= max_block[0] + 16);
 
       struct hk_rt_stack_sizes sizes = {
          .raygen = 40, .closest_hit = 72, .miss = 20, .any_hit = 32,
