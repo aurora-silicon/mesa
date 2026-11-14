@@ -604,6 +604,7 @@ if with_tests
     executable(
       'agx_tests',
       files(
+         '../lib/agx_chip.c',
          'test/test-compact-constants.cpp',
          'test/test-agx3-pack-binary.cpp',
          'test/test-minifloat.cpp',
@@ -664,6 +665,7 @@ if with_tests
          'test/test-shared-byte-offsets.cpp',
          'test/test-device-load-batches.cpp',
          'test/test-fuse-lea-constants.cpp',
+         'test/test-guarded-load-select.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
