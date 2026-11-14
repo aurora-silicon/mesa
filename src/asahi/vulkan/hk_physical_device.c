@@ -1393,7 +1393,8 @@ hk_get_device_properties(const struct agx_device *dev,
          VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
          VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR,
       .subgroupQuadOperationsInAllStages = true,
-      .meshAndTaskShaderDerivatives = false,
+      .meshAndTaskShaderDerivatives =
+         dev->chip == AGX_CHIP_G17P && features->meshShader,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxMultiviewViewCount = HK_MAX_MULTIVIEW_VIEW_COUNT,
       .maxMultiviewInstanceIndex = UINT32_MAX,

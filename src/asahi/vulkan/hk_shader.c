@@ -562,9 +562,14 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
 {
    hk_preprocess_nir_internal(vk_pdev, nir);
    const enum agx_chip chip = ((struct hk_physical_device *)vk_pdev)->dev.chip;
+   /* G17P task shaders run as compute kernels, and mesh workgroups map
+    * invocations to lanes as compute does, so they take the same derivatives
+    * (meshAndTaskShaderDerivatives). */
    const bool g17p_compute_derivatives =
-      (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
-      nir->info.stage == MESA_SHADER_COMPUTE &&
+      (((chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+        nir->info.stage == MESA_SHADER_COMPUTE) ||
+       (chip == AGX_CHIP_G17P && (nir->info.stage == MESA_SHADER_TASK ||
+                                  nir->info.stage == MESA_SHADER_MESH))) &&
       nir->info.derivative_group != DERIVATIVE_GROUP_NONE;
    nir_lower_compute_system_values_options csv_options = {
       /* Only vkCmdDispatchBase has a base workgroup. Task/mesh draws have

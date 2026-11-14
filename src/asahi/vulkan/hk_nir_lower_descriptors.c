@@ -1235,9 +1235,11 @@ static bool
 lower_compute_lod_query(nir_builder *b, nir_tex_instr *tex,
                         const struct lower_descriptors_ctx *ctx)
 {
+   /* Task and mesh shaders with a derivative group take the compute
+    * derivatives (meshAndTaskShaderDerivatives). */
    if (tex->op != nir_texop_lod ||
        (ctx->descriptor_generation != 9 && ctx->descriptor_generation != 10) ||
-       b->shader->info.stage != MESA_SHADER_COMPUTE ||
+       !mesa_shader_stage_uses_workgroup(b->shader->info.stage) ||
        b->shader->info.derivative_group == DERIVATIVE_GROUP_NONE ||
        agx_nir_compute_implicit_lod_diagnostic())
       return false;
