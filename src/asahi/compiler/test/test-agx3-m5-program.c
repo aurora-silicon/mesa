@@ -57,8 +57,14 @@ test_g17g_programs(enum agx_chip chip)
                                                  &output));
       CHECK(output.length == (fragment ? 90 : 84));
       CHECK(memcmp(output.bytes, expected_tail[fragment], 28) == 0);
-      CHECK(output.bytes[48] == (fragment ? 4 : 8) *
-            ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 2 : 1));
+      if (chip == AGX_CHIP_G17D) {
+         /* 0x800 and 0x1000 in the LDIMM's scattered immediate fields. */
+         CHECK(output.bytes[48] == 0 &&
+               output.bytes[49] == (fragment ? 4 : 8));
+      } else {
+         CHECK(output.bytes[48] == (fragment ? 4 : 8) *
+               ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 2 : 1));
+      }
 
 
       {
@@ -227,8 +233,11 @@ test_g17g_programs(enum agx_chip chip)
          CHECK(output.length == 84);
          CHECK(!memcmp(output.bytes, expected_tail[0], 8));
          CHECK(!memcmp(output.bytes + 8, expected_tail[1] + 8, 20));
-         CHECK(output.bytes[28 + 20] ==
-               ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 8 : 4));
+         if (chip == AGX_CHIP_G17D)
+            CHECK(output.bytes[28 + 20] == 0 && output.bytes[28 + 21] == 4);
+         else
+            CHECK(output.bytes[28 + 20] ==
+                  ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 8 : 4));
          static const uint8_t end[] = {14, 0, 0, 0};
          CHECK(!memcmp(output.bytes + 80, end, sizeof(end)));
 
@@ -753,19 +762,25 @@ int main(void) {
    int r = test_unused_vertex_outputs() || test_flat_shading_vertex() || test_load_completion_wait(AGX_CHIP_G17G) ||
            test_load_completion_wait(AGX_CHIP_G17S) ||
            test_load_completion_wait(AGX_CHIP_G17C) ||
+           test_load_completion_wait(AGX_CHIP_G17D) ||
            test_multiround_uniforms(AGX_CHIP_G17G) ||
            test_multiround_uniforms(AGX_CHIP_G17S) ||
            test_multiround_uniforms(AGX_CHIP_G17C) ||
+           test_multiround_uniforms(AGX_CHIP_G17D) ||
            test_cprog_input_bound(AGX_CHIP_G17G) ||
            test_cprog_input_bound(AGX_CHIP_G17S) ||
            test_cprog_input_bound(AGX_CHIP_G17C) ||
+           test_cprog_input_bound(AGX_CHIP_G17D) ||
            test_color_disabled() || test_visibility() || test_line_width() || test_polygon_and_primitive_msaa() || test_g17g_programs(AGX_CHIP_G17G) || test_g17g_programs(AGX_CHIP_G17S) ||
            test_g17g_programs(AGX_CHIP_G17C) ||
+           test_g17g_programs(AGX_CHIP_G17D) ||
            test_m5_dispatch(AGX_CHIP_G17G) || test_m5_dispatch(AGX_CHIP_G17S) ||
            test_m5_dispatch(AGX_CHIP_G17C) ||
+           test_m5_dispatch(AGX_CHIP_G17D) ||
            test_m5_single_kick_launch(AGX_CHIP_G17G) ||
            test_m5_single_kick_launch(AGX_CHIP_G17S) ||
-           test_m5_single_kick_launch(AGX_CHIP_G17C);
+           test_m5_single_kick_launch(AGX_CHIP_G17C) ||
+           test_m5_single_kick_launch(AGX_CHIP_G17D);
    if (!r) puts("M5_PROGRAM_DISPATCH_PASS");
    return r;
 }

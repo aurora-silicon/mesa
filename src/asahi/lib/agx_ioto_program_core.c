@@ -1150,6 +1150,21 @@ m5_no_resource_program_compose(
    staged[offset + 20] =
       (fragment ? 4 : 8) *
       ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 2 : 1);
+   if (chip == AGX_CHIP_G17D) {
+      /* The LDIMM at +16 loads the byte offset of the helper-table group the
+       * stage calls, in its scattered immediate fields (the raw bytes above
+       * are those fields for 0x100, 0x200 and 0x400). The M5 Ultra's lead
+       * (agx3_build_m5_container_lead, eight clusters numbered 0..7 across
+       * both dies) puts the groups at 0x800 and, for vertex, 0x1000; written
+       * raw those would be 32 and 64, which decode to 0. Write them through
+       * the immediate fields, keeping the LDIMM's destination.
+       */
+      const uint64_t field = agx_ioto_load_ldimm_long_immediate(UINT32_MAX);
+      uint8_t *ldimm = staged + offset + 16;
+      agx_store_le64(ldimm, (agx_load_le64(ldimm) & ~field) |
+                            agx_ioto_load_ldimm_long_immediate(
+                               fragment ? 0x800 : 0x1000));
+   }
    offset += AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
    if (fragment) {
       static const uint8_t pixrel[] = {0x9f, 0x17, 0x00, 0x04, 0x00, 0x00};
