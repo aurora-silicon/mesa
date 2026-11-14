@@ -4,7 +4,7 @@
  *
  * AGX3 ray-traversal instruction core.  See agx3_rt_core.h for the grounding
  * contract.  Every baseline below was recovered by decoding the witnessed
- * corpus bytes against Apple's encoder tables and re-encoding byte-exactly;
+ * corpus bytes against the encoder tables and re-encoding byte-exactly;
  * the composer fails closed on any contradiction, and the test replays the
  * exact bytes for every accepted input.
  */

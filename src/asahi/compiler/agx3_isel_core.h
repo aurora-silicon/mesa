@@ -16,7 +16,7 @@
  * A ladder of 12 MSL
  * kernels differing only in the comparison operator was compiled by Apple's
  * own offline translator (`metal-nt -arch applegpu_g16g`, the AGX3b encoding
- * G17P uses) and decoded through Apple's own encoder tables. The condition
+ * G17P uses) and decoded through the encoder tables. The condition
  * field f106 tracked the operator one-for-one and turned out to be numbered
  * exactly like `enum agx_icond`:
  *

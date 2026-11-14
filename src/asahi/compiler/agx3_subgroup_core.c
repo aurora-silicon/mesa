@@ -761,7 +761,7 @@ encode_reduce(enum agx_isa_encoding enc,
     * Metal has scans for sums and products only, so those are the witnessed
     * prefix forms: f53 on the integer add, f57 on the f32 and f56 on the f16
     * instructions. The bitwise and min/max instructions carry the same
-    * operand in Apple's encoder tables -- f53 on signed min/max, whose fields
+    * operand in the encoder tables -- f53 on signed min/max, whose fields
     * are numbered like the integer add, and f52 on the bitwise and unsigned
     * forms, which lack the signedness field f28 and number everything above
     * it one lower -- exactly as the AGX2 SIMD instructions take every

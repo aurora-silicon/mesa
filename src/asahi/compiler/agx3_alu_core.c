@@ -5060,7 +5060,7 @@ agx3_alu_rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
              uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *len)
 {
    /* 192, not 128. The register fields of this form are range-limited by
-    * Apple's own encoder tables -- f2 and f18 both accept [0, 191], 192
+    * the encoder tables -- f2 and f18 both accept [0, 191], 192
     * distinct encodings with no aliasing, and refuse 192 -- and the composer
     * enforces that, so the gate here only has to agree with it. At 128 it did
     * not: AGX_NUM_REGS is 256 half-registers, so a shader under any real
