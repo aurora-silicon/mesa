@@ -83,6 +83,40 @@ libagx_m5_task_dispatch(global uint32_t *record, global uint32_t *flag,
    *flag = enabled ? 1 : 0;
 }
 
+/*
+ * Software task stage (G17P): size a task draw whose grid, draw count or
+ * predicate lives in GPU memory. A disabled draw, or one whose entries do not
+ * fit the heap, launches no task workgroups and so no mesh children. With a
+ * heap the entries are allocated here; without one the recording allocated
+ * them for its known grid.
+ */
+KERNEL(1)
+libagx_task_setup(global struct libagx_task_record *rec,
+                  constant uint32_t *grid, constant uint32_t *draw_count,
+                  constant uint32_t *predicate, global struct poly_heap *heap,
+                  uint32_t draw_index, uint32_t inverted)
+{
+   uint32_t n = grid[0] * grid[1] * grid[2];
+   bool enabled = n != 0;
+   if (draw_count)
+      enabled = enabled && draw_index < *draw_count;
+   if (predicate)
+      enabled = enabled && ((*predicate != 0) != (inverted != 0));
+
+   if (enabled && heap) {
+      uint64_t size = (uint64_t)n * rec->stride_B;
+      uint offs = 0;
+      enabled = size <= heap->size &&
+                poly_heap_try_alloc_offs(heap, (uint)size, &offs);
+      if (enabled)
+         rec->entries = (uint64_t)heap->base + offs;
+   }
+
+   rec->task_count = enabled ? n : 0;
+   for (uint i = 0; i < 3; ++i)
+      rec->dispatch[i] = enabled ? grid[i] : 0;
+}
+
 KERNEL(1)
 libagx_conditional_render(global uint32_t *out, constant uint32_t *in,
                           constant uint32_t *predicate, uint32_t words,

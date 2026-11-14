@@ -397,6 +397,10 @@ target_supports_program(const char *target, const nir_function *func)
            * into the mesh dispatch record and the draw's execute word. */
           (!strcmp(target, "g17g") &&
            !strcmp(func->name, "libagx_m5_task_dispatch")) ||
+          /* G17P software task draws: one invocation of constant loads, a
+           * heap allocation and global stores into the task record. */
+          (!strcmp(target, "g17p") &&
+           !strcmp(func->name, "libagx_task_setup")) ||
           !strcmp(func->name, "libagx_draw_robust_index") ||
           !strcmp(func->name, "libagx_draw_robust_index_batch") ||
           !strcmp(func->name, "libagx_unroll_restart") ||
