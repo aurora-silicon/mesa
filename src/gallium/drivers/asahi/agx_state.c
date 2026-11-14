@@ -2275,6 +2275,36 @@ agx_batch_upload_pbe(struct agx_batch *batch,
       arrays_as_2d, force_2d_array, emrt, false, NULL);
 }
 
+/*
+ * Whether a render into one level and layer of a texture can be stored: a
+ * dry run of the end-of-tile PBE the tile program would use
+ * (agx_build_native_g17g_bg_eot). A render whose PBE has no encoding is
+ * dropped while the draw reports success, so callers that can do the work
+ * another way ask first.
+ */
+bool
+agx_g17g_level_renderable(struct agx_context *ctx, struct pipe_resource *prsc,
+                          enum pipe_format format, unsigned level,
+                          unsigned layer)
+{
+   /* The packer only reads the device through the batch. */
+   struct agx_batch scratch = {.ctx = ctx};
+   struct agx_gallium_pbe_descriptor pbe;
+   struct pipe_image_view view = {
+      .resource = prsc,
+      .format = util_format_linear(format),
+      .access = PIPE_IMAGE_ACCESS_READ_WRITE,
+      .shader_access = PIPE_IMAGE_ACCESS_READ_WRITE,
+      .u.tex.single_layer_view = true,
+      .u.tex.first_layer = layer,
+      .u.tex.last_layer = layer,
+      .u.tex.level = level,
+   };
+
+   return agx_batch_upload_pbe(&scratch, &pbe, &view, true, true, false,
+                               false);
+}
+
 /* Likewise constant buffers, textures, and samplers are handled in a common
  * per-draw path, with dirty tracking to reduce the costs involved.
  */
