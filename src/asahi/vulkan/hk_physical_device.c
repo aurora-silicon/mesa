@@ -349,11 +349,14 @@ hk_get_device_features(
       .tessellationShader = true,
 
       
-      .taskShader = dev->chip == AGX_CHIP_G17S &&
-                    supported_extensions->EXT_mesh_shader &&
-                    hk_m5_task_record(dev->params.features),
+      .taskShader = supported_extensions->EXT_mesh_shader &&
+                    (dev->chip == AGX_CHIP_G17P ||
+                     (dev->chip == AGX_CHIP_G17S &&
+                      hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
-      .multiviewMeshShader = false,
+      /* G17P replays a multiview mesh draw per view, as other draws. */
+      .multiviewMeshShader = dev->chip == AGX_CHIP_G17P &&
+                             supported_extensions->EXT_mesh_shader,
       .primitiveFragmentShadingRateMeshShader = false,
       .meshShaderQueries =
          !agx_chip_g17_m5(dev->chip) && supported_extensions->EXT_mesh_shader,
@@ -1314,7 +1317,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      .maxMeshMultiviewViewCount = 1,
+      /* A multiview mesh draw replays once per view (hk_foreach_view), which
+       * works up to HK_MAX_MULTIVIEW_VIEW_COUNT. Temporarily 16: CTS
+       * mesh_shader.ext.properties.max_view_index builds its view mask as
+       * (1u << count) - 1, undefined at 32. Raise it once the CTS is fixed. */
+      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
@@ -1415,7 +1422,8 @@ hk_get_device_properties(const struct agx_device *dev,
          VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
          VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR,
       .subgroupQuadOperationsInAllStages = true,
-      .meshAndTaskShaderDerivatives = false,
+      .meshAndTaskShaderDerivatives =
+         dev->chip == AGX_CHIP_G17P && features->meshShader,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_USER_CLIP_PLANES_ONLY,
       .maxMultiviewViewCount = HK_MAX_MULTIVIEW_VIEW_COUNT,
       .maxMultiviewInstanceIndex = UINT32_MAX,
@@ -1501,10 +1509,14 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
       /* The only subgroup size is 32, so requiring it is always satisfied,
-       * also in ray tracing stages, which are inlined into compute kernels. */
+       * also in ray tracing stages, which are inlined into compute kernels,
+       * and in G17P task (compute) and mesh stages. */
       .requiredSubgroupSizeStages =
          VK_SHADER_STAGE_COMPUTE_BIT |
-         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0),
+         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0) |
+         (dev->chip == AGX_CHIP_G17P && features->meshShader
+             ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT
+             : 0),
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
@@ -2263,8 +2275,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    struct vk_features supported_features;
+   /* G17P runs mesh shaders natively and task shaders in software. */
    if (pdev->dev.chip == AGX_CHIP_G17P)
-      supported_extensions.EXT_mesh_shader = hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE;
+      supported_extensions.EXT_mesh_shader = true;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 

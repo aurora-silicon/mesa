@@ -114,7 +114,7 @@ lower_implicit_sample(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
 bool
 agx_nir_lower_compute_derivatives(nir_shader *s)
 {
-   assert(s->info.stage == MESA_SHADER_COMPUTE &&
+   assert(mesa_shader_stage_uses_workgroup(s->info.stage) &&
           s->info.derivative_group != DERIVATIVE_GROUP_NONE);
 
    bool progress = false;
@@ -161,8 +161,10 @@ lower_quad_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
    case nir_intrinsic_load_global_invocation_id: {
       b->cursor = nir_before_instr(&intr->instr);
-      nir_def *group = nir_iadd(b, nir_load_workgroup_id(b),
-                                nir_load_base_workgroup_id(b, 32));
+      /* Only a compute dispatch has a base workgroup. */
+      nir_def *group = nir_load_workgroup_id(b);
+      if (s->info.stage == MESA_SHADER_COMPUTE)
+         group = nir_iadd(b, group, nir_load_base_workgroup_id(b, 32));
       nir_def *global = nir_iadd(b, nir_imul(b, group, workgroup_size(b, s)),
                                  nir_load_local_invocation_id(b));
       nir_def_replace(&intr->def, nir_u2uN(b, global, bit_size));
@@ -176,7 +178,7 @@ lower_quad_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 bool
 agx_nir_lower_quad_derivative_ids(nir_shader *s)
 {
-   assert(s->info.stage == MESA_SHADER_COMPUTE &&
+   assert(mesa_shader_stage_uses_workgroup(s->info.stage) &&
           s->info.derivative_group == DERIVATIVE_GROUP_QUADS);
    return nir_shader_intrinsics_pass(s, lower_quad_id,
                                      nir_metadata_control_flow, s);

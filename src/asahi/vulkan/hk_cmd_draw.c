@@ -1760,7 +1760,11 @@ hk_m5_vertex_secondary_storage(const struct agx_linked_shader *linked)
 static inline struct hk_shader *
 hk_native_mesh_object(struct hk_graphics_state *gfx, bool *task)
 {
-   if (gfx->shaders[MESA_SHADER_TASK]) {
+   /* A G17P software task kernel is a compute program, run ahead of the
+    * render; the mesh shader's own object launches the children. */
+   if (gfx->shaders[MESA_SHADER_TASK] &&
+       gfx->shaders[MESA_SHADER_TASK]->variants[0].b.info.stage !=
+          MESA_SHADER_COMPUTE) {
       *task = true;
       return &gfx->shaders[MESA_SHADER_TASK]->variants[0];
    }
@@ -11085,6 +11089,15 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   if (IS_DIRTY(VP_VIEWPORTS) && dev->dev.chip == AGX_CHIP_G17P) {
+      const float height = dyn->vp.viewports[0].height;
+      const float bias = height != 0.0f ? 1.0f / (32.0f * height) : 0.0f;
+      if (desc->root.line_y_bias != bias) {
+         desc->root.line_y_bias = bias;
+         desc->root_dirty = true;
+      }
+   }
+
    if (IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
       const float clip_z_coeff =
          dyn->vp.depth_clip_negative_one_to_one ? 0.5f : 0.0f;
@@ -13127,6 +13140,224 @@ hk_draw(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw)
    hk_draw_impl(cmd, draw_id, draw, NULL);
 }
 
+/* Record the VDM mesh launch of a draw whose object program, root and
+ * object parameters are already set up. */
+static void
+hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const struct hk_mesh_info *mesh_info =
+      &hk_main_mesh_variant(gfx->shaders[MESA_SHADER_MESH])->info.mesh;
+   gfx->shaders_dirty |= BITFIELD_BIT(MESA_SHADER_MESH);
+   hk_g17p_note_depth_use(cmd);
+   struct agx_draw dummy = {.b = agx_1d(3)};
+   bool robust = false, tail = false;
+   struct hk_cs *cs = hk_flush_gfx_state(cmd, draw_id, &dummy, &robust,
+                                        &tail, NULL);
+   if (!cs || vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+   cs->g17p_primitive_bound = UINT64_MAX;
+
+   if (tail) {
+      uint32_t draw_state_offset;
+      if (!hk_g17p_draw_state_offset(cmd, cs, &draw_state_offset)) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return;
+      }
+      memcpy(cs->current, &draw_state_offset, sizeof(draw_state_offset));
+      cs->current += sizeof(draw_state_offset);
+   }
+   struct agx_vdm_mesh_dispatch_info dispatch = {
+      .threads = {3, 1, 1}, .local_size = {3, 1, 1},
+      .primitive = mesh_info->prim == MESA_PRIM_POINTS ? 0
+                 : mesh_info->prim == MESA_PRIM_LINES  ? 1 : 6,
+   };
+   if (!agx_vdm_mesh_dispatch_pack(dev->dev.chip, &dispatch, cs->current)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   cs->current += AGX_VDM_MESH_DISPATCH_LENGTH;
+   cs->stats.calls++;
+   hk_upload_stat(cmd, draws, 1);
+   hk_note_pre_raster_images(cmd, cs);
+   cs->stats.cmds++;
+   vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
+   gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
+   gfx->descriptors.root_dirty = false;
+}
+
+/* A known grid's entries are allocated at recording (a large allocation gets
+ * its own BO); a grid only the GPU knows allocates them from the geometry
+ * heap. */
+#define HK_TASK_POOL_ENTRIES_B (1u << 30)
+
+/* The software task stage's pre-graphics work for one draw: resolve the grid
+ * on the GPU if needed, then run the task kernel. Uses the uploaded root. */
+static void
+hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
+                        uint64_t record, uint64_t grid, const uint32_t *cpu_grid,
+                        uint32_t draw_id, uint64_t count_address,
+                        bool conditional, bool gpu_setup, bool pool_entries)
+{
+   struct hk_cs *ccs =
+      hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+   if (!ccs)
+      return;
+   if (gpu_setup) {
+      libagx_task_setup(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_PREGFX, record,
+                        grid, count_address,
+                        conditional ? cmd->state.conditional.address : 0,
+                        pool_entries ? 0 : hk_heap(cmd), draw_id,
+                        conditional && cmd->state.conditional.inverted);
+   }
+   const uint16_t *wg = task->b.info.workgroup_size;
+   struct agx_grid task_grid = gpu_setup
+      ? agx_grid_indirect(record + offsetof(struct libagx_task_record, dispatch))
+      : agx_3d(cpu_grid[0] * wg[0], cpu_grid[1] * wg[1], cpu_grid[2] * wg[2]);
+   hk_dispatch_with_local_size(cmd, ccs, task, task_grid,
+                               agx_workgroup(wg[0], wg[1], wg[2]));
+
+   /* The launch ends in a weak ordering record, which doesn't make the
+    * entries visible to the mesh draws that read them; strengthen it into a
+    * cache flush, as a barrier does. */
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool alias_scope = hk_cdm_alias_scope(dev);
+   if (hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
+      hk_ensure_cs_has_space(cmd, ccs, AGX3_CDM_BARRIER_SIZE);
+      hk_cdm_visibility_flush(dev, ccs, alias_scope);
+   }
+}
+
+/* G17P software task stage. The task shader runs as a compute kernel in the
+ * pre-graphics stream and writes each workgroup's child grid and payload to
+ * its entry of a task record (struct libagx_task_record); the mesh shader's
+ * object then launches every task's children in task order and each mesh
+ * workgroup finds its task (hk_shader.c, hk_g17p_mesh_task_record()). A grid,
+ * draw count or predicate in GPU memory is resolved by libagx_task_setup. */
+static void
+hk_draw_mesh_sw_task(struct hk_cmd_buffer *cmd, uint64_t grid,
+                     const uint32_t *cpu_grid, uint32_t draw_id,
+                     uint64_t count_address)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
+   struct hk_shader *task = &task_api->variants[0];
+   const struct hk_mesh_info *mesh_info =
+      &hk_main_mesh_variant(gfx->shaders[MESA_SHADER_MESH])->info.mesh;
+
+   hk_xfer_check_draw(cmd, grid, grid + 3 * sizeof(uint32_t));
+   if (count_address)
+      hk_xfer_check_draw(cmd, count_address, count_address + sizeof(uint32_t));
+
+   const bool conditional = hk_conditional_render_is_active(
+      &cmd->state.conditional, cmd->in_meta, cmd->conditional_meta);
+   struct libagx_task_record rec = {
+      .stride_B = task->info.mesh.payload_size_B,
+      .mesh_threads = mesh_info->local_size[0] * mesh_info->local_size[1] *
+                      mesh_info->local_size[2],
+   };
+   const uint64_t tasks = cpu_grid
+      ? (uint64_t)cpu_grid[0] * cpu_grid[1] * cpu_grid[2] : 0;
+   const bool pool_entries =
+      cpu_grid && tasks * rec.stride_B <= HK_TASK_POOL_ENTRIES_B;
+   const bool gpu_setup = !pool_entries || count_address || conditional;
+   if (pool_entries) {
+      struct agx_ptr entries = hk_pool_alloc(cmd, tasks * rec.stride_B, 16);
+      if (!entries.cpu) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+      rec.entries = entries.gpu;
+      rec.task_count = tasks;
+      for (unsigned i = 0; i < 3; ++i)
+         rec.dispatch[i] = cpu_grid[i];
+   }
+   if (!pool_entries && !hk_cmd_ensure_geometry_heap(cmd))
+      return;
+   const uint64_t record = hk_pool_upload(cmd, &rec, sizeof(rec), 16);
+   if (!record) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return;
+   }
+
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   desc->root.mesh_task_flag = record;
+   desc->root.mesh_grid_addr = grid;
+   desc->root.mesh_draw_id = draw_id;
+   desc->root.mesh_launch = 0;
+   desc->root_dirty = true;
+   gfx->mesh.grid = grid;
+
+   /* The children are known only on the GPU: record the launches for up to
+    * HK_MESH_LAUNCHES_MAX * HK_MESH_LAUNCH_WGS mesh workgroups; the objects of
+    * launches past the last row publish none. Flushing the first uploads the
+    * root the task kernel reads. */
+   for (uint32_t launch = 0; launch < HK_MESH_LAUNCHES_MAX; ++launch) {
+      const struct {
+         uint64_t record;
+         uint32_t launch, pad;
+      } params = {record, launch};
+      gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
+      if (desc->root.mesh_launch != launch) {
+         desc->root.mesh_launch = launch;
+         desc->root_dirty = true;
+      }
+      hk_record_mesh_launch(cmd, draw_id);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+      if (launch == 0)
+         hk_dispatch_task_kernel(cmd, task, record, grid, cpu_grid, draw_id,
+                                 count_address, conditional, gpu_setup,
+                                 pool_entries);
+   }
+}
+
+/* A G17P mesh draw without a task stage. The predicated object publishes one
+ * launch's rows of the grid (HK_MESH_LAUNCH_WGS): a grid known at recording
+ * takes exactly the launches it needs, one in GPU memory the most it can. */
+static void
+hk_draw_mesh_g17p(struct hk_cmd_buffer *cmd, uint64_t grid,
+                  const uint32_t *cpu_grid, uint32_t draw_id,
+                  uint64_t count_address)
+{
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   hk_xfer_check_draw(cmd, grid, grid + 3 * sizeof(uint32_t));
+   if (count_address)
+      hk_xfer_check_draw(cmd, count_address, count_address + sizeof(uint32_t));
+   const bool conditional = hk_conditional_render_is_active(
+      &cmd->state.conditional, cmd->in_meta, cmd->conditional_meta);
+
+   gfx->mesh.grid = grid;
+   if (desc->root.mesh_grid_addr != grid || desc->root.mesh_draw_id != draw_id) {
+      desc->root.mesh_grid_addr = grid;
+      desc->root.mesh_draw_id = draw_id;
+      desc->root_dirty = true;
+   }
+   const uint32_t launches = cpu_grid
+      ? DIV_ROUND_UP((uint64_t)cpu_grid[1] * cpu_grid[2],
+                     hk_mesh_launch_rows(cpu_grid[0]))
+      : HK_MESH_LAUNCHES_MAX;
+   for (uint32_t launch = 0; launch < launches; ++launch) {
+      const struct {
+         uint64_t grid, count, predicate;
+         uint32_t draw_id, inverted, launch, pad;
+      } params = {grid, count_address,
+         conditional ? cmd->state.conditional.address : 0,
+         draw_id, conditional && cmd->state.conditional.inverted, launch};
+      gfx->mesh.object_params = hk_pool_upload(cmd, &params, sizeof(params), 8);
+      if (desc->root.mesh_launch != launch) {
+         desc->root.mesh_launch = launch;
+         desc->root_dirty = true;
+      }
+      hk_record_mesh_launch(cmd, draw_id);
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return;
+   }
+}
+
 static void
 hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
                     const uint32_t *cpu_grid, uint32_t draw_id,
@@ -13135,13 +13366,22 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
+   const bool sw_task = task_api && dev->dev.chip == AGX_CHIP_G17P;
    if (!gfx->shaders[MESA_SHADER_MESH] ||
-       (task_api && (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_enabled())) ||
-       (dev->dev.chip == AGX_CHIP_G17P
-          ? hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE
-          : (dev->dev.chip != AGX_CHIP_G17S ||
-             !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
+       (task_api && !sw_task &&
+        (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_enabled())) ||
+       (dev->dev.chip != AGX_CHIP_G17P &&
+        (dev->dev.chip != AGX_CHIP_G17S ||
+         !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (sw_task) {
+      hk_draw_mesh_sw_task(cmd, grid, cpu_grid, draw_id, count_address);
+      return;
+   }
+   if (dev->dev.chip == AGX_CHIP_G17P) {
+      hk_draw_mesh_g17p(cmd, grid, cpu_grid, draw_id, count_address);
       return;
    }
    gfx->mesh.grid = grid;
@@ -13286,8 +13526,9 @@ hk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX,
    if (!groupCountX || !groupCountY || !groupCountZ)
       return;
    const uint32_t grid[4] = {groupCountX, groupCountY, groupCountZ, 0};
-   hk_draw_mesh_native(cmd, hk_pool_upload(cmd, grid, sizeof(grid), 16), grid,
-                       0, 0);
+   const uint64_t grid_addr = hk_pool_upload(cmd, grid, sizeof(grid), 16);
+   hk_foreach_view(cmd)
+      hk_draw_mesh_native(cmd, grid_addr, grid, 0, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -13297,9 +13538,11 @@ hk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_buffer, src, buffer);
-   for (unsigned i = 0; i < drawCount; ++i)
-      hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
-                          NULL, i, 0);
+   hk_foreach_view(cmd) {
+      for (unsigned i = 0; i < drawCount; ++i)
+         hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
+                             NULL, i, 0);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -13312,9 +13555,11 @@ hk_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buff
    VK_FROM_HANDLE(hk_buffer, src, buffer);
    VK_FROM_HANDLE(hk_buffer, count, countBuffer);
    const uint64_t count_address = hk_buffer_address_rw(count, countBufferOffset);
-   for (unsigned i = 0; i < maxDrawCount; ++i)
-      hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
-                          NULL, i, count_address);
+   hk_foreach_view(cmd) {
+      for (unsigned i = 0; i < maxDrawCount; ++i)
+         hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
+                             NULL, i, count_address);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -44,6 +44,7 @@
 #include "hk_image.h"
 #include "hk_agx3_vdm_decode.h"
 #include "libagx.h"
+#include "libagx_dgc.h"
 #include "nir.h"
 #include "nir_serialize.h"
 #include "util/blob.h"
@@ -562,9 +563,14 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
 {
    hk_preprocess_nir_internal(vk_pdev, nir);
    const enum agx_chip chip = ((struct hk_physical_device *)vk_pdev)->dev.chip;
+   /* G17P task shaders run as compute kernels, and mesh workgroups map
+    * invocations to lanes as compute does, so they take the same derivatives
+    * (meshAndTaskShaderDerivatives). */
    const bool g17p_compute_derivatives =
-      (chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
-      nir->info.stage == MESA_SHADER_COMPUTE &&
+      (((chip == AGX_CHIP_G17P || agx_chip_g17_m5(chip)) &&
+        nir->info.stage == MESA_SHADER_COMPUTE) ||
+       (chip == AGX_CHIP_G17P && (nir->info.stage == MESA_SHADER_TASK ||
+                                  nir->info.stage == MESA_SHADER_MESH))) &&
       nir->info.derivative_group != DERIVATIVE_GROUP_NONE;
    nir_lower_compute_system_values_options csv_options = {
       /* Only vkCmdDispatchBase has a base workgroup. Task/mesh draws have
@@ -2437,6 +2443,31 @@ hk_lower_multiview(nir_shader *nir)
                                      ? nir_before_impl(impl)
                                      : nir_after_impl(impl));
 
+   if (nir->info.stage == MESA_SHADER_MESH) {
+      /* Every primitive the workgroup may output goes to the view's layer. */
+      const unsigned prims = nir->info.mesh.max_primitives_out;
+      const unsigned threads = nir->info.workgroup_size[0] *
+                               nir->info.workgroup_size[1] *
+                               nir->info.workgroup_size[2];
+      nir_variable *layer = nir_variable_create(
+         nir, nir_var_shader_out, glsl_array_type(glsl_uint_type(), prims, 0),
+         "view_layer");
+      layer->data.location = VARYING_SLOT_LAYER;
+      layer->data.per_primitive = true;
+      nir_def *view = nir_load_view_index(&b);
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      for (unsigned first = 0; first < prims; first += threads) {
+         nir_def *prim = nir_iadd_imm(&b, lane, first);
+         nir_push_if(&b, nir_ult_imm(&b, prim, prims));
+         nir_store_deref(&b, nir_build_deref_array(&b,
+                            nir_build_deref_var(&b, layer), prim), view, 1);
+         nir_pop_if(&b, NULL);
+      }
+      nir->info.outputs_written |= VARYING_BIT_LAYER;
+      nir->info.per_primitive_outputs |= VARYING_BIT_LAYER;
+      return;
+   }
+
    nir_variable *layer =
       nir_variable_create(nir, nir_var_shader_out, glsl_uint_type(), NULL);
 
@@ -3015,6 +3046,7 @@ hk_lower_multiview_stage(mesa_shader_stage stage,
    case MESA_SHADER_TESS_EVAL:
       return !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT);
    case MESA_SHADER_GEOMETRY:
+   case MESA_SHADER_MESH:
       return true;
    default:
       return false;
@@ -3544,9 +3576,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * the mesh branch then preprocesses every shared access exactly once.
     * Reprocessing here and there divides preexisting element indices again.
     * The M5 task (object) branch likewise preprocesses after adding its
-    * child-grid words. */
+    * child-grid words, and the G17P task kernel after its payload lowering. */
    if (nir->info.stage != MESA_SHADER_MESH &&
-       !(nir->info.stage == MESA_SHADER_TASK && agx_chip_g17_m5(dev->dev.chip))) {
+       !(nir->info.stage == MESA_SHADER_TASK &&
+         (agx_chip_g17_m5(dev->dev.chip) || dev->dev.chip == AGX_CHIP_G17P))) {
       if (agx_native_graphics(&dev->dev))
          agx_preprocess_nir_native(nir, dev->dev.chip);
       else if (dev->dev.chip == AGX_CHIP_G18G)
@@ -4747,9 +4780,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
               (nir->info.stage == MESA_SHADER_GEOMETRY ||
                nir->info.stage == MESA_SHADER_TESS_CTRL ||
                nir->info.stage == MESA_SHADER_TESS_EVAL ||
-               nir->info.stage == MESA_SHADER_MESH)) {
+               nir->info.stage == MESA_SHADER_MESH ||
+               sw_stage == MESA_SHADER_TASK)) {
       /* Poly executes geometry variants through CDM, so they use the native
-       * indexed texture/sampler heaps just like compute shaders. Metal has no
+       * indexed texture/sampler heaps just like compute shaders; so does the
+       * G17P software task kernel. Metal has no
        * geometry stage, but its indexed explicit-level vertex witness emits
        * the same register-operand SMP form selected after this rewrite. The
        * VDM-launched mesh program takes the heaps in uniform halves 0..7 like
@@ -5973,6 +6008,40 @@ hk_fs_build_sample_variant(struct hk_device *dev, struct hk_api_shader *obj,
    return result;
 }
 
+/* Launch `launch` of a mesh draw of `rows` rows of x workgroups: count rows
+ * from row first, published as y rows by z slices (hk_mesh_launch_rows()). */
+struct hk_mesh_launch {
+   nir_def *first, *count, *y, *z;
+};
+
+static struct hk_mesh_launch
+hk_mesh_launch_shape(nir_builder *b, nir_def *x, nir_def *rows, nir_def *launch)
+{
+   struct hk_mesh_launch l;
+   nir_def *zero = nir_imm_int(b, 0), *one = nir_imm_int(b, 1);
+   nir_def *per = nir_umax(b, nir_udiv(b, nir_imm_int(b, HK_MESH_LAUNCH_WGS),
+                                       nir_umax(b, x, one)), one);
+   nir_def *slices = nir_udiv_imm(b, nir_iadd_imm(b, per, HK_MESH_LAUNCH_MAX_Y - 1),
+                                  HK_MESH_LAUNCH_MAX_Y);
+   nir_def *slice_rows = nir_udiv(b, per, slices);
+   nir_def *launch_rows = nir_imul(b, slice_rows, slices);
+   l.first = nir_imul(b, launch, launch_rows);
+   nir_def *left = nir_bcsel(b, nir_ult(b, l.first, rows), nir_isub(b, rows, l.first), zero);
+   l.count = nir_bcsel(b, nir_ieq_imm(b, x, 0), zero, nir_umin(b, left, launch_rows));
+   l.y = nir_umin(b, l.count, slice_rows);
+   l.z = nir_bcsel(b, nir_ieq_imm(b, l.count, 0), zero,
+                   nir_udiv(b, nir_iadd(b, l.count, nir_iadd_imm(b, l.y, -1)),
+                            nir_umax(b, l.y, one)));
+   return l;
+}
+
+/* A mesh workgroup's row within its launch (hk_mesh_launch_shape()). */
+static nir_def *
+hk_mesh_launch_row(nir_builder *b, nir_def *wg, const struct hk_mesh_launch *l)
+{
+   return nir_iadd(b, nir_channel(b, wg, 1), nir_imul(b, nir_channel(b, wg, 2), l->y));
+}
+
 /* Parameter block addressed by the predicated object's uniform0 pointer.
  * The ordinary mesh-only object keeps its smaller native passthrough ABI. */
 static nir_shader *
@@ -6011,8 +6080,23 @@ hk_build_predicated_mesh_object(enum agx_chip chip)
    }
    nir_pop_if(&b, NULL);
    nir_def *lane = nir_load_local_invocation_index(&b);
-   nir_def *value = nir_load_global_constant(&b, 1, 32,
-      nir_iadd(&b, grid, nir_u2u64(&b, nir_imul_imm(&b, lane, 4))), .align_mul = 4);
+   nir_def *value;
+   if (chip == AGX_CHIP_G17P) {
+      /* This launch's rows of the grid (hk_mesh_launch_shape()). */
+      nir_def *g = nir_load_global_constant(&b, 3, 32, grid, .align_mul = 4);
+      nir_def *launch = nir_load_global_constant(&b, 1, 32,
+         nir_iadd_imm(&b, params, 32), .align_mul = 4);
+      nir_def *x = nir_channel(&b, g, 0);
+      struct hk_mesh_launch l = hk_mesh_launch_shape(&b, x,
+         nir_imul(&b, nir_channel(&b, g, 1), nir_channel(&b, g, 2)), launch);
+      nir_store_var(&b, enabled, nir_iand(&b, nir_load_var(&b, enabled),
+         nir_ine_imm(&b, l.count, 0)), 1);
+      value = nir_bcsel(&b, nir_ieq_imm(&b, lane, 0), x,
+                        nir_bcsel(&b, nir_ieq_imm(&b, lane, 1), l.y, l.z));
+   } else {
+      value = nir_load_global_constant(&b, 1, 32,
+         nir_iadd(&b, grid, nir_u2u64(&b, nir_imul_imm(&b, lane, 4))), .align_mul = 4);
+   }
    nir_store_object_childcount_agx(&b, nir_bcsel(&b, nir_load_var(&b, enabled),
                                                value, nir_imm_int(&b, 0)));
    if (agx_chip_g17_m5(chip))
@@ -6021,6 +6105,11 @@ hk_build_predicated_mesh_object(enum agx_chip chip)
       agx_preprocess_nir_native(b.shader, chip);
    return b.shader;
 }
+
+/* The mesh object of a software task draw: launch the children of every task
+ * entry (hk_g17p_mesh_task_record() decodes the grid). uniform0 points at the
+ * task record. */
+static nir_shader *hk_build_task_mesh_object(enum agx_chip chip);
 
 /* twin_of: compile the custom-border-emulating twin of the shader that
  * saved these inputs; info then names its NIR and saved create inputs. */
@@ -6038,50 +6127,64 @@ hk_mesh_query_root(nir_builder *b, unsigned bit_size, unsigned offset)
                                    .access = ACCESS_CAN_SPECULATE);
 }
 
+/* invocations: count mesh invocations here. A mesh shader launched by the
+ * software task stage leaves that to the task kernel, which knows how many of
+ * its padded workgroups are real. */
 static bool
-hk_lower_mesh_queries(nir_shader *nir)
+hk_lower_mesh_queries(nir_shader *nir, bool invocations)
 {
    if (nir->info.stage != MESA_SHADER_MESH)
       return false;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   nir_intrinsic_instr *counts = NULL;
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             nir_instr_as_intrinsic(instr)->intrinsic ==
-                nir_intrinsic_set_vertex_and_primitive_count)
-            counts = nir_instr_as_intrinsic(instr);
-      }
-   }
-
    nir_builder b = nir_builder_at(nir_before_impl(impl));
    const unsigned threads = nir->info.workgroup_size[0] *
                             nir->info.workgroup_size[1] *
                             nir->info.workgroup_size[2];
-   nir_def *flags = hk_mesh_query_root(
-      &b, 32, hk_root_descriptor_offset(draw.pipeline_stats_flags));
-   nir_def *first = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
-   nir_push_if(&b, nir_iand(&b, first, nir_ine_imm(&b, nir_iand_imm(&b, flags,
-      VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT), 0)));
-   {
-      nir_def *addr = nir_load_stat_query_address_poly(
-         &b, .base = PIPE_STAT_QUERY_MS_INVOCATIONS);
-      nir_global_atomic(&b, 32, addr, nir_imm_int(&b, threads),
-                        .atomic_op = nir_atomic_op_iadd);
-   }
-   nir_pop_if(&b, NULL);
-
-   if (counts) {
-      b.cursor = nir_after_instr(&counts->instr);
-      nir_def *query = hk_mesh_query_root(
-         &b, 64, hk_root_descriptor_offset(mesh_prims_query));
-      nir_def *lane0 = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
-      nir_push_if(&b, nir_iand(&b, lane0, nir_ine_imm(&b, query, 0)));
-      nir_global_atomic(&b, 32, query, nir_u2u32(&b, counts->src[1].ssa),
-                        .atomic_op = nir_atomic_op_iadd);
+   if (invocations) {
+      nir_def *flags = hk_mesh_query_root(
+         &b, 32, hk_root_descriptor_offset(draw.pipeline_stats_flags));
+      nir_def *first = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
+      nir_push_if(&b, nir_iand(&b, first, nir_ine_imm(&b, nir_iand_imm(&b, flags,
+         VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT), 0)));
+      {
+         nir_def *addr = nir_load_stat_query_address_poly(
+            &b, .base = PIPE_STAT_QUERY_MS_INVOCATIONS);
+         nir_global_atomic(&b, 32, addr, nir_imm_int(&b, threads),
+                           .atomic_op = nir_atomic_op_iadd);
+      }
       nir_pop_if(&b, NULL);
    }
+
+   /* Collect first: the query code below splits blocks. */
+   struct util_dynarray sites;
+   util_dynarray_init(&sites, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic ||
+             nir_instr_as_intrinsic(instr)->intrinsic !=
+                nir_intrinsic_set_vertex_and_primitive_count)
+            continue;
+         nir_intrinsic_instr *counts = nir_instr_as_intrinsic(instr);
+         if (!nir_src_is_const(counts->src[1]) ||
+             nir_src_as_uint(counts->src[1]) != 0)
+            util_dynarray_append(&sites, counts);
+      }
+   }
+   util_dynarray_foreach(&sites, nir_intrinsic_instr *, site) {
+      {
+         nir_intrinsic_instr *counts = *site;
+         b.cursor = nir_after_instr(&counts->instr);
+         nir_def *query = hk_mesh_query_root(
+            &b, 64, hk_root_descriptor_offset(mesh_prims_query));
+         nir_def *lane0 = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
+         nir_push_if(&b, nir_iand(&b, lane0, nir_ine_imm(&b, query, 0)));
+         nir_global_atomic(&b, 32, query, nir_u2u32(&b, counts->src[1].ssa),
+                           .atomic_op = nir_atomic_op_iadd);
+         nir_pop_if(&b, NULL);
+      }
+   }
+   util_dynarray_fini(&sites);
 
    return nir_progress(true, impl, nir_metadata_none);
 }
@@ -6131,6 +6234,439 @@ hk_m5_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
       return false;
    NIR_PASS(_, nir, agx_nir_lower_m5_mesh_task_record);
    return true;
+}
+
+/* Software task stage (G17P). The task kernel leaves one entry per task
+ * workgroup (libagx_task_record). The mesh objects launch every task's
+ * children in rows: x indexes the child within a row (32768 per row) and y
+ * the row, task after task, split into launches (hk_task_rows()). Tasks with
+ * fewer children than the largest leave empty workgroups, which output
+ * nothing.
+ */
+#define HK_TASK_CHILD_ROW 32768
+
+static nir_def *
+hk_task_record_addr(nir_builder *b)
+{
+   return nir_load_global_constant(b, 1, 64,
+      nir_iadd_imm(b, nir_load_root_agx(b),
+                   hk_root_descriptor_offset(mesh_task_flag)),
+      .align_mul = 8, .access = ACCESS_CAN_SPECULATE);
+}
+
+/* The software task draw's mesh launch: each task gets rows of x children
+ * (x = the largest child count, at most HK_TASK_CHILD_ROW). */
+struct hk_task_rows {
+   nir_def *x, *task_rows, *tasks;
+   struct hk_mesh_launch l;
+};
+
+static struct hk_task_rows
+hk_task_rows(nir_builder *b, nir_def *max_children, nir_def *tasks,
+             nir_def *launch)
+{
+   struct hk_task_rows r = {.tasks = tasks};
+   r.x = nir_umin(b, max_children, nir_imm_int(b, HK_TASK_CHILD_ROW));
+   r.task_rows = nir_bcsel(b, nir_ugt_imm(b, max_children, HK_TASK_CHILD_ROW),
+                           nir_ushr_imm(b, nir_iadd_imm(b, max_children,
+                                                        HK_TASK_CHILD_ROW - 1), 15),
+                           nir_imm_int(b, 1));
+   r.l = hk_mesh_launch_shape(b, r.x, nir_imul(b, r.task_rows, tasks), launch);
+   return r;
+}
+
+static nir_def *
+hk_mesh_launch_index(nir_builder *b)
+{
+   return nir_load_global_constant(b, 1, 32,
+      nir_iadd_imm(b, nir_load_root_agx(b),
+                   hk_root_descriptor_offset(mesh_launch)),
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+}
+
+static bool
+hk_mesh_task_rewrite(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_def **decoded = data;
+   nir_def *id = decoded[0], *grid = decoded[1], *payload = decoded[2];
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_workgroup_id:
+      if (&intr->def == decoded[3])
+         return false;
+      nir_def_replace(&intr->def, nir_u2uN(b, id, intr->def.bit_size));
+      return true;
+   case nir_intrinsic_load_num_workgroups:
+      if (!grid || &intr->def == decoded[4])
+         return false;
+      nir_def_replace(&intr->def, nir_u2uN(b, grid, intr->def.bit_size));
+      return true;
+   case nir_intrinsic_load_global_invocation_id: {
+      const uint16_t *size = b->shader->info.workgroup_size;
+      nir_def *global = nir_iadd(b,
+         nir_imul(b, id, nir_imm_ivec3(b, size[0], size[1], size[2])),
+         nir_load_local_invocation_id(b));
+      nir_def_replace(&intr->def, nir_u2uN(b, global, intr->def.bit_size));
+      return true;
+   }
+   case nir_intrinsic_load_task_payload: {
+      if (!payload)
+         return false;
+      nir_def *addr = nir_iadd(b, payload, nir_u2u64(b,
+         nir_iadd_imm(b, intr->src[0].ssa, nir_intrinsic_base(intr))));
+      nir_def_replace(&intr->def, nir_load_global(b,
+         intr->def.num_components, intr->def.bit_size, addr,
+         .align_mul = nir_intrinsic_align_mul(intr),
+         .align_offset = nir_intrinsic_align_offset(intr),
+         .access = ACCESS_NON_WRITEABLE));
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* A mesh shader that never calls SetMeshOutputsEXT outputs nothing. */
+static bool
+hk_g17p_mesh_default_counts(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_set_vertex_and_primitive_count)
+            return false;
+      }
+   }
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                      nir_undef(&b, 1, 32));
+   return nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+/* A G17P mesh shader used with a task stage: find the launching task's entry
+ * from the hardware workgroup ID, read the child grid and payload from it, and
+ * run the body only for a real child. Runs before hk_lower_nir, which would
+ * turn gl_NumWorkGroups into the API grid of the draw. */
+static void
+hk_g17p_mesh_task_record(nir_shader *nir)
+{
+   NIR_PASS(_, nir, hk_g17p_mesh_default_counts);
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload,
+            shared_var_info);
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_task_payload,
+            nir_address_format_32bit_offset);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   nir_def *rec = hk_task_record_addr(&b);
+   nir_def *hdr = nir_load_global(&b, 3, 32, rec, .align_mul = 16,
+                                  .access = ACCESS_NON_WRITEABLE);
+   nir_def *entries = nir_load_global(&b, 1, 64, nir_iadd_imm(&b, rec,
+      offsetof(struct libagx_task_record, entries)), .align_mul = 8,
+      .access = ACCESS_NON_WRITEABLE);
+   nir_def *max_children = nir_channel(&b, hdr, 0);
+   nir_def *tasks = nir_channel(&b, hdr, 1);
+   nir_def *stride = nir_channel(&b, hdr, 2);
+
+   nir_def *wg = nir_load_workgroup_id(&b);
+   struct hk_task_rows r = hk_task_rows(&b, max_children, tasks,
+                                        hk_mesh_launch_index(&b));
+   nir_def *launch_row = hk_mesh_launch_row(&b, wg, &r.l);
+   nir_def *global_row = nir_iadd(&b, r.l.first, launch_row);
+   nir_def *task = nir_udiv(&b, global_row, r.task_rows);
+   nir_def *row = nir_isub(&b, global_row, nir_imul(&b, task, r.task_rows));
+   nir_def *child = nir_iadd(&b, nir_channel(&b, wg, 0), nir_imul(&b, row, r.x));
+   nir_def *task_ok = nir_ult(&b, task, tasks);
+   nir_def *entry = nir_iadd(&b, entries,
+      nir_imul(&b, nir_u2u64(&b, nir_bcsel(&b, task_ok, task, nir_imm_int(&b, 0))),
+               nir_u2u64(&b, stride)));
+   nir_def *grid = nir_load_global(&b, 3, 32, entry, .align_mul = 16,
+                                   .access = ACCESS_NON_WRITEABLE);
+   grid = nir_bcsel(&b, task_ok, grid, nir_imm_ivec3(&b, 0, 0, 0));
+   nir_def *gx = nir_channel(&b, grid, 0), *gy = nir_channel(&b, grid, 1);
+   nir_def *count = nir_imul(&b, nir_imul(&b, gx, gy), nir_channel(&b, grid, 2));
+   nir_def *valid = nir_iand(&b, nir_ult(&b, child, count),
+                             nir_ult(&b, launch_row, r.l.count));
+   gx = nir_umax(&b, gx, nir_imm_int(&b, 1));
+   gy = nir_umax(&b, gy, nir_imm_int(&b, 1));
+   nir_def *rest = nir_udiv(&b, child, gx);
+   nir_def *id = nir_vec3(&b, nir_isub(&b, child, nir_imul(&b, rest, gx)),
+                          nir_umod(&b, rest, gy), nir_udiv(&b, rest, gy));
+   nir_def *payload = nir_iadd_imm(&b, entry, LIBAGX_TASK_ENTRY_PAYLOAD_B);
+
+   nir_push_if(&b, valid);
+   b.cursor = nir_cf_reinsert(&body, b.cursor);
+   nir_push_else(&b, NULL);
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                      nir_undef(&b, 1, 32));
+   nir_pop_if(&b, NULL);
+   nir_progress(true, impl, nir_metadata_none);
+
+   nir_def *decoded[5] = {id, grid, payload, wg, NULL};
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_mesh_task_rewrite,
+            nir_metadata_control_flow, decoded);
+}
+
+struct hk_task_kernel {
+   nir_def *rec, *entry, *mesh_threads;
+};
+
+static bool
+hk_task_kernel_rewrite(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct hk_task_kernel *k = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_barrier: {
+      const nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+      if (!(modes & nir_var_mem_task_payload))
+         return false;
+      nir_intrinsic_set_memory_modes(intr,
+         (modes & ~nir_var_mem_task_payload) | nir_var_mem_global);
+      return true;
+   }
+   case nir_intrinsic_load_task_payload:
+   case nir_intrinsic_store_task_payload: {
+      const bool store = intr->intrinsic == nir_intrinsic_store_task_payload;
+      nir_def *offset = intr->src[store ? 1 : 0].ssa;
+      nir_def *addr = nir_iadd(b, k->entry, nir_u2u64(b,
+         nir_iadd_imm(b, offset, LIBAGX_TASK_ENTRY_PAYLOAD_B +
+                                 nir_intrinsic_base(intr))));
+      if (store) {
+         nir_store_global(b, intr->src[0].ssa, addr,
+                          .write_mask = nir_intrinsic_write_mask(intr),
+                          .align_mul = nir_intrinsic_align_mul(intr),
+                          .align_offset = nir_intrinsic_align_offset(intr));
+         nir_instr_remove(&intr->instr);
+      } else {
+         nir_def_replace(&intr->def, nir_load_global(b,
+            intr->def.num_components, intr->def.bit_size, addr,
+            .align_mul = nir_intrinsic_align_mul(intr),
+            .align_offset = nir_intrinsic_align_offset(intr)));
+      }
+      return true;
+   }
+   case nir_intrinsic_launch_mesh_workgroups: {
+      /* The arguments of the first invocation launch the children. */
+      nir_def *grid = intr->src[0].ssa;
+      nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
+      {
+         nir_store_global(b, nir_pad_vector_imm_int(b, grid, 0, 4), k->entry,
+                          .write_mask = 0xf, .align_mul = 16);
+         nir_def *count = nir_imul(b, nir_imul(b, nir_channel(b, grid, 0),
+                                               nir_channel(b, grid, 1)),
+                                   nir_channel(b, grid, 2));
+         nir_global_atomic(b, 32, k->rec, count, .atomic_op = nir_atomic_op_umax);
+         nir_def *flags = hk_mesh_query_root(
+            b, 32, hk_root_descriptor_offset(draw.pipeline_stats_flags));
+         nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, flags,
+            VK_QUERY_PIPELINE_STATISTIC_MESH_SHADER_INVOCATIONS_BIT_EXT), 0));
+         {
+            nir_def *addr = nir_load_stat_query_address_poly(
+               b, .base = PIPE_STAT_QUERY_MS_INVOCATIONS);
+            nir_global_atomic(b, 32, addr, nir_imul(b, count, k->mesh_threads),
+                              .atomic_op = nir_atomic_op_iadd);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* nir_lower_task_shader() addresses the payload it keeps in shared memory
+ * with large constant bases; the AGX3 threadgroup forms take at most 255 in
+ * their byte-offset field, so move every base into the offset. */
+static bool
+hk_shared_base_to_offset(nir_builder *b, nir_intrinsic_instr *intr,
+                         UNUSED void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_store_shared:
+   case nir_intrinsic_shared_atomic:
+   case nir_intrinsic_shared_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+   const unsigned base = nir_intrinsic_base(intr);
+   if (!base)
+      return false;
+   nir_src *offset = nir_get_io_offset_src(intr);
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(offset, nir_iadd_imm(b, offset->ssa, base));
+   nir_intrinsic_set_base(intr, 0);
+   return true;
+}
+
+/* Lower a G17P API task shader to the compute kernel of the software task
+ * stage: the draw runs it ahead of the render (hk_draw_mesh_native), and each
+ * workgroup writes its child grid and payload to its entry of the task
+ * record. Payload accesses go to the entry; payload atomics and sub-dword
+ * payload accesses use shared memory, copied out before the launch. */
+static void
+hk_g17p_lower_task_kernel(nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_lower_task_shader,
+            (nir_lower_task_shader_options){
+               .payload_to_shared_for_atomics = true,
+               .payload_to_shared_for_small_types = true,
+            });
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_shared_base_to_offset,
+            nir_metadata_control_flow, NULL);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   struct hk_task_kernel k = {.rec = hk_task_record_addr(&b)};
+   nir_def *hdr = nir_load_global(&b, 2, 32, nir_iadd_imm(&b, k.rec,
+      offsetof(struct libagx_task_record, stride_B)), .align_mul = 8,
+      .access = ACCESS_NON_WRITEABLE);
+   nir_def *entries = nir_load_global(&b, 1, 64, nir_iadd_imm(&b, k.rec,
+      offsetof(struct libagx_task_record, entries)), .align_mul = 8,
+      .access = ACCESS_NON_WRITEABLE);
+   k.mesh_threads = nir_channel(&b, hdr, 1);
+   nir_def *grid_ptr = nir_load_global_constant(&b, 1, 64,
+      nir_iadd_imm(&b, nir_load_root_agx(&b),
+                   hk_root_descriptor_offset(mesh_grid_addr)),
+      .align_mul = 8, .access = ACCESS_CAN_SPECULATE);
+   nir_def *groups = nir_load_global_constant(&b, 3, 32, grid_ptr,
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+   nir_def *wg = nir_load_workgroup_id(&b);
+   nir_def *task = nir_iadd(&b, nir_channel(&b, wg, 0),
+      nir_imul(&b, nir_channel(&b, groups, 0),
+               nir_iadd(&b, nir_channel(&b, wg, 1),
+                        nir_imul(&b, nir_channel(&b, groups, 1),
+                                 nir_channel(&b, wg, 2)))));
+   k.entry = nir_iadd(&b, entries, nir_imul(&b, nir_u2u64(&b, task),
+                      nir_u2u64(&b, nir_channel(&b, hdr, 0))));
+
+   /* An entry starts with no children, for a workgroup that never launches. */
+   nir_def *lane0 = nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0);
+   nir_push_if(&b, lane0);
+   {
+      nir_store_global(&b, nir_imm_ivec4(&b, 0, 0, 0, 0), k.entry,
+                       .write_mask = 0xf, .align_mul = 16);
+      nir_def *flags = hk_mesh_query_root(
+         &b, 32, hk_root_descriptor_offset(draw.pipeline_stats_flags));
+      nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, flags,
+         VK_QUERY_PIPELINE_STATISTIC_TASK_SHADER_INVOCATIONS_BIT_EXT), 0));
+      {
+         const unsigned threads = nir->info.workgroup_size[0] *
+                                  nir->info.workgroup_size[1] *
+                                  nir->info.workgroup_size[2];
+         nir_def *addr = nir_load_stat_query_address_poly(
+            &b, .base = PIPE_STAT_QUERY_TS_INVOCATIONS);
+         nir_global_atomic(&b, 32, addr, nir_imm_int(&b, threads),
+                           .atomic_op = nir_atomic_op_iadd);
+      }
+      nir_pop_if(&b, NULL);
+   }
+   nir_pop_if(&b, NULL);
+   nir_progress(true, impl, nir_metadata_none);
+
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_task_kernel_rewrite,
+            nir_metadata_none, &k);
+
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+}
+
+static nir_shader *
+hk_build_task_mesh_object(enum agx_chip chip)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_TASK, &agx_nir_options, "software task mesh object");
+   b.shader->info.io_lowered = true;
+   b.shader->info.internal = true;
+   b.shader->info.workgroup_size[0] = 3;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+   /* uniform0: {task record, launch} */
+   nir_def *params = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *rec = nir_load_global_constant(&b, 1, 64, params, .align_mul = 8);
+   nir_def *launch = nir_load_global_constant(&b, 1, 32,
+      nir_iadd_imm(&b, params, 8), .align_mul = 4);
+   nir_def *hdr = nir_load_global(&b, 2, 32, rec, .align_mul = 8);
+   struct hk_task_rows r = hk_task_rows(&b, nir_channel(&b, hdr, 0),
+                                        nir_channel(&b, hdr, 1), launch);
+   nir_def *enabled = nir_ine_imm(&b, r.l.count, 0);
+   nir_def *lane = nir_load_local_invocation_index(&b);
+   nir_def *value = nir_bcsel(&b, nir_ieq_imm(&b, lane, 0), r.x,
+                              nir_bcsel(&b, nir_ieq_imm(&b, lane, 1), r.l.y, r.l.z));
+   nir_store_object_childcount_agx(&b, nir_bcsel(&b, enabled, value,
+                                                nir_imm_int(&b, 0)));
+   agx_preprocess_nir_native(b.shader, chip);
+   return b.shader;
+}
+
+/* A G17P mesh shader without a task stage: its workgroups arrive in rows of
+ * the API grid, launch by launch, as y rows by z slices
+ * (hk_build_predicated_mesh_object()), so rebuild the workgroup ID from the
+ * row, and run the body only for a row of the launch (the last slice can be
+ * partial). Runs before hk_lower_nir, which lowers gl_NumWorkGroups to the
+ * API grid. */
+static void
+hk_g17p_mesh_rows(nir_shader *nir)
+{
+   NIR_PASS(_, nir, hk_g17p_mesh_default_counts);
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *grid = nir_load_num_workgroups(&b);
+   nir_def *wg = nir_load_workgroup_id(&b);
+   nir_def *gy = nir_umax(&b, nir_channel(&b, grid, 1), nir_imm_int(&b, 1));
+   struct hk_mesh_launch l = hk_mesh_launch_shape(&b, nir_channel(&b, grid, 0),
+      nir_imul(&b, nir_channel(&b, grid, 1), nir_channel(&b, grid, 2)),
+      hk_mesh_launch_index(&b));
+   nir_def *launch_row = hk_mesh_launch_row(&b, wg, &l);
+   nir_def *row = nir_iadd(&b, l.first, launch_row);
+   nir_def *z = nir_udiv(&b, row, gy);
+   nir_def *id = nir_vec3(&b, nir_channel(&b, wg, 0),
+                          nir_isub(&b, row, nir_imul(&b, z, gy)), z);
+
+   nir_push_if(&b, nir_ult(&b, launch_row, l.count));
+   b.cursor = nir_cf_reinsert(&body, b.cursor);
+   nir_push_else(&b, NULL);
+   nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
+                                      nir_undef(&b, 1, 32));
+   nir_pop_if(&b, NULL);
+   nir_progress(true, impl, nir_metadata_none);
+
+   /* The mesh-only rewrite leaves gl_NumWorkGroups and payload alone. */
+   nir_def *decoded[5] = {id, NULL, NULL, wg, grid};
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_mesh_task_rewrite,
+            nir_metadata_control_flow, decoded);
+}
+
+/* gl_NumWorkGroups and the payload of a mesh shader used with a task stage
+ * come from the task: run before hk_lower_nir. M5 reads them from the native
+ * object->mesh record and returns false without one; G17P reads the software
+ * task record. */
+static bool
+hk_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
+                  VkShaderCreateFlagsEXT flags)
+{
+   if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (nir->info.stage == MESA_SHADER_MESH) {
+         if (flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT)
+            hk_g17p_mesh_rows(nir);
+         else
+            hk_g17p_mesh_task_record(nir);
+      }
+      return true;
+   }
+   return hk_m5_mesh_task_grid(dev, nir, flags);
 }
 
 /* The native three-thread passthrough object program of an M5 mesh-only
@@ -6242,7 +6778,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        hk_nir_reads_intrinsic(nir, nir_intrinsic_load_num_workgroups));
 
    if (!nir->info.io_lowered &&
-       !hk_m5_mesh_task_grid(dev, nir, info->flags)) {
+       !hk_mesh_task_grid(dev, nir, info->flags)) {
       ralloc_free(nir);
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "mesh gl_NumWorkGroups under a task stage needs the task record");
@@ -6472,14 +7008,17 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
-      if ((dev->dev.chip != AGX_CHIP_G17P && dev->dev.chip != AGX_CHIP_G17S) ||
-          hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE) {
+      if (dev->dev.chip != AGX_CHIP_G17P &&
+          (dev->dev.chip != AGX_CHIP_G17S ||
+           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
       }
       if (agx_chip_g17_m5(dev->dev.chip))
          NIR_PASS(_, nir, agx_nir_m5_canonicalize_empty_mesh);
+      else
+         NIR_PASS(_, nir, hk_g17p_mesh_default_counts);
       if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
           nir->info.mesh.primitive_type == MESA_PRIM_POINTS &&
           !(nir->info.outputs_written & VARYING_BIT_PSIZ))
@@ -6515,10 +7054,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
 
       NIR_PASS(_, nir, nir_opt_constant_folding);
+      const bool sw_task = dev->dev.chip == AGX_CHIP_G17P &&
+         !(info->flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT);
       if (dev->dev.chip == AGX_CHIP_G17P)
-         NIR_PASS(_, nir, hk_lower_mesh_queries);
-      if (hk_mesh_clip_m1_1(dev->vk.enabled_features.depthClipControl,
-                            state)) {
+         NIR_PASS(_, nir, hk_lower_mesh_queries, !sw_task);
+      const bool clip_m1_1 =
+         hk_mesh_clip_m1_1(dev->vk.enabled_features.depthClipControl, state);
+      /* G17P remaps the exported z instead (agx_nir_lower_gen1_mesh). */
+      if (clip_m1_1 && dev->dev.chip != AGX_CHIP_G17P) {
          /* Mesh outputs cannot go through output temporaries. Refuse what
           * the lowering cannot convert rather than render the wrong depth. */
          if (!agx_nir_clip_m1_1_complete(nir)) {
@@ -6537,6 +7080,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       const bool m5_mesh = agx_chip_g17_m5(dev->dev.chip);
       bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
                               : agx_gen1_mesh_gather_varyings(nir, &varyings);
+      varyings.clip_m1_1 = clip_m1_1 && dev->dev.chip == AGX_CHIP_G17P;
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          nir->info.mesh.primitive_type == MESA_PRIM_LINES)
+         varyings.line_bias_root_B = hk_root_descriptor_offset(line_y_bias);
 
       nir_builder layout = nir_builder_init_simple_shader(
          MESA_SHADER_VERTEX, &agx_nir_options, "native mesh raster interface");
@@ -6663,10 +7210,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       shader->info.writes_external_memory = api_writes_external_memory;
       struct hk_shader *object = &obj->variants[HK_MESH_VARIANT_RAST];
       if (dev->dev.chip == AGX_CHIP_G17P) {
-      
-
-
-      nir_shader *object_nir = hk_build_predicated_mesh_object(dev->dev.chip);
+      nir_shader *object_nir = sw_task
+         ? hk_build_task_mesh_object(dev->dev.chip)
+         : hk_build_predicated_mesh_object(dev->dev.chip);
       if (!object_nir) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -6715,7 +7261,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       struct hk_shader *predicated =
          &obj->variants[HK_MESH_VARIANT_PREDICATED_OBJECT];
-      nir_shader *object_nir = hk_build_predicated_mesh_object(dev->dev.chip);
+      nir_shader *object_nir = sw_task
+         ? hk_build_task_mesh_object(dev->dev.chip)
+         : hk_build_predicated_mesh_object(dev->dev.chip);
       if (!object_nir) {
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);
@@ -6729,6 +7277,21 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       /* This compiler-generated object only transports the mesh launch. */
       predicated->info.writes_external_memory = false;
+   } else if (sw_stage == MESA_SHADER_TASK &&
+              dev->dev.chip == AGX_CHIP_G17P) {
+      /* The software task stage: a compute kernel run ahead of the render. */
+      const unsigned stride_B = LIBAGX_TASK_ENTRY_PAYLOAD_B +
+                                ALIGN_POT(nir->info.task_payload_size, 16);
+      hk_g17p_lower_task_kernel(nir);
+      agx_preprocess_nir_native(nir, dev->dev.chip);
+      result = hk_compile_nir(dev, pAllocator, nir, info->flags,
+                             info->robustness, NULL, features, &obj->variants[0],
+                             sw_stage, false, NULL, info->set_layout_count,
+                             static_set_mask);
+      if (result == VK_SUCCESS) {
+         obj->variants[0].info.writes_external_memory = api_writes_external_memory;
+         obj->variants[0].info.mesh.payload_size_B = stride_B;
+      }
    } else if (sw_stage == MESA_SHADER_TASK) {
       /* Compile the actual API object shader through captured native payload
        * addressing and child-grid UVSW, never as a CDM mesh producer.
@@ -7335,7 +7898,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                       agx_chip_g17_m5(dev->dev.chip)) &&
                      nir->info.stage == MESA_SHADER_VERTEX &&
                      hk_vs_covers_clip_square(nir);
-      if (!hk_m5_mesh_task_grid(dev, nir, info->flags)) {
+      if (!hk_mesh_task_grid(dev, nir, info->flags)) {
          for (uint32_t j = 0; j < shader_count; j++)
             ralloc_free(infos[j].nir);
          memset(shaders_out, 0, shader_count * sizeof(*shaders_out));

@@ -3430,7 +3430,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!linked ||
        (dev->dev.chip == AGX_CHIP_G17P
-          ? (!linked->b.g17p_compiler_d_valid || hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)
+          ? !linked->b.g17p_compiler_d_valid
           : (dev->dev.chip != AGX_CHIP_G17S ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;
@@ -3453,6 +3453,15 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
          .start_halfs = 0, .size_halfs = 4,
          .address = hk_pool_upload(cmd, &grid, sizeof(grid), 8),
       };
+      /* Promoted constants, as for the other graphics programs
+       * (hk_g17p_graphics_uniform_ranges()). */
+      const struct agx_rodata *rodata = &s->b.info.rodata;
+      if (dev->dev.chip == AGX_CHIP_G17P && rodata->size_16 != 0 &&
+          (!s->bo || !s->bo->va ||
+           !hk_agx3_g17p_rodata_range(rodata->base_uniform, rodata->size_16,
+                                      hk_shader_code_va(s), rodata->offset,
+                                      s->b.info.binary_size, &ranges[count++])))
+         goto refused;
    } else if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked,
                                                cmd->state.gfx.root, ranges,
                                                &count, NULL)) {
@@ -3462,9 +3471,13 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .shader_va = linked->b.bo->va->addr + linked->b.entry_offset,
       .uniform_ranges = ranges, .uniform_range_count = count,
       .shader_binary_size = linked->b.size,
-      .scratch_size = MAX2(linked->b.scratch_size,
-                           dev->dev.chip == AGX_CHIP_G17P
-                              ? s->b.info.scratch_size : linked->b.agx3_spectpr_scratch_size),
+      /* The thread-private frame also holds returned atomic words
+       * (agx3_spectpr_scratch_size), as for the vertex and fragment programs. */
+      .scratch_size = dev->dev.chip == AGX_CHIP_G17P
+                         ? MAX3(linked->b.scratch_size, s->b.info.scratch_size,
+                                linked->b.agx3_spectpr_scratch_size)
+                         : MAX2(linked->b.scratch_size,
+                                linked->b.agx3_spectpr_scratch_size),
       .nr_gprs = linked->b.nr_gprs,
       .compiler_d_valid = linked->b.g17p_compiler_d_valid,
       .compiler_d = linked->b.g17p_compiler_d,

@@ -284,6 +284,13 @@ struct hk_root_descriptor_table {
    /* VK_EXT_depth_clip_control: 1/2 maps clip z from [-w, w] to [0, w] in the
     * last pre-rasterization stage, 0 leaves it (agx_nir_lower_clip_m1_1). */
    float clip_z_coeff;
+
+   /* G17P: which launch of a mesh draw this is (HK_MESH_LAUNCH_WGS). */
+   uint32_t mesh_launch;
+
+   /* G17P mesh lines: 1/64 pixel along +y in NDC for viewport 0, signed by
+    * its y direction (agx_nir_lower_gen1_mesh). */
+   float line_y_bias;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
