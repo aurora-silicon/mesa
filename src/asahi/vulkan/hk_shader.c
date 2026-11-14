@@ -6929,8 +6929,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
-      if ((dev->dev.chip != AGX_CHIP_G17P && dev->dev.chip != AGX_CHIP_G17S) ||
-          hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE) {
+      if (dev->dev.chip != AGX_CHIP_G17P &&
+          (dev->dev.chip != AGX_CHIP_G17S ||
+           hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
          return vk_error(dev, VK_ERROR_UNKNOWN);

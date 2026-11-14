@@ -3300,7 +3300,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!linked ||
        (dev->dev.chip == AGX_CHIP_G17P
-          ? (!linked->b.g17p_compiler_d_valid || hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE)
+          ? !linked->b.g17p_compiler_d_valid
           : (dev->dev.chip != AGX_CHIP_G17S ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;

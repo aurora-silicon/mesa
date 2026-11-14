@@ -13368,10 +13368,9 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    if (!gfx->shaders[MESA_SHADER_MESH] ||
        (task_api && !sw_task &&
         (dev->dev.chip != AGX_CHIP_G17S || !hk_m5_task_enabled())) ||
-       (dev->dev.chip == AGX_CHIP_G17P
-          ? hk_mesh_mode() != HK_MESH_MODE_NATIVE_PROBE
-          : (dev->dev.chip != AGX_CHIP_G17S ||
-             !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
+       (dev->dev.chip != AGX_CHIP_G17P &&
+        (dev->dev.chip != AGX_CHIP_G17S ||
+         !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }

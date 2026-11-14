@@ -2180,8 +2180,9 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    struct vk_features supported_features;
+   /* G17P runs mesh shaders natively and task shaders in software. */
    if (pdev->dev.chip == AGX_CHIP_G17P)
-      supported_extensions.EXT_mesh_shader = hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE;
+      supported_extensions.EXT_mesh_shader = true;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 
