@@ -600,7 +600,10 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R16G16_SFLOAT: bit = 2; break;
    case VK_FORMAT_R16_SFLOAT: bit = 4; break;
    case VK_FORMAT_R32_SFLOAT:
-      if (float_image_atomics)
+      /* A mutable R32F image may list R32_UINT or R32_SINT views (the R32
+       * channel layout of hk_can_compress()), which have image atomics. */
+      if (float_image_atomics ||
+          (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT))
          return false;
       bit = 8;
       break;

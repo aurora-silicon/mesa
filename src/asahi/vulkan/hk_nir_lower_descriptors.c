@@ -672,12 +672,18 @@ spread_bits_16(nir_builder *b, nir_def *v)
  * which addresses at most HK_M5_STORE_MAX_SLICES slices. When a storage
  * view's level needs more, its PBE is a linear window over that level of
  * every layer of the view, and the descriptor's store window record says so
- * (hk_native_descriptor.h). Layered stores and atomics check the record: at
- * zero they take the native path; otherwise they store through the window at
- * the texel's element index, or update the texel in memory. The index is the
- * tiled address arithmetic of image atomics (libagx_twiddle_coordinates_gen9)
- * plus the layer times the layer stride. Texels outside the view are dropped,
- * as the native store drops them.
+ * (hk_native_descriptor.h). Layered stores check the record's layer count
+ * and atomics its layer stride: at zero (every other descriptor, and the null
+ * descriptor) they take the native path; otherwise they store through the
+ * window at the texel's element index, or update the texel in memory. The
+ * index is the tiled address arithmetic of image atomics
+ * (libagx_twiddle_coordinates_gen9) plus the layer times the layer stride.
+ * Texels outside the view are dropped, as the native store drops them.
+ *
+ * A one-layer view of a compressed image has a 2D PBE instead, which its
+ * record marks (HK_M5_STORE_2D): layered stores store to it at (x, y), with
+ * the same bounds check, so layers other than 0 are dropped. Its record's
+ * word 0 is zero, so atomics keep the native op.
  *
  * Block stores (image_store_block_agx) are not windowed: on M5 nothing emits
  * them for an application storage view (meta copies take the tiled or
@@ -722,14 +728,14 @@ lower_m5_store_window(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *z = nir_channel(b, coord, is_1d ? 1 : 2);
 
    nir_def *layer_stride_el = nir_channel(b, window, 0);
+   nir_def *layers = nir_channel(b, window, 3);
    nir_def *window_result = NULL;
-   nir_push_if(b, nir_ine_imm(b, layer_stride_el, 0));
+   nir_push_if(b, nir_ine_imm(b, atomic ? layer_stride_el : layers, 0));
    {
       nir_def *tiles = nir_channel(b, window, 1);
       nir_def *size = nir_channel(b, window, 2);
       nir_def *width = nir_iand_imm(b, size, 0xffff);
       nir_def *height = nir_ushr_imm(b, size, 16);
-      nir_def *layers = nir_channel(b, window, 3);
       nir_def *in_bounds =
          nir_iand(b, nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height)),
                   nir_ult(b, z, layers));
@@ -781,9 +787,14 @@ lower_m5_store_window(nir_builder *b, nir_intrinsic_instr *intr,
          if (!(access & ACCESS_NON_READABLE))
             nir_fence_mem_to_tex_agx(b);
       } else {
+         nir_def *store_2d = nir_test_mask(b, tiles, HK_M5_STORE_2D);
          nir_def *window_coord = nir_vec4(
-            b, nir_iand_imm(b, index, HK_M5_STORE_WINDOW_WIDTH - 1),
-            nir_ushr_imm(b, index, util_logbase2(HK_M5_STORE_WINDOW_WIDTH)),
+            b,
+            nir_bcsel(b, store_2d, x,
+                      nir_iand_imm(b, index, HK_M5_STORE_WINDOW_WIDTH - 1)),
+            nir_bcsel(b, store_2d, y,
+                      nir_ushr_imm(b, index,
+                                   util_logbase2(HK_M5_STORE_WINDOW_WIDTH))),
             nir_imm_int(b, 0), nir_imm_int(b, 0));
          nir_intrinsic_instr *store =
             nir_instr_as_intrinsic(nir_instr_clone(b->shader, &intr->instr));

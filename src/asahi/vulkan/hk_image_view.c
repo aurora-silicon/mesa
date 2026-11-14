@@ -522,7 +522,22 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
          dev->dev.chip != AGX_CHIP_G17C && !eot &&
          layout->tiling != AIL_TILING_LINEAR &&
          cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
-      if (layers_as_3d)
+
+      /* The packer admits no compressed 3D PBE. A one-layer storage view of a
+       * compressed image instead gets the image's 2D PBE, and its store
+       * record makes layered stores store to it in 2D (hk_native_descriptor.h).
+       */
+      const bool store_2d =
+         layers_as_3d && store_window_out &&
+         usage == HK_DESC_USAGE_STORAGE && layout->compressed &&
+         layers == 1 && !msaa && denom.x == 1 && denom.y == 1 &&
+         hk_pack_m5_store_2d(u_minify(layout->width_px, level),
+                             u_minify(layout->height_px, level),
+                             store_window_out);
+      const bool store_3d = layers_as_3d && !store_2d;
+      if (store_2d)
+         cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+      else if (store_3d)
          cfg.dimension = AGX_TEXTURE_DIMENSION_3D;
 
       /* That 3D store addresses at most HK_M5_STORE_MAX_SLICES slices, and
@@ -530,12 +545,13 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
        * that is more, describe a linear window over the level instead, which
        * hk_nir_lower_descriptors() stores through at the texel's tiled
        * element index (hk_native_descriptor.h), with the tiled arithmetic of
-       * image atomics. Arrays of a 3D image and compressed, block-compressed
-       * or interchange layouts keep the 3D description.
+       * image atomics. Arrays of a 3D image and compressed (one-layer views:
+       * the 2D description above), block-compressed or interchange layouts
+       * keep their description.
        */
       const unsigned window_element_B = util_format_get_blocksize(p_format);
       uint32_t window_rows = 0;
-      if (layers_as_3d && store_window_out &&
+      if (store_3d && store_window_out &&
           usage == HK_DESC_USAGE_STORAGE && !msaa && !layout->mipmapped_z &&
           (layout->tiling == AIL_TILING_GPU ||
            layout->tiling == AIL_TILING_TWIDDLED) &&
@@ -642,7 +658,7 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
             /* A 3D image's depth shrinks with the selected level, the layer
              * count of an array does not: scale the depth so that, at this
              * level, it still bounds every layer of the view. */
-            if (layers_as_3d && cfg.level)
+            if (store_3d && cfg.level)
                cfg.layers = MIN2((uint64_t)layers << cfg.level, 1u << 16);
          }
 
