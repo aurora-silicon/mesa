@@ -353,6 +353,13 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
+          /* VK_EXT_opacity_micromap (micromap.cl): micromap builds, copies
+           * and sizes, and the OMM tables and directory of G17P acceleration
+           * structures. Global loads and stores, one global atomic increment
+           * (bucket slots), no barriers, printf or scratch. */
+          (!strcmp(target, "g17p") &&
+           (!strncmp(func->name, "libagx_micromap_", strlen("libagx_micromap_")) ||
+            !strncmp(func->name, "libagx_omm_", strlen("libagx_omm_")))) ||
           /* Native G17P AS copies relocate child slots and then restore the
            * instance-record slots which can resemble node markers. */
           (!strcmp(target, "g17p") &&

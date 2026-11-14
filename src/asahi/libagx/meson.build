@@ -12,6 +12,7 @@ libagx_shader_files = files(
   'tessellator.cl',
   'texture.cl',
   'helper.cl',
+  'micromap.cl',
 )
 
 libagx_spv = custom_target(

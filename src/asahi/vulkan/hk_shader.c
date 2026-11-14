@@ -800,6 +800,9 @@ enum hk_feature_key {
 
    /* The last pre-rasterization stage reads the clip z coefficient. */
    HK_FEAT_DEPTH_CLIP_CONTROL = BITFIELD_BIT(7),
+
+   /* G17P ray queries look up opacity micromaps. */
+   HK_FEAT_OPACITY_MICROMAP = BITFIELD_BIT(8),
 };
 
 /* What a dynamic-sample-count G17P fragment shader needs to compile its
@@ -871,7 +874,8 @@ hk_make_feature_key(const struct vk_features *feats)
           (feats->pipelineRobustness ? HK_FEAT_PIPELINE_ROBUSTNESS : 0) |
           (hk_rt_features_enabled(feats) ? HK_FEAT_RAY_TRACING : 0) |
           (feats->nullDescriptor ? HK_FEAT_NULL_DESCRIPTOR : 0) |
-          (feats->depthClipControl ? HK_FEAT_DEPTH_CLIP_CONTROL : 0);
+          (feats->depthClipControl ? HK_FEAT_DEPTH_CLIP_CONTROL : 0) |
+          (feats->micromapEXT ? HK_FEAT_OPACITY_MICROMAP : 0);
 }
 
 /*
@@ -3040,6 +3044,8 @@ hk_gen1_ray_query_layout(struct hk_device *dev, const nir_shader *nir,
       .position_fetch = dev->vk.enabled_features.rayTracingPositionFetch &&
                         dev->gen1_vertex_directory != NULL,
       .diagnostic_features = dev->vk.enabled_features.rayTracingPositionFetch,
+      .opacity_micromap = dev->vk.enabled_features.micromapEXT &&
+                          dev->gen1_omm_directory != NULL,
       .dispatch_group_count_offset = nir->info.stage == MESA_SHADER_COMPUTE
          ? hk_root_descriptor_offset(cs.group_count_addr) : 0,
    };

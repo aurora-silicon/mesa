@@ -95,6 +95,7 @@ hk_files = files(
   'hk_pipeline_statistics_core.h',
   'hk_private.h',
   'hk_query_oq.c',
+  'hk_micromap.c',
   'hk_query_pool.c',
   'hk_query_reset.c',
   'hk_query_pool.h',

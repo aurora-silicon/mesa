@@ -198,6 +198,13 @@ struct hk_device {
    struct agx_bo *gen1_vertex_directory;
    struct agx_va *gen1_vertex_directory_va;
    struct hash_table *gen1_vertex_tables;
+   /* VK_EXT_opacity_micromap: the OMM directory (one entry per AS id, see
+    * libagx/micromap.h), and the BLASes whose entry is set (struct
+    * hk_omm_table_layout). */
+   struct hk_gen1_sparse_table gen1_omm_directory_pages;
+   struct agx_bo *gen1_omm_directory;
+   struct hash_table *gen1_omm_tables;
+   uint32_t gen1_omm_tlas_stamp;
    uint64_t *gen1_rq_maps;
    unsigned gen1_rq_bound_maps;
    uint8_t *gen1_rq_user_image;
