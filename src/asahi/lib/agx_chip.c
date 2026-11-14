@@ -596,6 +596,9 @@ agx_params_m5_supported(const struct drm_asahi_params_global *params)
    const enum agx_chip chip = agx_chip_from_params(params);
    return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
            params->num_clusters_total == 1) ||
+          /* T6050 M5 Pro (J714s/J716s): G17S, one die, two clusters. */
+          (chip == AGX_CHIP_G17S && params->chip_id == 0x6050 &&
+           params->num_clusters_total == 2) ||
           /* T6050 M5 Max (J716c): G17C, one die, four clusters. */
           (chip == AGX_CHIP_G17C && params->chip_id == 0x6050 &&
            params->num_clusters_total == 4);

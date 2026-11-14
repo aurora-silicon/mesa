@@ -1,9 +1,11 @@
 # M5 Honeykrisp integration
 
-`ASAHI_M5_BRINGUP=1` enables experimental Linux device admission only for
-T8142/G17G with one die, one cluster, AGX3 USC and HAL300. M5 remains rejected
-by default. The opt-in does not establish general rendering support or Vulkan
-conformance; the experimental device reports conformance version 0.0.0.0.
+The driver admits the exact single-die AGX3 USC/HAL300 kernel contracts for
+T8142/G17G (one cluster), T6050/G17S M5 Pro (two clusters) and T6050/G17C M5 Max
+(four clusters) without an environment override. `ASAHI_M5_BRINGUP=1` retains
+the explicit experimental admission path for other supported bring-up
+topologies. Neither admission path establishes Vulkan conformance; the
+experimental device reports conformance version 0.0.0.0.
 
 The driver uses allocator-owned printf storage because the AGX2 fixed address
 overlaps M5's compact driver-owned TA arena. Honeykrisp loads its actual
