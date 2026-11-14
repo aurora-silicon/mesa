@@ -203,7 +203,9 @@ enum agx3_tex_gather {
 
 struct agx3_tex_sample_desc {
    /* Relocate both uploaded heap pointers together, retaining their +4
-    * separation. Zero preserves every existing native witness byte. */
+    * separation. Zero preserves every existing native witness byte. M5
+    * query dispatches use168/172 to avoid the intersection runtime's
+    * uniform prefix. */
    uint16_t heap_uniform_base;
    uint16_t dest;       /* half-register index */
    uint16_t coord;      /* four-half aligned pair of f32 coordinates */

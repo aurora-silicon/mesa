@@ -2103,6 +2103,21 @@ hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
    return total_used < pdev->sysmem ? pdev->sysmem - total_used : 0;
 }
 
+static void
+hk_read_m5_rt_profile(struct hk_physical_device *pdev)
+{
+   struct hk_m5_rt_profile *profile = &pdev->m5_rt;
+   profile->native_as = agx_chip_g17_m5(pdev->dev.chip) &&
+                        debug_get_bool_option("ASAHI_M5_NATIVE_AS", false);
+   if (!profile->native_as)
+      return;
+   profile->native_rt = debug_get_bool_option("ASAHI_M5_NATIVE_RT", false);
+   profile->rq_instances =
+      debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false);
+   profile->rq_candidate_api =
+      debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false);
+}
+
 VkResult
 hk_create_drm_physical_device(struct vk_instance *_instance,
                               drmDevicePtr drm_device,
@@ -2193,13 +2208,29 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_ray_tracing_position_fetch = true;
    }
 
-   /* Explicit bring-up profile for the native M5 acceleration structure
-    * builder. Nothing traverses the native format yet, so ray queries and
-    * ray tracing pipelines stay off. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
+   /* Explicit bring-up profile: the native M5 acceleration structure builder
+    * and ray queries through the hardware intersector, which runs the
+    * generated intersection runtime (hk_m5_rt_runtime.h). */
+   hk_read_m5_rt_profile(pdev);
+   if (pdev->m5_rt.native_as) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
+      /* Ray queries only in the configuration they are qualified in: on
+       * G17S, with instance traversal and the candidate interface, and with
+       * the kernel's v2 render programs, which graphics-stage queries need
+       * for their SCS fields. */
+      supported_extensions.KHR_ray_query =
+         pdev->dev.chip == AGX_CHIP_G17S &&
+         (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2) &&
+         pdev->m5_rt.rq_instances && pdev->m5_rt.rq_candidate_api;
+      /* Explicit pipeline qualification profile; the default remains gated. */
+      bool native_rt = supported_extensions.KHR_ray_query &&
+         pdev->m5_rt.native_rt;
+      supported_extensions.KHR_ray_tracing_pipeline = native_rt;
+      supported_extensions.KHR_ray_tracing_maintenance1 = native_rt;
+      /* Graphics pipeline libraries need VK_KHR_pipeline_library whether or
+       * not ray tracing pipelines are exposed. */
+      supported_extensions.KHR_pipeline_library |= native_rt;
    }
    /* The 8x8 f16/f32 matmad underlying a subgroup-scope cooperative matrix
     * exists on the AGX3B ISA (G15/G16/G17P) just as it does on the M5 AGX3C

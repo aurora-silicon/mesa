@@ -52,6 +52,17 @@ struct hk_memory_heap {
    VkMemoryHeapFlags flags;
 };
 
+/* The opt-in native M5 ray query profile, read from the environment once when
+ * the physical device is created. The extensions it advertises and the
+ * driver-side gates of its devices all use this copy, so they agree even if
+ * the environment changes later. All false unless native_as. */
+struct hk_m5_rt_profile {
+   bool native_as;        /* ASAHI_M5_NATIVE_AS, on an M5-family GPU */
+   bool native_rt;        /* ASAHI_M5_NATIVE_RT */
+   bool rq_instances;     /* ASAHI_M5_RQ_INSTANCES */
+   bool rq_candidate_api; /* ASAHI_M5_RQ_CANDIDATE_API */
+};
+
 struct hk_physical_device {
    struct vk_physical_device vk;
    dev_t render_dev;
@@ -85,6 +96,8 @@ struct hk_physical_device {
     * hk_sampled_image_descriptor_sw::scaled_conversion kind. */
    bool scaled_sampling;
    bool scaled_storage;
+
+   struct hk_m5_rt_profile m5_rt;
 
    /* Set once a device of this GPU creates a sampler whose border colour G17P
     * shaders must emulate (hk_CreateSampler). Shaders compiled before then
