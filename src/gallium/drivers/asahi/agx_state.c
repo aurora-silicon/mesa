@@ -14462,6 +14462,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       batch = agx_get_batch(ctx);
       /* Still a render of its own (agx_draw_vbo()). */
       batch->g17g_prims = AGX_G17G_RENDER_PRIMS;
+      batch->g17g_small_budget = true;
    }
 
    agx_batch_init_state(batch);
@@ -15563,9 +15564,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    /* A G17G render holds a bounded number of primitives: two million
     * tessellated triangles in one render timed out and left the GPU dead
-    * (tessellation.invariance). Start a new render past the budget. */
+    * (tessellation.invariance). Start a new render past the budget.
+    *
+    * The small budget is for the output of a tessellation stage, where the
+    * timeouts were seen, on the GPU or on the CPU (agx_swtnl.c). A render of
+    * plain draws takes AGX_G17G_RENDER_PRIMS_PLAIN: every render started for
+    * the budget loads and stores the whole framebuffer again.
+    * ASAHI_M5_RENDER_PRIMS sets another budget for those, for comparison. */
    const bool g17g_budget =
       agx_chip_g17_m5(agx_device(pctx->screen)->chip) && !indirect;
+   const bool g17g_small = info->mode == MESA_PRIM_PATCHES || ctx->swtnl_inner;
    /* A tessellated draw's output count is unknown here: give it a render of
     * its own. */
    const uint64_t prims =
@@ -15576,11 +15584,16 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
                                                      draws->count) *
               info->instance_count;
    if (g17g_budget && ctx->batch && ctx->batch->g17g_prims &&
-       ctx->batch->g17g_prims + prims > AGX_G17G_RENDER_PRIMS)
+       ctx->batch->g17g_prims + prims >
+          (g17g_small || ctx->batch->g17g_small_budget
+              ? AGX_G17G_RENDER_PRIMS
+              : debug_get_num_option("ASAHI_M5_RENDER_PRIMS",
+                                     AGX_G17G_RENDER_PRIMS_PLAIN)))
       agx_flush_batch_for_reason(ctx, ctx->batch, "G17G primitive budget");
 
    struct agx_batch *batch = agx_get_batch(ctx);
    batch->g17g_prims += prims;
+   batch->g17g_small_budget |= g17g_budget && g17g_small;
    uint64_t ib = 0;
    size_t ib_extent = 0;
 

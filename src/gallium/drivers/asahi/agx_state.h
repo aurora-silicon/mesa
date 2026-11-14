@@ -564,6 +564,12 @@ struct agx_encoder {
  * two 64K-primitive draws); 64K passed. Keep a margin below that. */
 #define AGX_G17G_RENDER_PRIMS (32 * 1024)
 
+/* Primitives per G17G render of draws without a tessellation stage. 512K
+ * small depth-tested triangles in one render draw the image the split
+ * renders draw, at 1024x1024 and at 3456x2160, on an M5 Pro; more has not
+ * been tried. */
+#define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -582,6 +588,9 @@ struct agx_batch {
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
+   /* G17G: this render holds the output of a tessellation stage and keeps
+    * to AGX_G17G_RENDER_PRIMS. */
+   bool g17g_small_budget;
 
    struct agx_tilebuffer_layout tilebuffer_layout;
 
