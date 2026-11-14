@@ -6042,6 +6042,20 @@ hk_mesh_launch_row(nir_builder *b, nir_def *wg, const struct hk_mesh_launch *l)
    return nir_iadd(b, nir_channel(b, wg, 1), nir_imul(b, nir_channel(b, wg, 2), l->y));
 }
 
+/* Whether an x by y by z grid of mesh workgroups fits one launch as it is.
+ * The object then publishes the grid itself at launch 0 (none at later
+ * launches) and the mesh workgroup IDs need no decode; otherwise the draw
+ * goes out in rows (hk_mesh_launch_shape()). */
+static nir_def *
+hk_mesh_launch_whole(nir_builder *b, nir_def *x, nir_def *y, nir_def *z)
+{
+   /* y and z are at most 65535 here, so only x * (y * z) can overflow. */
+   nir_def *rows = nir_imul(b, y, z);
+   nir_def *fits = nir_iand(b, nir_ieq_imm(b, nir_umul_high(b, x, rows), 0),
+                            nir_ule_imm(b, nir_imul(b, x, rows), HK_MESH_LAUNCH_WGS));
+   return nir_iand(b, fits, nir_ule_imm(b, y, HK_MESH_LAUNCH_MAX_Y));
+}
+
 /* Parameter block addressed by the predicated object's uniform0 pointer.
  * The ordinary mesh-only object keeps its smaller native passthrough ABI. */
 static nir_shader *
@@ -6087,12 +6101,18 @@ hk_build_predicated_mesh_object(enum agx_chip chip)
       nir_def *launch = nir_load_global_constant(&b, 1, 32,
          nir_iadd_imm(&b, params, 32), .align_mul = 4);
       nir_def *x = nir_channel(&b, g, 0);
-      struct hk_mesh_launch l = hk_mesh_launch_shape(&b, x,
-         nir_imul(&b, nir_channel(&b, g, 1), nir_channel(&b, g, 2)), launch);
-      nir_store_var(&b, enabled, nir_iand(&b, nir_load_var(&b, enabled),
-         nir_ine_imm(&b, l.count, 0)), 1);
+      nir_def *gy = nir_channel(&b, g, 1), *gz = nir_channel(&b, g, 2);
+      struct hk_mesh_launch l = hk_mesh_launch_shape(&b, x, nir_imul(&b, gy, gz), launch);
+      nir_def *whole = hk_mesh_launch_whole(&b, x, gy, gz);
+      nir_def *any = nir_bcsel(&b, whole,
+         nir_iand(&b, nir_ieq_imm(&b, launch, 0),
+                  nir_ine_imm(&b, nir_imul(&b, x, nir_imul(&b, gy, gz)), 0)),
+         nir_ine_imm(&b, l.count, 0));
+      nir_store_var(&b, enabled, nir_iand(&b, nir_load_var(&b, enabled), any), 1);
       value = nir_bcsel(&b, nir_ieq_imm(&b, lane, 0), x,
-                        nir_bcsel(&b, nir_ieq_imm(&b, lane, 1), l.y, l.z));
+                        nir_bcsel(&b, nir_ieq_imm(&b, lane, 1),
+                                  nir_bcsel(&b, whole, gy, l.y),
+                                  nir_bcsel(&b, whole, gz, l.z)));
    } else {
       value = nir_load_global_constant(&b, 1, 32,
          nir_iadd(&b, grid, nir_u2u64(&b, nir_imul_imm(&b, lane, 4))), .align_mul = 4);
@@ -6275,6 +6295,16 @@ hk_task_rows(nir_builder *b, nir_def *max_children, nir_def *tasks,
    return r;
 }
 
+/* Whether a software task draw's children fit one launch as one row per
+ * task: the object publishes (children, tasks, 1) and a mesh workgroup's task
+ * and child are its workgroup ID's y and x (hk_mesh_launch_whole()). */
+static nir_def *
+hk_task_whole(nir_builder *b, nir_def *max_children, nir_def *tasks)
+{
+   return nir_iand(b, nir_ule_imm(b, max_children, HK_TASK_CHILD_ROW),
+                   hk_mesh_launch_whole(b, max_children, tasks, nir_imm_int(b, 1)));
+}
+
 static nir_def *
 hk_mesh_launch_index(nir_builder *b)
 {
@@ -6374,29 +6404,47 @@ hk_g17p_mesh_task_record(nir_shader *nir)
    nir_def *stride = nir_channel(&b, hdr, 2);
 
    nir_def *wg = nir_load_workgroup_id(&b);
+   /* One row per task in one launch: the task and child are the workgroup
+    * ID's y and x (hk_task_whole()); otherwise decode the launch's rows. */
+   nir_def *true_ = nir_imm_true(&b);
+   nir_def *wg_x = nir_channel(&b, wg, 0), *wg_y = nir_channel(&b, wg, 1);
+   nir_push_if(&b, hk_task_whole(&b, max_children, tasks))->control =
+      nir_selection_control_dont_flatten;
+   nir_push_else(&b, NULL);
    struct hk_task_rows r = hk_task_rows(&b, max_children, tasks,
                                         hk_mesh_launch_index(&b));
    nir_def *launch_row = hk_mesh_launch_row(&b, wg, &r.l);
    nir_def *global_row = nir_iadd(&b, r.l.first, launch_row);
-   nir_def *task = nir_udiv(&b, global_row, r.task_rows);
-   nir_def *row = nir_isub(&b, global_row, nir_imul(&b, task, r.task_rows));
-   nir_def *child = nir_iadd(&b, nir_channel(&b, wg, 0), nir_imul(&b, row, r.x));
+   nir_def *task_rows = nir_udiv(&b, global_row, r.task_rows);
+   nir_def *row = nir_isub(&b, global_row, nir_imul(&b, task_rows, r.task_rows));
+   nir_def *child_rows = nir_iadd(&b, nir_channel(&b, wg, 0), nir_imul(&b, row, r.x));
+   nir_def *row_ok = nir_ult(&b, launch_row, r.l.count);
+   nir_pop_if(&b, NULL);
+   nir_def *task = nir_if_phi(&b, wg_y, task_rows);
+   nir_def *child = nir_if_phi(&b, wg_x, child_rows);
+   nir_def *in_launch = nir_if_phi(&b, true_, row_ok);
    nir_def *task_ok = nir_ult(&b, task, tasks);
    nir_def *entry = nir_iadd(&b, entries,
-      nir_imul(&b, nir_u2u64(&b, nir_bcsel(&b, task_ok, task, nir_imm_int(&b, 0))),
-               nir_u2u64(&b, stride)));
+      nir_umul_2x32_64(&b, nir_bcsel(&b, task_ok, task, nir_imm_int(&b, 0)), stride));
    nir_def *grid = nir_load_global(&b, 3, 32, entry, .align_mul = 16,
                                    .access = ACCESS_NON_WRITEABLE);
    grid = nir_bcsel(&b, task_ok, grid, nir_imm_ivec3(&b, 0, 0, 0));
    nir_def *gx = nir_channel(&b, grid, 0), *gy = nir_channel(&b, grid, 1);
    nir_def *count = nir_imul(&b, nir_imul(&b, gx, gy), nir_channel(&b, grid, 2));
-   nir_def *valid = nir_iand(&b, nir_ult(&b, child, count),
-                             nir_ult(&b, launch_row, r.l.count));
+   nir_def *valid = nir_iand(&b, nir_ult(&b, child, count), in_launch);
+   /* A one-row child grid (n, 1, 1) needs no division. */
+   nir_def *id_row = nir_vec3(&b, child, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+   nir_push_if(&b, nir_iand(&b, nir_ule_imm(&b, gy, 1),
+                            nir_ule_imm(&b, nir_channel(&b, grid, 2), 1)))->control =
+      nir_selection_control_dont_flatten;
+   nir_push_else(&b, NULL);
    gx = nir_umax(&b, gx, nir_imm_int(&b, 1));
    gy = nir_umax(&b, gy, nir_imm_int(&b, 1));
    nir_def *rest = nir_udiv(&b, child, gx);
-   nir_def *id = nir_vec3(&b, nir_isub(&b, child, nir_imul(&b, rest, gx)),
-                          nir_umod(&b, rest, gy), nir_udiv(&b, rest, gy));
+   nir_def *id_grid = nir_vec3(&b, nir_isub(&b, child, nir_imul(&b, rest, gx)),
+                               nir_umod(&b, rest, gy), nir_udiv(&b, rest, gy));
+   nir_pop_if(&b, NULL);
+   nir_def *id = nir_if_phi(&b, id_row, id_grid);
    nir_def *payload = nir_iadd_imm(&b, entry, LIBAGX_TASK_ENTRY_PAYLOAD_B);
 
    nir_push_if(&b, valid);
@@ -6598,10 +6646,17 @@ hk_build_task_mesh_object(enum agx_chip chip)
    nir_def *hdr = nir_load_global(&b, 2, 32, rec, .align_mul = 8);
    struct hk_task_rows r = hk_task_rows(&b, nir_channel(&b, hdr, 0),
                                         nir_channel(&b, hdr, 1), launch);
-   nir_def *enabled = nir_ine_imm(&b, r.l.count, 0);
+   nir_def *tasks = nir_channel(&b, hdr, 1);
+   nir_def *whole = hk_task_whole(&b, nir_channel(&b, hdr, 0), tasks);
+   nir_def *enabled = nir_bcsel(&b, whole,
+      nir_iand(&b, nir_ieq_imm(&b, launch, 0),
+               nir_ine_imm(&b, nir_imul(&b, r.x, tasks), 0)),
+      nir_ine_imm(&b, r.l.count, 0));
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_def *value = nir_bcsel(&b, nir_ieq_imm(&b, lane, 0), r.x,
-                              nir_bcsel(&b, nir_ieq_imm(&b, lane, 1), r.l.y, r.l.z));
+                              nir_bcsel(&b, nir_ieq_imm(&b, lane, 1),
+                                        nir_bcsel(&b, whole, tasks, r.l.y),
+                                        nir_bcsel(&b, whole, nir_imm_int(&b, 1), r.l.z)));
    nir_store_object_childcount_agx(&b, nir_bcsel(&b, enabled, value,
                                                 nir_imm_int(&b, 0)));
    agx_preprocess_nir_native(b.shader, chip);
@@ -6623,8 +6678,22 @@ hk_g17p_mesh_rows(nir_shader *nir)
    nir_cf_list body;
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
    nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_def *grid = nir_load_num_workgroups(&b);
    nir_def *wg = nir_load_workgroup_id(&b);
+   nir_def *valid_whole = nir_imm_true(&b);
+   /* A grid that fits one launch arrives as it is (hk_mesh_launch_whole()):
+    * the recording says so for a grid it knows, otherwise test the grid. */
+   nir_def *recorded_whole = nir_load_global_constant(&b, 1, 32,
+      nir_iadd_imm(&b, nir_load_root_agx(&b), hk_root_descriptor_offset(mesh_whole)),
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+   nir_push_if(&b, nir_ine_imm(&b, recorded_whole, 0))->control =
+      nir_selection_control_dont_flatten;
+   nir_push_else(&b, NULL);
+   nir_def *grid = nir_load_num_workgroups(&b);
+   nir_push_if(&b, hk_mesh_launch_whole(&b, nir_channel(&b, grid, 0),
+                                        nir_channel(&b, grid, 1),
+                                        nir_channel(&b, grid, 2)))->control =
+      nir_selection_control_dont_flatten;
+   nir_push_else(&b, NULL);
    nir_def *gy = nir_umax(&b, nir_channel(&b, grid, 1), nir_imm_int(&b, 1));
    struct hk_mesh_launch l = hk_mesh_launch_shape(&b, nir_channel(&b, grid, 0),
       nir_imul(&b, nir_channel(&b, grid, 1), nir_channel(&b, grid, 2)),
@@ -6632,10 +6701,17 @@ hk_g17p_mesh_rows(nir_shader *nir)
    nir_def *launch_row = hk_mesh_launch_row(&b, wg, &l);
    nir_def *row = nir_iadd(&b, l.first, launch_row);
    nir_def *z = nir_udiv(&b, row, gy);
-   nir_def *id = nir_vec3(&b, nir_channel(&b, wg, 0),
-                          nir_isub(&b, row, nir_imul(&b, z, gy)), z);
+   nir_def *id_rows = nir_vec3(&b, nir_channel(&b, wg, 0),
+                               nir_isub(&b, row, nir_imul(&b, z, gy)), z);
+   nir_def *valid_rows = nir_ult(&b, launch_row, l.count);
+   nir_pop_if(&b, NULL);
+   nir_def *id_tested = nir_if_phi(&b, wg, id_rows);
+   nir_def *valid_tested = nir_if_phi(&b, valid_whole, valid_rows);
+   nir_pop_if(&b, NULL);
+   nir_def *id = nir_if_phi(&b, wg, id_tested);
+   nir_def *valid = nir_if_phi(&b, valid_whole, valid_tested);
 
-   nir_push_if(&b, nir_ult(&b, launch_row, l.count));
+   nir_push_if(&b, valid);
    b.cursor = nir_cf_reinsert(&body, b.cursor);
    nir_push_else(&b, NULL);
    nir_set_vertex_and_primitive_count(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 0),
