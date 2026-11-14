@@ -666,6 +666,9 @@ if with_tests
          'test/test-fuse-lea-constants.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
+         # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
+         # in libasahi_lib, which this test does not link.
+         '../lib/agx_chip.c',
       ),
       c_args : [c_msvc_compat_args, no_override_init_args],
       gnu_symbol_visibility : 'hidden',
