@@ -1578,8 +1578,11 @@ hk_m5_backend_GetAccelerationStructureBuildSizesKHR(
          struct hk_agx3_as_layout layout;
          hk_agx3_as_layout_init(0, &layout);
          pSizeInfo->accelerationStructureSize = layout.as_bytes;
-         pSizeInfo->buildScratchSize = 0;
-         pSizeInfo->updateScratchSize = 0;
+         /* An empty build never touches scratch, but applications size and
+          * bind a scratch buffer from these values unconditionally (the CTS
+          * dereferences a buffer it only creates for a nonzero size). */
+         pSizeInfo->buildScratchSize = 256;
+         pSizeInfo->updateScratchSize = 256;
          return;
       }
    }
