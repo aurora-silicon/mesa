@@ -1489,6 +1489,7 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
       return;
 
    util_copy_framebuffer_state(&ctx->framebuffer, state);
+   ctx->g17g_mrt_spills_known = false;
 
    /* The frontend still reads and resolves the window's multisample colour
     * attachment. G17G/G18G's direct EOT resolve only writes the single-sample
@@ -14984,7 +14985,62 @@ agx_g17g_split_mrt_draw(struct agx_context *ctx,
  * and the others are spilled, loaded and stored by the fragments as images
  * (agx_build_tilebuffer_layout_rt0_resident). Single-sample only, and
  * attachment 0 must exist to be the resident one.
+ *
+ * Every other draw runs in one pass too when its spilled attachments can be
+ * described (agx_g17g_mrt_spills_encodable). The split costs far more than
+ * the repeated draw: its passes share the depth attachment, the first
+ * writing it and the others testing against it, so each pass flushes the
+ * batch of the one before and every application draw becomes a render per
+ * attachment. ASAHI_M5_MRT_SPLIT=1 keeps the split for those draws.
  */
+
+/* The fragment shader addresses at most four attachments as images: with
+ * more, attachments 4 and up keep their old contents (piglit
+ * bound-resource-limits, arb_texture_barrier-blending-in-shader with eight
+ * textures). */
+#define AGX_G17G_ONE_PASS_MAX_CBUFS 4
+
+/*
+ * Whether each attachment has the texture and PBE descriptors the fragments
+ * load and store the spilled ones through
+ * (agx_upload_spilled_rt_descriptors). A
+ * batch with one that has none is dropped whole, so such a framebuffer
+ * keeps the split.
+ */
+static bool
+agx_g17g_mrt_spills_encodable(struct agx_context *ctx)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   const enum agx_descriptor_generation generation =
+      agx_gallium_descriptor_generation(dev->chip);
+   /* The packers only read the device through the batch. */
+   struct agx_batch scratch = {.ctx = ctx};
+
+   if (ctx->framebuffer.nr_cbufs > AGX_G17G_ONE_PASS_MAX_CBUFS)
+      return false;
+
+   /* Attachment 0 too: the table holds an entry for every attachment. */
+   for (unsigned rt = 0; rt < ctx->framebuffer.nr_cbufs; ++rt) {
+      const struct pipe_surface *surf = &ctx->framebuffer.cbufs[rt];
+      if (!surf->texture)
+         continue;
+
+      struct agx_gallium_texture_descriptor texture;
+      struct agx_gallium_pbe_descriptor pbe;
+      struct pipe_image_view view = image_view_for_surface(surf);
+      struct pipe_sampler_view sampler_view = sampler_view_for_surface(surf);
+      sampler_view.target = PIPE_TEXTURE_2D_ARRAY;
+
+      if (!agx_pack_texture(generation, &texture, agx_resource(surf->texture),
+                            surf->format, &sampler_view) ||
+          !agx_batch_upload_pbe_internal(&scratch, &pbe, &view, false, false,
+                                         true, true, false, NULL))
+         return false;
+   }
+
+   return true;
+}
+
 static bool
 agx_g17g_mrt_one_pass(struct agx_context *ctx)
 {
@@ -14996,8 +15052,18 @@ agx_g17g_mrt_one_pass(struct agx_context *ctx)
        util_framebuffer_get_num_layers(&ctx->framebuffer) > 1)
       return false;
 
-   return (vs && vs->info.writes_memory) ||
-          (fs && (fs->info.writes_memory || fs->info.uses_fbfetch));
+   if ((vs && vs->info.writes_memory) ||
+       (fs && (fs->info.writes_memory || fs->info.uses_fbfetch)))
+      return true;
+
+   if (debug_get_bool_option("ASAHI_M5_MRT_SPLIT", false))
+      return false;
+
+   if (!ctx->g17g_mrt_spills_known) {
+      ctx->g17g_mrt_spills_ok = agx_g17g_mrt_spills_encodable(ctx);
+      ctx->g17g_mrt_spills_known = true;
+   }
+   return ctx->g17g_mrt_spills_ok;
 }
 
 static void

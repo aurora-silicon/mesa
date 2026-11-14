@@ -983,6 +983,10 @@ struct agx_context {
     * (agx_g17g_mrt_one_pass). */
    bool g17g_mrt_spill;
 
+   /* Whether the bound framebuffer's spilled attachments can be described
+    * (agx_g17g_mrt_spills_encodable), once it has been worked out. */
+   bool g17g_mrt_spills_known, g17g_mrt_spills_ok;
+
    /* G17G renders one layer at a time (agx_g17g_bind_layer): while a draw
     * or clear of a layered framebuffer is split, the bound framebuffer holds
     * one layer's views. g17g_layered_fb is the application's framebuffer
