@@ -350,6 +350,10 @@ target_supports_program(const char *target, const nir_function *func)
            * operations). Native AS images exist only on G17S. */
           (!strcmp(target, "g17g") &&
            !strncmp(func->name, "libagx_agx3_as_", strlen("libagx_agx3_as_"))) ||
+          /* The same operations on M5 structures in the common BVH layout,
+           * which the shader traversal reads (copy.cl). */
+          (!strcmp(target, "g17g") &&
+           !strncmp(func->name, "libagx_hk_bvh_", strlen("libagx_hk_bvh_"))) ||
           !strcmp(func->name, "libagx_fill_uint4") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
