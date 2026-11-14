@@ -6678,10 +6678,17 @@ hk_g17p_mesh_rows(nir_shader *nir)
    nir_cf_list body;
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
    nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_def *grid = nir_load_num_workgroups(&b);
    nir_def *wg = nir_load_workgroup_id(&b);
    nir_def *valid_whole = nir_imm_true(&b);
-   /* A grid that fits one launch arrives as it is (hk_mesh_launch_whole()). */
+   /* A grid that fits one launch arrives as it is (hk_mesh_launch_whole()):
+    * the recording says so for a grid it knows, otherwise test the grid. */
+   nir_def *recorded_whole = nir_load_global_constant(&b, 1, 32,
+      nir_iadd_imm(&b, nir_load_root_agx(&b), hk_root_descriptor_offset(mesh_whole)),
+      .align_mul = 4, .access = ACCESS_CAN_SPECULATE);
+   nir_push_if(&b, nir_ine_imm(&b, recorded_whole, 0))->control =
+      nir_selection_control_dont_flatten;
+   nir_push_else(&b, NULL);
+   nir_def *grid = nir_load_num_workgroups(&b);
    nir_push_if(&b, hk_mesh_launch_whole(&b, nir_channel(&b, grid, 0),
                                         nir_channel(&b, grid, 1),
                                         nir_channel(&b, grid, 2)))->control =
@@ -6698,8 +6705,11 @@ hk_g17p_mesh_rows(nir_shader *nir)
                                nir_isub(&b, row, nir_imul(&b, z, gy)), z);
    nir_def *valid_rows = nir_ult(&b, launch_row, l.count);
    nir_pop_if(&b, NULL);
-   nir_def *id = nir_if_phi(&b, wg, id_rows);
-   nir_def *valid = nir_if_phi(&b, valid_whole, valid_rows);
+   nir_def *id_tested = nir_if_phi(&b, wg, id_rows);
+   nir_def *valid_tested = nir_if_phi(&b, valid_whole, valid_rows);
+   nir_pop_if(&b, NULL);
+   nir_def *id = nir_if_phi(&b, wg, id_tested);
+   nir_def *valid = nir_if_phi(&b, valid_whole, valid_tested);
 
    nir_push_if(&b, valid);
    b.cursor = nir_cf_reinsert(&body, b.cursor);

@@ -13340,6 +13340,10 @@ hk_draw_mesh_g17p(struct hk_cmd_buffer *cmd, uint64_t grid,
    const bool whole = cpu_grid &&
       (uint64_t)cpu_grid[0] * cpu_grid[1] * cpu_grid[2] <= HK_MESH_LAUNCH_WGS &&
       cpu_grid[1] <= HK_MESH_LAUNCH_MAX_Y;
+   if (desc->root.mesh_whole != whole) {
+      desc->root.mesh_whole = whole;
+      desc->root_dirty = true;
+   }
    const uint32_t launches = !cpu_grid ? HK_MESH_LAUNCHES_MAX
       : whole ? 1
       : DIV_ROUND_UP((uint64_t)cpu_grid[1] * cpu_grid[2],

@@ -291,6 +291,11 @@ struct hk_root_descriptor_table {
    /* G17P mesh lines: 1/64 pixel along +y in NDC for viewport 0, signed by
     * its y direction (agx_nir_lower_gen1_mesh). */
    float line_y_bias;
+
+   /* G17P mesh-only draw: nonzero when the draw's grid is known at recording
+    * and fits one launch as it is (hk_mesh_launch_whole()), so the mesh
+    * workgroup IDs are the API's without reading the grid. */
+   uint32_t mesh_whole;
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
