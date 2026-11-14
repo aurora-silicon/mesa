@@ -2698,6 +2698,8 @@ struct hk_meta_save {
    struct hk_push_descriptor_set push_desc0;
    VkQueryPipelineStatisticFlags pipeline_stats_flags;
    uint8_t push[HK_MAX_PUSH_SIZE];
+   /* The runtime's record of stages bound from a pipeline. */
+   VkShaderStageFlags pipeline_shader_stages;
 };
 
 void hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
