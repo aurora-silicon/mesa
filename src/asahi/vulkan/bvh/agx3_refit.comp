@@ -3,14 +3,19 @@
  *
  * Retained jobs of updatable structures (see hk_agx3_retained_job).
  * HK_AGX3_REFIT_SAVE keeps a full build's encoding jobs after its image, one
- * thread per job, and HK_AGX3_REFIT_COUNT_LEVELS and LIST_LEVELS list its
- * inner jobs by level; counting also gives triangle leaves their slots. HK_AGX3_REFIT_PREPARE readies an update, after its
- * leaves: it finds the source's jobs, copies them when updating into
- * another structure, clears the arrival counters and writes the refit
- * state, the level dispatches and the envelope job. After refit encoding
- * has encoded the leaf jobs, HK_AGX3_REFIT_PROPAGATE encodes the inner jobs
- * deeper than the levels, one thread per job, and HK_AGX3_REFIT_INNER those
- * of one level, eight lanes per job.
+ * thread per job: it hands out their child offsets and positions.
+ * HK_AGX3_REFIT_NUMBER numbers them leaf first and writes their records,
+ * giving triangle leaves their slots, and HK_AGX3_REFIT_COUNT_LEVELS and
+ * LIST_LEVELS link the records and list the inner jobs by level. Each job
+ * keeps its children in their order, so the numbering changes no encoded
+ * byte. HK_AGX3_REFIT_PREPARE readies an update, after its leaves: it
+ * finds the source's jobs, copies them when updating into another
+ * structure, clears the arrival counters and writes the refit state, the
+ * level dispatches and the envelope job. Refit encoding then encodes the
+ * leaf jobs, which the leaf-first numbering puts at the start, so its grid
+ * and propagation's cover only those. HK_AGX3_REFIT_PROPAGATE encodes the
+ * inner jobs deeper than the levels, one thread per leaf job, and
+ * HK_AGX3_REFIT_INNER those of one level, eight lanes per job.
  *
  * Propagation runs apart from encoding: its device-scope arrivals wait for
  * the thread's earlier global stores, which in node encoding are a whole
@@ -84,8 +89,8 @@ save(uint id)
       saved.depth = plan.depth;
       saved.deepest_level = 0;
       saved.active_leaves = DEREF(args.header).active_leaf_count;
-      for (uint i = 0; i < 2; ++i)
-         saved.reserved[i] = 0;
+      saved.leaf_jobs = 0;
+      saved.inner_jobs = 0;
       DEREF(state) = saved;
       uint64_t table = level_table(args.retained, jobs);
       for (uint i = 0; i < HK_AGX3_REFIT_LEVELS * 2u; ++i)
@@ -98,28 +103,39 @@ save(uint id)
       return;
    hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.plan_jobs, id));
    uint count = min(job.child_count, 8u);
-   REF(hk_agx3_retained_job) record = INDEX(hk_agx3_retained_job, records, id);
+   /* Hand out the job's child offsets or positions only, and keep the
+    * first in its status: number() writes its record under its new id. */
+   REF(hk_agx3_plan_state) cursors = REF(hk_agx3_plan_state)(args.plan_state);
    uint first;
    if (job.node_kind == HK_AGX3_NODE_INNER) {
-      first = atomicAdd(DEREF(REF(hk_agx3_plan_state)(args.plan_state)).saved_positions, count);
-      for (uint c = 0; c < count; ++c) {
-         hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.plan_nodes,
-                                              node_index(job.triangle_offsets[c])));
-         uint child = node.job;
-         if (child >= jobs)
-            continue;
-         REF(hk_agx3_retained_job) child_record = INDEX(hk_agx3_retained_job, records, child);
-         DEREF(child_record).parent = id;
-         DEREF(child_record).position = first + c;
-         /* Inner jobs sit at depths of whole levels. */
-         DEREF(INDEX(uint32_t, args.status, child)) =
-            (node.depth & ~(HK_AGX3_PLAN_PAIR | HK_AGX3_PLAN_PAIR_OPAQUE)) / 3u;
-      }
+      first = atomicAdd(DEREF(cursors).saved_positions, count);
    } else {
-      first = atomicAdd(DEREF(REF(hk_agx3_plan_state)(args.plan_state)).saved_offsets, count);
+      first = atomicAdd(DEREF(cursors).saved_offsets, count);
       for (uint c = 0; c < count; ++c)
          DEREF(INDEX(uint32_t, offsets, first + c)) = job.triangle_offsets[c];
    }
+   DEREF(INDEX(uint32_t, args.status, id)) = first;
+}
+
+/* Give job `id` of the plan its retained id, leaf jobs from 0 and inner
+ * jobs down from job_count - 1, counted in the retained state. Write its
+ * record but for its parent and position, which count_levels() links, give
+ * a triangle leaf job's leaves their slots, the indices of their child
+ * offsets, and leave the retained id in the job's status. */
+void
+number(uint id)
+{
+   REF(hk_agx3_retained_state) state = REF(hk_agx3_retained_state)(args.retained);
+   uint jobs = DEREF(state).job_count;
+   if (id >= jobs)
+      return;
+   hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.plan_jobs, id));
+   uint first = DEREF(INDEX(uint32_t, args.status, id));
+   uint retained = job.node_kind == HK_AGX3_NODE_INNER
+      ? jobs - 1u - atomicAdd(DEREF(state).inner_jobs, 1u)
+      : atomicAdd(DEREF(state).leaf_jobs, 1u);
+   uint64_t records = args.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   REF(hk_agx3_retained_job) record = INDEX(hk_agx3_retained_job, records, retained);
    DEREF(record).root_slot = job.root_slot;
    DEREF(record).child_slot = job.child_slot;
    DEREF(record).kind_count = job.child_count | (job.node_kind << 4);
@@ -127,42 +143,64 @@ save(uint id)
    if (job.root_slot == 0u) {
       DEREF(record).parent = 0xffffffffu;
       DEREF(record).position = jobs - 1u;
-      DEREF(INDEX(uint32_t, args.status, id)) = 0u;
+      DEREF(state).root_job = retained;
    }
+   if (job.node_kind == HK_AGX3_NODE_LEAF) {
+      uint64_t slots = args.retained + uint64_t(HK_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
+      for (uint c = 0; c < min(job.child_count, 8u); ++c) {
+         uint leaf = job.triangle_offsets[c] / leaf_size();
+         if (leaf < args.leaf_bound)
+            DEREF(INDEX(uint32_t, slots, leaf)) = first + c;
+      }
+   }
+   DEREF(INDEX(uint32_t, args.status, id)) = retained;
 }
 
-/* Give each inner job its level and count the inner jobs of each level;
- * give each triangle leaf its slot, the index of its child offset. */
+/* Link the records of job `id` of the plan and of its children under the
+ * retained ids number() left in their statuses: an inner job gives each
+ * child its parent and position, and each inner child its level, counting
+ * the inner jobs of each level. */
 void
 count_levels(uint id)
 {
    REF(hk_agx3_retained_state) state = REF(hk_agx3_retained_state)(args.retained);
    uint jobs = DEREF(state).job_count;
    uint64_t records = args.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
-   uint level = 0;
+   uint64_t table = level_table(args.retained, jobs);
+   uint deepest = 0;
+   hk_agx3_leaf_job job;
    bool inner = false;
    if (id < jobs) {
-      REF(hk_agx3_retained_job) record = INDEX(hk_agx3_retained_job, records, id);
-      uint kind_count = DEREF(record).kind_count;
-      inner = (kind_count >> 4) == HK_AGX3_NODE_INNER;
-      if ((kind_count >> 4) == HK_AGX3_NODE_LEAF) {
-         uint first = DEREF(record).first;
-         uint64_t offsets = args.retained + uint64_t(HK_AGX3_RETAINED_OFFSETS(jobs));
-         uint64_t slots = args.retained + uint64_t(HK_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
-         for (uint c = 0; c < min(kind_count & 15u, 8u); ++c) {
-            uint leaf = DEREF(INDEX(uint32_t, offsets, first + c)) / leaf_size();
-            if (leaf < args.leaf_bound)
-               DEREF(INDEX(uint32_t, slots, leaf)) = first + c;
-         }
-      }
-      if (inner) {
-         level = DEREF(INDEX(uint32_t, args.status, id));
-         DEREF(record).kind_count = kind_count | (level << 8);
+      job = DEREF(INDEX(hk_agx3_leaf_job, args.plan_jobs, id));
+      inner = job.node_kind == HK_AGX3_NODE_INNER;
+   }
+   if (inner) {
+      /* The root is the inner job of level 0. */
+      if (job.root_slot == 0u)
+         atomicAdd(DEREF(INDEX(uint32_t, table, 0u)), 1u);
+      uint retained = DEREF(INDEX(uint32_t, args.status, id));
+      uint first = DEREF(INDEX(hk_agx3_retained_job, records, retained)).first;
+      for (uint c = 0; c < min(job.child_count, 8u); ++c) {
+         hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.plan_nodes,
+                                              node_index(job.triangle_offsets[c])));
+         if (node.job >= jobs)
+            continue;
+         uint child = DEREF(INDEX(uint32_t, args.status, node.job));
+         REF(hk_agx3_retained_job) child_record = INDEX(hk_agx3_retained_job, records, child);
+         DEREF(child_record).parent = retained;
+         DEREF(child_record).position = first + c;
+         uint kind_count = DEREF(child_record).kind_count;
+         if (((kind_count >> 4) & 15u) != HK_AGX3_NODE_INNER)
+            continue;
+         /* Inner jobs sit at depths of whole levels. */
+         uint level = (node.depth & ~(HK_AGX3_PLAN_PAIR | HK_AGX3_PLAN_PAIR_OPAQUE)) / 3u;
+         DEREF(child_record).kind_count = kind_count | (level << 8);
          if (level < HK_AGX3_REFIT_LEVELS)
-            atomicAdd(DEREF(INDEX(uint32_t, level_table(args.retained, jobs), level)), 1u);
+            atomicAdd(DEREF(INDEX(uint32_t, table, level)), 1u);
+         deepest = max(deepest, level);
       }
    }
-   uint deepest = subgroupMax(level);
+   deepest = subgroupMax(deepest);
    if (subgroupElect() && deepest != 0u)
       atomicMax(DEREF(state).deepest_level, deepest);
 }
@@ -217,15 +255,21 @@ prepare(uint id)
    }
    if (id != 0)
       return;
+   /* Refit encoding and propagation start from the leaf jobs only, those
+    * below the first inner job. Counts that do not add up to the jobs
+    * leave both to cover every job. */
+   uint leaves = saved.leaf_jobs;
+   if (leaves > jobs || leaves + saved.inner_jobs != jobs)
+      leaves = jobs;
    hk_agx3_refit_state refit;
-   refit.dispatch[0] = (jobs + HK_AGX3_NODE_JOBS_PER_GROUP - 1u) / HK_AGX3_NODE_JOBS_PER_GROUP;
+   refit.dispatch[0] = (leaves + HK_AGX3_NODE_JOBS_PER_GROUP - 1u) / HK_AGX3_NODE_JOBS_PER_GROUP;
    refit.dispatch[1] = 1u;
    refit.dispatch[2] = 1u;
    refit.job_count = jobs;
    refit.retained = args.copy != 0u ? args.retained : source;
    /* Propagation only for inner jobs past the levels. */
    refit.propagate[0] = saved.deepest_level >= args.level
-      ? (jobs + HK_AGX3_REFIT_GROUP_SIZE - 1u) / HK_AGX3_REFIT_GROUP_SIZE : 0u;
+      ? (leaves + HK_AGX3_REFIT_GROUP_SIZE - 1u) / HK_AGX3_REFIT_GROUP_SIZE : 0u;
    refit.propagate[1] = 1u;
    refit.propagate[2] = 1u;
    refit.end_slot = saved.end_slot;
@@ -393,6 +437,8 @@ main()
       count_levels(id);
    else if (phase == HK_AGX3_REFIT_LIST_LEVELS)
       list_levels(id);
+   else if (phase == HK_AGX3_REFIT_NUMBER)
+      number(id);
    else
       inner(id);
 }

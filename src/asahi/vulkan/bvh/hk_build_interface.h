@@ -66,6 +66,10 @@ TYPE(libagx_gen1_as_metadata, 8);
  * triangle update may skip generating IR leaves: its leaf pass leaves each
  * triangle (hk_agx3_refit_triangle) at its slot, so that each leaf job
  * finds its children together.
+ *
+ * The retained jobs are numbered leaf first: the leaf jobs (every job but
+ * the inner ones) take ids from 0 and the inner jobs the rest, so that an
+ * update's refit encoding and propagation cover only the leaf jobs.
  */
 struct hk_agx3_retained_state {
    uint32_t job_count;
@@ -77,7 +81,9 @@ struct hk_agx3_retained_state {
     * primitive is active (VK_BUILD_FLAG_ALWAYS_ACTIVE), so an update has as
     * many. */
    uint32_t active_leaves;
-   uint32_t reserved[2];
+   /* The leaf and inner jobs: ids below leaf_jobs are leaf jobs. */
+   uint32_t leaf_jobs;
+   uint32_t inner_jobs;
 };
 
 struct hk_agx3_retained_job {
@@ -112,20 +118,22 @@ TYPE(hk_agx3_retained_job, 4);
 #define HK_AGX3_RETAINED_BYTES(jobs, leaves)                                   \
    (HK_AGX3_RETAINED_SLOTS(jobs, leaves) + (leaves) * 4u)
 
-/* Refit phases. A full build that allows updates saves its jobs, then
- * counts its inner jobs by level and lists them. An update prepares (after
- * its leaves) to encode from them. After refit encoding has encoded the
- * leaf jobs, propagation encodes the inner jobs of the levels past those
- * the update encodes by level: each leaf job below them arrives at its
- * parent, and the last child of an inner job to arrive encodes that job's
- * node and arrives at its parent in turn. Then the update encodes the
- * inner jobs of one level per dispatch, deepest first (inner). */
+/* Refit phases. A full build that allows updates saves its jobs, numbers
+ * them leaf first, then counts its inner jobs by level and lists them. An
+ * update prepares (after its leaves) to encode from them. After refit
+ * encoding has encoded the leaf jobs, propagation encodes the inner jobs
+ * of the levels past those the update encodes by level: each leaf job
+ * below them arrives at its parent, and the last child of an inner job to
+ * arrive encodes that job's node and arrives at its parent in turn. Then
+ * the update encodes the inner jobs of one level per dispatch, deepest
+ * first (inner). */
 #define HK_AGX3_REFIT_SAVE 0u
 #define HK_AGX3_REFIT_PREPARE 1u
 #define HK_AGX3_REFIT_PROPAGATE 2u
 #define HK_AGX3_REFIT_COUNT_LEVELS 3u
 #define HK_AGX3_REFIT_LIST_LEVELS 4u
 #define HK_AGX3_REFIT_INNER 5u
+#define HK_AGX3_REFIT_NUMBER 6u
 
 /* Written by the prepare phase in encode scratch, read by refit encoding. */
 struct hk_agx3_refit_state {
@@ -177,7 +185,8 @@ struct hk_agx3_refit_args {
    uint32_t copy;
    /* Propagate and inner: as for node encoding. */
    uint32_t slot_bias;
-   /* Propagate and inner: as for node encoding. Save: each job's level, in
+   /* Propagate and inner: as for node encoding. Save and numbering: each
+    * plan job's first child offset or position, then its retained id, in
     * the node statuses, which node encoding has finished with. */
    REF(uint32_t) status;
    /* Prepare: the level dispatches (VkDispatchIndirectCommands, workgroups
