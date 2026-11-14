@@ -234,6 +234,8 @@ main()
    store32(h + 120ul, instances ? 0x41d00000u : job.opaque_build_word);
    store32(h + 124ul, 0x01000000);
 
+   /* Both 46-word loops are unrolled, past the compiler's limit, so that
+    * every descriptor access has a constant index. */
    uint descriptor[46] =
       uint[46](job.primitive_count, job.primitive_count, 0, 0, job.node_count,
                job.depth, 1, 0, 1, 0, 0, 0, 0, 0x3f800000, 0, 0, 2, 1, 0, 0, 2,
@@ -246,6 +248,7 @@ main()
          8,0,0,0,8,18,0,6,1,1,1,0,0x01000000,0,0x100,0x10000,
          0x10000,0x00ff0001,0x02000000,5,0x03000002,1,0,0x3f800000,
          0,0,0,0,0,0);
+      [[unroll]]
       for (uint i = 0; i < 46; ++i)
          descriptor[i] = template_words[i];
       descriptor[0] = job.primitive_count;
@@ -255,6 +258,7 @@ main()
       descriptor[7] = job.primitive_count;
       descriptor[27] = inverse_bits;
    }
+   [[unroll]]
    for (uint i = 0; i < 46; ++i)
       store32(job.output_bvh + descriptor_offset + uint64_t(i) * 4ul, descriptor[i]);
    publish_metadata(job, size);
