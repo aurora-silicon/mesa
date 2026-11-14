@@ -1164,11 +1164,11 @@ hk_encode_as(VkCommandBuffer commandBuffer,
                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(args),
                               &args);
 
-   /* One invocation per output node.  The shader clamps against the counts
-    * the builder wrote into the header, which can be smaller than this bound
-    * when leaves turn out inactive. */
-   hk_cmd_dispatch_unaligned(commandBuffer,
-                             internal_bound + state->leaf_node_count, 1, 1);
+   /* One invocation per internal node, which also encodes its leaf
+    * children.  The shader clamps against the count the builder wrote into
+    * the header, which can be smaller than this bound when leaves turn out
+    * inactive. */
+   hk_cmd_dispatch_unaligned(commandBuffer, internal_bound, 1, 1);
 }
 
 static void hk_write_buffer_cp(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
