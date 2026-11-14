@@ -13336,10 +13336,14 @@ hk_draw_mesh_g17p(struct hk_cmd_buffer *cmd, uint64_t grid,
       desc->root.mesh_draw_id = draw_id;
       desc->root_dirty = true;
    }
-   const uint32_t launches = cpu_grid
-      ? DIV_ROUND_UP((uint64_t)cpu_grid[1] * cpu_grid[2],
-                     hk_mesh_launch_rows(cpu_grid[0]))
-      : HK_MESH_LAUNCHES_MAX;
+   /* A grid that fits one launch goes out as it is (hk_mesh_launch_whole()). */
+   const bool whole = cpu_grid &&
+      (uint64_t)cpu_grid[0] * cpu_grid[1] * cpu_grid[2] <= HK_MESH_LAUNCH_WGS &&
+      cpu_grid[1] <= HK_MESH_LAUNCH_MAX_Y;
+   const uint32_t launches = !cpu_grid ? HK_MESH_LAUNCHES_MAX
+      : whole ? 1
+      : DIV_ROUND_UP((uint64_t)cpu_grid[1] * cpu_grid[2],
+                     hk_mesh_launch_rows(cpu_grid[0]));
    for (uint32_t launch = 0; launch < launches; ++launch) {
       const struct {
          uint64_t grid, count, predicate;
