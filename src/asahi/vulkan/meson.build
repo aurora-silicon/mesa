@@ -70,6 +70,8 @@ hk_files = files(
   'hk_nir_lower_gs.c',
   'hk_nir_lower_tes_rq.c',
   'hk_nir_lower_gs.h',
+  'hk_nir_vertex_preamble.c',
+  'hk_nir_vertex_preamble.h',
   'hk_nir_root_size.c',
   'hk_nir_lower_ray_queries.c',
   'hk_nir_lower_robust_image.c',
@@ -553,6 +555,20 @@ if with_tests
       include_directories : [include_directories('.'), inc_asahi, inc_poly],
       dependencies : [idep_nir, idep_mesautil, idep_libpoly],
       link_with : [libpoly_nir, libasahi_compiler],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'hk_vertex_preamble_shift',
+    executable(
+      'hk_vertex_preamble_shift_test',
+      files('tests/test-hk-vertex-preamble-shift.c',
+            'hk_nir_vertex_preamble.c'),
+      include_directories : [include_directories('.'), inc_asahi],
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
       gnu_symbol_visibility : 'hidden',
     ),
     suite : ['asahi'],
