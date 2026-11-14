@@ -740,9 +740,9 @@ bool agx_params_driver_supported(
 bool agx_params_g18g_bringup_supported(
    const struct drm_asahi_params_global *params);
 
-/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S) and M5 Max (T6050, G17C)
- * kernel contracts the driver admits. This is not a declaration of a complete
- * or conformant device path. */
+/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S), M5 Max (T6050, G17C) and M5
+ * Ultra (T6050, G17D) kernel contracts the driver admits. This is not a
+ * declaration of a complete or conformant device path. */
 bool agx_params_m5_supported(
    const struct drm_asahi_params_global *params);
 

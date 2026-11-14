@@ -581,12 +581,19 @@ agx_chip_exact_product_name(enum agx_chip chip)
 bool
 agx_params_m5_supported(const struct drm_asahi_params_global *params)
 {
-   if (!params || params->num_dies != 1 ||
-       params->usc_generation != AGX_ISA_AGX3 ||
+   if (!params || params->usc_generation != AGX_ISA_AGX3 ||
        params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_300)
       return false;
 
    const enum agx_chip chip = agx_chip_from_params(params);
+   /* T6050 M5 Ultra (J775D): G17D, two dies, eight clusters. */
+   if (chip == AGX_CHIP_G17D)
+      return params->chip_id == 0x6050 && params->num_dies == 2 &&
+             params->num_clusters_total == 8;
+
+   if (params->num_dies != 1)
+      return false;
+
    return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
            params->num_clusters_total == 1) ||
           /* T6050 M5 Pro (J714s/J716s): G17S, one die, two clusters. */

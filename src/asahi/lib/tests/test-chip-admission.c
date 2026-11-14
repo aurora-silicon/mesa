@@ -11,6 +11,7 @@
 #include <stdio.h>
 
 #include "agx_chip.h"
+#include "agx_drm_names.h"
 #include "agx_va_runtime_hole.h"
 #include "util/macros.h"
 
@@ -319,6 +320,46 @@ main(void)
    bad.gpu_variant = 'S';
    assert(agx_chip_from_params(&bad) == AGX_CHIP_G17S);
    assert(!agx_params_m5_supported(&bad));
+
+   /* The M5 Ultra (T6050, G17D) is admitted with its two dies and eight
+    * clusters only. */
+   struct drm_asahi_params_global t6050d = g15_params('D', 0x6050, 8);
+   t6050d.gpu_generation = 17;
+   t6050d.gpu_hal_generation = DRM_ASAHI_GPU_HAL_300;
+   t6050d.num_dies = 2;
+   assert(agx_chip_from_params(&t6050d) == AGX_CHIP_G17D);
+   assert(agx_chip_g17_m5(AGX_CHIP_G17D));
+   assert(agx_params_m5_supported(&t6050d));
+   assert(!agx_params_driver_supported(&t6050d));
+
+   bad = t6050d;
+   bad.num_dies = 1;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050d;
+   bad.num_clusters_total = 4;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050d;
+   bad.chip_id = 0x6051;
+   assert(!agx_params_m5_supported(&bad));
+   bad = t6050d;
+   bad.gpu_hal_generation = DRM_ASAHI_GPU_HAL_200;
+   assert(!agx_params_m5_supported(&bad));
+
+   /* Two dies describe neither an M5 Pro nor an M5 Max. */
+   bad = t6050d;
+   bad.gpu_variant = 'C';
+   assert(!agx_params_m5_supported(&bad));
+
+   /* The Gallium driver refuses the M5 Ultra, by chip or by its device
+    * tree compatible, and no other chip. */
+   for (unsigned c = 0; c < AGX_CHIP_UNKNOWN; ++c) {
+      assert(agx_gallium_refuses_gpu(NULL, agx_chip_name(c)) ==
+             (c == AGX_CHIP_G17D));
+   }
+   assert(agx_gallium_refuses_gpu("apple,agx-g17d", NULL));
+   assert(!agx_gallium_refuses_gpu("apple,agx-g17c", NULL));
+   assert(!agx_gallium_refuses_gpu("apple,agx-g17s", NULL));
+   assert(!agx_gallium_refuses_gpu(NULL, NULL));
 
    /* The M5 (T8142, G17G) is admitted by its exact kernel identity. */
    struct drm_asahi_params_global m5 = {
