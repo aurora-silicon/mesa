@@ -37,12 +37,25 @@
  * the descriptor's spare bytes past the atomic word:
  *
  *    word 0: layer stride in elements; zero for every other descriptor
- *    word 1: log2 tile width [0:3], log2 tile height [4:7], in pixels
+ *    word 1: log2 tile width [0:3], log2 tile height [4:7], in pixels;
+ *            bit 31 (HK_M5_STORE_2D) instead marks a 2D PBE, see below
  *    word 2: level width [0:15], level height [16:31], in pixels
- *    word 3: layer count of the view (faces for a cube)
+ *    word 3: layer count of the view (faces for a cube); zero for every
+ *            descriptor without a record
  *
- * hk_nir_lower_descriptors() stores through the window at the texel's tiled
- * element index (the arithmetic image atomics use) when word 0 is nonzero.
+ * hk_nir_lower_descriptors() takes the record for stores when word 3 is
+ * nonzero, and stores through the window at the texel's tiled element index
+ * (the arithmetic image atomics use) unless word 1 has HK_M5_STORE_2D; it
+ * takes it for atomics when word 0 is nonzero, updating the texel in memory.
+ *
+ * The packer admits a compressed layered PBE only as a one-layer 2D array,
+ * never 3D, so a one-layer layered storage view of a compressed image (on
+ * G17S, a single-layer 2D storage image, hk_image.c) cannot take the 3D
+ * store. Its PBE is the image's compressed 2D PBE at the view's level, and
+ * its record is word 0 zero, word 1 HK_M5_STORE_2D, word 2 the level size and
+ * word 3 one: layered stores then store to that PBE at (x, y), and drop
+ * layers other than 0. Atomics keep the native op, which the record's zero
+ * word 0 selects: no compressed storage format has image atomics.
  */
 #define HK_M5_STORE_WINDOW_OFFSET       80
 #define HK_M5_STORE_WINDOW_SIZE         16
@@ -51,6 +64,7 @@
 #define HK_M5_STORE_WINDOW_WIDTH        16384
 /* Gen10 PBE heights are 15 bits wide. */
 #define HK_M5_STORE_WINDOW_MAX_HEIGHT   32768
+#define HK_M5_STORE_2D                  (1u << 31)
 
 static_assert(HK_M5_STORE_WINDOW_OFFSET + HK_M5_STORE_WINDOW_SIZE <=
                  HK_G17P_STORAGE_STRIDE,
@@ -97,6 +111,24 @@ hk_pack_m5_store_window(uint64_t layer_stride_B, uint64_t level_size_B,
    out[2] = width_px | ((uint32_t)height_px << 16);
    out[3] = layers;
    return (uint32_t)rows;
+}
+
+/* Fill the record of a one-layer layered storage view whose PBE is 2D, at a
+ * level of width x height pixels. Returns false if the record cannot hold
+ * the level's size.
+ */
+static inline bool
+hk_pack_m5_store_2d(unsigned width_px, unsigned height_px, uint32_t out[4])
+{
+   if (!out || !width_px || !height_px || width_px > UINT16_MAX ||
+       height_px > UINT16_MAX)
+      return false;
+
+   out[0] = 0;
+   out[1] = HK_M5_STORE_2D;
+   out[2] = width_px | ((uint32_t)height_px << 16);
+   out[3] = 1;
+   return true;
 }
 
 static inline bool

@@ -53,6 +53,20 @@ check_record(void)
    CHECK(!hk_pack_m5_store_window(4100, 64, 8, 4, 4, 4, 4, 3, rec));
    CHECK(!hk_pack_m5_store_window(4096, 64, 4, 4, 4, 3, 4, 3, rec));
    CHECK(!hk_pack_m5_store_window(4096, 64, 4, 4, 4, 4, 4, 0, rec));
+
+   /* A one-layer view of a compressed image: a 2D PBE. Stores see a layer
+    * count of one and the flag; atomics see a zero layer stride. */
+   CHECK(hk_pack_m5_store_2d(256, 128, rec));
+   CHECK(rec[0] == 0);
+   CHECK(rec[1] == HK_M5_STORE_2D);
+   CHECK(rec[2] == (256 | (128 << 16)));
+   CHECK(rec[3] == 1);
+   CHECK(!hk_pack_m5_store_2d(65536, 1, rec));
+   CHECK(!hk_pack_m5_store_2d(1, 0, rec));
+   /* The flag is clear of the window's tile logs. */
+   CHECK(hk_pack_m5_store_window(1 << 20, 1 << 16, 16, 64, 64, 1 << 15,
+                                 1 << 15, 3, rec));
+   CHECK(!(rec[1] & HK_M5_STORE_2D));
 }
 
 struct counts {
