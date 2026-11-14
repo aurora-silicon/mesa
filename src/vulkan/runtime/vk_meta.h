@@ -229,6 +229,7 @@ enum vk_meta_object_key_type {
    VK_META_OBJECT_KEY_LBVH_GENERATE_IR,
    VK_META_OBJECT_KEY_PLOC,
    VK_META_OBJECT_KEY_HPLOC,
+   VK_META_OBJECT_KEY_HPLOC_SHUFFLE,
 
    /* Should be used as an offset for driver-specific object types. */
    VK_META_OBJECT_KEY_DRIVER_OFFSET = 0x80000000,
