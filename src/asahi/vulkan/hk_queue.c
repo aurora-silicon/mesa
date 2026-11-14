@@ -1258,24 +1258,6 @@ hk_submit_needs_render_rq(const struct vk_queue_submit *submit)
    return stages;
 }
 
-/* Destroy the replaced kernel queue once all its work is complete, which
- * returns its render free list to the kernel.
- */
-static void
-hk_queue_reap_retired(struct hk_device *dev, struct hk_queue *queue)
-{
-   if (queue->drm.retired_id == UINT32_MAX)
-      return;
-
-   uint64_t point = 0;
-   if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &point, 1) ||
-       point < queue->drm.retired_point)
-      return;
-
-   agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
-   queue->drm.retired_id = UINT32_MAX;
-}
-
 /* Create the kernel queue for the first GPU submission, or replace it with
  * one that reserves render ray-query scratch when the first render using ray
  * queries in a stage the queue does not reserve yet arrives. Only the stages
@@ -1286,6 +1268,8 @@ hk_queue_reap_retired(struct hk_device *dev, struct hk_queue *queue)
  * earlier one on the queue timeline, and queue-local command ordinals start
  * again.
  */
+static void hk_queue_restart_sync(struct hk_queue *queue);
+
 static VkResult
 hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
                     unsigned render_rq, bool *replaced)
@@ -1300,18 +1284,23 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
    /* A replacement keeps every stage the queue reserved. */
    render_rq |= queue->drm.render_rq;
 
-   /* Replacing for the other stage retires the current queue, so the one
-    * retired before must go first. All of its work was submitted before the
-    * current queue's, so this waits for no more than that. */
-   if (queue->drm.id != UINT32_MAX && queue->drm.retired_id != UINT32_MAX) {
+   /* Destroy the kernel queue being replaced before creating the new one,
+    * once its submitted work is complete. Until then the kernel keeps its
+    * compute pool and render free list, and on a 40-core G17P the lower
+    * window cannot also hold the new queue's: the submission that needs the
+    * new reservation would wait in the kernel for memory only this queue's
+    * destruction frees. This waits at most once per stage the queue adds.
+    */
+   const bool had_queue = queue->drm.id != UINT32_MAX;
+   if (had_queue) {
       if (drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj,
-                                 &queue->drm.retired_point, 1, INT64_MAX,
+                                 &queue->drm.timeline_value, 1, INT64_MAX,
                                  DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL))
          return vk_errorf(dev, VK_ERROR_DEVICE_LOST,
-                          "Waiting for the retired kernel queue failed: %s",
+                          "Waiting for the replaced kernel queue failed: %s",
                           strerror(errno));
-      agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
-      queue->drm.retired_id = UINT32_MAX;
+      agx_destroy_command_queue(&dev->dev, queue->drm.id);
+      queue->drm.id = UINT32_MAX;
    }
 
    /* M5 and G17P admit GPU work at the API entrypoint, before semaphore
@@ -1324,16 +1313,17 @@ hk_queue_ensure_drm(struct hk_device *dev, struct hk_queue *queue,
    const uint32_t id = agx_create_command_queue_with_render_scs(
       &dev->dev, (enum drm_asahi_priority)(queue->drm.virt_ring_idx - 1), layouts);
    if (id != UINT32_MAX) {
-      if (queue->drm.id != UINT32_MAX) {
-         /* Earlier work may still run on the old kernel queue. */
-         assert(queue->drm.retired_id == UINT32_MAX);
-         queue->drm.retired_id = queue->drm.id;
-         queue->drm.retired_point = queue->drm.timeline_value;
-         *replaced = true;
-      }
+      *replaced = had_queue;
       queue->drm.id = id;
       queue->drm.render_rq = render_rq;
       return VK_SUCCESS;
+   }
+
+   /* The replaced queue's work is complete, so a later queue starts like a
+    * first one. Keep the stages it reserved for that queue. */
+   if (had_queue) {
+      queue->drm.render_rq = render_rq;
+      hk_queue_restart_sync(queue);
    }
 
    const int error = errno;
@@ -1572,8 +1562,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
          return vk_device_set_lost(&dev->vk, "Asahi command ordinal overflow");
       return queue_submit_empty(dev, queue, submit);
    }
-
-   hk_queue_reap_retired(dev, queue);
 
    bool replaced;
    VkResult queue_result = hk_queue_ensure_drm(
@@ -2464,7 +2452,6 @@ hk_queue_create(struct hk_device *dev,
       (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) != 0;
 
    queue->drm.id = UINT32_MAX;
-   queue->drm.retired_id = UINT32_MAX;
    for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
       queue->sib.id[i] = UINT32_MAX;
    queue->sib.count = 1;
@@ -2593,8 +2580,6 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);
    if (queue->drm.id != UINT32_MAX)
       agx_destroy_command_queue(&dev->dev, queue->drm.id);
-   if (queue->drm.retired_id != UINT32_MAX)
-      agx_destroy_command_queue(&dev->dev, queue->drm.retired_id);
    for (unsigned i = 1; i < HK_QUEUE_SIBLINGS_MAX; ++i) {
       if (queue->sib.id[i] != UINT32_MAX)
          agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);

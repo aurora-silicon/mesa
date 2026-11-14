@@ -36,12 +36,6 @@ struct hk_queue {
        * one contiguous block in one bounded window. */
       uint8_t render_rq;
 
-      /* The kernel queue a render ray query replaced, UINT32_MAX if none.
-       * It is destroyed once the queue timeline reaches retired_point, the
-       * last point submitted to it, or with the queue. */
-      uint32_t retired_id;
-      uint64_t retired_point;
-
       /* Timeline syncobj backing the queue */
       uint32_t syncobj;
 
