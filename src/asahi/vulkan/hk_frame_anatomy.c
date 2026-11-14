@@ -854,7 +854,7 @@ hk_frame_anatomy_compute(struct hk_frame_anatomy_submit *s,
                 cs->stats.calls, cs->stats.flushes, cs->stats.merged,
                 (unsigned)util_dynarray_num_elements(&cs->imm_writes,
                                                      struct libagx_imm_write),
-                cs->gen1_native_rq ? 1 : 0,
+                cs->m5_native_rq || cs->gen1_native_rq ? 1 : 0,
                 cs->m5_matrix_ops ? 1 : 0, c->helper.data ? 'c' : '-');
    /* Compute programs, as for fragment programs in render records. */
    for (unsigned i = 0; i < HK_FA_FS_MAX && cs->anatomy_fs[i].fs; ++i) {

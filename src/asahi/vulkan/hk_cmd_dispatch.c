@@ -49,6 +49,9 @@
 DEBUG_GET_ONCE_BOOL_OPTION(m5_launch_debug, "ASAHI_M5_LAUNCH_DEBUG", false)
 DEBUG_GET_ONCE_BOOL_OPTION(m5_verify_compute_loader,
                            "AGX_M5_VERIFY_COMPUTE_LOADER", false)
+DEBUG_GET_ONCE_BOOL_OPTION(m5_rq_candidate_api, "ASAHI_M5_RQ_CANDIDATE_API",
+                           false)
+
 /* EXP-G1b's native access::write argument is a PBE pointer followed by a
  * pointer to this control descriptor, including when it follows a sampled
  * texture in the argument table. It is not the read_write clamp scalar. */
@@ -1755,6 +1758,57 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 }
 
 
+/*
+ * The SCS state block the native query runtime reads (the runtime's user
+ * image, a zero tail up to the layout's section 12, and for instance layouts
+ * the ScsLayoutGen2 parameter record at +0x80020) depends only on the packed
+ * layout, which is fixed for a device, and the GPU never writes it: with the
+ * block bound GPU-read-only, ray query CTS runs complete without a fault, and a
+ * before/after comparison over 469 traversal dispatches finds no changed byte.
+ * So it is initialized once per device and shared by every traversal
+ * dispatch, instead of allocating and copying 8 MiB per dispatch or per
+ * vkCmdTraceRays*. ASAHI_M5_RT_PERSISTENT_STATE=0 restores the per-dispatch
+ * block for A/B diagnosis.
+ */
+bool
+hk_m5_rt_persistent_state_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("ASAHI_M5_RT_PERSISTENT_STATE", true);
+   return enabled;
+}
+
+struct agx_ptr
+hk_m5_persistent_rt_state(struct hk_device *dev, uint64_t packed, uint64_t size,
+                          const struct agx_scs_layout_gen2 *scs)
+{
+   struct agx_ptr state = {0};
+   simple_mtx_lock(&dev->m5_as_lock);
+   if (!dev->m5_rt_state_bo) {
+      struct agx_bo *bo =
+         agx_bo_create(&dev->dev, size, 0x4000, 0, "M5 SCS state");
+      if (bo) {
+         uint8_t *map = agx_bo_map(bo);
+         memcpy(map, dev->m5_rq_user_image, 0x800000);
+         if (size > 0x800000)
+            memset(map + 0x800000, 0, size - 0x800000);
+         if (dev->m5_rq_instances)
+            agx_scs_layout_gen2_parameters(scs, map + 0x80020);
+         dev->m5_rt_state_bo = bo;
+         dev->m5_rt_state_packed = packed;
+         dev->m5_rt_state_size = size;
+      }
+   }
+   if (dev->m5_rt_state_bo && dev->m5_rt_state_packed == packed &&
+       dev->m5_rt_state_size >= size) {
+      state.cpu = agx_bo_map(dev->m5_rt_state_bo);
+      state.gpu = dev->m5_rt_state_bo->va->addr;
+   }
+   simple_mtx_unlock(&dev->m5_as_lock);
+   return state;
+}
+
 __attribute__((hot)) void
 hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                       struct hk_shader *s, struct agx_grid grid,
@@ -1770,7 +1824,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, 1u << 16) ||
        ((s->b.info.scratch_size || linked->b.scratch_size) &&
         !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) ||
-       s->b.info.uses_ray_traversal || s->info.agx3_txf_texture_valid ||
+       (s->b.info.uses_ray_traversal && !dev->m5_native_rq) || s->info.agx3_txf_texture_valid ||
        s->info.agx3_storage_image_valid || s->info.agx3_sampled_storage_valid ||
        s->info.agx3_indexed_storage_valid ||
        !local_size.x || !local_size.y || !local_size.z ||
@@ -1816,6 +1870,146 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        !hk_m5_compute_uniform_dma_ranges(cmd, s, root, ranges,
                                          ARRAY_SIZE(ranges), &count))
       goto refused;
+   if (s->b.info.uses_ray_traversal) {
+      reason = "native query dispatch shape";
+      /* Internal query kernels use the compute query ABI. A software vertex
+       * variant keeps the vertex ABI (hk_g17p_internal_graphics_uniform_ranges)
+       * and therefore stays refused. */
+      if (internal && s->info.stage != MESA_SHADER_TESS_CTRL &&
+          s->info.stage != MESA_SHADER_TESS_EVAL &&
+          s->info.stage != MESA_SHADER_GEOMETRY)
+         goto refused;
+      /* Keep the shader's native payload profile, but derive every allocation
+       * and parameter offset from the native ScsLayoutGen2 equations. In
+       * particular, the driver's payload and the saved instance levels are
+       * different sections; neither is the shader's ordinary spill buffer. */
+      struct agx_scs_layout_gen2 scs;
+      const uint64_t packed = dev->m5_rq_instances
+         ? (debug_get_option_m5_rq_candidate_api()
+                     ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
+                     : UINT64_C(0x00480000600100e8)) : UINT64_C(0x0028000060000070);
+      if (!agx_scs_layout_gen2_init(packed, &scs))
+         goto refused;
+      const uint64_t state_size = MAX2(UINT64_C(0x800000),
+                                       ALIGN_POT((uint64_t)scs.end[12], 0x4000));
+      /* One device-lifetime state block (hk_m5_persistent_rt_state). The
+       * per-dispatch block remains for ASAHI_M5_RT_PERSISTENT_STATE=0 and as
+       * the fallback if the device block cannot be created; the per-raygen
+       * dispatches of one vkCmdTraceRays* share it. */
+      struct agx_ptr state = hk_m5_rt_persistent_state_enabled()
+         ? hk_m5_persistent_rt_state(dev, packed, state_size, &scs)
+         : (struct agx_ptr){0};
+      const bool persistent_state = state.cpu != NULL;
+      if (persistent_state)
+         hk_cmd_buffer_retain_bo(cmd, dev->m5_rt_state_bo);
+      const bool reuse_state = !persistent_state && cmd->m5_rt_state.share &&
+                               cmd->m5_rt_state.state.cpu &&
+                               cmd->m5_rt_state.packed == packed;
+      const bool fresh_state = !persistent_state && !reuse_state;
+      if (!persistent_state)
+         state = reuse_state ? cmd->m5_rt_state.state
+                             : hk_pool_alloc(cmd, state_size, 0x4000);
+      /* The per-raygen dispatches of one vkCmdTraceRays* (see
+       * hk_trace_rays_select_and_dispatch) read identical traversal uniforms:
+       * the same state block, AS table and context. Build them once. */
+      const bool shared_uniforms = cmd->m5_rt_state.share &&
+                                   cmd->m5_rt_state.uniforms.cpu &&
+                                   cmd->m5_rt_state.uniforms_packed == packed &&
+                                   cmd->m5_rt_state.uniforms_state == state.gpu;
+      if (shared_uniforms) {
+         if (!state.cpu) return;
+         ranges[count++] = (struct agx3_ioto_uniform_range){
+            .start_halfs=0, .size_halfs=dev->m5_rq_instances ? 168 : 156,
+            .address=cmd->m5_rt_state.uniforms.gpu,
+         };
+      } else {
+         struct agx_ptr uniforms = hk_pool_alloc(cmd, 512, 16);
+         if (!state.cpu || !uniforms.cpu) return;
+         uint64_t as_table;
+         if (dev->m5_rq_instances) {
+            as_table = hk_m5_upload_as_table(cmd);
+         } else {
+            /* The native profile has96 resident cliques (3072 SCS slots).
+             * A slot is a hardware resident identity, not an invocation index.
+             * Slot0 is reserved by the native AS selector encoding. */
+            struct agx_ptr table = hk_pool_alloc(cmd, (96 * 32 + 1) * 16, 16);
+            if (!table.cpu) return;
+            memset(table.cpu, 0, (96 * 32 + 1) * 16);
+            as_table = table.gpu;
+         }
+         if (!as_table) return;
+         if (fresh_state) {
+            memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
+            if (state_size > 0x800000)
+               memset((uint8_t *)state.cpu + 0x800000, 0, state_size - 0x800000);
+         }
+         uint32_t context[32] = {0, 0, packed, packed >> 32};
+         const uint32_t offsets[] = {0x18000,0x18200,0x18400,0x18500,0x18700,0x19b00};
+         for (unsigned i = 0; i < 6; ++i) {
+            uint64_t pointer = state.gpu + offsets[i];
+            if (i == 4)
+               pointer = as_table;
+            memcpy(context + 4 + 2*i, &pointer, 8);
+         }
+         context[20] = scs.end[5];
+         context[22] = scs.end[10] - scs.end[5];
+         const unsigned levels = (packed >> 16) & 0xff;
+         context[23] = (levels + (levels > 1)) * 8;
+         if (dev->m5_rq_instances) {
+            uint64_t extra = state.gpu + 0x80050;
+            memcpy(context + 26, &extra, 8);
+            extra = state.gpu + 0x18900;
+            memcpy(context + 30, &extra, 8);
+            if (fresh_state)
+               agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
+         }
+         if (cmd->m5_rt_state.share && fresh_state) {
+            cmd->m5_rt_state.state = state;
+            cmd->m5_rt_state.packed = packed;
+         }
+         memset(uniforms.cpu, 0, 512);
+         memcpy(uniforms.cpu, dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms));
+         if (dev->m5_rq_instances) {
+            uint64_t sizes = (uint64_t)scs.end[6] | ((uint64_t)scs.end[11] << 32);
+            uint64_t layout = packed;
+            uint64_t driver = scs.end[5];
+            memcpy((uint8_t *)uniforms.cpu + 48*2, &sizes, 8);
+            memcpy((uint8_t *)uniforms.cpu + 52*2, &layout, 8);
+            memcpy((uint8_t *)uniforms.cpu + 56*2, &driver, 8);
+         }
+         if (debug_get_option_m5_rq_candidate_api()) {
+            /* The query-once payload at u110..113, bound separately because
+             * the ordinary profile uses u140 for its per-clique state. */
+            uint64_t query_payload = UINT64_C(0x3fffffff00008000);
+            memcpy((uint8_t *)uniforms.cpu + 152*2, &query_payload, 8);
+         }
+         for (unsigned i = 0; i < (dev->m5_rq_instances ? 80 : 74); i += 2) {
+            uint64_t pointer; memcpy(&pointer, (uint8_t *)uniforms.cpu + i*4, 8);
+            if (pointer >= UINT64_C(0x10000000000) && pointer < UINT64_C(0x10000800000)) {
+               pointer += state.gpu - UINT64_C(0x10000000000);
+               memcpy((uint8_t *)uniforms.cpu + i*4, &pointer, 8);
+            }
+         }
+         if (dev->m5_rq_instances)
+            memcpy((uint8_t *)uniforms.cpu + 32*2, &as_table, 8);
+         unsigned context_offset = dev->m5_rq_instances ? 352 : 320;
+         memcpy((uint8_t *)uniforms.cpu + context_offset, context, sizeof(context));
+         uint64_t ctx = uniforms.gpu + context_offset, table = as_table;
+         memcpy((uint8_t *)uniforms.cpu + (dev->m5_rq_instances ? 320 : 296), &ctx, 8);
+         memcpy((uint8_t *)uniforms.cpu + (dev->m5_rq_instances ? 328 : 304), &table, 8);
+         ranges[count++] = (struct agx3_ioto_uniform_range){
+            .start_halfs=0, .size_halfs=dev->m5_rq_instances ? 168 : 156, .address=uniforms.gpu,
+         };
+         if (cmd->m5_rt_state.share) {
+            cmd->m5_rt_state.uniforms = uniforms;
+            cmd->m5_rt_state.uniforms_packed = packed;
+            cmd->m5_rt_state.uniforms_state = state.gpu;
+         }
+      }
+      cs->m5_native_rq = true;
+      hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_code);
+      hk_cmd_buffer_retain_bo(cmd, dev->m5_rq_ift);
+   }
    reason = "program bound";
    size_t capacity;
    if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, count, &capacity))
@@ -1879,8 +2073,11 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    } else if (!agx3_g17g_compute_program_generate(dev->dev.chip, &desc, &program)) {
       goto refused;
    }
-   if (!agx3_cdm_direct_template_sources_compute(s->b.info.uses_resource_info_query,
-                                                 false, false, &launch_desc.launch_sources))
+   /* Native instance launch words are 0x00800000/0x01000080:
+    * the nested traversal path uses the 64-byte TI spill class and ID32 bit. */
+   const bool native_instances = dev->m5_rq_instances && s->b.info.uses_ray_traversal;
+   if (!agx3_cdm_direct_template_sources_compute(s->b.info.uses_resource_info_query || native_instances,
+                                                 s->b.info.uses_ray_traversal, native_instances, &launch_desc.launch_sources))
       goto refused;
    /* A constant program's TPS frame is the launch's thread-invariant spill
     * buffer (word 1 bits 3..20): the loader publishes the CProg's inputs to
@@ -1941,7 +2138,8 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           capture.length != AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE)
          goto refused;
       cmd->m5_rt_captured = true;
-      hk_m5_compute_resources(cs, desc.scratch_size, 0,
+      hk_m5_compute_resources(cs, desc.scratch_size,
+                              s->b.info.uses_ray_traversal ? 128 : 0,
                               desc.threadgroup_memory_size_B,
                               local[0] * local[1] * local[2]);
       cs->stats.cmds++;
@@ -1951,12 +2149,12 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * the previous one's weak tail, which nothing else has followed or
     * strengthened, and let this launch's own tail end the stream instead.
     * The two then run side by side; a barrier recorded after them waits for
-    * both. Indirect launches and ray-tracing pipeline kernels keep their
-    * barrier, and so does a kernel with a large per-thread scratch frame:
-    * it runs slower the more of its threads are in flight, so it stays
-    * alone. */
+    * both. Indirect launches and ray-tracing kernels keep their barrier, and
+    * so does a kernel with a large per-thread scratch frame: it runs slower
+    * the more of its threads are in flight, so it stays alone. */
    const bool app_dispatch =
       !cmd->in_meta && !internal && !agx_is_indirect(grid) &&
+      !s->b.info.uses_ray_traversal &&
       !cmd->state.cs.descriptors.root.cs.trace_rays_addr &&
       desc.scratch_size <= HK_M5_OVERLAP_MAX_SCRATCH_B &&
       agx_chip_elide_app_dispatch_barrier(dev->dev.chip);
@@ -1977,7 +2175,8 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->current = (uint32_t *)((uint8_t *)cs->current + sink.length);
    cs->weak_barrier_end = cs->current;
    cs->app_dispatch_end = app_dispatch ? cs->current : NULL;
-   hk_m5_compute_resources(cs, desc.scratch_size, 0,
+   hk_m5_compute_resources(cs, desc.scratch_size,
+                           s->b.info.uses_ray_traversal ? 128 : 0,
                            desc.threadgroup_memory_size_B,
                            local[0] * local[1] * local[2]);
    cs->stats.cmds++;

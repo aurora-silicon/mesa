@@ -15,6 +15,7 @@
 #include "hk_nir_root_size.h"
 #include "hk_nir_lower_tes_rq.h"
 #include "hk_native_write_class.h"
+#include "asahi/compiler/agx_nir_m5_ray_query.h"
 #include "asahi/compiler/agx_nir_m5_mesh.h"
 #include "asahi/compiler/agx3_mesh_core.h"
 #include "hk_nir_sampler_bias.h"
@@ -365,9 +366,9 @@ hk_cf_list_has_indexed_ray_query(struct exec_list *cf_list)
    return false;
 }
 
-/* Keep loops that run whole ray queries. Unrolled, each iteration copies
- * the complete traversal. Opt-in (ASAHI_M5_RQ_KEEP_LOOPS) until its CTS
- * qualification is complete. */
+/* Keep loops that run whole native queries. Unrolled, each iteration copies
+ * the complete traversal (a 64-iteration TES loop compiled to 317 KB).
+ * Opt-in (ASAHI_M5_RQ_KEEP_LOOPS) until its CTS qualification is complete. */
 static void
 hk_keep_m5_ray_query_loops(struct exec_list *cf_list)
 {
@@ -414,6 +415,28 @@ hk_nir_has_ray_query(nir_shader *nir)
             if (instr->type == nir_instr_type_intrinsic &&
                 nir_instr_as_intrinsic(instr)->intrinsic ==
                    nir_intrinsic_intersect_ray_gen1_agx)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
+/* M5 lowers graphics-stage ray queries to intersect_ray_agx before the vertex
+ * ABI is assigned. Those shaders own uniform halves 0..167 for query state. */
+static bool
+hk_nir_has_m5_native_query(const struct hk_device *dev, nir_shader *nir)
+{
+   if (!dev->m5_native_rq)
+      return false;
+   if (hk_nir_has_ray_query(nir))
+      return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_intersect_ray_agx)
                return true;
          }
       }
@@ -3379,6 +3402,42 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             mesa_loge("Gen1 native ray query: unsupported shape or operation");
             return;
          }
+      } else if (dev->m5_native_rq) {
+         /* A query used in closest-hit/miss/callable code is only live after
+          * the TraceRay query of the same invocation has finished, and
+          * separate shader-level queries are often sequential too. Merge
+          * queries whose live ranges do not overlap, so only queries that are
+          * genuinely live at the same time need distinct native contexts. */
+         /* Constant-indexed query arrays become separate queries first. */
+         NIR_PASS(_, nir, agx_nir_m5_split_ray_query_arrays);
+         NIR_PASS(_, nir, nir_split_array_vars, nir_var_function_temp);
+         NIR_PASS(_, nir, nir_opt_ray_queries);
+         NIR_PASS(_, nir, nir_opt_ray_query_ranges);
+
+         const struct agx_m5_ray_query_layout layout = {
+            .payload_uniform = dev->m5_rq_instances ? 134 : 122,
+            .bvh_uniform = dev->m5_rq_instances ? 100 : 96, .status_uniform = 134,
+            .launch_header = 0x10000000,
+            .context_uniform = dev->m5_rq_instances ? 160 : 148,
+            .as_table_uniform = dev->m5_rq_instances ? 164 : 152,
+            .instance_traversal = dev->m5_rq_instances,
+            .compute_kernel = true,
+         };
+         /* Geometry queries are lowered here and then cloned into the poly
+          * kernels and the raster vertex program. With dead-query removal
+          * from the poly kernels (agx_nir_m5_remove_dead_ray_queries), all
+          * 578 geometry ray-query CTS cases run without a GPU fault.
+          * ASAHI_M5_GS_RAY_QUERY_DISABLE=1 refuses them for diagnosis. */
+         const bool refused_stage = nir->info.stage == MESA_SHADER_GEOMETRY &&
+            debug_get_bool_option("ASAHI_M5_GS_RAY_QUERY_DISABLE", false);
+         if (refused_stage || !agx_nir_lower_m5_ray_query(nir, &layout)) {
+            mesa_loge(refused_stage
+               ? "M5 native ray query: geometry stage disabled"
+               : "M5 native ray query: unsupported query shape or operation");
+            if (debug_get_bool_option("ASAHI_M5_LAUNCH_DEBUG", false))
+               nir_print_shader(nir, stderr);
+            return;
+         }
       } else {
          NIR_PASS(_, nir, hk_nir_lower_ray_queries);
       }
@@ -4701,6 +4760,28 @@ hk_vs_covers_clip_square(const nir_shader *vs)
    return true;
 }
 
+/* Query lowering clears info.ray_queries before backend compilation. The
+ * native traversal instructions retain the requirement for its fixed ABI. */
+static bool
+hk_m5_needs_query_abi(nir_shader *nir)
+{
+   if (nir->info.ray_queries)
+      return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_intersect_ray_agx ||
+                op == nir_intrinsic_continue_ray_agx)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static VkResult
 hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                nir_shader *nir, VkShaderCreateFlagsEXT shader_flags,
@@ -4721,13 +4802,20 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    bool default_layer = true;
    if ((sw_stage == MESA_SHADER_FRAGMENT && dev->gen1_native_fragment_rq) ||
        (sw_stage != MESA_SHADER_FRAGMENT && sw_stage != MESA_SHADER_COMPUTE &&
-        dev->gen1_native_graphics_rq)) {
+        dev->gen1_native_graphics_rq) ||
+       /* The hardware evaluation variant becomes a vertex shader in
+        * poly_nir_lower_tes() below, after this scan. */
+       (dev->m5_native_rq && (nir->info.stage == MESA_SHADER_VERTEX ||
+                               nir->info.stage == MESA_SHADER_FRAGMENT ||
+                               (sw_stage == MESA_SHADER_TESS_EVAL && hw)))) {
       nir_foreach_function_impl(impl, nir) {
          nir_foreach_block(block, impl) {
             nir_foreach_instr(instr, block) {
-               if (instr->type == nir_instr_type_intrinsic &&
+               if ((instr->type == nir_instr_type_intrinsic &&
                    nir_instr_as_intrinsic(instr)->intrinsic ==
-                      nir_intrinsic_intersect_ray_gen1_agx)
+                      nir_intrinsic_intersect_ray_gen1_agx) ||
+                   (instr->type == nir_instr_type_intrinsic && dev->m5_native_rq &&
+                    nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_intersect_ray_agx))
                   shader->info.agx3_gen1_fragment_rq = true;
             }
          }
@@ -5254,6 +5342,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          : 0) +
       (sw_stage == MESA_SHADER_VERTEX && shader->info.agx3_gen1_fragment_rq
          ? 168 : 0);
+   /* TCS kernels retain their API stage through lowering. Reserve the native
+    * query prefix for them as well as compute, and only for live queries. */
+   const bool m5_native_query_abi =
+      (nir->info.stage == MESA_SHADER_COMPUTE ||
+       sw_stage == MESA_SHADER_TESS_CTRL ||
+       sw_stage == MESA_SHADER_GEOMETRY) && dev->m5_native_rq &&
+      (!debug_get_bool_option("ASAHI_M5_SHADER_LOCAL_RQ_ABI", true) ||
+       hk_m5_needs_query_abi(nir));
+   if (m5_native_query_abi)
+      root = dev->m5_rq_instances ? 176 : 164;
    if (sw_stage == MESA_SHADER_FRAGMENT)
       root = AGX_ABI_FUNI_ROOT;
    else if (sw_stage == MESA_SHADER_VERTEX)
@@ -5263,7 +5361,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       ((sw_stage == MESA_SHADER_COMPUTE && dev->gen1_native_rq &&
         hk_nir_has_ray_query(nir)) ||
        shader->info.agx3_gen1_fragment_rq) ? 168 : 0;
-   if (sw_stage != MESA_SHADER_VERTEX || !shader->info.agx3_gen1_fragment_rq)
+   if ((sw_stage != MESA_SHADER_VERTEX || !shader->info.agx3_gen1_fragment_rq) &&
+       !(m5_native_query_abi && shader->info.agx3_gen1_fragment_rq))
       root += texture_uniform_base;
    shader->info.set_count = set_count;
    shader->info.agx3_root_uniform = root;
@@ -5339,7 +5438,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
 
    struct agx_shader_key backend_key = {
       .reserved_preamble = root + (4 * (1 + set_count)),
-      .g17p_texture_uniform_base = texture_uniform_base,
+      .g17p_texture_uniform_base = m5_native_query_abi ? (dev->m5_rq_instances ? 168 : 156) : texture_uniform_base,
       .g17p_storage_image_pair = shader->info.agx3_storage_image_valid &&
                                  !shader->info.agx3_storage_image.write_only,
       .dev = agx_gather_device_key(&dev->dev),
@@ -5472,6 +5571,31 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       }
    }
 
+   /* Native query lowering and descriptor optimization can turn the last
+    * dynamic RT stack offset into a constant after the pipeline inliner has
+    * already tried promotion. Retry here, after preprocessing, so constant
+    * frame transport does not survive as per-lane memory traffic. */
+   if (agx_chip_g17_m5(dev->dev.chip) && nir->info.stage == MESA_SHADER_COMPUTE &&
+       nir->scratch_size) {
+      bool indirect = false, traversal = false;
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               traversal |= intr->intrinsic == nir_intrinsic_intersect_ray_agx;
+               if (intr->intrinsic == nir_intrinsic_load_scratch)
+                  indirect |= !nir_src_is_const(intr->src[0]);
+               else if (intr->intrinsic == nir_intrinsic_store_scratch)
+                  indirect |= !nir_src_is_const(intr->src[1]);
+            }
+         }
+      }
+      if (traversal && !indirect)
+         NIR_PASS(_, nir, nir_lower_scratch_to_var);
+   }
+
    /* G17P hardware vertex programs (API VS, GS raster and native TES
     * variants) run per-draw uniform work once in a native vertex constant
     * program, as Apple's compiler does: e.g. ProjMat * ModelViewMat. */
@@ -5490,6 +5614,28 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
        nir->info.stage == MESA_SHADER_FRAGMENT && !backend_key.no_preamble)
       compiled = hk_g17p_compile_fs_cprog(&nir, &backend_key, shader);
+   /* An M5 compute constant program can need a form the AGX3 packer does not
+    * encode, such as a 16-bit uniform write beside a used uniform half.
+    * Compile such a kernel without its constant program, as M5 runs the
+    * compute variants of graphics stages, rather than refusing the pipeline.
+    * Kernels that compile with one are unchanged. */
+   if (!compiled && m5_compute_cprog && !backend_key.no_preamble) {
+      nir_shader *attempt = nir_shader_clone(NULL, nir);
+      compiled = attempt &&
+                 agx_compile_shader_nir(attempt, &backend_key, &shader->b);
+      if (compiled) {
+         ralloc_free(nir);
+         nir = attempt;
+      } else {
+         mesa_logw("M5 compute constant program failed to compile (%s); "
+                   "compiling without it", agx_last_compile_refusal());
+         ralloc_free(attempt);
+         memset(&shader->b, 0, sizeof(shader->b));
+         backend_key.agx3_native_cprog = false;
+         backend_key.no_preamble = true;
+         backend_key.g17p_uniform_dma = false;
+      }
+   }
    if (!compiled)
       compiled = agx_compile_shader_nir(nir, &backend_key, &shader->b);
 
@@ -7414,12 +7560,15 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* The raster replay is always a hardware vertex shader. */
       rq_layout.graphics_stage = dev->gen1_native_graphics_rq;
       /* On M5 the main kernel performs the invocation's API stores and
-       * atomics; the count and raster variants drop them. */
+       * atomics; the count and raster variants drop them, together with any
+       * native ray query that only fed them. */
       const bool m5 = agx_chip_g17_m5(dev->dev.chip);
       if (!hk_nir_lower_gs(nir, &count, &rast, &pre_gs,
                            &count_variant->info.gs,
                            hk_native_rq_profile(dev) ? &rq_layout : NULL, m5,
-                           NULL)) {
+                           m5 && dev->m5_native_rq
+                              ? agx_nir_m5_remove_dead_ray_queries
+                              : NULL)) {
          ralloc_free(nir);
          ralloc_free(count);
          ralloc_free(rast);
@@ -7428,6 +7577,10 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          return vk_errorf(dev, VK_ERROR_UNKNOWN,
                           "Gen1 native GS ray query lowering failed");
       }
+
+      /* A main-kernel query whose results feed nothing is dead too. */
+      if (dev->m5_native_rq)
+         NIR_PASS(_, nir, agx_nir_m5_remove_dead_ray_queries);
 
       agx_preprocess_nir(count);
       agx_preprocess_nir(rast);
@@ -7631,7 +7784,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                 * ABI then starts at 168, as the prolog key and the bound
                 * uniform ranges already assume. */
                const bool query_prefix =
-                  dev->gen1_native_graphics_rq && hk_nir_has_ray_query(clone);
+                  (dev->gen1_native_graphics_rq && hk_nir_has_ray_query(clone)) ||
+                  hk_nir_has_m5_native_query(dev, clone);
                agx_nir_lower_non_monolithic_uniforms_at(clone, nr,
                                                         query_prefix ? 168 : 0);
             }

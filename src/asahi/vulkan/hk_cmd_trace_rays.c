@@ -140,6 +140,9 @@ hk_trace_rays_single_kick(struct hk_cmd_buffer *cmd,
 
    /* Template every kernel first: this records no stream words, only each
     * kernel's IOTO program and resource profile. */
+   cmd->m5_rt_state.share = true;
+   cmd->m5_rt_state.state = (struct agx_ptr){0};
+   cmd->m5_rt_state.uniforms = (struct agx_ptr){0};
    bool ok = true;
    for (uint32_t k = 0; k < count && ok; ++k) {
       cmd->m5_rt_capture = (uint8_t *)templates.cpu + T * k;
@@ -150,6 +153,9 @@ hk_trace_rays_single_kick(struct hk_cmd_buffer *cmd,
    }
    cmd->m5_rt_capture = NULL;
    cmd->m5_rt_captured = false;
+   cmd->m5_rt_state.share = false;
+   cmd->m5_rt_state.state = (struct agx_ptr){0};
+   cmd->m5_rt_state.uniforms = (struct agx_ptr){0};
    if (!ok)
       return false;
 
@@ -226,7 +232,12 @@ hk_trace_rays_select_and_dispatch(struct hk_cmd_buffer *cmd,
                                   handles_addr, count,
                                   HK_RT_WORKGROUP_SIZE_X_LOG2);
 
-   /* Exactly one kernel gets threadgroups; the others are empty dispatches. */
+   /* Exactly one kernel gets threadgroups; the others are empty dispatches.
+    * Let them share one SCS state block (when the device block is disabled)
+    * and one set of traversal uniforms and AS table. */
+   cmd->m5_rt_state.share = true;
+   cmd->m5_rt_state.state = (struct agx_ptr){0};
+   cmd->m5_rt_state.uniforms = (struct agx_ptr){0};
    for (uint32_t k = 0; k < count; ++k) {
       const uint64_t group_count_addr =
          groups_addr + k * sizeof(VkDispatchIndirectCommand);
@@ -235,6 +246,9 @@ hk_trace_rays_select_and_dispatch(struct hk_cmd_buffer *cmd,
                            group_count_addr,
                            agx_grid_indirect(group_count_addr));
    }
+   cmd->m5_rt_state.share = false;
+   cmd->m5_rt_state.state = (struct agx_ptr){0};
+   cmd->m5_rt_state.uniforms = (struct agx_ptr){0};
 }
 
 VKAPI_ATTR void VKAPI_CALL
