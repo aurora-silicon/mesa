@@ -22,6 +22,19 @@ struct nir_def;
  * after scaling the index (the lddev/stdev immediate offset). */
 #define AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT 16u
 #define AGX_NIR_MEMORY_BYTE_OFFSET_MASK (0xffffu << AGX_NIR_MEMORY_BYTE_OFFSET_SHIFT)
+/* FLAGS bits of load_scs_indexed_agx and load_scs_base_agx (G17P). TOUCH makes
+ * the load destination-less: the same address is accessed, but nothing is
+ * written to the intrinsic's value, which must have no use. The indexed form
+ * reads the low 16 bits of its index and scales them by COMPONENT, 2 or 4.
+ * The fence bits add a traversal barrier before the touch (the scope used
+ * ahead of a launch) or after it (the scope used at the end of a traversal
+ * program). */
+#define AGX_NIR_SCS_TOUCH 16u
+#define AGX_NIR_SCS_TOUCH_FENCE_BEFORE 32u
+#define AGX_NIR_SCS_TOUCH_FENCE_AFTER 64u
+#define AGX_NIR_SCS_TOUCH_FLAGS                                                \
+   (AGX_NIR_SCS_TOUCH | AGX_NIR_SCS_TOUCH_FENCE_BEFORE |                       \
+    AGX_NIR_SCS_TOUCH_FENCE_AFTER)
 /* byte_offsets: fold constant index addends into that byte offset. */
 bool agx_nir_lower_address(struct nir_shader *shader, bool byte_indices,
                            bool byte_offsets);

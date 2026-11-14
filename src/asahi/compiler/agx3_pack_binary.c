@@ -5735,6 +5735,49 @@ agx3_translate_scs(enum agx_isa_encoding enc, const agx_instr *I, bool is_store,
    return true;
 }
 
+/* The destination-less SCS load: a plain 32-bit register base and, in the
+ * indexed form, the low half of a plain 32-bit register as its 16-bit index.
+ * Post-RA cache hints are not operands of the form. */
+static bool
+agx3_translate_scs_touch(enum agx_isa_encoding enc, const agx_instr *I,
+                         struct agx3_scs_touch_desc *d)
+{
+   const bool indexed = I->op == AGX_OPCODE_SCS_TOUCH_REGISTER_INDEXED_AGX3;
+   const int64_t byte_offset = (int64_t)I->imm;
+   memset(d, 0, sizeof(*d));
+   if (enc != AGX_ISA_ENCODING_AGX3B || I->nr_dests != 0 ||
+       I->nr_srcs != (indexed ? 2u : 1u) || byte_offset < INT16_MIN ||
+       byte_offset > INT16_MAX || I->mask > 15 ||
+       (!indexed && I->scs_address_selector))
+      return false;
+
+   agx_index base = I->src[0];
+   base.kill = base.cache = base.discard = false;
+   if (!agx3_src_is_register(base) || base.size != AGX_SIZE_32 ||
+       !agx3_scs_plain_index(base))
+      return false;
+
+   *d = (struct agx3_scs_touch_desc){
+      .base_register = base.value,
+      .has_index = indexed,
+      .byte_offset = (int16_t)byte_offset,
+      .component_mask = I->mask,
+   };
+
+   if (indexed) {
+      agx_index index = I->src[1];
+      index.kill = index.cache = index.discard = false;
+      if (!agx3_src_is_register(index) || index.size != AGX_SIZE_32 ||
+          !agx3_scs_plain_index(index) || (index.value & 1))
+         return false;
+      d->index = index.value;
+      d->address_selector = I->scs_address_selector;
+   }
+
+   /* agx3_scs_encode_touch bounds the registers, mask and selector. */
+   return true;
+}
+
 /* Translate a device_load/device_store into the normalized memory descriptor.
  * Returns false for any operand shape outside the grounded domain. */
 static bool
@@ -13226,10 +13269,11 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
           * On M5, loads still in flight when an invocation stops at a
           * workgroup barrier are retired there as well, so none is
           * outstanding while the workgroup waits. */
-         e->drain = I->op == AGX_OPCODE_SCOPED_BARRIER_AGX3 &&
-            (I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
-             I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE ||
-             agx3_m5_rendezvous_barrier(ctx, enc, I->imm));
+         e->drain = (I->op == AGX_OPCODE_SCOPED_BARRIER_AGX3 &&
+                     (I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
+                      I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE ||
+                      agx3_m5_rendezvous_barrier(ctx, enc, I->imm))) ||
+                    I->op == AGX_OPCODE_RT_BARRIER_GEN1;
          e->reissues_live_slot = I->op == AGX_OPCODE_LDCF;
          if (I->agx3_tex_coord_start)
             e->preferred_slot = native_coord_preferred_slot;
@@ -16400,6 +16444,39 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                ctx->agx3_colour_link.rt_query_write_acquired = !g17p_colourless_fragment;
             }
             if (!agx3_append(emission,bytes,len)) AGX3_REFUSE(I);
+            continue;
+         }
+
+         if (I->op == AGX_OPCODE_RT_BARRIER_GEN1) {
+            /* Nothing stays in flight across the fence: what follows it has
+             * no scoreboard slot and nothing can wait on it afterwards. */
+            const uint16_t retire = wait | outstanding_here;
+            uint8_t fence[AGX3_RT_CORE_MAX_LENGTH], fence_len;
+            if (enc != AGX_ISA_ENCODING_AGX3B || I->nr_dests || I->nr_srcs ||
+                slot ||
+                (retire && !agx3_retire_slots_noop(emission, enc, retire)) ||
+                !agx3_rt_traversal_barrier(
+                   enc, (enum agx3_rt_barrier_scope)I->imm, fence,
+                   &fence_len) ||
+                !agx3_append(emission, fence, fence_len))
+               AGX3_REFUSE(I);
+            outstanding &= (uint16_t)~retire;
+            image_write_slots &= (uint16_t)~retire;
+            agx3_staging_forget(&staging_banks, retire);
+            continue;
+         }
+
+         if (I->op == AGX_OPCODE_SCS_TOUCH_REGISTER_INDEXED_AGX3 ||
+             I->op == AGX_OPCODE_SCS_TOUCH_REGISTER_BASE_AGX3) {
+            /* No destination and no slot. The form's wait fields are not
+             * established, so its address registers are completed first. */
+            struct agx3_scs_touch_desc d;
+            uint8_t bytes[AGX3_SCS_MAX_LENGTH], len = 0;
+            if (slot || !agx3_translate_scs_touch(enc, I, &d) ||
+                !agx3_scs_encode_touch(enc, &d, bytes, &len) ||
+                (wait && !agx3_retire_slots_noop(emission, enc, wait)) ||
+                !agx3_append(emission, bytes, len))
+               AGX3_REFUSE(I);
             continue;
          }
 

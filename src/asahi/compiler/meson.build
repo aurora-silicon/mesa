@@ -722,6 +722,32 @@ if with_tests
     suite : ['asahi'],
   )
 
+  test(
+    'agx3_scs_touch',
+    executable(
+      'agx3_scs_touch_test',
+      files('test/test-agx3-scs-touch.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx3_gen1_scs_sweep',
+    executable(
+      'agx3_gen1_scs_sweep_test',
+      files('test/test-gen1-scs-sweep.c'),
+      c_args : [c_msvc_compat_args, no_override_init_args],
+      gnu_symbol_visibility : 'hidden',
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_compiler],
+    ),
+    suite : ['asahi'],
+  )
+
   test('agx3_gen1_wait',
     executable('agx3_gen1_wait_test', files('test/test-gen1-wait.c'),
       c_args : [c_msvc_compat_args, no_override_init_args],

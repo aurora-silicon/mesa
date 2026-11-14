@@ -336,6 +336,106 @@ agx3_scs_decode_epilogue(enum agx_isa_encoding enc, const uint8_t *bytes,
    return false;
 }
 
+/* G17P's register file is 192 halves. */
+#define AGX3B_SCS_TOUCH_HALVES 192u
+
+bool
+agx3_scs_encode_touch(enum agx_isa_encoding enc,
+                      const struct agx3_scs_touch_desc *d,
+                      uint8_t out[AGX3_SCS_MAX_LENGTH], uint8_t *length)
+{
+   if (out == NULL || length == NULL)
+      return false;
+   memset(out, 0, AGX3_SCS_MAX_LENGTH);
+   *length = 0;
+   if (enc != AGX_ISA_ENCODING_AGX3B || d == NULL ||
+       (d->base_register & 1) ||
+       d->base_register + 2u > AGX3B_SCS_TOUCH_HALVES ||
+       (d->byte_offset & 3) ||
+       (d->component_mask != 1 && d->component_mask != 3 &&
+        d->component_mask != 15))
+      return false;
+   if (d->has_index
+          ? (d->index >= AGX3B_SCS_TOUCH_HALVES ||
+             (d->address_selector != 2 && d->address_selector != 4))
+          : (d->index != 0 || d->index_kill || d->address_selector != 0))
+      return false;
+
+   /* The leaf programs' own instance is this baseline with f23=1, a two-word
+    * mask and the base's final use; the AGX3c epilogue's is f23=2 plus that
+    * encoding's f45/f53/f59, which no AGX3b SCS form carries. */
+   const struct agx3_field_kv base[] = {
+      KV(10, 2), KV(23, d->has_index ? 2 : 1), KV(24, 1), KV(28, 1),
+      KV(38, 2), KV(39, 2), KV(54, 1), KV(80, 1),
+   };
+   const struct agx3_field_kv fields[] = {
+      KV(16, d->index), KV(27, d->index_kill),
+      KV(31, d->base_register), KV(42, d->base_kill),
+      KV(68, d->component_mask), KV(70, d->address_selector),
+      KV(71, (uint16_t)d->byte_offset),
+   };
+   uint8_t bytes[AGX3_SCS_MAX_LENGTH] = {0};
+   uint8_t len = 0;
+   if (!agx3_bind_compose(enc, "ldscs", 0, base,
+                          sizeof(base) / sizeof(base[0]), fields,
+                          sizeof(fields) / sizeof(fields[0]), bytes, &len) ||
+       len > sizeof(bytes))
+      return false;
+
+   memcpy(out, bytes, len);
+   *length = len;
+   return true;
+}
+
+bool
+agx3_scs_decode_touch(enum agx_isa_encoding enc, const uint8_t *bytes,
+                      size_t length, struct agx3_scs_touch_desc *out)
+{
+   if (out == NULL)
+      return false;
+   memset(out, 0, sizeof(*out));
+   if (enc != AGX_ISA_ENCODING_AGX3B || bytes == NULL || length != 14)
+      return false;
+
+   /* The operands sit where the ordinary AGX3b load keeps them. */
+   const uint16_t w2 = word(bytes, 2), w3 = word(bytes, 3);
+   const uint16_t w4 = word(bytes, 4), w5 = word(bytes, 5);
+   const uint16_t index = (uint16_t)(((w2 >> 9) & 0x7fu) | ((w3 & 1u) << 7));
+   static const uint8_t masks[] = {1, 3, 15};
+   static const uint8_t selectors[] = {2, 4};
+
+   /* Only accept a descriptor whose complete re-encoding matches. This also
+    * rejects ordinary loads, unknown controls and extra operand bits. */
+   for (unsigned has_index = 0; has_index < 2; ++has_index) {
+      for (unsigned m = 0; m < sizeof(masks); ++m) {
+         for (unsigned s = 0; s < (has_index ? sizeof(selectors) : 1); ++s) {
+            for (unsigned kills = 0; kills < (has_index ? 4u : 2u); ++kills) {
+               const struct agx3_scs_touch_desc d = {
+                  .base_register = w2 & 0xffu,
+                  .has_index = has_index,
+                  .index = has_index ? index : 0,
+                  .byte_offset = (int16_t)(((w4 >> 15) & 1u) |
+                                           ((w5 & 0x7fffu) << 1)),
+                  .component_mask = masks[m],
+                  .address_selector = has_index ? selectors[s] : 0,
+                  .index_kill = kills & 2,
+                  .base_kill = kills & 1,
+               };
+               uint8_t canonical[AGX3_SCS_MAX_LENGTH], canonical_length;
+               if (agx3_scs_encode_touch(enc, &d, canonical,
+                                         &canonical_length) &&
+                   canonical_length == length &&
+                   !memcmp(canonical, bytes, length)) {
+                  *out = d;
+                  return true;
+               }
+            }
+         }
+      }
+   }
+   return false;
+}
+
 static bool
 decode_address(enum agx_isa_encoding enc, const uint8_t *b,
                struct agx3_scs_desc *d)

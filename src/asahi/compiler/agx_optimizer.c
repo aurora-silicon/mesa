@@ -376,6 +376,8 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       agx_index src = I->src[s];
       if (I->op == AGX_OPCODE_INTERSECT_RAY_GEN1 ||
           I->op == AGX_OPCODE_SCS_STORE_AGX3 ||
+          I->op == AGX_OPCODE_SCS_TOUCH_REGISTER_INDEXED_AGX3 ||
+          I->op == AGX_OPCODE_SCS_TOUCH_REGISTER_BASE_AGX3 ||
           I->op == AGX_OPCODE_SCS_LOAD_REGISTER_INDEXED_AGX3 ||
           I->op == AGX_OPCODE_SCS_STORE_REGISTER_INDEXED_AGX3 ||
           I->op == AGX_OPCODE_SCS_LOAD_REGISTER_BASE_AGX3 ||
