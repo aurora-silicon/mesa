@@ -314,6 +314,13 @@ hk_m5_upload_as_table_count(struct hk_cmd_buffer *cmd, unsigned *table_count)
    return table.cpu ? table.gpu : 0;
 }
 
+uint64_t
+hk_m5_upload_as_table(struct hk_cmd_buffer *cmd)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   return dev->m5_as_table_va ? dev->m5_as_table_va->addr : 0;
+}
+
 static_assert(sizeof(struct hk_bvh_triangle_node) == 48, "node format");
 static_assert(sizeof(struct hk_bvh_aabb_node) == 32, "node format");
 static_assert(sizeof(struct hk_bvh_instance_node) == 120, "node format");

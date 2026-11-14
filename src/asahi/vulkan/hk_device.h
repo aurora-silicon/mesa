@@ -209,6 +209,10 @@ struct hk_device {
       VkCommandPool pool;
    } host_as;
    bool m5_native_as;
+   /* Native ray queries through the hardware intersector, which runs the
+    * generated intersection runtime (hk_m5_rt_runtime.h). */
+   bool m5_native_rq;
+   bool m5_rq_instances;
    simple_mtx_t m5_as_lock;
    struct util_dynarray m5_ases;
    /* Stable native AS-ID -> address table. VA is reserved once; backing
@@ -220,6 +224,16 @@ struct hk_device {
     * Binding publishes their final addresses without a submit-time walk. */
    struct util_dynarray m5_pending_as_ids;
    uint32_t m5_pending_as_count;
+   struct agx_bo *m5_rq_code;
+   struct agx_va *m5_rq_code_alias;
+   struct agx_bo *m5_rq_ift;
+   /* Device-lifetime SCS state block (hk_cmd_dispatch.c). */
+   struct agx_bo *m5_rt_state_bo;
+   uint64_t m5_rt_state_packed, m5_rt_state_size;
+   void *m5_rq_user_image;
+   uint32_t m5_rq_uniforms[80];
+   uint64_t m5_rq_default_program;
+   uint64_t m5_rq_default_control;
    struct agx_bg_eot_cache bg_eot;
    /* frg-codegen v4 BG/EOT device cache (hk_cmd_draw.c). */
    struct hk_g17p_bg_eot_dev_cache *g17p_bg_eot_dev_cache;
