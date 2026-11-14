@@ -2393,7 +2393,8 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             struct hk_descriptor_set *set = descriptors->sets[0];
             const void *set_map = set ? set->mapped_ptr : NULL;
             uint32_t mapped_size = set ? set->size : 0;
-            if (!set && descriptors->push[0]) {
+            if (!set && descriptors->push[0] &&
+                !(descriptors->buffer_active & BITFIELD_BIT(0))) {
                set_map = descriptors->push[0]->data;
                mapped_size = sizeof(descriptors->push[0]->data);
             }

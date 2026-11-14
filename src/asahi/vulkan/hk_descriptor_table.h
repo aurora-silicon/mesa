@@ -49,6 +49,13 @@ struct hk_descriptor_table {
 
    /* Stack for free descriptor elements */
    uint32_t *free_table;
+
+   /* Entries VK_EXT_descriptor_buffer capture/replay objects freed: kept for
+    * hk_descriptor_table_add_at(), which replays them, and never handed out
+    * otherwise, as the capture/replay VA region is kept from other
+    * allocations. */
+   uint32_t *replay_free_table;
+   uint32_t replay_free_count;
 };
 
 static inline void *
@@ -79,6 +86,25 @@ VkResult hk_descriptor_table_add(struct hk_device *dev,
                                  struct hk_descriptor_table *table,
                                  const void *desc_data, size_t desc_size,
                                  uint32_t *index_out);
+
+VkResult hk_descriptor_table_add_at(struct hk_device *dev,
+                                    struct hk_descriptor_table *table,
+                                    const void *desc_data, size_t desc_size,
+                                    uint32_t index);
+
+VkResult hk_descriptor_table_reserve_range(struct hk_device *dev,
+                                           struct hk_descriptor_table *table,
+                                           uint32_t count,
+                                           uint32_t *first_out);
+
+VkResult hk_descriptor_table_add_replay(struct hk_device *dev,
+                                        struct hk_descriptor_table *table,
+                                        const void *desc_data, size_t desc_size,
+                                        uint32_t *index_out);
+
+void hk_descriptor_table_remove_replay(struct hk_device *dev,
+                                      struct hk_descriptor_table *table,
+                                      uint32_t index);
 
 void hk_descriptor_table_remove(struct hk_device *dev,
                                 struct hk_descriptor_table *table,

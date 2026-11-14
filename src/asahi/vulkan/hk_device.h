@@ -74,6 +74,10 @@ struct hk_rc_sampler {
 
    /* Index of this hardware sampler in the hardware sampler heap */
    uint16_t index;
+
+   /* A VK_EXT_descriptor_buffer capture/replay sampler uses it: the index
+    * goes back to the replay pool (hk_descriptor_table_remove_replay()). */
+   bool replay;
 };
 
 struct hk_sampler_heap {
@@ -162,6 +166,10 @@ struct hk_device {
     * updated after command recording. Other generations keep inline state.
     */
    struct hk_descriptor_table sampled_images;
+
+   /* VK_EXT_descriptor_buffer texel-buffer textures (hk_buffer_view.c),
+    * NULL unless the device enables descriptorBuffer. */
+   struct hk_texel_windows *texel_windows;
 
    struct vk_meta_device meta;
 
@@ -446,6 +454,13 @@ VkResult hk_sampler_heap_add(struct hk_device *dev,
                              const struct hk_native_sampler_descriptor *desc,
                              struct hk_rc_sampler **out);
 
+VkResult
+hk_sampler_heap_add_capture(struct hk_device *dev,
+                            const struct hk_native_sampler_descriptor *desc,
+                            struct hk_rc_sampler **out);
+VkResult hk_sampler_heap_add_at(struct hk_device *dev,
+                                const struct hk_native_sampler_descriptor *desc,
+                                uint32_t index, struct hk_rc_sampler **out);
 void hk_sampler_heap_remove(struct hk_device *dev, struct hk_rc_sampler *rc);
 
 static inline struct agx_scratch *

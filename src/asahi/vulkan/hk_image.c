@@ -1694,19 +1694,40 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    return VK_SUCCESS;
 }
 
+/* VK_EXT_descriptor_buffer capture/replay: an address that replays, the
+ * captured one if there is one. */
+static struct agx_va *
+hk_image_replay_va(struct hk_device *dev, uint64_t size_B, uint64_t fixed_addr)
+{
+   enum agx_va_flags flags = fixed_addr ? AGX_VA_FIXED : 0;
+   if (dev->dev.replay_heap_initialized)
+      flags |= AGX_VA_CAPTURE_REPLAY;
+   return agx_va_alloc(&dev->dev, size_B, AIL_PAGESIZE, flags, fixed_addr);
+}
+
 static VkResult
 hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
-                         VkImageCreateFlags create_flags)
+                         VkImageCreateFlags create_flags,
+                         const struct hk_image_capture *replay, unsigned p)
 {
    const bool sparse_bound = create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
    const bool sparse_resident =
       create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
+   const bool capture_replay =
+      create_flags & VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT;
    assert(sparse_bound || !sparse_resident);
 
    if (sparse_bound) {
       size_t size = align(plane->layout.size_B, HK_SPARSE_ALIGN_B);
-      plane->va = agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
+      plane->va = capture_replay
+                     ? hk_image_replay_va(dev, size,
+                                          replay ? replay->plane_va[p] : 0)
+                     : agx_va_alloc(&dev->dev, size, AIL_PAGESIZE, 0, 0);
       if (!plane->va) {
+         if (replay && replay->plane_va[p])
+            return vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                             "Capture/replay address %#llx is in use",
+                             (unsigned long long)replay->plane_va[p]);
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "Sparse VMA allocation failed");
       }
@@ -1760,6 +1781,24 @@ hk_image_plane_alloc_vma(struct hk_device *dev, struct hk_image_plane *plane,
                           "Sparse residency map mapping failed");
       }
       memset(map, 0, plane->layout.sparse_table_size_B);
+      plane->sparse_map_addr = plane->sparse_map->va->addr;
+
+      if (capture_replay) {
+         const uint64_t size_B = plane->sparse_map->size;
+         const uint64_t fixed_addr = replay ? replay->sparse_map_va[p] : 0;
+         plane->sparse_map_va = hk_image_replay_va(dev, size_B, fixed_addr);
+         if (!plane->sparse_map_va)
+            return vk_errorf(dev,
+                             fixed_addr ? VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS
+                                        : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Sparse map capture/replay VA allocation failed");
+         if (agx_bo_bind(&dev->dev, plane->sparse_map,
+                         plane->sparse_map_va->addr, size_B, 0,
+                         DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
+            return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "Sparse map capture/replay bind failed");
+         plane->sparse_map_addr = plane->sparse_map_va->addr;
+      }
    }
 
    return VK_SUCCESS;
@@ -1778,6 +1817,10 @@ hk_image_plane_finish(struct hk_device *dev, struct hk_image_plane *plane,
    hk_release_sparse_scratch(dev, plane->sparse_scratch_B);
    plane->sparse_scratch_B = 0;
 
+   if (plane->sparse_map_va) {
+      agx_va_free(&dev->dev, plane->sparse_map_va, true);
+      plane->sparse_map_va = NULL;
+   }
    agx_bo_unreference(&dev->dev, plane->sparse_map);
 }
 
@@ -1846,9 +1889,20 @@ hk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
          image->planes[0].layout.compressed, views);
    }
 
+   const VkOpaqueCaptureDescriptorDataCreateInfoEXT *replay_info =
+      (pCreateInfo->flags &
+       VK_IMAGE_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+         ? vk_find_struct_const(pCreateInfo->pNext,
+                                OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT)
+         : NULL;
+   struct hk_image_capture replay;
+   if (replay_info)
+      memcpy(&replay, replay_info->opaqueCaptureDescriptorData, sizeof(replay));
+
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
       result = hk_image_plane_alloc_vma(dev, &image->planes[plane],
-                                        image->vk.create_flags);
+                                        image->vk.create_flags,
+                                        replay_info ? &replay : NULL, plane);
       if (result != VK_SUCCESS) {
          hk_image_finish(dev, image, pAllocator);
          vk_free2(&dev->vk.alloc, pAllocator, image);
@@ -2202,7 +2256,7 @@ hk_image_plane_bind(struct hk_device *dev, struct hk_image_plane *plane,
       const uint64_t mem_size_B =
          mem->vk.size ? MIN2(mem->bo->size, mem->vk.size) : mem->bo->size;
       uint64_t bo_offset_B;
-      if (!hk_image_plane_binding(mem->bo->va->addr, mem_size_B,
+      if (!hk_image_plane_binding(hk_device_memory_addr(mem), mem_size_B,
                                   memory_offset_B, plane->offset_B,
                                   plane->layout.size_B, &plane->addr,
                                   &bo_offset_B))
@@ -2618,5 +2672,23 @@ hk_TransitionImageLayoutEXT(
    const VkHostImageLayoutTransitionInfoEXT *transitions)
 {
    /* We don't do anything with layouts so this should be a no-op */
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetImageOpaqueCaptureDescriptorDataEXT(
+   VkDevice device, const VkImageCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_image, image, pInfo->image);
+
+   struct hk_image_capture capture = {0};
+   for (unsigned p = 0; p < image->plane_count; ++p) {
+      const struct hk_image_plane *plane = &image->planes[p];
+      capture.plane_va[p] = plane->va ? plane->va->addr : 0;
+      capture.sparse_map_va[p] =
+         plane->sparse_map_va ? plane->sparse_map_va->addr : 0;
+   }
+   memcpy(pData, &capture, sizeof(capture));
    return VK_SUCCESS;
 }

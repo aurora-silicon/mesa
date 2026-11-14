@@ -19,6 +19,9 @@
 #include "git_sha1.h"
 #include "hk_buffer.h"
 #include "hk_buffer_view.h"
+#include "hk_descriptor_set_layout.h"
+#include "hk_image_view.h"
+#include "hk_sampler.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
@@ -237,6 +240,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       /* Tested on G17P only. */
       .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
       .EXT_depth_clip_enable = true,
+      /* Qualified on G17P only (the whole binding_model.descriptor_buffer
+       * group); other chips share the code but need their own run. */
+      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
@@ -711,6 +717,17 @@ hk_get_device_features(
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
+
+      /* VK_EXT_descriptor_buffer. Descriptors never depend on the image
+       * layout, and push descriptors keep their own command-buffer storage.
+       */
+      .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferCaptureReplay =
+         supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferImageLayoutIgnored =
+         supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferPushDescriptors =
+         supported_extensions->EXT_descriptor_buffer,
 
       /* VK_EXT_dynamic_rendering_unused_attachments */
       .dynamicRenderingUnusedAttachments = true,
@@ -1502,6 +1519,69 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* VK_EXT_custom_border_color */
       .maxCustomBorderColorSamplers = 1 << 20,
+
+      /* VK_EXT_descriptor_buffer. A descriptor-buffer set is the same memory
+       * a descriptor pool hands out, so every size is the binding stride of
+       * that type, and set offsets keep the 64-byte inline-uniform and
+       * 32-byte storage PBE record alignment pool sets have. Push descriptors
+       * keep their own command-buffer storage; the push buffer the
+       * application then binds is never read. Embedded samplers and samplers
+       * share the device sampler heap.
+       */
+      .combinedImageSamplerDescriptorSingleArray = true,
+      .bufferlessPushDescriptors = false,
+      .allowSamplerImageViewPostSubmitCreation = false,
+      .descriptorBufferOffsetAlignment = HK_MIN_UBO_ALIGNMENT,
+      .maxDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxResourceDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxSamplerDescriptorBufferBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxEmbeddedImmutableSamplerBindings = HK_MAX_DESCRIPTOR_BUFFERS,
+      .maxEmbeddedImmutableSamplers = 2032,
+      /* Capture/replay: memory, buffers and images keep their addresses, an
+       * image view its heap textures and a sampler its heap samplers. An
+       * acceleration structure descriptor is its buffer's address. */
+      .bufferCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_buffer_capture),
+      .imageCaptureReplayDescriptorDataSize = sizeof(struct hk_image_capture),
+      .imageViewCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_image_view_capture),
+      .samplerCaptureReplayDescriptorDataSize =
+         sizeof(struct hk_sampler_capture),
+      .accelerationStructureCaptureReplayDescriptorDataSize = 0,
+      .EDBsamplerDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_SAMPLER),
+      .combinedImageSamplerDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER),
+      .sampledImageDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE),
+      .storageImageDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE),
+      .uniformTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER),
+      .robustUniformTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER),
+      .storageTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
+      .robustStorageTexelBufferDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER),
+      .uniformBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+      .robustUniformBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER),
+      .storageBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+      .robustStorageBufferDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER),
+      .inputAttachmentDescriptorSize =
+         hk_descriptor_buffer_size(dev, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT),
+      .accelerationStructureDescriptorSize = hk_descriptor_buffer_size(
+         dev, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR),
+      .maxSamplerDescriptorBufferRange = HK_MAX_DESCRIPTOR_SET_SIZE,
+      .maxResourceDescriptorBufferRange = HK_MAX_DESCRIPTOR_SET_SIZE,
+      /* Descriptor buffers may live anywhere in the application's VA. */
+      .samplerDescriptorBufferAddressSpaceSize = dev->main_heap_size,
+      .resourceDescriptorBufferAddressSpaceSize = dev->main_heap_size,
+      .descriptorBufferAddressSpaceSize = dev->main_heap_size,
 
       /* VK_EXT_extended_dynamic_state3 */
       .dynamicPrimitiveTopologyUnrestricted = true,

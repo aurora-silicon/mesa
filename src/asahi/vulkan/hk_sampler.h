@@ -45,3 +45,10 @@ struct hk_sampler {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_sampler, vk.base, VkSampler,
                                VK_OBJECT_TYPE_SAMPLER)
+
+/* VK_EXT_descriptor_buffer capture/replay data of a sampler: each plane's
+ * sampler heap indices plus one, 0 for none. */
+struct hk_sampler_capture {
+   uint16_t hw[2];
+   uint16_t unbiased[2];
+};

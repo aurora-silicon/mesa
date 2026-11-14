@@ -367,10 +367,49 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
    }
 
+   /* VK_EXT_descriptor_buffer capture/replay: image descriptors embed the
+    * address of the image's memory, so memory allocated for capture/replay
+    * also maps at an address in the capture/replay region, the captured one
+    * on replay when that is one. Buffers and images bound to it take that
+    * address (hk_device_memory_addr()); buffers with a capture/replay address
+    * of their own keep it. */
+   if ((mem->vk.alloc_flags &
+        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+       dev->vk.enabled_features.descriptorBufferCaptureReplay &&
+       dev->dev.replay_heap_initialized) {
+      const uint64_t fixed_addr =
+         capture_info ? capture_info->opaqueCaptureAddress : 0;
+      mem->replay_va = agx_va_alloc(
+         &dev->dev, mem->bo->size, 64 * 1024,
+         AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
+      if (mem->replay_va &&
+          (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
+                       mem->bo->size, 0,
+                       DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
+           agx_bo_bind(&dev->dev, mem->bo,
+                       agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
+                       mem->bo->size, 0, DRM_ASAHI_BIND_READ))) {
+         agx_va_free(&dev->dev, mem->replay_va, true);
+         mem->replay_va = NULL;
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto fail_alloc;
+      }
+      /* An address this region cannot take was not captured with the
+       * feature (on a device without it, it is the BO's own address): keep
+       * buffer device address replay as it was, through the buffers' own
+       * capture/replay addresses. */
+      /* The memory is reached through two read-write addresses now. */
+      if (mem->replay_va)
+         p_atomic_inc(&dev->va_alias_resources);
+   }
+
    if (mem->vk.alloc_flags &
        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
       mem->opaque_capture_address =
-         capture_info && capture_info->opaqueCaptureAddress
+         mem->replay_va ? mem->replay_va->addr
+         : capture_info && capture_info->opaqueCaptureAddress
             ? capture_info->opaqueCaptureAddress
             : mem->bo->va->addr;
    }
@@ -450,6 +489,11 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    /* The BO may outlive this object in the BO cache. */
    hk_set_memory_priority(dev, mem, 0.5f);
+
+   if (mem->replay_va) {
+      agx_va_free(&dev->dev, mem->replay_va, true);
+      p_atomic_dec(&dev->va_alias_resources);
+   }
 
    agx_bo_unreference(&dev->dev, mem->bo);
 

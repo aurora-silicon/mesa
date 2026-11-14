@@ -1410,3 +1410,118 @@ hk_push_descriptor_set_update_template(
    };
    hk_descriptor_set_write_template(&tmp_set, template, data);
 }
+
+/*
+ * VK_EXT_descriptor_buffer. A descriptor written here is byte for byte what
+ * vkUpdateDescriptorSets() writes for the same resource, so the shaders read
+ * descriptor buffers exactly like pool sets: the writers above run on a
+ * one-binding layout whose stride is the descriptor size of the type
+ * (hk_descriptor_buffer_size()), over the caller's memory.
+ */
+VKAPI_ATTR void VKAPI_CALL
+hk_GetDescriptorEXT(VkDevice _device,
+                    const VkDescriptorGetInfoEXT *pDescriptorInfo,
+                    size_t dataSize, void *pDescriptor)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   const VkDescriptorType type = pDescriptorInfo->type;
+
+   union {
+      struct hk_descriptor_set_layout layout;
+      uint8_t storage[sizeof(struct hk_descriptor_set_layout) +
+                      sizeof(struct hk_descriptor_set_binding_layout)];
+   } get;
+   memset(&get, 0, sizeof(get));
+   struct hk_descriptor_set_layout *layout = &get.layout;
+   layout->descriptor_generation =
+      agx_chip_descriptor_generation(dev->dev.chip);
+   layout->native_sampler_indices =
+      agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip);
+   layout->binding_count = 1;
+   layout->binding[0] = (struct hk_descriptor_set_binding_layout){
+      .type = type,
+      .array_size = 1,
+      .stride = hk_descriptor_buffer_size(&dev->dev, type),
+   };
+   assert(layout->binding[0].stride <= dataSize);
+
+   struct hk_descriptor_set set = {
+      .layout = layout,
+      .mapped_ptr = pDescriptor,
+      .size = dataSize,
+   };
+
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER: {
+      const VkDescriptorImageInfo info = {
+         .sampler = *pDescriptorInfo->data.pSampler,
+      };
+      write_sampled_image_view_desc(&set, &info, 0, 0, type);
+      break;
+   }
+
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      /* A YCbCr sampler takes one descriptor per plane:
+       * combinedImageSamplerDescriptorCount of them. */
+      write_sampled_image_view_desc(
+         &set, pDescriptorInfo->data.pCombinedImageSampler, 0, 0, type);
+      break;
+
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      write_sampled_image_view_desc(&set, pDescriptorInfo->data.pSampledImage,
+                                    0, 0, type);
+      break;
+
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      write_sampled_image_view_desc(
+         &set, pDescriptorInfo->data.pInputAttachmentImage, 0, 0, type);
+      break;
+
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+      write_storage_image_view_desc(&set, pDescriptorInfo->data.pStorageImage,
+                                    0, 0);
+      break;
+
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      hk_texel_buffer_descriptor(dev, pDescriptorInfo->data.pUniformTexelBuffer,
+                                 false, pDescriptor);
+      break;
+
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      hk_texel_buffer_descriptor(dev, pDescriptorInfo->data.pStorageTexelBuffer,
+                                 true, pDescriptor);
+      break;
+
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: {
+      const VkDescriptorAddressInfoEXT *info =
+         type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+            ? pDescriptorInfo->data.pUniformBuffer
+            : pDescriptorInfo->data.pStorageBuffer;
+      /* A null buffer is based at the zero page (hk_buffer_addr_range()). */
+      struct hk_buffer_address desc = {
+         .base_addr = AGX_ZERO_PAGE_ADDRESS,
+      };
+      if (info != NULL && info->address != 0 && info->range != 0) {
+         assert(info->range <= UINT32_MAX);
+         desc = (struct hk_buffer_address){
+            .base_addr = info->address,
+            .size = MIN2(info->range, UINT32_MAX),
+         };
+      }
+      write_desc(&set, 0, 0, &desc, sizeof(desc));
+      break;
+   }
+
+   case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: {
+      uint64_t addr = pDescriptorInfo->data.accelerationStructure;
+      if (addr && dev->m5_native_as)
+         addr = ALIGN_POT(addr, UINT64_C(1024));
+      write_desc(&set, 0, 0, &addr, sizeof(addr));
+      break;
+   }
+
+   default:
+      UNREACHABLE("Invalid descriptor type for vkGetDescriptorEXT");
+   }
+}

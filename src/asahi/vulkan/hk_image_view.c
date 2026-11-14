@@ -393,7 +393,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
          }
 
          cfg.mode = AGX_IMAGE_MODE_SPARSE;
-         cfg.address = plane->sparse_map->va->addr +
+         cfg.address = plane->sparse_map_addr +
                        ail_page_to_sparse_index_el(layout, layer, page) *
                           AIL_SPARSE_ELSIZE_B;
       }
@@ -738,6 +738,47 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
    return packed;
 }
 
+/* Put a view texture in the device heap: at the captured index when the view
+ * replays (VK_EXT_descriptor_buffer), else anywhere. *index is 0 on failure,
+ * so the destroy path never frees an index the view does not own. */
+static VkResult
+hk_image_view_heap_add(struct hk_device *dev, const struct hk_image_view *view,
+                       const struct hk_image_view_capture *replay, unsigned p,
+                       enum hk_view_heap which, const void *desc,
+                       uint32_t *index)
+{
+   VkResult result;
+   if (replay && replay->index[p][which]) {
+      result = hk_descriptor_table_add_at(dev, &dev->sampled_images, desc, 32,
+                                          replay->index[p][which]);
+      *index = result == VK_SUCCESS ? replay->index[p][which] : 0;
+   } else if (view->vk.create_flags &
+              VK_IMAGE_VIEW_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT) {
+      result = hk_descriptor_table_add_replay(dev, &dev->sampled_images, desc,
+                                              32, index);
+      if (result != VK_SUCCESS)
+         *index = 0;
+   } else {
+      result = hk_descriptor_table_add(dev, &dev->sampled_images, desc, 32,
+                                       index);
+      if (result != VK_SUCCESS)
+         *index = 0;
+   }
+   return result;
+}
+
+/* Capture/replay views free their textures to the table's replay pool. */
+static void
+hk_image_view_heap_remove(struct hk_device *dev,
+                          const struct hk_image_view *view, uint32_t index)
+{
+   if (view->vk.create_flags &
+       VK_IMAGE_VIEW_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+      hk_descriptor_table_remove_replay(dev, &dev->sampled_images, index);
+   else
+      hk_descriptor_table_remove(dev, &dev->sampled_images, index);
+}
+
 static VkResult
 hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
                    const VkImageViewCreateInfo *pCreateInfo)
@@ -746,6 +787,19 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
    memset(view, 0, sizeof(*view));
 
    vk_image_view_init(&dev->vk, &view->vk, pCreateInfo);
+
+   const VkOpaqueCaptureDescriptorDataCreateInfoEXT *replay_info =
+      (pCreateInfo->flags &
+       VK_IMAGE_VIEW_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+         ? vk_find_struct_const(pCreateInfo->pNext,
+                                OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT)
+         : NULL;
+   struct hk_image_view_capture replay_data;
+   if (replay_info)
+      memcpy(&replay_data, replay_info->opaqueCaptureDescriptorData,
+             sizeof(replay_data));
+   const struct hk_image_view_capture *replay =
+      replay_info ? &replay_data : NULL;
 
    const float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
    view->sampled_min_lod_fp16 = _mesa_float_to_half(min_lod);
@@ -813,8 +867,8 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
 
       if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip) ||
           dev->dev.chip == AGX_CHIP_G18G) {
-         VkResult result = hk_descriptor_table_add(
-            dev, &dev->sampled_images, &view->planes[p].sampled, 32,
+         VkResult result = hk_image_view_heap_add(
+            dev, view, replay, p, HK_VIEW_HEAP_SAMPLED, &view->planes[p].sampled,
             &view->planes[p].sampled_heap_index);
          if (result != VK_SUCCESS)
             return result;
@@ -824,9 +878,10 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
             pack_texture(dev, view, p, HK_DESC_USAGE_SAMPLED_FILTERABLE,
                          &view->planes[p].sampled_filterable);
          if (view->planes[p].filterable_valid) {
-            result = hk_descriptor_table_add(
-               dev, &dev->sampled_images, &view->planes[p].sampled_filterable,
-               32, &view->planes[p].filterable_heap_index);
+            result = hk_image_view_heap_add(
+               dev, view, replay, p, HK_VIEW_HEAP_FILTERABLE,
+               &view->planes[p].sampled_filterable,
+               &view->planes[p].filterable_heap_index);
             if (result != VK_SUCCESS) {
                /* Nothing was reserved, so the destroy path must not try to
                 * release an index we do not own. */
@@ -835,8 +890,9 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
             }
          }
          if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
-            result = hk_descriptor_table_add(
-               dev, &dev->sampled_images, &view->planes[p].ro_storage, 32,
+            result = hk_image_view_heap_add(
+               dev, view, replay, p, HK_VIEW_HEAP_STORAGE,
+               &view->planes[p].ro_storage,
                &view->planes[p].storage_heap_index);
             if (result != VK_SUCCESS)
                return result;
@@ -845,8 +901,8 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
           * of the application sampled view. Keep the exact native bytes in
           * the indexed heap rather than sampling through the wrong shape. */
          if (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) {
-            result = hk_descriptor_table_add(
-               dev, &dev->sampled_images, &view->planes[p].ia, 32,
+            result = hk_image_view_heap_add(
+               dev, view, replay, p, HK_VIEW_HEAP_INPUT, &view->planes[p].ia,
                &view->planes[p].input_heap_index);
             if (result != VK_SUCCESS)
                return result;
@@ -874,8 +930,9 @@ hk_image_view_init(struct hk_device *dev, struct hk_image_view *view,
             view->planes[p].emrt_aligned_width =
                align(u_minify(layout->width_px, level),
                      layout->tilesize_el[level].width_el);
-            VkResult result = hk_descriptor_table_add(
-               dev, &dev->sampled_images, &view->planes[p].emrt_texture, 32,
+            VkResult result = hk_image_view_heap_add(
+               dev, view, replay, p, HK_VIEW_HEAP_EMRT_READ,
+               &view->planes[p].emrt_texture,
                &view->planes[p].emrt_read_heap_index);
             if (result != VK_SUCCESS)
                return result;
@@ -934,17 +991,17 @@ hk_DestroyImageView(VkDevice _device, VkImageView imageView,
        dev->dev.chip == AGX_CHIP_G18G) {
       for (unsigned p = 0; p < view->plane_count; ++p) {
          if (view->planes[p].emrt_read_heap_index)
-            hk_descriptor_table_remove(dev, &dev->sampled_images,
-                                        view->planes[p].emrt_read_heap_index);
+            hk_image_view_heap_remove(dev, view,
+                                      view->planes[p].emrt_read_heap_index);
          if (view->planes[p].storage_heap_index)
-            hk_descriptor_table_remove(dev, &dev->sampled_images,
-                                        view->planes[p].storage_heap_index);
+            hk_image_view_heap_remove(dev, view,
+                                      view->planes[p].storage_heap_index);
          if (view->planes[p].input_heap_index)
-            hk_descriptor_table_remove(dev, &dev->sampled_images,
-                                        view->planes[p].input_heap_index);
+            hk_image_view_heap_remove(dev, view,
+                                      view->planes[p].input_heap_index);
          if (view->planes[p].sampled_heap_index)
-            hk_descriptor_table_remove(dev, &dev->sampled_images,
-                                        view->planes[p].sampled_heap_index);
+            hk_image_view_heap_remove(dev, view,
+                                      view->planes[p].sampled_heap_index);
          /* The filterable descriptor was reserved in hk_image_view_init but
           * never released here, leaking one sampled_images entry per view
           * whose format has a uscaled-normalized equivalent. The table only
@@ -953,8 +1010,8 @@ hk_DestroyImageView(VkDevice _device, VkImageView imageView,
           * more. Keyed on filterable_valid rather than a nonzero index
           * because index 0 is a valid descriptor index. */
          if (view->planes[p].filterable_valid)
-            hk_descriptor_table_remove(dev, &dev->sampled_images,
-                                        view->planes[p].filterable_heap_index);
+            hk_image_view_heap_remove(dev, view,
+                                      view->planes[p].filterable_heap_index);
       }
    }
 
@@ -1014,5 +1071,28 @@ hk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
 
    *pView = hk_image_view_to_handle(view);
 
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetImageViewOpaqueCaptureDescriptorDataEXT(
+   VkDevice device, const VkImageViewCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_image_view, view, pInfo->imageView);
+
+   struct hk_image_view_capture capture = {0};
+   for (unsigned p = 0; p < view->plane_count; ++p) {
+      capture.index[p][HK_VIEW_HEAP_SAMPLED] = view->planes[p].sampled_heap_index;
+      capture.index[p][HK_VIEW_HEAP_FILTERABLE] =
+         view->planes[p].filterable_valid
+            ? view->planes[p].filterable_heap_index
+            : 0;
+      capture.index[p][HK_VIEW_HEAP_STORAGE] = view->planes[p].storage_heap_index;
+      capture.index[p][HK_VIEW_HEAP_INPUT] = view->planes[p].input_heap_index;
+      capture.index[p][HK_VIEW_HEAP_EMRT_READ] =
+         view->planes[p].emrt_read_heap_index;
+   }
+   memcpy(pData, &capture, sizeof(capture));
    return VK_SUCCESS;
 }

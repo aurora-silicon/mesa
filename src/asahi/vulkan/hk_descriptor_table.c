@@ -28,6 +28,16 @@ hk_descriptor_table_resize_free_table(struct hk_device *dev,
    }
 
    table->free_table = new_free_table;
+
+   uint32_t *new_replay_free_table =
+      vk_realloc(&dev->vk.alloc, table->replay_free_table, new_free_table_size,
+                 4, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (new_replay_free_table == NULL) {
+      return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
+                       "Failed to allocate image descriptor free table");
+   }
+
+   table->replay_free_table = new_replay_free_table;
    return VK_SUCCESS;
 }
 
@@ -211,6 +221,7 @@ hk_descriptor_table_finish(struct hk_device *dev,
 
    agx_bo_unreference(&dev->dev, table->bo);
    vk_free(&dev->vk.alloc, table->free_table);
+   vk_free(&dev->vk.alloc, table->replay_free_table);
    simple_mtx_destroy(&table->mutex);
 }
 
@@ -280,6 +291,137 @@ hk_descriptor_table_add(struct hk_device *dev,
    simple_mtx_unlock(&table->mutex);
 
    return result;
+}
+
+/* Back entries [0, count) with memory. */
+static VkResult
+hk_descriptor_table_ensure_locked(struct hk_device *dev,
+                                  struct hk_descriptor_table *table,
+                                  uint32_t count)
+{
+   if (count > table->max_alloc)
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   while (table->alloc < count) {
+      /* A single-chunk table is allocated at full capacity */
+      assert(table->va != NULL);
+      VkResult result = hk_descriptor_table_add_chunk_locked(dev, table);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   return VK_SUCCESS;
+}
+
+/* VK_EXT_descriptor_buffer capture/replay: hand out exactly `index`, which a
+ * captured descriptor names. Fails if anything else holds it. */
+VkResult
+hk_descriptor_table_add_at(struct hk_device *dev,
+                           struct hk_descriptor_table *table,
+                           const void *desc_data, size_t desc_size,
+                           uint32_t index)
+{
+   VkResult result = VK_SUCCESS;
+   simple_mtx_lock(&table->mutex);
+
+   if (index >= table->max_alloc) {
+      result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+   } else if (index < table->next_desc) {
+      /* Handed out before: only a freed entry can be taken again, normally
+       * the one the captured object freed. */
+      uint32_t i;
+      for (i = 0; i < table->replay_free_count; i++) {
+         if (table->replay_free_table[i] == index)
+            break;
+      }
+      if (i < table->replay_free_count) {
+         table->replay_free_table[i] =
+            table->replay_free_table[--table->replay_free_count];
+      } else {
+         for (i = 0; i < table->free_count; i++) {
+            if (table->free_table[i] == index)
+               break;
+         }
+         if (i == table->free_count)
+            result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+         else
+            table->free_table[i] = table->free_table[--table->free_count];
+      }
+   } else {
+      result = hk_descriptor_table_ensure_locked(dev, table, index + 1);
+      if (result == VK_SUCCESS) {
+         /* The entries skipped over stay free for later allocations. */
+         for (uint32_t i = table->next_desc; i < index; i++)
+            table->free_table[table->free_count++] = i;
+         table->next_desc = index + 1;
+      }
+   }
+
+   if (result == VK_SUCCESS) {
+      assert(desc_size == table->desc_size);
+      memcpy(hk_descriptor_table_entry(table, index), desc_data,
+             table->desc_size);
+   }
+
+   simple_mtx_unlock(&table->mutex);
+   return result;
+}
+
+/* Hand out `count` consecutive, zeroed entries starting at *first_out, which
+ * the caller fills through hk_descriptor_table_entry() and never removes. */
+VkResult
+hk_descriptor_table_reserve_range(struct hk_device *dev,
+                                  struct hk_descriptor_table *table,
+                                  uint32_t count, uint32_t *first_out)
+{
+   simple_mtx_lock(&table->mutex);
+   VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   if (table->next_desc <= table->max_alloc - count)
+      result = hk_descriptor_table_ensure_locked(dev, table,
+                                                 table->next_desc + count);
+   if (result == VK_SUCCESS) {
+      *first_out = table->next_desc;
+      table->next_desc += count;
+   }
+   simple_mtx_unlock(&table->mutex);
+   return result;
+}
+
+/* A capture/replay object being captured: reuse what such objects freed
+ * first, so the replay pool stays bounded. */
+VkResult
+hk_descriptor_table_add_replay(struct hk_device *dev,
+                               struct hk_descriptor_table *table,
+                               const void *desc_data, size_t desc_size,
+                               uint32_t *index_out)
+{
+   simple_mtx_lock(&table->mutex);
+   VkResult result;
+   if (table->replay_free_count > 0) {
+      *index_out = table->replay_free_table[--table->replay_free_count];
+      assert(desc_size == table->desc_size);
+      memcpy(hk_descriptor_table_entry(table, *index_out), desc_data,
+             table->desc_size);
+      result = VK_SUCCESS;
+   } else {
+      result = hk_descriptor_table_add_locked(dev, table, desc_data,
+                                              desc_size, index_out);
+   }
+   simple_mtx_unlock(&table->mutex);
+   return result;
+}
+
+void
+hk_descriptor_table_remove_replay(struct hk_device *dev,
+                                  struct hk_descriptor_table *table,
+                                  uint32_t index)
+{
+   simple_mtx_lock(&table->mutex);
+
+   memset(hk_descriptor_table_entry(table, index), 0, table->desc_size);
+   assert(table->replay_free_count < table->alloc);
+   table->replay_free_table[table->replay_free_count++] = index;
+
+   simple_mtx_unlock(&table->mutex);
 }
 
 void

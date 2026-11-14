@@ -157,6 +157,9 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    save->desc0 = desc->sets[0];
    save->has_push_desc0 = desc->push[0];
    save->push_active0 = !!(desc->push_active & BITFIELD_BIT(0));
+   save->buffer_active0 = !!(desc->buffer_active & BITFIELD_BIT(0));
+   save->buffer_set0 = desc->root.sets[0];
+   save->buffer_set_size0 = desc->set_sizes[0];
    if (save->has_push_desc0)
       hk_copy_push_descriptor_set(&save->push_desc0, desc->push[0]);
 
@@ -194,7 +197,20 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    desc->root_dirty = true;
 
-   if (save->desc0) {
+   desc->buffer_active &= ~BITFIELD_BIT(0);
+   if (save->buffer_active0) {
+      /* Set 0 came from a descriptor buffer: rebind its address. A push
+       * descriptor set the application pushed earlier stays inactive. */
+      if (save->has_push_desc0)
+         hk_copy_push_descriptor_set(desc->push[0], &save->push_desc0);
+      desc->sets[0] = NULL;
+      desc->root.sets[0] = save->buffer_set0;
+      desc->set_sizes[0] = save->buffer_set_size0;
+      desc->sets_dirty |= BITFIELD_BIT(0);
+      desc->push_dirty &= ~BITFIELD_BIT(0);
+      desc->push_active &= ~BITFIELD_BIT(0);
+      desc->buffer_active |= BITFIELD_BIT(0);
+   } else if (save->desc0) {
       desc->sets[0] = save->desc0;
       desc->root.sets[0] = hk_descriptor_set_addr(save->desc0);
       desc->sets_dirty |= BITFIELD_BIT(0);

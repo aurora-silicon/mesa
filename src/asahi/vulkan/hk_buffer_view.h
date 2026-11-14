@@ -37,3 +37,16 @@ struct hk_buffer_view {
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_buffer_view, vk.base, VkBufferView,
                                VK_OBJECT_TYPE_BUFFER_VIEW)
+
+struct hk_device;
+
+/* VK_EXT_descriptor_buffer texel buffers (G17P, see hk_buffer_view.c) */
+VkResult hk_texel_windows_init(struct hk_device *dev);
+void hk_texel_windows_finish(struct hk_device *dev);
+
+/* Write the AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE bytes of a texel buffer
+ * descriptor for vkGetDescriptorEXT(); a null or unrepresentable buffer gets
+ * the null descriptor. */
+void hk_texel_buffer_descriptor(struct hk_device *dev,
+                                const VkDescriptorAddressInfoEXT *info,
+                                bool storage, void *out);

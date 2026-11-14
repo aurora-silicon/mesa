@@ -229,6 +229,23 @@ hk_sampler_pack_error(struct hk_device *dev, const VkSamplerCreateInfo *info,
       info->unnormalizedCoordinates, info->flags);
 }
 
+/* A heap sampler at its captured index when the sampler replays
+ * (VK_EXT_descriptor_buffer), else shared or new. */
+static VkResult
+hk_sampler_add(struct hk_device *dev, const struct hk_sampler_capture *replay,
+               bool capture, unsigned plane, bool unbiased,
+               const struct hk_native_sampler_descriptor *desc,
+               struct hk_rc_sampler **out)
+{
+   const uint16_t index =
+      replay ? (unbiased ? replay->unbiased[plane] : replay->hw[plane]) : 0;
+   if (index)
+      return hk_sampler_heap_add_at(dev, desc, index - 1, out);
+   if (capture)
+      return hk_sampler_heap_add_capture(dev, desc, out);
+   return hk_sampler_heap_add(dev, desc, out);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_CreateSampler(VkDevice device,
                  const VkSamplerCreateInfo *info /* pCreateInfo */,
@@ -250,6 +267,19 @@ hk_CreateSampler(VkDevice device,
    sampler = vk_sampler_create(&dev->vk, info, pAllocator, sizeof(*sampler));
    if (!sampler)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   const VkOpaqueCaptureDescriptorDataCreateInfoEXT *replay_info =
+      (info->flags & VK_SAMPLER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT)
+         ? vk_find_struct_const(info->pNext,
+                                OPAQUE_CAPTURE_DESCRIPTOR_DATA_CREATE_INFO_EXT)
+         : NULL;
+   struct hk_sampler_capture replay_data;
+   if (replay_info)
+      memcpy(&replay_data, replay_info->opaqueCaptureDescriptorData,
+             sizeof(replay_data));
+   const struct hk_sampler_capture *replay = replay_info ? &replay_data : NULL;
+   const bool capture =
+      info->flags & VK_SAMPLER_CREATE_DESCRIPTOR_BUFFER_CAPTURE_REPLAY_BIT_EXT;
 
    sampler->min_filter = info->minFilter;
    sampler->mag_filter = info->magFilter;
@@ -338,8 +368,8 @@ hk_CreateSampler(VkDevice device,
          ? _mesa_float_to_half(info->mipLodBias)
          : _mesa_float_to_half(0.0f);
 
-   result = hk_sampler_heap_add(
-      dev, &samp, &sampler->planes[sampler->plane_count].hw);
+   result = hk_sampler_add(dev, replay, capture, sampler->plane_count, false,
+                           &samp, &sampler->planes[sampler->plane_count].hw);
    if (result != VK_SUCCESS) {
       hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
       return result;
@@ -380,8 +410,9 @@ hk_CreateSampler(VkDevice device,
                                          sampler->vk.reduction_mode,
                                          "chroma plane");
          }
-         result = hk_sampler_heap_add(
-            dev, &samp, &sampler->planes[sampler->plane_count].hw);
+         result = hk_sampler_add(dev, replay, capture, sampler->plane_count,
+                                 false, &samp,
+                                 &sampler->planes[sampler->plane_count].hw);
 
          if (result != VK_SUCCESS) {
             hk_DestroySampler(device, hk_sampler_to_handle(sampler),
@@ -401,8 +432,9 @@ hk_CreateSampler(VkDevice device,
          return hk_sampler_pack_error(dev, info, sampler->vk.reduction_mode,
                                       "custom border clamp-to-0 plane");
       }
-      result = hk_sampler_heap_add(dev, &samp,
-                                   &sampler->planes[sampler->plane_count].hw);
+      result = hk_sampler_add(dev, replay, capture, sampler->plane_count,
+                              false, &samp,
+                              &sampler->planes[sampler->plane_count].hw);
 
       if (result != VK_SUCCESS) {
          hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
@@ -458,8 +490,8 @@ hk_CreateSampler(VkDevice device,
                                          "unbiased plane");
          }
 
-         result = hk_sampler_heap_add(dev, &samp,
-                                      &sampler->planes[plane].unbiased);
+         result = hk_sampler_add(dev, replay, capture, plane, true, &samp,
+                                 &sampler->planes[plane].unbiased);
          if (result != VK_SUCCESS) {
             hk_DestroySampler(device, hk_sampler_to_handle(sampler), pAllocator);
             return result;
@@ -489,4 +521,21 @@ hk_DestroySampler(VkDevice device, VkSampler _sampler,
    }
 
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetSamplerOpaqueCaptureDescriptorDataEXT(
+   VkDevice device, const VkSamplerCaptureDescriptorDataInfoEXT *pInfo,
+   void *pData)
+{
+   VK_FROM_HANDLE(hk_sampler, sampler, pInfo->sampler);
+
+   struct hk_sampler_capture capture = {0};
+   for (unsigned p = 0; p < sampler->plane_count; ++p) {
+      capture.hw[p] = sampler->planes[p].hw->index + 1;
+      if (sampler->planes[p].unbiased)
+         capture.unbiased[p] = sampler->planes[p].unbiased->index + 1;
+   }
+   memcpy(pData, &capture, sizeof(capture));
+   return VK_SUCCESS;
 }
