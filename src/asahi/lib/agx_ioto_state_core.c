@@ -37,6 +37,7 @@ agx_ioto_state_target_encoding(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_IOTO_STATE_ENCODING_GPU1;
    default:
       return AGX_IOTO_STATE_ENCODING_UNSUPPORTED;

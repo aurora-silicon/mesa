@@ -36,6 +36,7 @@ agx_ioto_preshader_target_encoding(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_IOTO_PRESHADER_ENCODING_GPU1;
 
    default:

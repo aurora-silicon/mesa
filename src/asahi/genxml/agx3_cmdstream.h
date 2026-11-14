@@ -146,6 +146,7 @@ agx3_cdm_launch_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
    case AGX_CHIP_G18G:
       return true;
    default:
@@ -174,6 +175,7 @@ agx3_cdm_indirect_launch_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return true;
    default:
       return false;
@@ -200,6 +202,7 @@ agx3_cdm_indirect_launch_36_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return true;
    default:
       return false;
@@ -224,6 +227,7 @@ agx3_cdm_stream_link_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return true;
    default:
       return false;
@@ -591,6 +595,7 @@ agx3_cdm_barrier_target_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
    case AGX_CHIP_G18G:
       return true;
    default:
@@ -608,6 +613,7 @@ agx3_cdm_barrier_flags_grounded(enum agx_chip chip, uint8_t flags)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return true;
    case AGX_CHIP_G18G:
       /* The flag-free word is captured on G18G (compute-add), and flags=5
@@ -660,6 +666,7 @@ agx3_cdm_barrier_flush_memory_grounded(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return true;
    default:
       return false;
@@ -848,7 +855,7 @@ static inline bool
 agx3_cdm_secondary_barrier_target_grounded(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
 }
 
 static inline bool
