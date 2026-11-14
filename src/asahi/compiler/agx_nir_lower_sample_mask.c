@@ -1240,6 +1240,14 @@ agx_nir_lower_sample_mask_one_update(nir_shader *shader)
    return lower_sample_mask_deferred(shader, false, false, NULL, true, true);
 }
 
+/* M5: the same, with M5's uniformly selected final update. */
+bool
+agx_nir_lower_sample_mask_one_update_m5(nir_shader *shader)
+{
+   assert(!shader->info.fs.early_fragment_tests);
+   return lower_sample_mask_deferred(shader, true, false, NULL, true, true);
+}
+
 bool
 agx_nir_lower_sample_mask_deferred(nir_shader *shader)
 {
