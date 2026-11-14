@@ -10,6 +10,21 @@
 
 
 enum hk_mesh_mode { HK_MESH_MODE_OFF=0, HK_MESH_MODE_NATIVE_PROBE };
+
+/* A native G17P mesh launch runs at most this many mesh workgroups: a larger
+ * child grid launches none. A draw's mesh workgroups therefore go out in
+ * launches of whole rows: launch k publishes (X, rows, 1) children, and row
+ * r = workgroup y + k * hk_mesh_launch_rows(X). */
+#define HK_MESH_LAUNCH_WGS ((1u << 19) - 1)
+/* Launches for a grid only the GPU knows: enough for the 2^22 workgroups of
+ * maxMeshWorkGroupTotalCount at any row width up to 65535. */
+#define HK_MESH_LAUNCHES_MAX 10
+
+static inline uint32_t
+hk_mesh_launch_rows(uint32_t x)
+{
+   return x ? (HK_MESH_LAUNCH_WGS / x ? HK_MESH_LAUNCH_WGS / x : 1) : 1;
+}
 static inline enum hk_mesh_mode hk_mesh_mode(void) {
    const char *mode=getenv("ASAHI_MESH");
    return mode && !strcmp(mode,"native-probe") ? HK_MESH_MODE_NATIVE_PROBE

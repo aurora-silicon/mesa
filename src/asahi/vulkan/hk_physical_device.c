@@ -341,9 +341,10 @@ hk_get_device_features(
       .tessellationShader = true,
 
       
-      .taskShader = dev->chip == AGX_CHIP_G17S &&
-                    supported_extensions->EXT_mesh_shader &&
-                    hk_m5_task_record(dev->params.features),
+      .taskShader = supported_extensions->EXT_mesh_shader &&
+                    (dev->chip == AGX_CHIP_G17P ||
+                     (dev->chip == AGX_CHIP_G17S &&
+                      hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
       .multiviewMeshShader = false,
       .primitiveFragmentShadingRateMeshShader = false,
@@ -1472,10 +1473,14 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
       /* The only subgroup size is 32, so requiring it is always satisfied,
-       * also in ray tracing stages, which are inlined into compute kernels. */
+       * also in ray tracing stages, which are inlined into compute kernels,
+       * and in G17P task (compute) and mesh stages. */
       .requiredSubgroupSizeStages =
          VK_SHADER_STAGE_COMPUTE_BIT |
-         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0),
+         (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0) |
+         (dev->chip == AGX_CHIP_G17P && features->meshShader
+             ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT
+             : 0),
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
