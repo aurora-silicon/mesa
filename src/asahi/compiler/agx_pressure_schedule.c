@@ -478,6 +478,14 @@ ilp_is_sample(const agx_context *ctx, const agx_instr *I)
            I->op == AGX_OPCODE_IMAGE_LOAD);
 }
 
+/* What the sample-issue schedule moves up: samples, and with `loads` device
+ * loads too (M5 compute, see agx_ilp_schedule). */
+static bool
+ilp_is_hoisted(const agx_context *ctx, const agx_instr *I, bool loads)
+{
+   return ilp_is_sample(ctx, I) || (loads && I->op == AGX_OPCODE_DEVICE_LOAD);
+}
+
 static unsigned
 ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
 {
@@ -765,7 +773,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    unsigned load_latency, signed slack, signed cap,
                    bool place_exit_compare, bool order_edges_free,
                    signed fwd_cap, unsigned hoist_samples,
-                   bool hoist_past_writes,
+                   bool hoist_past_writes, bool hoist_loads,
                    struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
@@ -834,7 +842,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       unsigned ordinal = 0;
       for (unsigned i = 0; i < n; ++i) {
          first_sample[i] =
-            ilp_is_sample(ctx, nodes[i]->instr) ? ordinal++ : ~0u;
+            ilp_is_hoisted(ctx, nodes[i]->instr, hoist_loads) ? ordinal++ : ~0u;
       }
       for (unsigned i = n; i-- > 0;) {
          util_dynarray_foreach(&dependents[i], unsigned, d)
@@ -935,7 +943,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
       done[best] = true;
       order[step] = nodes[best];
-      issued_samples += ilp_is_sample(ctx, nodes[best]->instr);
+      issued_samples += ilp_is_hoisted(ctx, nodes[best]->instr, hoist_loads);
       issued_writes += nodes[best]->instr->op == AGX_OPCODE_IMAGE_WRITE ||
                        nodes[best]->instr->op == AGX_OPCODE_DEVICE_STORE;
       changed |= (unsigned)best != step;
@@ -1057,6 +1065,15 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
    agx_foreach_instr_in_block(block, I)
       samples += ilp_is_sample(ctx, I);
    return samples;
+}
+
+static unsigned
+ilp_block_device_loads(const agx_block *block)
+{
+   unsigned loads = 0;
+   agx_foreach_instr_in_block(block, I)
+      loads += I->op == AGX_OPCODE_DEVICE_LOAD;
+   return loads;
 }
 
 /* Register halves the block's sample results occupy together. */
@@ -1376,11 +1393,19 @@ agx_ilp_schedule(agx_context *ctx)
        * shared AGX3 policy below, as agx_isa_is_agx3() gates it. */
       const bool copy = copy_mode[block->index];
       const bool loop_samples = loop_sample_mode[block->index];
+      /* Device loads too, in and outside loops: the pressure order places
+       * each right before its first use, so the block waits for one load at
+       * a time, as it would for samples. A copy block keeps its own
+       * schedule. M5 only: not G18G, which compiles as AGX3C with
+       * emit_agx3d. */
+      const bool compute_loads = m5_compute && !ctx->key->dev.emit_agx3d &&
+                                 !m5_full && m5_samples && !copy;
+      const unsigned loads = compute_loads ? ilp_block_device_loads(block) : 0;
       if ((m5_compute && !m5_full) || copy || loop_samples) {
          if ((m5_samples || copy || loop_samples) &&
              (!in_loop[block->index] || m5_sample_probe || copy ||
-              loop_samples) &&
-             ilp_block_samples(ctx, block) >=
+              loop_samples || loads) &&
+             ilp_block_samples(ctx, block) + loads >=
                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
                               : AGX_ILP_FS_MIN_SAMPLES)) {
             /* Let the block's peak grow only up to the largest register
@@ -1405,7 +1430,7 @@ agx_ilp_schedule(agx_context *ctx)
                                false, true, AGX_ILP_FS_SAMPLE_HALVES,
                                copy ? AGX_ILP_M5_COPY_SAMPLES
                                     : AGX_ILP_FS_HOIST_SAMPLES,
-                               copy, &dag_state);
+                               copy, loads > 0, &dag_state);
          }
          continue;
       }
@@ -1427,12 +1452,12 @@ agx_ilp_schedule(agx_context *ctx)
           !m5_ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0, false,
-                            &dag_state);
+                            false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, true, false, 0, 0, false,
-                            &dag_state);
+                            false, &dag_state);
       } else if ((!in_loop[block->index] || m5_sample_probe) &&
                  !ctx->is_preamble &&
                  (ctx->stage == MESA_SHADER_FRAGMENT || m5_sample_probe) &&
@@ -1450,7 +1475,7 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, slack, 0, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
-                            AGX_ILP_FS_HOIST_SAMPLES, false, &dag_state);
+                            AGX_ILP_FS_HOIST_SAMPLES, false, false, &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -1463,7 +1488,7 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, AGX_ILP_SLACK,
                             AGX_ILP_CPROG_HALVES, false, true,
-                            AGX_ILP_CPROG_HALVES - 16, 0, false, &dag_state);
+                            AGX_ILP_CPROG_HALVES - 16, 0, false, false, &dag_state);
       }
    }
 

@@ -7569,6 +7569,24 @@ agx3_m5_texture_barrier(enum agx_isa_encoding enc, unsigned scope)
            scope == AGX3_BARRIER_SCOPE_TEXTURE_FENCE_THREADGROUP);
 }
 
+/* Whether an M5 (G17) barrier is a workgroup barrier at which every load
+ * still in flight is retired first: every invocation of the workgroup stops
+ * there until all of them arrive. EXECUTION and THREADGROUP are the
+ * workgroup barriers without and with threadgroup memory. TEXTURE also
+ * carries the rendezvous, but the compiler emits it only right after a
+ * DEVICE barrier, which already retires everything (a workgroup barrier over
+ * image memory, fence_mem_to_tex_agx), and as the fragment shader's pixel
+ * fence (fence_pbe_to_tex_pixel_agx), which has no workgroup. G18G, which
+ * compiles with the same encoding, keeps its barriers as they are. */
+static bool
+agx3_m5_rendezvous_barrier(const agx_context *ctx, enum agx_isa_encoding enc,
+                           unsigned scope)
+{
+   return enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+          (scope == AGX3_BARRIER_SCOPE_EXECUTION ||
+           scope == AGX3_BARRIER_SCOPE_THREADGROUP);
+}
+
 static bool
 agx3_emit_scoped_barrier(struct util_dynarray *emission,
                          enum agx_isa_encoding enc, const agx_instr *I,
@@ -13247,10 +13265,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             e->preferred_slot = 8;
          e->latches_srcs = agx_is_texture_publication(I);
          /* Release ordering includes reads whose results are used after the
-          * fence. Register dependencies alone do not order those reads. */
+          * fence. Register dependencies alone do not order those reads.
+          * On M5, loads still in flight when an invocation stops at a
+          * workgroup barrier are retired there as well, so none is
+          * outstanding while the workgroup waits. */
          e->drain = (I->op == AGX_OPCODE_SCOPED_BARRIER_AGX3 &&
                      (I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
-                      I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE)) ||
+                      I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE ||
+                      agx3_m5_rendezvous_barrier(ctx, enc, I->imm))) ||
                     I->op == AGX_OPCODE_RT_BARRIER_GEN1;
          e->reissues_live_slot = I->op == AGX_OPCODE_LDCF;
          if (I->agx3_tex_coord_start)
@@ -16810,6 +16832,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              * issued writes, which the scheduler's drain cannot see. */
             const bool device = I->imm == AGX3_BARRIER_SCOPE_DEVICE ||
                                 I->imm == AGX3_BARRIER_SCOPE_DEVICE_FENCE;
+            /* An M5 workgroup barrier retires everything in flight, as the
+             * planner's drain does for the operations it tracks. */
+            const bool rendezvous =
+               agx3_m5_rendezvous_barrier(ctx, enc, I->imm);
             /* The native PBE-to-texture fence includes a wait on slot1.
              * Heap image writes rotate through the six completion slots,
              * however, so retire their other live generations before the
@@ -16831,7 +16857,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                texture_wait ? image_write_slots & outstanding_here & ~1u : 0;
             const uint16_t retire =
                wait | image_wait |
-               ((device || g18g_texture_barrier) ? outstanding_here : 0);
+               ((device || rendezvous || g18g_texture_barrier)
+                   ? outstanding_here : 0);
             if (!agx3_emit_scoped_barrier(emission, enc, I, retire))
                AGX3_REFUSE(I);
             const uint16_t completed =

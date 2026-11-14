@@ -147,11 +147,22 @@ g17p_sample_shape(const nir_tex_instr *tex, bool m5)
         * so G15 hands every depth cube-array texture() its sampler bias this
         * way (dEQP-VK.texture.shadow.cube_array). A constant bias or a bias
         * with a minimum stays closed. */
+       /*
+        * On the M5 the cube-array comparison also takes a per-lane level: the
+        * packer stages it beside the face and the layer, as it stages the
+        * cube comparison's level beside the face (agx3_emit_texture_sample).
+        * It is the form compute shaders with derivative groups reach, whose
+        * texture() agx_nir_lower_compute_derivatives() turns into txl
+        * (dEQP-VK.glsl.texture_functions.texture.samplercubearrayshadow_compute).
+        * Refusing it here sent the whole shader to the packer as a software
+        * heap handle, which has no AGX3 encoding.
+        */
        (cube &&
         (tex->op != nir_texop_tex && tex->op != nir_texop_tg4 && !query_lod &&
          !((!tex->is_shadow || shadow_level_zero ||
             (!cube_array && level_src >= 0 &&
-             !nir_src_is_const(tex->src[level_src].src))) &&
+             !nir_src_is_const(tex->src[level_src].src)) ||
+            (m5 && cube_array && register_level)) &&
             tex->op == nir_texop_txl) &&
          !(tex->op == nir_texop_txb &&
            (!tex->is_shadow ||

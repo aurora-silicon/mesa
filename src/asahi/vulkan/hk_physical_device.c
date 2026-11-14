@@ -2124,9 +2124,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * VK_KHR_cooperative_matrix does not advertise it. */
    supported_extensions.NV_cooperative_matrix2 = m5_cmat;
 
-   /* Hardware-qualified on M5 only. */
+   /* Counted by the pre-graphics helpers, which every native chip runs;
+    * hardware-qualified on M5 and G17P. */
    supported_extensions.EXT_primitives_generated_query =
-      agx_chip_g17_m5(pdev->dev.chip);
+      agx_chip_g17_m5(pdev->dev.chip) || pdev->dev.chip == AGX_CHIP_G17P;
 
    supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
       hk_mesh_mode() == HK_MESH_MODE_NATIVE_PROBE &&

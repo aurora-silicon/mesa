@@ -425,6 +425,7 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    if (pool->vk.query_type != VK_QUERY_TYPE_TIMESTAMP &&
        pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION &&
        pool->vk.query_type != VK_QUERY_TYPE_PIPELINE_STATISTICS &&
+       pool->vk.query_type != VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT &&
        pool->vk.query_type != VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT &&
        pool->vk.query_type != VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT &&
        !hk_is_acceleration_structure_query(pool->vk.query_type)) {

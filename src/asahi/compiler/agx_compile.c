@@ -10214,6 +10214,23 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    };
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
 
+   /* Small uniform ifs whose arms load from memory, which peephole select
+    * keeps: on M5 an if costs five control-flow instructions and a wait for
+    * every load in flight. Flattening one can expose another around it.
+    * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
+   if (m5 && !g18_scans) {
+      bool flattened;
+      do {
+         flattened = false;
+         NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
+         NIR_PASS(flattened, nir, nir_opt_peephole_select,
+                  &peephole_select_options);
+      } while (flattened);
+      NIR_PASS(_, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    NIR_PASS(_, nir, nir_opt_load_store_vectorize,
             &(const nir_load_store_vectorize_options){
                .modes = nir_var_mem_global | nir_var_mem_constant |

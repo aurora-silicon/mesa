@@ -3198,7 +3198,19 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
             /* The copies' one-hot sample masks, so that the lowering sees
              * each demote's constant sample. */
             NIR_PASS(_, nir, nir_opt_constant_folding);
-            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
+            /* Kills go into the one testing update where they can: a
+             * kill-only update of part of a multisampled pixel loses the
+             * killed samples' previous contents. Depth/stencil exports and
+             * memory writes keep the kills where they happen.
+             * AGX_G17P_SAMPLE_KILL_ONE_UPDATE=0 keeps the kill-only updates,
+             * for comparison. */
+            const uint64_t zs = BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+                                BITFIELD64_BIT(FRAG_RESULT_STENCIL);
+            if (!(nir->info.outputs_written & zs) && !nir->info.writes_memory &&
+                debug_get_bool_option("AGX_G17P_SAMPLE_KILL_ONE_UPDATE", true))
+               NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update);
+            else
+               NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
          }
       } else if (nir->info.fs.uses_sample_shading) {
          /* Ensure the sample ID is preserved in register */

@@ -16283,3 +16283,105 @@ TEST_F(AGX3PackBinary, FusedVertexExportsRetireEachSixSlotBatch)
       EXPECT_EQ(b->shader->agx3_staging_halfs, 2 * count);
    }
 }
+
+/* An M5 compute shader that issues `count` independent 32-bit device loads
+ * into r4, r6, ... (eight take a slot each, a ninth joins slot 1), then one
+ * barrier of `scope`, then stores every loaded value. */
+static void
+m5_loads_barrier_stores(agx_builder *b, unsigned count, unsigned scope)
+{
+   b->shader->stage = MESA_SHADER_COMPUTE;
+   b->shader->nir = rzalloc(b->shader, nir_shader);
+   b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+   for (unsigned n = 0; n < count; ++n)
+      agx_device_load_to(b, agx_register(8 + 4 * n, AGX_SIZE_32),
+                         agx_uniform(16, AGX_SIZE_64), agx_immediate(n),
+                         AGX_FORMAT_I32, 1, 0, false);
+   agx_scoped_barrier_agx3(b, scope);
+   for (unsigned n = 0; n < count; ++n)
+      agx_device_store(b, agx_register(8 + 4 * n, AGX_SIZE_32),
+                       agx_uniform(20, AGX_SIZE_64), agx_immediate(n),
+                       AGX_FORMAT_I32, 1, 0, false);
+   agx_stop(b);
+}
+
+static void
+m5_store_bytes(std::vector<uint8_t> &v, unsigned n, uint16_t wait_mask)
+{
+   struct agx3_mem_desc d = {};
+   d.data = 8 + 4 * n;
+   d.width = AGX3_MEM_W32;
+   d.mask = 1;
+   d.base_is_uniform = true;
+   d.base = 20;
+   d.idx_kind = AGX3_MEM_IDX_IMM;
+   d.byte_off = n << 2;
+   d.wait_mask = wait_mask;
+   uint8_t bytes[AGX3_MEM_MAX_LENGTH], len;
+   ASSERT_TRUE(agx3_mem_encode_store(AGX_ISA_ENCODING_AGX3C, &d, bytes, &len));
+   append(v, bytes, len);
+}
+
+/* A workgroup barrier, with or without shared memory, retires every load
+ * still in flight before the invocation stops there: nine loads on eight
+ * slots, all retired in one wait before the barrier, so no store after it
+ * waits. */
+TEST_F(AGX3PackBinary, M5WorkgroupBarriersRetirePendingLoads)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G17C;
+   for (unsigned scope : {(unsigned)AGX3_BARRIER_SCOPE_THREADGROUP,
+                          (unsigned)AGX3_BARRIER_SCOPE_EXECUTION}) {
+      SCOPED_TRACE(scope);
+      agx_builder *b = builder(enc);
+      m5_loads_barrier_stores(b, 9, scope);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty());
+
+      std::vector<uint8_t> tail;
+      uint8_t bytes[AGX3_ALU_MAX_LENGTH], len;
+      ASSERT_TRUE(agx3_alu_band_identity_wait(enc, 0, 0xff, bytes, &len));
+      append(tail, bytes, len);
+      struct agx3_encoded_scoped_barrier barrier;
+      ASSERT_TRUE(agx3_pack_scoped_barrier(
+         enc, (enum agx3_barrier_scope)scope, &barrier));
+      append(tail, barrier.bytes, barrier.length);
+      for (unsigned n = 0; n < 9; ++n)
+         m5_store_bytes(tail, n, 0);
+      tail.insert(tail.end(), {0x0e, 0, 0, 0});
+      ASSERT_GE(code.size(), tail.size());
+      EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
+                tail);
+   }
+}
+
+/* G18G compiles with the same encoding and keeps its workgroup barriers as
+ * they were: the barrier is issued without a wait, and each store after it
+ * waits for its own load's slot (the ninth load's slot is waited for by the
+ * first store already). */
+TEST_F(AGX3PackBinary, G18GWorkgroupBarriersKeepLoadsInFlight)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3C;
+   key.dev.chip = AGX_CHIP_G18G;
+   key.dev.emit_agx3d = true;
+   for (unsigned scope : {(unsigned)AGX3_BARRIER_SCOPE_THREADGROUP,
+                          (unsigned)AGX3_BARRIER_SCOPE_EXECUTION}) {
+      SCOPED_TRACE(scope);
+      agx_builder *b = builder(enc);
+      m5_loads_barrier_stores(b, 9, scope);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty());
+
+      std::vector<uint8_t> tail;
+      struct agx3_encoded_scoped_barrier barrier;
+      ASSERT_TRUE(agx3_pack_scoped_barrier(
+         enc, (enum agx3_barrier_scope)scope, &barrier));
+      append(tail, barrier.bytes, barrier.length);
+      for (unsigned n = 0; n < 9; ++n)
+         m5_store_bytes(tail, n, n < 8 ? 1u << n : 0);
+      tail.insert(tail.end(), {0x0e, 0, 0, 0});
+      ASSERT_GE(code.size(), tail.size());
+      EXPECT_EQ(std::vector<uint8_t>(code.end() - tail.size(), code.end()),
+                tail);
+   }
+}
