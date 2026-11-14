@@ -3235,11 +3235,25 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       }
 
       /* Defer only discards: gl_SampleMask writes and per-sample fragments
-       * reach this pass as demotes too and keep their ordinary lowering. */
+       * reach this pass as demotes too and keep their ordinary lowering,
+       * except M5's unrolled copies (below). */
+      const uint64_t m5_zs = BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+                             BITFIELD64_BIT(FRAG_RESULT_STENCIL);
       if (agx_chip_g17_m5(dev->chip) && !g17g_samples_unrolled &&
           !nir->info.fs.uses_sample_shading &&
           !writes_sample_mask)
          NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+      else if (g17g_samples_unrolled && key->nr_samples > 1 &&
+               !nir->info.fs.early_fragment_tests &&
+               !(nir->info.outputs_written & m5_zs) &&
+               !nir->info.writes_memory &&
+               debug_get_bool_option("AGX_M5_SAMPLE_KILL_ONE_UPDATE", true))
+         /* The unrolled copies' kills go into the one testing update, as on
+          * G17P, in M5's uniformly selected form (the draw's test selector
+          * is a uniform here): a kill-only update of part of a multisampled
+          * pixel loses the killed samples' previous contents.
+          * AGX_M5_SAMPLE_KILL_ONE_UPDATE=0 keeps the kill-only updates. */
+         NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update_m5);
       else
          NIR_PASS(_, nir, agx_nir_lower_sample_mask);
       if (dev->chip == AGX_CHIP_G18G && agx_g18_msaa4_enabled() &&

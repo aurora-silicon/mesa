@@ -4950,6 +4950,14 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          dev->dev.chip == AGX_CHIP_G17P && nir->info.fs.uses_sample_shading &&
          !nir->info.fs.early_fragment_tests &&
          debug_get_bool_option("AGX_G17P_SAMPLE_KILL_TEST_ONCE", true);
+      /* M5 unrolls its sample-shaded mains the same way. A main too large
+       * to unroll here (inlined with its epilog at draw time) keeps the
+       * lowering before that unroll. AGX_M5_SAMPLE_KILL_TEST_ONCE=0 keeps
+       * the per-sample tests, for comparison. */
+      const bool m5_test_once =
+         agx_chip_g17_m5(dev->dev.chip) && nir->info.fs.uses_sample_shading &&
+         !nir->info.fs.early_fragment_tests &&
+         debug_get_bool_option("AGX_M5_SAMPLE_KILL_TEST_ONCE", true);
 
       bool a2c_in_main = false;
       if (dev->dev.chip == AGX_CHIP_G17P && key && key->fs.static_a2c &&
@@ -4963,7 +4971,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       NIR_PASS(_, nir, agx_nir_lower_fs_output_to_epilog_for_device,
                dev->dev.chip, &shader->info.fs.epilog_key);
       if (agx_chip_g17_m5(dev->dev.chip)) {
-         NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+         if (!m5_test_once)
+            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
       } else if (dev->dev.chip == AGX_CHIP_G17P) {
          if (!g17p_test_once) {
             NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p,
@@ -4990,7 +4999,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          key && (key->fs.static_tests || a2c_in_main) &&
          !shader->info.fs.epilog_key.write_z &&
          !shader->info.fs.epilog_key.write_s;
-      if (fold_tests && !g17p_test_once) {
+      if (fold_tests && !g17p_test_once && !m5_test_once) {
          bool folded = false;
          NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
                   hk_fold_tests_zs, nir_metadata_control_flow, NULL);
@@ -5016,6 +5025,17 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                 agx_chip_g17_m5(dev->dev.chip))) {
             if (agx_chip_g17_m5(dev->dev.chip) && raster_samples == 8) {
                shader->info.fs.m5_inline_sample_shading = true;
+               /* Not unrolled here: lower as before. */
+               if (m5_test_once) {
+                  NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+                  if (fold_tests) {
+                     bool folded = false;
+                     NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
+                              hk_fold_tests_zs, nir_metadata_control_flow,
+                              NULL);
+                     shader->info.fs.static_tests = folded;
+                  }
+               }
             } else {
                ralloc_free(nir);
                return vk_errorf(dev, VK_ERROR_UNKNOWN,
@@ -5041,6 +5061,24 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update);
             else
                NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p, NULL);
+            if (fold_tests) {
+               bool folded = false;
+               NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
+                        hk_fold_tests_zs, nir_metadata_control_flow, NULL);
+               shader->info.fs.static_tests = folded;
+            }
+         } else if (m5_test_once && !shader->info.fs.m5_inline_sample_shading) {
+            NIR_PASS(_, nir, nir_opt_constant_folding);
+            /* As on G17P: kills go into the one testing update where they
+             * can. AGX_M5_SAMPLE_KILL_ONE_UPDATE=0 keeps the kill-only
+             * updates, for comparison. */
+            const uint64_t zs = BITFIELD64_BIT(FRAG_RESULT_DEPTH) |
+                                BITFIELD64_BIT(FRAG_RESULT_STENCIL);
+            if (!(nir->info.outputs_written & zs) && !nir->info.writes_memory &&
+                debug_get_bool_option("AGX_M5_SAMPLE_KILL_ONE_UPDATE", true))
+               NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update_m5);
+            else
+               NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
             if (fold_tests) {
                bool folded = false;
                NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
