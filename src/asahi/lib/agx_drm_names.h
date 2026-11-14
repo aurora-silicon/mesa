@@ -9,6 +9,25 @@
 #include <stddef.h>
 #include <string.h>
 
+/* DRM name of the AGX kernel driver. Kernels before the Aurora rename
+ * report "asahi", so both are accepted and Mesa and the kernel can update in
+ * either order. Every place that recognises the AGX GPU by its kernel name
+ * (the driver, the loader, the pipe-loader, kmsro) takes it from here, so a
+ * rename reaches all of them at once.
+ */
+#define AGX_DRM_DRIVER_NAME        "aurora"
+#define AGX_DRM_DRIVER_NAME_LEGACY "asahi"
+
+/* Both names, newest first, for lists of kernel driver names. */
+#define AGX_DRM_DRIVER_NAMES AGX_DRM_DRIVER_NAME, AGX_DRM_DRIVER_NAME_LEGACY
+
+static inline bool
+agx_is_native_drm_driver(const char *name)
+{
+   return name && (!strcmp(name, AGX_DRM_DRIVER_NAME) ||
+                   !strcmp(name, AGX_DRM_DRIVER_NAME_LEGACY));
+}
+
 /* Whether the asahi Gallium driver refuses a GPU, named by its device tree
  * compatible or by its chip name (agx_chip_name()); NULL for a name not
  * given. GL on such a GPU runs through zink over Borealis.
