@@ -138,7 +138,7 @@ agx3_cf_icmp_width_m5(enum agx3_cf_icond cond, unsigned slot,
  * and the surrounding loads and multiply-adds in the same kernel write the
  * same field just as high (`lddev` f2=178, `imadd` f2=182), so the index is
  * plainly a half number and not a narrower operand class.  The generated
- * composer -- which comes from Apple's encoder tables -- accepts f2/f17/f19
+ * composer -- which comes from the encoder tables -- accepts f2/f17/f19
  * up to 255 and refuses 256, and every value round-trips back through the
  * structural decomposer unchanged.
  */

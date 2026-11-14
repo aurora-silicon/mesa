@@ -307,7 +307,7 @@ bool agx3_pack_ldimm_u32(enum agx_isa_encoding encoding, uint16_t dest,
 /*
  * Encode/decode the source-grounded register-plus-inline-u8 form of 32-bit
  * integer add.  `dest` and `src` are 16-bit half-register indices, so both
- * must be even.  Apple's encoder tables limit this encoding point to r0..r95
+ * must be even.  The encoder tables limit this encoding point to r0..r95
  * on AGX3b (half-registers 0..190) and r0..r127 on AGX3c (0..254).
  *
  * The anonymous Apple fields were attached to their semantics by the pinned
@@ -939,7 +939,7 @@ bool agx3_unpack_update_node(enum agx_isa_encoding encoding,
 
 /*
  * Encode/decode the corpus-grounded hardware `intersect_ray` instruction.
- * Apple's encoder tables identify f5 as a 13-bit half-register field; the
+ * The encoder tables identify f5 as a 13-bit half-register field; the
  * surrounding native stream makes its SCS/ray-state role likely, but that
  * semantic name remains an inference.  Two direct native-corpus pairs vary
  * only f5 and establish these exact values and bytes:
@@ -969,7 +969,7 @@ agx3_intersect_ray_witnessed_chip_encoding(enum agx_chip chip);
 /*
  * Encode/decode the canonical hardware `continue_ray` instruction with its
  * one varying Apple-table field, f5.  The field is a half-register index; its
- * exact bit placement is established by Apple's AGX3b/AGX3c encoder tables.
+ * exact bit placement is established by the AGX3b/AGX3c encoder tables.
  * Its role as the ray-state/SCS register is an inference from the surrounding
  * lowering, so callers must not treat this codec as a complete traversal
  * operation.
