@@ -316,15 +316,42 @@ instr_cost(nir_instr *instr, const void *data)
    }
 }
 
+/* cb_data of the AGX3B cost callbacks that turns execution_weight() on. */
+static const bool execution_weight_on = true;
+
+/* Uniform slots run out in big shaders. Code under an if may never run, so
+ * divide its claim on them per level: otherwise the many small loads of a
+ * cold branch outbid the vectors every fragment reads, and the shader spills
+ * to hold those. The rewrite cost scales the same way, so this reorders the
+ * candidates without dropping any while slots are free.
+ *
+ * Only on G17P, where it was measured: data is &execution_weight_on there and
+ * NULL on the other AGX3B chips. Known gap: a small if that the later
+ * nir_opt_peephole_select turns into selects runs for every fragment, but its
+ * candidates are still weighted as cold. */
+static float
+execution_weight(const nir_block *block, const void *data)
+{
+   float weight = 1.0f;
+   if (!data)
+      return weight;
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+      if (node->type == nir_cf_node_if)
+         weight /= 8.0f;
+   }
+   return weight;
+}
+
 static float
 instr_cost_g17p(nir_instr *instr, const void *data)
 {
+   float weight = execution_weight(instr->block, data);
    if (instr->type == nir_instr_type_alu) {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
       if (alu->op == nir_op_fabs && alu->def.bit_size <= 32)
-         return 1.0f;
+         return weight;
    }
-   return instr_cost(instr, data);
+   return instr_cost(instr, data) * weight;
 }
 
 /* G17P's vertex output store reads its 16-bit index from the uniform file
@@ -390,7 +417,12 @@ rewrite_cost(nir_def *def, const void *data)
 static float
 rewrite_cost_g17p(nir_def *def, const void *data)
 {
-   return rewrite_cost_impl(def, true);
+   /* A phi is worth what its arms are, one if deeper than it sits. */
+   float weight = execution_weight(nir_def_block(def), data);
+   if (data && nir_def_instr(def)->type == nir_instr_type_phi)
+      weight /= 8.0f;
+
+   return rewrite_cost_impl(def, true) * weight;
 }
 
 /* AGX3C publishes constant-program results with 32-bit uniform copies only
@@ -878,7 +910,7 @@ widen_half_exports(nir_shader *nir)
 
 bool
 agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
-                     bool agx3c)
+                     bool agx3c, bool weight_by_execution)
 {
    bool progress = false;
    nir_opt_preamble_options options = preamble_options;
@@ -892,6 +924,8 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
       options.instr_cost_cb = agx3c ? instr_cost : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
+      if (weight_by_execution && !agx3c)
+         options.cb_data = &execution_weight_on;
    }
    bool speculative = false;
    if (g17p && !agx3c && nir->info.stage == MESA_SHADER_FRAGMENT) {

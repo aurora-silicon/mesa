@@ -10396,7 +10396,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (sizes[2] == 0)
          sizes[2]++;
 
-      NIR_PASS(_, nir, agx_nir_opt_preamble, sizes, byte_indices || m5, m5);
+      NIR_PASS(_, nir, agx_nir_opt_preamble, sizes, byte_indices || m5, m5,
+               g17p);
 
       *preamble_size = sizes[0];
 
