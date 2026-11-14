@@ -11,6 +11,7 @@
 #include "hk_frame_anatomy.h"
 #include "hk_agx3_ioto_program_core.h"
 #include "hk_nir_lower_gs.h"
+#include "hk_nir_vertex_preamble.h"
 #include "hk_nir_root_size.h"
 #include "hk_nir_lower_tes_rq.h"
 #include "hk_native_write_class.h"
@@ -3981,29 +3982,6 @@ hk_nir_root_reads(const nir_shader *nir)
    return reads;
 }
 
-struct hk_g17p_vertex_preamble_shift {
-   unsigned base;
-   /* Preamble loads below this half are fixed ABI state, not VBO uniforms. */
-   unsigned first;
-};
-
-static bool
-hk_g17p_shift_vertex_preamble(UNUSED nir_builder *b,
-                              nir_intrinsic_instr *intr, void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_load_preamble)
-      return false;
-
-   const struct hk_g17p_vertex_preamble_shift *shift = data;
-   const unsigned base = shift->base;
-   const unsigned old = nir_intrinsic_base(intr);
-   if (old < shift->first || old > UINT16_MAX - base)
-      return false;
-
-   nir_intrinsic_set_base(intr, old + base);
-   return true;
-}
-
 /* The layer and viewport index each occupy a 16-bit half of the shared UVS
  * scalar. Apple's G17P compiler saturates a wider index into its half rather
  * than truncating it: every vertex program writing render_target_array_index
@@ -4732,13 +4710,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
           * driver publishes there (hk_gen1_upload_fragment_query_state()).
           * This covers an API vertex shader and a geometry shader's raster
           * replay alike. */
-         const struct hk_g17p_vertex_preamble_shift shift = {
-            .base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
-            .first = shader->info.agx3_gen1_fragment_rq ? 168 : 0,
-         };
-         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-                  hk_g17p_shift_vertex_preamble,
-                  nir_metadata_control_flow, (void *)&shift);
+         NIR_PASS(_, nir, hk_nir_shift_vertex_preamble,
+                  AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
+                  shader->info.agx3_gen1_fragment_rq);
       }
    } else if (agx_native_graphics(&dev->dev) &&
               (nir->info.stage == MESA_SHADER_GEOMETRY ||
@@ -4893,13 +4867,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
           * and sampler heaps. Move already-lowered VBO uniforms together.
           * A native query owns halves 0..167 and its heaps start at 168, so
           * only the vertex ABI above the query state moves. */
-         const struct hk_g17p_vertex_preamble_shift shift = {
-            .base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
-            .first = shader->info.agx3_gen1_fragment_rq ? 168 : 0,
-         };
-         NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-                  hk_g17p_shift_vertex_preamble,
-                  nir_metadata_control_flow, (void *)&shift);
+         NIR_PASS(_, nir, hk_nir_shift_vertex_preamble,
+                  AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
+                  shader->info.agx3_gen1_fragment_rq);
       }
    }
 
