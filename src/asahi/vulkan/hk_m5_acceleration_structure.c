@@ -17,14 +17,9 @@
 #include "hk_acceleration_structure.h"
 #include "hk_m5_acceleration_structure.h"
 #include "hk_agx3_as_layout.h"
-#include "asahi/compiler/agx3_pack.h"
-#include "asahi/compiler/agx3_mem_core.h"
-#include "hk_m5_ift_diag_inventory.h"
 #include "util/u_debug.h"
 #include "util/cache_ops.h"
 #include "util/u_atomic.h"
-#include <errno.h>
-#include <unistd.h>
 
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
@@ -317,13 +312,6 @@ hk_m5_upload_as_table_count(struct hk_cmd_buffer *cmd, unsigned *table_count)
    }
    simple_mtx_unlock(&dev->m5_as_lock);
    return table.cpu ? table.gpu : 0;
-}
-
-uint64_t
-hk_m5_upload_as_table(struct hk_cmd_buffer *cmd)
-{
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   return dev->m5_as_table_va ? dev->m5_as_table_va->addr : 0;
 }
 
 static_assert(sizeof(struct hk_bvh_triangle_node) == 48, "node format");
@@ -1370,224 +1358,6 @@ hk_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
 /* ---------------------------------------------------------------- */
 /* Device state                                                      */
 
-/* Private integration profile. The external capture is an oracle while owned
- * traversal bodies are developed; it is never embedded in the driver. */
-static bool
-hk_m5_rq_init_fail(struct hk_device *dev, const char *stage, int error)
-{
-   const int saved_errno = errno;
-   if (debug_get_bool_option("ASAHI_M5_DEVICE_INIT_DIAG", false))
-      fprintf(stderr, "M5_RQ_INIT pid=%ld dev=%p stage=%s errno=%d\n",
-              (long)getpid(), (void *)dev, stage, error);
-   errno = saved_errno;
-   return false;
-}
-
-/* Whether the query traversal files ASAHI_M5_RQ_CAPTURE_DIR names are
- * readable in this process. A container that replaces /usr (Steam's runtime)
- * may not see them; ray queries are then not offered rather than failing
- * device creation. */
-bool
-hk_m5_rq_assets_available(void)
-{
-   static const char *const names[] = {
-      "driver-rebase-b3.bin", "user-image.bin", "uniforms.bin",
-   };
-   const char *dir = getenv("ASAHI_M5_RQ_CAPTURE_DIR");
-   if (!dir)
-      return false;
-   for (unsigned i = 0; i < ARRAY_SIZE(names); ++i) {
-      char path[4096];
-      if (snprintf(path, sizeof(path), "%s/%s", dir, names[i]) >= sizeof(path) ||
-          access(path, R_OK))
-         return false;
-   }
-   return true;
-}
-
-static bool
-hk_m5_rq_read(const char *dir, const char *name, void *data, size_t bytes)
-{
-   char path[4096];
-   if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= sizeof(path))
-      return false;
-   FILE *f = fopen(path, "rb");
-   if (!f) {
-      const int error = errno;
-      if (debug_get_bool_option("ASAHI_M5_DEVICE_INIT_DIAG", false)) {
-         fprintf(stderr, "M5_RQ_READ pid=%ld file=%s stage=open errno=%d\n",
-                 (long)getpid(), name, error);
-      }
-      errno = error;
-      return false;
-   }
-   bool ok = fread(data, 1, bytes, f) == bytes && fgetc(f) == EOF;
-   const int read_errno = errno;
-   if (!ok && debug_get_bool_option("ASAHI_M5_DEVICE_INIT_DIAG", false)) {
-      const int error = ferror(f) ? read_errno : 0;
-      const int saved_errno = read_errno;
-      fprintf(stderr, "M5_RQ_READ pid=%ld file=%s stage=exact-size errno=%d ferror=%d feof=%d\n",
-              (long)getpid(), name, error, ferror(f), feof(f));
-      errno = saved_errno;
-   }
-   if (!ok)
-      errno = read_errno;
-   fclose(f);
-   return ok;
-}
-
-/* Explicit diagnostic only. A native IFT program store has not been qualified
- * on hardware. The exact captured call setup overwrites halves0..3 before the
- * native body executes; no additional caller registers or uniforms are used. */
-static bool
-hk_m5_ift_diag_setup(struct hk_device *dev)
-{
-   const char *dump = getenv("ASAHI_M5_RQ_IFT_DIAG_DUMP");
-   if (!dump || !dump[0])
-      return true;
-   dev->m5_rq_diag_dump = strdup(dump);
-   dev->m5_rq_diag = agx_bo_create(&dev->dev, 0x4000, 0x4000,
-                                 AGX_BO_WRITEBACK, "M5 IFT diagnostic bitmap");
-   if (!dev->m5_rq_diag_dump || !dev->m5_rq_diag)
-      return false;
-   memset(agx_bo_map(dev->m5_rq_diag), 0, 0x4000);
-   const uint64_t address = dev->m5_rq_diag->va->addr;
-   /* Each callback stores its slotAddressLow at its inventory slot. Repeated writers
-    * store the same word. This observes entry execution, not callback counts
-    * or individual lanes. Require a nonzero marker and a native48-bit VA. */
-   if (!(uint32_t)address || (address >> 48))
-      return false;
-   uint8_t *code = agx_bo_map(dev->m5_rq_code);
-   /* Verify every original before writing any entry. The inventory also
-    * qualifies the full GPR0..3 overwrite and entry-specific prefix padding. */
-   for (unsigned i = 0; i < ARRAY_SIZE(hk_m5_ift_diag_entries); ++i) {
-      const struct hk_m5_ift_diag_entry *e = &hk_m5_ift_diag_entries[i];
-      if (memcmp(code + e->offset, hk_m5_ift_diag_original + e->original,
-                 e->bytes))
-         return false;
-      for (unsigned j = 0; j < e->max_prefix; ++j) {
-         if (code[e->offset + e->bytes + j])
-            return false;
-      }
-   }
-   uint8_t prefixes[ARRAY_SIZE(hk_m5_ift_diag_entries)][32];
-   uint8_t lengths[ARRAY_SIZE(hk_m5_ift_diag_entries)];
-   for (unsigned i = 0; i < ARRAY_SIZE(hk_m5_ift_diag_entries); ++i) {
-      const struct hk_m5_ift_diag_entry *e = &hk_m5_ift_diag_entries[i];
-      uint8_t *prefix = prefixes[i], bytes;
-      const uint64_t marker_address = address + e->slot * 4;
-      size_t length = 0;
-      struct agx3_encoded_ldimm imm;
-      if (!agx3_pack_ldimm_u32(AGX_ISA_ENCODING_AGX3C, 0, marker_address, &imm))
-         return false;
-      memcpy(prefix + length, imm.bytes, imm.length);
-      length += imm.length;
-      if (!agx3_pack_ldimm_u32(AGX_ISA_ENCODING_AGX3C, 2, marker_address >> 32, &imm))
-         return false;
-      memcpy(prefix + length, imm.bytes, imm.length);
-      length += imm.length;
-      const struct agx3_mem_desc store = {
-         .data = 0, .width = AGX3_MEM_W32, .mask = 1, .base = 0,
-         .idx_kind = AGX3_MEM_IDX_IMM, .byte_off = 0,
-      };
-      if (!agx3_mem_encode_store(AGX_ISA_ENCODING_AGX3C, &store,
-                                prefix + length, &bytes))
-         return false;
-      length += bytes;
-      if (length > e->max_prefix)
-         return false;
-      lengths[i] = length;
-   }
-   for (unsigned i = 0; i < ARRAY_SIZE(hk_m5_ift_diag_entries); ++i) {
-      const struct hk_m5_ift_diag_entry *e = &hk_m5_ift_diag_entries[i];
-      memmove(code + e->offset + lengths[i], code + e->offset, e->bytes);
-      memcpy(code + e->offset, prefixes[i], lengths[i]);
-   }
-   return true;
-}
-
-static void
-hk_m5_ift_diag_finish(struct hk_device *dev)
-{
-   if (!dev->m5_rq_diag || !dev->m5_rq_diag_dump)
-      return;
-   /* The caller must have completed its work before destroying the device.
-    * The diagnostic fixture performs vkDeviceWaitIdle before VkDestroyDevice. */
-   FILE *f = fopen(dev->m5_rq_diag_dump, "wb");
-   if (f) {
-      fwrite(agx_bo_map(dev->m5_rq_diag), 1, 0x4000, f);
-      fclose(f);
-   }
-   char path[4096];
-   int n = snprintf(path, sizeof(path), "%s.patched-driver.bin", dev->m5_rq_diag_dump);
-   if (n >= 0 && (size_t)n < sizeof(path)) {
-      f = fopen(path, "wb");
-      if (f) {
-         fwrite(agx_bo_map(dev->m5_rq_code), 1, 0x800000, f);
-         fclose(f);
-      }
-   }
-   n = snprintf(path, sizeof(path), "%s.address.txt", dev->m5_rq_diag_dump);
-   if (n >= 0 && (size_t)n < sizeof(path)) {
-      f = fopen(path, "w");
-      if (f) {
-         fprintf(f, "0x%llx\n", (unsigned long long)dev->m5_rq_diag->va->addr);
-         fclose(f);
-      }
-   }
-}
-
-static bool
-hk_m5_rq_init(struct hk_device *dev, const char *dir)
-{
-   dev->m5_rq_instances = debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false);
-   const uint64_t alias = UINT64_C(0x10010000000);
-   dev->m5_rq_code_alias = agx_va_alloc(&dev->dev, 0x800000, 0x4000,
-                                        AGX_VA_USC | AGX_VA_FIXED, alias);
-   if (!dev->m5_rq_code_alias)
-      return hk_m5_rq_init_fail(dev, "fixed-code-alias", 0);
-   dev->m5_rq_code = agx_bo_create(&dev->dev, 0x800000, 0x4000,
-                                    AGX_BO_EXEC | AGX_BO_WRITEBACK, "M5 query oracle");
-   dev->m5_rq_ift = agx_bo_create(&dev->dev, 0x8000, 0x4000,
-                                   AGX_BO_WRITEBACK, "M5 intersection table");
-   dev->m5_rq_user_image = malloc(0x800000);
-   const int image_error = dev->m5_rq_user_image ? 0 : errno;
-   if (!dev->m5_rq_code)
-      return hk_m5_rq_init_fail(dev, "code-bo", 0);
-   if (!dev->m5_rq_ift)
-      return hk_m5_rq_init_fail(dev, "ift-bo", 0);
-   if (!dev->m5_rq_user_image)
-      return hk_m5_rq_init_fail(dev, "user-image-allocation", image_error);
-   if (!hk_m5_rq_read(dir, "driver-rebase-b3.bin", agx_bo_map(dev->m5_rq_code), 0x800000) ||
-       !hk_m5_rq_read(dir, "user-image.bin", dev->m5_rq_user_image, 0x800000) ||
-       !hk_m5_rq_read(dir, "uniforms.bin", dev->m5_rq_uniforms, 296))
-      return hk_m5_rq_init_fail(dev, "oracle-read", 0);
-   if (dev->m5_rq_instances && !hk_m5_rq_read(dir, "instance-uniforms.bin", dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms)))
-      return hk_m5_rq_init_fail(dev, "instance-uniforms-read", 0);
-   if (!hk_m5_ift_diag_setup(dev))
-      return hk_m5_rq_init_fail(dev, "ift-diagnostic-setup", 0);
-   if (agx_bo_bind(&dev->dev, dev->m5_rq_code, alias, 0x800000, 0,
-                   DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
-      return hk_m5_rq_init_fail(dev, "code-alias-bind", 0);
-   uint8_t *table = agx_bo_map(dev->m5_rq_ift);
-   memset(table, 0, 0x8000);
-   memcpy(table + 128, (uint8_t *)dev->m5_rq_user_image + 0x558080, 112 * 128);
-   for (unsigned i = 0; i < 112 * 8; ++i) {
-      uint64_t lo; memcpy(&lo, table + 128 + 16*i, 8);
-      uint64_t address = lo & UINT64_C(0xffffffffffff);
-      if (!address) continue;
-      if (address < UINT64_C(0x1000000000) || address >= UINT64_C(0x1000800000))
-         return hk_m5_rq_init_fail(dev, "ift-address-range", 0);
-      lo = (lo & UINT64_C(0xffff000000000000)) | (alias + address - UINT64_C(0x1000000000));
-      memcpy(table + 128 + 16*i, &lo, 8);
-   }
-   dev->m5_rq_default_program = alias + 0x4d8800;
-   dev->m5_rq_default_control = UINT64_C(0x16000000000);
-   dev->m5_rq_instances = debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false);
-   dev->m5_native_rq = true;
-   return true;
-}
-
 VkResult
 hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
 {
@@ -1630,16 +1400,6 @@ hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       }
    }
-   /* Only a device that enables ray queries or ray tracing pipelines runs
-    * the query traversal code, so only such a device loads it. */
-   const char *capture = getenv("ASAHI_M5_RQ_CAPTURE_DIR");
-   const bool queries = dev->vk.enabled_features.rayQuery ||
-                        dev->vk.enabled_features.rayTracingPipeline;
-   if (dev->m5_native_as && capture && queries &&
-       !hk_m5_rq_init(dev, capture)) {
-      hk_device_finish_accel_struct_state(dev);
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
    return VK_SUCCESS;
 }
 
@@ -1648,18 +1408,6 @@ hk_device_finish_accel_struct_state(struct hk_device *dev)
 {
    if (!agx_chip_g17_m5(dev->dev.chip))
       return;
-   hk_m5_ift_diag_finish(dev);
-   if (dev->m5_rq_code_alias) {
-      agx_bo_bind(&dev->dev, NULL, dev->m5_rq_code_alias->addr, 0x800000, 0,
-                  DRM_ASAHI_BIND_UNBIND);
-      agx_va_free(&dev->dev, dev->m5_rq_code_alias, false);
-   }
-   agx_bo_unreference(&dev->dev, dev->m5_rq_code);
-   agx_bo_unreference(&dev->dev, dev->m5_rq_ift);
-   agx_bo_unreference(&dev->dev, dev->m5_rq_diag);
-   agx_bo_unreference(&dev->dev, dev->m5_rt_state_bo);
-   free(dev->m5_rq_diag_dump);
-   free(dev->m5_rq_user_image);
    bool table_unmapped = true;
    unsigned page = 0;
    util_dynarray_foreach(&dev->m5_as_table_pages, struct agx_bo *, bo) {
@@ -1738,7 +1486,7 @@ hk_m5_backend_CmdBuildAccelerationStructuresKHR(
          }
          struct hk_agx3_as_layout layout;
          /* Bottom-level structures hold triangles or procedural AABBs; the
-          * native encoder emits the captured record for either. */
+          * native encoder emits the hardware record for either. */
          bool triangles =
             pInfos[i].type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
             (!geometry || geometry->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR ||

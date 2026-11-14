@@ -1808,20 +1808,6 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                cmd.intersection_first=1;cmd.intersection_count=112;
                cmd.intersection_default_program=UINT64_C(0x10010020000);
                cmd.intersection_default_control=UINT64_C(0x16000000000);
-            } else if (cs->m5_native_rq) {
-               header.size = sizeof(cmd);
-               cmd.scs_layout = dev->m5_rq_instances
-                  ? ((debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_PROBE", false) || debug_get_bool_option("ASAHI_M5_RQ_CANDIDATE_API", false))
-                     ? UINT64_C(0x01140000600100e8) /* 276-entry IFT50 tail */
-                     : UINT64_C(0x00480000600100e8))
-                  : UINT64_C(0x0028000060000070);
-               cmd.cdm_auxiliary_allocation = 14;
-               cmd.intersection_pool = dev->m5_rq_ift->va->addr;
-               cmd.intersection_pool_bytes = 0x8000;
-               cmd.intersection_first = 1;
-               cmd.intersection_count = 112;
-               cmd.intersection_default_program = dev->m5_rq_default_program;
-               cmd.intersection_default_control = dev->m5_rq_default_control;
             }
             if (queue->sync.exact_prior) {
                header.size = sizeof(cmd);

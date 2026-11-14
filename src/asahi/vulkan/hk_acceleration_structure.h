@@ -27,7 +27,6 @@ struct hk_agx3_plan_args;
 void hk_gen1_rq_finish(struct hk_device *dev);
 VkResult hk_device_init_accel_struct_state(struct hk_device *device);
 void hk_device_finish_accel_struct_state(struct hk_device *device);
-uint64_t hk_m5_upload_as_table(struct hk_cmd_buffer *cmd);
 void hk_m5_as_buffer_bound(struct hk_device *dev, struct vk_buffer *buffer);
 
 /* Native build phase; the caller owns job planning, validated output ranges,
