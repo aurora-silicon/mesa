@@ -2126,8 +2126,11 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.KHR_shader_bfloat16 =
       m5_cmat && debug_get_bool_option("ASAHI_M5_BFLOAT16", true);
 
-   supported_extensions.NV_cooperative_matrix2 =
-      supported_extensions.KHR_cooperative_matrix;
+   /* Most of VK_NV_cooperative_matrix2 (flexible dimensions, tensor
+    * addressing, block loads, per-element operations, reductions) is lowered
+    * for the M5 only, so an AGX3B part that enables the 8x8
+    * VK_KHR_cooperative_matrix does not advertise it. */
+   supported_extensions.NV_cooperative_matrix2 = m5_cmat;
 
    /* Hardware-qualified on M5 only. */
    supported_extensions.EXT_primitives_generated_query =
