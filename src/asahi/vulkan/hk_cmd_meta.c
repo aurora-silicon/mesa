@@ -130,6 +130,7 @@ hk_meta_begin(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 {
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    save->in_meta = cmd->in_meta;
+   save->pipeline_shader_stages = cmd->vk.pipeline_shader_stages;
 
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       save->dynamic = cmd->vk.dynamic_graphics_state;
@@ -250,6 +251,13 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
 
    memcpy(desc->root.push, save->push, sizeof(save->push));
    cmd->in_meta = save->in_meta;
+
+   /* The meta pipeline's bind recorded every stage it bound as bound from a
+    * pipeline. The state restored above is the application's, so restore
+    * that record too: otherwise the application's next vkCmdBindShadersEXT,
+    * even of only the task and mesh stages, unbinds the "pipeline" and with
+    * it every graphics shader object restored here. */
+   cmd->vk.pipeline_shader_stages = save->pipeline_shader_stages;
 }
 
 void
