@@ -2092,6 +2092,14 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
+   } else if (hk_m5_soft_rt_enabled(&pdev->dev)) {
+      /* Shader traversal of the common BVH: no intersector programs and no
+       * native query state, so nothing beyond ordinary compute. */
+      supported_extensions.KHR_acceleration_structure = true;
+      supported_extensions.KHR_deferred_host_operations = true;
+      supported_extensions.KHR_ray_query = true;
+      supported_extensions.KHR_ray_tracing_pipeline = true;
+      supported_extensions.KHR_ray_tracing_maintenance1 = true;
    }
    /* The 8x8 f16/f32 matmad underlying a subgroup-scope cooperative matrix
     * exists on the AGX3B ISA (G15/G16/G17P) just as it does on the M5 AGX3C
