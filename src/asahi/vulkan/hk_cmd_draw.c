@@ -8426,6 +8426,32 @@ hk_flush_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
 }
 
+/* M5 (G17G/G17S/G17C): a HAL300 Index List carries no restart value, whether
+ * hk writes it or the robust index kernel does; the hardware compares the
+ * indices with the stream's restart state. Program that state with the
+ * draw's own index (the custom one from VK_EXT_primitive_restart_index or
+ * the default of the index type) before the list. Returns the new write
+ * pointer.
+ */
+static uint8_t *
+hk_m5_emit_restart_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                         uint8_t *out, struct agx_draw draw)
+{
+   const uint32_t index = hk_draw_restart_index(cmd, draw);
+   if (cs->restart_index_set && cs->restart_index == index)
+      return out;
+
+   agx_push(out, VDM_STATE, cfg) {
+      cfg.restart_index_present = true;
+   }
+   agx_push(out, VDM_STATE_RESTART_INDEX, cfg) {
+      cfg.value = index;
+   }
+   cs->restart_index = index;
+   cs->restart_index_set = true;
+   return out;
+}
+
 static float hk_depth_bias_factor(VkFormat format, bool exact,
                                   bool force_unorm);
 
@@ -13057,6 +13083,10 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          assert(!geom && !tess && !adj);
          perf_debug(cmd, "lowering robust index buffer");
 
+         /* The kernel writes the M5 Index List into a slot reserved after
+          * this point; its restart state goes before it. */
+         if (agx_chip_g17_m5(dev->dev.chip) && draw.restart)
+            out = hk_m5_emit_restart_index(cmd, cs, out, draw);
          cs->current = out;
 
          draw = hk_draw_as_indexed_indirect(cmd, draw);
@@ -13067,8 +13097,10 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
 
          hk_emit_robust_index(cmd, cs, draw, topology,
                               g17p_native_bind_tail_emitted, batch);
-         /* Its GPU-written indexed indirect packets set the restart index. */
-         if (agx_native_graphics(&dev->dev))
+         /* G17P: its GPU-written indexed indirect packets set the restart
+          * index. M5: for an empty draw the kernel writes a Stream Link over
+          * the slot, which counts as a link (hk_cmd_buffer.c). */
+         if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
             cs->restart_index_set = false;
       } else {
          if (agx_native_graphics(&dev->dev)) {
@@ -13080,22 +13112,15 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
              * the indirect packet carries its own state update. Geometry
              * may have synthesized an index width unrelated to the API IB. */
             if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed &&
-                draw.restart && !agx_is_indirect(draw.b)) {
-               const uint32_t index =
-                  agx_primitive_restart_index(draw.index_size);
-               if (cs->restart_index != index) {
-                  agx_push(out, VDM_STATE, cfg) {
-                     cfg.restart_index_present = true;
-                  }
-                  agx_push(out, VDM_STATE_RESTART_INDEX, cfg) {
-                     cfg.value = index;
-                  }
-                  cs->restart_index = index;
-               }
-            }
+                draw.restart && !agx_is_indirect(draw.b))
+               out = hk_m5_emit_restart_index(cmd, cs, out, draw);
             cs->current = (void *)agx_vdm_draw(
                (uint32_t *)out, agx_vdm_index_list_record_chip(dev->dev.chip),
                draw, topology, hk_draw_restart_index(cmd, draw));
+            /* The indirect packet's own state update replaced it. */
+            if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed &&
+                agx_is_indirect(draw.b))
+               cs->restart_index_set = false;
          }
       }
 
@@ -13609,6 +13634,8 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
          (uint32_t *)cs->current,
          agx_vdm_index_list_record_chip(hk_cmd_buffer_device(cmd)->dev.chip),
          draw, gfx->topology, hk_draw_restart_index(cmd, draw));
+      if (agx_chip_g17_m5(dev->dev.chip) && draw.indexed)
+         cs->restart_index_set = false;
    }
    hk_g17p_note_layer_zero_draw(cmd, cs);
    hk_note_pre_raster_images(cmd, cs);
