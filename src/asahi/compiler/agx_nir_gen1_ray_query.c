@@ -393,15 +393,22 @@ gen1_rq_alias_copies(nir_function_impl *impl)
    return progress;
 }
 
-/* Arm (default off). ASAHI_G17P_RQ_SCS_SWEEP=<mask> ends a candidate-layout
- * compute kernel with destination-less SCS loads over storage its warp used:
- * once per thread, after everything else the kernel does, between a traversal
- * barrier of the scope used ahead of a launch and one of the scope a
- * traversal program ends with. Every lane issues every load. A row is what a
- * warp reaches with four words a lane: 512 bytes.
+/* A candidate-layout compute kernel ends with destination-less SCS loads over
+ * storage its warp used: once per thread, after everything else the kernel
+ * does, between a traversal barrier of the scope used ahead of a launch and
+ * one of the scope a traversal program ends with. Every lane issues every
+ * load. A row is what a warp reaches with four words a lane: 512 bytes. The
+ * generated traversal programs end with the same kind of load.
  *
- * What such a load does to the storage it names is not established; the arm
- * is there to measure it. The mask selects the storage:
+ * By default the kernel names the per-thread storage a query of its warp
+ * used: the payload records and the query block it stored to itself, and the
+ * warp's records in the two other per-thread areas below the query blocks.
+ * Without that, each ray query costs a fixed amount more on the GPU, the same
+ * for cheap and for expensive rays; what the access does to the storage it
+ * names is not established beyond that measurement.
+ *
+ * ASAHI_G17P_RQ_SCS_SWEEP=<mask> overrides the selection (0 ends the kernel
+ * as before):
  *
  *   bit 0  the warp's query block, as far as its last instance pointer
  *   bit 1  the warp's payload records
@@ -412,9 +419,11 @@ gen1_rq_alias_copies(nir_function_impl *impl)
  *   bit 5  the warp's records of other per-thread storage, named by
  *          ASAHI_G17P_RQ_SCS_SWEEP_EXTRA=<address>/<bytes>[,...]: <bytes> a
  *          thread from SCS offset <address>, below the query blocks
+ *   bit 6  the warp's records in the two other per-thread areas:
+ *          GEN1_RQ_LEVEL_PAYLOADS and GEN1_RQ_THREAD_RECORDS
  *
- * The loads come in the order payload, extra, saved context, query context,
- * query block.
+ * The loads come in the order payload, extra, the two areas, saved context,
+ * query context, query block.
  */
 enum gen1_rq_sweep {
    GEN1_RQ_SWEEP_QUERY = 1 << 0,
@@ -423,6 +432,10 @@ enum gen1_rq_sweep {
    GEN1_RQ_SWEEP_CONTEXT = 1 << 3,
    GEN1_RQ_SWEEP_NO_INDEX = 1 << 4,
    GEN1_RQ_SWEEP_EXTRA = 1 << 5,
+   GEN1_RQ_SWEEP_AREAS = 1 << 6,
+
+   GEN1_RQ_SWEEP_DEFAULT = GEN1_RQ_SWEEP_QUERY | GEN1_RQ_SWEEP_PAYLOAD |
+                           GEN1_RQ_SWEEP_AREAS,
 };
 
 /* The candidate layout: 96 warps, their query blocks from this offset on. */
@@ -432,8 +445,16 @@ enum gen1_rq_sweep {
 /* The candidate query block ends with a six-byte instance pointer a lane. */
 #define GEN1_RQ_QUERY_USED_BYTES (9152 + 32 * 6)
 #define GEN1_RQ_SWEEP_ROW_BYTES  (32 * 16)
-/* Loads the mask can select (19 + 2 + 3 + 7), and extra rows on top. */
-#define GEN1_RQ_SWEEP_MASK_MAX   31
+/* Two more per-thread areas of the SCS, below the query blocks. The payload
+ * section holds two runs of payload records 0x20000 apart, thirty-two bytes a
+ * thread each; the kernel stores to the first and this is the second. The
+ * section behind it starts with sixteen bytes a thread. */
+#define GEN1_RQ_LEVEL_PAYLOADS       0x28000
+#define GEN1_RQ_LEVEL_PAYLOAD_BYTES  32
+#define GEN1_RQ_THREAD_RECORDS       0x48000
+#define GEN1_RQ_THREAD_RECORD_BYTES  16
+/* Loads the mask can select (19 + 2 + 3 + 7 + 3), and extra rows on top. */
+#define GEN1_RQ_SWEEP_MASK_MAX   34
 #define GEN1_RQ_SWEEP_EXTRA_MAX  32
 
 struct gen1_rq_touch {
@@ -558,6 +579,17 @@ gen1_rq_scs_sweep(nir_builder *b,
       gen1_rq_sweep_rows(&s,
          nir_iadd_imm(b, nir_imul_imm(b, first, extra[i].bytes),
                       extra[i].address), 32 * extra[i].bytes);
+
+   if (mask & GEN1_RQ_SWEEP_AREAS) {
+      gen1_rq_sweep_rows(&s,
+         nir_iadd_imm(b, nir_imul_imm(b, first, GEN1_RQ_LEVEL_PAYLOAD_BYTES),
+                      GEN1_RQ_LEVEL_PAYLOADS),
+         32 * GEN1_RQ_LEVEL_PAYLOAD_BYTES);
+      gen1_rq_sweep_rows(&s,
+         nir_iadd_imm(b, nir_imul_imm(b, first, GEN1_RQ_THREAD_RECORD_BYTES),
+                      GEN1_RQ_THREAD_RECORDS),
+         32 * GEN1_RQ_THREAD_RECORD_BYTES);
+   }
 
    if (mask & GEN1_RQ_SWEEP_SAVED) {
       /* The three stores the launch makes, word for word. */
@@ -1109,7 +1141,8 @@ agx_nir_lower_gen1_ray_query(nir_shader *shader,
    }
    /* Returns are lowered by now, so every thread reaches the end of the
     * entrypoint, whether or not it launched a ray. */
-   const unsigned sweep = debug_get_num_option("ASAHI_G17P_RQ_SCS_SWEEP", 0);
+   const unsigned sweep = debug_get_num_option("ASAHI_G17P_RQ_SCS_SWEEP",
+                                               GEN1_RQ_SWEEP_DEFAULT);
    if (sweep && launches && layout->candidates &&
        shader->info.stage == MESA_SHADER_COMPUTE) {
       b.cursor = nir_after_block_before_jump(nir_impl_last_block(impl));

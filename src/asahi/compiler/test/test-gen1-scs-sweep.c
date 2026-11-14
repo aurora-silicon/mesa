@@ -1,7 +1,7 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * The G17P kernel-end SCS sweep arm, ASAHI_G17P_RQ_SCS_SWEEP.
+ * The G17P kernel-end SCS sweep and its switch, ASAHI_G17P_RQ_SCS_SWEEP.
  *
  * Lowering: which destination-less loads a candidate kernel ends with for
  * each mask, in which order, between which fences, and that general NIR
@@ -63,6 +63,10 @@ expected(unsigned mask, const unsigned *extra, unsigned extras,
       n = rows(out, n, 32 * 32, indexed);
    for (unsigned i = 0; (mask & 32) && i < extras; ++i)
       n = rows(out, n, 32 * extra[i], indexed);
+   if (mask & 64) {
+      n = rows(out, n, 32 * 32, indexed);
+      n = rows(out, n, 32 * 16, indexed);
+   }
    if (mask & 4) {
       out[n++] = (struct touch){false, 256, 4, 0};
       out[n++] = (struct touch){false, 272, 4, 0};
@@ -369,7 +373,7 @@ compile_kernel(unsigned mask, const char *extra, const unsigned *sizes,
    char text[16];
    snprintf(text, sizeof(text), "0x%x", mask);
    const unsigned count = expected(mask, sizes, extras, want);
-   set_arm(mask ? text : NULL, extra);
+   set_arm(text, extra);
    nir_builder b = lowered_kernel();
    set_arm(NULL, NULL);
 
@@ -398,15 +402,26 @@ lowering_cases(void)
    unsigned cases = 0;
 
    /* Off: nothing, whatever the extra list says. */
-   check_lowering(NULL, NULL, NULL, 0);
    check_lowering("0", NULL, NULL, 0);
-   check_lowering(NULL, "0x40000/16", NULL, 0);
-   cases += 3;
+   check_lowering("0", "0x40000/16", NULL, 0);
+   cases += 2;
+
+   /* Unset: the payload records, the two other per-thread areas and the
+    * query block, and no extra storage even when a list is given. */
+   {
+      struct touch want[64];
+      const unsigned count = expected(0x43, NULL, 0, want);
+      CHECK(count == 2 + 2 + 1 + 19);
+      check_lowering(NULL, NULL, want, count);
+      check_lowering(NULL, "0x40000/16", want, count);
+      cases += 2;
+   }
 
    /* Each store class alone, all of them, and both addressing forms. The
     * addressing bit selects nothing, nor does the extra bit without a list. */
    static const unsigned masks[] = {1, 2, 4, 8, 3, 0xf, 0x10, 0x11, 0x12,
-                                    0x13, 0x1c, 0x1f, 0x20, 0x30, 0x3f};
+                                    0x13, 0x1c, 0x1f, 0x20, 0x30, 0x3f,
+                                    0x40, 0x43, 0x50, 0x53, 0x7f};
    for (unsigned i = 0; i < ARRAY_SIZE(masks); ++i, ++cases)
       check_mask(masks[i], NULL, NULL, 0);
 
@@ -424,12 +439,16 @@ lowering_cases(void)
    check_mask(0x23, "0x10000/48,0x40000/16", two, 2);
    check_mask(0x33, "0x10000/48,0x40000/16", two, 2);
    check_mask(0x3f, "0x10000/48,0x40000/16", two, 2);
+   check_mask(0x7f, "0x10000/48,0x40000/16", two, 2);
+   check_mask(0x63, "0x10000/48,0x40000/16", two, 2);
    check_mask(0x20, "0x40000/16", one, 1);
    check_mask(0x30, "0x40000/16", one, 1);
    check_mask(0x21, "0x40000/20,0x50000/4", odd, 2);
    check_mask(3, "0x10000/48,0x40000/16", two, 2);
    check_mask(0x1f, "0x10000/48,0x40000/16", two, 2);
-   cases += 8;
+   cases += 10;
+   CHECK(expected(0x40, NULL, 0, want) == 3);
+   CHECK(expected(0x43, NULL, 0, want) == 24);
    CHECK(expected(0x23, two, 2, want) == 2 + 3 + 1 + 19);
    CHECK(expected(3, two, 2, want) == 21);
 
@@ -477,7 +496,8 @@ backend_cases(void)
    const unsigned plain = compile_kernel(0, NULL, NULL, 0, &off);
    CHECK(off.fences[0] >= 1 && off.fences[1] >= 1);
    ++cases;
-   static const unsigned kernel[] = {1, 2, 4, 8, 3, 0xf, 0x13, 0x1f};
+   static const unsigned kernel[] = {1, 2, 4, 8, 3, 0xf, 0x13, 0x1f, 0x40,
+                                     0x43, 0x7f};
    for (unsigned i = 0; i < ARRAY_SIZE(kernel); ++i, ++cases) {
       const unsigned size = compile_kernel(kernel[i], NULL, NULL, 0, &on);
       CHECK(size > plain);
@@ -499,6 +519,29 @@ backend_cases(void)
    for (unsigned i = 0; i < ARRAY_SIZE(idle); ++i, ++cases) {
       CHECK(compile_kernel(idle[i], NULL, NULL, 0, &on) == plain);
       CHECK(on.fences[0] == off.fences[0] && on.fences[1] == off.fences[1]);
+   }
+
+   /* With the variable unset the kernel is the one mask 0x43 gives. */
+   {
+      struct touch want[64];
+      const unsigned count = expected(0x43, NULL, 0, want);
+      const unsigned selected = compile_kernel(0x43, NULL, NULL, 0, &on);
+      nir_builder b = lowered_kernel();
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_key key = {
+         .dev = {.chip = AGX_CHIP_G17P, .encoding = AGX_ISA_ENCODING_AGX3B},
+         .no_preamble = true, .has_scratch = true,
+      };
+      struct agx_shader_part part = {0};
+      CHECK(agx_compile_shader_nir(b.shader, &key, &part));
+      const struct scan unset =
+         scan_binary(&part, AGX_ISA_ENCODING_AGX3B, want, count);
+      CHECK(part.info.main_size == selected && selected > plain);
+      CHECK(unset.fences[0] == on.fences[0] && unset.fences[1] == on.fences[1]);
+      CHECK(unset.loads == off.loads);
+      free(part.binary);
+      ralloc_free(b.shader);
+      ++cases;
    }
    return cases;
 }
