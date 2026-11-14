@@ -517,7 +517,9 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
          (struct pipe_sampler_view **)ctx->stage[MESA_SHADER_FRAGMENT].textures);
    }
 
-   if (!(op & ASAHI_DISABLE_RENDER_COND)) {
+   /* Saving the condition is what lets u_blitter turn it off for the
+    * operation and restore it afterwards. */
+   if (op & ASAHI_DISABLE_RENDER_COND) {
       util_blitter_save_render_condition(blitter,
                                          (struct pipe_query *)ctx->cond_query,
                                          ctx->cond_cond, ctx->cond_mode);
