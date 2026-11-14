@@ -1236,14 +1236,15 @@ hk_get_device_properties(const struct agx_device *dev,
        * other chips keep the largest allowed, 32.
        *
        * Trace recursion is unrolled into the megakernel at compile time up
-       * to three levels. G17P runs deeper pipelines as continuations
-       * (hk_rt_cont_split) and reports the specification's maximum of 31;
+       * to three levels. G17P and M5 run deeper pipelines as continuations
+       * (hk_rt_cont_split) and report the specification's maximum of 31;
        * legacy generations retain their limit of three.
        *
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
       .shaderGroupHandleSize = HK_RAY_TRACING_GROUP_HANDLE_SIZE,
-      .maxRayRecursionDepth = dev->chip == AGX_CHIP_G17P ?
+      .maxRayRecursionDepth =
+         dev->chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->chip) ?
          HK_G17P_MAX_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
@@ -2199,6 +2200,14 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
        debug_get_bool_option("ASAHI_M5_NATIVE_AS", false)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
+   } else if (hk_m5_soft_rt_enabled(&pdev->dev)) {
+      /* Shader traversal of the common BVH: no intersector programs and no
+       * native query state, so nothing beyond ordinary compute. */
+      supported_extensions.KHR_acceleration_structure = true;
+      supported_extensions.KHR_deferred_host_operations = true;
+      supported_extensions.KHR_ray_query = true;
+      supported_extensions.KHR_ray_tracing_pipeline = true;
+      supported_extensions.KHR_ray_tracing_maintenance1 = true;
    }
    /* The 8x8 f16/f32 matmad underlying a subgroup-scope cooperative matrix
     * exists on the AGX3B ISA (G15/G16/G17P) just as it does on the M5 AGX3C

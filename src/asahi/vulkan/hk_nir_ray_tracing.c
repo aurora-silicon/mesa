@@ -82,6 +82,11 @@ hk_build_intersect_ray_box(nir_builder *b, nir_def **node_data, nir_def *ray_tma
    const struct glsl_type *vec2_type = glsl_vector_type(GLSL_TYPE_FLOAT, 2);
    const struct glsl_type *uvec2_type = glsl_vector_type(GLSL_TYPE_UINT, 2);
 
+   /* Keep the slab test's float math exact, with infinities and NaNs, as in
+    * RADV's software box test. */
+   const unsigned old_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact | nir_fp_preserve_nan | nir_fp_preserve_inf;
+
    nir_variable *distances =
       nir_variable_create(b->shader, nir_var_shader_temp, vec2_type, "distances");
    nir_store_var(b, distances, nir_imm_vec2(b, INFINITY, INFINITY), 0xf);
@@ -161,6 +166,7 @@ hk_build_intersect_ray_box(nir_builder *b, nir_def **node_data, nir_def *ray_tma
    }
    nir_pop_if(b, NULL);
 
+   b->fp_math_ctrl = old_math_ctrl;
    return nir_load_var(b, child_indices);
 }
 
@@ -190,6 +196,14 @@ hk_build_intersect_ray_tri(nir_builder *b, nir_def **node_data, nir_def *ray_tma
                            nir_def *origin, nir_def *dir, nir_def *inv_dir)
 {
    const struct glsl_type *vec4_type = glsl_vector_type(GLSL_TYPE_FLOAT, 4);
+
+   /* Watertightness needs each edge function rounded exactly as written: the
+    * two triangles of a shared edge then compute it with opposite signs, and
+    * the edge rules below hit exactly one of them. A fused multiply-add
+    * rounds the two orders differently, which hits both or neither. As in
+    * RADV's software triangle test. */
+   const unsigned old_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact | nir_fp_preserve_nan | nir_fp_preserve_inf;
 
    const uint32_t coord_offsets[3] = {
       offsetof(struct hk_bvh_triangle_node, coords[0]),
@@ -375,6 +389,7 @@ hk_build_intersect_ray_tri(nir_builder *b, nir_def **node_data, nir_def *ray_tma
    }
    nir_pop_if(b, NULL);
 
+   b->fp_math_ctrl = old_math_ctrl;
    return nir_load_var(b, result);
 }
 

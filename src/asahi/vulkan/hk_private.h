@@ -116,6 +116,21 @@ hk_g16s_as_enabled(const struct agx_device *dev)
           !debug_get_bool_option("ASAHI_G17P_RT_DISABLE", false);
 }
 
+/* M5 ray tracing through the software traversal (hk_nir_ray_tracing.c) over
+ * the common BVH. Its traversal stack lives in per-thread private memory,
+ * which M5 compute sizes through the per-dispatch storage declarations.
+ * Opt-in until the ray tracing CTS passes on G17S; the native
+ * ASAHI_M5_NATIVE_AS profile takes precedence.
+ */
+static inline bool
+hk_m5_soft_rt_enabled(const struct agx_device *dev)
+{
+   return agx_chip_g17_m5(dev->chip) &&
+          (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES) &&
+          !debug_get_bool_option("ASAHI_M5_NATIVE_AS", false) &&
+          debug_get_bool_option("ASAHI_M5_SOFT_RT", false);
+}
+
 static inline bool
 hk_gen1_as_enabled(const struct agx_device *dev)
 {

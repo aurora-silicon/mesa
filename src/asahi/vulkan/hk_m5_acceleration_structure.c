@@ -1561,6 +1561,35 @@ hk_m5_backend_CmdBuildAccelerationStructuresKHR(
    free(nonempty_ranges);
 }
 
+/* Structures in the common BVH layout (hk_bvh.h), built by the common
+ * builder when the native one is off, are copied by libagx's hk_bvh kernels,
+ * which read these header words. Each invocation copies 16 bytes. */
+static_assert(offsetof(struct hk_bvh_header, compacted_size) == 6 * 4, "hk_bvh kernels");
+static_assert(offsetof(struct hk_bvh_header, serialization_size) == 7 * 4, "hk_bvh kernels");
+static_assert(offsetof(struct hk_bvh_header, instance_count) == 8 * 4, "hk_bvh kernels");
+static_assert(offsetof(struct hk_bvh_header, leaf_nodes_offset) == 9 * 4, "hk_bvh kernels");
+static_assert(sizeof(struct vk_accel_struct_serialization_header) == 14 * 4, "hk_bvh kernels");
+static_assert(sizeof(struct hk_bvh_instance_node) == 120, "hk_bvh kernels");
+
+static uint32_t
+hk_bvh_copy_threads(struct hk_cmd_buffer *cmd, struct vk_acceleration_structure *as)
+{
+   if (!as->size || DIV_ROUND_UP(as->size, 16) > UINT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return 0;
+   }
+   return DIV_ROUND_UP(as->size, 16);
+}
+
+/* The compatibility UUID of serialized common BVH structures: the driver
+ * UUID, distinguished from the native layout's. */
+static void
+hk_bvh_compat_uuid(const struct hk_physical_device *pdev, uint32_t uuid[4])
+{
+   memcpy(uuid, pdev->vk.properties.driverUUID, 4 * sizeof(uint32_t));
+   uuid[3] ^= 0x6276686b;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_m5_backend_GetDeviceAccelerationStructureCompatibilityKHR(
    VkDevice _device, const VkAccelerationStructureVersionInfoKHR *pVersionInfo,
@@ -1569,8 +1598,16 @@ hk_m5_backend_GetDeviceAccelerationStructureCompatibilityKHR(
    VK_FROM_HANDLE(hk_device, dev, _device);
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
-   bool compat = memcmp(pVersionInfo->pVersionData,
-                        pdev->vk.properties.driverUUID, VK_UUID_SIZE) == 0;
+   /* The driver UUID, then the layout's compatibility UUID: the native
+    * layout repeats the driver UUID. */
+   uint32_t expected[8];
+   memcpy(expected, pdev->vk.properties.driverUUID, VK_UUID_SIZE);
+   if (dev->m5_native_as)
+      memcpy(expected + 4, pdev->vk.properties.driverUUID, VK_UUID_SIZE);
+   else
+      hk_bvh_compat_uuid(pdev, expected + 4);
+   bool compat = memcmp(pVersionInfo->pVersionData, expected,
+                        2 * VK_UUID_SIZE) == 0;
    *pCompatibility = compat
                         ? VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR
                         : VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR;
@@ -1603,10 +1640,17 @@ hk_m5_backend_CmdCopyAccelerationStructureKHR(
    VK_FROM_HANDLE(vk_acceleration_structure, src, info->src);
    VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dst);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!dev->m5_native_as ||
-       (info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
-        info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR)) {
+   if (info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR &&
+       info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!dev->m5_native_as) {
+      uint32_t threads = hk_bvh_copy_threads(cmd, src);
+      if (threads)
+         libagx_hk_bvh_copy(cmd, agx_1d(threads), AGX_BARRIER_ALL,
+                            vk_acceleration_structure_get_va(dst),
+                            vk_acceleration_structure_get_va(src));
       return;
    }
    uint32_t threads = hk_as_copy_threads(cmd, src);
@@ -1625,9 +1669,23 @@ hk_m5_backend_CmdCopyAccelerationStructureToMemoryKHR(
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(vk_acceleration_structure, src, info->src);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!dev->m5_native_as ||
-       info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR) {
+   if (info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_SERIALIZE_KHR) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!dev->m5_native_as) {
+      uint32_t threads = hk_bvh_copy_threads(cmd, src);
+      if (!threads)
+         return;
+      const struct hk_physical_device *pdev = hk_device_physical(dev);
+      uint32_t driver[4], compat[4];
+      memcpy(driver, pdev->vk.properties.driverUUID, sizeof(driver));
+      hk_bvh_compat_uuid(pdev, compat);
+      libagx_hk_bvh_serialize(cmd, agx_1d(threads), AGX_BARRIER_ALL,
+                              info->dst.deviceAddress,
+                              vk_acceleration_structure_get_va(src),
+                              driver[0], driver[1], driver[2], driver[3],
+                              compat[0], compat[1], compat[2], compat[3]);
       return;
    }
    uint32_t threads = hk_as_copy_threads(cmd, src);
@@ -1648,9 +1706,18 @@ hk_m5_backend_CmdCopyMemoryToAccelerationStructureKHR(
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(vk_acceleration_structure, dst, info->dst);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!dev->m5_native_as ||
-       info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR) {
+   if (info->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_DESERIALIZE_KHR) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
+   if (!dev->m5_native_as) {
+      /* A serialized handle is the referenced structure's address, which is
+       * what an instance node holds. */
+      uint32_t threads = hk_bvh_copy_threads(cmd, dst);
+      if (threads)
+         libagx_hk_bvh_deserialize(cmd, agx_1d(threads), AGX_BARRIER_ALL,
+                                   vk_acceleration_structure_get_va(dst),
+                                   info->src.deviceAddress);
       return;
    }
    uint32_t threads = hk_as_copy_threads(cmd, dst);

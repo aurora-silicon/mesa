@@ -351,6 +351,8 @@ struct hk_rt_compiler {
     * (procedural) hit; triangle hits derive theirs from the facing bit. */
    nir_variable *native_hit_kind;
    nir_variable *native_hit_attribs;
+   /* Software traversal: the committed hit's attributes. */
+   nir_variable *committed_hit_attribs;
 
    struct hash_table **functions;
    struct hash_table *function_depths;
@@ -987,6 +989,50 @@ hk_native_commit_report(nir_builder *b, struct hk_rt_compiler *compiler,
    }
 }
 
+/* Software traversal. A candidate writes its attributes into the frame and
+ * a later rejected candidate can overwrite the committed hit's there, so each
+ * commit keeps a copy, which is put back once traversal ends. */
+static nir_deref_instr *
+hk_rt_committed_attrib(nir_builder *b, struct hk_rt_compiler *compiler,
+                       unsigned word)
+{
+   if (!compiler->committed_hit_attribs) {
+      compiler->committed_hit_attribs = nir_variable_create(b->shader,
+         nir_var_shader_temp,
+         glsl_array_type(glsl_uint_type(), HK_RAY_HIT_ATTRIBS_SIZE / 4, 0),
+         "rt.committed_hit_attribs");
+   }
+   return nir_build_deref_array_imm(
+      b, nir_build_deref_var(b, compiler->committed_hit_attribs), word);
+}
+
+/* In the intersection stage, whose scratch is frame-relative. */
+static void
+hk_rt_commit_report_attribs(nir_builder *b, struct hk_rt_compiler *compiler)
+{
+   for (unsigned i = 0; i < HK_RAY_HIT_ATTRIBS_SIZE / 4; ++i) {
+      nir_store_deref(b, hk_rt_committed_attrib(b, compiler, i),
+                      nir_load_scratch(b, 1, 32, nir_imm_int(b, 4 * i),
+                                       .align_mul = 4), 0x1);
+   }
+}
+
+static void
+hk_rt_restore_committed_attribs(nir_builder *b, struct hk_rt_compiler *compiler)
+{
+   if (!compiler->committed_hit_attribs)
+      return;
+   struct hk_rt_shader_state *state = &compiler->state;
+   nir_def *frame = nir_load_var(b, state->stack_ptr);
+   nir_push_if(b, nir_load_var(b, state->traversal.hit));
+   for (unsigned i = 0; i < HK_RAY_HIT_ATTRIBS_SIZE / 4; ++i) {
+      nir_store_scratch(b, nir_load_deref(b, hk_rt_committed_attrib(b, compiler, i)),
+                        nir_iadd_imm(b, frame, 4 * i), .align_mul = 4,
+                        .write_mask = 0x1);
+   }
+   nir_pop_if(b, NULL);
+}
+
 static bool
 hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
 {
@@ -1037,11 +1083,12 @@ hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
                        nir_ior(b, terminate, prev_terminate), 0x1);
 
          /* Commit before terminateRay returns from the intersection stage. */
-         if (compiler->native_agx) {
-            nir_push_if(b, nir_load_var(b, state->accept));
+         nir_push_if(b, nir_load_var(b, state->accept));
+         if (compiler->native_agx)
             hk_native_commit_report(b, compiler, t, hit_kind);
-            nir_pop_if(b, NULL);
-         }
+         else
+            hk_rt_commit_report_attribs(b, compiler);
+         nir_pop_if(b, NULL);
          nir_push_if(b, terminate);
          nir_jump(b, nir_jump_return);
          nir_pop_if(b, NULL);
@@ -1051,6 +1098,8 @@ hk_lower_isec_intrinsic(nir_builder *b, nir_intrinsic_instr *instr, void *data)
       {
          if (compiler->native_agx && !isec_state->ahit)
             hk_native_commit_report(b, compiler, t, hit_kind);
+         else if (!compiler->native_agx && !isec_state->ahit)
+            hk_rt_commit_report_attribs(b, compiler);
          nir_store_var(b, commit, nir_imm_true(b), 0x1);
       }
       nir_push_else(b, NULL);
@@ -1232,6 +1281,10 @@ hk_handle_triangle_intersection(nir_builder *b,
    {
       nir_store_var(b, state->sbt_index, sbt_index, 0x1);
       nir_store_var(b, state->traversal.hit, nir_imm_true(b), 0x1);
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_store_deref(b, hk_rt_committed_attrib(b, compiler, i),
+                         nir_channel(b, intersection->barycentrics, i), 0x1);
+      }
 
       nir_break_if(b, nir_load_var(b, state->terminate));
    }
@@ -1493,8 +1546,10 @@ hk_rt_emit_traversal(nir_builder *b, struct hk_rt_compiler *compiler,
    if (compiler->native_agx)
       hk_trace_ray_native(b, compiler, accel_struct, flags, cull_mask,
                       origin, tmin, dir, tmax);
-   else
+   else {
       hk_build_ray_traversal(b, &args);
+      hk_rt_restore_committed_attribs(b, compiler);
+   }
    nir_pop_if(b, NULL);
 }
 
@@ -1827,8 +1882,10 @@ hk_hit_object_trace(nir_builder *b, struct hk_rt_compiler *compiler,
    if (compiler->native_agx)
       hk_trace_ray_native(b, compiler, accel_struct, flags, cull_mask,
                           origin, tmin, dir, tmax);
-   else
+   else {
       hk_build_ray_traversal(b, &args);
+      hk_rt_restore_committed_attribs(b, compiler);
+   }
    nir_pop_if(b, NULL);
 
    nir_def *hit = nir_load_var(b, state->traversal.hit);
@@ -2135,6 +2192,8 @@ hk_hit_object_load(nir_builder *b, struct hk_rt_compiler *compiler,
 /* Keeps the stack and the backend's spills inside the 64 KiB thread-private
  * frame that static TPS offsets can address. */
 #define HK_RT_CONT_MAX_STACK_SIZE (48 * 1024)
+/* That frame: the most scratch an M5 compute launch can address. */
+#define HK_M5_RT_MAX_SCRATCH_B (1u << 16)
 
 static bool
 hk_rt_cont_hoist_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -3765,9 +3824,15 @@ hk_compile_rt_kernel(
     * is small. Reject that expansion before NIR allocates gigabytes and
     * drives the system into reclaim. This is a compiler resource limit, not
     * a substitute for the advertised depth bound. Legacy generations are
-    * unchanged.
+    * unchanged. M5 inlines its software traversal at every level, so its
+    * inlined pipelines up to the legacy depth can exceed this budget yet
+    * compile; there the guard applies only above that depth, where it bounds
+    * the pipelines the continuation split declines (a continuation kernel
+    * holds each stage once and stays well inside it).
     */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if ((dev->dev.chip == AGX_CHIP_G17P ||
+        (agx_chip_g17_m5(dev->dev.chip) &&
+         compiler.max_depth > HK_RT_INLINE_MAX_RAY_RECURSION_DEPTH)) &&
        !hk_rt_inlining_fits(b->shader, 1u << 20)) {
       ralloc_free(b->shader);
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -3895,8 +3960,28 @@ hk_compile_rt_kernel(
       .push_constant_ranges = NULL,
    };
 
-   return hk_compile_shader(dev, &info, NULL, &dev->vk.enabled_features,
-                            pAllocator, &kernel->shader);
+   VkResult result = hk_compile_shader(dev, &info, NULL,
+                                       &dev->vk.enabled_features, pAllocator,
+                                       &kernel->shader);
+
+   /* M5 launches compute with static thread-private addresses, which reach
+    * HK_M5_RT_MAX_SCRATCH_B (hk_dispatch_m5_native). Continuations keep their
+    * stack below it, but an inlined pipeline's stack grows with every level.
+    * Refuse a kernel above it at creation, rather than when a command buffer
+    * records the trace. */
+   if (result == VK_SUCCESS && agx_chip_g17_m5(dev->dev.chip)) {
+      const struct hk_shader *s = hk_only_variant(kernel->shader);
+      if (s->b.info.scratch_size > HK_M5_RT_MAX_SCRATCH_B ||
+          (s->only_linked &&
+           s->only_linked->b.scratch_size > HK_M5_RT_MAX_SCRATCH_B)) {
+         hk_api_shader_destroy(&dev->vk, &kernel->shader->vk, pAllocator);
+         kernel->shader = NULL;
+         return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "RT kernel needs more than %u bytes of scratch",
+                          HK_M5_RT_MAX_SCRATCH_B);
+      }
+   }
+   return result;
 }
 
 /*
@@ -4488,8 +4573,9 @@ hk_create_ray_tracing_pipeline(
       vk_rt_pipeline_create_flags(create_info);
 
    /* Keep the existing defensive ceiling before key construction or NIR
-    * cloning. G17P advertises 31 levels; legacy generations three. */
-   const uint32_t max_depth = dev->dev.chip == AGX_CHIP_G17P ?
+    * cloning. G17P and M5 advertise 31 levels; legacy generations three. */
+   const uint32_t max_depth =
+      dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip) ?
       HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH;
    if (create_info->maxPipelineRayRecursionDepth > max_depth)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,

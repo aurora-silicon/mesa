@@ -462,3 +462,108 @@ libagx_agx3_as_property(global uint64_t *image, global uint64_t *report,
    else
       *report = bytes + AGX3_AS_SLACK;
 }
+
+/*
+ * Acceleration structures in the common BVH layout (hk_bvh.h), which the
+ * shader traversal reads. Its header keeps the compacted size, the
+ * serialization size, the instance count and the leaf offset in 32-bit words
+ * 6..9. A top level structure's leaves are 120-byte instance nodes that begin
+ * with the address of the structure they reference. The serialized form is
+ * the Vulkan header, one 64-bit handle per instance, then the structure.
+ */
+#define HK_BVH_COMPACTED_SIZE      6
+#define HK_BVH_SERIALIZATION_SIZE  7
+#define HK_BVH_INSTANCE_COUNT      8
+#define HK_BVH_LEAF_OFFSET         9
+#define HK_BVH_INSTANCE_NODE_BYTES 120
+#define HK_BVH_SERIAL_HEADER_WORDS 14
+
+/* Copy 16 bytes per invocation. With handles, each instance node's reference
+ * is taken from the handle list instead of the source. */
+static void
+hk_bvh_copy_words(global uint32_t *dst, global const uint32_t *src,
+                  uint32_t chunk, uint32_t bytes,
+                  global const uint64_t *handles, uint32_t leaf_offset,
+                  uint32_t instances)
+{
+   for (uint64_t w = (uint64_t)chunk * 4; w < (uint64_t)chunk * 4 + 4; ++w) {
+      uint64_t b = w * 4;
+      if (b >= bytes)
+         return;
+      uint32_t value = src[w];
+      if (handles && b >= leaf_offset) {
+         uint64_t node = (b - leaf_offset) / HK_BVH_INSTANCE_NODE_BYTES;
+         uint32_t within = (b - leaf_offset) % HK_BVH_INSTANCE_NODE_BYTES;
+         if (node < instances && within < 8)
+            value = (uint32_t)(handles[node] >> (within * 8));
+      }
+      dst[w] = value;
+   }
+}
+
+KERNEL(32)
+libagx_hk_bvh_copy(global uint32_t *dst, global uint32_t *src)
+{
+   hk_bvh_copy_words(dst, src, cl_global_id.x, src[HK_BVH_COMPACTED_SIZE],
+                     NULL, 0, 0);
+}
+
+KERNEL(32)
+libagx_hk_bvh_serialize(global uint32_t *dst, global uint32_t *src,
+                        uint32_t driver0, uint32_t driver1, uint32_t driver2,
+                        uint32_t driver3, uint32_t compat0, uint32_t compat1,
+                        uint32_t compat2, uint32_t compat3)
+{
+   uint32_t i = cl_global_id.x;
+   uint32_t bytes = src[HK_BVH_COMPACTED_SIZE];
+   uint32_t instances = src[HK_BVH_INSTANCE_COUNT];
+   global uint64_t *header = (global uint64_t *)dst;
+
+   if (i == 0) {
+      dst[0] = driver0;
+      dst[1] = driver1;
+      dst[2] = driver2;
+      dst[3] = driver3;
+      dst[4] = compat0;
+      dst[5] = compat1;
+      dst[6] = compat2;
+      dst[7] = compat3;
+      header[4] = src[HK_BVH_SERIALIZATION_SIZE];
+      header[5] = bytes;
+      header[6] = instances;
+   }
+
+   if (i < instances) {
+      global uint64_t *node =
+         (global uint64_t *)((global uint8_t *)src + src[HK_BVH_LEAF_OFFSET] +
+                             i * HK_BVH_INSTANCE_NODE_BYTES);
+      header[7 + i] = node[0];
+   }
+
+   hk_bvh_copy_words(dst + HK_BVH_SERIAL_HEADER_WORDS + instances * 2, src, i,
+                     bytes, NULL, 0, 0);
+}
+
+KERNEL(32)
+libagx_hk_bvh_deserialize(global uint32_t *dst, global uint32_t *src)
+{
+   global uint64_t *header = (global uint64_t *)src;
+   uint32_t instances = header[6];
+   global uint32_t *image = src + HK_BVH_SERIAL_HEADER_WORDS + instances * 2;
+
+   hk_bvh_copy_words(dst, image, cl_global_id.x, image[HK_BVH_COMPACTED_SIZE],
+                     header + 7, image[HK_BVH_LEAF_OFFSET], instances);
+}
+
+/* kind: 0 compacted/structure size, 1 serialization size, 2 pointer count. */
+KERNEL(1)
+libagx_hk_bvh_property(global uint32_t *src, global uint64_t *report,
+                       uint32_t kind)
+{
+   if (kind == 2)
+      *report = src[HK_BVH_INSTANCE_COUNT];
+   else if (kind == 1)
+      *report = src[HK_BVH_SERIALIZATION_SIZE];
+   else
+      *report = src[HK_BVH_COMPACTED_SIZE];
+}
