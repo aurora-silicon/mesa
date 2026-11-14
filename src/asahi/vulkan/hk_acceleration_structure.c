@@ -1470,14 +1470,16 @@ hk_agx3_refit_phase(VkCommandBuffer commandBuffer,
       hk_cmd_dispatch_unaligned(commandBuffer, count, 1, 1);
 }
 
-/* Keep the jobs of a full build that can be updated, with its inner jobs
- * listed by level. */
+/* Keep the jobs of a full build that can be updated, numbered leaf first,
+ * with its inner jobs listed by level. */
 static void
 hk_agx3_refit_save(VkCommandBuffer commandBuffer,
                    const struct vk_acceleration_structure_build_state *state)
 {
    vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
    hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_SAVE, 0);
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+   hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_NUMBER, 0);
    vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
    hk_agx3_refit_phase(commandBuffer, state, HK_AGX3_REFIT_COUNT_LEVELS, 0);
    vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
