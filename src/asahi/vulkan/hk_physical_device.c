@@ -1442,11 +1442,15 @@ hk_get_device_properties(const struct agx_device *dev,
       .driverID = instance->drirc.misc.report_honeykrisp_driver_id
                      ? VK_DRIVER_ID_MESA_HONEYKRISP
                      : VK_DRIVER_ID_AURORA_BOREALIS,
-      /* Conformance is submitted per driver ID. Borealis has not made a
-       * submission under its own ID yet, so it claims no CTS version on any
-       * chip, including the ones Honeykrisp is conformant on.
+      /* conformanceVersion is the CTS release the driver was successfully
+       * tested against before release. Report it only on chips whose full
+       * vulkan-cts-1.4.7.0 run passes (G17P). Other chips report none until
+       * their own full run passes. Borealis has no Khronos submission under
+       * its own driver ID.
        */
-      .conformanceVersion = (VkConformanceVersion){1, 4, 7, 0},
+      .conformanceVersion = dev->chip == AGX_CHIP_G17P
+                               ? (VkConformanceVersion){1, 4, 7, 0}
+                               : (VkConformanceVersion){0, 0, 0, 0},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
       .shaderSignedZeroInfNanPreserveFloat16 = true,
