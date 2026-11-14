@@ -154,6 +154,12 @@ struct vk_acceleration_structure_build_args {
    bool emit_markers;
    bool has_update;
    bool morton_phase_dispatch;
+   /* H-PLOC builds of at most this many leaves use the neighbour search that
+    * exchanges candidates by subgroup shuffles instead of shared atomics: the
+    * same tree, with shorter dependency chains, which wins on small builds and
+    * can lose on large ones. 0 = never.
+    */
+   uint32_t hploc_shuffle_max_leaves;
 };
 
 struct vk_acceleration_structure_build_ops {

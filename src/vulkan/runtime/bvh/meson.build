@@ -57,6 +57,11 @@ bvh_shaders = [
     'hploc_internal.comp',
     'hploc_internal',
   ],
+  [
+    'hploc_internal.comp',
+    'hploc_internal_shuffle',
+    [ 'HPLOC_SHUFFLE_SEARCH=1' ]
+  ],
 ]
 
 spirv_include_dir = dir_source_root + '/src/compiler/spirv'
