@@ -2430,6 +2430,31 @@ hk_lower_multiview(nir_shader *nir)
                                      ? nir_before_impl(impl)
                                      : nir_after_impl(impl));
 
+   if (nir->info.stage == MESA_SHADER_MESH) {
+      /* Every primitive the workgroup may output goes to the view's layer. */
+      const unsigned prims = nir->info.mesh.max_primitives_out;
+      const unsigned threads = nir->info.workgroup_size[0] *
+                               nir->info.workgroup_size[1] *
+                               nir->info.workgroup_size[2];
+      nir_variable *layer = nir_variable_create(
+         nir, nir_var_shader_out, glsl_array_type(glsl_uint_type(), prims, 0),
+         "view_layer");
+      layer->data.location = VARYING_SLOT_LAYER;
+      layer->data.per_primitive = true;
+      nir_def *view = nir_load_view_index(&b);
+      nir_def *lane = nir_load_local_invocation_index(&b);
+      for (unsigned first = 0; first < prims; first += threads) {
+         nir_def *prim = nir_iadd_imm(&b, lane, first);
+         nir_push_if(&b, nir_ult_imm(&b, prim, prims));
+         nir_store_deref(&b, nir_build_deref_array(&b,
+                            nir_build_deref_var(&b, layer), prim), view, 1);
+         nir_pop_if(&b, NULL);
+      }
+      nir->info.outputs_written |= VARYING_BIT_LAYER;
+      nir->info.per_primitive_outputs |= VARYING_BIT_LAYER;
+      return;
+   }
+
    nir_variable *layer =
       nir_variable_create(nir, nir_var_shader_out, glsl_uint_type(), NULL);
 
@@ -3008,6 +3033,7 @@ hk_lower_multiview_stage(mesa_shader_stage stage,
    case MESA_SHADER_TESS_EVAL:
       return !(next_stage_mask & VK_SHADER_STAGE_GEOMETRY_BIT);
    case MESA_SHADER_GEOMETRY:
+   case MESA_SHADER_MESH:
       return true;
    default:
       return false;

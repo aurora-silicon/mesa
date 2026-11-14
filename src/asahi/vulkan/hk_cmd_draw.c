@@ -13525,8 +13525,9 @@ hk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX,
    if (!groupCountX || !groupCountY || !groupCountZ)
       return;
    const uint32_t grid[4] = {groupCountX, groupCountY, groupCountZ, 0};
-   hk_draw_mesh_native(cmd, hk_pool_upload(cmd, grid, sizeof(grid), 16), grid,
-                       0, 0);
+   const uint64_t grid_addr = hk_pool_upload(cmd, grid, sizeof(grid), 16);
+   hk_foreach_view(cmd)
+      hk_draw_mesh_native(cmd, grid_addr, grid, 0, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -13536,9 +13537,11 @@ hk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer buffer,
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(hk_buffer, src, buffer);
-   for (unsigned i = 0; i < drawCount; ++i)
-      hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
-                          NULL, i, 0);
+   hk_foreach_view(cmd) {
+      for (unsigned i = 0; i < drawCount; ++i)
+         hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
+                             NULL, i, 0);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -13551,9 +13554,11 @@ hk_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer buff
    VK_FROM_HANDLE(hk_buffer, src, buffer);
    VK_FROM_HANDLE(hk_buffer, count, countBuffer);
    const uint64_t count_address = hk_buffer_address_rw(count, countBufferOffset);
-   for (unsigned i = 0; i < maxDrawCount; ++i)
-      hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
-                          NULL, i, count_address);
+   hk_foreach_view(cmd) {
+      for (unsigned i = 0; i < maxDrawCount; ++i)
+         hk_draw_mesh_native(cmd, hk_buffer_address_rw(src, offset + (uint64_t)i * stride),
+                             NULL, i, count_address);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

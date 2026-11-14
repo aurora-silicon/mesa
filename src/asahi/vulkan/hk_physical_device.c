@@ -346,7 +346,9 @@ hk_get_device_features(
                      (dev->chip == AGX_CHIP_G17S &&
                       hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
-      .multiviewMeshShader = false,
+      /* G17P replays a multiview mesh draw per view, as other draws. */
+      .multiviewMeshShader = dev->chip == AGX_CHIP_G17P &&
+                             supported_extensions->EXT_mesh_shader,
       .primitiveFragmentShadingRateMeshShader = false,
       .meshShaderQueries =
          !agx_chip_g17_m5(dev->chip) && supported_extensions->EXT_mesh_shader,
@@ -1286,7 +1288,11 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxMeshOutputVertices = 256,
       .maxMeshOutputPrimitives = 256,
       .maxMeshOutputLayers = 8,
-      .maxMeshMultiviewViewCount = 1,
+      /* A multiview mesh draw replays once per view (hk_foreach_view), which
+       * works up to HK_MAX_MULTIVIEW_VIEW_COUNT. Temporarily 16: CTS
+       * mesh_shader.ext.properties.max_view_index builds its view mask as
+       * (1u << count) - 1, undefined at 32. Raise it once the CTS is fixed. */
+      .maxMeshMultiviewViewCount = features->multiviewMeshShader ? 16 : 1,
       .meshOutputPerVertexGranularity = 32,
       .meshOutputPerPrimitiveGranularity = 32,
       .maxPreferredTaskWorkGroupInvocations = 32,
