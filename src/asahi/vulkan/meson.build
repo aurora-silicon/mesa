@@ -5,6 +5,8 @@ hk_files = files(
   'hk_barrier.h',
   'hk_acceleration_structure.c',
   'hk_m5_acceleration_structure.c',
+  'hk_m5_rt_build.c',
+  'hk_m5_rt_runtime.c',
   'hk_host_as.c',
   'hk_acceleration_structure.h',
   'hk_buffer.c',
@@ -666,6 +668,12 @@ if with_tests
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_m5_store_window', executable('hk_m5_store_window_test',
     files('tests/test-hk-m5-store-window.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_m5_rt_runtime', executable('hk_m5_rt_runtime_test',
+    files('tests/test-hk-m5-rt-runtime.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],

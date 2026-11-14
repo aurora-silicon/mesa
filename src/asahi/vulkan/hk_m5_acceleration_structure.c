@@ -17,9 +17,14 @@
 #include "hk_acceleration_structure.h"
 #include "hk_m5_acceleration_structure.h"
 #include "hk_agx3_as_layout.h"
+#include "hk_m5_rt_runtime.h"
+#include "util/os_misc.h"
 #include "util/u_debug.h"
 #include "util/cache_ops.h"
 #include "util/u_atomic.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "hk_buffer.h"
 #include "hk_cmd_buffer.h"
@@ -1365,6 +1370,108 @@ hk_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer, VkDeviceAddress addr,
 /* ---------------------------------------------------------------- */
 /* Device state                                                      */
 
+/* Native ray queries run the intersection runtime (hk_m5_rt_runtime.h)
+ * through the intersection function table. ASAHI_M5_DEVICE_INIT_DIAG reports
+ * the stage at which its setup fails. */
+static bool
+hk_m5_rq_init_fail(struct hk_device *dev, const char *stage, int error)
+{
+   const int saved_errno = errno;
+   if (debug_get_bool_option("ASAHI_M5_DEVICE_INIT_DIAG", false))
+      fprintf(stderr, "M5_RQ_INIT pid=%ld dev=%p stage=%s errno=%d\n",
+              (long)getpid(), (void *)dev, stage, error);
+   errno = saved_errno;
+   return false;
+}
+
+static void
+hk_m5_rq_dump_image(const char *prefix, const char *what, const void *data)
+{
+   char path[4096];
+   if (snprintf(path, sizeof(path), "%s.%s.bin", prefix, what) >= (int)sizeof(path))
+      return;
+   const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+   if (fd < 0) {
+      mesa_logw("M5 query runtime: cannot create %s", path);
+      return;
+   }
+   const uint8_t *p = data;
+   size_t left = HK_M5_RT_IMAGE_SIZE;
+   while (left) {
+      const ssize_t n = write(fd, p, left);
+      if (n <= 0) {
+         mesa_logw("M5 query runtime: short write to %s", path);
+         break;
+      }
+      p += n;
+      left -= (size_t)n;
+   }
+   close(fd);
+}
+
+static bool
+hk_m5_rq_init(struct hk_device *dev)
+{
+   dev->m5_rq_instances = debug_get_bool_option("ASAHI_M5_RQ_INSTANCES", false);
+   const uint64_t alias = UINT64_C(0x10010000000);
+   dev->m5_rq_code_alias = agx_va_alloc(&dev->dev, 0x800000, 0x4000,
+                                        AGX_VA_USC | AGX_VA_FIXED, alias);
+   if (!dev->m5_rq_code_alias)
+      return hk_m5_rq_init_fail(dev, "fixed-code-alias", 0);
+   dev->m5_rq_code = agx_bo_create(&dev->dev, 0x800000, 0x4000,
+                                    AGX_BO_EXEC | AGX_BO_WRITEBACK, "M5 intersection runtime");
+   dev->m5_rq_ift = agx_bo_create(&dev->dev, 0x8000, 0x4000,
+                                   AGX_BO_WRITEBACK, "M5 intersection table");
+   dev->m5_rq_user_image = malloc(0x800000);
+   const int image_error = dev->m5_rq_user_image ? 0 : errno;
+   if (!dev->m5_rq_code)
+      return hk_m5_rq_init_fail(dev, "code-bo", 0);
+   if (!dev->m5_rq_ift)
+      return hk_m5_rq_init_fail(dev, "ift-bo", 0);
+   if (!dev->m5_rq_user_image)
+      return hk_m5_rq_init_fail(dev, "user-image-allocation", image_error);
+   /* Every instruction of the code image is composed with agx3c_table
+    * (hk_m5_rt_runtime.h); the user image and uniforms are generated data. */
+   if (!hk_m5_rt_build_code(agx_bo_map(dev->m5_rq_code)))
+      return hk_m5_rq_init_fail(dev, "generated-code", 0);
+   if (!hk_m5_rt_build_user_image(dev->m5_rq_user_image))
+      return hk_m5_rq_init_fail(dev, "generated-user-image", 0);
+   static_assert(sizeof(dev->m5_rq_uniforms) == sizeof(hk_m5_rt_instance_uniforms),
+                 "M5 query uniforms");
+   memset(dev->m5_rq_uniforms, 0, sizeof(dev->m5_rq_uniforms));
+   memcpy(dev->m5_rq_uniforms, hk_m5_rt_uniforms, sizeof(hk_m5_rt_uniforms));
+   if (dev->m5_rq_instances)
+      memcpy(dev->m5_rq_uniforms, hk_m5_rt_instance_uniforms,
+             sizeof(hk_m5_rt_instance_uniforms));
+   /* ASAHI_M5_RQ_IMAGE_DUMP=<prefix> writes the images this device built to
+    * new files <prefix>.code.bin and <prefix>.user.bin (never in a setuid
+    * process, never over an existing file or through a symlink). */
+   const char *gen_dump = os_get_option_secure("ASAHI_M5_RQ_IMAGE_DUMP");
+   if (gen_dump) {
+      hk_m5_rq_dump_image(gen_dump, "code", agx_bo_map(dev->m5_rq_code));
+      hk_m5_rq_dump_image(gen_dump, "user", dev->m5_rq_user_image);
+   }
+   if (agx_bo_bind(&dev->dev, dev->m5_rq_code, alias, 0x800000, 0,
+                   DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE))
+      return hk_m5_rq_init_fail(dev, "code-alias-bind", 0);
+   uint8_t *table = agx_bo_map(dev->m5_rq_ift);
+   memset(table, 0, 0x8000);
+   memcpy(table + 128, (uint8_t *)dev->m5_rq_user_image + 0x558080, 112 * 128);
+   for (unsigned i = 0; i < 112 * 8; ++i) {
+      uint64_t lo; memcpy(&lo, table + 128 + 16*i, 8);
+      uint64_t address = lo & UINT64_C(0xffffffffffff);
+      if (!address) continue;
+      if (address < UINT64_C(0x1000000000) || address >= UINT64_C(0x1000800000))
+         return hk_m5_rq_init_fail(dev, "ift-address-range", 0);
+      lo = (lo & UINT64_C(0xffff000000000000)) | (alias + address - UINT64_C(0x1000000000));
+      memcpy(table + 128 + 16*i, &lo, 8);
+   }
+   dev->m5_rq_default_program = alias + 0x4d8800;
+   dev->m5_rq_default_control = UINT64_C(0x16000000000);
+   dev->m5_native_rq = true;
+   return true;
+}
+
 VkResult
 hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
 {
@@ -1407,6 +1514,14 @@ hk_m5_backend_device_init_accel_struct_state(struct hk_device *dev)
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
       }
    }
+   /* Only a device that enables ray queries or ray tracing pipelines runs
+    * the query traversal code, so only such a device builds it. */
+   const bool queries = dev->vk.enabled_features.rayQuery ||
+                        dev->vk.enabled_features.rayTracingPipeline;
+   if (dev->m5_native_as && queries && !hk_m5_rq_init(dev)) {
+      hk_device_finish_accel_struct_state(dev);
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
    return VK_SUCCESS;
 }
 
@@ -1415,6 +1530,15 @@ hk_device_finish_accel_struct_state(struct hk_device *dev)
 {
    if (!agx_chip_g17_m5(dev->dev.chip))
       return;
+   if (dev->m5_rq_code_alias) {
+      agx_bo_bind(&dev->dev, NULL, dev->m5_rq_code_alias->addr, 0x800000, 0,
+                  DRM_ASAHI_BIND_UNBIND);
+      agx_va_free(&dev->dev, dev->m5_rq_code_alias, false);
+   }
+   agx_bo_unreference(&dev->dev, dev->m5_rq_code);
+   agx_bo_unreference(&dev->dev, dev->m5_rq_ift);
+   agx_bo_unreference(&dev->dev, dev->m5_rt_state_bo);
+   free(dev->m5_rq_user_image);
    bool table_unmapped = true;
    unsigned page = 0;
    util_dynarray_foreach(&dev->m5_as_table_pages, struct agx_bo *, bo) {
