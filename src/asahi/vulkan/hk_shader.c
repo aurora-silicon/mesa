@@ -4725,9 +4725,16 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          /* Native G17P publishes texture/sampler heap pointers in halves
           * 0..7. The monolithic VBO lowering may already have materialized
           * vertex ABI preamble loads, so move those as one unit before root
-          * and descriptor-set lowering allocates the following ranges. */
+          * and descriptor-set lowering allocates the following ranges.
+          * A native query owns halves 0..167 and its heaps start at 168, so
+          * only the vertex ABI above the query state moves: the query
+          * lowering has already read its state from fixed halves, which the
+          * driver publishes there (hk_gen1_upload_fragment_query_state()).
+          * This covers an API vertex shader and a geometry shader's raster
+          * replay alike. */
          const struct hk_g17p_vertex_preamble_shift shift = {
             .base = AGX_ABI_G17P_TEXTURE_POINTER_HALFS,
+            .first = shader->info.agx3_gen1_fragment_rq ? 168 : 0,
          };
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_shift_vertex_preamble,
