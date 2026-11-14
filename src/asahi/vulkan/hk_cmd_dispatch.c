@@ -1770,7 +1770,7 @@ hk_dispatch_precomp_m5(struct hk_cmd_buffer *cmd, struct agx_grid grid,
  * vkCmdTraceRays*. ASAHI_M5_RT_PERSISTENT_STATE=0 restores the per-dispatch
  * block for A/B diagnosis.
  */
-static bool
+bool
 hk_m5_rt_persistent_state_enabled(void)
 {
    static int enabled = -1;
@@ -1779,7 +1779,7 @@ hk_m5_rt_persistent_state_enabled(void)
    return enabled;
 }
 
-static struct agx_ptr
+struct agx_ptr
 hk_m5_persistent_rt_state(struct hk_device *dev, uint64_t packed, uint64_t size,
                           const struct agx_scs_layout_gen2 *scs)
 {

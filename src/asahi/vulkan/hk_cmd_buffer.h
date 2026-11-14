@@ -2669,6 +2669,14 @@ void hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
                           struct agx_grid grid,
                           struct agx_workgroup local_size);
 
+/* The device-lifetime M5 SCS state block for the packed layout, created on
+ * first use; {0} if it is unavailable or holds another layout. */
+struct agx_scs_layout_gen2;
+bool hk_m5_rt_persistent_state_enabled(void);
+struct agx_ptr hk_m5_persistent_rt_state(struct hk_device *dev, uint64_t packed,
+                                         uint64_t size,
+                                         const struct agx_scs_layout_gen2 *scs);
+
 void hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             struct hk_shader *s, struct agx_grid grid,
                             struct agx_workgroup local_size);

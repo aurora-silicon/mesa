@@ -2325,15 +2325,28 @@ hk_m5_graphics_query_uniforms(struct hk_cmd_buffer *cmd, bool vertex,
       return false;
    const uint64_t size = MAX2(UINT64_C(0x800000),
       ALIGN_POT((uint64_t)scs.end[12], 0x4000));
-   struct agx_ptr state = hk_pool_alloc(cmd, size, 0x4000);
+   /* The state block depends only on the layout and the GPU never writes it:
+    * share the device-lifetime block compute queries use (same layout here)
+    * rather than building 8 MiB per draw. A per-draw block remains the
+    * fallback if the device block is unavailable. */
+   struct agx_ptr state = hk_m5_rt_persistent_state_enabled()
+      ? hk_m5_persistent_rt_state(dev, packed, size, &scs)
+      : (struct agx_ptr){0};
+   const bool persistent = state.cpu != NULL;
+   if (!persistent)
+      state = hk_pool_alloc(cmd, size, 0x4000);
    struct agx_ptr uniforms = hk_pool_alloc(cmd, 512, 16);
    uint64_t table = hk_m5_upload_as_table(cmd);
    if (!state.cpu || !uniforms.cpu || !table)
       return false;
-   memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
-   if (size > 0x800000)
-      memset((uint8_t *)state.cpu + 0x800000, 0, size - 0x800000);
-   agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
+   if (persistent) {
+      hk_cmd_buffer_retain_bo(cmd, dev->m5_rt_state_bo);
+   } else {
+      memcpy(state.cpu, dev->m5_rq_user_image, 0x800000);
+      if (size > 0x800000)
+         memset((uint8_t *)state.cpu + 0x800000, 0, size - 0x800000);
+      agx_scs_layout_gen2_parameters(&scs, (uint8_t *)state.cpu + 0x80020);
+   }
    memset(uniforms.cpu, 0, 512);
    memcpy(uniforms.cpu, dev->m5_rq_uniforms, sizeof(dev->m5_rq_uniforms));
    uint64_t sizes = (uint64_t)scs.end[6] | ((uint64_t)scs.end[11] << 32);
