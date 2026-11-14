@@ -420,7 +420,12 @@ agx3_fold_m5_constant_lods(agx_context *ctx)
 static void
 agx3_lower_m5_live_scalar_lods(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
+   /* G18G samples through j873's G17G-family sampler
+    * (agx3_emit_texture_sample_g17g), which takes a per-lane level or bias
+    * only as the 16-bit scalar itself, not as a packed word.
+    */
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       agx_is_g18g(&ctx->key->dev))
       return;
 
    bool needed = false;
