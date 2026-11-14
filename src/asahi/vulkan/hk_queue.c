@@ -2443,8 +2443,9 @@ hk_queue_create(struct hk_device *dev,
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
+      /* Two kernel queues by default; ASAHI_G17P_SIBLING_QUEUES=1 keeps one. */
       queue->sib.count = CLAMP(
-         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 1), 1,
+         debug_get_num_option("ASAHI_G17P_SIBLING_QUEUES", 2), 1,
          HK_QUEUE_SIBLINGS_MAX);
    }
    queue->drm.render_rq = false;

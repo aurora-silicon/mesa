@@ -83,7 +83,7 @@ struct hk_queue {
       uint64_t seen;
       int64_t due_ns;
    } kick;
-   /* G17P sibling kernel queues (ASAHI_G17P_SIBLING_QUEUES=N, default off).
+   /* G17P sibling kernel queues (ASAHI_G17P_SIBLING_QUEUES=N, default 2; 1 is off).
     * Submissions that depend on no earlier submission and hold only plain
     * compute streams take turns over N kernel queues, the primary (drm.id)
     * and N - 1 siblings, so consecutive ones may run side by side. Every
