@@ -2427,6 +2427,23 @@ hk_DestroySemaphore(VkDevice _device, VkSemaphore semaphore,
    vk_common_DestroySemaphore(_device, semaphore, pAllocator);
 }
 
+/* An import replaces the semaphore's syncobj, and the new handle may reuse
+ * the number of one this queue recorded a signal for. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_ImportSemaphoreFdKHR(VkDevice _device,
+                        const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   VK_FROM_HANDLE(vk_semaphore, sem, pImportSemaphoreFdInfo->semaphore);
+
+   VkResult result =
+      vk_common_ImportSemaphoreFdKHR(_device, pImportSemaphoreFdInfo);
+   hk_queue_forget_own_signals(dev, &sem->permanent);
+   if (sem->temporary)
+      hk_queue_forget_own_signals(dev, sem->temporary);
+   return result;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_DestroyFence(VkDevice _device, VkFence fence,
                 const VkAllocationCallbacks *pAllocator)
