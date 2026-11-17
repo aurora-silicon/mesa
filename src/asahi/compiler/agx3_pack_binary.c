@@ -13267,10 +13267,21 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
 
    unsigned k = 0;
    unsigned vertex_loads_scheduled = 0;
+   /* Batched device loads of application compute shaders: 1 joins the 32-bit
+    * loads of a batch into one scoreboard slot when the slot is free, 2 also
+    * prefers an occupied joinable slot so that one wait covers the whole
+    * batch, 0 keeps one slot per load. M5 defaults to 1 and the M4 Pro (G17P)
+    * to 2; ASAHI_M5_DEVICE_LOAD_BATCH overrides both. */
+   const bool device_load_batch_part =
+      enc == AGX_ISA_ENCODING_AGX3C ||
+      (enc == AGX_ISA_ENCODING_AGX3B && ctx->key->dev.chip == AGX_CHIP_G17P);
+   const unsigned device_load_batch_default =
+      enc == AGX_ISA_ENCODING_AGX3C ? 1 : 2;
    const unsigned device_load_batch =
-      enc == AGX_ISA_ENCODING_AGX3C && !ctx->is_preamble &&
+      device_load_batch_part && !ctx->is_preamble &&
       ctx->stage == MESA_SHADER_COMPUTE && ctx->nir && !ctx->nir->info.internal
-         ? debug_get_num_option("ASAHI_M5_DEVICE_LOAD_BATCH", 1) : 0;
+         ? debug_get_num_option("ASAHI_M5_DEVICE_LOAD_BATCH",
+                                device_load_batch_default) : 0;
    agx_foreach_block(ctx, slot_block) {
       agx_foreach_instr_in_block(slot_block, I) {
          if (I->op == AGX_OPCODE_STOP)
