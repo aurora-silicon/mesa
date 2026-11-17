@@ -9,12 +9,15 @@
 
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/simple_mtx.h"
 #include "vk_queue.h"
 
 struct hk_device;
 
 /* Kernel queues one hk_queue may spread its independent work over. */
 #define HK_QUEUE_SIBLINGS_MAX 4
+
+#define HK_QUEUE_OWN_SIGNALS 8
 
 struct hk_queue {
    struct vk_queue vk;
@@ -111,6 +114,23 @@ struct hk_queue {
       /* Timeline point of the latest submission to a sibling. */
       uint64_t last_point;
    } sib;
+
+   /* Timeline semaphore points this queue's own submissions signal from the
+    * kernel queue, most recent first (hk_own_signal_*). A later compute-only
+    * submission to the same kernel queue that waits for one of them is
+    * ordered behind every earlier command by its barriers instead of by a
+    * kernel wait on the syncobj, which would hold the job until the earlier
+    * one completes and leave the GPU idle meanwhile. The submit thread
+    * writes the table; semaphore destruction clears entries under lock. */
+   struct {
+      simple_mtx_t lock;
+      struct hk_own_signal {
+         const struct vk_sync *sync;
+         uint32_t syncobj;
+         uint32_t kernel_queue;
+         uint64_t value;
+      } entry[HK_QUEUE_OWN_SIGNALS];
+   } own;
 };
 
 static inline struct hk_device *
@@ -130,6 +150,9 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+
+void hk_queue_forget_own_signals(struct hk_device *dev,
+                                 const struct vk_sync *sync);
 
 VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);

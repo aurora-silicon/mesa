@@ -54,9 +54,11 @@
 #include "layout.h"
 #include "vk_common_entrypoints.h"
 #include "vk_drm_syncobj.h"
+#include "vk_semaphore.h"
 #include "vk_sync.h"
 
 DEBUG_GET_ONCE_BOOL_OPTION(m5_chunk_timelines, "ASAHI_M5_CHUNK_TIMELINES", true)
+DEBUG_GET_ONCE_BOOL_OPTION(own_waits, "HK_OWN_WAITS", true)
 
 /* Signal scope includes all earlier commands on this Vulkan queue. A DRM
  * timeline point retains its predecessor fence chain; an individual submit's
@@ -1536,6 +1538,91 @@ hk_sibling_prior(uint64_t prior, uint64_t base, uint64_t kq_base, bool *earlier)
    return kq_base;
 }
 
+/* Own-signal table (hk_queue::own). */
+static bool
+hk_own_signal_covers(struct hk_queue *queue, struct vk_sync *sync,
+                     uint64_t value)
+{
+   if (!(sync->flags & VK_SYNC_IS_TIMELINE) ||
+       !vk_sync_type_is_drm_syncobj(sync->type))
+      return false;
+
+   const uint32_t handle = vk_sync_as_drm_syncobj(sync)->syncobj;
+   bool covered = false;
+   simple_mtx_lock(&queue->own.lock);
+   for (unsigned i = 0; i < HK_QUEUE_OWN_SIGNALS; ++i) {
+      const struct hk_own_signal *e = &queue->own.entry[i];
+      if (e->sync == sync && e->syncobj == handle &&
+          e->kernel_queue == queue->drm.id && e->value >= value) {
+         covered = true;
+         break;
+      }
+   }
+   simple_mtx_unlock(&queue->own.lock);
+   return covered;
+}
+
+static void
+hk_own_signal_record(struct hk_queue *queue, struct vk_sync *sync,
+                     uint64_t value)
+{
+   if (!(sync->flags & VK_SYNC_IS_TIMELINE) ||
+       !vk_sync_type_is_drm_syncobj(sync->type))
+      return;
+
+   const struct hk_own_signal e = {
+      .sync = sync,
+      .syncobj = vk_sync_as_drm_syncobj(sync)->syncobj,
+      .kernel_queue = queue->drm.id,
+      .value = value,
+   };
+
+   /* Move the semaphore to the front, dropping its older entry or the
+    * least recently signalled one. */
+   simple_mtx_lock(&queue->own.lock);
+   unsigned last = HK_QUEUE_OWN_SIGNALS - 1;
+   for (unsigned i = 0; i < HK_QUEUE_OWN_SIGNALS; ++i) {
+      if (queue->own.entry[i].sync == sync) {
+         last = i;
+         break;
+      }
+   }
+   memmove(&queue->own.entry[1], &queue->own.entry[0],
+           last * sizeof(queue->own.entry[0]));
+   queue->own.entry[0] = e;
+   simple_mtx_unlock(&queue->own.lock);
+}
+
+void
+hk_queue_forget_own_signals(struct hk_device *dev, const struct vk_sync *sync)
+{
+   vk_foreach_queue(vk_queue, &dev->vk) {
+      struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+      simple_mtx_lock(&queue->own.lock);
+      for (unsigned i = 0; i < HK_QUEUE_OWN_SIGNALS; ++i) {
+         if (queue->own.entry[i].sync == sync)
+            queue->own.entry[i] = (struct hk_own_signal){0};
+      }
+      simple_mtx_unlock(&queue->own.lock);
+   }
+}
+
+static bool
+hk_submit_compute_only(const struct vk_queue_submit *submit)
+{
+   for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+      struct hk_cmd_buffer *cmdbuf =
+         (struct hk_cmd_buffer *)submit->command_buffers[i];
+
+      list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
+         if (cs->type != HK_CS_CDM)
+            return false;
+      }
+   }
+
+   return true;
+}
+
 static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit)
@@ -1629,6 +1716,16 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
       alloca((submit->wait_count + kernel_signal_count + 3) *
              sizeof(struct drm_asahi_sync));
 
+   /* A wait for a point this kernel queue signals itself is replaced by
+    * barriers on every earlier command (see hk_queue::own). Kept to the
+    * plain case: the current kernel queue of this queue only (none
+    * replaced, no siblings), one timeline point per submission, no sparse
+    * flush, and compute streams only. */
+   const bool own_eligible = debug_get_option_own_waits() && !replaced &&
+      !chunk_timelines && !flush_sstt &&
+      queue->sib.count <= 1 && hk_submit_compute_only(submit);
+   bool own_waited = false;
+
    if (replaced) {
       syncs[wait_count++] = (struct drm_asahi_sync){
          .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
@@ -1659,6 +1756,13 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 
          if (skip)
             continue;
+      }
+
+      if (own_eligible &&
+          hk_own_signal_covers(queue, submit->waits[i].sync,
+                               submit->waits[i].wait_value)) {
+         own_waited = true;
+         continue;
       }
 
       asahi_fill_sync(&syncs[wait_count++], submit->waits[i].sync,
@@ -1878,6 +1982,17 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                 header.vdm_barrier <= nr_vdm);
          assert(header.cdm_barrier == DRM_ASAHI_BARRIER_NONE ||
                 header.cdm_barrier <= nr_cdm);
+
+         /* A replaced own wait: no command may start before every command
+          * of earlier ioctls completes. A zero barrier names those; a
+          * barrier on an earlier command of this ioctl already implies it,
+          * since that command is rewritten the same way. */
+         if (own_waited) {
+            if (header.vdm_barrier == DRM_ASAHI_BARRIER_NONE)
+               header.vdm_barrier = 0;
+            if (header.cdm_barrier == DRM_ASAHI_BARRIER_NONE)
+               header.cdm_barrier = 0;
+         }
 
          if (cs->type == HK_CS_CDM) {
             perf_debug(
@@ -2255,6 +2370,12 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
                                    pending);
    }
    hk_cmd_pending_end(dev, pending, queue, result);
+   if (result == VK_SUCCESS && sib_target == 0 && !chunk_timelines) {
+      for (unsigned i = 0; i < submit->signal_count; ++i) {
+         hk_own_signal_record(queue, submit->signals[i].sync,
+                              submit->signals[i].signal_value);
+      }
+   }
    if (queue->sib.count > 1 && result == VK_SUCCESS) {
       queue->sib.submitted[sib_target][HK_SYNC_VDM] += nr_vdm;
       queue->sib.submitted[sib_target][HK_SYNC_CDM] += nr_cdm;
@@ -2356,9 +2477,31 @@ hk_DestroySemaphore(VkDevice _device, VkSemaphore semaphore,
                     const VkAllocationCallbacks *pAllocator)
 {
    VK_FROM_HANDLE(hk_device, dev, _device);
-   if (semaphore != VK_NULL_HANDLE)
+   if (semaphore != VK_NULL_HANDLE) {
+      VK_FROM_HANDLE(vk_semaphore, sem, semaphore);
       hk_device_quiesce_lost_submissions(dev);
+      hk_queue_forget_own_signals(dev, &sem->permanent);
+      if (sem->temporary)
+         hk_queue_forget_own_signals(dev, sem->temporary);
+   }
    vk_common_DestroySemaphore(_device, semaphore, pAllocator);
+}
+
+/* An import replaces the semaphore's syncobj, and the new handle may reuse
+ * the number of one this queue recorded a signal for. */
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_ImportSemaphoreFdKHR(VkDevice _device,
+                        const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
+{
+   VK_FROM_HANDLE(hk_device, dev, _device);
+   VK_FROM_HANDLE(vk_semaphore, sem, pImportSemaphoreFdInfo->semaphore);
+
+   VkResult result =
+      vk_common_ImportSemaphoreFdKHR(_device, pImportSemaphoreFdInfo);
+   hk_queue_forget_own_signals(dev, &sem->permanent);
+   if (sem->temporary)
+      hk_queue_forget_own_signals(dev, sem->temporary);
+   return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2434,6 +2577,7 @@ hk_queue_create(struct hk_device *dev,
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    list_inithead(&queue->cmd_pending);
+   simple_mtx_init(&queue->own.lock, mtx_plain);
 
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(pCreateInfo->pNext,
@@ -2637,5 +2781,6 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
          agx_destroy_command_queue(&dev->dev, queue->sib.id[i]);
    }
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
+   simple_mtx_destroy(&queue->own.lock);
    vk_free(&dev->vk.alloc, queue);
 }
