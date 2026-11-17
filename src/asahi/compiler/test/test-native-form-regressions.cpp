@@ -6971,6 +6971,36 @@ TEST(NativeForms, Agx3bMatmad8x8MatchesAppleG16G)
 }
 
 /*
+ * AGX3B f16matmad8x8 (f16 A, B, C and result): a real Apple G16G capture from
+ * the compose corpus (fid53), a c-is-zero product into half 4 from halves 8
+ * and 4 with both sources discarded and wait slot 5. The f16 form refuses
+ * other input types and the AGX3C encoding (its M5 layout is not mapped).
+ */
+TEST(NativeForms, Agx3bF16Matmad8x8MatchesAppleG16G)
+{
+   struct agx3_matrix_mma8_desc d = {
+      .dest = 4, .a = 8, .b = 4, .c_zero = true,
+      .discard = {true, true, false}, .wait_mask = 0x20,
+      .input_type = AGX3_MATRIX_INPUT_F16, .f16_accumulate = true,
+   };
+   const std::vector<uint8_t> apple = {0xcf, 0x00, 0x56, 0x04, 0x02, 0x08,
+                                       0x04, 0x00, 0x10, 0x62, 0x04, 0x00};
+   uint8_t out[14], length = 0;
+   ASSERT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &d, out, &length));
+   EXPECT_EQ(std::vector<uint8_t>(out, out + length), apple);
+
+   /* Accumulating into C in place encodes too */
+   d.c_zero = false;
+   d.c = 12;
+   d.dest = 12;
+   EXPECT_TRUE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &d, out, &length));
+
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3C, &d, out, &length));
+   d.input_type = AGX3_MATRIX_INPUT_BF16;
+   EXPECT_FALSE(agx3_matrix_encode_mma8(AGX_ISA_ENCODING_AGX3B, &d, out, &length));
+}
+
+/*
  * Adding the AGX3B path must not perturb the M5 (AGX3C) encoding. The AGX3C
  * form is 14 bytes (its two extra selector fields f67/f68 and the wider
  * scoreboard-wait range are absent on the 12-byte AGX3B form), and its output
