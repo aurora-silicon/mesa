@@ -10178,6 +10178,105 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
    return progress;
 }
 
+/* Whether s is 0 or 1 << bit: a lane's choice between the halves of a word,
+ * as 16 * ((lane >> 3) & 1). */
+static bool
+agx_is_zero_or_bit(nir_scalar s, unsigned bit, unsigned depth)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_scalar_is_const(s)) {
+      const uint64_t v = nir_scalar_as_uint(s);
+      return v == 0 || v == (UINT64_C(1) << bit);
+   }
+   if (depth > 6 || !nir_scalar_is_alu(s) || s.def->bit_size != 32)
+      return false;
+
+   switch (nir_scalar_alu_op(s)) {
+   case nir_op_iand:
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_scalar m = nir_scalar_chase_alu_src(s, i);
+         if (!nir_scalar_is_const(m))
+            continue;
+         const uint64_t mask = nir_scalar_as_uint(m);
+         if (mask == (UINT64_C(1) << bit))
+            return true;
+         return (mask & (UINT64_C(1) << bit)) &&
+                agx_is_zero_or_bit(nir_scalar_chase_alu_src(s, 1 - i), bit,
+                                   depth + 1);
+      }
+      return false;
+   case nir_op_ishl: {
+      nir_scalar k = nir_scalar_chase_alu_src(s, 1);
+      if (!nir_scalar_is_const(k) || nir_scalar_as_uint(k) > bit)
+         return false;
+      return agx_is_zero_or_bit(nir_scalar_chase_alu_src(s, 0),
+                                bit - nir_scalar_as_uint(k), depth + 1);
+   }
+   case nir_op_imadshl_agx: {
+      /* a * b + (c << k) */
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(s, 1);
+      nir_scalar k = nir_scalar_chase_alu_src(s, 3);
+      if (!((nir_scalar_is_const(a) && nir_scalar_as_uint(a) == 0) ||
+            (nir_scalar_is_const(b) && nir_scalar_as_uint(b) == 0)) ||
+          !nir_scalar_is_const(k) || nir_scalar_as_uint(k) > bit)
+         return false;
+      return agx_is_zero_or_bit(nir_scalar_chase_alu_src(s, 2),
+                                bit - nir_scalar_as_uint(k), depth + 1);
+   }
+   case nir_op_ubitfield_extract: {
+      nir_scalar bits = nir_scalar_chase_alu_src(s, 2);
+      return bit == 0 && nir_scalar_is_const(bits) &&
+             nir_scalar_as_uint(bits) == 1;
+   }
+   case nir_op_b2i32:
+      return bit == 0;
+   default:
+      return false;
+   }
+}
+
+/* The low half of a word shifted right by 0 or 16 is one of its halves:
+ * select the half (one 16-bit select) instead of shifting the word and then
+ * copying its low half into place (a matrix operand built from loaded words,
+ * MAT_A_OF_ROWS's `v >> odd16`, took both for every half). */
+static bool
+agx_nir_select_shifted_half_instr(nir_builder *b, nir_alu_instr *alu,
+                                  UNUSED void *data)
+{
+   if (alu->op != nir_op_u2u16 || alu->def.num_components != 1 ||
+       nir_src_bit_size(alu->src[0].src) != 32)
+      return false;
+
+   nir_scalar shifted = nir_scalar_chase_movs(
+      nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[0]));
+   if (!nir_scalar_is_alu(shifted) ||
+       (nir_scalar_alu_op(shifted) != nir_op_ushr &&
+        nir_scalar_alu_op(shifted) != nir_op_ishr))
+      return false;
+
+   nir_scalar amount = nir_scalar_chase_alu_src(shifted, 1);
+   if (nir_scalar_is_const(amount) || !agx_is_zero_or_bit(amount, 4, 0))
+      return false;
+
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_scalar word = nir_scalar_chase_alu_src(shifted, 0);
+   nir_def *w = nir_channel(b, word.def, word.comp);
+   nir_def *k = nir_channel(b, amount.def, amount.comp);
+   nir_def *half =
+      nir_bcsel(b, nir_ine_imm(b, k, 0), nir_unpack_32_2x16_split_y(b, w),
+                nir_unpack_32_2x16_split_x(b, w));
+   nir_def_replace(&alu->def, half);
+   return true;
+}
+
+bool
+agx_nir_select_shifted_half(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, agx_nir_select_shifted_half_instr,
+                              nir_metadata_control_flow, NULL);
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
@@ -10525,6 +10624,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
    NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
    NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_select_shifted_half);
    if (g18_scans)
       NIR_PASS(_, nir, agx_nir_avoid_square_overflow);
    NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
