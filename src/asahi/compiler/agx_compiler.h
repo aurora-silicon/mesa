@@ -30,6 +30,25 @@ extern "C" {
 /* G18G's ordinary register file ends at r125 (half 251). */
 #define AGX3D_NUM_REGS (252)
 
+/* The general register file of an encoding in 16-bit halves, the file agx_ra
+ * bounds allocation by before its workgroup and alignment limits. G18G
+ * compiles as AGX3C (see emit_agx3d).
+ */
+static inline unsigned
+agx_num_regs(enum agx_isa_encoding encoding)
+{
+   switch (encoding) {
+   case AGX_ISA_ENCODING_AGX3B:
+      return AGX3B_NUM_REGS;
+   case AGX_ISA_ENCODING_AGX3C:
+      return AGX3C_NUM_REGS;
+   case AGX_ISA_ENCODING_AGX3D:
+      return AGX3D_NUM_REGS;
+   default:
+      return AGX_NUM_REGS;
+   }
+}
+
 /* u0-u255 inclusive, as pairs of 16-bits */
 #define AGX_NUM_UNIFORMS (512)
 
