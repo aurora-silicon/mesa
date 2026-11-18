@@ -10598,6 +10598,12 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          NIR_PASS(progress, nir, agx_nir_fuse_doubled_add);
    } while (progress);
 
+   /* After fusion has formed the bitfield extracts. Exact, and built from
+    * and/or/fadd that every generation has: see agx_nir_lower_bitfield_u2f.c
+    * for what it was measured on.
+    */
+   NIR_PASS(_, nir, agx_nir_lower_bitfield_u2f);
+
    /* Before optimizing bounds checks, we need to clean up and index defs so
     * optimize_bounds does the right thing.
     */
