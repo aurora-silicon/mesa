@@ -7225,6 +7225,15 @@ typedef enum {
     * example the per-iteration constants of an accumulation.
     */
    nir_reassociate_loop_invariant = (1 << 2),
+
+   /* With nir_reassociate_loop_invariant, rank invariance above convergence:
+    * every invariant source comes before every varying one. For backends
+    * that hoist invariant code out of loops but run convergent math in a
+    * loop on the vector ALU anyway, so that a convergent per-iteration term
+    * (a loop counter) does not split the invariant divergent terms of a chain
+    * (per-lane addresses) from its invariant convergent ones.
+    */
+   nir_reassociate_loop_invariant_first = (1 << 3),
 } nir_reassociate_options;
 
 bool nir_opt_reassociate(nir_shader *shader, nir_reassociate_options opts);
