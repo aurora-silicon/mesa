@@ -296,7 +296,8 @@ agx_has_uniform_store(const agx_context *ctx)
 bool
 agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I)
 {
-   return ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+   return ctx->key && (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+                       ctx->key->dev.chip == AGX_CHIP_G17C) &&
           !ctx->is_preamble && !ctx->uniforms_written &&
           I->op == AGX_OPCODE_MOV && I->nr_dests == 1 && I->nr_srcs == 1 &&
           I->dest[0].type == AGX_INDEX_NORMAL && !I->dest[0].memory &&
