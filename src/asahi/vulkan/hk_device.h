@@ -463,10 +463,11 @@ enum hk_perftest {
  * mapped at more than one GPU VA an application compute/transfer barrier needs
  * the memory-scoped strong flush (hk_cdm_visibility_flush()).
  *
- * On M5, devices that enable aliasing-capable features (sparse, BDA,
- * capture/replay, fd/dma-buf, writable host imports) track active aliasing
- * resources in alias_live under host_alias.dynamic (or force memory scope via
- * may_alias_memory / ASAHI_M5_HOST_ALIAS_STATIC=1). Barriers recorded while
+ * On M5, devices that enable aliasing-capable features (sparse,
+ * VK_EXT_buffer_device_address capture/replay, fd/dma-buf, writable host
+ * imports) track active aliasing resources in alias_live under
+ * host_alias.dynamic (or force memory scope via may_alias_memory /
+ * ASAHI_M5_HOST_ALIAS_STATIC=1). Barriers recorded while
  * alias_live == 0 record patch sites (struct hk_alias_site) that are upgraded
  * in place when alias_live leaves 0 or at submission; unpatched paths
  * (graphics dependencies, event-using command buffers) and stream-end flushes
