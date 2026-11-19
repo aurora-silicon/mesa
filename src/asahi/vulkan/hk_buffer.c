@@ -279,10 +279,17 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /* A sparse buffer has an address of its own, and so has a capture/replay
+    * buffer of VK_EXT_buffer_device_address, whose memory need not replay.
+    * Any other buffer takes its memory's address plus the offset, which
+    * replays with capture/replay memory
+    * (VUID-VkBindBufferMemoryInfo-bufferDeviceAddressCaptureReplay-09200,
+    * VUID-VkBindBufferMemoryInfo-buffer-09201). */
    if (buffer->vk.size > 0 &&
-       (buffer->vk.create_flags &
-        (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
-         VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT))) {
+       ((buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) ||
+        ((buffer->vk.create_flags &
+          VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+         dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT))) {
 
       const uint32_t alignment = hk_get_buffer_alignment(
          hk_device_physical(dev), buffer->vk.usage, buffer->vk.create_flags);

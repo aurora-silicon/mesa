@@ -136,10 +136,9 @@ struct hk_device {
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
    /* Live buffers and image planes with a GPU virtual address of their own
-    * (sparse binding, capture/replay buffers), and memory mapped again for
-    * descriptor buffer capture/replay, atomic (hk_device_va_alias_get()).
-    * Their memory is also mapped at another address, see
-    * hk_cdm_alias_scope(). */
+    * (sparse binding, bufferDeviceAddressCaptureReplayEXT buffers), atomic
+    * (hk_device_va_alias_get()). Their memory is also mapped at another
+    * address, see hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
     * virtual address at any time, decided at creation
@@ -448,10 +447,10 @@ enum hk_perftest {
  * scope while alias_live is not 0, the count of
  *
  * - live buffers and image planes with a GPU address of their own over
- *   other memory: sparse buffers and images, buffers with a capture/replay
- *   address, and memory mapped again in the capture/replay region for
- *   descriptor buffers (va_alias_resources, which G17P reads alone). Each
- *   counts from its creation, before memory can be bound to it. On M5 an
+ *   other memory: sparse buffers and images, and buffers with a
+ *   bufferDeviceAddressCaptureReplayEXT address (va_alias_resources, which
+ *   G17P reads alone). Each counts from its creation, before memory can be
+ *   bound to it. On M5 an
  *   acceleration structure's address is its buffer's (also on replay,
  *   vk_common_CreateAccelerationStructureKHR()), and image views and
  *   samplers replay only descriptor indices, so their capture/replay adds
@@ -505,10 +504,10 @@ enum hk_perftest {
  * ASAHI_M5_HOST_ALIAS_STATIC=1 restores the per-device rule for every one
  * of these features (A/B and fallback).
  *
- * On G17P the state is read when a barrier is recorded: live sparse and
- * capture/replay resources, and live fd imports and host imports the GPU may
- * write (another import can map the same pages at a second address). A
- * resource the command buffer references exists by then, and it counts from
+ * On G17P the state is read when a barrier is recorded: live sparse
+ * resources, and live fd imports and host imports the GPU may write
+ * (another import can map the same pages at a second address). A resource
+ * the command buffer references exists by then, and it counts from
  * creation, so later sparse binds are covered. Not covered on G17P: a
  * resource or import created after the command buffer was recorded and
  * reached through a path recording did not see, that is a device address the

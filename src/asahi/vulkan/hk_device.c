@@ -929,8 +929,7 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  * On M5 every resource through which these features map memory at a second
  * address is seen as it is created, so the scope follows the live ones
  * instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers and image
- * planes with an address of their own and memory mapped again for
- * descriptor buffer capture/replay (va_alias_resources), fd and dma-buf
+ * planes with an address of their own (va_alias_resources), fd and dma-buf
  * imports, and host imports that may alias (hk_host_import_aliases()). An
  * acceleration structure's address is its buffer's, also on replay, so its
  * capture/replay is covered by the buffer's. An import of private anonymous
@@ -1175,10 +1174,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
-   /* Capture-replay buffers reserve their VA and bind the fill page until
-    * memory is bound, like sparse buffers, so they need it too. */
+   /* VK_EXT_buffer_device_address capture/replay buffers reserve their VA
+    * and bind the fill page until memory is bound, like sparse buffers, so
+    * they need it too (hk_CreateBuffer()). */
    if (dev->vk.enabled_features.sparseBinding ||
-       dev->vk.enabled_features.bufferDeviceAddressCaptureReplay) {
+       dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT) {
       dev->sparse_fill = agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0,
                                        "Sparse fill page");
       if (!dev->sparse_fill || !agx_bo_map(dev->sparse_fill)) {
