@@ -124,6 +124,29 @@ static uint64_t hk_heap(struct hk_cmd_buffer *cmd);
 static bool hk_cmd_ensure_geometry_heap(struct hk_cmd_buffer *cmd);
 static enum mesa_prim hk_gs_in_prim(struct hk_cmd_buffer *cmd);
 
+/* G18G backs multisampled images with one sample (hk_image_init), so every
+ * draw rasterizes at one sample whatever the pipeline asks for. Fold a
+ * multisample coverage mask the same way: the pixel is covered when any of
+ * the API's samples is. */
+static void
+hk_g18_single_sample_dyn(const struct hk_device *dev,
+                         struct vk_dynamic_graphics_state *dyn)
+{
+   if (dev->dev.chip != AGX_CHIP_G18G || dyn->ms.rasterization_samples <= 1)
+      return;
+
+   const uint16_t mask =
+      (dyn->ms.sample_mask & BITFIELD_MASK(dyn->ms.rasterization_samples))
+         ? 0xffff
+         : 0;
+   if (dyn->ms.sample_mask != mask) {
+      dyn->ms.sample_mask = mask;
+      BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_SAMPLE_MASK);
+   }
+   dyn->ms.rasterization_samples = 1;
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
+}
+
 static enum libagx_program
 hk_sw_tess_program(enum tess_primitive_mode prim, enum poly_tess_mode mode)
 {
@@ -5407,6 +5430,82 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 static void hk_take_pending_z_store(struct hk_cmd_buffer *cmd,
                                     const VkRenderingInfo *info);
 
+/* G18G backs multisampled images with one sample (hk_image_init), and its
+ * background/end-of-tile programs have no resolve form. Render a pass that
+ * resolves without its resolve attachments, storing each resolve source,
+ * and resolve after the pass by copying (hk_meta_resolve_rendering). */
+static void
+hk_g18_strip_resolve(VkRenderingAttachmentInfo *out,
+                     const VkRenderingAttachmentInfo **att)
+{
+   if (*att == NULL || (*att)->resolveMode == VK_RESOLVE_MODE_NONE)
+      return;
+
+   *out = **att;
+   out->resolveMode = VK_RESOLVE_MODE_NONE;
+   out->resolveImageView = VK_NULL_HANDLE;
+   out->storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+   *att = out;
+}
+
+static const VkRenderingInfo *
+hk_g18_strip_resolves(struct hk_cmd_buffer *cmd, const VkRenderingInfo *in,
+                      VkRenderingInfo *info, VkRenderingAttachmentInfo *color,
+                      VkRenderingAttachmentInfo *depth,
+                      VkRenderingAttachmentInfo *stencil)
+{
+   if (hk_cmd_buffer_device(cmd)->dev.chip != AGX_CHIP_G18G)
+      return in;
+
+   bool any = false;
+   for (uint32_t i = 0; i < in->colorAttachmentCount; ++i)
+      any |= in->pColorAttachments[i].resolveMode != VK_RESOLVE_MODE_NONE;
+   any |= in->pDepthAttachment &&
+          in->pDepthAttachment->resolveMode != VK_RESOLVE_MODE_NONE;
+   any |= in->pStencilAttachment &&
+          in->pStencilAttachment->resolveMode != VK_RESOLVE_MODE_NONE;
+   if (!any || in->colorAttachmentCount > HK_MAX_RTS)
+      return in;
+
+   *info = *in;
+   for (uint32_t i = 0; i < in->colorAttachmentCount; ++i) {
+      const VkRenderingAttachmentInfo *att = &in->pColorAttachments[i];
+      color[i] = *att;
+      hk_g18_strip_resolve(&color[i], &att);
+   }
+   info->pColorAttachments = color;
+   hk_g18_strip_resolve(depth, &info->pDepthAttachment);
+   hk_g18_strip_resolve(stencil, &info->pStencilAttachment);
+   return info;
+}
+
+static void
+hk_g18_restore_resolve(struct hk_attachment *att,
+                       const VkRenderingAttachmentInfo *info)
+{
+   if (info == NULL || info->resolveMode == VK_RESOLVE_MODE_NONE ||
+       att->iview == NULL)
+      return;
+
+   VK_FROM_HANDLE(hk_image_view, res_iview, info->resolveImageView);
+   att->resolve_mode = info->resolveMode;
+   att->resolve_iview = res_iview;
+}
+
+static void
+hk_g18_restore_resolves(struct hk_cmd_buffer *cmd, const VkRenderingInfo *in,
+                        const VkRenderingInfo *rendered)
+{
+   if (rendered == in)
+      return;
+
+   struct hk_rendering_state *render = &cmd->state.gfx.render;
+   for (uint32_t i = 0; i < in->colorAttachmentCount; ++i)
+      hk_g18_restore_resolve(&render->color_att[i], &in->pColorAttachments[i]);
+   hk_g18_restore_resolve(&render->depth_att, in->pDepthAttachment);
+   hk_g18_restore_resolve(&render->stencil_att, in->pStencilAttachment);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
                      const VkRenderingInfo *pRenderingInfo)
@@ -5415,8 +5514,15 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
 
    hk_take_pending_z_store(cmd, pRenderingInfo);
 
+   VkRenderingInfo g18_info;
+   VkRenderingAttachmentInfo g18_color[HK_MAX_RTS], g18_depth, g18_stencil;
+   const VkRenderingInfo *api = pRenderingInfo;
+   pRenderingInfo = hk_g18_strip_resolves(cmd, api, &g18_info, g18_color,
+                                          &g18_depth, &g18_stencil);
+
    if (likely(!cmd->state.deferred_clear_count)) {
       hk_begin_rendering(commandBuffer, pRenderingInfo);
+      hk_g18_restore_resolves(cmd, api, pRenderingInfo);
       return;
    }
 
@@ -5428,6 +5534,7 @@ hk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       cmd, pRenderingInfo, &info, color, &depth, &stencil);
    hk_flush_deferred_clears(cmd);
    hk_begin_rendering(commandBuffer, taken);
+   hk_g18_restore_resolves(cmd, api, pRenderingInfo);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -10830,6 +10937,7 @@ hk_prelink_pipeline_fragment(struct hk_device *dev,
    dyn.vi = &vi;
    dyn.ms.sample_locations = &sl;
    vk_dynamic_graphics_state_fill(&dyn, state);
+   hk_g18_single_sample_dyn(dev, &dyn);
 
    for (unsigned i = 0; i < dyn.cb.attachment_count; ++i) {
       if (dyn.cb.attachments[i].color_blend_op >= VK_BLEND_OP_ZERO_EXT &&
@@ -12055,6 +12163,8 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
+
+   hk_g18_single_sample_dyn(dev, &cmd->vk.dynamic_graphics_state);
 
    /* Every stage hk_flush_shaders() reads has to actually be bound.  Binding
     * VK_NULL_HANDLE for a stage is how CmdBindShadersEXT *unbinds* it, and it

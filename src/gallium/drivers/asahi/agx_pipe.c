@@ -604,6 +604,13 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
    nresource->base = *templ;
    nresource->base.screen = screen;
 
+   /* driconf asahi_fake_msaa: a multisampled resource is single-sampled. */
+   if (agx_screen(screen)->fake_msaa && templ->nr_samples > 1) {
+      nresource->base.nr_samples = 0;
+      nresource->base.nr_storage_samples = 0;
+   }
+   templ = &nresource->base;
+
    if (modifiers) {
       nresource->modifier =
          agx_select_modifier_from_list(nresource, modifiers, count);
@@ -3100,6 +3107,28 @@ agx_screen_create(int fd, struct renderonly *ro,
     */
    if (driQueryOptionb(config->options, "asahi_no_fp16"))
       agx_screen->dev.debug |= AGX_DBG_NO16;
+
+   /* The G18G Gallium draw profile admits only some 2x/4x shapes
+    * (agx_g18_msaa4_draw_admitted): opaque and punch-through draws.
+    * Every translucent draw into a multisampled target -- any blending, and
+    * any draw with colour writes masked off, whose epilog preserves the tile
+    * by reloading it -- is refused and dropped ("draw exceeds the native
+    * triangle profile: multisampled"), and the 4x R8/RG8 preserve epilog
+    * cannot even be packed. Chromium/Skia, ANGLE's WebGL with antialias and
+    * most GL toolkits do exactly that. Multisampling cannot be hidden: ANGLE
+    * offers ES 3.0 only with GL_MAX_SAMPLES >= 4, and Chromium refuses a
+    * context below ES 3.0.
+    *
+    * So on G18G multisampled resources are backed single-sampled by default
+    * (driconf asahi_fake_msaa, default true; asahi_fake_msaa=false in the
+    * environment restores the native 2x/4x paths). Sample counts stay
+    * advertised; every multisampled resource is allocated with one sample
+    * (agx_resource_create_with_modifiers), draws into it are ordinary 1x
+    * draws, a resolve is a copy, and multisample texel fetches read the one
+    * sample (agx_nir_lower_single_sample_msaa). Edges are not antialiased.
+    * The option is G18G-only: other chips keep their real multisampling. */
+   agx_screen->fake_msaa = agx_screen->dev.chip == AGX_CHIP_G18G &&
+                           driQueryOptionb(config->options, "asahi_fake_msaa");
 
    /* G18G's packer has grounded half-precision forms for only part of what
     * mediump lowering produces (half FSEL/ADD/FMA with immediates or abs

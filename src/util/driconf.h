@@ -573,4 +573,8 @@
    DRI_CONF_OPT_B(asahi_no_fp16, def, \
                   "Disable 16-bit float support")
 
+#define DRI_CONF_ASAHI_FAKE_MSAA(def) \
+   DRI_CONF_OPT_B(asahi_fake_msaa, def, \
+                  "Allocate multisampled resources single-sampled")
+
 #endif

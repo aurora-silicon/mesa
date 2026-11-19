@@ -2433,3 +2433,102 @@ agx_nir_lower_texture_early_with_2d_robustness(nir_shader *s,
 {
    return lower_texture_early(s, support_lod_bias, lower_2d_robustness, false);
 }
+
+static bool
+lower_single_sample_msaa(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS)
+         return false;
+
+      b->cursor = nir_before_instr(instr);
+      switch (tex->op) {
+      case nir_texop_txf_ms: {
+         /* One stored sample: fetch it as an ordinary level-0 texel. */
+         nir_steal_tex_src(tex, nir_tex_src_ms_index);
+         tex->op = nir_texop_txf;
+         tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+         if (nir_tex_instr_src_index(tex, nir_tex_src_lod) < 0)
+            nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_int(b, 0));
+         return true;
+      }
+      case nir_texop_samples_identical:
+         nir_def_replace(&tex->def, nir_imm_true(b));
+         return true;
+      default:
+         /* Size and sample-count queries read the descriptor, which already
+          * describes the one-sample allocation. */
+         return false;
+      }
+   }
+
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_load:
+   case nir_intrinsic_image_sparse_load:
+   case nir_intrinsic_image_store:
+   case nir_intrinsic_image_atomic:
+   case nir_intrinsic_image_atomic_swap:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_bindless_image_load:
+   case nir_intrinsic_bindless_image_sparse_load:
+   case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_bindless_image_atomic_swap:
+      break;
+   default:
+      return false;
+   }
+
+   if (nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_MS)
+      return false;
+
+   /* The image keeps its multisample addressing, with a sample count of one
+    * in its descriptor: sample 0 is the stored texel. */
+   b->cursor = nir_before_instr(instr);
+   nir_src_rewrite(&intr->src[2], nir_imm_int(b, 0));
+   return true;
+}
+
+bool
+agx_nir_lower_single_sample_msaa(nir_shader *s)
+{
+   return nir_shader_instructions_pass(s, lower_single_sample_msaa,
+                                       nir_metadata_control_flow, NULL);
+}
+
+static bool
+lower_single_sample_coverage(nir_builder *b, nir_intrinsic_instr *intr,
+                             void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output ||
+       nir_intrinsic_io_semantics(intr).location != FRAG_RESULT_SAMPLE_MASK)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *mask = intr->src[0].ssa;
+   nir_def *any = nir_ine_imm(b, nir_iand_imm(b, mask, 0xf), 0);
+   nir_src_rewrite(&intr->src[0],
+                   nir_bcsel(b, any, nir_imm_intN_t(b, ~0ull, mask->bit_size),
+                             nir_imm_intN_t(b, 0, mask->bit_size)));
+   return true;
+}
+
+bool
+agx_nir_lower_single_sample_coverage(nir_shader *s)
+{
+   if (s->info.stage != MESA_SHADER_FRAGMENT ||
+       !(s->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)))
+      return false;
+
+   return nir_shader_intrinsics_pass(s, lower_single_sample_coverage,
+                                     nir_metadata_control_flow, NULL);
+}

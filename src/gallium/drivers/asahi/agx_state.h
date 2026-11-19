@@ -1306,6 +1306,10 @@ struct agx_screen {
    struct agx_device dev;
    struct disk_cache *disk_cache;
 
+   /* driconf asahi_fake_msaa: multisampled resources are allocated
+    * single-sampled (see agx_pipe.c). */
+   bool fake_msaa;
+
    /* Atomic: a context with unknown completion keeps the device alive. */
    bool submit_quarantined;
    struct agx_bo *rodata;

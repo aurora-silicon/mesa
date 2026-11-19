@@ -18,6 +18,7 @@
 #include "hk_entrypoints.h"
 #include "hk_g17p_meta_copy_core.h"
 #include "hk_image.h"
+#include "hk_image_view.h"
 #include "hk_physical_device.h"
 
 #include "layout.h"
@@ -2840,6 +2841,25 @@ hk_xfer_blitimage2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
+/* G18G backs multisampled images with one sample (hk_image_init): resolving
+ * one of them is copying its one sample. */
+static void
+hk_g18_resolve_by_copy(struct hk_cmd_buffer *cmd, struct hk_image *src,
+                       VkImageLayout src_layout, struct hk_image *dst,
+                       VkImageLayout dst_layout, const VkImageCopy2 *region)
+{
+   const VkCopyImageInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2,
+      .srcImage = hk_image_to_handle(src),
+      .srcImageLayout = src_layout,
+      .dstImage = hk_image_to_handle(dst),
+      .dstImageLayout = dst_layout,
+      .regionCount = 1,
+      .pRegions = region,
+   };
+   hk_CmdCopyImage2(hk_cmd_buffer_to_handle(cmd), &info);
+}
+
 static void
 hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
                     const VkResolveImageInfo2 *pResolveImageInfo)
@@ -2849,6 +2869,25 @@ hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(hk_image, dst_image, pResolveImageInfo->dstImage);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Resolve");
+
+   if (dev->dev.chip == AGX_CHIP_G18G &&
+       src_image->vk.samples == VK_SAMPLE_COUNT_1_BIT) {
+      for (uint32_t r = 0; r < pResolveImageInfo->regionCount; ++r) {
+         const VkImageResolve2 *res = &pResolveImageInfo->pRegions[r];
+         const VkImageCopy2 region = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+            .srcSubresource = res->srcSubresource,
+            .srcOffset = res->srcOffset,
+            .dstSubresource = res->dstSubresource,
+            .dstOffset = res->dstOffset,
+            .extent = res->extent,
+         };
+         hk_g18_resolve_by_copy(cmd, src_image,
+                                pResolveImageInfo->srcImageLayout, dst_image,
+                                pResolveImageInfo->dstImageLayout, &region);
+      }
+      return;
+   }
 
    const struct ail_layout *src_layout = &src_image->planes[0].layout;
    const struct ail_layout *dst_layout = &dst_image->planes[0].layout;
@@ -2976,11 +3015,69 @@ hk_xfer_resolveimage2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
+static void
+hk_g18_resolve_attachment_by_copy(struct hk_cmd_buffer *cmd,
+                                  const VkRenderingInfo *info,
+                                  const VkRenderingAttachmentInfo *att,
+                                  VkImageAspectFlags aspect)
+{
+   if (att == NULL || att->resolveMode == VK_RESOLVE_MODE_NONE ||
+       att->imageView == VK_NULL_HANDLE ||
+       att->resolveImageView == VK_NULL_HANDLE)
+      return;
+
+   VK_FROM_HANDLE(hk_image_view, src, att->imageView);
+   VK_FROM_HANDLE(hk_image_view, dst, att->resolveImageView);
+
+   /* Without multiview the pass renders layers [0, layerCount). With it, only
+    * the views in viewMask are rendered and resolved: copy just those layers
+    * and leave the other layers of the resolve image untouched. */
+   unsigned views = info->viewMask;
+   do {
+      int first = 0, count = info->layerCount;
+      if (info->viewMask)
+         u_bit_scan_consecutive_range(&views, &first, &count);
+
+      const VkImageCopy2 region = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+         .srcSubresource = {aspect, src->vk.base_mip_level,
+                            src->vk.base_array_layer + first, count},
+         .srcOffset = {info->renderArea.offset.x, info->renderArea.offset.y, 0},
+         .dstSubresource = {aspect, dst->vk.base_mip_level,
+                            dst->vk.base_array_layer + first, count},
+         .dstOffset = {info->renderArea.offset.x, info->renderArea.offset.y, 0},
+         .extent = {info->renderArea.extent.width,
+                    info->renderArea.extent.height, 1},
+      };
+      hk_g18_resolve_by_copy(
+         cmd, container_of(src->vk.image, struct hk_image, vk),
+         att->imageLayout, container_of(dst->vk.image, struct hk_image, vk),
+         att->resolveImageLayout, &region);
+   } while (views);
+}
+
 void
 hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
                           const VkRenderingInfo *pRenderingInfo)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+
+   /* G18G: every resolve source holds one sample (hk_image_init), and the
+    * render pass stored it (hk_g18_strip_resolves): any resolve mode is a
+    * copy of the render area. */
+   if (dev->dev.chip == AGX_CHIP_G18G) {
+      for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; ++i)
+         hk_g18_resolve_attachment_by_copy(
+            cmd, pRenderingInfo, &pRenderingInfo->pColorAttachments[i],
+            VK_IMAGE_ASPECT_COLOR_BIT);
+      hk_g18_resolve_attachment_by_copy(cmd, pRenderingInfo,
+                                        pRenderingInfo->pDepthAttachment,
+                                        VK_IMAGE_ASPECT_DEPTH_BIT);
+      hk_g18_resolve_attachment_by_copy(cmd, pRenderingInfo,
+                                        pRenderingInfo->pStencilAttachment,
+                                        VK_IMAGE_ASPECT_STENCIL_BIT);
+      return;
+   }
 
    struct hk_meta_save save;
    hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_GRAPHICS);

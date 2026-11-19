@@ -3268,6 +3268,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       }
    }
 
+   /* G18G multisampled images hold one sample (hk_image_init). */
+   if (dev->dev.chip == AGX_CHIP_G18G)
+      NIR_PASS(_, nir, agx_nir_lower_single_sample_msaa);
+
    if (is_multiview &&
        hk_lower_multiview_stage(nir->info.stage, next_stage_mask))
       hk_lower_multiview(nir, dev->dev.chip == AGX_CHIP_G17P);
@@ -5220,6 +5224,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       shader->info.fs.interp.linear = nir->info.linear_varyings;
       shader->info.fs.interp.flat =
          ~(nir->info.linear_varyings | nir->info.perspective_varyings);
+
+      /* G18G draws rasterize at one sample (hk_image_init): a written
+       * SampleMask covers the pixel when it keeps any API sample. */
+      if (dev->dev.chip == AGX_CHIP_G18G)
+         NIR_PASS(_, nir, agx_nir_lower_single_sample_coverage);
 
       /* Discards must be lowering before lowering MSAA to handle discards */
       NIR_PASS(_, nir, agx_nir_lower_discard_zs_emit);

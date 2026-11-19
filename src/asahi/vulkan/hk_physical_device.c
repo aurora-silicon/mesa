@@ -1126,9 +1126,16 @@ hk_get_device_properties(const struct agx_device *dev,
    const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
+   /* G18G backs every multisampled image with one sample (hk_image_init):
+    * its draw-state profile has no qualified encoding for blended or
+    * colour-masked multisampled draws. Advertising 2x/4x keeps the counts
+    * Vulkan requires (framebufferColorSampleCounts must include 4x) and
+    * lets applications that ask for multisampling render, without
+    * antialiased edges. */
    const VkSampleCountFlagBits sample_counts =
       dev->chip == AGX_CHIP_G18G
-         ? VK_SAMPLE_COUNT_1_BIT
+         ? (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+            VK_SAMPLE_COUNT_4_BIT)
          : (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
             VK_SAMPLE_COUNT_4_BIT |
             (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0));

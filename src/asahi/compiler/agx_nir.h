@@ -362,3 +362,15 @@ bool agx_nir_lower_cmat_flexible(struct nir_shader *s, bool *pairing);
 bool agx_nir_lower_texture_early_with_2d_robustness(struct nir_shader *s,
                                                     bool support_lod_bias,
                                                     bool lower_2d_robustness);
+
+/* G18G single-sample backing of multisampled resources (Gallium driconf
+ * asahi_fake_msaa, on by default there; hk always on G18G): every
+ * multisampled image is allocated and rendered with one sample, so a
+ * multisample texel fetch or image access reads that one sample whatever
+ * sample index the shader names. Run before texture/binding lowering. */
+bool agx_nir_lower_single_sample_msaa(struct nir_shader *s);
+
+/* The same backing, for a fragment shader after I/O lowering: a written
+ * SampleMask covers the pixels one sample when it keeps any of the APIs
+ * (up to four) samples, rather than only when it keeps sample 0. */
+bool agx_nir_lower_single_sample_coverage(struct nir_shader *s);

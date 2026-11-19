@@ -1501,6 +1501,16 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
    if (image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
       image->vk.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
+   /* G18G: a multisampled image is allocated, rendered and sampled with one
+    * sample (hk_get_device_properties). Every driver path below -- layout,
+    * views, rendering, copies, resolves -- then sees a one-sample image:
+    * draws into it rasterize at one sample (hk_g18_single_sample_dyn), a
+    * resolve is a copy, and a multisample texel fetch reads the one sample
+    * (agx_nir_lower_single_sample_msaa). The application's sample count is
+    * only validated against, never needed by the driver. */
+   if (dev->dev.chip == AGX_CHIP_G18G && image->vk.samples > 1)
+      image->vk.samples = VK_SAMPLE_COUNT_1_BIT;
+
    image->plane_count = vk_format_get_plane_count(pCreateInfo->format);
    image->disjoint = image->plane_count > 1 &&
                      (pCreateInfo->flags & VK_IMAGE_CREATE_DISJOINT_BIT);
@@ -1640,7 +1650,7 @@ hk_image_init(struct hk_device *dev, struct hk_image *image,
          .depth_px = MAX2(pCreateInfo->extent.depth, pCreateInfo->arrayLayers),
 
          .levels = pCreateInfo->mipLevels,
-         .sample_count_sa = pCreateInfo->samples,
+         .sample_count_sa = image->vk.samples,
          .writeable_image = !compressed,
 
          /* TODO: Maybe optimize this, our GL driver doesn't bother though */

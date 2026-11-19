@@ -1297,6 +1297,13 @@ agx_set_sample_mask(struct pipe_context *pipe, unsigned sample_mask)
     */
    unsigned new_mask = sample_mask & BITFIELD_MASK(4);
 
+   /* Single-sample backing (asahi_fake_msaa): the API mask names up to four
+    * samples but the pixel has one. It is covered when any API sample is,
+    * so a partial coverage mask (glSampleCoverage, glSampleMaski, ANGLE's
+    * sample-coverage emulation) draws rather than depending on bit 0. */
+   if (agx_screen(pipe->screen)->fake_msaa && new_mask)
+      new_mask = BITFIELD_MASK(4);
+
    if (ctx->sample_mask != new_mask) {
       ctx->sample_mask = new_mask;
       ctx->dirty |= AGX_DIRTY_SAMPLE_MASK;
@@ -1498,6 +1505,16 @@ agx_set_framebuffer_state(struct pipe_context *pctx,
    if (agx_chip_g17_m5(agx_device(pctx->screen)->chip) ||
        agx_device(pctx->screen)->chip == AGX_CHIP_G18G)
       pipe_resource_reference(&ctx->framebuffer.resolve, NULL);
+
+   /* Single-sample backing (asahi_fake_msaa): every multisampled resource
+    * holds one sample, so an attachmentless framebuffer's default sample
+    * count and any per-surface sample count rasterize at one sample too. */
+   if (agx_screen(pctx->screen)->fake_msaa) {
+      ctx->framebuffer.samples = MIN2(ctx->framebuffer.samples, 1);
+      for (unsigned i = 0; i < ctx->framebuffer.nr_cbufs; ++i)
+         ctx->framebuffer.cbufs[i].nr_samples = 0;
+      ctx->framebuffer.zsbuf.nr_samples = 0;
+   }
 
    for (unsigned i = 0; i < state->nr_cbufs; ++i) {
       agx_legalize_compression(ctx,
@@ -3824,6 +3841,13 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    if (nir->info.stage == MESA_SHADER_KERNEL)
       nir->info.stage = MESA_SHADER_COMPUTE;
 
+   /* Single-sample backing (asahi_fake_msaa): a multisample texel fetch or
+    * image access reads the one sample every multisampled resource holds. */
+   const bool single_sample_msaa =
+      container_of(dev, struct agx_screen, dev)->fake_msaa;
+   if (single_sample_msaa)
+      NIR_PASS(_, nir, agx_nir_lower_single_sample_msaa);
+
    blob_init(&so->early_serialized_nir);
    nir_serialize(&so->early_serialized_nir, nir, true);
 
@@ -3950,6 +3974,9 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    /* Every stage: a G17G draw whose vertex shader writes memory is not
     * repeated per attachment either (agx_g17g_mrt_one_pass). */
    so->info.writes_memory = nir->info.writes_memory;
+
+   if (single_sample_msaa)
+      NIR_PASS(_, nir, agx_nir_lower_single_sample_coverage);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       so->info.uses_fbfetch = nir->info.fs.uses_fbfetch_output;
