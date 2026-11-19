@@ -476,6 +476,7 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
    }
 
    const VkImageCreateFlags allowed_flags =
+      (chip == AGX_CHIP_G17C ? VK_IMAGE_CREATE_ALIAS_BIT : 0) |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -600,6 +601,7 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
    }
 
    const VkImageCreateFlags allowed_flags =
+      (chip == AGX_CHIP_G17C ? VK_IMAGE_CREATE_ALIAS_BIT : 0) |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
       VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
    const VkImageUsageFlags allowed_usage =
