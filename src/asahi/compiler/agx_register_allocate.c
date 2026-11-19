@@ -3113,6 +3113,22 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
    }
 
+   /* Keep more waves resident in ordinary G17C compute programs that
+    * contain texture reads. Helpers and unspillable programs keep their
+    * original hardware budget. */
+   if (ctx->key->dev.chip == AGX_CHIP_G17C &&
+       ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
+       !ctx->key->is_helper && ctx->key->has_scratch &&
+       !ctx->out->uses_ray_traversal) {
+      unsigned samples = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE || I->op == AGX_OPCODE_TEXTURE_LOAD)
+            samples++;
+      }
+      if (samples >= 4)
+         max_possible_regs = MIN2(max_possible_regs, 160);
+   }
+
    /* Match the CEM scratch extent reserved by agx3_pack_binary. */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
       max_possible_regs = MIN2(max_possible_regs,
