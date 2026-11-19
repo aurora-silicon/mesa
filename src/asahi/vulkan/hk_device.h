@@ -439,9 +439,8 @@ enum hk_perftest {
  *
  * On M5 the features through which memory can get a second GPU address are
  * looked at once, when the device is created (hk_device_may_alias_memory()):
- * sparse binding and residency, buffer device address, descriptor buffer
- * and acceleration structure capture/replay, fd and dma-buf memory, and
- * writable host imports. A device that enabled none of them never has such
+ * sparse binding and residency, VK_EXT_buffer_device_address
+ * capture/replay, fd and dma-buf memory, and writable host imports. A device that enabled none of them never has such
  * memory and keeps the plain flushes. On any other M5 device
  * (host_alias.dynamic) the scope follows the resources that exist: memory
  * scope while alias_live is not 0, the count of
@@ -450,11 +449,12 @@ enum hk_perftest {
  *   other memory: sparse buffers and images, and buffers with a
  *   bufferDeviceAddressCaptureReplayEXT address (va_alias_resources, which
  *   G17P reads alone). Each counts from its creation, before memory can be
- *   bound to it. On M5 an
- *   acceleration structure's address is its buffer's (also on replay,
- *   vk_common_CreateAccelerationStructureKHR()), and image views and
- *   samplers replay only descriptor indices, so their capture/replay adds
- *   no address;
+ *   bound to it. Other capture/replay memory has its one address in the
+ *   capture/replay region, which the buffers and images bound to it take;
+ *   on M5 an acceleration structure's address is its buffer's (also on
+ *   replay, vk_common_CreateAccelerationStructureKHR()), and image views
+ *   and samplers replay only descriptor indices, so their capture/replay
+ *   adds no address;
  * - live fd and dma-buf imports, each for its lifetime: another import, of
  *   this device or another, may map the same pages;
  * - live host imports that may alias (hk_host_import_aliases()): not all

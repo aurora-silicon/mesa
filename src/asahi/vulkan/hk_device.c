@@ -907,11 +907,13 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
 /* Whether memory can be mapped at a second GPU virtual address at any time
  * in the life of `dev`, from what it enabled (hk_cdm_alias_scope()):
  *
- * - sparse buffers and images, and capture/replay buffers, have an address
- *   of their own, and the memory bound to them keeps its own as well;
- * - an fd import of memory from elsewhere gets an address of its own, and
- *   another import may map the same pages (two dma-bufs over one memfd, or
- *   a dma-buf and a host import of its pages);
+ * - sparse buffers and images, and capture/replay buffers of
+ *   VK_EXT_buffer_device_address, have an address of their own, and the
+ *   memory bound to them keeps its own as well;
+ * - an fd import gets an address of its own. Importing one GEM object again,
+ *   our own export included, gives the same BO and address (agx_bo_import()),
+ *   but two dma-bufs can share pages under different GEM objects (two
+ *   udmabufs over one memfd), and a host import may map a dma-buf's pages;
  * - a host import gets an address of its own, and the same pages may be
  *   imported again, or be mapped by the application at a second virtual
  *   address that another import, or memory of another kind, reaches. With
@@ -919,12 +921,14 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  *   GPU, so the GPU writes no imported page and a read through the import
  *   cannot miss a write through another address.
  *
- * Nothing else maps memory the GPU writes at two addresses: the read-only
- * shadow of every allocation is read only through sparse and capture/replay
- * buffers, and the driver's other second mappings (descriptor tables,
- * acceleration structure tables, shader code) hold memory written by the
- * CPU alone. The structures of these features may only be used when they
- * are enabled, so a device that enabled none of them never has such memory.
+ * Nothing else maps memory the GPU writes at two addresses: capture/replay
+ * memory has its address in the capture/replay region alone, and other
+ * buffers and images bound to it take that address; the read-only shadow of
+ * every allocation is read only through sparse buffers; and the driver's
+ * other second mappings (descriptor tables, acceleration structure tables,
+ * shader code) hold memory written by the CPU alone. The structures of these
+ * features may only be used when they are enabled, so a device that enabled
+ * none of them never has such memory.
  *
  * On M5 every resource through which these features map memory at a second
  * address is seen as it is created, so the scope follows the live ones
@@ -951,13 +955,7 @@ hk_device_may_alias_memory(const struct hk_device *dev,
        f->sparseResidencyImage2D || f->sparseResidencyImage3D ||
        f->sparseResidency2Samples || f->sparseResidency4Samples ||
        f->sparseResidency8Samples || f->sparseResidency16Samples ||
-       f->sparseResidencyAliased)
-      return true;
-
-   if (f->bufferDeviceAddressCaptureReplay ||
-       f->bufferDeviceAddressCaptureReplayEXT ||
-       f->descriptorBufferCaptureReplay ||
-       f->accelerationStructureCaptureReplay)
+       f->sparseResidencyAliased || f->bufferDeviceAddressCaptureReplayEXT)
       return true;
 
    if (ext->KHR_external_memory_fd || ext->EXT_external_memory_dma_buf)
@@ -991,13 +989,8 @@ hk_device_trace_alias_reasons(const struct hk_device *dev,
                       f->sparseResidency8Samples || f->sparseResidency16Samples,
                    "sparseResidencyNSamples");
    HK_ALIAS_REASON(f->sparseResidencyAliased, "sparseResidencyAliased");
-   HK_ALIAS_REASON(f->bufferDeviceAddressCaptureReplay ||
-                      f->bufferDeviceAddressCaptureReplayEXT,
-                   "bufferDeviceAddressCaptureReplay");
-   HK_ALIAS_REASON(f->descriptorBufferCaptureReplay,
-                   "descriptorBufferCaptureReplay");
-   HK_ALIAS_REASON(f->accelerationStructureCaptureReplay,
-                   "accelerationStructureCaptureReplay");
+   HK_ALIAS_REASON(f->bufferDeviceAddressCaptureReplayEXT,
+                   "bufferDeviceAddressCaptureReplayEXT");
    HK_ALIAS_REASON(ext->KHR_external_memory_fd, "KHR_external_memory_fd");
    HK_ALIAS_REASON(ext->EXT_external_memory_dma_buf, "EXT_external_memory_dma_buf");
    HK_ALIAS_REASON(ext->EXT_external_memory_host &&
