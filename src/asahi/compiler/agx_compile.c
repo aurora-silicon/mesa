@@ -9744,7 +9744,7 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
     * loops before scheduling. Keep earlier GPU generations unchanged. */
    if (m5) {
       options = *saved_options;
-      options.max_unroll_iterations = 64;
+      options.max_unroll_iterations = nir->info.stage == MESA_SHADER_FRAGMENT ? 8 : 64;
       nir->options = &options;
    }
    bool progress;
@@ -9759,7 +9759,7 @@ agx_optimize_loop_nir(nir_shader *nir, bool m5, bool g17p)
       NIR_PASS(progress, nir, nir_opt_cse);
 
       nir_opt_peephole_select_options peephole_select_options = {
-         .limit = 64,
+         .limit = m5 && nir->info.stage == MESA_SHADER_FRAGMENT ? 12 : 64,
          .expensive_alu_ok = true,
          .expensive_limit = g17p ? AGX_G17P_EXPENSIVE_FLATTEN_LIMIT : 0,
       };
