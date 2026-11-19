@@ -527,6 +527,55 @@ hk_init_vm_status_mirror(struct hk_device *dev)
    dev->vm_status_mirror.word = word;
 }
 
+/* M5: register the kernel-maintained count of this VM's output fences that
+ * signalled with an error. The kernel updates it before each such fence
+ * signals, so the command-memory reap can retire a submission whose queue
+ * point was reached without reading its fences when the count did not move
+ * (hk_cmd_pending_poll). Only M5 pins command memory. The GPU maps the word
+ * read-only: a stray GPU store could otherwise put back an old count. Any
+ * failure leaves the count NULL and the reap reads every fence.
+ */
+static void
+hk_init_fence_error_count(struct hk_device *dev)
+{
+   /* virtio: dev->dev.fd is the virtgpu fd, asahi ioctls don't go there. */
+   if (!agx_chip_g17_m5(dev->dev.chip) || dev->dev.is_virtio ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT))
+      return;
+
+   struct agx_bo *bo =
+      agx_bo_create(&dev->dev, 16384, 0, AGX_BO_WRITEBACK | AGX_BO_READONLY,
+                    "VM fence error count");
+   if (!bo)
+      return;
+
+   /* Registration sets the word to the VM's current count; hk only reads it. */
+   const uint64_t *word = agx_bo_map(bo);
+   if (!word) {
+      agx_bo_unreference(&dev->dev, bo);
+      return;
+   }
+
+   struct drm_asahi_vm_fence_error_mirror mirror = {
+      .vm_id = dev->dev.vm_id,
+      .handle = bo->uapi_handle,
+      .offset = 0,
+      .flags = 0,
+   };
+   struct drm_asahi_get_params query = {
+      .param_group = DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR,
+      .pointer = (uintptr_t)&mirror,
+      .size = sizeof(mirror),
+   };
+   if (drmIoctl(dev->dev.fd, DRM_IOCTL_ASAHI_GET_PARAMS, &query)) {
+      agx_bo_unreference(&dev->dev, bo);
+      return;
+   }
+
+   dev->fence_error_count_bo = bo;
+   dev->fence_error_count = word;
+}
+
 #define HK_CODE_CHUNK_SIZE (1024 * 1024)
 #define HK_CODE_ALIGNMENT  256
 
@@ -578,6 +627,17 @@ hk_finish_vm_status_mirror(struct hk_device *dev)
       agx_bo_unreference(&dev->dev, dev->vm_status_mirror.bo);
    dev->vm_status_mirror.bo = NULL;
    dev->vm_status_mirror.word = NULL;
+}
+
+/* As hk_finish_vm_status_mirror(). Every reap that reads the count runs
+ * before hk_cmd_pending_finish(), which precedes this. */
+static void
+hk_finish_fence_error_count(struct hk_device *dev)
+{
+   if (dev->fence_error_count_bo)
+      agx_bo_unreference(&dev->dev, dev->fence_error_count_bo);
+   dev->fence_error_count_bo = NULL;
+   dev->fence_error_count = NULL;
 }
 
 static VkResult
@@ -1047,6 +1107,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.check_status = hk_check_status;
    dev->vk.get_timestamp = hk_get_timestamp;
    hk_init_vm_status_mirror(dev);
+   hk_init_fence_error_count(dev);
    if (dev->dev.async_errors)
       dev->async_errors_base = p_atomic_read(dev->dev.async_errors);
 
@@ -1278,6 +1339,7 @@ fail_samplers:
    hk_destroy_sampler_heap(dev, &dev->samplers);
 fail_dev:
    hk_finish_vm_status_mirror(dev);
+   hk_finish_fence_error_count(dev);
    agx_bo_unreference(&dev->dev, dev->physical_sparse_map);
    agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);
@@ -1381,6 +1443,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_g17p_bg_eot_dev_cache_finish(dev);
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_finish_vm_status_mirror(dev);
+   hk_finish_fence_error_count(dev);
    agx_bo_unreference(&dev->dev, dev->physical_sparse_map);
    agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);

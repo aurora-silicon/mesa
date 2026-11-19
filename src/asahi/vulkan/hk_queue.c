@@ -2251,7 +2251,9 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    struct hk_cmd_pending *pending = NULL;
    if (agx_chip_g17_m5(dev->dev.chip) && !dev->dev.is_virtio) {
       unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
-      VkResult pin_result = hk_cmd_pending_begin(dev, submit, chunks, &pending);
+      VkResult pin_result =
+         hk_cmd_pending_begin(dev, submit, chunks, chunk_timelines,
+                              kernel_cumulative, &pending);
       if (pin_result != VK_SUCCESS) {
          util_dynarray_fini(&payload);
          /* Sync ordinals were already resolved above; this is not retryable

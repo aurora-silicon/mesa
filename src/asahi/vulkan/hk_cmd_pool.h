@@ -155,7 +155,9 @@ struct hk_queue;
 struct vk_queue_submit;
 VkResult hk_cmd_pending_begin(struct hk_device *dev,
                                const struct vk_queue_submit *submit,
-                               unsigned chunks, struct hk_cmd_pending **out);
+                               unsigned chunks, bool chunk_timelines,
+                               bool cumulative_outputs,
+                               struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
                         struct hk_queue *queue, VkResult result);

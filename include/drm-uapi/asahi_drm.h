@@ -454,9 +454,30 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
 
+/*
+ * DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT: GET_PARAMS supports
+ * DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR, which registers a userspace
+ * word that counts the SUBMIT ioctls of a VM whose output fence ended with an
+ * error. The kernel updates the word before it installs or signals such a
+ * fence, so for a submission without DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE
+ * outputs, when every output fence of the submission has signalled and the
+ * word still holds the value it had before the submission, none of them
+ * failed.
+ * Registration may still be refused. A feature bit like those of enum
+ * drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT ((1ULL) << 39)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
+
+/**
+ * define DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR - GET_PARAMS group for
+ * struct drm_asahi_vm_fence_error_mirror, available with
+ * DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT
+ */
+#define DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR 4
 
 /* GET_PARAMS group VM_STATUS_MIRROR (input only; feature bit 4).
  * handle names a GEM object (at most 64 KiB) of the calling file; offset is a 4-byte-aligned
@@ -470,6 +491,49 @@ struct drm_asahi_vm_status_mirror {
    __u32 handle;
    __u32 offset;
    __u32 flags;
+};
+
+/**
+ * struct drm_asahi_vm_fence_error_mirror - VM fence error count registration,
+ * GET_PARAMS group DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR
+ *
+ * Registers a 64-bit word in a GEM object of the calling file. The kernel
+ * keeps its own reference to the object until the VM is destroyed, sets the
+ * word to the VM's current count, and from then on keeps it equal to the
+ * number of this VM's SUBMIT ioctls whose output fence ended with an error
+ * (any errno, including ECANCELED and ENODATA, which leave the VM status at
+ * 0). It updates the word before it installs or signals each such fence; the
+ * count only grows and does not wrap. Userspace only reads the word.
+ *
+ * Each such SUBMIT counts one, whether or not it named output syncs, so a
+ * submission split across several SUBMITs counts once per failed SUBMIT.
+ * That includes a SUBMIT that fails and installs an error fence in its
+ * outputs instead; the kernel counts it before installing it. A SUBMIT
+ * refused before it has an output fence (invalid arguments, queue or sync
+ * list) counts nothing. A DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ_CUMULATIVE output
+ * may also carry an earlier point's error, which only that point's SUBMIT
+ * counts, if it is one of this VM's.
+ *
+ * Each VM accepts one registration (EBUSY for a second one). EINVAL: nonzero
+ * flags, a zero handle, an offset that is not 8-byte aligned or outside the
+ * object, an object larger than 64 KiB, a VM without a status, or a request
+ * size over 4 KiB or with nonzero bytes past this struct. ENOENT: missing,
+ * foreign or destroyed vm_id, or missing handle. EOPNOTSUPP: the device does
+ * not count fence errors (DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT is clear);
+ * kernels without this group fail it with EINVAL.
+ */
+struct drm_asahi_vm_fence_error_mirror {
+	/** @vm_id: VM whose fence errors are counted */
+	__u32 vm_id;
+
+	/** @handle: GEM object holding the word, at most 64 KiB in size */
+	__u32 handle;
+
+	/** @offset: Byte offset of the word in the object, 8-byte aligned */
+	__u64 offset;
+
+	/** @flags: MBZ */
+	__u64 flags;
 };
 
 /* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.

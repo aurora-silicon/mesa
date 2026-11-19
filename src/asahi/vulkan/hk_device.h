@@ -266,6 +266,13 @@ struct hk_device {
       int32_t *word;
    } vm_status_mirror;
 
+   /* M5: kernel-maintained count of this VM's output fences that signalled
+    * with an error (DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT), in a BO the GPU
+    * maps read-only. NULL: the command-memory reap reads every fence's
+    * status instead (hk_cmd_pool.c). */
+   struct agx_bo *fence_error_count_bo;
+   const uint64_t *fence_error_count;
+
    /* virtio: dev->dev.async_errors when the device was created. */
    uint32_t async_errors_base;
 

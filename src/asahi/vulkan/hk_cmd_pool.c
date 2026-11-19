@@ -695,6 +695,15 @@ struct hk_cmd_pending {
    /* The queue timeline point its last ioctl signals. */
    uint64_t point;
 
+   /* dev->fence_error_count, sampled before the first ioctl. */
+   uint64_t fail_seq;
+
+   /* How its ioctls signal the queue timeline: each chunk at its own point,
+    * and whether the queue point is a cumulative output rather than the
+    * ioctl's own fence (hk_cmd_pending_points_cover()).
+    */
+   bool chunk_timelines, cumulative_outputs;
+
    unsigned count;
    struct hk_cmd_pin pins[];
 };
@@ -833,17 +842,54 @@ enum hk_cmd_pending_state {
    HK_PENDING_FAILED,
 };
 
+/* Whether a reached queue point covers every fence of the submission: each
+ * of its ioctls signalled the queue timeline with that ioctl's own fence, at
+ * a point no later than the submission's. That holds with a single ioctl or
+ * with a point per chunk. Without chunk timelines, earlier chunks signal only
+ * their private syncobjs. A cumulative output would put a scope fence, not
+ * the ioctl's own, on the timeline. M5 sends none today; this is a guard.
+ */
+static bool
+hk_cmd_pending_points_cover(const struct hk_cmd_pending *p)
+{
+   return !p->cumulative_outputs && (p->attempted == 1 || p->chunk_timelines);
+}
+
 /* A signalled ERROR is deliberately not completion for ownership purposes.
  * A private binary syncobj keeps the original fence, including its error;
  * exporting a pruned queue timeline point could instead yield a success
  * stub. Unless the queue timeline has already shown that the submission's
  * fences signalled, one zero-timeout wait rejects a submission that is still
  * running. The status of each signalled fence is then read once and
- * remembered.
+ * remembered, unless the VM's fence-error count already proves them all
+ * successful. errors is that count, loaded after a wait confirmed the
+ * reached queue point, or NULL.
  */
 static enum hk_cmd_pending_state
-hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
+hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait,
+                    const uint64_t *errors)
 {
+   /* The point was reached and the count has not moved since before the
+    * first ioctl, so no fence of this submission failed:
+    * - the kernel bumps the count before it signals any output fence of
+    *   this VM with an error;
+    * - every ioctl's fence signalled before the reached point
+    *   (hk_cmd_pending_points_cover());
+    * - a zero-timeout wait confirmed the point the query reported, and the
+    *   count was loaded after it, behind an acquire fence
+    *   (hk_cmd_pending_reap_queue());
+    * - fail_seq was sampled before the first ioctl, so it cannot include
+    *   this submission's own errors.
+    * Errors elsewhere in the VM only make the counts differ, and a mismatch
+    * only means the exact per-fence read below.
+    */
+   if (!wait && errors && hk_cmd_pending_points_cover(p) &&
+       *errors == p->fail_seq) {
+      for (unsigned i = 0; i < p->attempted; ++i)
+         p->succeeded[i] = true;
+      return HK_PENDING_SUCCEEDED;
+   }
+
    unsigned unknown_count = 0;
 
    for (unsigned i = 0; wait && i < p->attempted; ++i) {
@@ -893,7 +939,8 @@ hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
  * means every timeline signal up to it has happened. Check the queue's
  * submissions oldest first and stop at the first one past the reached point.
  * The point only skips the wait: each submission's own syncobjs are still
- * read before its memory is released. Fences on the timeline can signal out
+ * read before its memory is released, unless the VM's fence-error count
+ * shows that none of its fences failed. Fences on the timeline can signal out
  * of order, so an unfinished submission can hold back finished ones behind
  * it; once it has done so for a while, a few of them are also polled on each
  * reap. Finished work behind several long-running submissions stays pinned
@@ -914,6 +961,31 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
    else if (queue->cmd_stalled < HK_CMD_STALL_REAPS)
       queue->cmd_stalled++;
 
+   /* The fence-error count, for the fast path of hk_cmd_pending_poll() only.
+    * The query alone is not trusted there: a restarted SUBMIT can leave two
+    * links at one point under different fence contexts, and the query can
+    * then report a point while an older submission still runs. A zero-timeout
+    * wait on the reached point signals only once every older link has, so
+    * the fast path needs it to succeed; otherwise it is skipped this reap and
+    * the per-fence path runs as before. The count is loaded after that wait,
+    * the last ioctl, behind an acquire fence: the wait can decide on a plain
+    * load of a signalled flag in the kernel, and an acquire load orders only
+    * what follows it, so without the fence the count could be read before
+    * the point was seen, missing an increment that preceded its signal.
+    */
+   uint64_t errors_after_wait = 0;
+   const uint64_t *errors = NULL;
+   if (dev->fence_error_count && oldest->point <= reached) {
+      uint64_t point = reached;
+      if (!drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj, &point, 1,
+                                  0, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL)) {
+         __atomic_thread_fence(__ATOMIC_ACQUIRE);
+         errors_after_wait =
+            __atomic_load_n(dev->fence_error_count, __ATOMIC_ACQUIRE);
+         errors = &errors_after_wait;
+      }
+   }
+
    unsigned polls =
       queue->cmd_stalled >= HK_CMD_STALL_REAPS ? HK_CMD_STALL_POLLS : 0;
 
@@ -923,7 +995,7 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
       if (!signalled && !polls)
          break;
 
-      switch (hk_cmd_pending_poll(dev, p, !signalled)) {
+      switch (hk_cmd_pending_poll(dev, p, !signalled, errors)) {
       case HK_PENDING_BUSY:
          if (!signalled)
             polls--;
@@ -973,6 +1045,7 @@ hk_cmd_pending_reap(struct hk_device *dev)
 VkResult
 hk_cmd_pending_begin(struct hk_device *dev,
                      const struct vk_queue_submit *submit, unsigned chunks,
+                     bool chunk_timelines, bool cumulative_outputs,
                      struct hk_cmd_pending **out)
 {
    *out = NULL;
@@ -1020,6 +1093,16 @@ hk_cmd_pending_begin(struct hk_device *dev,
    assert(p->count == count);
    for (unsigned i = 0; i < p->count; ++i)
       hk_cmd_pin_ref(p->pins[i]);
+
+   p->chunk_timelines = chunk_timelines;
+   p->cumulative_outputs = cumulative_outputs;
+
+   /* Before the submission's first ioctl. The kernel cannot count an error
+    * of this submission before that ioctl creates its fences, so none of its
+    * own errors can be in the sample.
+    */
+   if (dev->fence_error_count)
+      p->fail_seq = __atomic_load_n(dev->fence_error_count, __ATOMIC_ACQUIRE);
 
    *out = p;
    return VK_SUCCESS;
