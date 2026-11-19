@@ -108,8 +108,10 @@ struct agx_submit_virt {
 };
 
 typedef struct {
+   /* A BO at `va` (agx_bo_create_at()), which it takes over and frees on
+    * failure too, or at a VA of its own when `va` is NULL. */
    struct agx_bo *(*bo_alloc)(struct agx_device *dev, size_t size, size_t align,
-                              enum agx_bo_flags flags);
+                              enum agx_bo_flags flags, struct agx_va *va);
    int (*bo_bind)(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
                   uint32_t count);
    void (*bo_mmap)(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,

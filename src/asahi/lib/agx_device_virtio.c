@@ -52,7 +52,7 @@ agx_virtio_simple_ioctl(struct agx_device *dev, unsigned cmd, void *_req)
 
 static struct agx_bo *
 agx_virtio_bo_alloc(struct agx_device *dev, size_t size, size_t align,
-                    enum agx_bo_flags flags)
+                    enum agx_bo_flags flags, struct agx_va *va)
 {
    struct agx_bo *bo;
    unsigned handle = 0;
@@ -79,7 +79,8 @@ agx_virtio_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    uint32_t blob_id = p_atomic_inc_return(&dev->next_blob_id);
 
    enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
-   struct agx_va *va = agx_va_alloc(dev, size, align, va_flags, 0);
+   if (!va)
+      va = agx_va_alloc(dev, size, align, va_flags, 0);
    if (!va) {
       fprintf(stderr, "Failed to allocate BO VMA\n");
       return NULL;
@@ -92,6 +93,7 @@ agx_virtio_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    handle = vdrm_bo_create(dev->vdrm, size, blob_flags, blob_id, 0, &req.hdr);
    if (!handle) {
       fprintf(stderr, "vdrm_bo_created failed\n");
+      agx_va_free(dev, va, false);
       return NULL;
    }
 

@@ -627,6 +627,37 @@ agx_bo_unreference(struct agx_device *dev, struct agx_bo *bo)
    simple_mtx_unlock(&dev->bo_map_lock);
 }
 
+/* Hands out a freshly allocated or reused BO. */
+static struct agx_bo *
+agx_bo_publish(struct agx_device *dev, struct agx_bo *bo, const char *label)
+{
+   bo->label = label;
+   p_atomic_set(&bo->refcnt, 1);
+
+   if (dev->debug &
+       (AGX_DBG_TRACE | AGX_DBG_ASYNCTRACE)) {
+      agx_bo_map(bo);
+      agxdecode_track_alloc(dev->agxdecode, bo);
+   }
+
+   agx_bo_dump_all_periodic(dev);
+   return bo;
+}
+
+/* A BO whose only GPU address is `va`, which it takes over, also when it
+ * fails. Never cached: the address is free again once the BO is. */
+struct agx_bo *
+agx_bo_create_at(struct agx_device *dev, size_t size, enum agx_bo_flags flags,
+                 struct agx_va *va, const char *label)
+{
+   assert(size > 0 && va != NULL);
+   flags |= AGX_BO_NO_CACHE;
+
+   struct agx_bo *bo = dev->ops.bo_alloc(dev, ALIGN_POT(size, AIL_PAGESIZE),
+                                         AIL_PAGESIZE, flags, va);
+   return bo ? agx_bo_publish(dev, bo, label) : NULL;
+}
+
 struct agx_bo *
 agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
               enum agx_bo_flags flags, const char *label)
@@ -654,14 +685,14 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
     * flush the cache to make space for the new allocation.
     */
    if (!bo)
-      bo = dev->ops.bo_alloc(dev, size, align, flags);
+      bo = dev->ops.bo_alloc(dev, size, align, flags, NULL);
    if (!bo) {
       bo = agx_bo_cache_fetch(dev, size, align, flags, false);
       reused = bo != NULL;
    }
    if (!bo) {
       agx_bo_cache_evict_all(dev);
-      bo = dev->ops.bo_alloc(dev, size, align, flags);
+      bo = dev->ops.bo_alloc(dev, size, align, flags, NULL);
    }
 
    if (!bo) {
@@ -707,15 +738,5 @@ agx_bo_create(struct agx_device *dev, size_t size, unsigned align,
       memset(map, 0, bo->size);
    }
 
-   bo->label = label;
-   p_atomic_set(&bo->refcnt, 1);
-
-   if (dev->debug &
-       (AGX_DBG_TRACE | AGX_DBG_ASYNCTRACE)) {
-      agx_bo_map(bo);
-      agxdecode_track_alloc(dev->agxdecode, bo);
-   }
-
-   agx_bo_dump_all_periodic(dev);
-   return bo;
+   return agx_bo_publish(dev, bo, label);
 }
