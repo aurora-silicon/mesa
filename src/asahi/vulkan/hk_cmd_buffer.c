@@ -409,7 +409,7 @@ hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
                             : HK_CMD_SPAN_SIZE;
    VkResult result =
       !uploader->map && size <= span && list_is_empty(&pool->free_bos[type]) &&
-            hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev)
+            hk_cached_cmd_uploads(&hk_cmd_buffer_device(cmd)->dev)
          ? hk_cmd_pool_alloc_bo_span(pool, type, span, bo_out)
          : hk_cmd_pool_alloc_bo(pool, type, bo_out);
    if (result != VK_SUCCESS)
@@ -922,13 +922,13 @@ hk_cmd_bo_clean_unlinked_streams(struct hk_cmd_buffer *cmd,
 }
 
 /* Clean everything recording wrote to CPU-cached command memory (see
- * hk_g17p_cached_cmd_memory()); hk_cmd_buffer_publish_root_uploads() and
+ * hk_cached_cmd_uploads()); hk_cmd_buffer_publish_root_uploads() and
  * queue submission fence the cleans. */
 static void
 hk_cmd_buffer_publish_cached_uploads(struct hk_cmd_buffer *cmd)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!hk_g17p_cached_cmd_memory(&dev->dev))
+   if (!hk_cached_cmd_uploads(&dev->dev))
       return;
 
    bool linked_stream = false;
