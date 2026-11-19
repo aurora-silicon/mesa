@@ -356,6 +356,7 @@ target_supports_program(const char *target, const nir_function *func)
           (!strcmp(target, "g17g") &&
            !strncmp(func->name, "libagx_agx3_as_", strlen("libagx_agx3_as_"))) ||
           !strcmp(func->name, "libagx_fill_uint4") ||
+          !strcmp(func->name, "libagx_fill_uint4_blocks") ||
           !strcmp(func->name, "libagx_gen1_as_property") ||
           !strcmp(func->name, "libagx_gen1_as_copy") ||
           /* Native G17P AS copies relocate child slots and then restore the

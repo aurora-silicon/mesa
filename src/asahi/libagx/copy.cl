@@ -302,6 +302,20 @@ libagx_fill_uint4(global uint4 *address, uint layer_stride_uint4, uint a,
    address[offs] = (uint4)(a, b, c, d);
 }
 
+/* Like libagx_fill_uint4, but each 32-lane group fills one 4 KiB block in
+ * eight rounds of adjacent 16-byte stores, so the address generation is
+ * shared by eight stores. The fill size must be a multiple of 4 KiB.
+ */
+KERNEL(32)
+libagx_fill_uint4_blocks(global uint4 *address, uint layer_stride_uint4,
+                         uint a, uint b, uint c, uint d)
+{
+   ulong base = (ulong)cl_global_id.y * layer_stride_uint4 +
+                (ulong)cl_group_id.x * 256 + cl_local_id.x;
+   for (uint i = 0; i < 8; ++i)
+      address[base + 32 * i] = (uint4)(a, b, c, d);
+}
+
 /*
  * Native M5 acceleration structures (vulkan/bvh/agx3_envelope.comp). An
  * image starts at a 1KiB-aligned base. Slot 0 holds the root and the header

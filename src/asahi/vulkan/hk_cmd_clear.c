@@ -21,6 +21,13 @@
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
 
+/* Smallest uncompressed level, in bytes per layer, cleared with
+ * libagx_fill_uint4_blocks. The block fill launches an eighth of the groups
+ * of libagx_fill_uint4, so a small fill has less parallelism: a 4 KiB clear
+ * is slower with it, while 256 KiB and larger clears are faster.
+ */
+#define HK_CLEAR_BLOCK_FILL_MIN_B (256 * 1024)
+
 void
 hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                enum pipe_format view_format, const uint32_t *clear_value,
@@ -159,6 +166,10 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                               util_logbase2(blocksize_B),
                               util_logbase2(layout->sample_count_sa), c[0],
                               c[1], c[2], c[3], word);
+         } else if (size >= HK_CLEAR_BLOCK_FILL_MIN_B && size % 4096 == 0) {
+            libagx_fill_uint4_blocks(cmd, agx_2d(size / 128, layer_count),
+                                     AGX_BARRIER_ALL, address, layer_stride_uint4,
+                                     c[0], c[1], c[2], c[3]);
          } else {
             libagx_fill_uint4(cmd, agx_2d(DIV_ROUND_UP(size, 16), layer_count),
                               AGX_BARRIER_ALL, address, layer_stride_uint4,
