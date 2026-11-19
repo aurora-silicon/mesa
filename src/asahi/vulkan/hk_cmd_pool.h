@@ -78,7 +78,8 @@ struct hk_device;
 static inline bool
 hk_g17p_cached_cmd_memory(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
+   return (dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G17C) &&
+          util_has_cache_ops();
 }
 
 struct hk_cmd_pool;
