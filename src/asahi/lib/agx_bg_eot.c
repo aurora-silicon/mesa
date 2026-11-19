@@ -229,6 +229,7 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
                &bindless_base, NULL, NULL, false,
                cache->dev->chip == AGX_CHIP_G18G,
                cache->dev->chip == AGX_CHIP_G18G,
+               cache->dev->chip == AGX_CHIP_G18G,
                agx_chip_native_agx3(cache->dev->chip) ||
                   agx_chip_g17_m5(cache->dev->chip),
                cache->dev->chip == AGX_CHIP_G18G);
