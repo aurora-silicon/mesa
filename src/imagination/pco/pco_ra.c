@@ -1,7 +1,7 @@
 /*
  * Copyright © 2024 Imagination Technologies Ltd.
  *
- * based in part on asahi driver which is:
+ * based in part on aurora driver which is:
  * Copyright 2022 Alyssa Rosenzweig
  *
  * SPDX-License-Identifier: MIT

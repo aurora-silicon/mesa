@@ -118,8 +118,8 @@ if with_gfxstream_vk
   endif
   subdir('gfxstream')
 endif
-if with_gallium_asahi or with_asahi_vk or with_tools.contains('asahi')
-  subdir('asahi')
+if with_gallium_aurora or with_aurora_vk or with_tools.contains('aurora')
+  subdir('aurora')
 endif
 if with_kosmickrisp_vk
   subdir('kosmickrisp')

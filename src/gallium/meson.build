@@ -70,11 +70,11 @@ else
   driver_swrast = declare_dependency()
 endif
 
-if with_gallium_asahi
-  subdir('winsys/asahi/drm')
-  subdir('drivers/asahi')
+if with_gallium_aurora
+  subdir('winsys/aurora/drm')
+  subdir('drivers/aurora')
 else
-  driver_asahi = declare_dependency()
+  driver_aurora = declare_dependency()
 endif
 if with_gallium_r300 or with_gallium_radeonsi or with_gallium_r600
   subdir('winsys/radeon/drm')

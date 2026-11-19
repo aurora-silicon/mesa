@@ -275,7 +275,7 @@ For hangs, preventing them would make it possible to make a trace.
    * - Freedreno
      - :envvar:`FD_MESA_DEBUG`, :envvar:`IR3_SHADER_DEBUG`
    * - HK
-     - :envvar:`ASAHI_MESA_DEBUG`, :envvar:`AGX_MESA_DEBUG`
+     - :envvar:`AURORA_MESA_DEBUG`, :envvar:`AGX_MESA_DEBUG`
    * - PANVK
      - ``PANVK_DEBUG``
    * - V3DV, V3D

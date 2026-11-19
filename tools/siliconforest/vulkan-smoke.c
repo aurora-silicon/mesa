@@ -19,7 +19,7 @@
 
 int main(int argc, char **argv)
 {
-   REQUIRE(dlsym(RTLD_DEFAULT, "asahi_noop_is_registered_fd") != NULL);
+   REQUIRE(dlsym(RTLD_DEFAULT, "aurora_noop_is_registered_fd") != NULL);
    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                             .pApplicationName = "siliconforest-host-smoke",
                             .apiVersion = VK_API_VERSION_1_3};

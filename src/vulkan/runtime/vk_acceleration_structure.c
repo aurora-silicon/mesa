@@ -1421,8 +1421,8 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
       }
 
       if (args->emit_markers &&
-          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
-          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "leaves") == 0) {
+          getenv("AURORA_G17P_AS_STOP_AFTER") &&
+          strcmp(getenv("AURORA_G17P_AS_STOP_AFTER"), "leaves") == 0) {
          free(states);
          return;
       }
@@ -1443,8 +1443,8 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
 
       if (args->emit_markers &&
-          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
-          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "fills") == 0) {
+          getenv("AURORA_G17P_AS_STOP_AFTER") &&
+          strcmp(getenv("AURORA_G17P_AS_STOP_AFTER"), "fills") == 0) {
          free(states);
          return;
       }
@@ -1459,8 +1459,8 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
       vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
 
       if (args->emit_markers &&
-          getenv("ASAHI_G17P_AS_STOP_AFTER") &&
-          strcmp(getenv("ASAHI_G17P_AS_STOP_AFTER"), "morton") == 0) {
+          getenv("AURORA_G17P_AS_STOP_AFTER") &&
+          strcmp(getenv("AURORA_G17P_AS_STOP_AFTER"), "morton") == 0) {
          free(states);
          return;
       }

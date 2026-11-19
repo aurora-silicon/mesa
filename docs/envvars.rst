@@ -2161,10 +2161,10 @@ r300 driver environment variables
       and 0 * anything = 0 rules in FS
 
 
-Asahi driver environment variables
-----------------------------------
+Aurora driver environment variables
+-----------------------------------
 
-.. envvar:: ASAHI_MESA_DEBUG
+.. envvar:: AURORA_MESA_DEBUG
 
    a comma-separated list of named flags, which do various things:
 

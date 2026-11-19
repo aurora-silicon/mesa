@@ -36,8 +36,8 @@ endif
 if with_gallium_panfrost
   renderonly_drivers_c_args += '-DGALLIUM_PANFROST'
 endif
-if with_gallium_asahi
-  renderonly_drivers_c_args += '-DGALLIUM_ASAHI'
+if with_gallium_aurora
+  renderonly_drivers_c_args += '-DGALLIUM_AURORA'
 endif
 if with_gallium_rocket
   renderonly_drivers_c_args += '-DGALLIUM_ROCKET'

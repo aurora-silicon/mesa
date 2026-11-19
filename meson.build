@@ -116,7 +116,7 @@ with_tools = get_option('tools')
 if with_tools.contains('all')
   with_tools = [
     'amd',
-    'asahi',
+    'aurora',
     'dlclose-skip',
     'drm-shim',
     'etnaviv',
@@ -174,7 +174,7 @@ if gallium_drivers.contains('auto')
       gallium_drivers = [
         'v3d', 'vc4', 'freedreno', 'etnaviv', 'nouveau', 'svga',
         'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
-        'zink', 'asahi'
+        'zink', 'aurora'
       ]
     elif ['arm'].contains(host_machine.cpu_family())
       gallium_drivers = [
@@ -206,7 +206,7 @@ elif gallium_drivers.contains('all')
    gallium_drivers = [
      'r300', 'r600', 'radeonsi', 'crocus', 'v3d', 'vc4', 'freedreno', 'etnaviv', 'i915',
      'nouveau', 'svga', 'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
-     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu'
+     'zink', 'd3d12', 'aurora', 'rocket', 'ethosu'
    ]
 endif
 
@@ -232,7 +232,7 @@ with_gallium_virgl = gallium_drivers.contains('virgl')
 with_gallium_lima = gallium_drivers.contains('lima')
 with_gallium_zink = gallium_drivers.contains('zink')
 with_gallium_d3d12 = gallium_drivers.contains('d3d12')
-with_gallium_asahi = gallium_drivers.contains('asahi')
+with_gallium_aurora = gallium_drivers.contains('aurora')
 with_gallium_rocket = gallium_drivers.contains('rocket')
 with_gallium_ethosu = gallium_drivers.contains('ethosu')
 foreach gallium_driver : gallium_drivers
@@ -257,7 +257,7 @@ endif
 
 with_gallium = gallium_drivers.length() != 0
 with_gallium_drm = system_has_kms_drm and [
-  with_gallium_asahi,
+  with_gallium_aurora,
   with_gallium_etnaviv,
   with_gallium_freedreno,
   with_gallium_lima,
@@ -273,7 +273,7 @@ if _vulkan_drivers.contains('auto')
     if host_machine.cpu_family().startswith('x86')
       _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'nouveau', 'swrast']
     elif ['aarch64'].contains(host_machine.cpu_family())
-      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'asahi']
+      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'aurora']
     elif ['arm'].contains(host_machine.cpu_family())
       _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno']
     elif ['mips', 'mips64', 'ppc', 'ppc64', 'riscv32', 'riscv64'].contains(host_machine.cpu_family())
@@ -296,7 +296,7 @@ elif _vulkan_drivers.contains('all')
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
                       'imagination', 'microsoft-experimental',
-                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp']
+                      'nouveau', 'aurora', 'gfxstream', 'kosmickrisp']
 endif
 
 with_intel_vk = _vulkan_drivers.contains('intel')
@@ -311,7 +311,7 @@ with_imagination_vk = _vulkan_drivers.contains('imagination')
 with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
-with_asahi_vk = _vulkan_drivers.contains('asahi')
+with_aurora_vk = _vulkan_drivers.contains('aurora')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
 with_any_vk = _vulkan_drivers.length() != 0
@@ -354,8 +354,8 @@ endif
 with_vdrm = [
   with_amdgpu_virtio,
   freedreno_kmds.contains('virtio'),
-  with_gallium_asahi,
-  with_asahi_vk,
+  with_gallium_aurora,
+  with_aurora_vk,
   with_intel_virtio,
 ].contains(true)
 
@@ -739,7 +739,7 @@ if with_gallium_d3d12 and not _with_gallium_d3d12_video.disabled()
   pre_args += '-DHAVE_GALLIUM_D3D12_VIDEO'
 endif
 
-with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk or with_asahi_vk
+with_bvh = with_amd_vk or with_intel_vk or with_swrast_vk or with_freedreno_vk or with_aurora_vk
 _glslang_preamble_version = '12.2'
 
 # GLSL has interesting version output and Meson doesn't parse it correctly as of
@@ -1031,8 +1031,8 @@ endif
 
 with_driver_using_cl = [
   with_gallium_iris, with_gallium_crocus, with_intel_vk, with_intel_hasvk,
-  with_gallium_asahi, with_asahi_vk,
-  with_tools.contains('asahi'),
+  with_gallium_aurora, with_aurora_vk,
+  with_tools.contains('aurora'),
   with_gallium_panfrost, with_panfrost_vk,
   with_gallium_rusticl,
   with_nouveau_vk, with_imagination_vk,
@@ -1054,7 +1054,7 @@ with_llvm = with_llvm \
   .enable_if(with_clc, error_message : 'CLC requires LLVM')
 
 with_poly = [
-  with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+  with_gallium_aurora, with_aurora_vk, with_tools.contains('aurora'),
   with_kosmickrisp_vk,
 ].contains(true)
 

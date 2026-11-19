@@ -10,7 +10,7 @@ import subprocess
 
 ALIASES = {
     "amd": "gfx1201",
-    "asahi": "m1",
+    "aurora": "m1",
     "etnaviv": "gc2000-r5108",
     "freedreno": "a750",
     "intel": "lnl",
@@ -46,7 +46,7 @@ TARGETS = {
     "navi31": ["amd", "NAVI31"],
     "gfx1201": ["amd", "GFX1201"],
 
-    "m1": ["asahi", None],
+    "m1": ["aurora", None],
 
     "gc2000-r5108": ["etnaviv", "2000:5108"],
     "gc3000-r5450": ["etnaviv", "3000:5450"],
@@ -120,7 +120,7 @@ for target in INTEL_TARGETS:
 
 LD_PRELOAD = {
     "amd": "src/amd/drm-shim/libamdgpu_noop_drm_shim.so",
-    "asahi": "src/asahi/drm-shim/libasahi_noop_drm_shim.so",
+    "aurora": "src/aurora/drm-shim/libaurora_noop_drm_shim.so",
     "etnaviv": "src/etnaviv/drm-shim/libetnaviv_noop_drm_shim.so",
     "freedreno": "src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so",
     "intel": "src/intel/tools/libintel_noop_drm_shim.so",
@@ -142,7 +142,7 @@ SHIM_VAR = {
 
 DISASM = {
     "amd": [("AMD_DEBUG", "vs,ps,gs,tcs,tes,cs,ts,ms,nir,aco,asm"), ("RADV_DEBUG", "shaders")],
-    "asahi": [("AGX_MESA_DEBUG", "shaders")],
+    "aurora": [("AGX_MESA_DEBUG", "shaders")],
     "etnaviv": [("ETNA_MESA_DEBUG", "dump_shaders")],
     "freedreno": [("IR3_SHADER_DEBUG", "disasm")],
     "intel": [("INTEL_DEBUG", "vs,tcs,tes,gs,fs,cs,mesh,task,rt")],

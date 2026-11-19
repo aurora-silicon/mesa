@@ -33,7 +33,7 @@ librusticl = shared_library(
     libws_null,
   ],
   dependencies : [
-    driver_asahi,
+    driver_aurora,
     driver_freedreno,
     driver_iris,
     driver_nouveau,

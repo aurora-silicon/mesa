@@ -10,8 +10,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 build = Path(sys.argv[1]).resolve()
-shim = build / 'src/asahi/drm-shim/libasahi_noop_drm_shim.so'
-icds = list((build / 'src/asahi/vulkan').glob('asahi_devenv_icd.*.json'))
+shim = build / 'src/aurora/drm-shim/libaurora_noop_drm_shim.so'
+icds = list((build / 'src/aurora/vulkan').glob('aurora_devenv_icd.*.json'))
 assert shim.is_file() and len(icds) == 1, 'Build the driver, development ICD and drm-shim first'
 with tempfile.TemporaryDirectory(prefix='siliconforest-vulkan-smoke-') as directory:
     binary = str(Path(directory) / 'vulkan-smoke')
@@ -28,12 +28,12 @@ with tempfile.TemporaryDirectory(prefix='siliconforest-vulkan-smoke-') as direct
     for chip, old_opt_in, refused in cases:
         env = os.environ.copy()
         env.update(LD_PRELOAD=str(shim), VK_DRIVER_FILES=str(icds[0]),
-                   ASAHI_SHIM_CHIP=chip, ASAHI_SHIM_G15S_EXPECT_VALID='1')
+                   AURORA_SHIM_CHIP=chip, AURORA_SHIM_G15S_EXPECT_VALID='1')
         for key in ['VK_ICD_FILENAMES', 'VK_LOADER_DRIVERS_SELECT',
-                    'VK_LOADER_DRIVERS_DISABLE', 'ASAHI_M3_EXPERIMENTAL']:
+                    'VK_LOADER_DRIVERS_DISABLE', 'AURORA_M3_EXPERIMENTAL']:
             env.pop(key, None)
         if old_opt_in is not None:
-            env['ASAHI_M3_EXPERIMENTAL'] = old_opt_in
+            env['AURORA_M3_EXPERIMENTAL'] = old_opt_in
         print('drm-shim profile:', chip, 'old opt-in:', old_opt_in,
               'expected:', 'refused' if refused else 'admitted', flush=True)
         command = [binary] + (['--expect-no-device'] if refused else [])

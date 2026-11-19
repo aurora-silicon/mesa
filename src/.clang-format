@@ -199,7 +199,7 @@ ForEachMacros:
   - vk_foreach_multi_draw
   - vk_foreach_multi_draw_indexed
 
-# asahi
+# aurora
   - foreach_active
   - foreach_submitted
   - hk_foreach_view

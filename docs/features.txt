@@ -36,7 +36,7 @@ context as extensions.
 Feature                                                 Status
 ------------------------------------------------------- ------------------------
 
-GL 3.0, GLSL 1.30 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, panfrost, asahi, iris, crocus/gen6+
+GL 3.0, GLSL 1.30 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, panfrost, aurora, iris, crocus/gen6+
 
   glBindFragDataLocation, glGetFragDataLocation         DONE
   GL_NV_conditional_render (Conditional rendering)      DONE (v3d, etnaviv/HALTI0)
@@ -69,7 +69,7 @@ GL 3.0, GLSL 1.30 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe,
 (*) freedreno (a2xx-a4xx) and softpipe have fake Multisample anti-aliasing support
 
 
-GL 3.1, GLSL 1.40 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, panfrost, asahi, iris, crocus/gen6+
+GL 3.1, GLSL 1.40 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, panfrost, aurora, iris, crocus/gen6+
 
   Forward compatible context support/deprecations       DONE
   GL_ARB_draw_instanced (Instanced drawing)             DONE (etnaviv/HALTI2, v3d, crocus)
@@ -82,7 +82,7 @@ GL 3.1, GLSL 1.40 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe,
   GL_EXT_texture_snorm (Signed normalized textures)     DONE (v3d, crocus, etnaviv/HALTI1)
 
 
-GL 3.2, GLSL 1.50 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, iris, crocus/gen6+, asahi
+GL 3.2, GLSL 1.50 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, iris, crocus/gen6+, aurora
 
   Core/compatibility profiles                           DONE
   Geometry shaders                                      DONE (freedreno/a6xx, crocus)
@@ -97,7 +97,7 @@ GL 3.2, GLSL 1.50 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe,
   GLX_ARB_create_context_profile                        DONE
 
 
-GL 3.3, GLSL 3.30 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, iris, crocus/gen6+, asahi
+GL 3.3, GLSL 3.30 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, iris, crocus/gen6+, aurora
 
   GL_ARB_blend_func_extended                            DONE (freedreno/a3xx, freedreno/a5xx+, v3d, panfrost, lima)
   GL_ARB_explicit_attrib_location                       DONE (all drivers that support GLSL)
@@ -111,7 +111,7 @@ GL 3.3, GLSL 3.30 --- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe,
   GL_ARB_vertex_type_2_10_10_10_rev                     DONE (v3d, panfrost, etnaviv/HALTI2)
 
 
-GL 4.0, GLSL 4.00 --- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7+, asahi
+GL 4.0, GLSL 4.00 --- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7+, aurora
 
   GL_ARB_draw_buffers_blend                             DONE (freedreno, nv50, softpipe, panfrost, v3d, crocus/gen6+, etnaviv/HALTI5+)
   GL_ARB_draw_indirect                                  DONE (freedreno, softpipe, v3d, panfrost, etnaviv/HALTI5+)
@@ -140,7 +140,7 @@ GL 4.0, GLSL 4.00 --- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, 
   GL_ARB_transform_feedback3                            DONE (freedreno/a3xx+, softpipe, panfrost)
 
 
-GL 4.1, GLSL 4.10 --- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7+, asahi
+GL 4.1, GLSL 4.10 --- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7+, aurora
 
   GL_ARB_ES2_compatibility                              DONE (freedreno, nv50, softpipe, v3d, vc4, panfrost, lima, crocus)
   GL_ARB_get_program_binary                             DONE (all drivers)
@@ -150,7 +150,7 @@ GL 4.1, GLSL 4.10 --- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, 
   GL_ARB_viewport_array                                 DONE (freedreno/a6xx, nv50, softpipe, crocus/gen6+)
 
 
-GL 4.2, GLSL 4.20 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7+, asahi
+GL 4.2, GLSL 4.20 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7+, aurora
 
   GL_ARB_texture_compression_bptc                       DONE (all drivers that supports EXT_texture_sRGB and OES_texture_half_float)
   GL_ARB_compressed_texture_pixel_storage               DONE (all drivers)
@@ -166,7 +166,7 @@ GL 4.2, GLSL 4.20 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, v
   GL_ARB_map_buffer_alignment                           DONE (all drivers)
 
 
-GL 4.3, GLSL 4.30 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7.5+, asahi
+GL 4.3, GLSL 4.30 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, d3d12, iris, crocus/gen7.5+, aurora
 
   GL_ARB_arrays_of_arrays                               DONE (all drivers that support GLSL 1.30)
   GL_ARB_ES3_compatibility                              DONE (all drivers that support GLSL 3.30)
@@ -192,7 +192,7 @@ GL 4.3, GLSL 4.30 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, v
   GL_ARB_vertex_attrib_binding                          DONE (all drivers)
 
 
-GL 4.4, GLSL 4.40 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, iris, crocus/gen7.5+, d3d12, asahi
+GL 4.4, GLSL 4.40 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, iris, crocus/gen7.5+, d3d12, aurora
 
   GL_MAX_VERTEX_ATTRIB_STRIDE                           DONE (all drivers)
   GL_ARB_buffer_storage                                 DONE (freedreno, nv50, v3d, vc4, lima, panfrost, softpipe, etnaviv, crocus)
@@ -211,7 +211,7 @@ GL 4.4, GLSL 4.40 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, v
   GL_ARB_vertex_type_10f_11f_11f_rev                    DONE (freedreno, nv50, softpipe, panfrost, crocus, svga)
   GL_NV_shader_atomic_int64                             DONE (radeonsi, panfrost/v9+)
 
-GL 4.5, GLSL 4.50 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, iris, crocus/gen7.5+, d3d12, asahi
+GL 4.5, GLSL 4.50 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, virgl, zink, iris, crocus/gen7.5+, d3d12, aurora
 
   GL_ARB_ES3_1_compatibility                            DONE (freedreno/a6xx, softpipe)
   GL_ARB_clip_control                                   DONE (freedreno, nv50, softpipe, lima, panfrost, crocus, v3d)
@@ -226,7 +226,7 @@ GL 4.5, GLSL 4.50 -- all DONE: freedreno/a6xx, nvc0, r600, radeonsi, llvmpipe, v
   GL_KHR_robustness                                     DONE (freedreno, panfrost, v3d)
   GL_EXT_shader_integer_mix                             DONE (all drivers that support GLSL)
 
-GL 4.6, GLSL 4.60 -- all DONE: radeonsi, virgl, zink, iris, crocus/gen7+, d3d12, asahi, r600/evergreen+, llvmpipe
+GL 4.6, GLSL 4.60 -- all DONE: radeonsi, virgl, zink, iris, crocus/gen7+, d3d12, aurora, r600/evergreen+, llvmpipe
 
   GL_ARB_gl_spirv                                       DONE (freedreno, r600)
   GL_ARB_indirect_parameters                            DONE (freedreno/a6xx+, nvc0, r600/evergreen+)
@@ -240,10 +240,10 @@ GL 4.6, GLSL 4.60 -- all DONE: radeonsi, virgl, zink, iris, crocus/gen7+, d3d12,
   GL_ARB_transform_feedback_overflow_query              DONE (freedreno/a6xx+, nvc0, softpipe, crocus/gen6+, r600/evergreen+)
   GL_KHR_no_error                                       DONE (all drivers)
 
-GLES3.0, GLSL ES 3.0 -- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, panfrost, asahi, iris, crocus/gen6+, v3d, etnaviv/HALTI5
+GLES3.0, GLSL ES 3.0 -- all DONE: freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, zink, d3d12, panfrost, aurora, iris, crocus/gen6+, v3d, etnaviv/HALTI5
 
 These are the extensions cherry-picked to make GLES 3.1
-GLES3.1, GLSL ES 3.1 -- all DONE: freedreno/a5xx+, nvc0, r600, radeonsi, virgl, v3d, softpipe, llvmpipe, zink, panfrost, d3d12, iris, crocus/gen7.5+, asahi
+GLES3.1, GLSL ES 3.1 -- all DONE: freedreno/a5xx+, nvc0, r600, radeonsi, virgl, v3d, softpipe, llvmpipe, zink, panfrost, d3d12, iris, crocus/gen7.5+, aurora
 
   GL_ARB_arrays_of_arrays                               DONE (all drivers that support GLSL 1.30)
   GL_ARB_draw_indirect                                  DONE (freedreno, crocus/gen7+)
@@ -271,7 +271,7 @@ GLES3.1, GLSL ES 3.1 -- all DONE: freedreno/a5xx+, nvc0, r600, radeonsi, virgl, 
       glGetBooleani_v - restrict to GLES enums
       gl_HelperInvocation support                       DONE (r600, crocus)
 
-GLES3.2, GLSL ES 3.2 -- all DONE: freedreno/a6xx, radeonsi, virgl, llvmpipe, zink, iris, crocus/gen7.5+, asahi
+GLES3.2, GLSL ES 3.2 -- all DONE: freedreno/a6xx, radeonsi, virgl, llvmpipe, zink, iris, crocus/gen7.5+, aurora
 
   GL_EXT_color_buffer_float                             DONE (all drivers)
   GL_KHR_blend_equation_advanced                        DONE (freedreno/a6xx, nvc0, panfrost, crocus/gen4.5+, v3d)
@@ -300,31 +300,31 @@ Khronos, ARB, and OES extensions that are not part of any OpenGL or OpenGL ES ve
 
   GL_ARB_bindless_texture                               DONE (nvc0, radeonsi, zink)
   GL_ARB_cl_event                                       not started
-  GL_ARB_compute_variable_group_size                    DONE (freedreno/a4xx+, nvc0, radeonsi, zink, iris, crocus/gen7+, asahi, r600)
-  GL_ARB_ES3_2_compatibility                            DONE (freedreno/a6xx, llvmpipe, radeonsi, virgl, zink, iris, crocus/gen7.5+, asahi)
+  GL_ARB_compute_variable_group_size                    DONE (freedreno/a4xx+, nvc0, radeonsi, zink, iris, crocus/gen7+, aurora, r600)
+  GL_ARB_ES3_2_compatibility                            DONE (freedreno/a6xx, llvmpipe, radeonsi, virgl, zink, iris, crocus/gen7.5+, aurora)
   GL_ARB_fragment_shader_interlock                      DONE (zink, iris/gen9+)
-  GL_ARB_gpu_shader_int64                               DONE (freedreno/a6xx, nvc0, radeonsi, softpipe, llvmpipe, zink, d3d12, iris, crocus/gen8, asahi)
-  GL_ARB_parallel_shader_compile                        DONE (freedreno, llvmpipe, radeonsi, etnaviv, virgl, zink, iris, crocus/gen6+, asahi)
+  GL_ARB_gpu_shader_int64                               DONE (freedreno/a6xx, nvc0, radeonsi, softpipe, llvmpipe, zink, d3d12, iris, crocus/gen8, aurora)
+  GL_ARB_parallel_shader_compile                        DONE (freedreno, llvmpipe, radeonsi, etnaviv, virgl, zink, iris, crocus/gen6+, aurora)
   GL_ARB_post_depth_coverage                            DONE (freedreno/a6xx, nvc0, radeonsi, llvmpipe, zink, iris/gen9+)
   GL_ARB_robustness_isolation                           not started
   GL_ARB_sample_locations                               DONE (freedreno/a6xx, nvc0, zink, llvmpipe)
-  GL_ARB_seamless_cubemap_per_texture                   DONE (etnaviv/SEAMLESS_CUBE_MAP, freedreno, nvc0, r600, radeonsi, softpipe, llvmpipe, virgl, zink, asahi, iris, crocus)
-  GL_ARB_shader_ballot                                  DONE (llvmpipe, nvc0, radeonsi, zink, iris, crocus/gen8, d3d12, asahi)
+  GL_ARB_seamless_cubemap_per_texture                   DONE (etnaviv/SEAMLESS_CUBE_MAP, freedreno, nvc0, r600, radeonsi, softpipe, llvmpipe, virgl, zink, aurora, iris, crocus)
+  GL_ARB_shader_ballot                                  DONE (llvmpipe, nvc0, radeonsi, zink, iris, crocus/gen8, d3d12, aurora)
   GL_ARB_shader_clock                                   DONE (freedreno/a6xx, nv50, nvc0, r600, radeonsi, llvmpipe, virgl, panfrost/v6+, zink, iris, crocus/gen7+)
-  GL_ARB_shader_stencil_export                          DONE (r600, radeonsi, softpipe, llvmpipe, virgl, panfrost, zink, asahi, iris/gen9+)
-  GL_ARB_shader_viewport_layer_array                    DONE (freedreno/a6xx, llvmpipe, nvc0, radeonsi, zink, iris, crocus/gen6+, asahi)
+  GL_ARB_shader_stencil_export                          DONE (r600, radeonsi, softpipe, llvmpipe, virgl, panfrost, zink, aurora, iris/gen9+)
+  GL_ARB_shader_viewport_layer_array                    DONE (freedreno/a6xx, llvmpipe, nvc0, radeonsi, zink, iris, crocus/gen6+, aurora)
   GL_ARB_shading_language_include                       DONE
   GL_ARB_sparse_buffer                                  DONE (radeonsi/gfx9+, zink)
   GL_ARB_sparse_texture                                 DONE (radeonsi/gfx9+, zink)
   GL_ARB_sparse_texture2                                DONE (radeonsi/gfx9+, zink)
   GL_ARB_sparse_texture_clamp                           DONE (radeonsi/gfx9+, zink)
-  GL_ARB_texture_buffer_object                          DONE (freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, d3d12, asahi, iris, crocus/gen6+)
+  GL_ARB_texture_buffer_object                          DONE (freedreno, nv50, nvc0, r600, radeonsi, llvmpipe, softpipe, virgl, d3d12, aurora, iris, crocus/gen6+)
   GL_ARB_texture_filter_minmax                          DONE (freedreno/a6xx, iris/gen9+, llvmpipe, nvc0/gm200+, zink)
   GL_ARM_shader_framebuffer_fetch_depth_stencil         DONE (llvmpipe)
-  GL_EXT_shader_framebuffer_fetch                       DONE (freedreno/a6xx, iris/gen9+, llvmpipe, panfrost, virgl, zink, asahi, v3d)
-  GL_EXT_shader_framebuffer_fetch_non_coherent          DONE (freedreno/a6xx, iris, llvmpipe, panfrost, virgl, zink, asahi, v3d)
+  GL_EXT_shader_framebuffer_fetch                       DONE (freedreno/a6xx, iris/gen9+, llvmpipe, panfrost, virgl, zink, aurora, v3d)
+  GL_EXT_shader_framebuffer_fetch_non_coherent          DONE (freedreno/a6xx, iris, llvmpipe, panfrost, virgl, zink, aurora, v3d)
   GL_EXT_clear_texture                                  DONE (all drivers)
-  GL_EXT_color_buffer_half_float                        DONE (freedreno, iris, llvmpipe, nv50, nvc0, radeonsi, virgl, zink, crocus, asahi, v3d, panfrost)
+  GL_EXT_color_buffer_half_float                        DONE (freedreno, iris, llvmpipe, nv50, nvc0, radeonsi, virgl, zink, crocus, aurora, v3d, panfrost)
   GL_EXT_conservative_depth                             DONE (all drivers that support GLES 3.0+)
   GL_EXT_depth_bounds_test                              DONE (freedreno/a6xx, nv50, nvc0, radeonsi, softpipe, zink, iris/gen12+)
   GL_EXT_memory_object                                  DONE (freedreno, radeonsi, llvmpipe, zink, d3d12, iris, crocus/gen7+)
@@ -333,7 +333,7 @@ Khronos, ARB, and OES extensions that are not part of any OpenGL or OpenGL ES ve
   GL_EXT_mesh_shader                                    DONE (radeonsi/gfx10_3+, zink)
   GL_EXT_multisampled_render_to_texture                 DONE (freedreno/a6xx, panfrost, zink, lima)
   GL_EXT_polygon_offset_clamp                           DONE (all drivers that support GL_ARB_polygon_offset_clamp)
-  GL_EXT_render_snorm                                   DONE (freedreno/a6xx, r600, radeonsi, softpipe, llvmpipe, virgl, zink, panfrost/v6+, iris, asahi)
+  GL_EXT_render_snorm                                   DONE (freedreno/a6xx, r600, radeonsi, softpipe, llvmpipe, virgl, zink, panfrost/v6+, iris, aurora)
   GL_EXT_semaphore                                      DONE (radeonsi, zink, d3d12, iris, crocus)
   GL_EXT_semaphore_fd                                   DONE (radeonsi, zink, iris, crocus)
   GL_EXT_semaphore_win32                                DONE (zink, d3d12)
@@ -345,14 +345,14 @@ Khronos, ARB, and OES extensions that are not part of any OpenGL or OpenGL ES ve
   GL_EXT_texture_compression_astc_decode_mode           DONE (panfrost/v7+)
   GL_EXT_texture_norm16                                 DONE (freedreno, r600, radeonsi, nvc0, softpipe, llvmpipe, virgl, zink, iris, crocus, v3d, panfrost)
   GL_EXT_texture_sRGB_R8                                DONE (all drivers that support GLES 3.0+)
-  GL_EXT_texture_shadow_lod                             DONE (asahi, crocus/gen6+, iris, llvmpipe, nvc0, radeonsi, r600/evergreen+, virgl)
+  GL_EXT_texture_shadow_lod                             DONE (aurora, crocus/gen6+, iris, llvmpipe, nvc0, radeonsi, r600/evergreen+, virgl)
   GL_EXT_texture_view                                   DONE (all drivers that support GL_OES_texture_view)
   GL_EXT_YUV_target                                     DONE (freedreno/a6xx+)
-  GL_KHR_blend_equation_advanced_coherent               DONE (freedreno/a6xx, llvmpipe, panfrost, zink, asahi, iris/gen9+, v3d)
+  GL_KHR_blend_equation_advanced_coherent               DONE (freedreno/a6xx, llvmpipe, panfrost, zink, aurora, iris/gen9+, v3d)
   GL_KHR_robust_buffer_access_behavior                  DONE (panfrost, llvmpipe, virgl)
-  GL_KHR_shader_subgroup                                DONE (radeonsi, zink, asahi, iris/gen9+)
-  GL_KHR_texture_compression_astc_hdr                   DONE (freedreno, panfrost, zink, asahi)
-  GL_KHR_texture_compression_astc_sliced_3d             DONE (freedreno/a4xx+, r600, radeonsi, panfrost, softpipe, llvmpipe, v3d, virgl, zink, lima, asahi, iris/gen9+)
+  GL_KHR_shader_subgroup                                DONE (radeonsi, zink, aurora, iris/gen9+)
+  GL_KHR_texture_compression_astc_hdr                   DONE (freedreno, panfrost, zink, aurora)
+  GL_KHR_texture_compression_astc_sliced_3d             DONE (freedreno/a4xx+, r600, radeonsi, panfrost, softpipe, llvmpipe, v3d, virgl, zink, lima, aurora, iris/gen9+)
   GL_NV_timeline_semaphore                              DONE (radeonsi, zink)
   GL_OES_depth_texture_cube_map                         DONE (all drivers that support GLSL 1.30+)
   GL_OES_EGL_image                                      DONE (all drivers)
@@ -361,12 +361,12 @@ Khronos, ARB, and OES extensions that are not part of any OpenGL or OpenGL ES ve
   GL_OES_required_internalformat                        DONE (all drivers)
   GL_OES_surfaceless_context                            DONE (all drivers)
   GL_OES_texture_compression_astc                       DONE (core only)
-  GL_OES_texture_float                                  DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, asahi, iris, crocus, etnaviv/HALF_FLOAT)
-  GL_OES_texture_float_linear                           DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, virgl, zink, asahi, iris, crocus)
-  GL_OES_texture_half_float                             DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, lima, asahi, iris, crocus, etnaviv/HALF_FLOAT)
-  GL_OES_texture_half_float_linear                      DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, lima, asahi, iris, crocus, etnaviv/HALF_FLOAT)
+  GL_OES_texture_float                                  DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, aurora, iris, crocus, etnaviv/HALF_FLOAT)
+  GL_OES_texture_float_linear                           DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, virgl, zink, aurora, iris, crocus)
+  GL_OES_texture_half_float                             DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, lima, aurora, iris, crocus, etnaviv/HALF_FLOAT)
+  GL_OES_texture_half_float_linear                      DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, lima, aurora, iris, crocus, etnaviv/HALF_FLOAT)
   GL_OES_texture_view                                   DONE (freedreno, r600, radeonsi, nv50, nvc0, softpipe, llvmpipe, panfrost, v3d, virgl, zink, iris, crocus/gen7+, d3d12)
-  GL_OES_viewport_array                                 DONE (freedreno/a6xx, nvc0, r600, radeonsi, softpipe, llvmpipe, virgl, zink, iris, crocus/gen7.5+, asahi)
+  GL_OES_viewport_array                                 DONE (freedreno/a6xx, nvc0, r600, radeonsi, softpipe, llvmpipe, virgl, zink, iris, crocus/gen7.5+, aurora)
   GL_OVR_multiview                                      DONE (llvmpipe, zink)
   GL_OVR_multiview2                                     DONE (llvmpipe, zink)
   GL_OVR_multiview_multisampled_render_to_texture       DONE (zink)
@@ -820,7 +820,7 @@ Rusticl OpenCL 3.0 -- all DONE:
   CL_COMMAND_SVM_MIGRATE_MEM for clGetEventInfo         DONE
   OpenCL C 3.0                                          DONE
 
-Rusticl OpenCL 3.1 -- all DONE: asahi, iris, llvmpipe, radeonsi, zink
+Rusticl OpenCL 3.1 -- all DONE: aurora, iris, llvmpipe, radeonsi, zink
   cl_khr_il_program                                     DONE
   - Support SPIR-V 1.4                                  DONE
   - Max SPIR-V version                                  DONE 1.6
@@ -847,7 +847,7 @@ Rusticl Optional Core Features:
   - Built-in kernels                                    in progress (reports 0 built-in kernels)
   - Device partitioning                                 not started
   - cl_khr_fp64                                         in progress (iris, llvmpipe, nvc0, radeonsi, zink, Available with environment variable RUSTICL_FEATURES=fp64, device dependent.)
-  Latest conformance version passed for devices         DONE (asahi, iris, panfrost, zink)
+  Latest conformance version passed for devices         DONE (aurora, iris, panfrost, zink)
 
 
 Rusticl Optional OpenCL 2.x Features:
@@ -871,7 +871,7 @@ Rusticl Optional OpenCL 2.x Features:
   Device and host timer synchronization                 DONE (freedreno, iris, llvmpipe, radeonsi, zink)
   OpenCL C 2.0                                          in progress
   - Memory Consistency Model (atomics)                  not started
-  - Sub-groups                                          DONE (asahi, iris, llvmpipe, radeonsi, zink)
+  - Sub-groups                                          DONE (aurora, iris, llvmpipe, radeonsi, zink)
   - Work-group Collective Functions                     not started
   - Generic Address Space                               in progress
   Program Initialization and Clean-Up Kernels           not started
@@ -900,7 +900,7 @@ Rusticl extensions:
   cl_khr_external_semaphore_opaque_fd                   not started
   cl_khr_external_semaphore_sync_fd                     DONE (iris, radeonsi, zink)
   cl_khr_external_semaphore_win32                       not started
-  cl_khr_fp16                                           DONE (asahi, freedreno, llvmpipe, panfrost, radeonsi, zink)
+  cl_khr_fp16                                           DONE (aurora, freedreno, llvmpipe, panfrost, radeonsi, zink)
   cl_khr_gl_depth_images                                not started
   cl_khr_gl_event                                       not started
   cl_khr_gl_msaa_sharing                                not started
@@ -913,17 +913,17 @@ Rusticl extensions:
   cl_khr_mipmap_image                                   not started
   cl_khr_mipmap_image_writes                            not started
   cl_khr_pci_bus_info                                   DONE (iris, nvc0, radeonsi, zink)
-  cl_khr_priority_hints                                 DONE (asahi, freedreno, iris, panfrost, radeonsi)
+  cl_khr_priority_hints                                 DONE (aurora, freedreno, iris, panfrost, radeonsi)
   cl_khr_semaphore                                      DONE (iris, radeonsi, zink)
   cl_khr_spirv_extended_debug_info                      not started
   cl_khr_spirv_linkonce_odr                             DONE
   cl_khr_spirv_no_integer_wrap_decoration               DONE
   cl_khr_srgb_image_writes                              not started
-  cl_khr_subgroup_ballot                                DONE (asahi, iris, llvmpipe, radeonsi, zink)
-  cl_khr_subgroup_clustered_reduce                      DONE (asahi, llvmpipe, radeonsi, zink)
+  cl_khr_subgroup_ballot                                DONE (aurora, iris, llvmpipe, radeonsi, zink)
+  cl_khr_subgroup_clustered_reduce                      DONE (aurora, llvmpipe, radeonsi, zink)
   cl_khr_subgroup_named_barrier                         not started
-  cl_khr_subgroup_non_uniform_arithmetic                DONE (asahi, llvmpipe, radeonsi, zink)
-  cl_khr_subgroup_non_uniform_vote                      DONE (asahi, iris, llvmpipe, radeonsi, zink)
+  cl_khr_subgroup_non_uniform_arithmetic                DONE (aurora, llvmpipe, radeonsi, zink)
+  cl_khr_subgroup_non_uniform_vote                      DONE (aurora, iris, llvmpipe, radeonsi, zink)
   cl_khr_subgroups                                      in progress
   cl_khr_terminate_context                              not started
   cl_khr_throttle_hints                                 not started

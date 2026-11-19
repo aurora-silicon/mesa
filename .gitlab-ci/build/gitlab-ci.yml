@@ -238,12 +238,12 @@ debian-build-x86_64:
       -D gallium-va=enabled
       -D gallium-rusticl=true
       -D legacy-wayland=bind-wayland-display
-    GALLIUM_DRIVERS: "i915,iris,nouveau,r300,r600,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,d3d12,asahi,crocus,radeonsi"
+    GALLIUM_DRIVERS: "i915,iris,nouveau,r300,r600,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,d3d12,aurora,crocus,radeonsi"
     VULKAN_DRIVERS: "intel_hasvk,imagination,microsoft-experimental,nouveau,swrast"
     BUILDTYPE: "debugoptimized"
     EXTRA_OPTION: >
       -D spirv-to-dxil=true
-      -D tools=drm-shim,etnaviv,freedreno,glsl,intel,intel-ui,nir,nouveau,lima,panfrost,asahi
+      -D tools=drm-shim,etnaviv,freedreno,glsl,intel,intel-ui,nir,nouveau,lima,panfrost,aurora
       -D panfrost-rust=true
       -D perfetto=true
     S3_ARTIFACT_NAME: debian-build-x86_64
@@ -270,7 +270,7 @@ debian-release:
       -D gallium-va=enabled
       -D gallium-rusticl=false
       -D llvm=enabled
-    GALLIUM_DRIVERS: "i915,iris,nouveau,r300,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,d3d12,asahi,crocus"
+    GALLIUM_DRIVERS: "i915,iris,nouveau,r300,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,d3d12,aurora,crocus"
     VULKAN_DRIVERS: "swrast,intel_hasvk,imagination,microsoft-experimental"
     EXTRA_OPTION: >
       -D spirv-to-dxil=true
@@ -358,7 +358,7 @@ fedora-release:
       -D microsoft-clc=disabled
       -D shared-llvm=enabled
     UNWIND: "disabled"
-    VULKAN_DRIVERS: "amd,asahi,broadcom,freedreno,imagination,intel,intel_hasvk"
+    VULKAN_DRIVERS: "amd,aurora,broadcom,freedreno,imagination,intel,intel_hasvk"
 
 debian-android:
   extends:
@@ -450,7 +450,7 @@ debian-android:
     - .meson-cross
     - .use-debian/arm64_build
   variables:
-    VULKAN_DRIVERS: "asahi,broadcom,freedreno"
+    VULKAN_DRIVERS: "aurora,broadcom,freedreno"
     GALLIUM_DRIVERS: "etnaviv,freedreno,lima,nouveau,panfrost,llvmpipe,softpipe,tegra,v3d,vc4,zink"
     BUILDTYPE: "debugoptimized"
 
@@ -463,7 +463,7 @@ debian-arm32:
     CROSS: armhf
     DRI_LOADERS:
       -D glvnd=disabled
-    # remove asahi & llvmpipe from the .meson-arm list because here we have llvm=disabled
+    # remove aurora & llvmpipe from the .meson-arm list because here we have llvm=disabled
     VULKAN_DRIVERS: "broadcom,freedreno"
     GALLIUM_DRIVERS: "etnaviv,freedreno,lima,nouveau,panfrost,softpipe,tegra,v3d,vc4,zink"
     EXTRA_OPTION: >
@@ -582,7 +582,7 @@ debian-arm64-build-test:
     - .ci-deqp-artifacts
     - .meson-build-only
   variables:
-    VULKAN_DRIVERS: "amd,asahi,imagination,nouveau"
+    VULKAN_DRIVERS: "amd,aurora,imagination,nouveau"
     DRI_LOADERS:
       -D glvnd=disabled
     EXTRA_OPTION: >
@@ -652,12 +652,12 @@ debian-clang:
       -D llvm=enabled
       -D microsoft-clc=disabled
       -D shared-llvm=enabled
-    GALLIUM_DRIVERS: "iris,nouveau,r300,r600,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,radeonsi,tegra,d3d12,crocus,i915,asahi"
+    GALLIUM_DRIVERS: "iris,nouveau,r300,r600,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,radeonsi,tegra,d3d12,crocus,i915,aurora"
     VULKAN_DRIVERS: intel,amd,freedreno,broadcom,virtio,swrast,panfrost,imagination,microsoft-experimental,nouveau
     EXTRA_OPTION:
       -D spirv-to-dxil=true
       -D imagination-srv=true
-      -D tools=drm-shim,etnaviv,freedreno,glsl,intel,intel-ui,nir,nouveau,lima,panfrost,asahi,imagination
+      -D tools=drm-shim,etnaviv,freedreno,glsl,intel,intel-ui,nir,nouveau,lima,panfrost,aurora,imagination
       -D panfrost-rust=true
       -D vulkan-layers=device-select,overlay
       -D build-radv-tests=true
@@ -738,7 +738,7 @@ debian-vulkan:
       -D c_args=-fno-sanitize-recover=all
       -D cpp_args=-fno-sanitize-recover=all
     UBSAN_OPTIONS: "print_stacktrace=1"
-    VULKAN_DRIVERS: amd,asahi,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination,microsoft-experimental,nouveau,kosmickrisp
+    VULKAN_DRIVERS: amd,aurora,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination,microsoft-experimental,nouveau,kosmickrisp
     EXTRA_OPTION: >
       -D vulkan-layers=device-select,overlay
       -D tools=drm-shim

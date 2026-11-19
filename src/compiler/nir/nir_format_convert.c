@@ -212,7 +212,7 @@ _nir_format_norm_factor(nir_builder *b, const unsigned *bits,
        * formats even though you're guaranteed to lose precision. Those formats
        * are broken by design, but we do need to support them with the
        * bugginess, and the loss of precision here is acceptable for GL. This
-       * helper is used for the vertex format conversion on Asahi, so we can't
+       * helper is used for the vertex format conversion on Aurora, so we can't
        * assert(bits[i] <= 16). But if it's not, you get to pick up the pieces.
        */
       switch (bit_size) {

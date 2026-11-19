@@ -15,7 +15,7 @@
  * This file contains helpers for precompiling OpenCL kernels with a Mesa driver
  * and dispatching them from within the driver. It is a grab bag of utility
  * functions, rather than an all-in-one solution, to give drivers flexibility to
- * customize the compile pipeline. See asahi_clc for how the pieces fit
+ * customize the compile pipeline. See aurora_clc for how the pieces fit
  * together, and see libagx for real world examples of this infrastructure.
  *
  * Why OpenCL C?

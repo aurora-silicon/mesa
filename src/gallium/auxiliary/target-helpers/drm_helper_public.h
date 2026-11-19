@@ -20,6 +20,7 @@ extern const struct drm_driver_descriptor vc4_driver_descriptor;
 extern const struct drm_driver_descriptor panfrost_driver_descriptor;
 extern const struct drm_driver_descriptor panthor_driver_descriptor;
 extern const struct drm_driver_descriptor aurora_driver_descriptor;
+/* LEGACY-ASAHI(2027-02-28) */
 extern const struct drm_driver_descriptor asahi_driver_descriptor;
 extern const struct drm_driver_descriptor etnaviv_driver_descriptor;
 extern const struct drm_driver_descriptor rknpu_driver_descriptor;

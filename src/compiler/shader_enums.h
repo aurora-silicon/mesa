@@ -1292,7 +1292,7 @@ enum gl_access_qualifier
    ACCESS_ESTREAM_PAN = (1 << 22),
 
    /**
-    * The Asahi backend lowered an imageBuffer operation to a 2D image while
+    * The Aurora backend lowered an imageBuffer operation to a 2D image while
     * retaining the buffer-view descriptor ABI.  Keep this distinction until
     * native descriptor routing is selected; Gen9's direct state-0 image path
     * is valid for image views but not for linear buffer-view descriptors.
@@ -1300,7 +1300,7 @@ enum gl_access_qualifier
    ACCESS_BUFFER_AGX = (1 << 23),
 
    /**
-    * On Asahi, this load reads a valid buffer descriptor: its vec4 is the
+    * On Aurora, this load reads a valid buffer descriptor: its vec4 is the
     * address and the bound size in bytes, whatever path the program takes.
     */
    ACCESS_BUFFER_DESCRIPTOR_AGX = (1 << 24),

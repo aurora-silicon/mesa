@@ -65,8 +65,8 @@ fn get_enabled_devs() -> HashMap<String, u32> {
 
     // we require the type here as this list can be empty depending on the build options
     let default_devs: &[&str] = &[
-        #[cfg(any(rusticl_enable_asahi, rusticl_enable_auto))]
-        "asahi",
+        #[cfg(any(rusticl_enable_aurora, rusticl_enable_auto))]
+        "aurora",
         #[cfg(any(rusticl_enable_freedreno, rusticl_enable_auto))]
         "freedreno",
         #[cfg(any(rusticl_enable_panfrost, rusticl_enable_auto))]

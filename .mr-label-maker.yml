@@ -9,7 +9,7 @@ issues:
     topics: &topics
         'aco': 'ACO'
         'anv': 'ANV'
-        'asahi': 'asahi'
+        'aurora': 'aurora'
         'blorp': 'blorp'
         'ci': 'CI'
         'clc': 'OpenCL'
@@ -155,7 +155,7 @@ merge_requests:
         '^src/amd/llvm/': ['AMD common']
         '^src/amd/registers/': ['AMD common']
         '^src/amd/vulkan/': ['RADV']
-        '^src/asahi/': ['asahi']
+        '^src/aurora/': ['aurora']
         '^src/broadcom/drm-shim/v3d': ['v3d']
         '^src/broadcom/vulkan/': ['v3dv']
         '^src/compiler/clc': ['OpenCL']
@@ -186,7 +186,7 @@ merge_requests:
         '^src/gallium/auxiliary/nir/.*tgsi.*': ['TGSI']
         '^src/gallium/auxiliary/tgsi/': ['TGSI']
         '^src/gallium/docs/': ['gallium']
-        '^src/gallium/drivers/asahi/': ['asahi']
+        '^src/gallium/drivers/aurora/': ['aurora']
         '^src/gallium/drivers/crocus/': ['crocus']
         '^src/gallium/drivers/d3d12/': ['d3d12']
         '^src/gallium/drivers/etnaviv/': ['etnaviv']

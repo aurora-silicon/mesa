@@ -567,10 +567,10 @@
 
 
 /**
- * \brief Asahi specific configuration options
+ * \brief Aurora specific configuration options
  */
-#define DRI_CONF_ASAHI_NO_FP16(def) \
-   DRI_CONF_OPT_B(asahi_no_fp16, def, \
+#define DRI_CONF_AURORA_NO_FP16(def) \
+   DRI_CONF_OPT_B(aurora_no_fp16, def, \
                   "Disable 16-bit float support")
 
 #endif

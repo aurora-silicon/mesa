@@ -32,7 +32,7 @@
 #include "freedreno/drm/freedreno_drm_public.h"
 #include "panfrost/drm/panfrost_drm_public.h"
 #include "lima/drm/lima_drm_public.h"
-#include "asahi/drm/asahi_drm_public.h"
+#include "aurora/drm/aurora_drm_public.h"
 #include "zink/drm/zink_drm_public.h"
 #include "xf86drm.h"
 
@@ -87,12 +87,13 @@ kmsro_screen_create(int kms_fd, const struct pipe_screen_config *config,
       util_sparse_array_init(&ro->bo_map, sizeof(struct renderonly_scanout), 64);
       simple_mtx_init(&ro->bo_map_lock, mtx_plain);
 
-      /* "aurora" is the native AGX kernel driver; "asahi" is its older name. */
+      /* "aurora" is the native AGX kernel driver. LEGACY-ASAHI(2027-02-28): kernels
+       * built before 2026-10-31 report the old name. */
       if (!force_zink && (strcmp(render_dev_name, "aurora") == 0 ||
                           strcmp(render_dev_name, "asahi") == 0)) {
-#if defined(GALLIUM_ASAHI)
+#if defined(GALLIUM_AURORA)
          ro->create_for_resource = renderonly_create_gpu_import_for_resource;
-         screen = asahi_drm_screen_create_renderonly(ro->gpu_fd, ro, config);
+         screen = aurora_drm_screen_create_renderonly(ro->gpu_fd, ro, config);
 #endif
       }
       else if (!force_zink && strcmp(render_dev_name, "etnaviv") == 0) {

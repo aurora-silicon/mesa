@@ -79,7 +79,7 @@ Linux, FreeBSD, and other operating systems.
    :hidden:
 
    drivers/anv
-   drivers/asahi
+   drivers/aurora
    drivers/d3d12
    drivers/freedreno
    drivers/kosmickrisp

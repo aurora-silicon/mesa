@@ -123,9 +123,9 @@ gitlab-ci*.yml @eric
 /src/glx/apple @jeremyhu
 /src/glx/applegl_glx.c @jeremyhu
 
-# Asahi
-/src/asahi/ @alyssa
-/src/gallium/drivers/asahi/ @alyssa
+# Aurora
+/src/aurora/ @alyssa
+/src/gallium/drivers/aurora/ @alyssa
 
 # Broadcom
 /src/broadcom/ @chema @jasuarez @itoral @apinheiro

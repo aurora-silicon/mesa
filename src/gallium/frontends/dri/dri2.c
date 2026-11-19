@@ -1721,7 +1721,7 @@ dri2_map_image(struct dri_context *ctx, struct dri_image *image,
 
    /* NV12/P010 from dri_create_lowered_yuv_image() is one linear buffer,
     * chroma at stride * height. A direct map of plane 0 from (0, 0)
-    * (asahi) reaches the chroma plane through the same linear mapping.
+    * (aurora) reaches the chroma plane through the same linear mapping.
     */
    struct pipe_resource *resource = image->texture;
    while (plane--)

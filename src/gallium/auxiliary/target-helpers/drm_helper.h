@@ -50,7 +50,7 @@ const struct drm_driver_descriptor descriptor_name = {         \
 #undef GALLIUM_ETNAVIV
 #undef GALLIUM_PANFROST
 #undef GALLIUM_LIMA
-#undef GALLIUM_ASAHI
+#undef GALLIUM_AURORA
 #undef GALLIUM_ROCKET
 #undef GALLIUM_ETHOSU
 #endif
@@ -337,30 +337,31 @@ DRM_DRIVER_DESCRIPTOR_STUB(panfrost)
 DRM_DRIVER_DESCRIPTOR_STUB(panthor)
 #endif
 
-#ifdef GALLIUM_ASAHI
-#include "asahi/drm/asahi_drm_public.h"
+#ifdef GALLIUM_AURORA
+#include "aurora/drm/aurora_drm_public.h"
 
 static struct pipe_screen *
-pipe_asahi_create_screen(int fd, const struct pipe_screen_config *config)
+pipe_aurora_create_screen(int fd, const struct pipe_screen_config *config)
 {
    struct pipe_screen *screen;
 
-   screen = asahi_drm_screen_create(fd, config);
+   screen = aurora_drm_screen_create(fd, config);
    return screen ? debug_screen_wrap(screen) : NULL;
 }
 
-const driOptionDescription asahi_driconf[] = {
-      #include "asahi/driinfo_asahi.h"
+const driOptionDescription aurora_driconf[] = {
+      #include "aurora/driinfo_aurora.h"
 };
-DRM_DRIVER_DESCRIPTOR(asahi, asahi_driconf, ARRAY_SIZE(asahi_driconf))
-/* The kernel driver is "aurora"; "asahi" stays for older kernels and for
- * MESA_LOADER_DRIVER_OVERRIDE and dri_driver settings that name it.
+DRM_DRIVER_DESCRIPTOR(aurora, aurora_driconf, ARRAY_SIZE(aurora_driconf))
+/* LEGACY-ASAHI(2027-02-28): the kernel driver is "aurora"; kernels built before
+ * 2026-10-31 report the old name, so the alias stays until the removal date.
  */
-DRM_DRIVER_DESCRIPTOR_ALIAS(asahi, aurora, asahi_driconf, ARRAY_SIZE(asahi_driconf))
+DRM_DRIVER_DESCRIPTOR_ALIAS(aurora, asahi, aurora_driconf, ARRAY_SIZE(aurora_driconf))
 
 #else
-DRM_DRIVER_DESCRIPTOR_STUB(asahi)
 DRM_DRIVER_DESCRIPTOR_STUB(aurora)
+/* LEGACY-ASAHI(2027-02-28) */
+DRM_DRIVER_DESCRIPTOR_STUB(asahi)
 #endif
 
 #ifdef GALLIUM_ETNAVIV
@@ -515,8 +516,8 @@ const driOptionDescription kmsro_driconf[] = {
 #if defined(GALLIUM_VC4) || defined(GALLIUM_V3D)
       #include "v3d/driinfo_v3d.h"
 #endif
-#ifdef GALLIUM_ASAHI
-      #include "asahi/driinfo_asahi.h"
+#ifdef GALLIUM_AURORA
+      #include "aurora/driinfo_aurora.h"
 #endif
 #ifdef GALLIUM_FREEDRENO
       #include "freedreno/driinfo_freedreno.h"
