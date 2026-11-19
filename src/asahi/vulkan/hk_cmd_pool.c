@@ -111,7 +111,7 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
       (type == HK_CMD_BO_USC    ? AGX_BO_LOW_VA
        : type == HK_CMD_BO_ROOT ? AGX_BO_WRITEBACK
                                 : 0) |
-      (hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK : 0);
+      (hk_cached_cmd_uploads(&dev->dev) ? AGX_BO_WRITEBACK : 0);
 
    bo->bo = agx_bo_create(&dev->dev, HK_CMD_BO_SIZE, 0, flags, labels[type]);
    if (bo->bo == NULL) {
@@ -134,7 +134,7 @@ hk_cmd_bo_create(struct hk_cmd_pool *pool, enum hk_cmd_bo_type type,
     * buffers reuse already-resident pages without adding per-draw work. */
    if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) {
       memset(bo->map, 0, bo->bo->size);
-      if (hk_g17p_cached_cmd_memory(&dev->dev))
+      if (hk_cached_cmd_uploads(&dev->dev))
          util_flush_range(bo->map, bo->bo->size);
    }
 
@@ -178,7 +178,7 @@ hk_device_create_vdm_slab(struct hk_device *dev, enum hk_cmd_slab_class class)
       (class == HK_CMD_SLAB_USC    ? AGX_BO_LOW_VA
        : class == HK_CMD_SLAB_IOTO ? AGX_BO_EXEC | AGX_BO_LOW_VA
                                    : 0) |
-      (hk_g17p_cached_cmd_memory(&dev->dev) ? AGX_BO_WRITEBACK : 0);
+      (hk_cached_cmd_uploads(&dev->dev) ? AGX_BO_WRITEBACK : 0);
 
    struct hk_vdm_slab *slab =
       vk_zalloc(&dev->vk.alloc, sizeof(*slab), 8,

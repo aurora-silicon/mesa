@@ -527,7 +527,7 @@ queue_submit_single(struct hk_device *dev, struct drm_asahi_submit *submit,
 
    /* Complete the cache cleans of CPU-cached descriptor writes
     * (hk_descriptor_set_publish()) before the GPU can read them. */
-   if (hk_g17p_cached_cmd_memory(&dev->dev))
+   if (dev->dev.chip == AGX_CHIP_G17P && util_has_cache_ops())
       util_post_flush_fence();
 
    if (dev->dev.is_virtio) {
