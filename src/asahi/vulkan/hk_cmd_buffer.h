@@ -487,6 +487,14 @@ struct hk_attachment {
    uint32_t clear_colour[4];
 };
 
+/* CPU image/view handles describe command-buffer-owned transient storage.
+ * The GPU allocation itself belongs to the command-buffer pool. */
+struct hk_transient_spill {
+   struct list_head link;
+   VkImage image;
+   VkImageView view;
+};
+
 struct hk_bg_eot {
    uint64_t usc;
    uint32_t primary_storage_B;
@@ -582,6 +590,9 @@ struct hk_rendering_state {
 
    uint32_t color_att_count;
    struct hk_attachment color_att[HK_MAX_RTS];
+   /* Original views for targets redirected to transient eMRT storage. */
+   struct hk_image_view *spill_original[HK_MAX_RTS];
+
    struct hk_attachment depth_att;
    struct hk_attachment stencil_att;
 
@@ -1776,6 +1787,7 @@ struct hk_cmd_buffer {
 
    /* Command-pool slab spans leased by this command buffer's VDM uploader. */
    struct list_head vdm_allocations;
+   struct list_head transient_spills;
    /* Most recently addressed span. Recording often references the current
     * 4 KiB VDM chunk many times before moving to the next one. */
    struct hk_vdm_allocation *g17p_vdm_last_allocation;
@@ -2881,3 +2893,6 @@ void agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
                          uint64_t attribs_read, struct agx_velem_key *keys);
 
 struct agx_robustness hk_prolog_robustness(struct hk_device *dev);
+
+/* Boundary copies use the ordinary texture/PBE path, classified as graphics. */
+void hk_cmd_copy_spill(struct hk_cmd_buffer *cmd, const VkCopyImageInfo2 *info);

@@ -8,12 +8,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* The physical T6040 selector in hk_image.c supplies this capability.
- * The pre-existing test-hk-g17p-compression separately pins false/Neo. */
+/* The physical T6040 selector in hk_image.c supplies this capability, and
+ * multisampled colour comes from the G17P-wide colour MSAA policy, as in
+ * hk_can_compress_create_info(). The pre-existing test-hk-g17p-compression
+ * separately pins false/Neo. */
 static bool
 g16s_eligible(enum agx_chip chip, unsigned plane, const VkImageCreateInfo *info)
 {
-   return hk_hal200_compression_eligible(chip, plane, info, true);
+   return hk_hal200_compression_eligible(chip, plane, info, true) ||
+          hk_g17p_color_msaa_compression_eligible(chip, plane, info);
 }
 
 static unsigned checks;
@@ -182,12 +185,13 @@ check_shape(VkFormat format, bool is_zs)
    CHECK(ELIGIBLE(i));
    i = base; i.arrayLayers = 6;
    CHECK(ELIGIBLE(i));
-   /* Of the multisample colour attachments, only 2x (one layer) on M4 Pro. */
+   /* Multisample colour attachments at 2x and 4x, arrays too; the depth
+    * plane at 2x and one layer only. */
    for (unsigned s = 2; s <= 64; s <<= 1) {
       i = base; i.samples = (VkSampleCountFlagBits)s;
-      CHECK(ELIGIBLE(i) == (s == 2));
+      CHECK(ELIGIBLE(i) == (s == 2 || (!is_zs && s == 4)));
       i.arrayLayers = 2;
-      CHECK(!ELIGIBLE(i));
+      CHECK(ELIGIBLE(i) == (!is_zs && s <= 4));
    }
    i = base; i.tiling = VK_IMAGE_TILING_LINEAR;
    CHECK(!ELIGIBLE(i));
@@ -236,8 +240,9 @@ check_shape(VkFormat format, bool is_zs)
  * pass, attachment slot and neighbouring formats are unknown at allocation.
  * Cover every admitted colour format, including the smallest ones that can
  * spill next to wide targets, and input/transient attachment combinations.
- * A 2x single-layer attachment is admitted: allocated first, every target
- * of at most eight bytes fits the 64-byte 2x sample (hk_resident_attachments).
+ * 2x and 4x attachments, arrays too, are admitted: a target that spills gets
+ * plain transient backing (hk_g17p_spill.h). Colour input attachments stay
+ * plain.
  */
 static void
 check_colour_msaa_spill_policy(void)
@@ -263,8 +268,7 @@ check_colour_msaa_spill_policy(void)
                   attachment.usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
                if (mask & 2)
                   attachment.usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
-               const bool expected =
-                  samples == 1 || (samples == 2 && layers == 1 && !(mask & 1));
+               const bool expected = samples == 1 || !(mask & 1);
                CHECK(ELIGIBLE(attachment) == expected);
                attachment.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                                   VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -297,7 +301,7 @@ check_layered_and_msaa(void)
       i.samples = (VkSampleCountFlagBits)samples;
       CHECK(ELIGIBLE(i) == (samples <= 4));
       i.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-      CHECK(ELIGIBLE(i) == (samples == 1));
+      CHECK(ELIGIBLE(i) == (samples <= 4));
       i.usage &= ~VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
       i.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
       CHECK(!ELIGIBLE(i));
@@ -504,7 +508,8 @@ check_transport_fever_3(void)
       CHECK(!g16s_eligible(AGX_CHIP_G17P, 1, &i));
       CHECK(!hk_g17p_compression_eligible(AGX_CHIP_G17P, 0, &i));
       i.samples = VK_SAMPLE_COUNT_4_BIT;
-      CHECK(!ELIGIBLE(i));
+      CHECK(ELIGIBLE(i) == (gbuffer[g].m4_pro &&
+                            gbuffer[g].format != VK_FORMAT_D32_SFLOAT_S8_UINT));
    }
 }
 

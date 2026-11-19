@@ -28,13 +28,12 @@
  *    texels are excluded so that a single-sample tilebuffer never spills a
  *    compressed target (spilling needs libagx_decompress, which has no G17P
  *    binary): 8 targets x 8 B fit in the 120 B/sample G17P budget.
- *  - Colour at 2x on M4 Pro: also colour attachments of one layer. G17P
- *    cannot spill a compressed target; at 2x the tile holds 64 bytes a
- *    sample, so the eight bytes-at-most targets, allocated first
- *    (hk_resident_attachments()), always stay in it. M4 Pro keeps a 2x
- *    reload's whole sample (agx_chip_uncovered_tile_ms_reload_defect()).
- *    A multiview pass has an eight-byte budget, so on a device with the
- *    multiview feature 2x colour stays plain (hk_image.c). Input
+ *  - Multisampled colour, 2x/4x, one level, on every G17P part:
+ *    hk_g17p_color_msaa_compression_eligible(). Compressed targets are
+ *    allocated first (hk_resident_attachments()); one that still spills, as
+ *    in a multiview pass's eight-byte budget, gets plain transient backing
+ *    for the pass (hk_g17p_spill.h). M4 Pro keeps a 2x reload's whole
+ *    sample (agx_chip_uncovered_tile_ms_reload_defect()). Colour input
  *    attachments stay plain.
  *  - Not R11G11B10F on M4 Pro: attachments store through the format's own
  *    class (hk_eot_pbe_format()), and a compressed tile of that class reads
@@ -264,14 +263,11 @@ hk_hal200_compression_eligible(enum agx_chip chip, unsigned plane,
       if (g16s && (three_d || info->arrayLayers > 1) && info->mipLevels != 1)
          return false;
       /* #66: a legal MRT mix can spill any MSAA colour attachment, and G17P
-       * has no decompression for a spilled compressed one. Only a 2x
-       * single-layer attachment always stays in the tilebuffer (see the
-       * policy above); 4x and arrays stay plain. */
-      if (g16s && multisampled &&
-          (info->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                         VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)) &&
-          (info->samples != VK_SAMPLE_COUNT_2_BIT || info->arrayLayers != 1 ||
-           (info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
+       * has no decompression for a spilled compressed one. Multisampled
+       * colour is admitted on every G17P part by
+       * hk_g17p_color_msaa_compression_eligible() alone, whose spilled
+       * targets get plain transient backing. */
+      if (multisampled)
          return false;
 
       /* An RGBA8/BGRA8 UNORM mip chain the application never renders to is
@@ -320,6 +316,32 @@ hk_g17p_compression_eligible(enum agx_chip chip, unsigned plane,
                              const VkImageCreateInfo *info)
 {
    return hk_hal200_compression_eligible(chip, plane, info, false);
+}
+
+/* G17P colour MSAA, the one multisampled colour policy for every G17P part
+ * (T8140, T6040, T6041): spilled targets use private transient backing for
+ * eMRT (hk_g17p_spill.h). Reuse the existing single-layer policy for all
+ * format, usage, flag and extension exclusions. Only sample count and
+ * single-level array storage are expanded; depth/stencil, 3D, cubes and mip
+ * chains keep their old policy. */
+static inline bool
+hk_g17p_color_msaa_compression_eligible(enum agx_chip chip, unsigned plane,
+                                       const VkImageCreateInfo *info)
+{
+   if (chip != AGX_CHIP_G17P || !info || plane != 0 ||
+       !hk_g17p_compression_color_format(info->format) ||
+       info->imageType != VK_IMAGE_TYPE_2D || !info->arrayLayers ||
+       info->mipLevels != 1 ||
+       (info->samples != VK_SAMPLE_COUNT_2_BIT &&
+        info->samples != VK_SAMPLE_COUNT_4_BIT) ||
+       ((info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+        (info->usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
+      return false;
+
+   VkImageCreateInfo single = *info;
+   single.samples = VK_SAMPLE_COUNT_1_BIT;
+   single.arrayLayers = 1;
+   return hk_g17p_compression_eligible(chip, plane, &single);
 }
 
 /* G17P and M5 colour images shared through
