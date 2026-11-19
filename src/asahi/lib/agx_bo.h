@@ -184,6 +184,9 @@ struct agx_bo *agx_bo_create_checked(struct agx_device *dev, size_t size,
 struct agx_bo *agx_bo_create(struct agx_device *dev, size_t size,
                              unsigned align, enum agx_bo_flags flags,
                              const char *label);
+struct agx_bo *agx_bo_create_at(struct agx_device *dev, size_t size,
+                                enum agx_bo_flags flags, struct agx_va *va,
+                                const char *label);
 
 int agx_bo_ensure_ro_shadow(struct agx_device *dev, struct agx_bo *bo);
 

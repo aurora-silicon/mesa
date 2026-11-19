@@ -43,8 +43,9 @@ static struct mock_state mock;
 
 static struct agx_bo *
 mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
-              enum agx_bo_flags flags)
+              enum agx_bo_flags flags, struct agx_va *va)
 {
+   assert(va == NULL);
    mock.alloc_calls++;
    const uint32_t handle = ++mock.next_handle;
 
