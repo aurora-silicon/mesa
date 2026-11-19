@@ -1295,6 +1295,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_capture_replay = executable(
+    'brl-vulkan-capture-replay',
+    files('tests/hk_vulkan_capture_replay.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   hk_vulkan_sparse_bind_first_submit = executable(
     'hk-vulkan-sparse-bind-first-submit',
     files('tests/hk_vulkan_sparse_bind_first_submit.c'),

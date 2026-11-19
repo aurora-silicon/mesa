@@ -328,10 +328,23 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   if (buffer->vk.create_flags &
+       VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT)
+      buffer->opaque_capture_address = hk_get_bda_replay_addr(pCreateInfo);
+
+   /* A sparse buffer has an address of its own, and so has a capture/replay
+    * buffer of VK_EXT_buffer_device_address, whose memory need not replay
+    * and whose address may be asked before the bind
+    * (VUID-vkGetBufferDeviceAddress-bufferDeviceAddress-03324).
+    * Any other buffer takes its memory's address plus the offset, which
+    * replays with capture/replay memory
+    * (VUID-VkBindBufferMemoryInfo-bufferDeviceAddressCaptureReplay-09200,
+    * VUID-VkBindBufferMemoryInfo-buffer-09201). */
    if (buffer->vk.size > 0 &&
-       (buffer->vk.create_flags &
-        (VK_BUFFER_CREATE_SPARSE_BINDING_BIT |
-         VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT))) {
+       ((buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) ||
+        ((buffer->vk.create_flags &
+          VK_BUFFER_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+         dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT))) {
 
       const uint32_t alignment = hk_get_buffer_alignment(
          hk_device_physical(dev), buffer->vk.usage, buffer->vk.create_flags);
@@ -640,8 +653,8 @@ hk_BindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
          assert(buffer->vk.device_address == 0);
          buffer->vk.device_address =
             hk_device_memory_addr(mem) + pBindInfos[i].memoryOffset;
-         if (!mem->replay_va &&
-             !(mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE | AGX_BO_HOST_PTR))) {
+         if (!(mem->bo->flags &
+               (AGX_BO_SHARED | AGX_BO_SHAREABLE | AGX_BO_HOST_PTR))) {
             buffer->storage_backing_handle = mem->bo->handle;
             buffer->storage_backing_offset = pBindInfos[i].memoryOffset;
          }
@@ -692,6 +705,15 @@ hk_GetBufferOpaqueCaptureAddress(UNUSED VkDevice device,
                                  const VkBufferDeviceAddressInfo *pInfo)
 {
    VK_FROM_HANDLE(hk_buffer, buffer, pInfo->buffer);
+
+   /* The address asked for is the answer (vkGetBufferOpaqueCaptureAddress),
+    * also before the bind, which this query does not need. A KHR
+    * capture/replay buffer has no address of its own until then: 0 is no
+    * specific address. */
+   if (buffer->opaque_capture_address)
+      return buffer->opaque_capture_address;
+   if (!buffer->vk.device_address)
+      return 0;
 
    return hk_buffer_address_rw(buffer, 0);
 }

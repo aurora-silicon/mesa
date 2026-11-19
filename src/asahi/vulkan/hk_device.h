@@ -136,10 +136,9 @@ struct hk_device {
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
    /* Live buffers and image planes with a GPU virtual address of their own
-    * (sparse binding, capture/replay buffers), and memory mapped again for
-    * descriptor buffer capture/replay, atomic (hk_device_va_alias_get()).
-    * Their memory is also mapped at another address, see
-    * hk_cdm_alias_scope(). */
+    * (sparse binding, bufferDeviceAddressCaptureReplayEXT buffers), atomic
+    * (hk_device_va_alias_get()). Their memory is also mapped at another
+    * address, see hk_cdm_alias_scope(). */
    uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
     * virtual address at any time, decided at creation
@@ -474,9 +473,10 @@ enum hk_perftest {
  * keep memory scope unconditionally while dynamic mode is active.
  *
  * On G17P, memory scope is selected at barrier recording time whenever
- * va_alias_resources != 0 (live sparse, capture/replay, fd, or writable host
- * imports). The flush is emitted into an open compute stream holding work;
- * earlier closed streams already flushed at stream end.
+ * va_alias_resources != 0 (live sparse, bufferDeviceAddressCaptureReplayEXT
+ * buffers, fd, or writable host imports). The flush is emitted into an open
+ * compute stream holding work; earlier closed streams already flushed at
+ * stream end.
  *
  * Not covered on G17P: resources or imports created after command buffer
  * recording and reached via device address or UpdateAfterBind descriptors;

@@ -79,13 +79,14 @@ mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
               enum agx_bo_flags flags, struct agx_va *va)
 {
    ++bo_calls;
-   assert(va == NULL);
-   if (limited && size > limit - host - pinned - cached) {
-      ++kernel_oom_attempts;
+   /* bo_alloc takes over a caller's VA and frees it when it fails. */
+   if ((limited && size > limit - host - pinned - cached) || bo_fails) {
+      if (limited && size > limit - host - pinned - cached)
+         ++kernel_oom_attempts;
+      if (va)
+         agx_va_free(dev, va, false);
       return NULL;
    }
-   if (bo_fails)
-      return NULL;
    struct agx_bo *bo = calloc(1, sizeof(*bo));
    assert(bo);
    unsigned handle;
@@ -100,7 +101,7 @@ mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    bo->size = size;
    bo->align = align;
    bo->flags = flags;
-   bo->va = agx_va_alloc(dev, size, align, 0, 0);
+   bo->va = va ?: agx_va_alloc(dev, size, align, 0, 0);
    assert(bo->va);
    pinned += size;
    if (pinned > peak)
@@ -349,6 +350,23 @@ static VkResult
 alloc(struct hk_device *dev, uint64_t size, VkDeviceMemory *memory)
 {
    return alloc_type(dev, size, 0, memory);
+}
+
+static VkResult
+alloc_capture_replay(struct hk_device *dev, uint64_t size,
+                     VkDeviceMemory *memory)
+{
+   const VkMemoryAllocateFlagsInfo flags = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+      .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT |
+               VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT,
+   };
+   const VkMemoryAllocateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &flags,
+      .allocationSize = size,
+   };
+   return hk_AllocateMemory(hk_device_to_handle(dev), &info, &allocator, memory);
 }
 
 static void
@@ -624,6 +642,27 @@ main(void)
    free_returns_available = false;
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    agx_bo_cache_evict_all(&dev->dev);
+
+   /* Capture/replay memory never comes from the cache and never goes back
+    * to it, but a refusal still evicts the cache and asks once more. */
+   fake_available = 64 * 1024 * MIB;
+   assert(alloc(dev, 128 * MIB, &memory) == VK_SUCCESS);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   assert(dev->dev.bo_cache.size == 128 * MIB);
+   fake_available = 512 * MIB + 1024 * MIB - 1;
+   free_returns_available = true;
+   meminfo_reads = 0;
+   before = bo_calls;
+   assert(alloc_capture_replay(dev, 512 * MIB, &memory) == VK_SUCCESS);
+   assert(meminfo_reads == 2 && bo_calls == before + 1);
+   assert(!dev->dev.bo_cache.size && pinned == 512 * MIB);
+   free_returns_available = false;
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   assert(!dev->dev.bo_cache.size && !pinned);
+   /* Without anything to evict, it is refused. */
+   fake_available = 1024 * MIB;
+   assert(alloc_capture_replay(dev, 512 * MIB, &memory) ==
+          VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    /* Warm BO-cache reuse across 4 KiB..64 MiB must issue zero VM_BINDs,
     * isolate memory types by BO flags, retry after a bind failure, and reset
