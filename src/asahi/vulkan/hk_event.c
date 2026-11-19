@@ -211,4 +211,7 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
 
       hk_sync_barrier(cmd, src_kinds, dst_kinds);
    }
+
+   for (uint32_t i = 0; i < eventCount; i++)
+      hk_init_discarded_storage_images(cmd, &pDependencyInfos[i]);
 }
