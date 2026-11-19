@@ -3113,6 +3113,29 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
       max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
    }
 
+   /* Keep more threads resident in ordinary compute programs with several
+    * texture reads (agx_sampled_compute_register_cap() derives the budget).
+    * Helpers and unspillable programs keep their hardware budget. The cap
+    * only trades spills for occupancy, so a retry after a failed allocation
+    * (ra_budget_cut) drops it and spills down from the whole file, as it
+    * would without the cap, rather than refusing a program that fits there.
+    */
+   const unsigned sampled_cap =
+      agx_sampled_compute_register_cap(&ctx->key->dev);
+   if (sampled_cap && !ctx->ra_budget_cut &&
+       ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
+       !ctx->key->is_helper && ctx->key->has_scratch &&
+       ctx->key->optional_spills &&
+       !(ctx->out && ctx->out->uses_ray_traversal)) {
+      unsigned samples = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE || I->op == AGX_OPCODE_TEXTURE_LOAD)
+            samples++;
+      }
+      if (samples >= 4)
+         max_possible_regs = MIN2(max_possible_regs, sampled_cap);
+   }
+
    /* Match the CEM scratch extent reserved by agx3_pack_binary. */
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
       max_possible_regs = MIN2(max_possible_regs,

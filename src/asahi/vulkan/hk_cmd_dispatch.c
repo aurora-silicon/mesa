@@ -1805,7 +1805,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        /* Static TPS addresses are 15-bit halfword offsets. */
        !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, 1u << 16) ||
        ((s->b.info.scratch_size || linked->b.scratch_size) &&
-        !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) ||
+        !hk_compute_launch_takes_scratch(&dev->dev)) ||
        s->b.info.uses_ray_traversal || s->info.agx3_txf_texture_valid ||
        s->info.agx3_storage_image_valid || s->info.agx3_sampled_storage_valid ||
        s->info.agx3_indexed_storage_valid ||
@@ -2565,9 +2565,10 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                                          AGX3_G17P_MAX_SPILL_B) ||
        s->info.stage != MESA_SHADER_COMPUTE || agx_is_indirect(grid) ||
       (!g18 && s->b.info.local_size) || s->b.info.uses_ray_traversal ||
-       (g18 && (s->b.info.scratch_size || linked->b.scratch_size ||
-                s->b.info.agx3_spectpr_scratch_size ||
-                s->b.info.nr_preamble_gprs)) ||
+       (!hk_compute_launch_takes_scratch(&dev->dev) &&
+        (s->b.info.scratch_size || linked->b.scratch_size ||
+         s->b.info.agx3_spectpr_scratch_size)) ||
+       (g18 && s->b.info.nr_preamble_gprs) ||
        (g18 && s->info.g18_unlowered_image) ||
        s->info.agx3_txf_texture_valid ||
        (s->info.agx3_storage_image_valid && !g18) ||
