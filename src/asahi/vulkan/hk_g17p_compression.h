@@ -610,7 +610,7 @@ hk_m5_depth_compression_eligible(enum agx_chip chip, unsigned plane,
       VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
    return info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth == 1 &&
-          info->arrayLayers == 1 && info->mipLevels == 1 &&
+          info->mipLevels == 1 &&
           info->samples == VK_SAMPLE_COUNT_1_BIT &&
           info->tiling == VK_IMAGE_TILING_OPTIMAL &&
           !(info->flags & ~allowed_flags) &&
