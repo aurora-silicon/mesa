@@ -96,6 +96,8 @@
 /* Gallium's Gen10 (G17G) buffer texture keeps its element count in the
  * descriptor's last word, which no Gen10 field occupies. */
 #define AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET 28
+/* G17C Vulkan image views use the same spare word for their level-zero extent. */
+#define AGX_G17C_IMAGE_EXTENT_OFFSET 28
 /* Gallium's Gen10 storage PBE keeps the image-atomic address word (the
  * G17P sideband, AGX_G17P_IMAGE_ATOMIC_SW_FROM_PBE) in its last eight bytes,
  * which no Gen10 field occupies. */

@@ -122,6 +122,7 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * read the word from the PBE's last eight bytes, where Gallium keeps it.
  * Texel-buffer atomics are not affected. */
 #define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
+#define AGX_NIR_TEXTURE_LEVEL_ZERO_EXTENT (1u << 10)
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for
  * view-bounds robustness and require it. */

@@ -440,8 +440,16 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
 
    }
 
-   return hk_pack_native_texture(
-      agx_chip_descriptor_generation(dev->dev.chip), out, &cfg);
+   if (!hk_pack_native_texture(agx_chip_descriptor_generation(dev->dev.chip), out, &cfg))
+      return false;
+
+   if (dev->dev.chip == AGX_CHIP_G17C) {
+      const uint32_t w = u_minify(cfg.width, cfg.first_level);
+      const uint32_t h = u_minify(cfg.height, cfg.first_level);
+      out->opaque[AGX_G17C_IMAGE_EXTENT_OFFSET / 4] = w | (h << 16);
+   }
+
+   return true;
 }
 
 static bool
