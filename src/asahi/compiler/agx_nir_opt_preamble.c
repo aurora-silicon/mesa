@@ -415,6 +415,25 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
 }
 
 static float
+execution_weight(const nir_block *block, const void *data)
+{
+   float weight = 1.0f;
+   if (!data)
+      return weight;
+   for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
+      if (node->type == nir_cf_node_if)
+         weight /= 8.0f;
+   }
+   return weight;
+}
+
+static float
+instr_cost_agx3c(nir_instr *instr, const void *data)
+{
+   return instr_cost(instr, data) * execution_weight(instr->block, data);
+}
+
+static float
 instr_cost_g17p(nir_instr *instr, const void *data)
 {
    float weight = execution_weight(instr->block, data);
@@ -507,7 +526,10 @@ rewrite_cost_agx3c(nir_def *def, const void *data)
 {
    if (def->bit_size < 32 && def->num_components > 1)
       return 1e30f;
-   return rewrite_cost_impl(def, true);
+   float weight = execution_weight(nir_def_block(def), data);
+   if (data && nir_def_instr(def)->type == nir_instr_type_phi)
+      weight /= 8.0f;
+   return rewrite_cost_impl(def, true) * weight;
 }
 
 static bool
@@ -999,7 +1021,10 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       /* The G17P uniform fabs cost is not an M5 witness; keep the
        * generic instruction cost there. */
       options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
-      options.instr_cost_cb = agx3c ? instr_cost : instr_cost_g17p;
+      static const bool weight_fragments = true;
+      if (agx3c && nir->info.stage == MESA_SHADER_FRAGMENT)
+         options.cb_data = &weight_fragments;
+      options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
    /* Every AGX3B chip: the uniform file it fills is the encoding's. */
