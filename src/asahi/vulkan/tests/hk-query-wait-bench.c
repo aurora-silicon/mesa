@@ -61,6 +61,7 @@ json_string(const char *s)
 
 struct library_check {
    char expected[PATH_MAX];
+   char observed[PATH_MAX];
    bool found;
 };
 
@@ -70,8 +71,15 @@ loaded_library(struct dl_phdr_info *info, size_t size, void *data)
    (void)size;
    struct library_check *check = data;
    char path[PATH_MAX];
-   if (realpath(info->dlpi_name, path) && !strcmp(path, check->expected))
-      check->found = true;
+   if (realpath(info->dlpi_name, path)) {
+      const char *name = strrchr(path, '/');
+      const bool exact = !strcmp(path, check->expected);
+      if (exact ||
+          (!check->found && name && !strcmp(name + 1, "libvulkan_asahi.so")))
+         snprintf(check->observed, sizeof(check->observed), "%s", path);
+      if (exact)
+         check->found = true;
+   }
    return 0;
 }
 
@@ -202,7 +210,7 @@ main(int argc, char **argv)
    const VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "HK query wait benchmark",
-      .applicationVersion = 1,
+      .applicationVersion = 2,
       .apiVersion = VK_API_VERSION_1_3,
    };
    const VkInstanceCreateInfo instance_info = {
@@ -217,7 +225,6 @@ main(int argc, char **argv)
    VkPhysicalDevice physical;
    CHECK(vkEnumeratePhysicalDevices(instance, &count, &physical));
    dl_iterate_phdr(loaded_library, &loaded);
-   require(loaded.found, "expected private ICD library was not loaded");
 
    VkPhysicalDeviceDrmPropertiesEXT drm = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT,
@@ -231,9 +238,26 @@ main(int argc, char **argv)
       .pNext = &driver,
    };
    vkGetPhysicalDeviceProperties2(physical, &properties);
-   require(properties.properties.vendorID == 0x106b &&
+   printf("{\"kind\":\"identity\",\"workload_version\":2,\"vendor_id\":%u,"
+          "\"device_id\":%u,\"driver_id\":%u,\"expected_library\":",
+          properties.properties.vendorID, properties.properties.deviceID,
+          driver.driverID);
+   json_string(loaded.expected);
+   printf(",\"observed_library\":");
+   json_string(loaded.observed);
+   printf(",\"expected_library_loaded\":%s,\"driver_name\":",
+          loaded.found ? "true" : "false");
+   json_string(driver.driverName);
+   printf(",\"driver_info\":");
+   json_string(driver.driverInfo);
+   puts("}");
+   fflush(stdout);
+   require(loaded.found, "expected private ICD library was not loaded");
+   /* HK reports Mesa's Vulkan vendor ID by default, independently of its
+    * native Apple GPU/kernel identity checked below. */
+   require(properties.properties.vendorID == VK_VENDOR_ID_MESA &&
               driver.driverID == VK_DRIVER_ID_AURORA_BOREALIS,
-           "expected Apple hardware and the Aurora Borealis driver");
+           "expected Mesa vendor ID and the Aurora Borealis driver");
    require(properties.properties.apiVersion >= VK_API_VERSION_1_3,
            "Vulkan 1.3 is required");
    kernel_preflight(&drm);
@@ -263,7 +287,7 @@ main(int argc, char **argv)
          break;
    }
    require(family < count, "no timestamp-capable graphics/compute queue");
-   printf("{\"kind\":\"configuration\",\"workload_version\":1,\"device\":");
+   printf("{\"kind\":\"configuration\",\"workload_version\":2,\"device\":");
    json_string(properties.properties.deviceName);
    printf(",\"driver\":");
    json_string(driver.driverInfo);
