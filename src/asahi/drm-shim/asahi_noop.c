@@ -244,29 +244,33 @@ static const struct drm_asahi_queue_limits queue_limits_g17 = {
    .max_in_flight_per_queue = 1,
 };
 
-static const struct drm_asahi_params_global params_g16g = {
-   .features = DRM_ASAHI_FEATURE_VM_STATUS |
-               DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
-               DRM_ASAHI_FEATURE_VM_STATUS_MIRROR |
-               DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS,
-   .gpu_generation = 16,
-   .gpu_variant = 'G',
-   .gpu_revision = 0x10,
-   .chip_id = 0x8132,
-   .num_dies = 1,
-   .num_clusters_total = 1,
-   .num_cores_per_cluster = 10,
-   .core_masks = {0x3ff},
-   .vm_start = 0x4000,
-   .vm_end = (1ull << 42) - 0x8000ull,
-   .vm_kernel_min_size = 0x20000000,
-   .max_commands_per_submission = 64,
-   .max_attachments = 16,
-   .max_frequency_khz = 1470000,
-   .command_timestamp_frequency_hz = 1000000000,
-   .usc_generation = 3,
-   .gpu_hal_generation = DRM_ASAHI_GPU_HAL_200,
-};
+/* T8132 / M4 (G16G) as the g16 kernel reports it (feature word 0x1c02). */
+#define SHIM_T8132_PARAMS(extra_features)                                     \
+   {                                                                          \
+      .features = DRM_ASAHI_FEATURE_VM_STATUS |                               \
+                  DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |                 \
+                  DRM_ASAHI_FEATURE_VM_STATUS_MIRROR |                        \
+                  DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | (extra_features),  \
+      .gpu_generation = 16, .gpu_variant = 'G', .gpu_revision = 0x10,         \
+      .chip_id = 0x8132, .num_dies = 1, .num_clusters_total = 1,              \
+      .num_cores_per_cluster = 10, .core_masks = {0x3ff},                     \
+      .vm_start = 0x4000, .vm_end = (1ull << 42) - 0x8000ull,                 \
+      .vm_kernel_min_size = 0x20000000,                                       \
+      .max_commands_per_submission = 64, .max_attachments = 16,               \
+      .max_frequency_khz = 1470000,                                           \
+      .command_timestamp_frequency_hz = 1000000000, .usc_generation = 3,      \
+      .gpu_hal_generation = DRM_ASAHI_GPU_HAL_200,                            \
+   }
+
+static const struct drm_asahi_params_global params_g16g = SHIM_T8132_PARAMS(0);
+
+/* ASAHI_SHIM_CHIP=g16g-rt: the same with the ray-query and bounded AS-build
+ * features G17P's kernel reports, which the g16 kernel does not advertise
+ * yet. It exercises the G16G ray-tracing paths without hardware; submissions
+ * are not executed or validated. */
+static const struct drm_asahi_params_global params_g16g_rt =
+   SHIM_T8132_PARAMS(DRM_ASAHI_FEATURE_RENDER_RAY_QUERY |
+                     DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
 
 /*
  * T6030 / M3 Pro, as the M3 kernel (drivers/gpu/drm/apple/gpu-g15-backend.c
@@ -553,6 +557,8 @@ shim_params(void)
       return &params_g15c;
    if (chip && !strcmp(chip, "g16g"))
       return &params_g16g;
+   if (chip && !strcmp(chip, "g16g-rt"))
+      return &params_g16g_rt;
    if (chip && !strcmp(chip, "g17s"))
       return &params_g17s;
    if (chip && !strcmp(chip, "t6041"))

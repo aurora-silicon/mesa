@@ -83,9 +83,11 @@ enum agx_dbg {
     * computation. */
    AGX_DBG_VERIFY = BITFIELD_BIT(25),
    /* G16G opt-ins for paths that are not yet hardware-qualified there. Mesh:
-    * VK_EXT_mesh_shader on the GEN1 native mesh path. Without it G16G does
-    * not expose mesh shaders. */
+    * VK_EXT_mesh_shader on the GEN1 native mesh path. Ray tracing: the GEN1
+    * hardware ray-tracing runtime, which still also needs the kernel's
+    * ray-query features. Without them G16G exposes neither. */
    AGX_DBG_G16G_MESH = BITFIELD_BIT(26),
+   AGX_DBG_G16G_RT = BITFIELD_BIT(27),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen

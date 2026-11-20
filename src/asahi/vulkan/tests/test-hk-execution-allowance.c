@@ -219,9 +219,60 @@ check_as_contracts(void)
    }
 }
 
+/* G16G takes the G17P contract only when opted in, and then exactly: the
+ * same kernel features select traversal and AS-only devices. */
+static void
+check_g16g_as_contracts(void)
+{
+   struct agx_device dev = {
+      .chip = AGX_CHIP_G16G,
+      .params = {.chip_id = 0x8132, .gpu_generation = 16, .gpu_variant = 'G'},
+   };
+   for (unsigned bits = 0; bits < 16; ++bits) {
+      dev.debug = (bits & 8) ? AGX_DBG_G16G_RT : 0;
+      dev.params.features =
+         ((bits & 1) ? DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS : 0) |
+         ((bits & 2) ? DRM_ASAHI_FEATURE_RENDER_RAY_QUERY : 0) |
+         ((bits & 4) ? DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD : 0);
+      const bool opted = bits & 8;
+      assert(!hk_g16s_as_enabled(&dev));
+      assert(hk_g16g_as_enabled(&dev) == (opted && (bits & 5) == 5));
+      assert(hk_g17p_rt_enabled(&dev) == (opted && (bits & 3) == 3));
+      assert(hk_gen1_as_enabled(&dev) ==
+             (opted && (((bits & 5) == 5) || ((bits & 3) == 3))));
+      assert(hk_gen1_rt_chip(&dev) == opted);
+   }
+   /* The mesh opt-in is separate and selects nothing for ray tracing. */
+   dev.params.features = UINT64_MAX;
+   dev.debug = AGX_DBG_G16G_MESH;
+   assert(!hk_g17p_rt_enabled(&dev) && !hk_gen1_as_enabled(&dev));
+   assert(hk_gen1_mesh_exposed(&dev));
+   dev.debug = AGX_DBG_G16G_RT;
+   assert(!hk_gen1_mesh_exposed(&dev));
+   /* The opt-ins name G16G only. */
+   dev.debug = AGX_DBG_G16G_RT | AGX_DBG_G16G_MESH;
+   for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
+      dev.chip = chip;
+      if (chip == AGX_CHIP_G16G || chip == AGX_CHIP_G17P)
+         continue;
+      assert(!hk_g17p_rt_enabled(&dev) && !hk_gen1_as_enabled(&dev) &&
+             !hk_gen1_mesh_exposed(&dev) && !hk_gen1_rt_chip(&dev));
+   }
+   /* The GEN1 runtime's chips are G17P and G16G. */
+   for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip)
+      assert(agx_chip_gen1_rt(chip) ==
+             (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G));
+   /* G17P does not depend on them. */
+   dev.chip = AGX_CHIP_G17P;
+   dev.debug = 0;
+   assert(hk_g17p_rt_enabled(&dev) && hk_gen1_mesh_exposed(&dev) &&
+          hk_gen1_rt_chip(&dev));
+}
+
 int main(void)
 {
    check_as_contracts();
+   check_g16g_as_contracts();
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip)
       assert(hk_shader_binary_version(chip) ==
              (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G17G ||
@@ -233,9 +284,19 @@ int main(void)
    assert(hk_as_build_flags(AGX_CHIP_G17P, DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD, true) ==
           DRM_ASAHI_COMPUTE_AS_BUILD);
    assert(hk_as_build_flags(AGX_CHIP_G17P, UINT64_MAX, true) == DRM_ASAHI_COMPUTE_AS_BUILD);
-   /* Even a future classic kernel advertising every bit keeps zero flags. */
+   /* G16G runs the same GEN1 builder: the flag follows its kernel's
+    * BOUNDED_AS_BUILD exactly as on G17P. */
+   assert(hk_as_build_flags(AGX_CHIP_G16G, 0, true) == 0);
+   assert(hk_as_build_flags(AGX_CHIP_G16G, DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+                                           DRM_ASAHI_FEATURE_RENDER_RAY_QUERY,
+                            true) == 0);
+   assert(hk_as_build_flags(AGX_CHIP_G16G, DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD, false) == 0);
+   assert(hk_as_build_flags(AGX_CHIP_G16G, DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD, true) ==
+          DRM_ASAHI_COMPUTE_AS_BUILD);
+   /* Even a future kernel advertising every bit keeps zero flags on the
+    * chips without the GEN1 builder. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip <= AGX_CHIP_G17A; ++chip)
-      if (chip != AGX_CHIP_G17P)
+      if (chip != AGX_CHIP_G17P && chip != AGX_CHIP_G16G)
          assert(hk_as_build_flags(chip, UINT64_MAX, true) == 0);
    for (unsigned a = 0; a < 2; ++a)
       for (unsigned b = 0; b < 2; ++b)

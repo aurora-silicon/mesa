@@ -3022,7 +3022,7 @@ hk_native_rq_profile(const struct hk_device *dev)
 bool
 hk_tes_ray_queries_in_compute(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P &&
+   return agx_chip_gen1_rt(dev->dev.chip) &&
           dev->gen1_native_rq && dev->gen1_native_graphics_rq;
 }
 

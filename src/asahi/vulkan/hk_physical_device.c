@@ -1251,13 +1251,13 @@ hk_get_device_properties(const struct agx_device *dev,
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
       .shaderGroupHandleSize = HK_RAY_TRACING_GROUP_HANDLE_SIZE,
-      .maxRayRecursionDepth = dev->chip == AGX_CHIP_G17P ?
+      .maxRayRecursionDepth = hk_gen1_rt_chip(dev) ?
          HK_G17P_MAX_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
-      .shaderGroupHandleAlignment = dev->chip == AGX_CHIP_G17P ? 1 : 32,
+      .shaderGroupHandleAlignment = hk_gen1_rt_chip(dev) ? 1 : 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
 
       .rayTracingInvocationReorderReorderingHint =
@@ -2208,7 +2208,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(&pdev->dev, instance, &supported_extensions);
-   if (hk_g16s_as_enabled(&pdev->dev)) {
+   if (hk_g16s_as_enabled(&pdev->dev) || hk_g16g_as_enabled(&pdev->dev)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
    }

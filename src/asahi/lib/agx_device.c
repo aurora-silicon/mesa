@@ -117,6 +117,7 @@ static const struct debug_named_value agx_debug_options[] = {
    {"asynctrace",AGX_DBG_ASYNCTRACE,"Trace command streams without waiting"},
    {"verify",    AGX_DBG_VERIFY,   "Check cached launch programs against fresh ones"},
    {"g16gmesh",  AGX_DBG_G16G_MESH, "G16G: expose mesh shaders (not yet hardware-qualified)"},
+   {"g16grt",    AGX_DBG_G16G_RT,  "G16G: expose hardware ray tracing the kernel admits (not yet hardware-qualified)"},
    {"bodumpverbose", AGX_DBG_BODUMPVERBOSE,   "Include extra info with dumps"},
    DEBUG_NAMED_VALUE_END
 };
