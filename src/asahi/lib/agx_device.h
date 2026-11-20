@@ -82,6 +82,10 @@ enum agx_dbg {
    /* Check cached native launch programs and root snapshots against a fresh
     * computation. */
    AGX_DBG_VERIFY = BITFIELD_BIT(25),
+   /* G16G opt-ins for paths that are not yet hardware-qualified there. Mesh:
+    * VK_EXT_mesh_shader on the GEN1 native mesh path. Without it G16G does
+    * not expose mesh shaders. */
+   AGX_DBG_G16G_MESH = BITFIELD_BIT(26),
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen

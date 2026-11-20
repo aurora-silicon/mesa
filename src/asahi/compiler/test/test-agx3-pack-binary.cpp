@@ -176,6 +176,37 @@ TEST_F(AGX3PackBinary, MeshExportFencesUseExactLivePhaseMasks)
              (std::vector<uint8_t>{0x0e,0,0,0}));
 }
 
+/* G16G executes G17P's AGX3B mesh export protocol (agx_chip_gen1_mesh): the
+ * same program packs to the same bytes, where other AGX3B identities refuse
+ * the GEN1 fence. */
+TEST_F(AGX3PackBinary, G16GMeshExportPacksAsG17P)
+{
+   std::vector<uint8_t> codes[3];
+   const agx_chip chips[3] = {AGX_CHIP_G17P, AGX_CHIP_G16G, AGX_CHIP_G15S};
+   for (unsigned i = 0; i < 3; ++i) {
+      agx_builder *b = builder(AGX_ISA_ENCODING_AGX3B);
+      key.dev.chip = chips[i];
+      b->shader->stage = MESA_SHADER_MESH;
+      agx_mov_imm_to(b, agx_register(8, AGX_SIZE_16), 32);
+      agx_mov_imm_to(b, agx_register(10, AGX_SIZE_16), 64);
+      agx_allocate_uvb_m5(b, agx_register(8, AGX_SIZE_16),
+                           agx_register(10, AGX_SIZE_16));
+      agx_index desc = agx_register(12, AGX_SIZE_32); desc.channels_m1 = 1;
+      agx_mov_imm_to(b, agx_register(12, AGX_SIZE_32), 0);
+      agx_mov_imm_to(b, agx_register(14, AGX_SIZE_32), 256);
+      agx_store_uvb_m5(b, desc, 1);
+      agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_INDICES);
+      agx_store_uvb_m5(b, desc, 0);
+      agx_fence_uvb_gen1(b, AGX_MESH_EXPORT_FENCE_VERTEX_BATCH);
+      agx_store_uvb_m5(b, desc, 0);
+      agx_stop(b);
+      /* G15S refuses the program. */
+      codes[i] = pack(b, chips[i] != AGX_CHIP_G15S);
+   }
+   ASSERT_FALSE(codes[0].empty());
+   EXPECT_EQ(codes[0], codes[1]);
+}
+
 /* An in-place 32-bit NOT whose halves come from two loads in flight waits on
  * two slots. Only the unary AGX3b `inv` form carries that wait in place: the
  * NOT's ignored second bitop source must not keep it from that form

@@ -3491,7 +3491,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (!linked ||
-       (dev->dev.chip == AGX_CHIP_G17P
+       (agx_chip_gen1_mesh(dev->dev.chip)
           ? !linked->b.g17p_compiler_d_valid
           : (dev->dev.chip != AGX_CHIP_G17S ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
@@ -3518,7 +3518,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       /* Promoted constants, as for the other graphics programs
        * (hk_g17p_graphics_uniform_ranges()). */
       const struct agx_rodata *rodata = &s->b.info.rodata;
-      if (dev->dev.chip == AGX_CHIP_G17P && rodata->size_16 != 0 &&
+      if (agx_chip_gen1_mesh(dev->dev.chip) && rodata->size_16 != 0 &&
           (!s->bo || !s->bo->va ||
            !hk_agx3_g17p_rodata_range(rodata->base_uniform, rodata->size_16,
                                       hk_shader_code_va(s), rodata->offset,
@@ -3535,7 +3535,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .shader_binary_size = linked->b.size,
       /* The thread-private frame also holds returned atomic words
        * (agx3_spectpr_scratch_size), as for the vertex and fragment programs. */
-      .scratch_size = dev->dev.chip == AGX_CHIP_G17P
+      .scratch_size = agx_chip_gen1_mesh(dev->dev.chip)
                          ? MAX3(linked->b.scratch_size, s->b.info.scratch_size,
                                 linked->b.agx3_spectpr_scratch_size)
                          : MAX2(linked->b.scratch_size,
@@ -3543,11 +3543,11 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       .nr_gprs = linked->b.nr_gprs,
       .compiler_d_valid = linked->b.g17p_compiler_d_valid,
       .compiler_d = linked->b.g17p_compiler_d,
-      .threadgroup_memory_size_B = dev->dev.chip == AGX_CHIP_G17P && object
+      .threadgroup_memory_size_B = agx_chip_gen1_mesh(dev->dev.chip) && object
                                     ? 0 : s->b.info.local_size,
    };
    size_t bound;
-   if (!(dev->dev.chip == AGX_CHIP_G17P
+   if (!(agx_chip_gen1_mesh(dev->dev.chip)
           ? agx3_g17p_graphics_program_bound(dev->dev.chip, ranges, count, &bound)
           : agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, count, &bound)))
       goto refused;
@@ -3556,7 +3556,7 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       return 0;
    d.program_va = allocation.gpu;
    struct agx3_g17p_graphics_program program;
-   if (!(dev->dev.chip == AGX_CHIP_G17P
+   if (!(agx_chip_gen1_mesh(dev->dev.chip)
           ? agx3_g17p_graphics_program_generate(dev->dev.chip, &d, &program)
           : agx3_g17g_mesh_program_generate(dev->dev.chip, &d, object, &program)))
       goto refused;

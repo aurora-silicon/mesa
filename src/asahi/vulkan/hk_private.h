@@ -91,6 +91,24 @@ struct hk_addr_range {
 #define HK_G17P_RT_KERNEL_FEATURES                                             \
    (DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
 
+/* G16G (the base M4) shares G17P's AGX3B encoding and HAL200 records, and so
+ * the GEN1 mesh path (agx_chip_gen1_mesh()). Until it passes the Vulkan CTS on
+ * G16G hardware it is exposed only when asked: ASAHI_MESA_DEBUG=g16gmesh. */
+static inline bool
+hk_g16g_opted_in(const struct agx_device *dev, uint32_t flag)
+{
+   return dev->chip == AGX_CHIP_G16G && (dev->debug & flag);
+}
+
+/* Whether the device exposes VK_EXT_mesh_shader on the GEN1 native mesh path
+ * (native mesh, software task). */
+static inline bool
+hk_gen1_mesh_exposed(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          hk_g16g_opted_in(dev, AGX_DBG_G16G_MESH);
+}
+
 static inline bool
 hk_g17p_rt_enabled(const struct agx_device *dev)
 {
