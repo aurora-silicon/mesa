@@ -40,6 +40,7 @@ struct fixture {
    unsigned available, statuses, completions, changes, errors;
    bool race_ready, race_loss, idle;
    bool publish_pending;
+   bool idle_after_completion;
 };
 
 static void
@@ -141,6 +142,8 @@ completion(void *data, void *queue, uint64_t point, uint64_t deadline)
    f->completions++;
    if (f->completion_at[q] <= deadline) {
       f->now = f->completion_at[q];
+      if (f->idle_after_completion)
+         f->idle = true;
       return 0;
    }
    f->now = deadline;
@@ -401,6 +404,16 @@ test_victims(void)
       assert(f.completions == 0);
       finish(&f);
    }
+   struct fixture f;
+   bool never;
+   init(&f);
+   enqueue(&f, 0);
+   accept(&f, 0, 5);
+   f.completion_at[0] = 10;
+   f.idle_after_completion = true;
+   assert(wait(&f, true, &never) == VK_SUCCESS && never);
+   assert(f.now == 10 && f.completions == 1 && !f.changes);
+   finish(&f);
 }
 
 /* The completion mock deliberately has no loss notification, just as an
@@ -410,6 +423,7 @@ struct threaded {
    mtx_t lock;
    struct u_cnd_monotonic changed;
    unsigned entered, returned;
+   unsigned waiting;
    bool lost;
    bool ready;
    unsigned polls, statuses;
@@ -511,6 +525,71 @@ test_threads(void)
    finish(&t.f);
 }
 
+static int
+registration_changed(void *data, struct hk_query_wait_device *dev,
+                     uint64_t deadline)
+{
+   struct threaded *t = data;
+   assert(deadline <= os_time_get_nano() + HK_QUERY_WAIT_INTERVAL_NS);
+   mtx_lock(&t->lock);
+   t->waiting++;
+   u_cnd_monotonic_broadcast(&t->changed);
+   mtx_unlock(&t->lock);
+   /* The producer registers after the announcement above, contending on the
+    * still-held tracking mutex. A longer test guard distinguishes a missed
+    * notification from the normal 100 ms predicate-check fallback. */
+   deadline = os_time_get_nano() + UINT64_C(2000000000);
+   struct timespec ts = {deadline / 1000000000, deadline % 1000000000};
+   int ret = u_cnd_monotonic_timedwait(&dev->changed, &dev->mutex, &ts);
+   assert(ret == thrd_success);
+   return ret;
+}
+
+static int
+registration_reader(void *data)
+{
+   struct threaded *t = data;
+   const struct hk_query_wait_ops thread_ops = {
+      .available = thread_ready,
+      .status = thread_status,
+      .completion = thread_completion,
+      .changed = registration_changed,
+   };
+   bool never;
+   assert(hk_query_wait_available(t->f.pool, 0, false, &never, &thread_ops,
+                                  t) == VK_SUCCESS);
+   assert(!never);
+   return 0;
+}
+
+static void
+test_registration_race(void)
+{
+   struct threaded t = {0};
+   init(&t.f);
+   assert(mtx_init(&t.lock, mtx_plain) == thrd_success);
+   assert(u_cnd_monotonic_init(&t.changed) == thrd_success);
+   thrd_t thread;
+   assert(thrd_create(&thread, registration_reader, &t) == thrd_success);
+   mtx_lock(&t.lock);
+   while (!t.waiting)
+      assert(u_cnd_monotonic_wait(&t.changed, &t.lock) == thrd_success);
+   mtx_unlock(&t.lock);
+   enqueue(&t.f, 0);
+   accept(&t.f, 0, 1);
+   mtx_lock(&t.lock);
+   while (!t.entered)
+      assert(u_cnd_monotonic_wait(&t.changed, &t.lock) == thrd_success);
+   t.ready = true;
+   u_cnd_monotonic_broadcast(&t.changed);
+   mtx_unlock(&t.lock);
+   thrd_join(thread, NULL);
+   assert(list_is_empty(&t.f.dev.producers));
+   u_cnd_monotonic_destroy(&t.changed);
+   mtx_destroy(&t.lock);
+   finish(&t.f);
+}
+
 static uint64_t
 clock_ns(clockid_t clock)
 {
@@ -602,6 +681,7 @@ main(int argc, char **argv)
    test_allocation_failure();
    test_victims();
    test_threads();
+   test_registration_race();
    puts("PASS: production query wait/tracking helpers; no GPU/device access");
    return 0;
 }

@@ -11,7 +11,10 @@
 #include "vk_query_pool.h"
 
 struct agx_bo;
+struct hk_device;
 struct hk_query_wait_pool;
+
+bool hk_query_wait_has_loss_status(const struct hk_device *dev);
 
 struct hk_query_pool {
    struct vk_query_pool vk;

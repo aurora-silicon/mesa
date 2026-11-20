@@ -1421,6 +1421,9 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
       }
    }
 
+   if (!hk_query_wait_has_loss_status(dev))
+      return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+
    bool queries = false;
    for (uint32_t i = 0; i < submitCount; i++) {
       for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
@@ -2799,9 +2802,11 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * a completion point. */
    struct hk_query_wait_producer **producers = NULL;
    bool queries = false;
-   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
-      struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
-      queries |= cmd->query_wait_ops.size != 0;
+   if (hk_query_wait_has_loss_status(dev)) {
+      for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+         struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
+         queries |= cmd->query_wait_ops.size != 0;
+      }
    }
    if (queries) {
       producers = calloc(submit->command_buffer_count, sizeof(*producers));

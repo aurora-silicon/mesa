@@ -8,7 +8,6 @@
 
 struct hk_query_wait_query {
    struct list_head producers;
-   uint64_t epoch;
 };
 
 struct hk_query_wait_pool {
@@ -27,8 +26,6 @@ struct hk_query_wait_link {
    struct list_head link;
    struct hk_query_wait_producer *producer;
    struct hk_query_wait_pool *pool;
-   uint32_t query;
-   uint64_t epoch;
 };
 
 enum hk_query_wait_state {
@@ -151,7 +148,6 @@ reset_locked(struct hk_query_wait_pool *pool, uint32_t first, uint32_t count)
       list_for_each_entry_safe(struct hk_query_wait_link, p, &q->producers,
                                link)
          unlink_query(p);
-      q->epoch++;
    }
    list_for_each_entry_safe(struct hk_query_wait_producer, p, &dev->producers,
                             link) {
@@ -273,25 +269,20 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
    size_t n = 0;
    util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
       struct hk_query_wait_pool *pool = op->pool;
-      if (pool->destroyed)
+      /* Ordered GPU resets never discard earlier producers here: their
+       * availability may still be visible until the reset executes. Retain
+       * every writer instance until host reset or observed retirement. */
+      if (pool->destroyed || op->reset)
          continue;
       for (uint32_t i = op->first; i < op->first + op->count; i++) {
          struct hk_query_wait_query *q = &pool->queries[i];
-         if (op->reset) {
-            /* Recording/queuing a reset must not erase an available value,
-             * or discard an older epoch whose GPU reset has not executed. */
-            q->epoch++;
-         } else {
-            struct hk_query_wait_link *link = &p->queries[n++];
-            *link = (struct hk_query_wait_link){
-               .producer = p,
-               .pool = pool,
-               .query = i,
-               .epoch = q->epoch,
-            };
-            p_atomic_inc(&pool->refs);
-            list_addtail(&link->link, &q->producers);
-         }
+         struct hk_query_wait_link *link = &p->queries[n++];
+         *link = (struct hk_query_wait_link){
+            .producer = p,
+            .pool = pool,
+         };
+         p_atomic_inc(&pool->refs);
+         list_addtail(&link->link, &q->producers);
       }
    }
    list_addtail(&p->link, &dev->producers);

@@ -44,10 +44,22 @@ struct hk_query_report {
    uint64_t value;
 };
 
+bool
+hk_query_wait_has_loss_status(const struct hk_device *dev)
+{
+   /* Match hk_check_status's usable kernel/host error sources. A feature bit
+    * for a status mirror is insufficient if registration failed. */
+   return dev->vm_status_mirror.word || dev->dev.async_errors ||
+          (!dev->dev.is_virtio &&
+           (dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS));
+}
+
 static bool
 hk_query_record(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
                  uint32_t first, uint32_t count, bool reset)
 {
+   if (!pool->wait)
+      return true;
    if (hk_query_wait_record(&cmd->query_wait_ops, pool->wait, first, count,
                              reset))
       return true;
@@ -608,11 +620,13 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   pool->wait = hk_query_wait_pool_create(&dev->query_wait,
-                                          pCreateInfo->queryCount);
-   if (!pool->wait) {
-      vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
-      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   if (hk_query_wait_has_loss_status(dev)) {
+      pool->wait = hk_query_wait_pool_create(&dev->query_wait,
+                                             pCreateInfo->queryCount);
+      if (!pool->wait) {
+         vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
    }
 
    /* Occlusion availability lives in 64-bit slots of a bound timestamp
@@ -764,7 +778,8 @@ hk_ResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery,
    VK_FROM_HANDLE(hk_device, dev, device);
 
    host_zero_queries(dev, pool, firstQuery, queryCount, false);
-   hk_query_wait_host_reset(pool->wait, firstQuery, queryCount);
+   if (pool->wait)
+      hk_query_wait_host_reset(pool->wait, firstQuery, queryCount);
 
    for (uint32_t i = 0; pool->oq_submit && i < queryCount; i++)
       p_atomic_set(&pool->oq_submit[firstQuery + i].point, 0);
@@ -1216,6 +1231,45 @@ hk_queues_idle(struct hk_device *dev)
    return hk_query_wait_quiescent(&dev->query_wait, &after) && serial == after;
 }
 
+/* Without an observable loss source, retaining the original finite wait
+ * avoids introducing an indefinite wait on a retired error fence. The legacy
+ * busy spin and two-second deadline remain unresolved on those kernels. */
+#define HK_QUERY_TIMEOUT 2000000000ull
+static VkResult
+hk_query_wait_for_available_legacy(struct hk_device *dev, struct hk_query_pool *pool,
+                            uint32_t query, bool *never)
+{
+   uint64_t abs_timeout_ns = os_time_get_absolute_timeout(HK_QUERY_TIMEOUT);
+   const bool victims = agx_chip_g17_m5(dev->dev.chip);
+
+   *never = false;
+   while (os_time_get_nano() < abs_timeout_ns) {
+      if (hk_query_is_available(dev, pool, query))
+         return VK_SUCCESS;
+
+      VkResult status = vk_device_check_status(&dev->vk);
+      if (status != VK_SUCCESS)
+         return status;
+
+      if (victims && hk_queues_idle(dev)) {
+         /* The last producer may have retired after the check above. */
+         if (hk_query_is_available(dev, pool, query))
+            return VK_SUCCESS;
+         status = vk_device_check_status(&dev->vk);
+         if (status != VK_SUCCESS)
+            return status;
+
+         mesa_logw_once("query %u became unavailable for good: all submitted "
+                        "work completed without writing it (a command the "
+                        "kernel failed as a recovery victim)", query);
+         *never = true;
+         return VK_SUCCESS;
+      }
+   }
+
+   return vk_device_set_lost(&dev->vk, "query timeout");
+}
+
 struct hk_query_wait_context {
    struct hk_device *dev;
    struct hk_query_pool *pool;
@@ -1268,6 +1322,8 @@ static VkResult
 hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
                             uint32_t query, bool *never)
 {
+   if (!pool->wait)
+      return hk_query_wait_for_available_legacy(dev, pool, query, never);
    struct hk_query_wait_context ctx = {dev, pool, query};
    const struct hk_query_wait_ops ops = {
       .available = hk_query_wait_ready,

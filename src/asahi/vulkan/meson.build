@@ -141,11 +141,11 @@ hk_drirc = custom_target(
 
 if with_tests
   if host_machine.system() == 'linux'
-  test('hk_query_wait', executable('hk_query_wait_test',
-    files('tests/test-hk-query-wait.c', 'hk_query_wait.c'),
-    include_directories : [include_directories('.'), inc_include, inc_src],
-    dependencies : [idep_mesautil, dep_thread],
-    link_args : ['-Wl,--wrap=calloc', '-Wl,--wrap=realloc']), suite : ['asahi'])
+    test('hk_query_wait', executable('hk_query_wait_test',
+      files('tests/test-hk-query-wait.c', 'hk_query_wait.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src],
+      dependencies : [idep_mesautil, dep_thread],
+      link_args : ['-Wl,--wrap=calloc', '-Wl,--wrap=realloc']), suite : ['asahi'])
   endif
 
   test('hk_execution_allowance',
@@ -1214,6 +1214,9 @@ if with_tests
     dependencies : [hk_deps], link_with : [libhk]),
     timeout : 30, suite : ['asahi'])
 
+endif
+
+if with_tests and host_machine.system() == 'linux'
   test('hk_query_wait_wiring', executable('hk_query_wait_wiring_test',
     files('tests/test-hk-query-wait-wiring.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
@@ -1227,5 +1230,8 @@ if with_tests
       '-Wl,--wrap=hk_flush_deferred_clears_why',
       '-Wl,--wrap=hk_cmd_invalidate_graphics_state',
       '-Wl,--wrap=hk_cmd_invalidate_compute_state',
+      '-Wl,--wrap=os_time_get_nano',
+      '-Wl,--wrap=os_time_get_absolute_timeout',
+      '-Wl,--wrap=_vk_device_set_lost',
     ]), timeout : 30, suite : ['asahi'])
 endif

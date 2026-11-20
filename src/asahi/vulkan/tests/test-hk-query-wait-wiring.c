@@ -27,13 +27,56 @@ __typeof__(hk_cmd_invalidate_compute_state)
    __wrap_hk_cmd_invalidate_compute_state;
 
 static unsigned stamps, submissions;
+static unsigned expected_live;
+static bool fail_submission;
+static bool tracking_expected = true;
+static bool legacy_clock;
+static uint64_t legacy_now, legacy_timeout;
+static unsigned legacy_losses;
+
+__typeof__(os_time_get_nano) __real_os_time_get_nano;
+__typeof__(os_time_get_nano) __wrap_os_time_get_nano;
+__typeof__(os_time_get_absolute_timeout) __real_os_time_get_absolute_timeout;
+__typeof__(os_time_get_absolute_timeout) __wrap_os_time_get_absolute_timeout;
+__typeof__(_vk_device_set_lost) __wrap__vk_device_set_lost;
+
+int64_t
+__wrap_os_time_get_nano(void)
+{
+   if (legacy_clock)
+      return legacy_now += 100000000;
+   return __real_os_time_get_nano();
+}
+
+int64_t
+__wrap_os_time_get_absolute_timeout(uint64_t timeout)
+{
+   if (legacy_clock) {
+      legacy_timeout = timeout;
+      return legacy_now + timeout;
+   }
+   return __real_os_time_get_absolute_timeout(timeout);
+}
+
+VkResult
+__wrap__vk_device_set_lost(struct vk_device *dev, const char *file, int line,
+                           const char *msg, ...)
+{
+   (void)dev;
+   (void)file;
+   (void)line;
+   (void)msg;
+   assert(legacy_clock);
+   legacy_losses++;
+   return VK_ERROR_DEVICE_LOST;
+}
 
 void
 __wrap_hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                                VkPipelineStageFlags2 stage,
                                struct agx_timestamp_req req)
 {
-   assert(cmd->query_wait_ops.size && req.addr);
+   assert((!tracking_expected || cmd->query_wait_ops.size) && req.addr);
    assert(stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
    stamps++;
 }
@@ -95,14 +138,21 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct hk_device *dev = (void *)vk_queue->base.device;
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    uint64_t serial;
+   if (!tracking_expected) {
+      assert(hk_query_wait_quiescent(&dev->query_wait, &serial));
+      assert(list_is_empty(&dev->query_wait.producers));
+      return VK_SUCCESS;
+   }
    /* This assertion fails if the production API entrypoint omits its early
     * registration, even though claim() supports a late fallback. */
    assert(!hk_query_wait_quiescent(&dev->query_wait, &serial));
-   assert(list_length(&dev->query_wait.producers) == submissions + 1);
+   assert(list_length(&dev->query_wait.producers) == expected_live);
    assert(submit->command_buffer_count == 1);
    struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[0];
    assert(util_dynarray_num_elements(&cmd->query_wait_ops,
                                      struct hk_query_wait_op) == 6);
+   if (fail_submission)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    struct hk_query_wait_producer *p;
    assert(hk_query_wait_claim(&dev->query_wait, queue, cmd,
                               &cmd->query_wait_ops, &p));
@@ -117,6 +167,27 @@ init_cmd(struct hk_cmd_buffer *cmd, struct hk_device *dev)
    vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
    cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE;
    list_inithead(&cmd->control_streams);
+}
+
+static void
+test_loss_capability(struct hk_device *dev)
+{
+   int32_t mirror = 0;
+   uint32_t async = 0;
+   for (unsigned mask = 0; mask < 16; mask++) {
+      dev->vm_status_mirror.word = mask & 1 ? &mirror : NULL;
+      dev->dev.async_errors = mask & 2 ? &async : NULL;
+      dev->dev.is_virtio = mask & 4;
+      dev->dev.params.features = mask & 8 ? DRM_ASAHI_FEATURE_VM_STATUS : 0;
+      bool supported = (mask & 3) || (!(mask & 4) && (mask & 8));
+      assert(hk_query_wait_has_loss_status(dev) == supported);
+   }
+   dev->vm_status_mirror.word = NULL;
+   dev->dev.async_errors = NULL;
+   dev->dev.is_virtio = false;
+   dev->dev.params.features = DRM_ASAHI_FEATURE_VM_STATUS_MIRROR;
+   assert(!hk_query_wait_has_loss_status(dev));
+   dev->dev.params.features = DRM_ASAHI_FEATURE_VM_STATUS;
 }
 
 int
@@ -136,6 +207,7 @@ main(void)
    dev->vk.timeline_mode = VK_DEVICE_TIMELINE_MODE_NATIVE;
    list_inithead(&dev->vk.queues);
    assert(hk_query_wait_device_init(&dev->query_wait));
+   test_loss_capability(dev);
    const struct vk_device_dispatch_table dispatch = {
       .CmdResetQueryPool = hk_CmdResetQueryPool,
       .CmdWriteTimestamp2 = hk_CmdWriteTimestamp2,
@@ -202,9 +274,11 @@ main(void)
       .commandBufferInfoCount = 1,
       .pCommandBufferInfos = &ci,
    };
-   for (unsigned i = 0; i < 2; i++)
+   for (unsigned i = 0; i < 2; i++) {
+      expected_live = i + 1;
       assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
                              VK_NULL_HANDLE) == VK_SUCCESS);
+   }
    assert(submissions == 2);
    hk_query_wait_prune(&dev->query_wait, &queue, 36);
    assert(list_length(&dev->query_wait.producers) == 1);
@@ -218,6 +292,38 @@ main(void)
              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
           VK_NOT_READY);
    assert(output[1] == 0);
+
+   fail_submission = true;
+   expected_live = 1;
+   assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
+                          VK_NULL_HANDLE) == VK_ERROR_OUT_OF_HOST_MEMORY);
+   assert(list_is_empty(&dev->query_wait.producers));
+   assert(!vk_device_is_lost(&dev->vk));
+
+   /* The original finite wait is preserved when no usable loss source is
+    * available, without recording or submitting new tracking metadata. */
+   hk_query_wait_recording_finish(&primary->query_wait_ops);
+   struct hk_query_wait_pool *saved_wait = pool.wait;
+   pool.wait = NULL;
+   dev->dev.params.features = 0;
+   tracking_expected = false;
+   fail_submission = false;
+   hk_CmdResetQueryPool(cmd, handle, 0, 1);
+   hk_CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, handle,
+                         0);
+   assert(!primary->query_wait_ops.size);
+   assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
+                          VK_NULL_HANDLE) == VK_SUCCESS);
+   legacy_clock = true;
+   assert(hk_GetQueryPoolResults(
+             hk_device_to_handle(dev), handle, 0, 1, sizeof(output), output,
+             sizeof(output),
+             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) ==
+          VK_ERROR_DEVICE_LOST);
+   assert(legacy_timeout == UINT64_C(2000000000));
+   assert(legacy_now == UINT64_C(2000000000) && legacy_losses == 1);
+   legacy_clock = false;
+   pool.wait = saved_wait;
 
    vk_queue_finish(&queue.vk);
    hk_query_wait_pool_destroy(pool.wait);
@@ -234,6 +340,6 @@ main(void)
    free(physical);
    free(dev);
    puts(
-      "PASS: real timestamp/reset recording, secondary replay, repeated API submission and host reset/readback; no GPU");
+      "PASS: recording/replay, early registration, readback/reset, failure cleanup and observable-loss/finite-legacy guards; no GPU");
    return 0;
 }
