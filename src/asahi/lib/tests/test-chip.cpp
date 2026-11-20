@@ -74,6 +74,18 @@ TEST(AGXChip, G16GUsesSharedNativePathWithItsOwnCapabilities)
    EXPECT_FALSE(agx_chip_uses_legacy_precompiled_programs(AGX_CHIP_G16G));
 }
 
+TEST(AGXChip, HardwareTexelFetchBoundsOnlyWhereMeasured)
+{
+   /* Measured on G17C; every other generation keeps the software bounds
+    * until a hardware row adds it. */
+   EXPECT_TRUE(agx_chip_hw_texel_fetch_bounds(AGX_CHIP_G17C));
+   for (enum agx_chip chip :
+        {AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15S, AGX_CHIP_G16G,
+         AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G18G,
+         AGX_CHIP_UNKNOWN})
+      EXPECT_FALSE(agx_chip_hw_texel_fetch_bounds(chip));
+}
+
 TEST(AGXChip, UncoveredTileReloadDefect)
 {
    /* M4 Pro keeps a 2x reload in the tilebuffer; 4x and A18 Pro spill. */

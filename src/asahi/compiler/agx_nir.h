@@ -121,6 +121,12 @@ bool agx_nir_lower_texture(struct nir_shader *s);
  * read the word from the PBE's last eight bytes, where Gallium keeps it.
  * Texel-buffer atomics are not affected. */
 #define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
+/* Hardware enforces view bounds and missing-alpha one on integer texelFetch
+ * for in-range 16-bit layer, LOD, and sample operands
+ * (agx_chip_hw_texel_fetch_bounds). Saturate wide layer/LOD/sample indices
+ * before 16-bit narrowing and predicate only nonzero LODs and multisample
+ * sample indices against view metadata. */
+#define AGX_NIR_TEXTURE_HW_TXF_BOUNDS (1u << 10)
 bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generation);
 /* robust_formatless_images: formatless image loads have not been lowered for
  * view-bounds robustness and require it. */
