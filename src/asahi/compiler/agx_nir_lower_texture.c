@@ -1092,6 +1092,16 @@ lower_regular_texture(nir_builder *b, nir_instr *instr, void *data)
          nir_def *nr_layers = nir_channel(b, txs, lidx);
          nir_def *max_layer = nir_iadd_imm(b, nr_layers, -1);
          layer = nir_umin(b, unclamped_layer, max_layer);
+      } else if (is_txf && skip_layer_clamp &&
+                 unclamped_layer->bit_size > 16 &&
+                 !(tex->backend_flags & AGX_TEXTURE_FLAG_NO_CLAMP)) {
+         /* The hardware texture unit bounds 16-bit layers to the view, but
+          * wider layers >= 65536 would truncate and wrap into range. Saturate
+          * unsigned layers to 65535 before truncating to 16 bits so any
+          * out-of-range layer stays out of range in hardware. */
+         layer = nir_umin(
+            b, unclamped_layer,
+            nir_imm_intN_t(b, 65535, unclamped_layer->bit_size));
       } else {
          layer = unclamped_layer;
       }

@@ -5313,6 +5313,91 @@ test_g17p_2d_robustness_scope(void)
 }
 
 static nir_shader *
+build_cs_2d_array_texel_fetch(bool runtime_lod, unsigned backend_flags)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options,
+      "AGX3 2D array texel fetch");
+   b.shader->info.workgroup_size[0] = 1;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *handle = nir_bindless_image_agx(
+      &b, nir_imm_int(&b, 64), .desc_set = 0);
+   nir_def *gid = nir_load_global_invocation_id(&b, 32);
+   nir_tex_instr *tex = nir_tex_instr_create(b.shader, 3);
+   tex->op = nir_texop_txf;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   tex->dest_type = nir_type_uint32;
+   tex->coord_components = 3;
+   tex->backend_flags = backend_flags;
+   tex->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_coord,
+      nir_trim_vector(&b, gid, 3));
+   tex->src[1] =
+      nir_tex_src_for_ssa(nir_tex_src_texture_handle, handle);
+   tex->src[2] = nir_tex_src_for_ssa(
+      nir_tex_src_lod,
+      runtime_lod ? nir_channel(&b, gid, 2) : nir_imm_int(&b, 0));
+   nir_def_init(&tex->instr, &tex->def, 4, 32);
+   nir_builder_instr_insert(&b, &tex->instr);
+   nir_store_scratch(&b, &tex->def, nir_imm_int(&b, 0), .write_mask = 0xf,
+                     .align_mul = 16);
+   return b.shader;
+}
+
+static bool
+test_g17c_txf_layer_saturation(void)
+{
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      const bool runtime_lod = mode == 2;
+      const unsigned flags = mode == 1 ? AGX_TEXTURE_FLAG_NO_CLAMP : 0;
+      nir_shader *nir = build_cs_2d_array_texel_fetch(runtime_lod, flags);
+      agx_nir_lower_texture_with_buffer_metadata(nir, 10, false, 0, false);
+
+      unsigned fetches = 0, umin_65535 = 0, bcsels = 0, desc_loads = 0;
+      nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (tex->op == nir_texop_txf &&
+                   nir_tex_instr_src_index(tex, nir_tex_src_backend1) >= 0)
+                  fetches++;
+            } else if (instr->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (alu->op == nir_op_bcsel) {
+                  bcsels++;
+               } else if (alu->op == nir_op_umin) {
+                  for (unsigned s = 0; s < 2; ++s) {
+                     if (nir_src_is_const(alu->src[s].src) &&
+                         nir_src_as_uint(alu->src[s].src) == 65535)
+                        umin_65535++;
+                  }
+               }
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               if (nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_load_global_constant)
+                  desc_loads++;
+            }
+         }
+      }
+
+      const bool ok =
+         mode == 0 ? (fetches == 1 && umin_65535 == 1 && bcsels == 0 &&
+                      desc_loads == 0)
+         : mode == 1 ? (fetches == 1 && umin_65535 == 0 && bcsels == 0 &&
+                        desc_loads == 0)
+                     : (fetches == 1 && umin_65535 == 1 && desc_loads > 0);
+      ralloc_free(nir);
+      if (!ok)
+         return false;
+   }
+
+   return true;
+}
+
+static nir_shader *
 build_cs_sampled_storage(unsigned mode)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -9269,6 +9354,7 @@ main(int argc, char **argv)
    RUN(test_g17p_clustered_minmax_width);
    RUN(test_g17p_half_rgb10_epilog);
    RUN(test_g17p_frag_sidefx_late_depth_once);
+   RUN(test_g17c_txf_layer_saturation);
 #undef RUN
 
    for (unsigned e = 0; e < ARRAY_SIZE(encodings); ++e) {
