@@ -377,7 +377,17 @@ load_descriptor_for_idx_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    const unsigned components =
       nir_intrinsic_desc_type(intrin) == nir_descriptor_type_storage_buffer &&
       storage_address_has_map(ctx) ? 5 : 4;
-   return load_descriptor(b, components, 32, set, binding, index, 0, ctx);
+   nir_def *desc =
+      load_descriptor(b, components, 32, set, binding, index, 0, ctx);
+
+   /* A mutable descriptor holding a UBO includes the offset in its base. */
+   if (ctx->descriptor_generation == AGX_DESCRIPTOR_GENERATION_10 &&
+       nir_intrinsic_desc_type(intrin) == nir_descriptor_type_uniform_buffer &&
+       get_binding_layout(set, binding, ctx)->type ==
+          VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
+      desc = nir_vector_insert_imm(b, desc, nir_imm_int(b, 0), 3);
+
+   return desc;
 }
 
 static bool

@@ -1191,7 +1191,7 @@ hk_get_device_properties(const struct agx_device *dev,
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
                                (agx_chip_native_agx3(dev->chip) ? 15 : 0),
-      .maxUniformBufferRange = 65536,
+      .maxUniformBufferRange = HK_MAX_UBO_RANGE,
 
       /* Storage buffers are lowered to global address arithmetic with a
        * zero-extended 32-bit offset, so the whole 32-bit range works. Direct3D
