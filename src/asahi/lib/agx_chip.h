@@ -553,6 +553,21 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
    return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
 }
 
+/* Whether the part's compute barriers need memory scope even where no memory
+ * is reached through a second GPU address: every launch's ordering record has
+ * it (0x6000017c), and every dependency the driver flushes for takes the
+ * memory-scoped strong flush (hk_cdm_alias_scope()). On the M5 Ultra (G17D,
+ * J775D) under the per-resource rule (host_alias.dynamic, hk_CreateDevice()),
+ * 6 cases of a 117-case compute CTS subset, 2059 to 2160 of 8520 ycbcr cases (a
+ * different set from run to run) and 270 of 5310 host_image_copy cases failed,
+ * and llama.cpp's output was wrong. With memory scope on every barrier all of
+ * them pass. Why the M5 Ultra needs it is not established. */
+static inline bool
+agx_chip_m5_barriers_memory_scoped(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17D;
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's

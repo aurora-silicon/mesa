@@ -696,9 +696,14 @@ agx3_cdm_barrier_pack(const struct agx3_cdm_barrier_info *info,
         !agx3_cdm_barrier_wide_visibility_grounded(info->chip)))
       return false;
 
+   /* The strong flush (flags 5) takes the memory scope, and so does the
+    * ordering record (flags 0) on parts whose barriers always need it
+    * (agx_chip_m5_barriers_memory_scoped()). */
    if (info->flush_memory &&
        (!agx3_cdm_barrier_flush_memory_grounded(info->chip) ||
-        info->flags != 5))
+        (info->flags != 5 &&
+         !(info->flags == 0 &&
+           agx_chip_m5_barriers_memory_scoped(info->chip)))))
       return false;
    agx3_cmdstream_store_le32(
       packed, agx3_cdm_barrier_word(info->flags) |
@@ -748,7 +753,8 @@ agx3_cdm_barrier_unpack(enum agx_chip chip, const void *packed,
    if (!agx3_cdm_barrier_flags_grounded(chip, flags))
       return false;
 
-   if (flush_memory && flags != 5)
+   if (flush_memory && flags != 5 &&
+       !(flags == 0 && agx_chip_m5_barriers_memory_scoped(chip)))
       return false;
    info->chip = chip;
    info->flags = flags;

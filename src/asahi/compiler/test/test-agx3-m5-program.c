@@ -306,9 +306,13 @@ test_m5_dispatch(enum agx_chip chip)
       .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
       .size = {1024,1,1}, .local_size = {64,1,1}, .dimensions = 1,
    };
+   /* The ordering tail has memory scope where every barrier needs it. */
+   const uint32_t tail = agx_chip_m5_barriers_memory_scoped(chip)
+                            ? 0x6000017c
+                            : 0x60000160;
    const uint32_t expected[] = {
       0, 0x01000000, 0x2400, 0x40000001,
-      1024, 1, 1, 64, 1, 1, 0x60000160,
+      1024, 1, 1, 64, 1, 1, tail,
    };
    uint8_t out[sizeof(expected)];
    struct agx3_compute_dispatch_sink sink = {.data = out, .capacity = sizeof(out)};
@@ -332,7 +336,7 @@ test_m5_dispatch(enum agx_chip chip)
    CHECK(!memcmp(saved, out, sizeof(out)));
    const uint32_t indirect_local[] = {
       0x10080000, 0x01000000, 0x2400, 0x40000001,
-      0x23, 0x45678000, 0x60000160,
+      0x23, 0x45678000, tail,
    };
    sink.length = 0;
    CHECK(agx3_m5_native_indirect_dispatch_append(

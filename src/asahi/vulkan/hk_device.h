@@ -443,7 +443,10 @@ enum hk_perftest {
  * sparse binding and residency, buffer device address, descriptor buffer
  * and acceleration structure capture/replay, fd and dma-buf memory, and
  * writable host imports. A device that enabled none of them never has such
- * memory and keeps the plain flushes. On any other M5 device
+ * memory and keeps the plain flushes, except on a part whose barriers
+ * always need memory scope (agx_chip_m5_barriers_memory_scoped()), which
+ * takes it on every one and in every launch's ordering record. On any other
+ * M5 device
  * (host_alias.dynamic) the scope follows the resources that exist: memory
  * scope while alias_live is not 0, the count of
  *
@@ -534,7 +537,8 @@ static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
    if (agx_chip_g17_m5(dev->dev.chip))
-      return dev->may_alias_memory || p_atomic_read(&dev->alias_live);
+      return agx_chip_m5_barriers_memory_scoped(dev->dev.chip) ||
+             dev->may_alias_memory || p_atomic_read(&dev->alias_live);
 
    return dev->dev.chip == AGX_CHIP_G17P &&
           p_atomic_read(&dev->va_alias_resources) != 0;
