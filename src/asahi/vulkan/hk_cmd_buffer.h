@@ -1849,6 +1849,9 @@ struct hk_cmd_buffer {
    /* struct hk_oq_end for every occlusion query this command buffer ends. */
    struct util_dynarray oq_ends;
 
+   /* Ordered reset/availability operations, replayed into each primary. */
+   struct util_dynarray query_wait_ops;
+
    /* Are we currently inside a vk_meta operation? This alters sample location
     * behaviour.
     */

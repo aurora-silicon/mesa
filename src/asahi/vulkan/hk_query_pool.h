@@ -11,9 +11,12 @@
 #include "vk_query_pool.h"
 
 struct agx_bo;
+struct hk_query_wait_pool;
 
 struct hk_query_pool {
    struct vk_query_pool vk;
+
+   struct hk_query_wait_pool *wait;
 
    uint64_t query_start;
    uint64_t query_stride;

@@ -26,6 +26,7 @@
 
 #include "hk_descriptor_table.h"
 #include "hk_host_alias.h"
+#include "hk_query_wait.h"
 #include "hk_native_sampler.h"
 #include "hk_queue.h"
 #include "vk_device.h"
@@ -132,6 +133,7 @@ struct hk_compute_kick;
 
 struct hk_device {
    struct vk_device vk;
+   struct hk_query_wait_device query_wait;
    struct agx_device dev;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
