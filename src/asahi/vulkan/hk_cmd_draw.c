@@ -11818,10 +11818,29 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
    /* A conditionally lowered direct draw has an immutable indirect record:
     * apply the direct draw's exact range test instead of conservatively
     * treating it as application-authored indirect data. */
-   if (agx_is_indirect(draw->b))
-      return conditional_direct
-                ? agx_direct_draw_overreads_indices(*conditional_direct)
-                : true;
+   if (agx_is_indirect(draw->b)) {
+      if (conditional_direct)
+         return agx_direct_draw_overreads_indices(*conditional_direct);
+
+      /* G17C's native indirect VDM INDEX_LIST bounds index fetches in dword
+       * units and substitutes index 0 for out-of-range indices (both partial
+       * and fully out-of-bounds draws, including with primitive restart and
+       * vertex offsets). When the index buffer base and range are 4-byte
+       * aligned, use 16- or 32-bit indices, and fit the hardware VA and dword
+       * count limits, hardware bounds are exact and no pre-graphics robust
+       * index rewrite pass is needed. */
+      const uint64_t va_limit = UINT64_C(1) << 48;
+      if (dev->dev.chip == AGX_CHIP_G17C &&
+          draw->index_size != AGX_INDEX_SIZE_U8 &&
+          (draw->index_buffer & 3) == 0 &&
+          (draw->index_buffer_range_B & 3) == 0 &&
+          draw->index_buffer < va_limit &&
+          draw->index_buffer_range_B <= va_limit - draw->index_buffer &&
+          draw->index_buffer_range_B <= ((uint64_t)UINT32_MAX << 2))
+         return false;
+
+      return true;
+   }
 
    return agx_direct_draw_overreads_indices(*draw);
 }
