@@ -2575,6 +2575,11 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    u_init_pipe_screen_caps(pscreen, 1);
 
+   /* kmsro and the EGL/GBM loaders skip a screen without graphics and fall
+    * back to another driver (in the end software rendering).
+    */
+   caps->graphics = !agx_compute_only(agx_device(pscreen));
+
    /* G17G generates mipmaps on the CPU (agx_generate_mipmap_g17g). */
    caps->generate_mipmap = agx_chip_g17_m5(agx_device(pscreen)->chip);
 

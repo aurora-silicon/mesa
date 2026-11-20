@@ -2399,6 +2399,11 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       if (pdev->vk.supported_features.sparseBinding)
          queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
    }
+   /* The kernel refuses render commands: offer a compute queue only, so that
+    * graphics clients (zink among them) pass over this device.
+    */
+   if (agx_compute_only(&pdev->dev))
+      queue_flags &= ~VK_QUEUE_GRAPHICS_BIT;
 
    uint32_t queue_count = 1;
    /* Under virtio the simple-ioctl path forwards the request struct, not the

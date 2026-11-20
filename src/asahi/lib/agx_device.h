@@ -568,6 +568,15 @@ agx_native_graphics(const struct agx_device *dev)
    return agx_chip_native_agx3(dev->chip);
 }
 
+/* The kernel refuses render commands on this device (for example G14 on GPU
+ * firmware 27.2). It must not be offered for graphics, only for compute.
+ */
+static inline bool
+agx_compute_only(const struct agx_device *dev)
+{
+   return dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_ONLY;
+}
+
 /* This interface carries native sampler state in GPU records, not in the
  * firmware command's optional sampler-heap fields. */
 static inline bool
