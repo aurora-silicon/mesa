@@ -930,11 +930,11 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  * features may only be used when they are enabled, so a device that enabled
  * none of them never has such memory.
  *
- * On M5 every resource through which these features map memory at a second
- * address is seen as it is created, so the scope follows the live ones
- * instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers and image
- * planes with an address of their own (va_alias_resources), fd and dma-buf
- * imports, and host imports that may alias (hk_host_import_aliases()). An
+ * With VA-tagged caches every resource through which these features map
+ * memory at a second address is seen as it is created, so the scope follows
+ * the live ones instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers
+ * and image planes with an address of their own, fd and dma-buf imports,
+ * and host imports that may alias (hk_host_import_aliases()). An
  * acceleration structure's address is its buffer's, also on replay, so its
  * capture/replay is covered by the buffer's. An import of private anonymous
  * memory of this process (malloc, aligned_alloc, an anonymous private mmap)
@@ -1061,9 +1061,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    simple_mtx_init(&dev->host_alias.cmd_lock, mtx_plain);
    list_inithead(&dev->host_alias.cmd_buffers);
    u_rwlock_init(&dev->host_alias.patch_lock);
-   dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
+   /* dev->dev is opened below: the chip comes from pdev. */
+   dev->host_alias.trace = hk_va_tagged_caches(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
-   if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
+   if (dev->may_alias_memory && hk_va_tagged_caches(pdev->dev.chip) &&
        !debug_get_option_m5_host_alias_static()) {
       /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
       const struct agx3_cdm_barrier_info info = {

@@ -129,15 +129,17 @@ hk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    /* The wait orders later work behind this stream's source work, but on
     * G17P and M5 a read through another address of the same memory also
     * needs the source writes flushed with memory scope
-    * (hk_cdm_alias_scope()). A command buffer that uses events records no
-    * patch site for a later host import: it has the scope whenever an
-    * import could add such an address (hk_cmd_alias_scope()). */
+    * (hk_cdm_alias_scope()). Where only a resource created later could
+    * map it there, the stream's last record is a patch site instead. */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_cs *cs = cmd->current_cs.cs;
-   if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER)) &&
-       hk_cmd_alias_scope(cmd) && hk_cdm_visibility_flush_needed(dev, cs, true)) {
-      hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
-      hk_cdm_visibility_flush(dev, cs, true);
+   if (cs && (src_kinds & (HK_SYNC_COMPUTE | HK_SYNC_XFER))) {
+      if (!hk_cmd_alias_scope(cmd)) {
+         hk_cdm_note_alias_site(cmd, cs);
+      } else if (hk_cdm_visibility_flush_needed(dev, cs, true)) {
+         hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, cs, true);
+      }
    }
 
    hk_event_write(cmd, event, src_kinds, VK_EVENT_SET);
@@ -154,6 +156,30 @@ hk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent _event,
    cmd->state.uses_events = true;
    perf_debug(cmd, "Reset event");
    hk_event_write(cmd, event, hk_sync_kinds_src(stageMask), VK_EVENT_RESET);
+}
+
+/* Whether a wait's first synchronization scope holds host operations, as it
+ * must when an event is set by vkSetEvent
+ * (VUID-vkCmdWaitEvents2-pEvents-03839,
+ * VUID-vkCmdWaitEvents-srcStageMask-01158). */
+static bool
+hk_dependency_waits_for_host(const VkDependencyInfo *info)
+{
+   for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+      if (info->pMemoryBarriers[i].srcStageMask & VK_PIPELINE_STAGE_2_HOST_BIT)
+         return true;
+   }
+   for (uint32_t i = 0; i < info->bufferMemoryBarrierCount; ++i) {
+      if (info->pBufferMemoryBarriers[i].srcStageMask &
+          VK_PIPELINE_STAGE_2_HOST_BIT)
+         return true;
+   }
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; ++i) {
+      if (info->pImageMemoryBarriers[i].srcStageMask &
+          VK_PIPELINE_STAGE_2_HOST_BIT)
+         return true;
+   }
+   return false;
 }
 
 /* A wait polls the event word on the GPU, so a later host vkSetEvent is
@@ -175,6 +201,11 @@ hk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    cmd->state.uses_events = true;
    perf_debug(cmd, "Wait events");
+
+   /* An event the host sets (hk_cmd_alias_scope()). */
+   for (uint32_t i = 0; i < eventCount; ++i)
+      cmd->state.alias_host_wait |=
+         hk_dependency_waits_for_host(&pDependencyInfos[i]);
 
    for (uint32_t i = 0; i < eventCount; ++i) {
       VK_FROM_HANDLE(hk_event, event, pEvents[i]);

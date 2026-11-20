@@ -3617,15 +3617,17 @@ hk_xfer_order(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    }
 
    /* Each launch ends in a weak ordering record; strengthen the last one
-    * into a cache flush, as a barrier does (hk_CmdPipelineBarrier2()). No
-    * patch site is recorded here (hk_cdm_alias_scope_unpatched()). */
-   const bool alias_scope = hk_cdm_alias_scope_unpatched(dev);
+    * into a cache flush, as a barrier does (hk_CmdPipelineBarrier2()),
+    * including its patch site. */
+   const bool alias_scope = hk_cmd_alias_scope(cmd);
    for (unsigned i = 0; i < n; ++i) {
       struct hk_cs *w = flush[i];
       if (hk_cdm_visibility_flush_needed(dev, w, alias_scope)) {
          hk_ensure_cs_has_space(cmd, w, AGX3_CDM_BARRIER_SIZE);
          hk_cdm_visibility_flush(dev, w, alias_scope);
       }
+      if (!alias_scope)
+         hk_cdm_note_alias_site(cmd, w);
    }
 
    perf_debug(cmd, "Ordering an unsynchronized transfer before graphics");
@@ -13210,14 +13212,15 @@ hk_dispatch_task_kernel(struct hk_cmd_buffer *cmd, struct hk_shader *task,
 
    /* The launch ends in a weak ordering record, which doesn't make the
     * entries visible to the mesh draws that read them; strengthen it into a
-    * cache flush, as a barrier does, without a patch site
-    * (hk_cdm_alias_scope_unpatched()). */
+    * cache flush, as a barrier does, including its patch site. */
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const bool alias_scope = hk_cdm_alias_scope_unpatched(dev);
+   const bool alias_scope = hk_cmd_alias_scope(cmd);
    if (hk_cdm_visibility_flush_needed(dev, ccs, alias_scope)) {
       hk_ensure_cs_has_space(cmd, ccs, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, ccs, alias_scope);
    }
+   if (!alias_scope)
+      hk_cdm_note_alias_site(cmd, ccs);
 }
 
 /* G17P software task stage. The task shader runs as a compute kernel in the

@@ -424,7 +424,7 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
     * the memory's, or other resources' (hk_cdm_alias_scope()). It counts
     * before memory can be bound to it. */
    if (buffer->va)
-      hk_device_va_alias_get(dev, (buffer->vk.create_flags &
+      hk_device_alias_get(dev, 1, (buffer->vk.create_flags &
                                    VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
                                      ? HK_ALIAS_CAUSE_SPARSE
                                      : HK_ALIAS_CAUSE_CAPTURE_REPLAY);
@@ -466,7 +466,7 @@ hk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
 
    if (buffer->va) {
       agx_va_free(&dev->dev, buffer->va, true);
-      hk_device_va_alias_put(dev);
+      hk_device_alias_put(dev, 1);
    }
    hk_release_sparse_scratch(dev, buffer->sparse_scratch_B);
 

@@ -290,7 +290,7 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
    return cls;
 }
 
-/* M5 with host_alias.dynamic: enter a host import into the device's set, so
+/* With host_alias.dynamic: enter a host import into the device's set, so
  * hk_cdm_alias_scope() asks for memory scope while it may alias
  * (hk_host_import_aliases()). A GPU-writable import of pages that are all
  * private anonymous memory of this process (/proc/self/maps), and that no
@@ -316,7 +316,7 @@ hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
    if (!dev->host_alias.dynamic) {
       /* Under the per-device rule nothing is tracked; say the import
        * happened, so a trace shows whether an application imports at all. */
-      if (agx_chip_g17_m5(dev->dev.chip) && debug_get_option_m5_host_alias_trace())
+      if (hk_va_tagged_caches(dev->dev.chip) && debug_get_option_m5_host_alias_trace())
          fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " (per-device rule)\n",
                  pointer, size);
       return VK_SUCCESS;
@@ -457,7 +457,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          goto fail_alloc;
       }
       assert(!(flags & ~mem->bo->flags));
-      mem->alias_import = true;
    } else if (host_info && host_info->handleType) {
       /* The pointer and the size are multiples of
        * minImportedHostPointerAlignment (VUID-VkImportMemoryHostPointerInfoEXT-
@@ -469,7 +468,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * hk_host_memory_read_only. With hk_host_memory_import_read_only only
        * such a range is taken, and a range the kernel can pin for writing is
        * refused, also with hk_host_memory_read_only: the GPU then writes
-       * through no host import (hk_cdm_alias_scope()). Otherwise, on M5,
+       * through no host import (hk_cdm_alias_scope()). Otherwise
        * hk_host_import_track() decides below whether this import may alias.
        */
       assert(host_info->handleType ==
@@ -495,7 +494,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                             host_info->pHostPointer, strerror(err));
          goto fail_alloc;
       }
-      mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
    } else {
       enum agx_bo_flags flags = 0;
       if (handle_types)
@@ -596,9 +594,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);
 
-   if (mem->alias_import)
-      p_atomic_inc(&dev->va_alias_resources);
-
    if (priority_info)
       hk_set_memory_priority(dev, mem, priority_info->priority);
 
@@ -659,9 +654,6 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    /* The BO may outlive this object in the BO cache. */
    hk_set_memory_priority(dev, mem, 0.5f);
-
-   if (mem->alias_import)
-      p_atomic_dec(&dev->va_alias_resources);
 
    /* No work that may still run reaches this memory any more. */
    hk_host_import_untrack(dev, mem);

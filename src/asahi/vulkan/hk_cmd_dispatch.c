@@ -692,7 +692,7 @@ hk_cmd_alias_scope(struct hk_cmd_buffer *cmd)
 {
    const struct hk_device *dev = hk_cmd_buffer_device(cmd);
    return hk_cdm_alias_scope(dev) ||
-          (dev->host_alias.dynamic && cmd->state.uses_events);
+          (dev->host_alias.dynamic && cmd->state.alias_host_wait);
 }
 
 void
@@ -726,9 +726,10 @@ hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
             .value = dev->host_alias.flush_word,
          };
          cs->alias_sites++;
-         /* A following application dispatch must not drop the record
-          * (hk_dispatch_m5_native_impl()). */
+         /* A following launch must not drop the record (application
+          * dispatch barrier elision, hk_tess_batch_stage()). */
          cs->app_dispatch_end = NULL;
+         cs->alias_pin = cs->current;
          return;
       }
    }

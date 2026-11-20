@@ -20,15 +20,6 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return (uint8_t *)current + AGX_CDM_STREAM_LINK_LENGTH;
 }
 
-/* The streams here record no alias sites (hk_cs::alias_sites stays zero), so
- * the merge never moves any. */
-void
-hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
-                               const void *from_end, uint8_t *to, size_t skip)
-{
-   assert(!"no alias sites are recorded");
-}
-
 /* Merged streams here record no attachments; with more than one merge call
  * the compiler keeps hk_cs_merge_cdm() out of line, with its attachment loop. */
 bool
@@ -110,6 +101,52 @@ init_opener(struct hk_cs *cs, uint8_t *bytes, size_t size, bool memory,
       cs->strong_flush_end = cs->current;
       cs->memory_flush_end = memory ? cs->current : NULL;
    }
+}
+
+/* Patch sites and the pin move with the words an inline merge copies; a site
+ * on b's folded opening barrier moves to a's trailing record, and a pin on
+ * a's tail stays where b adds nothing after it. */
+static void
+check_merge_alias_sites(void)
+{
+   static struct hk_cmd_buffer cmd;
+   uint8_t a_bytes[HK_CS_SPACE_PADDING + 256], b_bytes[64];
+   struct hk_cs a, b;
+   uint8_t *a_tail = a_bytes + LAUNCH_BYTES;
+
+   init_tail(&a, a_bytes, sizeof(a_bytes), false);
+   init_opener(&b, b_bytes, sizeof(b_bytes), false, true);
+   agx3_cmdstream_store_le32(b_bytes + AGX3_CDM_BARRIER_SIZE + LAUNCH_BYTES,
+                             plain_flush);
+   b.current = b_bytes + 2 * AGX3_CDM_BARRIER_SIZE + LAUNCH_BYTES;
+   b.strong_flush_end = b.alias_pin = b.current;
+   a.cmd = b.cmd = &cmd;
+   b.alias_sites = 2;
+   cmd.alias_sites = UTIL_DYNARRAY_INIT;
+   const struct hk_alias_site opener = {(uint32_t *)b_bytes, memory_flush};
+   const struct hk_alias_site flush = {
+      (uint32_t *)(b_bytes + AGX3_CDM_BARRIER_SIZE + LAUNCH_BYTES),
+      memory_flush};
+   util_dynarray_append(&cmd.alias_sites, opener);
+   util_dynarray_append(&cmd.alias_sites, flush);
+   hk_cs_merge_cdm(&a, &b);
+
+   const struct hk_alias_site *sites = cmd.alias_sites.data;
+   assert((uint8_t *)sites[0].word == a_tail);
+   assert((uint8_t *)sites[1].word ==
+          a_tail + AGX3_CDM_BARRIER_SIZE + LAUNCH_BYTES);
+   assert(word_at(sites[1].word) == plain_flush);
+   assert((uint8_t *)a.alias_pin ==
+          (uint8_t *)sites[1].word + AGX3_CDM_BARRIER_SIZE);
+   assert(a.alias_sites == 2);
+   util_dynarray_fini(&cmd.alias_sites);
+
+   init_tail(&a, a_bytes, sizeof(a_bytes), false);
+   init_opener(&b, b_bytes, sizeof(b_bytes), false, false);
+   a.cmd = b.cmd = &cmd;
+   a.alias_pin = a.current;
+   hk_cs_merge_cdm(&a, &b);
+   assert(a.alias_pin == a.current);
 }
 
 static void
@@ -242,5 +279,6 @@ int main(void)
          for (unsigned link = 0; link < 2; ++link)
             check_merge(a, b, link);
    check_merge_memory_scope();
+   check_merge_alias_sites();
    return 0;
 }
