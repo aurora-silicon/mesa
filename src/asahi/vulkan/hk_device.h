@@ -363,6 +363,17 @@ struct hk_device {
    uint32_t cmd_syncobjs[HK_CMD_SYNCOBJ_POOL];
    unsigned cmd_syncobj_count;
 
+   /* In-flight kernel host writes to bound timestamp buffers (timestamp
+    * queries and stamped occlusion availability slots), used to emit
+    * DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS on compute commands whose query
+    * accesses are disjoint from every pending host write. */
+   struct {
+      bool ready;
+      bool oom;
+      simple_mtx_t lock;
+      struct util_dynarray pending;
+   } query_stamps;
+
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a
     * runtime grid can reach the main record is for this program to publish

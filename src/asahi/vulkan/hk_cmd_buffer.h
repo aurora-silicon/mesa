@@ -1292,6 +1292,15 @@ struct hk_cs {
    /* A query copy or reset was recorded into this stream. */
    bool query_access;
 
+   /* True if any query access on this stream could not be recorded in
+    * query_access_ranges (fail closed: omit NO_QUERY_ACCESS). */
+   bool query_access_untracked;
+
+   /* Bound timestamp buffer byte ranges accessed by query commands in this
+    * stream (struct hk_query_access_range). Empty when all query accesses in
+    * the stream target pools without a kernel timestamp buffer handle. */
+   struct util_dynarray query_access_ranges;
+
    /* The stream ends with a strong, memory-scoped flush
     * (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
     */
@@ -1605,6 +1614,17 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
    a->stats.query_reset_queries += b->stats.query_reset_queries;
    a->stats.query_reset_flushes += b->stats.query_reset_flushes;
    a->query_access |= b->query_access;
+   a->query_access_untracked |= b->query_access_untracked;
+   if (b->query_access_ranges.size) {
+      if (!a->query_access_ranges.data)
+         a->query_access_ranges = UTIL_DYNARRAY_INIT;
+      void *dst = util_dynarray_grow_bytes(&a->query_access_ranges, 1,
+                                           b->query_access_ranges.size);
+      if (dst)
+         memcpy(dst, b->query_access_ranges.data, b->query_access_ranges.size);
+      else
+         a->query_access_untracked = true;
+   }
    assert(!a->query_reset_pending && !b->query_reset_pending);
 
    /* Frame anatomy: the merged command runs b's programs too. Without them
@@ -2481,6 +2501,45 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->descriptors.root_dirty = true;
 }
 
+struct hk_query_access_range {
+   uint32_t handle;
+   uint32_t start_B;
+   uint32_t end_B;
+};
+
+static inline void
+hk_cs_note_query_access(struct hk_cs *cs, uint32_t handle, uint64_t start_B,
+                        uint64_t size_B)
+{
+   if (!cs)
+      return;
+
+   cs->query_access = true;
+   if (!handle || !size_B)
+      return;
+
+   if (start_B >= UINT32_MAX || size_B > UINT32_MAX - start_B) {
+      cs->query_access_untracked = true;
+      return;
+   }
+
+   if (!cs->query_access_ranges.data)
+      cs->query_access_ranges = UTIL_DYNARRAY_INIT;
+
+   struct hk_query_access_range *slot = util_dynarray_grow_bytes(
+      &cs->query_access_ranges, 1, sizeof(*slot));
+   if (!slot) {
+      cs->query_access_untracked = true;
+      return;
+   }
+
+   *slot = (struct hk_query_access_range){
+      .handle = handle,
+      .start_B = (uint32_t)start_B,
+      .end_B = (uint32_t)(start_B + size_B),
+   };
+}
+
 static inline void
 hk_cs_destroy(struct hk_cs *cs)
 {
@@ -2492,6 +2551,7 @@ hk_cs_destroy(struct hk_cs *cs)
    } else {
       util_dynarray_fini(&cs->imm_writes);
       util_dynarray_fini(&cs->oq_stamps);
+      util_dynarray_fini(&cs->query_access_ranges);
    }
 
    free(cs);

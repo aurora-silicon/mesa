@@ -1364,6 +1364,14 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
       if (gfx->timestamp.end.handle) {
          libagx_copy_timestamp(cmd, agx_1d(1), AGX_BARRIER_ALL | AGX_POSTGFX,
                                req.addr, gfx->timestamp.end.addr);
+         if (cmd->current_cs.post_gfx) {
+            hk_cs_note_query_access(cmd->current_cs.post_gfx,
+                                    gfx->timestamp.end.handle,
+                                    gfx->timestamp.end.offset_B,
+                                    sizeof(uint64_t));
+            hk_cs_note_query_access(cmd->current_cs.post_gfx, req.handle,
+                                    req.offset_B, sizeof(uint64_t));
+         }
       } else {
          gfx->timestamp.end = req;
       }

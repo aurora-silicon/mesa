@@ -310,10 +310,18 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
          hk_drm_attachment_set_add(&cs->compute_attachments, write->address,
                                     sizeof(write->value));
       }
+      util_dynarray_foreach(&cs->oq_stamps, struct hk_oq_stamp, stamp) {
+         hk_cs_note_query_access(cs, stamp->handle, stamp->offset_B,
+                                 sizeof(uint64_t));
+      }
       return;
    }
 
    libagx_write_u32s(cmd, agx_1d(count), AGX_BARRIER_ALL | AGX_POSTGFX, params);
+   util_dynarray_foreach(&cs->oq_stamps, struct hk_oq_stamp, stamp) {
+      hk_cs_note_query_access(cs, stamp->handle, stamp->offset_B,
+                              sizeof(uint64_t));
+   }
 }
 
 void
@@ -397,14 +405,35 @@ hk_cmd_end_query_stamped(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    util_dynarray_append(&cs->oq_stamps, stamp);
 }
 
-/* Mark the stream that received a query copy or reset: only such a stream
- * reads or writes query values the kernel may still be publishing for earlier
- * commands (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). */
+/* Mark the stream that received a query copy or reset and record the bound
+ * timestamp buffer byte range it accesses so submission can still set
+ * DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS whenever no in-flight kernel host write
+ * overlaps that range. */
 static void
-hk_note_query_access(struct hk_cmd_buffer *cmd)
+hk_note_query_access(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
+                     uint32_t first_index, uint32_t num_queries)
 {
-   if (cmd->current_cs.cs)
-      cmd->current_cs.cs->query_access = true;
+   struct hk_cs *cs = cmd->current_cs.cs;
+   if (!cs)
+      return;
+
+   if (!pool->handle || !num_queries) {
+      hk_cs_note_query_access(cs, 0, 0, 0);
+      return;
+   }
+
+   if (hk_has_available(pool)) {
+      hk_cs_note_query_access(
+         cs, pool->handle, hk_query_available_offset(pool, first_index),
+         (uint64_t)num_queries * hk_query_available_size(pool));
+   } else if (pool->vk.query_type == VK_QUERY_TYPE_TIMESTAMP) {
+      hk_cs_note_query_access(cs, pool->handle,
+                              hk_query_offset(pool, first_index),
+                              (uint64_t)num_queries * pool->query_stride);
+   } else {
+      cs->query_access = true;
+      cs->query_access_untracked = true;
+   }
 }
 
 static void
@@ -470,7 +499,7 @@ emit_zero_queries_g17p(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    libagx_reset_query_struct(cmd, agx_1d(num_queries),
                              set_available ? AGX_BARRIER_ALL : AGX_BARRIER_NONE,
                              info);
-   hk_note_query_access(cmd);
+   hk_note_query_access(cmd, pool, first_index, num_queries);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
@@ -531,7 +560,7 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    };
 
    libagx_reset_query_struct(cmd, agx_1d(num_queries), AGX_BARRIER_ALL, info);
-   hk_note_query_access(cmd);
+   hk_note_query_access(cmd, pool, first_index, num_queries);
 }
 
 static void
@@ -718,6 +747,7 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
    }
 
    if (pool->handle) {
+      hk_query_stamps_unbind(dev, pool->handle);
       hk_frame_anatomy_unbind_pool(dev, pool->handle);
       dev->dev.ops.bo_unbind_object(&dev->dev, pool->handle);
    }
@@ -1089,6 +1119,264 @@ hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
    }
 }
 
+struct hk_pending_query_stamp {
+   uint32_t handle;
+   uint32_t offset_B;
+   struct hk_queue *queue;
+   uint64_t point;
+};
+
+void
+hk_query_stamps_init(struct hk_device *dev)
+{
+   simple_mtx_init(&dev->query_stamps.lock, mtx_plain);
+   dev->query_stamps.pending = UTIL_DYNARRAY_INIT;
+   dev->query_stamps.oom = false;
+   dev->query_stamps.ready = true;
+}
+
+void
+hk_query_stamps_finish(struct hk_device *dev)
+{
+   if (!dev->query_stamps.ready)
+      return;
+   util_dynarray_fini(&dev->query_stamps.pending);
+   simple_mtx_destroy(&dev->query_stamps.lock);
+   dev->query_stamps.ready = false;
+}
+
+static bool
+hk_query_stamp_done_locked(struct hk_device *dev,
+                           const struct hk_pending_query_stamp *e,
+                           bool allow_query)
+{
+   if (e->point <= p_atomic_read(&e->queue->drm.signalled_value))
+      return true;
+   if (!allow_query)
+      return false;
+
+   uint64_t reached = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &e->queue->drm.syncobj, &reached, 1) == 0) {
+      hk_queue_note_signalled(e->queue, reached);
+      if (e->point <= reached)
+         return true;
+   }
+   return false;
+}
+
+static void
+hk_query_stamps_prune_locked(struct hk_device *dev, bool query_queues)
+{
+   struct hk_pending_query_stamp *entries = dev->query_stamps.pending.data;
+   size_t count = util_dynarray_num_elements(&dev->query_stamps.pending,
+                                             struct hk_pending_query_stamp);
+   struct hk_queue *queried[8];
+   unsigned queried_n = 0;
+
+   size_t i = 0;
+   while (i < count) {
+      bool allow_query = false;
+      if (query_queues &&
+          entries[i].point >
+             p_atomic_read(&entries[i].queue->drm.signalled_value)) {
+         bool seen = false;
+         for (unsigned q = 0; q < queried_n; ++q) {
+            if (queried[q] == entries[i].queue) {
+               seen = true;
+               break;
+            }
+         }
+         if (!seen) {
+            allow_query = true;
+            if (queried_n < ARRAY_SIZE(queried))
+               queried[queried_n++] = entries[i].queue;
+         }
+      }
+
+      if (hk_query_stamp_done_locked(dev, &entries[i], allow_query)) {
+         entries[i] = entries[--count];
+      } else {
+         i++;
+      }
+   }
+
+   dev->query_stamps.pending.size =
+      count * sizeof(struct hk_pending_query_stamp);
+}
+
+void
+hk_query_stamps_unbind(struct hk_device *dev, uint32_t handle)
+{
+   if (!dev->query_stamps.ready || !handle)
+      return;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   struct hk_pending_query_stamp *entries = dev->query_stamps.pending.data;
+   size_t count = util_dynarray_num_elements(&dev->query_stamps.pending,
+                                             struct hk_pending_query_stamp);
+   size_t i = 0;
+   while (i < count) {
+      if (entries[i].handle == handle)
+         entries[i] = entries[--count];
+      else
+         i++;
+   }
+   dev->query_stamps.pending.size =
+      count * sizeof(struct hk_pending_query_stamp);
+   simple_mtx_unlock(&dev->query_stamps.lock);
+}
+
+void
+hk_query_stamps_clear_queue(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (!dev->query_stamps.ready)
+      return;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   struct hk_pending_query_stamp *entries = dev->query_stamps.pending.data;
+   size_t count = util_dynarray_num_elements(&dev->query_stamps.pending,
+                                             struct hk_pending_query_stamp);
+   size_t i = 0;
+   while (i < count) {
+      if (entries[i].queue == queue)
+         entries[i] = entries[--count];
+      else
+         i++;
+   }
+   dev->query_stamps.pending.size =
+      count * sizeof(struct hk_pending_query_stamp);
+   simple_mtx_unlock(&dev->query_stamps.lock);
+}
+
+static bool
+hk_query_stamp_overlaps_cs(const struct hk_pending_query_stamp *e,
+                           const struct hk_cs *cs)
+{
+   const uint64_t stamp_start = e->offset_B;
+   const uint64_t stamp_end = stamp_start + sizeof(uint64_t);
+
+   util_dynarray_foreach(&cs->query_access_ranges, struct hk_query_access_range,
+                         r) {
+      if (r->handle == e->handle && stamp_start < r->end_B &&
+          r->start_B < stamp_end)
+         return true;
+   }
+   return false;
+}
+
+bool
+hk_query_stamps_conflict(struct hk_device *dev, const struct hk_cs *cs)
+{
+   if (!dev->query_stamps.ready || cs->query_access_untracked)
+      return true;
+   if (!cs->query_access_ranges.size)
+      return false;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   if (dev->query_stamps.oom) {
+      simple_mtx_unlock(&dev->query_stamps.lock);
+      return true;
+   }
+
+   struct hk_pending_query_stamp *entries = dev->query_stamps.pending.data;
+   size_t count = util_dynarray_num_elements(&dev->query_stamps.pending,
+                                             struct hk_pending_query_stamp);
+   bool conflict = false;
+   size_t i = 0;
+   while (i < count) {
+      if (hk_query_stamp_overlaps_cs(&entries[i], cs)) {
+         if (hk_query_stamp_done_locked(dev, &entries[i], true)) {
+            entries[i] = entries[--count];
+         } else {
+            conflict = true;
+            break;
+         }
+      } else if (hk_query_stamp_done_locked(dev, &entries[i], false)) {
+         entries[i] = entries[--count];
+      } else {
+         i++;
+      }
+   }
+   dev->query_stamps.pending.size =
+      count * sizeof(struct hk_pending_query_stamp);
+   simple_mtx_unlock(&dev->query_stamps.lock);
+   return conflict;
+}
+
+static void
+hk_query_stamps_note_one_locked(struct hk_device *dev, struct hk_queue *queue,
+                                uint64_t point, uint32_t handle,
+                                uint32_t offset_B)
+{
+   if (!handle || dev->query_stamps.oom)
+      return;
+
+   struct hk_pending_query_stamp *entries = dev->query_stamps.pending.data;
+   size_t count = util_dynarray_num_elements(&dev->query_stamps.pending,
+                                             struct hk_pending_query_stamp);
+   for (size_t i = 0; i < count; ++i) {
+      if (entries[i].handle == handle && entries[i].offset_B == offset_B &&
+          entries[i].queue == queue) {
+         if (point > entries[i].point)
+            entries[i].point = point;
+         return;
+      }
+   }
+
+   if (count >= 64)
+      hk_query_stamps_prune_locked(dev, true);
+
+   struct hk_pending_query_stamp *slot = util_dynarray_grow_bytes(
+      &dev->query_stamps.pending, 1, sizeof(*slot));
+   if (!slot) {
+      dev->query_stamps.oom = true;
+      return;
+   }
+
+   *slot = (struct hk_pending_query_stamp){
+      .handle = handle,
+      .offset_B = offset_B,
+      .queue = queue,
+      .point = point,
+   };
+}
+
+void
+hk_query_stamps_note_cs(struct hk_device *dev, struct hk_queue *queue,
+                        uint64_t point, const struct hk_cs *cs)
+{
+   if (!dev->query_stamps.ready)
+      return;
+
+   bool any = cs->timestamp.start.handle || cs->timestamp.end.handle;
+   if (!any && cs->type == HK_CS_VDM) {
+      for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
+         if (cs->oq_stamp[i].handle) {
+            any = true;
+            break;
+         }
+      }
+   }
+   if (!any)
+      return;
+
+   simple_mtx_lock(&dev->query_stamps.lock);
+   hk_query_stamps_note_one_locked(dev, queue, point,
+                                   cs->timestamp.start.handle,
+                                   cs->timestamp.start.offset_B);
+   hk_query_stamps_note_one_locked(dev, queue, point,
+                                   cs->timestamp.end.handle,
+                                   cs->timestamp.end.offset_B);
+   if (cs->type == HK_CS_VDM) {
+      for (unsigned i = 0; i < ARRAY_SIZE(cs->oq_stamp); ++i) {
+         hk_query_stamps_note_one_locked(dev, queue, point,
+                                         cs->oq_stamp[i].handle,
+                                         cs->oq_stamp[i].offset_B);
+      }
+   }
+   simple_mtx_unlock(&dev->query_stamps.lock);
+}
+
 /*
  * A render's occlusion counts reach memory with its end-of-render cache
  * maintenance. The availability word is written by a compute stream that
@@ -1371,7 +1659,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
       hk_cdm_cache_flush(dev, cs);
       libagx_copy_query_g17p_struct(cmd, agx_1d(queryCount), AGX_BARRIER_NONE,
                                    info);
-      hk_note_query_access(cmd);
+      hk_note_query_access(cmd, pool, firstQuery, queryCount);
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
 
@@ -1399,7 +1687,7 @@ hk_cmd_copy_query_pool_results(struct hk_cmd_buffer *cmd,
    };
 
    libagx_copy_query_struct(cmd, agx_1d(queryCount), AGX_BARRIER_ALL, info);
-   hk_note_query_access(cmd);
+   hk_note_query_access(cmd, pool, firstQuery, queryCount);
 }
 
 VKAPI_ATTR void VKAPI_CALL
