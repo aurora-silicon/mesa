@@ -1,12 +1,14 @@
 HK query wait checks
 ====================
 
-The CPU-only regression targets are ``hk_query_wait`` and
-``hk_query_wait_wiring``. The first links the production wait/tracking helper
+The CPU-only regression targets are ``hk_query_wait``,
+``hk_query_wait_wiring`` and ``hk_query_wait_bench_profile``. The first links the production wait/tracking helper
 with controlled clock, completion and loss dependencies. The second calls the
 real timestamp/reset recording, secondary replay, host read/reset and
 QueueSubmit2 registration entrypoints, replacing GPU emission and the final
-submission callback. Neither target opens a GPU device.
+submission callback. The profile fixture uses the real pure ``agx_chip`` helpers with observed raw
+G16S parameters and rejects wrong chip, USC, HAL, topology, clock, architecture
+and required-feature cases. None of these targets opens a GPU device.
 
 Compatibility boundary
 ----------------------
@@ -51,23 +53,30 @@ not a Meson test. Compilation and ``--help`` do not enumerate or submit GPU
 work. Build against the headers in this source tree and the installed loader
 and libdrm::
 
-   cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude \
+   cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude -Isrc -Isrc/asahi/lib \
       $(pkg-config --cflags libdrm) \
-      src/asahi/vulkan/tests/hk-query-wait-bench.c \
+      src/asahi/vulkan/tests/hk-query-wait-bench.c src/asahi/lib/agx_chip.c \
       -lvulkan -ldl -pthread -ldrm -o /PRIVATE/hk-query-wait-bench
    /PRIVATE/hk-query-wait-bench --help
 
 Both ``--probe`` and ``--run`` access real hardware and require authorization.
 Use a fresh process with one absolute private ICD manifest in
 ``VK_DRIVER_FILES``. ``--library`` must name the exact private library; the
-program verifies that it was actually mapped, requires one Apple/Borealis
-physical device, and prints driver identity and Vulkan capabilities.
+program verifies that it was actually mapped, requires exactly Mesa's default
+Vulkan vendor ID and the Borealis driver ID, and prints observed IDs and library
+mapping before identity rejection. Native Apple hardware identity is verified
+separately through the kernel parameters. Workload version three reports both
+the raw GPU generation/variant and the normalized driver profile.
 
 The preflight reads the native kernel's global parameters using the enumerated
 render node. This first benchmark is deliberately limited to the M4 Pro's
-source-defined profile: chip 0x6040, G17P, one die, two clusters, USC 3, HAL200,
-nonzero timestamp frequency, VM_STATUS, PER_COMMAND_INPUT_SYNCS and
-EXACT_PRIOR_BARRIERS. A mismatch stops before creating the logical device.
+source-defined profile: chip 0x6040, normalized G17P, one die, two clusters,
+USC 3, HAL200, nonzero timestamp frequency, VM_STATUS, PER_COMMAND_INPUT_SYNCS
+and EXACT_PRIOR_BARRIERS. The benchmark links the actual pure
+``agx_chip_from_params``, ``agx_params_driver_supported`` and
+``agx_params_native_kernel_abi_supported`` helpers. Raw G16S T6040 with USC 3
+and HAL200 maps to G17P in that source; raw and normalized identities must not
+be confused. The exact chip/topology/USC/HAL/clock/feature guards remain. A mismatch stops before creating the logical device.
 These checks do not certify kernel/ICD compatibility or recovery safety; review
 the raw parameters and the kernel build provenance before authorizing a run.
 The VM status mirror is optional; the sticky VM status query is required here.

@@ -16,6 +16,7 @@
 #include <xf86drm.h>
 
 #include "drm-uapi/asahi_drm.h"
+#include "hk-query-wait-bench-profile.h"
 
 #define CHECK(call)                                                            \
    do {                                                                        \
@@ -105,29 +106,26 @@ kernel_preflight(const VkPhysicalDeviceDrmPropertiesEXT *drm)
            "kernel GET_PARAMS failed");
    printf("{\"kind\":\"kernel_contract\",\"driver\":");
    json_string(version->name);
-   printf(",\"major\":%d,\"minor\":%d,\"patch\":%d,\"features\":%llu,"
-          "\"chip_id\":%u,\"generation\":%u,\"variant\":%u,\"dies\":%u,"
-          "\"clusters\":%u,\"usc\":%u,\"hal\":%u,\"timestamp_hz\":%llu}\n",
-          version->version_major, version->version_minor,
-          version->version_patchlevel, (unsigned long long)params.features,
-          params.chip_id, params.gpu_generation, params.gpu_variant,
-          params.num_dies, params.num_clusters_total, params.usc_generation,
-          params.gpu_hal_generation,
-          (unsigned long long)params.command_timestamp_frequency_hz);
+   printf(
+      ",\"major\":%d,\"minor\":%d,\"patch\":%d,\"features\":%llu,"
+      "\"chip_id\":%u,\"generation\":%u,\"variant\":%u,\"dies\":%u,"
+      "\"clusters\":%u,\"usc\":%u,\"hal\":%u,\"timestamp_hz\":%llu,"
+      "\"normalized_profile\":\"%s\",\"driver_supported\":%s,\"native_abi_supported\":%s}\n",
+      version->version_major, version->version_minor,
+      version->version_patchlevel, (unsigned long long)params.features,
+      params.chip_id, params.gpu_generation, params.gpu_variant,
+      params.num_dies, params.num_clusters_total, params.usc_generation,
+      params.gpu_hal_generation,
+      (unsigned long long)params.command_timestamp_frequency_hz,
+      agx_chip_name(agx_chip_from_params(&params)),
+      agx_params_driver_supported(&params) ? "true" : "false",
+      agx_params_native_kernel_abi_supported(&params) ? "true" : "false");
    drmFreeVersion(version);
    close(fd);
    /* Deliberately narrower than the driver: this workload's first physical
     * comparison is specified for the M4 Pro and its native HAL200 contract. */
-   const uint64_t required = DRM_ASAHI_FEATURE_VM_STATUS |
-                             DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
-                             DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
    require(
-      params.chip_id == 0x6040 && params.gpu_generation == 17 &&
-         params.gpu_variant == 'P' && params.num_dies == 1 &&
-         params.num_clusters_total == 2 && params.usc_generation == 3 &&
-         params.gpu_hal_generation == DRM_ASAHI_GPU_HAL_200 &&
-         params.command_timestamp_frequency_hz &&
-         (params.features & required) == required,
+      hk_query_wait_bench_profile_supported(&params),
       "benchmark preflight differs from the planned M4 Pro contract; review before running");
 }
 
@@ -210,7 +208,7 @@ main(int argc, char **argv)
    const VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "HK query wait benchmark",
-      .applicationVersion = 2,
+      .applicationVersion = 3,
       .apiVersion = VK_API_VERSION_1_3,
    };
    const VkInstanceCreateInfo instance_info = {
@@ -238,7 +236,7 @@ main(int argc, char **argv)
       .pNext = &driver,
    };
    vkGetPhysicalDeviceProperties2(physical, &properties);
-   printf("{\"kind\":\"identity\",\"workload_version\":2,\"vendor_id\":%u,"
+   printf("{\"kind\":\"identity\",\"workload_version\":3,\"vendor_id\":%u,"
           "\"device_id\":%u,\"driver_id\":%u,\"expected_library\":",
           properties.properties.vendorID, properties.properties.deviceID,
           driver.driverID);
@@ -287,7 +285,7 @@ main(int argc, char **argv)
          break;
    }
    require(family < count, "no timestamp-capable graphics/compute queue");
-   printf("{\"kind\":\"configuration\",\"workload_version\":2,\"device\":");
+   printf("{\"kind\":\"configuration\",\"workload_version\":3,\"device\":");
    json_string(properties.properties.deviceName);
    printf(",\"driver\":");
    json_string(driver.driverInfo);

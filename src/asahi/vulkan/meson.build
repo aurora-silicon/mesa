@@ -141,6 +141,11 @@ hk_drirc = custom_target(
 
 if with_tests
   if host_machine.system() == 'linux'
+    test('hk_query_wait_bench_profile',
+      executable('hk_query_wait_bench_profile_test',
+        files('tests/test-hk-query-wait-bench-profile.c', '../lib/agx_chip.c'),
+        include_directories : [include_directories('../lib'), inc_include, inc_src]),
+      suite : ['asahi'])
     test('hk_query_wait', executable('hk_query_wait_test',
       files('tests/test-hk-query-wait.c', 'hk_query_wait.c'),
       include_directories : [include_directories('.'), inc_include, inc_src],
