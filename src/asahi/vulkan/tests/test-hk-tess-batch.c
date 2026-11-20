@@ -73,15 +73,6 @@ hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
    return (uint8_t *)current + AGX_CDM_STREAM_LINK_LENGTH;
 }
 
-/* The streams here record no alias sites (hk_cs::alias_sites stays zero), so
- * the merge never moves any. */
-void
-hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
-                               const void *from_end, uint8_t *to, size_t skip)
-{
-   assert(!"no alias sites are recorded");
-}
-
 /* As the driver's: move to a new chunk through a link when the space does
  * not fit. */
 void
@@ -391,6 +382,19 @@ main(void)
    T("exact fit: flush before the link",
      stage_major(r, n, 0, 3, 0) && count(r, n, WEAK) == 0 && link_ok &&
         pre->stream_linked);
+
+   /* A patch site at a stage's tail (hk_cdm_note_alias_site()) stays: the
+    * next draw's launch goes after it. */
+   cmd = new_cmd();
+   pre = open_pre_gfx(cmd);
+   record_draw(cmd, 0, 0);
+   struct hk_cs *pinned = cmd->tess_batch.stages[HK_TESS_STAGE_VS];
+   pinned->alias_pin = pinned->current;
+   record_draw(cmd, 1, 0);
+   hk_tess_batch_flush(cmd);
+   n = decode(pre, r, MAX_RECORDS, &link_ok);
+   T("patch site: kept", n > 2 && r[0] == (LAUNCH | HK_TESS_STAGE_VS) &&
+                            r[1] == WEAK && count(r, n, WEAK) == 1);
 
    /* Other pre-graphics work splits the batch: it follows the tessellation
     * of the draws before it and precedes that of the draws after it. */

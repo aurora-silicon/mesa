@@ -2766,11 +2766,12 @@ hk_byte_stencil_validate_dispatch(const struct hk_device *dev,
       return false;
 
    /* Guarantee 1:1 physical-to-VA mapping across all writable buffers so VA
-    * disjointness implies physical non-aliasing. */
+    * disjointness implies physical non-aliasing: no live resource gives
+    * memory a second address. With host_alias.dynamic, alias_live counts
+    * them and may_alias_memory is false; without it, may_alias_memory says
+    * whether the device enabled anything that can. */
    const bool alias_free =
-      p_atomic_read(&dev->va_alias_resources) == 0 &&
-      p_atomic_read(&dev->alias_live) == 0 &&
-      !hk_cdm_alias_scope(dev);
+      !dev->may_alias_memory && p_atomic_read(&dev->alias_live) == 0;
 
    return hk_byte_stencil_validate_dispatch_core(
       alias_free, desc, plan, base_x, base_y, base_z, groups_x, groups_y,
