@@ -1478,6 +1478,53 @@ bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
    return nir_bcsel(b, valid, def, nir_imm_int(b, 0));
 }
 
+/* Match (record + field) * 4, including OR when the field bits are
+ * known zero in the record index. Addition and OR then agree, and the
+ * scaled field cannot carry into the record when added after the scaled
+ * 32-bit index, even if that index wrapped.
+ */
+static nir_def *
+bounded_word_field_address(nir_builder *b, nir_intrinsic_instr *intr,
+                           nir_scalar offset)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_bounded ||
+       intr->def.bit_size != 32 || intr->num_components != 1 ||
+       offset.def->bit_size != 32 || !is_op(offset, nir_op_amul))
+      return NULL;
+
+   nir_scalar left = nir_scalar_chase_alu_src(offset, 0);
+   nir_scalar right = nir_scalar_chase_alu_src(offset, 1);
+   nir_scalar scale = nir_scalar_is_const(left) ? left : right;
+   nir_scalar index = nir_scalar_is_const(left) ? right : left;
+   if (!nir_scalar_is_const(scale) || nir_scalar_as_uint(scale) != 4 ||
+       !(is_op(index, nir_op_iadd) || is_op(index, nir_op_ior)))
+      return NULL;
+
+   left = nir_scalar_chase_alu_src(index, 0);
+   right = nir_scalar_chase_alu_src(index, 1);
+   nir_scalar word = nir_scalar_is_const(left) ? left : right;
+   nir_scalar record = nir_scalar_is_const(left) ? right : left;
+   if (!nir_scalar_is_const(word) || nir_scalar_is_const(record))
+      return NULL;
+
+   uint32_t n = nir_scalar_as_uint(word);
+   if (!n || n >= AGX_ZERO_PAGE_SIZE / 4)
+      return NULL;
+
+   unsigned field = n * 4;
+   unsigned mul = nir_intrinsic_align_mul(intr);
+   if (mul > AGX_ZERO_PAGE_SIZE ||
+       field % mul != nir_intrinsic_align_offset(intr) ||
+       !m5_offset_aligned(record, BITFIELD_MASK(util_last_bit(n)), 12))
+      return NULL;
+
+   nir_def *start = nir_ishl_imm(b, nir_mov_scalar(b, record), 2);
+   nir_def *base = nir_iadd(b, intr->src[0].ssa, nir_u2u64(b, start));
+   nir_def *safe = nir_bcsel(b, check_in_bounds(b, intr), base,
+                             nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   return nir_iadd_imm(b, safe, field);
+}
+
 /* Fold the constant field displacement into the bounds check so adjacent
  * fields can share their base-plus-index address.
  */
@@ -1485,6 +1532,10 @@ static nir_def *
 bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
 {
    nir_scalar offset = nir_scalar_resolved(intr->src[1].ssa, 0);
+   nir_def *address = bounded_word_field_address(b, intr, offset);
+   if (address)
+      return address;
+
    nir_def *bound = intr->src[2].ssa;
    unsigned bytes = intr->def.num_components * (intr->def.bit_size / 8);
    unsigned align_offset = nir_intrinsic_align_offset(intr);
