@@ -67,41 +67,55 @@ publication or merge.
 Retired writers and reset generations
 ------------------------------------
 
-For a slot without a GPU reset since its last host reset, observed completion
-of its latest registered writer now retains missing-write evidence. Once no
-writer remains, the first reader observation starts a shared two-second grace.
-Availability and sticky loss are rechecked before a generation-checked final
-decision. A newer registration or host reset clears the evidence and deadline;
-unrelated queue/query activity does not restart it. Queued, reserved and
-accepted work has no overall timeout. Cancellation, teardown and host-reset
-unlinking are not completion evidence. The existing M5 idle/victim rule and
-the finite legacy path remain separate.
+Observed completion of the latest writer in a provably ordered reset
+sequence retains missing-write evidence. Once no writer remains, the first
+reader observation starts a shared two-second grace. Availability and sticky
+loss are rechecked before a generation-checked final decision. New registration
+or reset clears the evidence/deadline; unrelated activity cannot restart it.
+Queued, reserved and accepted work has no overall timeout. Cancellation,
+teardown and host-reset unlinking provide no completion evidence. The existing
+M5 idle/victim rule and finite legacy path remain separate.
 
-This is a conservative partial diagnostic. GPU resets can make a successfully
-written query unavailable again, including after the old producer completed.
-Record reset ranges so submission can suppress the diagnostic for that slot
-until its next host reset. Suppression starts before execution, also for
-failed/deferred submissions, and survives writer/reset recording replay.
-Ordered reset records do not prove execution order across queues or identify
-an executed GPU generation. Missing-write timeouts after GPU resets remain
-open; a sticky historical retired flag would be unsafe. No GPU memory layout,
-reset emission, cache flush, timestamp write or synchronization is changed.
+Vulkan's Query Reset dependency orders same-query commands earlier/later in
+submission order on one queue. Process reset/writer ranges in recording order
+at early API registration, including expanded secondaries and every replay.
+A writer following a reset on that same logical queue restores diagnostic
+coverage. A later reset invalidates it, retaining old live links until they
+retire because availability can precede the reset's execution. Reset-only then
+late future-writer use must still succeed. Merely recording an unsubmitted
+reset changes no generation.
 
-Reset-only recordings retain range metadata and pool references again, but
-create no producer or batch, allocate no producer-pointer array and issue no
-tracker completion query on submission. On aarch64 the slot grows from 16 to
-48 bytes and the per-writer link from 32 to 40 bytes; a recording op remains
-24 bytes. A fresh reset-only recording first allocates the dynarray's 64-byte
-minimum capacity; subsequent growth is amortized. Submission scans the ops
-and locks the tracker to invalidate reset ranges at registration and again
-before actual submission. This is additional host memory/locking work, not a
-measured performance claim. Repeated invalidation while suppressed does not
-bump the device serial or broadcast. Only availability is read under the
-tracking mutex at the final decision; status/error callbacks, which can log
-through application debug callbacks, remain outside it.
+This is still a conservative partial diagnostic. Resets on multiple/unknown
+logical queues remain ambiguous until host reset, even if application semaphore
+synchronization would make a particular use safe. Writer registration on a
+different queue cannot establish order. The common runtime carries the API
+queue identity through deferred submission/redirection; producer claims match
+that identity as well as the real completion queue and recording pointer.
+Sharing one real queue does not establish logical submission order. Claim does
+not replay ranges, so an old callback cannot undo a newer reset. Partial-failure
+fallback preserves origin but does not restore lost ordering proof. Borealis
+advertises neither KHR_internally_synchronized_queues nor its feature; API queue
+external synchronization orders early registration. No support for that
+extension is added here.
+
+No GPU memory layout, reset emission, cache flush, timestamp write or
+synchronization is changed. On aarch64, slots grow from ce1's 48 to 56 bytes
+(16 bytes before tracking); producer headers grow from 64 to 72 bytes. Links
+remain 40 bytes and range ops 24 bytes. The common runtime submission adds one
+CPU pointer (8 bytes). Reset-only recordings keep range storage/pool references
+but no producer, batch, producer-pointer array or tracker completion query.
+An initial range dynarray allocates 64 bytes, with amortized growth thereafter.
+Reset invalidation now locks at early registration only; mixed writer/reset
+recordings also lock when registering their producer. Callback claims no longer
+invalidate ranges. Repeated already-suppressed resets on the same queue do not
+broadcast or bump serial. These are source costs, not performance measurements;
+fresh matched target/proposal physical measurements remain necessary. Status
+and error callbacks stay outside the tracking mutex; only final availability
+is checked under it.
 
 The CPU-only regression and bounded fault-model probes are::
 
+   timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_wiring_test --probe-ordered-reset
    timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_test --case retired-reset-future
    timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_test --probe-retired-missing completion
    timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_test --probe-retired-missing prune
@@ -119,16 +133,18 @@ loss, unrelated churn and generation recovery by host reset.
 Private physical workload (separate authorization required)
 ----------------------------------------------------------
 
-``hk-query-wait-bench.c`` is a standalone, manually invoked Vulkan workload,
-not a Meson test. Compilation and ``--help`` do not enumerate or submit GPU
-work. Build against the headers in this source tree and the installed loader
-and libdrm::
+``hk-query-wait-bench.c`` is a manually invoked Vulkan workload. The explicit
+Meson option defaults off. It is never installed, registered as a test or built
+by the default target, even with the option on. With the Vulkan loader and
+libdrm development files already available, configure and explicitly build::
 
-   cc -std=c11 -O2 -Wall -Wextra -Werror -Iinclude -Isrc -Isrc/asahi/lib \
-      $(pkg-config --cflags libdrm) \
-      src/asahi/vulkan/tests/hk-query-wait-bench.c src/asahi/lib/agx_chip.c \
-      -lvulkan -ldl -pthread -ldrm -o /PRIVATE/hk-query-wait-bench
-   /PRIVATE/hk-query-wait-bench --help
+   meson configure build -Dasahi-query-wait-bench=true
+   meson compile -C build hk-query-wait-bench
+   build/src/asahi/vulkan/hk-query-wait-bench --help
+
+Asahi must be among ``vulkan-drivers``. Compilation and ``--help`` do not
+enumerate or submit GPU work. Turning this option on authorizes no GPU run.
+The exact T6040/profile/feature guards are unchanged.
 
 Both ``--probe`` and ``--run`` access real hardware and require authorization.
 Use a fresh process with one absolute private ICD manifest in
@@ -190,7 +206,14 @@ preserve its output and exit status rather than dropping that sample.
 Local candidate measurement modes (not yet run on hardware)
 ----------------------------------------------------------
 
-Workload version four additionally reports CPU and wall time around the single
+Workload version five retains version four's submit measurements and adds
+``--gpu-reset``: one valid GPU reset before the timestamp writers in the same
+command buffer. It is distinct from ``--reset-only``, which has no writer and
+never performs WAIT readback. This healthy workload exercises ordered reset
+registration; it cannot prove missing-write recovery on hardware. No new
+hardware measurement is authorized by adding the mode.
+
+The workload additionally reports CPU and wall time around the single
 ``vkQueueSubmit2`` call. ``--timestamps N`` records between 1 and 1024 ordered
 BOTTOM_OF_PIPE timestamps in that command buffer, with separate query slots.
 With normal readback, only query zero is read with WAIT. The subsequent fence

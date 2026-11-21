@@ -168,17 +168,19 @@ int
 main(int argc, char **argv)
 {
    bool run = false, probe = false, submit_only = false, reset_only = false;
+   bool gpu_reset = false;
    unsigned timestamps = 1;
    const char *library = NULL;
    unsigned delay_ms = 2200;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--help")) {
          puts(
-            "hk-query-wait-bench --probe|--run --library ABSOLUTE_PRIVATE_ICD_LIBRARY [--delay-ms 2200] [--timestamps 1..1024] [--submit-only] [--reset-only]\n"
+            "hk-query-wait-bench --probe|--run --library ABSOLUTE_PRIVATE_ICD_LIBRARY [--delay-ms 2200] [--timestamps 1..1024] [--submit-only] [--reset-only] [--gpu-reset]\n"
             "Requires one absolute process-local VK_DRIVER_FILES manifest.\n"
             "--probe enumerates hardware; --run submits one command buffer.\n"
             "--submit-only skips WAIT readback and requires --delay-ms 0.\n"
             "--reset-only records GPU resets and requires --submit-only.\n"
+            "--gpu-reset records a reset before the timestamp writers.\n"
             "The old driver may report device loss before the host release.\n"
             "Neither hardware mode is a build/test step. Use a separately approved test machine.\n"
             "Output is JSON Lines; each invocation is one fresh-device measurement.");
@@ -191,6 +193,8 @@ main(int argc, char **argv)
          submit_only = true;
       } else if (!strcmp(argv[i], "--reset-only")) {
          reset_only = true;
+      } else if (!strcmp(argv[i], "--gpu-reset")) {
+         gpu_reset = true;
       } else if (!strcmp(argv[i], "--timestamps") && i + 1 < argc) {
          char *end;
          unsigned long value = strtoul(argv[++i], &end, 10);
@@ -215,6 +219,8 @@ main(int argc, char **argv)
            "--submit-only requires --delay-ms 0");
    require(!reset_only || submit_only,
            "--reset-only requires --submit-only (reset is not a writer)");
+   require(!gpu_reset || !reset_only,
+           "--gpu-reset and --reset-only are separate workloads");
    const char *icd = getenv("VK_DRIVER_FILES");
    require(icd && icd[0] == '/' && !strchr(icd, ':'),
            "set VK_DRIVER_FILES to one absolute private ICD manifest");
@@ -253,7 +259,7 @@ main(int argc, char **argv)
       .pNext = &driver,
    };
    vkGetPhysicalDeviceProperties2(physical, &properties);
-   printf("{\"kind\":\"identity\",\"workload_version\":4,\"vendor_id\":%u,"
+   printf("{\"kind\":\"identity\",\"workload_version\":5,\"vendor_id\":%u,"
           "\"device_id\":%u,\"driver_id\":%u,\"expected_library\":",
           properties.properties.vendorID, properties.properties.deviceID,
           driver.driverID);
@@ -302,7 +308,7 @@ main(int argc, char **argv)
          break;
    }
    require(family < count, "no timestamp-capable graphics/compute queue");
-   printf("{\"kind\":\"configuration\",\"workload_version\":4,\"device\":");
+   printf("{\"kind\":\"configuration\",\"workload_version\":5,\"device\":");
    json_string(properties.properties.deviceName);
    printf(",\"driver\":");
    json_string(driver.driverInfo);
@@ -385,9 +391,9 @@ main(int argc, char **argv)
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
    };
    CHECK(vkBeginCommandBuffer(cmd, &bi));
-   if (reset_only)
+   if (reset_only || gpu_reset)
       vkCmdResetQueryPool(cmd, pool, 0, timestamps);
-   else
+   if (!reset_only)
       for (unsigned i = 0; i < timestamps; i++)
          vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, pool, i);
    CHECK(vkEndCommandBuffer(cmd));
@@ -451,12 +457,13 @@ main(int argc, char **argv)
    VkResult fence_at_return = vkGetFenceStatus(device, fence);
    pthread_join(thread, NULL);
    VkResult retired = vkWaitForFences(device, 1, &fence, true, 5000000000);
-   printf("{\"kind\":\"submit_measurement\",\"query_count\":%u,"
-          "\"reset_only\":%s,\"submit_only\":%s,\"submit_wall_ns\":%llu,"
-          "\"submit_cpu_ns\":%llu,\"fence_at_return\":%d}\n",
-          timestamps, reset_only ? "true" : "false",
-          submit_only ? "true" : "false", (unsigned long long)submit_wall,
-          (unsigned long long)submit_cpu, fence_at_return);
+   printf(
+      "{\"kind\":\"submit_measurement\",\"query_count\":%u,"
+      "\"reset_only\":%s,\"gpu_reset\":%s,\"submit_only\":%s,\"submit_wall_ns\":%llu,"
+      "\"submit_cpu_ns\":%llu,\"fence_at_return\":%d}\n",
+      timestamps, reset_only ? "true" : "false", gpu_reset ? "true" : "false",
+      submit_only ? "true" : "false", (unsigned long long)submit_wall,
+      (unsigned long long)submit_cpu, fence_at_return);
    printf("{\"kind\":\"measurement\",\"delay_ms\":%u,\"result\":%d,"
           "\"availability\":%llu,\"timestamp\":%llu,\"wall_ns\":%llu,"
           "\"reader_cpu_ns\":%llu,\"process_cpu_ns\":%llu,"

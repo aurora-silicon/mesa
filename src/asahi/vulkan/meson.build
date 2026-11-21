@@ -139,6 +139,18 @@ hk_drirc = custom_target(
   ],
 )
 
+# Manual hardware workload: explicit opt-in, outside default builds/tests and
+# installation. Building it does not authorize device probing or execution.
+if get_option('asahi-query-wait-bench')
+  executable('hk-query-wait-bench',
+    files('tests/hk-query-wait-bench.c', '../lib/agx_chip.c'),
+    include_directories : [inc_include, inc_src, inc_asahi],
+    dependencies : [dependency('vulkan'), dep_libdrm, dep_dl, dep_thread],
+    build_by_default : false,
+    install : false,
+  )
+endif
+
 if with_tests
   if host_machine.system() == 'linux'
     test('hk_query_wait_bench_profile',
@@ -1222,7 +1234,7 @@ if with_tests
 endif
 
 if with_tests and host_machine.system() == 'linux'
-  test('hk_query_wait_wiring', executable('hk_query_wait_wiring_test',
+  hk_query_wait_wiring_test = executable('hk_query_wait_wiring_test',
     files('tests/test-hk-query-wait-wiring.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
@@ -1238,5 +1250,9 @@ if with_tests and host_machine.system() == 'linux'
       '-Wl,--wrap=os_time_get_nano',
       '-Wl,--wrap=os_time_get_absolute_timeout',
       '-Wl,--wrap=_vk_device_set_lost',
-    ]), timeout : 30, suite : ['asahi'])
+    ])
+  test('hk_query_wait_wiring', hk_query_wait_wiring_test,
+    timeout : 30, suite : ['asahi'])
+  test('hk_query_wait_ordered_wiring', hk_query_wait_wiring_test,
+    args : ['--probe-ordered-reset'], timeout : 8, suite : ['asahi'])
 endif

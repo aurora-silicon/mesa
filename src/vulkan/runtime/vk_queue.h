@@ -278,6 +278,10 @@ vk_queue_is_lost(struct vk_queue *queue)
 struct vk_queue_submit {
    struct list_head link;
 
+   /* Originating API queue. A driver callback may instead receive the real
+    * queue used by emulation; keep logical submission order distinguishable. */
+   struct vk_queue *api_queue;
+
    uint32_t wait_count;
    uint32_t command_buffer_count;
    uint32_t signal_count;

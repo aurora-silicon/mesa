@@ -17,7 +17,7 @@
  * This is a tuning candidate, not a hardware latency/CPU guarantee. */
 #define HK_QUERY_WAIT_PRODUCER_NS UINT64_C(1000000)
 
-/* Diagnostic grace after observing completion of the current host-reset
+/* Diagnostic grace after observing completion of the current ordered-reset
  * generation's last registered writer, with no live writer left. */
 #define HK_QUERY_WAIT_RETIRED_NS UINT64_C(2000000000)
 
@@ -51,18 +51,24 @@ bool hk_query_wait_record(struct util_dynarray *ops,
 void hk_query_wait_recording_finish(struct util_dynarray *ops);
 bool hk_query_wait_has_writers(const struct util_dynarray *ops);
 void hk_query_wait_invalidate_resets(struct hk_query_wait_device *dev,
-                                    const struct util_dynarray *ops);
+                                     const struct util_dynarray *ops,
+                                     void *order_queue);
 
 struct hk_query_wait_batch *hk_query_wait_batch_create(void);
 void hk_query_wait_batch_finish(struct hk_query_wait_device *dev,
                                 struct hk_query_wait_batch *batch, bool failed);
+/* order_queue is the logical API queue whose external synchronization orders
+ * registration. queue is the real completion queue. Claim matches both; its
+ * partial-failure fallback retains identity but cannot restore order proof. */
 bool hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
                            const void *recording,
                            const struct util_dynarray *ops,
-                           struct hk_query_wait_batch *batch);
+                           struct hk_query_wait_batch *batch,
+                           void *order_queue);
 bool hk_query_wait_claim(struct hk_query_wait_device *dev, void *queue,
                          const void *recording, const struct util_dynarray *ops,
-                         struct hk_query_wait_producer **out);
+                         struct hk_query_wait_producer **out,
+                         void *order_queue);
 void hk_query_wait_publish(struct hk_query_wait_device *dev,
                            struct hk_query_wait_producer *producer,
                            uint64_t point, bool accepted);

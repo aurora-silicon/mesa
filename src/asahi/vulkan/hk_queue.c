@@ -1424,12 +1424,16 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
    if (!hk_query_wait_has_loss_status(dev))
       return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
 
+   /* Borealis does not expose KHR_internally_synchronized_queues. External
+    * synchronization of this API queue orders registration before the common
+    * runtime can defer or redirect its submissions. */
    bool queries = false;
    for (uint32_t i = 0; i < submitCount; i++) {
       for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
          VK_FROM_HANDLE(hk_cmd_buffer, cmd,
                         pSubmits[i].pCommandBufferInfos[j].commandBuffer);
-         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops);
+         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops,
+                                         vk_queue);
          queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
       }
    }
@@ -1447,7 +1451,7 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
                         pSubmits[i].pCommandBufferInfos[j].commandBuffer);
          if (cmd->query_wait_ops.size &&
              !hk_query_wait_enqueue(&dev->query_wait, real, cmd,
-                                     &cmd->query_wait_ops, batch)) {
+                                    &cmd->query_wait_ops, batch, vk_queue)) {
             hk_query_wait_batch_finish(&dev->query_wait, batch, true);
             return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
          }
@@ -2810,7 +2814,6 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (hk_query_wait_has_loss_status(dev)) {
       for (unsigned i = 0; i < submit->command_buffer_count; i++) {
          struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
-         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops);
          queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
       }
    }
@@ -2826,7 +2829,8 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       for (unsigned i = 0; i < submit->command_buffer_count; i++) {
          struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
          if (!hk_query_wait_claim(&dev->query_wait, queue, cmd,
-                                   &cmd->query_wait_ops, &producers[i])) {
+                                  &cmd->query_wait_ops, &producers[i],
+                                  submit->api_queue)) {
             for (unsigned j = 0; j < i; j++)
                hk_query_wait_publish(&dev->query_wait, producers[j], 0, false);
             free(producers);

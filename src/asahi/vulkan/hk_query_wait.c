@@ -11,10 +11,11 @@ struct hk_query_wait_query {
    struct hk_query_wait_link *latest;
    uint64_t generation;
    uint64_t deadline;
+   /* Logical API queue, not the real queue shared by deferred submissions.
+    * Resets on multiple/unknown queues stay unproven until a host reset. */
+   void *reset_queue;
+   bool reset_unordered;
    bool retired;
-   /* Without an execution-ordered GPU generation token, a later GPU reset
-    * can explain missing availability. Suppress the diagnostic until the
-    * next host reset, including failed/deferred/replayed reset submits. */
    bool gpu_reset;
 };
 
@@ -52,6 +53,7 @@ struct hk_query_wait_producer {
    unsigned refs;
    enum hk_query_wait_state state;
    void *queue;
+   void *order_queue;
    const void *recording;
    struct hk_query_wait_batch *batch;
    uint64_t point;
@@ -171,7 +173,8 @@ reset_locked(struct hk_query_wait_pool *pool, uint32_t first, uint32_t count)
       q->latest = NULL;
       q->generation++;
       q->deadline = 0;
-      q->retired = q->gpu_reset = false;
+      q->retired = q->gpu_reset = q->reset_unordered = false;
+      q->reset_queue = NULL;
    }
    list_for_each_entry_safe(struct hk_query_wait_producer, p, &dev->producers,
                             link) {
@@ -245,42 +248,53 @@ hk_query_wait_has_writers(const struct util_dynarray *ops)
    return false;
 }
 
-static void
-invalidate_resets_locked(struct hk_query_wait_device *dev,
-                         const struct util_dynarray *ops)
+/* Registration follows submission order on each externally synchronized API
+ * queue. Query reset defines an execution dependency with same-query commands
+ * earlier/later in that order (Vulkan, Queries / Query Reset). Do not infer
+ * dependencies between API queues, even if the runtime redirects both to one
+ * real queue. Remember all reset domains since host reset conservatively.
+ * Never discard live links: old availability can remain visible until reset.
+ */
+static bool
+reset_query_locked(struct hk_query_wait_query *q, void *order_queue)
 {
-   bool changed = false;
-   util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
-      if (!op->reset || op->pool->destroyed)
-         continue;
-      for (uint32_t i = op->first; i < op->first + op->count; i++) {
-         struct hk_query_wait_query *q = &op->pool->queries[i];
-         changed |= !q->gpu_reset;
-         if (!q->gpu_reset)
-            q->generation++;
-         q->gpu_reset = true;
-         q->retired = false;
-         q->deadline = 0;
-         q->latest = NULL;
-      }
-   }
-   if (changed) {
-      dev->serial++;
-      u_cnd_monotonic_broadcast(&dev->changed);
-   }
+   bool changed = !q->gpu_reset || q->reset_queue != order_queue;
+   if (!order_queue || (q->reset_queue && q->reset_queue != order_queue))
+      q->reset_unordered = true;
+   q->reset_queue = order_queue;
+   if (changed)
+      q->generation++;
+   q->gpu_reset = true;
+   q->retired = false;
+   q->deadline = 0;
+   q->latest = NULL;
+   return changed;
 }
 
 void
 hk_query_wait_invalidate_resets(struct hk_query_wait_device *dev,
-                               const struct util_dynarray *ops)
+                                const struct util_dynarray *ops,
+                                void *order_queue)
 {
+   bool locked = false, changed = false;
    util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
       if (!op->reset)
          continue;
-      mtx_lock(&dev->mutex);
-      invalidate_resets_locked(dev, ops);
+      if (!locked) {
+         mtx_lock(&dev->mutex);
+         locked = true;
+      }
+      if (!op->pool->destroyed) {
+         for (uint32_t i = op->first; i < op->first + op->count; i++)
+            changed |= reset_query_locked(&op->pool->queries[i], order_queue);
+      }
+   }
+   if (locked) {
+      if (changed) {
+         dev->serial++;
+         u_cnd_monotonic_broadcast(&dev->changed);
+      }
       mtx_unlock(&dev->mutex);
-      return;
    }
 }
 
@@ -312,13 +326,14 @@ hk_query_wait_batch_finish(struct hk_query_wait_device *dev,
    batch_unref(batch);
 }
 
-bool
-hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
-                      const void *recording, const struct util_dynarray *ops,
-                      struct hk_query_wait_batch *batch)
+static bool
+enqueue(struct hk_query_wait_device *dev, void *queue, const void *recording,
+        const struct util_dynarray *ops, struct hk_query_wait_batch *batch,
+        void *order_queue, bool ordered)
 {
+   void *proof_queue = ordered ? order_queue : NULL;
    if (!hk_query_wait_has_writers(ops)) {
-      hk_query_wait_invalidate_resets(dev, ops);
+      hk_query_wait_invalidate_resets(dev, ops, proof_queue);
       return true;
    }
 
@@ -338,6 +353,7 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
       return false;
    p->refs = 1;
    p->queue = queue;
+   p->order_queue = order_queue;
    p->recording = recording;
    p->batch = batch;
    p->count = count;
@@ -346,15 +362,16 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
       p_atomic_inc(&batch->refs);
 
    mtx_lock(&dev->mutex);
-   invalidate_resets_locked(dev, ops);
    size_t n = 0;
    util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
       struct hk_query_wait_pool *pool = op->pool;
-      /* Ordered GPU resets never discard earlier producers here: their
-       * availability may still be visible until the reset executes. Retain
-       * every writer instance until host reset or observed retirement. */
-      if (pool->destroyed || op->reset)
+      if (pool->destroyed)
          continue;
+      if (op->reset) {
+         for (uint32_t i = op->first; i < op->first + op->count; i++)
+            reset_query_locked(&pool->queries[i], proof_queue);
+         continue;
+      }
       for (uint32_t i = op->first; i < op->first + op->count; i++) {
          struct hk_query_wait_query *q = &pool->queries[i];
          struct hk_query_wait_link *link = &p->queries[n++];
@@ -363,6 +380,8 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
             .pool = pool,
             .query = i,
          };
+         q->gpu_reset = q->reset_unordered ||
+                        (q->reset_queue && q->reset_queue != proof_queue);
          q->latest = q->gpu_reset ? NULL : link;
          q->generation++;
          q->retired = false;
@@ -379,22 +398,28 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
 }
 
 bool
+hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
+                      const void *recording, const struct util_dynarray *ops,
+                      struct hk_query_wait_batch *batch, void *order_queue)
+{
+   return enqueue(dev, queue, recording, ops, batch, order_queue, true);
+}
+
+bool
 hk_query_wait_claim(struct hk_query_wait_device *dev, void *queue,
                     const void *recording, const struct util_dynarray *ops,
-                    struct hk_query_wait_producer **out)
+                    struct hk_query_wait_producer **out, void *order_queue)
 {
    *out = NULL;
-   if (!hk_query_wait_has_writers(ops)) {
-      hk_query_wait_invalidate_resets(dev, ops);
+   if (!hk_query_wait_has_writers(ops))
       return true;
-   }
    for (;;) {
       mtx_lock(&dev->mutex);
-      invalidate_resets_locked(dev, ops);
       list_for_each_entry(struct hk_query_wait_producer, p, &dev->producers,
                           link) {
          if ((p->state == HK_QUERY_REGISTERED || p->state == HK_QUERY_QUEUED) &&
-             p->queue == queue && p->recording == recording) {
+             p->queue == queue && p->order_queue == order_queue &&
+             p->recording == recording) {
             p->state = HK_QUERY_RESERVED;
             p_atomic_inc(&p->refs);
             *out = p;
@@ -404,8 +429,9 @@ hk_query_wait_claim(struct hk_query_wait_device *dev, void *queue,
       }
       mtx_unlock(&dev->mutex);
       /* QueueSubmit2 may have failed after queuing an earlier part of the
-       * call. Recreate that part from its still-live original recording. */
-      if (!hk_query_wait_enqueue(dev, queue, recording, ops, NULL))
+       * call. Preserve callback identity when recreating its registration,
+       * but do not restore ordering proof after later registrations/resets. */
+      if (!enqueue(dev, queue, recording, ops, NULL, order_queue, false))
          return false;
    }
 }

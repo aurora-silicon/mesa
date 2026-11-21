@@ -35,6 +35,7 @@ struct fixture {
    struct hk_query_wait_pool *pool;
    struct util_dynarray recording;
    int queue[2];
+   void *order_queue[2];
    uint64_t point[2], completion_at[2];
    uint64_t now, ready_at, loss_at, publish_at;
    uint64_t watchdog_at;
@@ -59,6 +60,8 @@ init(struct fixture *f)
 {
    memset(f, 0, sizeof(*f));
    assert(hk_query_wait_device_init(&f->dev));
+   f->order_queue[0] = &f->queue[0];
+   f->order_queue[1] = &f->queue[1];
    f->pool = hk_query_wait_pool_create(&f->dev, 4);
    assert(f->pool);
    f->ready_at = f->loss_at = f->publish_at = UINT64_MAX;
@@ -85,7 +88,7 @@ enqueue(struct fixture *f, unsigned q)
    struct hk_query_wait_batch *b = hk_query_wait_batch_create();
    assert(b);
    assert(hk_query_wait_enqueue(&f->dev, &f->queue[q], &f->recording,
-                                &f->recording, b));
+                                &f->recording, b, &f->queue[q]));
    hk_query_wait_batch_finish(&f->dev, b, false);
 }
 
@@ -94,7 +97,7 @@ claim(struct fixture *f, unsigned q)
 {
    struct hk_query_wait_producer *p;
    assert(hk_query_wait_claim(&f->dev, &f->queue[q], &f->recording,
-                              &f->recording, &p));
+                              &f->recording, &p, f->order_queue[q]));
    assert(p);
    return p;
 }
@@ -392,7 +395,7 @@ test_unaccepted_availability(unsigned state)
          batch = hk_query_wait_batch_create();
          assert(batch);
          assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording,
-                                      &f.recording, batch));
+                                      &f.recording, batch, &f.queue[0]));
       } else {
          enqueue(&f, 0);
          if (state == 2)
@@ -490,9 +493,11 @@ test_reset_only(void)
    assert(resets.size && !hk_query_wait_has_writers(&resets));
    allocation_failure = 1;
    for (unsigned i = 0; i < 2; i++) {
-      assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets, &resets, NULL));
+      assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets, &resets, NULL,
+                                   &f.queue[0]));
       struct hk_query_wait_producer *p = NULL;
-      assert(hk_query_wait_claim(&f.dev, &f.queue[0], &resets, &resets, &p));
+      assert(hk_query_wait_claim(&f.dev, &f.queue[0], &resets, &resets, &p,
+                                 &f.queue[0]));
       assert(!p && list_is_empty(&f.dev.producers) && allocation_failure == 1);
       hk_query_wait_publish(&f.dev, p, 1, true);
    }
@@ -534,12 +539,12 @@ test_retired_reset_future(void)
 
          /* The reset invalidates evidence, without a writer allocation. */
          allocation_failure = 1;
-         assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets,
-                                      &resets, NULL));
+         assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets, &resets,
+                                      NULL, &f.queue[0]));
          uint64_t serial = f.dev.serial;
          struct hk_query_wait_producer *p = NULL;
-         assert(hk_query_wait_claim(&f.dev, &f.queue[0], &resets,
-                                    &resets, &p));
+         assert(hk_query_wait_claim(&f.dev, &f.queue[0], &resets, &resets, &p,
+                                    &f.queue[0]));
          assert(!p && f.dev.serial == serial && allocation_failure == 1);
          allocation_failure = 0;
          f.ready_at = UINT64_MAX; /* completed GPU reset */
@@ -593,14 +598,149 @@ probe_retired_missing(bool pruned)
    return finite_exit ? 0 : 1;
 }
 
+/* A small order matrix distinguishes reset position, range and API queue
+ * from completion queue. Each row runs both completion-observation paths. */
+static void
+test_ordered_resets(void)
+{
+   static const struct {
+      const char *ops;
+      bool separate, other_queue, redirected, loss;
+   } cases[] = {
+      {"rw", false, false, false, true},   {"wr", false, false, false, false},
+      {"rwr", false, false, false, false}, {"rwrw", false, false, false, true},
+      {"rwR", false, false, false, true}, /* R resets another slot */
+      {"rw", true, false, false, true},    {"rw", true, true, false, false},
+      {"rw", true, true, true, false}, /* two API queues, one real queue */
+   };
+   for (unsigned c = 0; c < ARRAY_SIZE(cases); c++) {
+      for (unsigned pruned = 0; pruned < 2; pruned++) {
+         struct fixture f;
+         bool never;
+         init(&f);
+         hk_query_wait_recording_finish(&f.recording);
+         for (const char *op = cases[c].ops; *op; op++) {
+            bool reset = *op != 'w';
+            assert(hk_query_wait_record(&f.recording, f.pool, *op == 'R', 1,
+                                        reset));
+            if (cases[c].separate && reset) {
+               assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording,
+                                            &f.recording, NULL, &f.queue[0]));
+               hk_query_wait_recording_finish(&f.recording);
+            }
+         }
+         unsigned real = cases[c].other_queue && !cases[c].redirected;
+         void *logical = &f.queue[cases[c].other_queue];
+         assert(hk_query_wait_enqueue(&f.dev, &f.queue[real], &f.recording,
+                                      &f.recording, NULL, logical));
+         f.order_queue[real] = logical;
+         accept(&f, real, 1);
+         f.completion_at[real] = 0;
+         if (pruned)
+            hk_query_wait_prune(&f.dev, &f.queue[real], 1);
+         f.watchdog_at = UINT64_C(3000000000);
+         VkResult result = wait(&f, false, &never);
+         assert(result ==
+                (cases[c].loss ? VK_ERROR_DEVICE_LOST : VK_ERROR_UNKNOWN));
+         assert(!never && f.now == (cases[c].loss ? HK_QUERY_WAIT_RETIRED_NS
+                                                  : f.watchdog_at));
+         finish(&f);
+      }
+   }
+
+   /* A later queued reset must invalidate an earlier writer even when the
+    * earlier callback runs afterward. Claim must not replay/reset generations.
+    * A canceled latest writer cannot revive evidence from the older one. */
+   for (unsigned cancel = 0; cancel < 2; cancel++) {
+      struct fixture f;
+      bool never;
+      init(&f);
+      hk_query_wait_recording_finish(&f.recording);
+      assert(hk_query_wait_record(&f.recording, f.pool, 0, 1, true));
+      assert(hk_query_wait_record(&f.recording, f.pool, 0, 1, false));
+      enqueue(&f, 0);
+      struct util_dynarray later = {0};
+      assert(hk_query_wait_record(&later, f.pool, 0, 1, true));
+      if (cancel)
+         assert(hk_query_wait_record(&later, f.pool, 0, 1, false));
+      assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &later, &later, NULL,
+                                   &f.queue[0]));
+      accept(&f, 0, 1);
+      hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+      if (cancel) {
+         struct hk_query_wait_producer *p;
+         assert(hk_query_wait_claim(&f.dev, &f.queue[0], &later, &later, &p,
+                                    &f.queue[0]));
+         hk_query_wait_publish(&f.dev, p, 0, false);
+      }
+      f.watchdog_at = UINT64_C(3000000000);
+      assert(wait(&f, false, &never) == VK_ERROR_UNKNOWN && !f.errors);
+      hk_query_wait_recording_finish(&later);
+      finish(&f);
+   }
+   /* Cross-queue uncertainty survives a later same-queue reset and replay;
+    * it must not be overwritten by the last reset's queue identity. */
+   struct fixture f;
+   bool never;
+   init(&f);
+   struct util_dynarray resets = {0};
+   assert(hk_query_wait_record(&resets, f.pool, 0, 1, true));
+   for (unsigned replay = 0; replay < 2; replay++) {
+      for (unsigned n = 0; n < 3; n++) {
+         unsigned q = n == 1;
+         assert(hk_query_wait_enqueue(&f.dev, &f.queue[q], &resets, &resets,
+                                      NULL, &f.queue[q]));
+      }
+      enqueue(&f, 0);
+      accept(&f, 0, replay + 1);
+      hk_query_wait_prune(&f.dev, &f.queue[0], replay + 1);
+      f.now = 0;
+      f.watchdog_at = UINT64_C(3000000000);
+      assert(wait(&f, false, &never) == VK_ERROR_UNKNOWN && !f.errors);
+   }
+   hk_query_wait_recording_finish(&resets);
+   finish(&f);
+   /* Identical recording, two logical queues, one completion queue. Register
+    * B then A but invoke A's callback first. Failure must belong to its actual
+    * origin: stealing B's registration could turn canceled A into evidence. */
+   for (unsigned fail_a = 0; fail_a < 2; fail_a++) {
+      init(&f);
+      struct util_dynarray reset = {0};
+      assert(hk_query_wait_record(&reset, f.pool, 0, 1, true));
+      assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &reset, &reset, NULL,
+                                   &f.queue[0]));
+      assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording,
+                                   &f.recording, NULL, &f.queue[1]));
+      enqueue(&f, 0);
+      struct hk_query_wait_producer *a, *b;
+      assert(hk_query_wait_claim(&f.dev, &f.queue[0], &f.recording,
+                                 &f.recording, &a, &f.queue[0]));
+      assert(hk_query_wait_claim(&f.dev, &f.queue[0], &f.recording,
+                                 &f.recording, &b, &f.queue[1]));
+      assert(a != b);
+      hk_query_wait_publish(&f.dev, a, fail_a ? 0 : 1, !fail_a);
+      hk_query_wait_publish(&f.dev, b, fail_a ? 1 : 0, fail_a);
+      hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+      f.watchdog_at = UINT64_C(3000000000);
+      assert(wait(&f, false, &never) ==
+             (fail_a ? VK_ERROR_UNKNOWN : VK_ERROR_DEVICE_LOST));
+      hk_query_wait_recording_finish(&reset);
+      finish(&f);
+   }
+   puts(
+      "ordered GPU resets: position, subsets, separate submits, cross/redirected queues, deferred claims and canceled latest passed");
+}
+
 static void
 unrelated_churn(struct fixture *f)
 {
    struct util_dynarray ops = {0};
    assert(hk_query_wait_record(&ops, f->pool, 1, 1, false));
    struct hk_query_wait_producer *p;
-   assert(hk_query_wait_enqueue(&f->dev, &f->queue[1], &ops, &ops, NULL));
-   assert(hk_query_wait_claim(&f->dev, &f->queue[1], &ops, &ops, &p));
+   assert(hk_query_wait_enqueue(&f->dev, &f->queue[1], &ops, &ops, NULL,
+                                &f->queue[1]));
+   assert(
+      hk_query_wait_claim(&f->dev, &f->queue[1], &ops, &ops, &p, &f->queue[1]));
    hk_query_wait_publish(&f->dev, p, ++f->point[1], true);
    hk_query_wait_prune(&f->dev, &f->queue[1], f->point[1]);
    hk_query_wait_recording_finish(&ops);
@@ -622,7 +762,7 @@ new_registered(struct fixture *f)
    f->batch = hk_query_wait_batch_create();
    assert(f->batch);
    assert(hk_query_wait_enqueue(&f->dev, &f->queue[0], &f->recording,
-                                &f->recording, f->batch));
+                                &f->recording, f->batch, &f->queue[0]));
    f->ready_at = UINT64_C(4500000000);
 }
 
@@ -654,7 +794,8 @@ gpu_reset(struct fixture *f)
 {
    struct util_dynarray ops = {0};
    assert(hk_query_wait_record(&ops, f->pool, 0, 1, true));
-   assert(hk_query_wait_enqueue(&f->dev, &f->queue[1], &ops, &ops, NULL));
+   assert(hk_query_wait_enqueue(&f->dev, &f->queue[1], &ops, &ops, NULL,
+                                &f->queue[1]));
    hk_query_wait_recording_finish(&ops);
    f->publish_pending = true;
    f->publish_at = UINT64_C(2500000000);
@@ -868,9 +1009,9 @@ test_epochs_and_failure(void)
    struct hk_query_wait_batch *batch = hk_query_wait_batch_create();
    assert(batch);
    assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording, &f.recording,
-                                batch));
+                                batch, &f.queue[0]));
    assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording, &f.recording,
-                                batch));
+                                batch, &f.queue[0]));
    struct hk_query_wait_producer *p = claim(&f, 0);
    hk_query_wait_publish(&f.dev, p, 17, true);
    /* A partially queued API call fails after its earlier part was accepted. */
@@ -910,7 +1051,7 @@ test_allocation_failure(void)
    assert(!hk_query_wait_batch_create());
    allocation_failure = 1;
    assert(!hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording,
-                                 &f.recording, NULL));
+                                 &f.recording, NULL, &f.queue[0]));
    assert(list_is_empty(&f.dev.producers));
    struct util_dynarray failed_recording = {0};
    allocation_failure = 1;
@@ -923,7 +1064,7 @@ test_allocation_failure(void)
    struct hk_query_wait_producer *p;
    allocation_failure = 1;
    assert(!hk_query_wait_claim(&f.dev, &f.queue[0], &f.recording, &f.recording,
-                               &p));
+                               &p, &f.queue[0]));
    assert(!p && list_is_empty(&f.dev.producers));
    finish(&f);
 }
@@ -1246,6 +1387,7 @@ main(int argc, char **argv)
    test_retired_reset_future();
    assert(probe_retired_missing(false) == 0);
    assert(probe_retired_missing(true) == 0);
+   test_ordered_resets();
    test_retired_generations();
    test_rechecks_and_errors();
    for (unsigned state = 0; state < 3; state++)
