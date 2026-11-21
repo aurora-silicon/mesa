@@ -23,6 +23,7 @@
 #define HK_MIN_SSBO_ALIGNMENT            4
 #define HK_MIN_TEXEL_BUFFER_ALIGNMENT    16
 #define HK_MIN_UBO_ALIGNMENT             64
+#define HK_MAX_UBO_RANGE                 (1u << 16)
 #define HK_MAX_VIEWPORTS                 16
 /* The largest per-descriptor stride any binding can take. G17P storage images
  * occupy 80 bytes and round to 96 so every array element's PBE half remains
