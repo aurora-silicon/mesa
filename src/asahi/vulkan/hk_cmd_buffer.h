@@ -284,6 +284,10 @@ struct hk_root_descriptor_table {
     * and fits one launch as it is (hk_mesh_launch_whole()), so the mesh
     * workgroup IDs are the API's without reading the grid. */
    uint32_t mesh_whole;
+
+   /* G16G host-evaluated fragment uniforms (hk_linked_shader::g16_host),
+    * published to uniform halves [0, 2 * n_out). */
+   uint32_t g16_host_unif[HK_G16_HOST_MAX_OUT];
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
