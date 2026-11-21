@@ -1428,7 +1428,13 @@ vk_cmd_build_acceleration_structures_indirect(VkCommandBuffer commandBuffer,
       }
 
       for (uint32_t i = 0; i < infoCount; ++i) {
-         if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE) {
+         /* The sort's workgroup counters. A sort dispatched pass by pass
+          * never reads them, and an H-PLOC build keeps nothing else there
+          * (PLOC and LBVH alias the region with their own data). */
+         const bool sort_counters =
+            !args->morton_phase_dispatch ||
+            states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_HPLOC;
+         if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE && sort_counters) {
             device->cmd_fill_buffer_addr(commandBuffer, pInfos[i].scratchData.deviceAddress + states[i].scratch.sort_internal_offset,
                                          sizeof(struct morton_ready_count) * states[i].morton_sort_passes, 0x0);
          }

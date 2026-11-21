@@ -426,6 +426,10 @@ struct hk_agx3_plan_args {
 #define HK_AGX3_M5_AABB_RECORD_B 48u
 
 #define HK_AGX3_PLAN_ENCODE_DISPATCH 32u /* bytes after hk_agx3_plan_state */
+/* HK_AGX3_PLAN_JOB_GRID: phase 3's indirect dispatch, a workgroup per
+ * gl_WorkGroupSize.x jobs. Phases 0 and 2 write it in the encode dispatch's
+ * words, which phase 4 then overwrites. */
+#define HK_AGX3_PLAN_EMIT_DISPATCH HK_AGX3_PLAN_ENCODE_DISPATCH
 /* hk_agx3_plan_node.depth flags of an internal node whose two children are
  * triangles encoded as one record, and whether that record is opaque. */
 #define HK_AGX3_PLAN_PAIR 0x80000000u
