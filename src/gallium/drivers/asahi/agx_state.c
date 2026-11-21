@@ -26,8 +26,8 @@
 #include "asahi/lib/agx_helpers.h"
 #include "asahi/lib/agx_m5_va.h"
 #include "asahi/lib/agx_ppp.h"
+#include "asahi/lib/agx_hal200_draw_state.h"
 #include "asahi/lib/agx_ppp_hal200_graphics_core.h"
-#include "asahi/lib/agx_ppp_hal200_raster_core.h"
 #include "asahi/lib/agx_ppp_hal300_graphics_core.h"
 #include "asahi/lib/agx_ppp_hal300_depth_bias_scissor_core.h"
 #include "asahi/lib/agx_ppp_hal300_depth_stencil_core.h"
@@ -11936,16 +11936,19 @@ agx_g17p_stencil_word(const struct pipe_stencil_state *stencil)
       stencil->writemask);
 }
 
-static uint8_t *
-agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
-                         struct agx_compiled_shader *vs,
-                         uint32_t *draw_state_offset)
+/* The state block of the batch's next draw in the terms of
+ * agx_hal200_draw_state_pack(), except the fragment program address and the
+ * occlusion query, which the caller adds once the program is built. */
+static void
+agx_g17p_draw_state(struct agx_batch *batch,
+                    const struct agx_compiled_shader *vs,
+                    struct agx_hal200_draw_state *state)
 {
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
-   struct agx_rasterizer *rast = ctx->rast;
-   if (!agx_chip_native_agx3(dev->chip) || !draw_state_offset)
-      return NULL;
+   const struct agx_rasterizer *rast = ctx->rast;
+   const struct pipe_depth_stencil_alpha_state *zs = &ctx->zs->base;
+   const struct agx_linked_shader *fs = ctx->linked.fs;
 
    /* Gallium does not track the highest initialized viewport. When a shader
     * can select a nonzero viewport, preserve the established AGX path and
@@ -11956,293 +11959,182 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
    static_assert(AGX_MAX_VIEWPORTS ==
                  AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS);
 
+   /* Every field up to the viewports is assigned or zero; only the first
+    * viewport_count viewports are written and read. */
+   memset(state, 0, offsetof(struct agx_hal200_draw_state, viewports));
+
    const bool is_points = batch->reduced_prim == MESA_PRIM_POINTS;
    const bool is_lines = batch->reduced_prim == MESA_PRIM_LINES;
-   const enum agx_object_type object_type =
-      is_points  ? agx_point_object_type(rast)
-      : is_lines ? AGX_OBJECT_TYPE_LINE
-                 : AGX_OBJECT_TYPE_TRIANGLE;
+   state->object_type = is_points  ? agx_point_object_type(ctx->rast)
+                        : is_lines ? AGX_OBJECT_TYPE_LINE
+                                   : AGX_OBJECT_TYPE_TRIANGLE;
 
-   const bool depth_bias_enable =
-      rast->depth_bias && object_type == AGX_OBJECT_TYPE_TRIANGLE;
-   unsigned minx[AGX_MAX_VIEWPORTS], miny[AGX_MAX_VIEWPORTS];
-   unsigned maxx[AGX_MAX_VIEWPORTS], maxy[AGX_MAX_VIEWPORTS];
-   struct agx_ppp_hal200_raster_state raster_states[AGX_MAX_VIEWPORTS];
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      agx_get_scissor_extents(
-         &ctx->viewport[i], rast->base.scissor ? &ctx->scissor[i] : NULL,
-         &batch->key, &minx[i], &miny[i], &maxx[i], &maxy[i]);
-      float minz, maxz;
-      util_viewport_zmin_zmax(&ctx->viewport[i], rast->base.clip_halfz, &minz,
-                              &maxz);
-      const struct agx_ppp_hal200_raster_fields raster_fields = {
-         .scissor_enable = true,
-         .depth_bias_enable = depth_bias_enable,
-         .max_x = MIN2(maxx[i], UINT16_MAX),
-         .min_x = MIN2(minx[i], UINT16_MAX),
-         .max_y = MIN2(maxy[i], UINT16_MAX),
-         .min_y = MIN2(miny[i], UINT16_MAX),
-         .min_z_raw = fui(minz),
-         .max_z_raw = fui(maxz),
-         .depth_bias_raw =
-            fui(depth_bias_enable ? rast->base.offset_units * 2.0f : 0.0f),
-         .slope_scale_raw =
-            fui(depth_bias_enable ? rast->base.offset_scale : 0.0f),
-         .clamp_raw = fui(depth_bias_enable ? rast->base.offset_clamp : 0.0f),
-      };
-      if (!agx_ppp_hal200_raster_state_build(
-             dev->chip, &raster_fields, &raster_states[i]))
-         return NULL;
-   }
-
-   uint8_t *scissors = util_dynarray_grow_bytes(
-      &batch->scissor, viewport_count, sizeof(raster_states[0].scissor));
-   uint8_t *depth_bias_records = util_dynarray_grow_bytes(
-      &batch->depth_bias, viewport_count,
-      sizeof(raster_states[0].depth_bias));
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      memcpy(scissors + i * sizeof(raster_states[i].scissor),
-             raster_states[i].scissor, sizeof(raster_states[i].scissor));
-      memcpy(depth_bias_records + i * sizeof(raster_states[i].depth_bias),
-             raster_states[i].depth_bias,
-             sizeof(raster_states[i].depth_bias));
-   }
-   const struct agx_ppp_hal200_raster_state *raster_state = &raster_states[0];
-
-   struct agx_ppp_viewport_payload_fields viewport_fields = {
-      .viewport_count = viewport_count,
-   };
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      uint8_t region_clip[AGX_REGION_CLIP_LENGTH];
-      agx_pack(region_clip, REGION_CLIP, cfg) {
-         cfg.enable = true;
-         cfg.min_x = minx[i] / 32;
-         cfg.min_y = miny[i] / 32;
-         cfg.max_x = DIV_ROUND_UP(MAX2(maxx[i], 1), 32);
-         cfg.max_y = DIV_ROUND_UP(MAX2(maxy[i], 1), 32);
-      }
-      memcpy(&viewport_fields.region_clip_raw[i], region_clip,
-             sizeof(region_clip));
-      const struct pipe_viewport_state *vp = &ctx->viewport[i];
-      viewport_fields.viewports[i] =
-         (struct agx_ppp_viewport_transform_raw){
-            .translate_x = fui(vp->translate[0]),
-            .scale_x = fui(vp->scale[0]),
-            .translate_y = fui(vp->translate[1]),
-            .scale_y = fui(vp->scale[1]),
-            .translate_z = fui(rast->base.clip_halfz
-                                  ? vp->translate[2]
-                                  : vp->translate[2] - vp->scale[2]),
-            .scale_z = fui(rast->base.clip_halfz ? vp->scale[2]
-                                                 : vp->scale[2] * 2.0f),
-         };
-   }
-   struct agx_ppp_viewport_payload_core viewport;
-   if (!agx_ppp_viewport_payload_core_pack(dev->chip, &viewport_fields,
-                                            &viewport))
-      return NULL;
-
-   uint64_t fragment_program = 0;
-   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs,
-                      MESA_SHADER_FRAGMENT, 0, 0, &fragment_program, NULL);
-   if (agx_drop_for_null_g17p_program(ctx, ctx->fs, fragment_program,
-                                      "fragment", NULL))
-      return NULL;
-
-   const struct agx_ppp_hal200_fragment_fields fs_fields = {
-      .resource_counts = ctx->linked.fs->cf.nr_bindings << 16,
-      .varying_table = batch->varyings,
-      .stage_program = fragment_program,
-   };
-   struct agx_ppp_hal200_graphics_core fs_record;
-   if (!agx_ppp_hal200_fragment_core_pack(dev->chip, &fs_fields, &fs_record))
-      return NULL;
-
-   uint32_t output_size;
-   if (!agx_ppp_hal200_output_size_pack(vs->uvs.size, 0, &output_size))
-      return NULL;
-   uint32_t viewport_count_word;
-   if (!agx_ppp_hal200_viewport_count_pack(dev->chip, viewport_count,
-                                            &viewport_count_word))
-      return NULL;
-
-   const bool stencil_test = ctx->zs->base.stencil[0].enabled;
-   enum agx_visibility_mode visibility = AGX_VISIBILITY_MODE_NONE;
-   uint16_t query_index = 0;
-   if (ctx->active_queries && ctx->occlusion_query) {
-      visibility = ctx->occlusion_query->type == PIPE_QUERY_OCCLUSION_COUNTER
-                      ? AGX_VISIBILITY_MODE_COUNTING
-                      : AGX_VISIBILITY_MODE_BOOLEAN;
-      query_index = agx_get_oq_index(batch, ctx->occlusion_query);
-   }
-   const uint32_t linked_fragment_control =
-      ctx->linked.fs->fragment_control.opaque[0];
-   const uint32_t pass_type = linked_fragment_control >> 29;
-   if (pass_type != AGX_PASS_TYPE_OPAQUE &&
-       pass_type != AGX_PASS_TYPE_TRANSLUCENT &&
-       pass_type != AGX_PASS_TYPE_PUNCH_THROUGH &&
-       pass_type != AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH)
-      return NULL;
-
-   uint32_t fragment_control = raster_state->fragment_control |
-                               (stencil_test ? UINT32_C(0x000c0000) : 0);
-   uint32_t secondary_control = UINT32_C(0x00000200);
-   const struct agx_ppp_hal200_fragment_control_fields control_fields = {
-      .linked_control = linked_fragment_control,
-      .shader_tri_merge_disable =
-         (dev->chip == AGX_CHIP_G17P &&
-          ctx->fs->b.info.needs_quad_derivatives) ||
-         (batch->tilebuffer_layout.nr_samples > 1 &&
-          ctx->fs->epilog_key.write_z) ||
-         /* The linker's own merge-disable bit. */
-         (!agx_chip_tri_merge_across_side_effects(dev->chip) &&
-          (linked_fragment_control & (UINT32_C(1) << 26))),
-      .coverage_tri_merge_disable =
-         pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
-         pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH,
-      .primitive_tri_merge_disable =
-         object_type != AGX_OBJECT_TYPE_TRIANGLE ||
-         rast->polygon_mode != AGX_POLYGON_MODE_FILL,
-   };
-   if (!agx_ppp_hal200_fragment_controls_pack(
-          dev->chip, &control_fields, fragment_control, secondary_control,
-          &fragment_control, &secondary_control))
-      return NULL;
-
-   uint32_t occlusion_query;
-   if (!agx_ppp_hal200_occlusion_pack(dev->chip, visibility, query_index,
-                                      fragment_control, &fragment_control,
-                                      &occlusion_query))
-      return NULL;
-
-   struct agx_fragment_face_packed front_face, back_face;
-   agx_pack(&front_face, FRAGMENT_FACE, cfg) {
-      cfg.stencil_reference = ctx->stencil_ref.ref_value[0];
-      cfg.line_width = rast->line_width;
-      cfg.polygon_mode = rast->polygon_mode;
-   }
-   agx_pack(&back_face, FRAGMENT_FACE, cfg) {
-      cfg.stencil_reference =
-         ctx->stencil_ref.ref_value[ctx->zs->base.stencil[1].enabled ? 1 : 0];
-      cfg.line_width = rast->line_width;
-      cfg.polygon_mode = rast->polygon_mode;
-   }
-   const bool depth_test =
-      batch->key.zsbuf.texture && ctx->zs->base.depth_enabled;
-   if (!agx_ppp_hal200_depth_face_pack(
-          dev->chip, depth_test, ctx->zs->base.depth_writemask,
-          ctx->zs->base.depth_func, front_face.opaque[0],
-          &front_face.opaque[0]) ||
-       !agx_ppp_hal200_depth_face_pack(
-          dev->chip, depth_test, ctx->zs->base.depth_writemask,
-          ctx->zs->base.depth_func, back_face.opaque[0],
-          &back_face.opaque[0]))
-      return NULL;
-
-   struct agx_fragment_face_2_packed face_2;
-   agx_pack_fragment_face_2(&face_2, object_type, &ctx->fs->b.info);
+   /* Unlike Borealis, the linker's tag write disable never reaches the
+    * SECONDARY control here, and a punch-through pass is never promoted. */
+   const uint32_t linked_control = fs->fragment_control.opaque[0];
+   const uint32_t pass_type = linked_control >> 29;
+   state->fragment_control = linked_control & ~(UINT32_C(1) << 21);
+   state->varying_table = batch->varyings;
+   state->nr_bindings = fs->cf.nr_bindings;
+   state->fragment_reads_z = fs->cf.reads_z;
    /* G17P's native depth contract must preserve late shader side effects.
     * An unchanged depth output alone does not permit early rejection when
-    * image or SSBO stores precede the fragment tests. Match Honeykrisp's
-    * native face packing rather than inheriting the AGX2 depth-only word. */
-   if (!agx_ppp_hal200_fragment_face_depth_pack(
-          dev->chip, agx_translate_depth_layout(ctx->fs->b.info.depth_layout),
-          ctx->fs->b.info.early_fragment_tests,
-          ctx->fs->so && ctx->fs->so->info.writes_memory,
-          face_2.opaque[0], &face_2.opaque[0]))
-      return NULL;
+    * image or SSBO stores precede the fragment tests. */
+   state->conservative_depth =
+      agx_translate_depth_layout(ctx->fs->b.info.depth_layout);
+   state->early_fragment_tests = ctx->fs->b.info.early_fragment_tests;
+   state->fragment_writes_memory =
+      ctx->fs->so && ctx->fs->so->info.writes_memory;
+   state->shader_tri_merge_disable =
+      (dev->chip == AGX_CHIP_G17P && ctx->fs->b.info.needs_quad_derivatives) ||
+      (batch->tilebuffer_layout.nr_samples > 1 &&
+       ctx->fs->epilog_key.write_z) ||
+      /* The linker's own merge-disable bit. */
+      (!agx_chip_tri_merge_across_side_effects(dev->chip) &&
+       (linked_control & (UINT32_C(1) << 26)));
+   state->coverage_tri_merge_disable =
+      pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
+      pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH;
 
    /* The output select carries the vertex program's clip-distance planes,
     * point size and viewport/layer selectors alongside the fragment bits;
     * Apple's clip3 pipeline keeps the first three plane bits in this word.
     * The G17P layout matches AGX2's OUTPUT_SELECT, so the compiler's packed
-    * selects merge as they do on other chips.
-    */
-   uint32_t output_select;
-   if (!agx_ppp_hal200_output_select_pack(
-          dev->chip, vs->uvs.osel.opaque[0], ctx->linked.fs->cf.nr_bindings,
-          ctx->linked.fs->cf.reads_z, &output_select))
+    * selects merge as they do on other chips. */
+   state->vertex_output_select = vs->uvs.osel.opaque[0];
+   state->vertex_output_size = vs->uvs.size;
+   state->generate_primitive_id = batch->generate_primitive_id;
+   state->varying_counts_32 = batch->linked_varyings.counts_32.opaque[0];
+   state->varying_counts_16 = batch->linked_varyings.counts_16.opaque[0];
+
+   state->depth_test = batch->key.zsbuf.texture && zs->depth_enabled;
+   state->depth_write = zs->depth_writemask;
+   state->depth_compare = zs->depth_func;
+   state->stencil_test = zs->stencil[0].enabled;
+   const unsigned back = zs->stencil[1].enabled ? 1 : 0;
+   const struct pipe_stencil_state *api_faces[2] = {
+      &zs->stencil[0], &zs->stencil[back],
+   };
+   struct agx_hal200_stencil_face *faces[2] = {
+      &state->stencil_front, &state->stencil_back,
+   };
+   for (unsigned i = 0; i < 2; ++i) {
+      *faces[i] = (struct agx_hal200_stencil_face){
+         .enabled = api_faces[i]->enabled,
+         .compare = api_faces[i]->func,
+         .fail = agx_stencil_ops[api_faces[i]->fail_op],
+         .depth_fail = agx_stencil_ops[api_faces[i]->zfail_op],
+         .pass = agx_stencil_ops[api_faces[i]->zpass_op],
+         .compare_mask = api_faces[i]->valuemask,
+         .write_mask = api_faces[i]->writemask,
+         .reference = ctx->stencil_ref.ref_value[i ? back : 0],
+      };
+   }
+
+   state->line_width = rast->line_width;
+   state->polygon_mode = rast->polygon_mode;
+   state->cull_mode = rast->base.cull_face;
+   state->front_face_ccw = agx_front_face_ccw(ctx);
+   state->provoking = rast->base.flatshade_first ? 0 : 2;
+   state->depth_clip = rast->base.depth_clip_near;
+   state->rasterizer_discard = rast->base.rasterizer_discard;
+   /* As on AGX2, always scissor: the record emitted with the viewport holds
+    * the viewport clipped by the scissor, and the hardware does not clip to
+    * the viewport otherwise. */
+   state->scissor_enable = true;
+   state->depth_bias_enable =
+      rast->depth_bias && state->object_type == AGX_OBJECT_TYPE_TRIANGLE;
+   if (state->depth_bias_enable) {
+      state->depth_bias_raw = fui(rast->base.offset_units * 2.0f);
+      state->slope_scale_raw = fui(rast->base.offset_scale);
+      state->depth_bias_clamp_raw = fui(rast->base.offset_clamp);
+   }
+
+   state->viewport_count = viewport_count;
+   for (unsigned i = 0; i < viewport_count; ++i) {
+      const struct pipe_viewport_state *vp = &ctx->viewport[i];
+      const bool halfz = rast->base.clip_halfz;
+      unsigned minx, miny, maxx, maxy;
+      float minz, maxz;
+      agx_get_scissor_extents(vp, rast->base.scissor ? &ctx->scissor[i] : NULL,
+                              &batch->key, &minx, &miny, &maxx, &maxy);
+      util_viewport_zmin_zmax(vp, halfz, &minz, &maxz);
+
+      state->viewports[i] = (struct agx_hal200_viewport){
+         .min_x = minx,
+         .min_y = miny,
+         .max_x = maxx,
+         .max_y = maxy,
+         .min_z_raw = fui(minz),
+         .max_z_raw = fui(maxz),
+         .transform = {
+            .translate_x = fui(vp->translate[0]),
+            .scale_x = fui(vp->scale[0]),
+            .translate_y = fui(vp->translate[1]),
+            .scale_y = fui(vp->scale[1]),
+            .translate_z = fui(halfz ? vp->translate[2]
+                                     : vp->translate[2] - vp->scale[2]),
+            .scale_z = fui(halfz ? vp->scale[2] : vp->scale[2] * 2.0f),
+         },
+      };
+   }
+}
+
+static uint8_t *
+agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
+                         struct agx_compiled_shader *vs,
+                         uint32_t *draw_state_offset)
+{
+   struct agx_context *ctx = batch->ctx;
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   if (!agx_chip_native_agx3(dev->chip) || !draw_state_offset)
       return NULL;
 
-   const struct agx_ppp_hal200_graphics_fields output_fields = {
-      .words = {output_select, 0, viewport_count_word, output_size,
-                AGX_PPP_HAL200_PRIMARY_FACE_HEADER, fragment_control},
-   };
-   const struct agx_ppp_hal200_graphics_fields primary_fields = {
-      .words = {fragment_control, front_face.opaque[0],
-                agx_g17p_stencil_word(&ctx->zs->base.stencil[0]),
-                back_face.opaque[0],
-                agx_g17p_stencil_word(ctx->zs->base.stencil[1].enabled
-                                        ? &ctx->zs->base.stencil[1]
-                                        : &ctx->zs->base.stencil[0]),
-                occlusion_query},
-   };
-   const struct agx_ppp_hal200_graphics_fields secondary_fields = {
-      .words = {secondary_control, face_2.opaque[0], face_2.opaque[0],
-                UINT32_C(0x0001ffff)},
-   };
+   struct agx_hal200_draw_state state;
+   agx_g17p_draw_state(batch, vs, &state);
 
-   uint32_t cull = UINT32_C(0x00000480);
-   if (!agx_ppp_hal200_cull_mode_pack(dev->chip, rast->base.cull_face,
-                                      agx_front_face_ccw(ctx), cull, &cull) ||
-       !agx_ppp_hal200_cull_provoking_pack(
-          dev->chip, rast->base.flatshade_first ? 0 : 2, cull, &cull) ||
-       !agx_ppp_hal200_depth_clip_pack(dev->chip, rast->base.depth_clip_near,
-                                       cull, &cull) ||
-       !agx_ppp_hal200_rasterizer_discard_pack(
-          dev->chip, rast->base.rasterizer_discard, secondary_control, cull,
-          &secondary_control, &cull))
+   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs, MESA_SHADER_FRAGMENT, 0,
+                      0, &state.fragment_program, NULL);
+   if (state.fragment_program && ctx->active_queries &&
+       ctx->occlusion_query) {
+      state.occlusion_mode =
+         ctx->occlusion_query->type == PIPE_QUERY_OCCLUSION_COUNTER
+            ? AGX_VISIBILITY_MODE_COUNTING
+            : AGX_VISIBILITY_MODE_BOOLEAN;
+      state.occlusion_index = agx_get_oq_index(batch, ctx->occlusion_query);
+   }
+
+   struct agx_hal200_draw_state_packed packed;
+   const bool complete =
+      agx_hal200_draw_state_pack(dev->chip, &state, &packed);
+   const unsigned viewport_count = packed.viewport_count;
+   if (!viewport_count)
       return NULL;
 
-   struct agx_ppp_hal200_graphics_core output_record, primary_record;
-   struct agx_ppp_hal200_graphics_core secondary_record, cull_record;
-   struct agx_ppp_hal200_graphics_fields final_secondary = secondary_fields;
-   final_secondary.words[0] = secondary_control;
-   const struct agx_ppp_hal200_graphics_fields cull_fields = {
-      .words = {cull},
-   };
-   const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
-      .w_clamp_raw = 0,
-      .cull2_raw = UINT32_C(0x80) |
-                   (batch->generate_primitive_id ? UINT32_C(0x1000) : 0),
-   };
-   struct agx_ppp_w_clamp_cull2_core w_cull2;
-   if (!agx_ppp_hal200_graphics_core_pack(
-          dev->chip, AGX_PPP_HAL200_GRAPHICS_OUTPUT, &output_fields,
-          &output_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->chip, AGX_PPP_HAL200_GRAPHICS_PRIMARY_FACE, &primary_fields,
-          &primary_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->chip, AGX_PPP_HAL200_GRAPHICS_SECONDARY_FACE, &final_secondary,
-          &secondary_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->chip, AGX_PPP_HAL200_GRAPHICS_CULL, &cull_fields,
-          &cull_record) ||
-       !agx_ppp_w_clamp_cull2_core_pack(dev->chip, &w_cull2_fields,
-                                         &w_cull2))
+   /* The scissor and depth-bias records have always joined the batch before
+    * the checks that can still drop this draw. */
+   uint8_t *scissors = util_dynarray_grow_bytes(
+      &batch->scissor, viewport_count, sizeof(packed.scissors[0]));
+   uint8_t *depth_bias = util_dynarray_grow_bytes(
+      &batch->depth_bias, viewport_count, sizeof(packed.depth_bias[0]));
+   memcpy(scissors, packed.scissors,
+          viewport_count * sizeof(packed.scissors[0]));
+   memcpy(depth_bias, packed.depth_bias,
+          viewport_count * sizeof(packed.depth_bias[0]));
+
+   if (agx_drop_for_null_g17p_program(ctx, ctx->fs, state.fragment_program,
+                                      "fragment", NULL) ||
+       !complete)
       return NULL;
 
-   uint8_t bind_group[AGX_G17P_BIND_GROUP_BYTES] = {0};
-   memcpy(&bind_group[0x00], fs_record.bytes, fs_record.length);
-   memcpy(&bind_group[0x1c], output_record.bytes, output_record.length);
-   memcpy(&bind_group[0x30], primary_record.bytes, primary_record.length);
-   memcpy(&bind_group[0x4c], secondary_record.bytes, secondary_record.length);
-   memcpy(&bind_group[0x60], w_cull2.bytes, w_cull2.length);
-   memcpy(&bind_group[0x6c], cull_record.bytes, cull_record.length);
-
-   const size_t state_size = agx_g17p_bind_state_size(viewport.length);
-   struct agx_ptr state =
-      agx_pool_alloc_aligned(&batch->pool, state_size, 64);
+   const size_t state_size = agx_hal200_draw_state_size(&packed);
+   struct agx_ptr block = agx_pool_alloc_aligned(&batch->pool, state_size, 64);
    uint64_t compact_state;
-   struct agx_g17p_bind_state_upload uploaded;
-   if (!state_size || !state.cpu ||
-       !agx_gallium_vdm_compact(batch, state.gpu, &compact_state) ||
-       !agx_g17p_upload_bind_state(
-          state.cpu, state_size, compact_state, bind_group,
-          viewport.bytes, viewport.length,
-          batch->linked_varyings.counts_32.opaque[0],
-          batch->linked_varyings.counts_16.opaque[0], &uploaded))
+   struct agx_vdm_hal200_bind_tail tail;
+   if (!state_size || !block.cpu ||
+       !agx_gallium_vdm_compact(batch, block.gpu, &compact_state) ||
+       !agx_hal200_draw_state_upload(&packed, block.cpu, state_size,
+                                     compact_state, &tail))
       return NULL;
 
    struct agx_ptr indices = agx_pool_alloc_aligned(&batch->pool, 8, 4);
@@ -12254,8 +12146,8 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
           batch->depth_bias.size, viewport_count, draw_state_offset))
       return NULL;
 
-   memcpy(out, uploaded.tail.bytes, uploaded.tail.length);
-   return out + uploaded.tail.length;
+   memcpy(out, tail.bytes, tail.length);
+   return out + tail.length;
 }
 
 /* HAL300 uses full Ioto program pointers and separate viewport/base/graphics
