@@ -2297,6 +2297,34 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 
+   /* A compute-only device has no graphics queue, and presenting can blit
+    * through the graphics meta path, which the kernel refuses there. Offer no
+    * swapchain or present extensions, nor their features.
+    */
+   if (agx_compute_only(&pdev->dev)) {
+      supported_extensions.KHR_swapchain = false;
+      supported_extensions.KHR_swapchain_maintenance1 = false;
+      supported_extensions.KHR_swapchain_mutable_format = false;
+      supported_extensions.EXT_swapchain_maintenance1 = false;
+      supported_extensions.KHR_incremental_present = false;
+      supported_extensions.KHR_present_id = false;
+      supported_extensions.KHR_present_id2 = false;
+      supported_extensions.KHR_present_wait = false;
+      supported_extensions.KHR_present_wait2 = false;
+      supported_extensions.EXT_display_control = false;
+      supported_extensions.EXT_hdr_metadata = false;
+      supported_extensions.EXT_present_timing = false;
+      supported_extensions.GOOGLE_display_timing = false;
+      supported_features.presentId = false;
+      supported_features.presentId2 = false;
+      supported_features.presentWait = false;
+      supported_features.presentWait2 = false;
+      supported_features.presentTiming = false;
+      supported_features.presentAtRelativeTime = false;
+      supported_features.presentAtAbsoluteTime = false;
+      supported_features.swapchainMaintenance1 = false;
+   }
+
    struct vk_properties properties;
    hk_get_device_properties(&pdev->dev, instance, &supported_features,
                             &properties);
@@ -2399,6 +2427,11 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       if (pdev->vk.supported_features.sparseBinding)
          queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
    }
+   /* The kernel refuses render commands: offer a compute queue only, so that
+    * graphics clients (zink among them) pass over this device.
+    */
+   if (agx_compute_only(&pdev->dev))
+      queue_flags &= ~VK_QUEUE_GRAPHICS_BIT;
 
    uint32_t queue_count = 1;
    /* Under virtio the simple-ioctl path forwards the request struct, not the

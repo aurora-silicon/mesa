@@ -410,6 +410,16 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
    if (dev->debug & AGX_DBG_NOCOMPRESS)
       return false;
 
+   /* A compute-only device copies and uploads into images only through
+    * compute, which cannot write a compressed multisampled layout: such a copy
+    * would take the graphics meta path (hk_copy_requires_gfx), and the kernel
+    * refuses render commands there.
+    */
+   if (samples > 1 && agx_compute_only(dev)) {
+      perf_debug_dev(dev, "No compression: multisampled on a compute-only device");
+      return false;
+   }
+
    /* Copies must preserve the packed word, including non-canonical shared
     * exponents and NaN payloads. The R32_UINT copy view cannot decode these
     * formats' compression classes. Apply this to modifier queries too, so
