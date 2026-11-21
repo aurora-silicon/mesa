@@ -18,6 +18,7 @@
 #include "asahi/lib/agx_scratch.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/lib/agx_uvs.h"
+#include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/pool.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -584,6 +585,16 @@ struct agx_batch {
    /* The last program of the hardware vertex stage and of the fragment
     * stage. The same inputs give the same program, so it is kept. */
    struct agx_g17p_program_inputs g17p_program[2];
+   /* The bind state of the last native draw: its tail, its draw-state
+    * selector, and the vertex shader and fragment program it was built for
+    * (no program: none). agx_g17p_emit_bind_state() publishes it again
+    * while nothing it was built from has changed. */
+   struct {
+      const struct agx_compiled_shader *vs;
+      uint64_t fragment_program;
+      uint32_t draw_state_offset;
+      struct agx_vdm_hal200_bind_tail tail;
+   } g17p_bind_state;
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;

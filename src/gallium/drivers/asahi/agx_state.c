@@ -12203,11 +12203,32 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
    if (!agx_chip_native_agx3(dev->chip) || !draw_state_offset)
       return NULL;
 
+   uint64_t fragment_program = 0;
+   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs, MESA_SHADER_FRAGMENT, 0,
+                      0, &fragment_program, NULL);
+
+   /* Publish the last bind state again while nothing it was built from has
+    * changed. agx_g17p_draw_state() reads this batch's own constants, the
+    * vertex shader, the fragment program, and state whose change sets a
+    * dirty bit other than these two, which stand for new vertex buffers and
+    * new vertex uniforms. The scissor and depth-bias records its selector
+    * names stay in the batch. */
+   const unsigned vertex_inputs = AGX_DIRTY_VERTEX | AGX_DIRTY_VS;
+   if (fragment_program &&
+       fragment_program == batch->g17p_bind_state.fragment_program &&
+       vs == batch->g17p_bind_state.vs && !(ctx->dirty & ~vertex_inputs)) {
+      const struct agx_vdm_hal200_bind_tail *tail =
+         &batch->g17p_bind_state.tail;
+
+      *draw_state_offset = batch->g17p_bind_state.draw_state_offset;
+      memcpy(out, tail->bytes, tail->length);
+      return out + tail->length;
+   }
+   batch->g17p_bind_state.fragment_program = 0;
+
    struct agx_hal200_draw_state state;
    agx_g17p_draw_state(batch, vs, &state);
-
-   agx_build_pipeline(batch, ctx->fs, ctx->linked.fs, MESA_SHADER_FRAGMENT, 0,
-                      0, &state.fragment_program, NULL);
+   state.fragment_program = fragment_program;
    if (state.fragment_program && ctx->active_queries &&
        ctx->occlusion_query) {
       state.occlusion_mode =
@@ -12258,6 +12279,11 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
           indices.cpu, 8, compact_indices, batch->scissor.size,
           batch->depth_bias.size, viewport_count, draw_state_offset))
       return NULL;
+
+   batch->g17p_bind_state.vs = vs;
+   batch->g17p_bind_state.fragment_program = fragment_program;
+   batch->g17p_bind_state.draw_state_offset = *draw_state_offset;
+   batch->g17p_bind_state.tail = tail;
 
    memcpy(out, tail.bytes, tail.length);
    return out + tail.length;

@@ -366,6 +366,7 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_fragment_shader = NULL;
    batch->g17p_fragment_linked = NULL;
    batch->g17p_program[0].shader = batch->g17p_program[1].shader = NULL;
+   batch->g17p_bind_state.fragment_program = 0;
 
    agx_bo_reference(screen->rodata);
    agx_pool_init(&batch->pool, dev, "Batch pool", 0, true);
