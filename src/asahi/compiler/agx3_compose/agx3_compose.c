@@ -20,6 +20,8 @@ typedef struct {
     * caller's and stays out of the snapshot of an alternative. */
    uint8_t path_n;
    const agx3_node **path;
+   /* Fields with a direct deposit and a value that has other bits set. */
+   uint64_t wide[3];
 } ctx;
 
 static inline uint64_t wmask(unsigned width) {
@@ -165,6 +167,8 @@ static bool apply_node(ctx *c, const agx3_node *n)
          transformed = c->t->lutpool[cmd->lut_off + value];
       } else {
          transformed = value;
+         if (value & ~c->t->slices[cmd->lut_off])
+            c->wide[cmd->field >> 6] |= 1ull << (cmd->field & 63);
       }
       uint16_t bits = (uint16_t)((transformed >> cmd->src_shift) & wmask(cmd->width));
       if (!deposit(c, cmd->word, (uint16_t)(wmask(cmd->width) << cmd->dst_shift),
@@ -199,33 +203,16 @@ bool agx3_compose_known(const agx3_table *t, uint32_t form,
    if (!preds_test(t, fields, root)) return false;
    if (!apply_node(cp, root)) return false;
 
-   /* The bits of each field that the applied nodes account for: all of
-    * them once a predicate tests the field or a command maps it through a
-    * LUT, otherwise the source slices of its direct deposits. */
-   uint64_t used[AGX3_MAX_FIELDS] = {0};
+   /* strict: every nonzero field must have been consumed, and a directly
+    * deposited value must fit its slices unless a predicate or a LUT of an
+    * applied node covers the field. */
+   uint64_t use[6] = {0};
    for (unsigned i = 0; i < cp->path_n; i++) {
-      const agx3_node *n = path[i];
-      const agx3_predref *r = &t->predrefs[n->pred_off];
-      for (unsigned j = 0; j < n->pred_n; j++) {
-         used[r[j].field < AGX3_MAX_FIELDS ? r[j].field
-                                           : agx3_wide_pred(t, r[j])->field] =
-            ~0ull;
-      }
-      const agx3_cmd *cmd = &t->cmds[n->cmd_off];
-      for (unsigned j = 0; j < n->cmd_n; j++) {
-         used[cmd[j].field] |=
-            cmd[j].lut_n ? ~0ull : wmask(cmd[j].width) << cmd[j].src_shift;
-      }
+      for (unsigned w = 0; w < 6; w++)
+         use[w] |= t->uses[path[i]->use_off + w];
    }
-
-   /* strict: a nonzero field that nothing consumes has every bit left over,
-    * and a directly deposited value must fit the union of its slices. */
-   if (nonzero[2] >> (AGX3_MAX_FIELDS - 128)) return false;
    for (unsigned w = 0; w < 3; w++) {
-      for (uint64_t bits = nonzero[w]; bits; bits &= bits - 1) {
-         const unsigned field = w * 64 + (unsigned)__builtin_ctzll(bits);
-         if (fields[field] & ~used[field]) return false;
-      }
+      if ((nonzero[w] & ~use[w]) | (cp->wide[w] & ~use[3 + w])) return false;
    }
 
    for (unsigned w = 0; w < cp->nwords; w++) {
