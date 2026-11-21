@@ -587,7 +587,8 @@ hk_g17p_buffer_to_image_copy_supported(
                          copy->format == VK_FORMAT_D16_UNORM_S8_UINT;
       if (copy->plane_count != (split ? 2 : 1) ||
           copy->image_type != VK_IMAGE_TYPE_2D || copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip) &&
+           !agx_chip_g17_m5(copy->chip)))
          return false;
       plane_format = (copy->format == VK_FORMAT_D32_SFLOAT ||
                       copy->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
@@ -600,7 +601,8 @@ hk_g17p_buffer_to_image_copy_supported(
        * bit-compatible R8_UINT view, in the same single-level 2D shapes. */
       if (copy->plane_count != 2 || copy->image_type != VK_IMAGE_TYPE_2D ||
           copy->mip_levels != 1 ||
-          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip)))
+          (copy->array_layers != 1 && !agx_chip_native_agx3(copy->chip) &&
+           !agx_chip_g17_m5(copy->chip)))
          return false;
       plane_format = VK_FORMAT_R8_UINT;
    } else if (copy->plane_count != 1 ||
