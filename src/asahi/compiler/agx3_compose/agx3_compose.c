@@ -30,21 +30,25 @@ static inline uint64_t wmask(unsigned width) {
    return width >= 64 ? ~0ull : (1ull << width) - 1;
 }
 
-static bool pred_ok(const ctx *c, const agx3_pred *p)
+bool agx3_pred_holds(const agx3_table *t, const agx3_pred *p, uint64_t v)
 {
-   uint64_t v = c->fields[p->field];
    switch (p->kind) {
    case 0: return v == p->a;
    case 1: {
       if (v >= 0x10000) return false;
       for (uint16_t i = 0; i < p->b; i++)
-         if (c->t->setpool[p->a + i] == v) return true;
+         if (t->setpool[p->a + i] == v) return true;
       return false;
    }
    case 2: return p->a <= v && v <= p->b;
    case 3: return ((v >> p->shift) & wmask(p->width)) == p->a;
    default: return false;
    }
+}
+
+static bool pred_ok(const ctx *c, const agx3_pred *p)
+{
+   return agx3_pred_holds(c->t, p, c->fields[p->field]);
 }
 
 static bool preds_test(const ctx *c, uint32_t off, uint16_t n)
