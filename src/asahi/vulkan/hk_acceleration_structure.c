@@ -92,6 +92,14 @@ static const uint32_t agx3_plan_spv[] = {
 #include "bvh/hk_agx3_gen1_plan.spv.h"
 };
 
+/* The plans whose phase 3 runs a thread per job (HK_AGX3_PLAN_JOB_GRID). */
+static const uint32_t agx3_plan_jobs_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_jobs.spv.h"
+};
+static const uint32_t agx3_plan_pairs_jobs_spv[] = {
+#include "bvh/hk_agx3_gen1_plan_pairs_jobs.spv.h"
+};
+
 static const uint32_t agx3_refit_spv[] = {
 #include "bvh/hk_agx3_refit.spv.h"
 };
@@ -769,6 +777,20 @@ get_pipeline_spv(struct hk_device *dev, const char *name, const uint32_t *spv,
                                           name, key_size, pipeline);
 }
 
+/* Plan phase 3 (emit) has work on job nodes only: a few percent to a sixth
+ * of the ids, scattered so that nearly every SIMD group of a per-node grid
+ * holds one and runs a whole emit for it. With many nodes the phase is
+ * faster over the jobs alone, an indirect grid that phase 2 sizes; with
+ * few, that grid's indirect read costs more than the idle groups. The
+ * crossover is measured (gpubench rt.asbuild on the Neo). */
+#define HK_AGX3_PLAN_JOB_GRID_MIN_LEAVES 4096
+
+static bool
+hk_agx3_plan_job_grid(const struct hk_device *dev, uint32_t leaf_bound)
+{
+   return leaf_bound >= HK_AGX3_PLAN_JOB_GRID_MIN_LEAVES;
+}
+
 VkResult
 hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                         const struct hk_agx3_plan_args *args,
@@ -799,16 +821,26 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
                        sizeof(struct hk_agx3_leaf_args)}
       : (struct stage){"hk-agx3-node-encode", agx3_node_spv,
                        sizeof(agx3_node_spv), sizeof(struct hk_agx3_leaf_args)};
+   const bool job_grid = hk_agx3_plan_job_grid(dev, args->leaf_bound);
+   const struct stage plan_stage = job_grid
+      ? (struct stage){"hk-agx3-plan-jobs", agx3_plan_jobs_spv,
+                       sizeof(agx3_plan_jobs_spv), sizeof(*args)}
+      : (struct stage){"hk-agx3-plan", agx3_plan_spv, sizeof(agx3_plan_spv),
+                       sizeof(*args)};
+   const struct stage plan_pairs_stage = job_grid
+      ? (struct stage){"hk-agx3-plan-pairs-jobs", agx3_plan_pairs_jobs_spv,
+                       sizeof(agx3_plan_pairs_jobs_spv), sizeof(*args)}
+      : (struct stage){"hk-agx3-plan-pairs", agx3_plan_pairs_spv,
+                       sizeof(agx3_plan_pairs_spv), sizeof(*args)};
    const struct stage stages[] = {
-      {"hk-agx3-plan", agx3_plan_spv, sizeof(agx3_plan_spv), sizeof(*args)},
+      plan_stage,
       node_encode,
       {"hk-agx3-as-envelope", agx3_envelope_spv, sizeof(agx3_envelope_spv),
        sizeof(struct hk_agx3_envelope_args)},
       /* Planning and node encoding that pair triangles. */
       {"hk-agx3-node-encode-pairs", agx3_node_pairs_spv,
        sizeof(agx3_node_pairs_spv), sizeof(struct hk_agx3_leaf_args)},
-      {"hk-agx3-plan-pairs", agx3_plan_pairs_spv, sizeof(agx3_plan_pairs_spv),
-       sizeof(*args)},
+      plan_pairs_stage,
    };
    VkPipeline pipeline[5];
    VkPipelineLayout layout[5];
@@ -835,9 +867,15 @@ hk_cmd_build_agx3_from_ir(VkCommandBuffer command_buffer,
       vk_common_CmdPushConstants(command_buffer, layout[plan],
                                 VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push),
                                 &push);
-      hk_cmd_dispatch_unaligned(command_buffer,
-                                phase == 4 ? 1 : args->node_bound,
-                                1, 1);
+      /* The job grid's phase 3 takes the workgroup count phase 2 wrote;
+       * the barrier after phase 2 covers indirect reads. */
+      if (job_grid && phase == 3)
+         hk_cmd_dispatch_indirect_addr(command_buffer,
+                                       args->state + HK_AGX3_PLAN_EMIT_DISPATCH);
+      else
+         hk_cmd_dispatch_unaligned(command_buffer,
+                                   phase == 4 ? 1 : args->node_bound,
+                                   1, 1);
       vk_common_CmdPipelineBarrier(
          command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,

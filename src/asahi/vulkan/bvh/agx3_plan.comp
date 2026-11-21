@@ -8,6 +8,8 @@
  * triangles that share an edge (phase 0 marks their parent as a pair).
  * Preserve the common builder's spatial partition and order. Built twice:
  * HK_AGX3_PLAN_PAIRS forms pairs (see hk_agx3_plan_args.pairs).
+ * HK_AGX3_PLAN_JOB_GRID builds the programs whose phase 3 runs a thread per
+ * job rather than per node, for builds with many nodes.
  * A global atomic allocator compacts jobs/child regions; it never changes
  * traversal order. The five phases are separated by dispatch barriers.
  * An update does not plan: it encodes from the retained jobs (see
@@ -265,6 +267,12 @@ initialize(uint id)
           args.slot_bound < 5)
          state.error |= HK_AGX3_PLAN_INDEX;
       DEREF(args.state) = state;
+#ifdef HK_AGX3_PLAN_JOB_GRID
+      uint64_t dispatch = uint64_t(args.state) + uint64_t(HK_AGX3_PLAN_EMIT_DISPATCH);
+      DEREF(REF(uint32_t)(dispatch)) = 0u;
+      DEREF(REF(uint32_t)(dispatch + 4ul)) = 1u;
+      DEREF(REF(uint32_t)(dispatch + 8ul)) = 1u;
+#endif
    }
 }
 
@@ -338,7 +346,12 @@ classify(uint id)
    output_job.intermediate_bvh = args.intermediate_bvh;
    output_job.output_bvh = args.output_bvh;
    output_job.root_slot = id == root ? 0u : 0xffffffffu;
+#ifdef HK_AGX3_PLAN_JOB_GRID
+   /* The job's node, for phase 3; emit overwrites it. */
+   output_job.child_slot = id;
+#else
    output_job.child_slot = 0;
+#endif
    output_job.child_count = 0;
    output_job.node_kind =
       node.leaf_count <= 8
@@ -351,6 +364,12 @@ classify(uint id)
       output_job.triangle_offsets[i] = 0;
    DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = output_job;
    atomicMax(DEREF(args.state).depth, (depth + 2u) / 3u + 1u);
+#ifdef HK_AGX3_PLAN_JOB_GRID
+   /* Job ids are dense: the first job of each emit workgroup adds it. */
+   if (job % gl_WorkGroupSize.x == 0u)
+      atomicAdd(DEREF(REF(uint32_t)(uint64_t(args.state) +
+                                    uint64_t(HK_AGX3_PLAN_EMIT_DISPATCH))), 1u);
+#endif
 }
 
 void
@@ -439,6 +458,16 @@ emit(uint id)
    }
 }
 
+#ifdef HK_AGX3_PLAN_JOB_GRID
+/* Phase 3 runs a thread per job, on the node classify left in it. */
+void
+emit_job(uint job)
+{
+   if (job < DEREF(args.state).job_count)
+      emit(DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)).child_slot);
+}
+#endif
+
 void
 finish(uint id)
 {
@@ -490,5 +519,9 @@ main()
    if (args.phase == 2)
       classify(id);
    if (args.phase == 3)
+#ifdef HK_AGX3_PLAN_JOB_GRID
+      emit_job(id);
+#else
       emit(id);
+#endif
 }
