@@ -73,7 +73,7 @@ struct agx_usc_builder;
 struct vk_shader;
 
 /* The dynamic graphics state a HAL200 bind tail is built from: every member
- * of vk_dynamic_graphics_state that hk_g17p_build_native_bind_tail() reads,
+ * of vk_dynamic_graphics_state that hk_g17p_draw_state() reads,
  * as X(name, member), with those that change most often first. The viewports
  * and scissors, of which only viewport_count and scissor_count are used, and
  * the blend factors, which decide whether the fragment program the tail

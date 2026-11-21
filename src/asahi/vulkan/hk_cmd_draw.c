@@ -16,15 +16,14 @@
 #include "agx_linker.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_ppp.h"
+#include "agx_hal200_draw_state.h"
 #include "agx_ppp_hal200_graphics_core.h"
 #include "agx_ppp_hal300_graphics_core.h"
 #include "hk_ppp_state.h"
 #include "agx_vdm_state_core.h"
-#include "agx_ppp_hal200_raster_core.h"
 #include "agx_ppp_hal300_depth_bias_scissor_core.h"
 #include "agx_ppp_hal300_graphics_core.h"
 #include "agx_ppp_viewport_payload_core.h"
-#include "agx_ppp_w_clamp_cull2_core.h"
 #include "agx_tilebuffer.h"
 #include "agx_usc.h"
 #include "agx_uvs.h"
@@ -8446,6 +8445,287 @@ hk_m5_emit_restart_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 static float hk_depth_bias_factor(VkFormat format, bool exact,
                                   bool force_unorm);
 
+/* This draw's state block in the terms of agx_hal200_draw_state_pack().
+ * fs and vs are the programs the draw launches; fragment_program is fs's
+ * stage program. False for state the HAL200 records cannot express. */
+static bool
+hk_g17p_draw_state(struct hk_cmd_buffer *cmd, const struct hk_shader *fs,
+                   const struct hk_linked_shader *linked_fs,
+                   const struct hk_shader *vs, uint64_t fragment_program,
+                   struct agx_hal200_draw_state *state)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const struct hk_rendering_state *render = &gfx->render;
+   const unsigned viewport_count = MAX2(dyn->vp.viewport_count, 1);
+
+   if (dyn->ds.depth.bounds_test.enable ||
+       (fs->b.info.has_preamble && !fs->b.info.agx3_preamble_staging_known))
+      return false;
+
+   /* Every field up to the viewports is assigned or zero; only the first
+    * viewport_count viewports are written and read. */
+   memset(state, 0, offsetof(struct agx_hal200_draw_state, viewports));
+
+   uint32_t fragment_control = linked_fs->b.fragment_control.opaque[0];
+
+   /* The rasterizer clips x/y at about +-1.5 NDC, and only bit 26 clear
+    * stitches the pieces back into whole quads. Native keeps bit 26 for
+    * every punch-through (type 2) draw, so Metal splits those quads too.
+    * Single-sample type 3 is the native state with bit 26 clear (Metal emits
+    * it for discard with early fragment tests, without blending), so a
+    * shader that needs full quads is promoted to it. A derivative shader
+    * keeps bit 26 regardless (shader_tri_merge_disable), so it stays type 2
+    * and keeps hidden-surface removal. */
+   if ((fragment_control >> 29) == AGX_PASS_TYPE_PUNCH_THROUGH &&
+       render->tilebuffer.nr_samples == 1 && fs->b.info.needs_full_quads &&
+       !fs->b.info.needs_quad_derivatives) {
+      fragment_control =
+         (fragment_control & ~BITFIELD_RANGE(29, 3)) |
+         (AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH << 29);
+   }
+   const uint32_t pass_type = fragment_control >> 29;
+
+   state->fragment_program = fragment_program;
+   state->varying_table = gfx->varyings;
+   state->fragment_control = fragment_control;
+   state->nr_bindings = linked_fs->b.cf.nr_bindings;
+   state->fragment_reads_z = linked_fs->b.cf.reads_z;
+
+   /* UNCHANGED permits early depth rejection. DEPTHF shaders must publish
+    * their actual depth contract here, including the forced-ANY contract of
+    * late side effects. This is independent of pass type and triangle
+    * merging. */
+   state->conservative_depth =
+      agx_translate_depth_layout(fs->b.info.depth_layout);
+   state->early_fragment_tests = fs->b.info.early_fragment_tests;
+   state->fragment_writes_memory = fs->info.fs.writes_memory;
+   state->fragment_ti_resources = fs->b.info.has_preamble;
+   state->fragment_ti_spill_bytes = fs->b.info.preamble_scratch_size;
+   state->fragment_ti_largest_ipr_bytes =
+      fs->b.info.agx3_preamble_staging_halfs * 2u;
+
+   /* Apple G17P shader metadata leaves bit26 clear for texture gradients,
+    * storage writes, framebuffer fetch, sample-rate execution, and shadows.
+    * Multisampled depth/depth-stencil variants set it.
+    *
+    * A shader that takes implicit quad derivatives still needs it on this
+    * stack. Triangle merging shades a 2x2 quad straddling the shared edge
+    * of two primitives once, with its lanes interpolated from two different
+    * plane equations, so an implicit-LOD sample on that quad derives its
+    * mip level across the seam.
+    *
+    * Measured on G17P: without this term all 30
+    * dEQP-VK.texture.mipmap.{2d,3d,cubemap}.projected.* cases fail and
+    * every invalid pixel lies exactly on the shared diagonal of the test's
+    * two triangles (31/31 in the decoded error mask of
+    * 2d.projected.nearest_linear_clamp); with it, all 30 pass and the 18
+    * basic/affine siblings are unchanged. Those siblings pass either way
+    * because both of their triangles carry the same affine texcoord map, so
+    * the cross-seam derivative equals the correct one.
+    *
+    * AGX2 never had the defect: agx_compile.c derives disable_tri_merging
+    * from needs_coarse_quad_helper_invocations, which nir_gather_info sets
+    * for every implicit-derivative texture op; agx_linker.c ORs it across
+    * the shader parts into the linked FRAGMENT_CONTROL bit 26; and
+    * hk_flush_ppp_state() merges that word into the secondary control.
+    * G17P never reaches it -- the draw path calls hk_flush_ppp_state() only
+    * `if (!g17p_native_bind_tail_emitted)` -- so the whole control comes
+    * from this record instead, and agx_ppp_hal200_fragment_controls_pack()
+    * deliberately masks bit 26 out of the original and rebuilds it from the
+    * three fields below. The helper-invocation term was dropped in that
+    * re-derivation and nothing else carried it.
+    *
+    * Whether Apple's own driver disables merging here or keeps quads
+    * coherent some other way is NOT established; only that this stack needs
+    * the bit. Kept narrower than the linker's bit 26, which also fires on
+    * memory writes and wide subgroup intrinsics -- neither needs quad
+    * coherence, and Apple's metadata leaves bit 26 clear for both. */
+   state->shader_tri_merge_disable =
+      fs->b.info.needs_quad_derivatives ||
+      (render->tilebuffer.nr_samples > 1 && fs->info.fs.epilog_key.write_z) ||
+      /* The linker's own merge-disable bit. */
+      (!agx_chip_tri_merge_across_side_effects(dev->dev.chip) &&
+       (fragment_control & (UINT32_C(1) << 26)));
+
+   /* Native forces bit26 for type 2, and for type 3 only in a multisampled
+    * pass: Metal on the M4 Pro clears it for single-sample type 3 in every
+    * state tried, and a 1x/4x pair differs in this bit alone. */
+   state->coverage_tri_merge_disable =
+      pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
+      (pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH &&
+       render->tilebuffer.nr_samples > 1);
+
+   /* This describes the program actually launched by the Index List.
+    * Ordinary draws use the API vertex shader, while GS/XFB draws use the
+    * geometry raster-copy variant. Taking the API VS unconditionally makes
+    * the HAL200 output contract disagree with the live VertexProgramVariant
+    * as soon as interstage optimization changes their UVS footprints. */
+   const bool mesh_primitive_page =
+      dev->dev.chip == AGX_CHIP_G17P && vs->info.stage == MESA_SHADER_MESH &&
+      vs->info.uvs.mesh_primitive_page;
+   state->vertex_output_select = vs->info.uvs.osel.opaque[0];
+   state->vertex_output_size = vs->info.uvs.size;
+   if (mesh_primitive_page) {
+      state->mesh_primitive_words =
+         DIV_ROUND_UP(vs->info.mesh.primitive_stride_B, 4);
+      state->mesh_primitive_address = vs->info.mesh.primitive_stride_B != 0;
+   }
+   state->generate_primitive_id = gfx->generate_primitive_id;
+   state->varying_counts_32 = gfx->linked_varyings.counts_32.opaque[0];
+   state->varying_counts_16 = gfx->linked_varyings.counts_16.opaque[0];
+
+   state->depth_test = render->depth_att.iview && dyn->ds.depth.test_enable;
+   state->depth_write = dyn->ds.depth.write_enable;
+   /* A shader with side effects under VK_COMPARE_OP_NEVER emulates the test
+    * by exporting NaN depth (agx_nir_lower_frag_sidefx); the hardware test
+    * must then pass everything, as FRAGMENT_FACE does, or the fragments
+    * never run (rasterization.frag_side_effects.*.depth_never). */
+   state->depth_compare = gfx->descriptors.root.draw.force_never_in_shader
+                             ? VK_COMPARE_OP_ALWAYS
+                             : dyn->ds.depth.compare_op;
+
+   state->stencil_test = hk_stencil_test_enabled(cmd);
+   const struct vk_stencil_test_face_state *api_faces[2] = {
+      &dyn->ds.stencil.front, &dyn->ds.stencil.back,
+   };
+   struct agx_hal200_stencil_face *faces[2] = {
+      &state->stencil_front, &state->stencil_back,
+   };
+   for (unsigned i = 0; i < 2; ++i) {
+      *faces[i] = (struct agx_hal200_stencil_face){
+         .enabled = state->stencil_test,
+         .compare = api_faces[i]->op.compare,
+         .fail = api_faces[i]->op.fail,
+         .depth_fail = api_faces[i]->op.depth_fail,
+         .pass = api_faces[i]->op.pass,
+         .compare_mask = api_faces[i]->compare_mask,
+         .write_mask = api_faces[i]->write_mask,
+         .reference = api_faces[i]->reference,
+      };
+   }
+
+   state->line_width = agx_pack_line_width(dyn->rs.line.width);
+   state->polygon_mode = dyn->rs.polygon_mode;
+   state->object_type = gfx->object_type;
+   state->cull_mode = dyn->rs.cull_mode;
+   /* Software tessellation emits its own winding; fold the domain's
+    * orientation into the front face as the common CULL packet does
+    * (shader_object.misc.state.*.vert_tess_frag.cull.*). */
+   state->front_face_ccw =
+      dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+   if (gfx->shaders[MESA_SHADER_TESS_CTRL] &&
+       !gfx->shaders[MESA_SHADER_GEOMETRY]) {
+      state->front_face_ccw ^= gfx->tess.info.ccw;
+      state->front_face_ccw ^= dyn->ts.domain_origin ==
+                               VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+   }
+   state->provoking = gfx->provoking;
+   state->depth_clip = vk_rasterization_state_depth_clip_enable(&dyn->rs);
+   state->rasterizer_discard = hk_rast_discard(cmd);
+   state->bresenham_lines =
+      gfx->object_type == AGX_OBJECT_TYPE_LINE &&
+      dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR;
+
+   const VkViewport *vp = &dyn->vp.viewports[0];
+   const struct hk_image_view *color = render->color_att_count == 1
+                                         ? render->color_att[0].iview : NULL;
+   const VkRect2D api_scissor = dyn->vp.scissor_count
+                                  ? dyn->vp.scissors[0] : (VkRect2D){0};
+   const struct hk_g17p_full_frame_scissor full_frame = {
+      .width = render->cr.width,
+      .height = render->cr.height,
+      .area_x = render->area.offset.x,
+      .area_y = render->area.offset.y,
+      .area_width = render->area.extent.width,
+      .area_height = render->area.extent.height,
+      .scissor_x = api_scissor.offset.x,
+      .scissor_y = api_scissor.offset.y,
+      .scissor_width = api_scissor.extent.width,
+      .scissor_height = api_scissor.extent.height,
+      .viewport_x = vp->x,
+      .viewport_y = vp->y,
+      .viewport_width = vp->width,
+      .viewport_height = vp->height,
+      .min_depth = vp->minDepth,
+      .max_depth = vp->maxDepth,
+      .viewport_count = dyn->vp.viewport_count,
+      .scissor_count = dyn->vp.scissor_count,
+      .single_color_layer_sample =
+         color && !render->depth_att.iview && !render->stencil_att.iview &&
+         render->layer_count == 1 && !render->view_mask &&
+         render->tilebuffer.nr_samples == 1 &&
+         u_minify(color->vk.image->extent.width, color->vk.base_mip_level) ==
+            render->cr.width &&
+         u_minify(color->vk.image->extent.height, color->vk.base_mip_level) ==
+            render->cr.height,
+      .default_depth =
+         state->depth_clip && !dyn->rs.depth_clamp_enable &&
+         !dyn->vp.depth_clip_negative_one_to_one &&
+         !dyn->rs.depth_bias.enable && !state->rasterizer_discard,
+   };
+   state->scissor_enable = dyn->vp.viewport_count > 0 &&
+                           !hk_g17p_full_frame_scissor_can_elide(&full_frame);
+
+   state->depth_bias_enable = dyn->rs.depth_bias.enable &&
+                              gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE;
+   if (state->depth_bias_enable) {
+      const bool force_unorm =
+         dyn->rs.depth_bias.representation ==
+         VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+      state->depth_bias_raw =
+         fui(dyn->rs.depth_bias.constant_factor /
+             hk_depth_bias_factor(render->depth_att.vk_format,
+                                  dyn->rs.depth_bias.exact, force_unorm));
+      state->slope_scale_raw = fui(dyn->rs.depth_bias.slope_factor);
+      state->depth_bias_clamp_raw = fui(dyn->rs.depth_bias.clamp);
+   }
+
+   state->occlusion_mode = gfx->occlusion.mode;
+   state->occlusion_index = gfx->occlusion.index;
+
+   state->viewport_count = viewport_count;
+   for (unsigned i = 0; i < viewport_count; ++i) {
+      const VkViewport *v = &dyn->vp.viewports[i];
+      unsigned minx = MIN2(v->x, v->x + v->width);
+      unsigned miny = MIN2(v->y, v->y + v->height);
+      unsigned maxx = MAX2(v->x, v->x + v->width);
+      unsigned maxy = MAX2(v->y, v->y + v->height);
+      minx = MIN2(minx, render->cr.width);
+      miny = MIN2(miny, render->cr.height);
+      maxx = MIN2(maxx, render->cr.width);
+      maxy = MIN2(maxy, render->cr.height);
+      if (i < dyn->vp.scissor_count) {
+         const VkRect2D *s = &dyn->vp.scissors[i];
+         minx = MAX2(minx, s->offset.x);
+         miny = MAX2(miny, s->offset.y);
+         maxx = MIN2(maxx, s->offset.x + s->extent.width);
+         maxy = MIN2(maxy, s->offset.y + s->extent.height);
+      }
+
+      const bool clamp = dyn->rs.depth_clamp_enable;
+      state->viewports[i] = (struct agx_hal200_viewport){
+         .min_x = minx,
+         .min_y = miny,
+         .max_x = maxx,
+         .max_y = maxy,
+         .min_z_raw = fui(clamp ? MIN2(v->minDepth, v->maxDepth) : 0.0f),
+         .max_z_raw = fui(clamp ? MAX2(v->minDepth, v->maxDepth) : 1.0f),
+         .transform = {
+            .translate_x = fui(v->x + 0.5f * v->width),
+            .scale_x = fui(v->width * 0.5f),
+            .translate_y = fui(v->y + 0.5f * v->height),
+            .scale_y = fui(v->height * 0.5f),
+            .translate_z = fui(v->minDepth),
+            .scale_z = fui(v->maxDepth - v->minDepth),
+         },
+      };
+   }
+
+   return true;
+}
+
 /* Every refusal below is a real capability gap that silently drops the draw.
  * Report the exact check that refused, once per site, so a failing
  * application names a specific unimplemented G17P bind-tail field
@@ -8706,500 +8986,38 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    if ((linked_fs->b.cf.nr_bindings != 0) != (gfx->varyings != 0))
       return hk_g17p_bind_tail_refused(__LINE__);
 
-   /* This record describes the program actually launched by the Index List.
-    * Ordinary draws use the API vertex shader, while GS/XFB draws use the
-    * geometry raster-copy variant. Taking the API VS unconditionally makes
-    * the HAL200 output contract disagree with the live VertexProgramVariant
-    * as soon as interstage optimization changes their UVS footprints. */
    const struct hk_shader *vs = hk_bound_hw_vs(gfx);
    if (!vs)
       return hk_g17p_bind_tail_refused(__LINE__);
 
-   uint32_t output_size;
-   if (!agx_ppp_hal200_output_size_pack(vs->info.uvs.size, 0, &output_size))
+   struct agx_hal200_draw_state draw_state;
+   struct agx_hal200_draw_state_packed packed;
+   struct agx_ppp_hal200_fragment_fields fs_fields;
+   if (!hk_g17p_draw_state(cmd, fs, linked_fs, vs, fragment_program,
+                           &draw_state) ||
+       !agx_hal200_draw_state_pack(dev->dev.chip, &draw_state, &packed) ||
+       !agx_hal200_draw_state_fragment_fields(dev->dev.chip, &draw_state,
+                                              &fs_fields))
       return hk_g17p_bind_tail_refused(__LINE__);
 
-   uint32_t output_select;
-   if (!agx_ppp_hal200_output_select_pack(
-          dev->dev.chip, vs->info.uvs.osel.opaque[0],
-          linked_fs->b.cf.nr_bindings != 0, linked_fs->b.cf.reads_z,
-          &output_select))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   struct agx_ppp_hal200_graphics_core fs_record;
-   struct agx_ppp_hal200_fragment_fields fs_fields = {
-      /* The HAL200 fragment record puts the iteration count at bit 16.
-       * The packer merges the complete VIT address, including its high bits. */
-      .resource_counts = linked_fs->b.cf.nr_bindings << 16,
-      .varying_table = gfx->varyings,
-      .unknown_0c = 0,
-      .stage_program = fragment_program,
-      .stage_program_template = 0,
-      .flags = 0,
-   };
-   if (fs->b.info.has_preamble &&
-       (!fs->b.info.agx3_preamble_staging_known ||
-        !agx_ppp_hal200_fragment_ti_resources(
-          dev->dev.chip, fs->b.info.preamble_scratch_size,
-          fs->b.info.agx3_preamble_staging_halfs * 2u, &fs_fields)))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   struct agx_ppp_hal200_graphics_core output_record;
-   struct agx_ppp_hal200_graphics_fields output_fields = {
-      /* The vertex state holds zero and viewport_count-1; both are zero for
-       * this single-viewport layout. VIT supplies interpolation. Output-select
-       * bit16 is set for nonempty iteration metadata in the fragment program.
-       */
-      .words = {output_select,
-                0, 0, output_size,
-                AGX_PPP_HAL200_PRIMARY_FACE_HEADER, 0},
-   };
-   if (!agx_ppp_hal200_viewport_count_pack(
-          dev->dev.chip, viewport_count, &output_fields.words[2]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-   if (dev->dev.chip == AGX_CHIP_G17P && vs->info.stage == MESA_SHADER_MESH &&
-       vs->info.uvs.mesh_primitive_page)
-      output_fields.words[1] = DIV_ROUND_UP(vs->info.mesh.primitive_stride_B, 4);
-
-   struct agx_ppp_hal200_graphics_core primary_record;
-   struct agx_ppp_hal200_graphics_fields primary_fields = {
-      .words = {0, UINT32_C(0x07200f00),
-                UINT32_C(0x0e000000), UINT32_C(0x07200f00),
-                UINT32_C(0x0e000000), 0},
-   };
-
-   /* Each draw already owns its complete PRIMARY_FACE record. Native depth
-    * control only changes these two words; retain the allocation and staging
-    * layout and do not add launches, cache flushes or device-global state. */
-   const bool depth_test = render->depth_att.iview && dyn->ds.depth.test_enable;
-   /* A shader with side effects under VK_COMPARE_OP_NEVER emulates the test
-    * by exporting NaN depth (agx_nir_lower_frag_sidefx); the hardware test
-    * must then pass everything, as FRAGMENT_FACE does, or the fragments
-    * never run (rasterization.frag_side_effects.*.depth_never). */
-   const VkCompareOp depth_compare =
-      gfx->descriptors.root.draw.force_never_in_shader
-         ? VK_COMPARE_OP_ALWAYS : dyn->ds.depth.compare_op;
-   if (dyn->ds.depth.bounds_test.enable ||
-       !agx_ppp_hal200_depth_face_pack(
-          dev->dev.chip, depth_test, dyn->ds.depth.write_enable,
-          depth_compare, primary_fields.words[1],
-          &primary_fields.words[1]) ||
-       !agx_ppp_hal200_depth_face_pack(
-          dev->dev.chip, depth_test, dyn->ds.depth.write_enable,
-          depth_compare, primary_fields.words[3],
-          &primary_fields.words[3]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   const bool stencil_test = hk_stencil_test_enabled(cmd);
-   const struct vk_stencil_test_face_state stencil_faces[2] = {
-      dyn->ds.stencil.front, dyn->ds.stencil.back,
-   };
-   for (unsigned i = 0; i < 2; ++i) {
-      const struct vk_stencil_test_face_state *face = &stencil_faces[i];
-      const unsigned face_word = 1 + 2 * i;
-      /* Native458734/458740 updates only the low reference byte. */
-      primary_fields.words[face_word] =
-         (primary_fields.words[face_word] & ~0xffu) | (face->reference & 0xffu);
-      primary_fields.words[face_word + 1] = agx_ppp_hal200_stencil_pack(
-         stencil_test, face->op.compare, face->op.fail, face->op.depth_fail,
-         face->op.pass, face->compare_mask, face->write_mask);
-   }
-
-   struct agx_ppp_hal200_graphics_core secondary_record;
-   struct agx_ppp_hal200_graphics_fields secondary_fields = {
-      .words = {UINT32_C(0x00000200), UINT32_C(0x07e00000),
-                UINT32_C(0x07e00000), UINT32_C(0x0001ffff)},
-   };
-
-   /* UNCHANGED permits early depth rejection. DEPTHF shaders must publish
-    * their actual depth contract here, including the forced-ANY contract of
-    * late side effects. This is independent of pass type and triangle merging. */
-   const unsigned conservative_depth =
-      agx_translate_depth_layout(fs->b.info.depth_layout);
-   for (unsigned face = 1; face <= 2; ++face) {
-      if (!agx_ppp_hal200_fragment_face_depth_pack(
-             dev->dev.chip, conservative_depth, fs->b.info.early_fragment_tests,
-             fs->info.fs.writes_memory, secondary_fields.words[face],
-             &secondary_fields.words[face]))
-         return hk_g17p_bind_tail_refused(__LINE__);
-   }
-
-   const unsigned line_width = agx_pack_line_width(dyn->rs.line.width);
-   const unsigned polygon_mode = dyn->rs.polygon_mode;
-   const unsigned object_type = gfx->object_type;
-   if (!agx_ppp_hal200_fragment_face_raster_pack(
-          dev->dev.chip, line_width, polygon_mode, primary_fields.words[1],
-          &primary_fields.words[1]) ||
-       !agx_ppp_hal200_fragment_face_raster_pack(
-          dev->dev.chip, line_width, polygon_mode, primary_fields.words[3],
-          &primary_fields.words[3]) ||
-       !agx_ppp_hal200_fragment_face_object_pack(
-          dev->dev.chip, object_type, secondary_fields.words[1],
-          &secondary_fields.words[1]) ||
-       !agx_ppp_hal200_fragment_face_object_pack(
-          dev->dev.chip, object_type, secondary_fields.words[2],
-          &secondary_fields.words[2]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   struct agx_ppp_hal200_graphics_core cull_record;
-   struct agx_ppp_hal200_graphics_fields cull_fields = {
-      .words = {UINT32_C(0x00000480)},
-   };
-   /* Software tessellation emits its own winding; fold the domain's
-    * orientation into the front face as the common CULL packet does
-    * (shader_object.misc.state.*.vert_tess_frag.cull.*). */
-   bool front_face_ccw = dyn->rs.front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
-   if (gfx->shaders[MESA_SHADER_TESS_CTRL] &&
-       !gfx->shaders[MESA_SHADER_GEOMETRY]) {
-      front_face_ccw ^= gfx->tess.info.ccw;
-      front_face_ccw ^= dyn->ts.domain_origin ==
-                        VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
-   }
-   if (!agx_ppp_hal200_cull_mode_pack(
-          dev->dev.chip, dyn->rs.cull_mode, front_face_ccw,
-          cull_fields.words[0], &cull_fields.words[0]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-   if (!agx_ppp_hal200_cull_provoking_pack(dev->dev.chip, gfx->provoking,
-                                         cull_fields.words[0],
-                                         &cull_fields.words[0]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-   if (!agx_ppp_hal200_depth_clip_pack(
-          dev->dev.chip,
-          vk_rasterization_state_depth_clip_enable(&dyn->rs),
-          cull_fields.words[0], &cull_fields.words[0]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-   if (!agx_ppp_hal200_rasterizer_discard_pack(
-          dev->dev.chip, hk_rast_discard(cmd), secondary_fields.words[0],
-          cull_fields.words[0], &secondary_fields.words[0],
-          &cull_fields.words[0]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-   if (!agx_ppp_hal200_primitive_msaa_pack(
-          dev->dev.chip,
-          object_type == AGX_OBJECT_TYPE_LINE &&
-             dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM_KHR,
-          cull_fields.words[0], &cull_fields.words[0]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   struct agx_ppp_w_clamp_cull2_core w_cull2_record;
-   const bool native_mesh_primitive_address_enabled =
-      dev->dev.chip == AGX_CHIP_G17P &&
-      vs->info.stage == MESA_SHADER_MESH &&
-      vs->info.uvs.mesh_primitive_page &&
-      vs->info.mesh.primitive_stride_B != 0;
-   const struct agx_ppp_w_clamp_cull2_fields w_cull2_fields = {
-      .w_clamp_raw = 0,
-      /* The generated primitive-ID coefficient needs its rasterizer input
-       * enabled as well as the matching VDM producer and output slot. */
-      .cull2_raw = UINT32_C(0x80) |
-                   (gfx->generate_primitive_id ? UINT32_C(0x1000) : 0) |
-                   (native_mesh_primitive_address_enabled ? UINT32_C(0x2000) : 0),
-   };
-
-   /* Only the first viewport_count entries are written and read. */
-   struct agx_ppp_viewport_payload_fields viewport_fields;
-   viewport_fields.viewport_count = viewport_count;
-   viewport_fields.viewport_control_raw = 0;
-   unsigned minx[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   unsigned miny[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   unsigned maxx[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   unsigned maxy[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      const VkViewport *vp = &dyn->vp.viewports[i];
-      minx[i] = MIN2(vp->x, vp->x + vp->width);
-      miny[i] = MIN2(vp->y, vp->y + vp->height);
-      maxx[i] = MAX2(vp->x, vp->x + vp->width);
-      maxy[i] = MAX2(vp->y, vp->y + vp->height);
-      minx[i] = MIN2(minx[i], render->cr.width);
-      miny[i] = MIN2(miny[i], render->cr.height);
-      maxx[i] = MIN2(maxx[i], render->cr.width);
-      maxy[i] = MIN2(maxy[i], render->cr.height);
-      if (i < dyn->vp.scissor_count) {
-         const VkRect2D *s = &dyn->vp.scissors[i];
-         minx[i] = MAX2(minx[i], s->offset.x);
-         miny[i] = MAX2(miny[i], s->offset.y);
-         maxx[i] = MIN2(maxx[i], s->offset.x + s->extent.width);
-         maxy[i] = MIN2(maxy[i], s->offset.y + s->extent.height);
-      }
-   }
-
-   const VkViewport *vp = &dyn->vp.viewports[0];
-   const struct hk_image_view *color = render->color_att_count == 1
-                                         ? render->color_att[0].iview : NULL;
-   const VkRect2D api_scissor = dyn->vp.scissor_count
-                                  ? dyn->vp.scissors[0] : (VkRect2D){0};
-   const struct hk_g17p_full_frame_scissor full_frame = {
-      .width = render->cr.width,
-      .height = render->cr.height,
-      .area_x = render->area.offset.x,
-      .area_y = render->area.offset.y,
-      .area_width = render->area.extent.width,
-      .area_height = render->area.extent.height,
-      .scissor_x = api_scissor.offset.x,
-      .scissor_y = api_scissor.offset.y,
-      .scissor_width = api_scissor.extent.width,
-      .scissor_height = api_scissor.extent.height,
-      .viewport_x = vp->x,
-      .viewport_y = vp->y,
-      .viewport_width = vp->width,
-      .viewport_height = vp->height,
-      .min_depth = vp->minDepth,
-      .max_depth = vp->maxDepth,
-      .viewport_count = dyn->vp.viewport_count,
-      .scissor_count = dyn->vp.scissor_count,
-      .single_color_layer_sample =
-         color && !render->depth_att.iview && !render->stencil_att.iview &&
-         render->layer_count == 1 && !render->view_mask &&
-         render->tilebuffer.nr_samples == 1 &&
-         u_minify(color->vk.image->extent.width, color->vk.base_mip_level) ==
-            render->cr.width &&
-         u_minify(color->vk.image->extent.height, color->vk.base_mip_level) ==
-            render->cr.height,
-      .default_depth =
-         vk_rasterization_state_depth_clip_enable(&dyn->rs) &&
-         !dyn->rs.depth_clamp_enable && !dyn->vp.depth_clip_negative_one_to_one &&
-         !dyn->rs.depth_bias.enable && !hk_rast_discard(cmd),
-   };
-   const bool scissor_enable = dyn->vp.viewport_count > 0 &&
-                              !hk_g17p_full_frame_scissor_can_elide(&full_frame);
-   const bool depth_bias_enable =
-      dyn->rs.depth_bias.enable &&
-      gfx->object_type == AGX_OBJECT_TYPE_TRIANGLE;
-   const bool exact = dyn->rs.depth_bias.exact;
-   const bool force_unorm =
-      dyn->rs.depth_bias.representation ==
-      VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
-   const float depth_bias =
-      depth_bias_enable
-         ? dyn->rs.depth_bias.constant_factor /
-              hk_depth_bias_factor(render->depth_att.vk_format, exact,
-                                   force_unorm)
-         : 0.0f;
-   struct agx_ppp_hal200_raster_state
-      raster_states[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      const VkViewport *current_vp = &dyn->vp.viewports[i];
-      const float min_z = dyn->rs.depth_clamp_enable
-                             ? MIN2(current_vp->minDepth, current_vp->maxDepth)
-                             : 0.0f;
-      const float max_z = dyn->rs.depth_clamp_enable
-                             ? MAX2(current_vp->minDepth, current_vp->maxDepth)
-                             : 1.0f;
-      const struct agx_ppp_hal200_raster_fields raster_fields = {
-         .scissor_enable = scissor_enable,
-         .depth_bias_enable = depth_bias_enable,
-         .max_x = MIN2(maxx[i], UINT16_MAX),
-         .min_x = MIN2(minx[i], UINT16_MAX),
-         .max_y = MIN2(maxy[i], UINT16_MAX),
-         .min_y = MIN2(miny[i], UINT16_MAX),
-         .min_z_raw = fui(min_z),
-         .max_z_raw = fui(max_z),
-         .depth_bias_raw = fui(depth_bias),
-         .slope_scale_raw =
-            depth_bias_enable ? fui(dyn->rs.depth_bias.slope_factor) : 0,
-         .clamp_raw = depth_bias_enable ? fui(dyn->rs.depth_bias.clamp) : 0,
-      };
-      if (!agx_ppp_hal200_raster_state_build(
-             dev->dev.chip, &raster_fields, &raster_states[i]))
-         return hk_g17p_bind_tail_refused(__LINE__);
-   }
-   const struct agx_ppp_hal200_raster_state *raster_state = &raster_states[0];
-
-   /* The pass type goes in SECONDARY header 0x02000048's first payload word,
-    * within the 0xe6600000 field mask and ORed with 0x200. It is not the
-    * older-generation FRAGMENT_CONTROL location in our PRIMARY record.
-    */
-   uint32_t linked_fragment_control =
-      linked_fs->b.fragment_control.opaque[0];
-
-   /* The rasterizer clips x/y at about +-1.5 NDC, and only bit 26 clear
-    * stitches the pieces back into whole quads. Native keeps bit 26 for
-    * every punch-through (type 2) draw, so Metal splits those quads too.
-    * Single-sample type 3 is the native state with bit 26 clear (Metal emits
-    * it for discard with early fragment tests, without blending), so a
-    * shader that needs full quads is promoted to it. A derivative shader
-    * keeps bit 26 regardless (shader_tri_merge_disable), so it stays type 2
-    * and keeps hidden-surface removal. */
-   if ((linked_fragment_control >> 29) == AGX_PASS_TYPE_PUNCH_THROUGH &&
-       render->tilebuffer.nr_samples == 1 && fs->b.info.needs_full_quads &&
-       !fs->b.info.needs_quad_derivatives) {
-      linked_fragment_control =
-         (linked_fragment_control & ~BITFIELD_RANGE(29, 3)) |
-         (AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH << 29);
-   }
-   const uint32_t pass_type = linked_fragment_control >> 29;
-   if (pass_type != AGX_PASS_TYPE_OPAQUE &&
-       pass_type != AGX_PASS_TYPE_TRANSLUCENT &&
-       pass_type != AGX_PASS_TYPE_PUNCH_THROUGH &&
-       pass_type != AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH)
-      return hk_g17p_bind_tail_refused(__LINE__);
-   /* Native458934..45896c retains both stencil-control bits in the
-    * same per-draw record as depth. No extra state allocation or launch. */
-   uint32_t fragment_control = raster_state->fragment_control |
-      (stencil_test ? UINT32_C(0x000c0000) : 0);
-   const struct agx_ppp_hal200_fragment_control_fields control_fields = {
-      .linked_control = linked_fragment_control,
-
-      /* Apple G17P shader metadata leaves bit26 clear for texture gradients,
-       * storage writes, framebuffer fetch, sample-rate execution, and shadows.
-       * Multisampled depth/depth-stencil variants set it.
-       *
-       * A shader that takes implicit quad derivatives still needs it on this
-       * stack. Triangle merging shades a 2x2 quad straddling the shared edge
-       * of two primitives once, with its lanes interpolated from two different
-       * plane equations, so an implicit-LOD sample on that quad derives its
-       * mip level across the seam.
-       *
-       * Measured on G17P: without this term all 30
-       * dEQP-VK.texture.mipmap.{2d,3d,cubemap}.projected.* cases fail and
-       * every invalid pixel lies exactly on the shared diagonal of the test's
-       * two triangles (31/31 in the decoded error mask of
-       * 2d.projected.nearest_linear_clamp); with it, all 30 pass and the 18
-       * basic/affine siblings are unchanged. Those siblings pass either way
-       * because both of their triangles carry the same affine texcoord map, so
-       * the cross-seam derivative equals the correct one.
-       *
-       * AGX2 never had the defect: agx_compile.c derives disable_tri_merging
-       * from needs_coarse_quad_helper_invocations, which nir_gather_info sets
-       * for every implicit-derivative texture op; agx_linker.c ORs it across
-       * the shader parts into the linked FRAGMENT_CONTROL bit 26; and
-       * hk_flush_ppp_state() merges that word into the secondary control.
-       * G17P never reaches it -- the draw path calls hk_flush_ppp_state() only
-       * `if (!g17p_native_bind_tail_emitted)` -- so the whole control comes
-       * from this record instead, and agx_ppp_hal200_fragment_controls_pack()
-       * deliberately masks bit 26 out of the original and rebuilds it from the
-       * three fields below. The helper-invocation term was dropped in that
-       * re-derivation and nothing else carried it.
-       *
-       * Whether Apple's own driver disables merging here or keeps quads
-       * coherent some other way is NOT established; only that this stack needs
-       * the bit. Kept narrower than the linker's bit 26, which also fires on
-       * memory writes and wide subgroup intrinsics -- neither needs quad
-       * coherence, and Apple's metadata leaves bit 26 clear for both. */
-      .shader_tri_merge_disable =
-         fs->b.info.needs_quad_derivatives ||
-         (render->tilebuffer.nr_samples > 1 &&
-          fs->info.fs.epilog_key.write_z) ||
-         /* The linker's own merge-disable bit. */
-         (!agx_chip_tri_merge_across_side_effects(dev->dev.chip) &&
-          (linked_fragment_control & (UINT32_C(1) << 26))),
-
-      /* Native forces bit26 for type 2, and for type 3 only in a multisampled
-       * pass: Metal on the M4 Pro clears it for single-sample type 3 in every
-       * state tried, and a 1x/4x pair differs in this bit alone. */
-      .coverage_tri_merge_disable =
-         pass_type == AGX_PASS_TYPE_PUNCH_THROUGH ||
-         (pass_type == AGX_PASS_TYPE_TRANSLUCENT_PUNCH_THROUGH &&
-          render->tilebuffer.nr_samples > 1),
-
-      /* The ISP primitive type selects the runtime override for points,
-       * lines, and non-filled triangles, then applies it to both controls. */
-      .primitive_tri_merge_disable =
-         object_type != AGX_OBJECT_TYPE_TRIANGLE ||
-         polygon_mode != VK_POLYGON_MODE_FILL,
-   };
-   if (!agx_ppp_hal200_fragment_controls_pack(
-          dev->dev.chip, &control_fields, fragment_control,
-          secondary_fields.words[0], &fragment_control,
-          &secondary_fields.words[0]))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   uint32_t occlusion_query;
-   if (!agx_ppp_hal200_occlusion_pack(
-          dev->dev.chip, gfx->occlusion.mode, gfx->occlusion.index,
-          fragment_control, &fragment_control, &occlusion_query))
-      return hk_g17p_bind_tail_refused(__LINE__);
-   output_fields.words[5] = fragment_control;
-   primary_fields.words[0] = fragment_control;
-   primary_fields.words[5] = occlusion_query;
-   if (!agx_ppp_hal200_fragment_core_pack(dev->dev.chip, &fs_fields,
-                                          &fs_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->dev.chip, AGX_PPP_HAL200_GRAPHICS_OUTPUT, &output_fields,
-          &output_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->dev.chip, AGX_PPP_HAL200_GRAPHICS_PRIMARY_FACE,
-          &primary_fields, &primary_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->dev.chip, AGX_PPP_HAL200_GRAPHICS_SECONDARY_FACE,
-          &secondary_fields, &secondary_record) ||
-       !agx_ppp_hal200_graphics_core_pack(
-          dev->dev.chip, AGX_PPP_HAL200_GRAPHICS_CULL, &cull_fields,
-          &cull_record) ||
-       !agx_ppp_w_clamp_cull2_core_pack(dev->dev.chip, &w_cull2_fields,
-                                         &w_cull2_record))
-      return hk_g17p_bind_tail_refused(__LINE__);
-
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      static_assert(sizeof(prepared->scissors[i]) ==
-                    sizeof(raster_states[i].scissor));
-      static_assert(sizeof(prepared->depth_bias[i]) ==
-                    sizeof(raster_states[i].depth_bias));
-      memcpy(prepared->scissors[i], raster_states[i].scissor,
-             sizeof(prepared->scissors[i]));
-      memcpy(prepared->depth_bias[i], raster_states[i].depth_bias,
-             sizeof(prepared->depth_bias[i]));
-   }
-
-   /* Preserve the physical +0x00..+0x73 layout from Metal.  The complete
-    * 28-byte FS record occupies +0x00..+0x1b; in particular, +0x14 is the
-    * low stage-program word and must not be overlaid by the old anonymous
-    * metadata guess.  The output window at +0x1c intentionally overlaps the
-    * primary header/control at +0x30/+0x34.
-    */
-   static_assert(AGX_PPP_HAL200_FS_LENGTH == 0x1c,
-                 "HAL200 FS must end where the output record begins");
-   uint8_t bind_group[0x80] = {0};
-   memcpy(&bind_group[0x00], fs_record.bytes, fs_record.length);
-   memcpy(&bind_group[0x1c], output_record.bytes, output_record.length);
-   memcpy(&bind_group[0x30], primary_record.bytes, primary_record.length);
-   memcpy(&bind_group[0x4c], secondary_record.bytes, secondary_record.length);
-   memcpy(&bind_group[0x60], w_cull2_record.bytes, w_cull2_record.length);
-   memcpy(&bind_group[0x6c], cull_record.bytes, cull_record.length);
-
-   for (unsigned i = 0; i < viewport_count; ++i) {
-      uint8_t region_clip[AGX_REGION_CLIP_LENGTH];
-      agx_pack(region_clip, REGION_CLIP, cfg) {
-         cfg.enable = true;
-         cfg.min_x = minx[i] / 32;
-         cfg.min_y = miny[i] / 32;
-         cfg.max_x = DIV_ROUND_UP(MAX2(maxx[i], 1), 32);
-         cfg.max_y = DIV_ROUND_UP(MAX2(maxy[i], 1), 32);
-      }
-      memcpy(&viewport_fields.region_clip_raw[i], region_clip,
-             sizeof(region_clip));
-      const VkViewport *current_vp = &dyn->vp.viewports[i];
-      viewport_fields.viewports[i] =
-         (struct agx_ppp_viewport_transform_raw){
-            .translate_x = fui(current_vp->x + 0.5f * current_vp->width),
-            .scale_x = fui(current_vp->width * 0.5f),
-            .translate_y = fui(current_vp->y + 0.5f * current_vp->height),
-            .scale_y = fui(current_vp->height * 0.5f),
-            .translate_z = fui(current_vp->minDepth),
-            .scale_z = fui(current_vp->maxDepth - current_vp->minDepth),
-         };
-   }
-
-   struct agx_ppp_viewport_payload_core viewport_record;
-   if (!agx_ppp_viewport_payload_core_pack(dev->dev.chip, &viewport_fields,
-                                            &viewport_record))
-      return hk_g17p_bind_tail_refused(__LINE__);
+   static_assert(sizeof(prepared->scissors) == sizeof(packed.scissors), "");
+   static_assert(sizeof(prepared->depth_bias) == sizeof(packed.depth_bias),
+                 "");
+   memcpy(prepared->scissors, packed.scissors,
+          viewport_count * sizeof(packed.scissors[0]));
+   memcpy(prepared->depth_bias, packed.depth_bias,
+          viewport_count * sizeof(packed.depth_bias[0]));
 
    /* A VDM fetch happens after recording. Never point earlier draws at a
     * device-global record that another draw/CB can overwrite. This upload
     * and its architectural low alias live until command-buffer reset. */
-   const size_t state_size = agx_g17p_bind_state_size(viewport_record.length);
+   const size_t state_size = agx_hal200_draw_state_size(&packed);
    struct agx_ptr state = hk_pool_vdm_alloc(cmd, state_size, 64);
-   struct hk_g17p_bind_state_upload uploaded;
    if (!state_size || !state.cpu ||
-       !hk_g17p_upload_bind_state(state.cpu, state_size, state.gpu,
-                                  bind_group, viewport_record.bytes,
-                                  viewport_record.length,
-                                  gfx->linked_varyings.counts_32.opaque[0],
-                                  gfx->linked_varyings.counts_16.opaque[0],
-                                  &uploaded))
+       !agx_hal200_draw_state_upload(&packed, state.cpu, state_size,
+                                     state.gpu, &prepared->tail))
       return hk_g17p_bind_tail_refused(__LINE__);
 
-   prepared->tail = uploaded.tail;
    gfx->g17p_bind_tail_memo.state_cpu = state.cpu;
    gfx->g17p_bind_tail_memo.state_compact = (uint32_t)state.gpu;
    gfx->g17p_bind_tail_memo.state_size = state_size;
