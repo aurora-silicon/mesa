@@ -13583,7 +13583,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    }
 
    const bool gen1_mesh = enc == AGX_ISA_ENCODING_AGX3B &&
-      ctx->key->dev.chip == AGX_CHIP_G17P &&
+      agx_chip_gen1_mesh(ctx->key->dev.chip) &&
       ctx->stage == MESA_SHADER_MESH && !ctx->is_preamble;
    if (gen1_mesh) {
       bool exports_pending = false;

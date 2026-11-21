@@ -8552,7 +8552,8 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    if (!agx_ppp_hal200_viewport_count_pack(
           dev->dev.chip, viewport_count, &output_fields.words[2]))
       return hk_g17p_bind_tail_refused(__LINE__);
-   if (dev->dev.chip == AGX_CHIP_G17P && vs->info.stage == MESA_SHADER_MESH &&
+   if (agx_chip_gen1_mesh(dev->dev.chip) &&
+       vs->info.stage == MESA_SHADER_MESH &&
        vs->info.uvs.mesh_primitive_page)
       output_fields.words[1] = DIV_ROUND_UP(vs->info.mesh.primitive_stride_B, 4);
 
@@ -8677,7 +8678,7 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
 
    struct agx_ppp_w_clamp_cull2_core w_cull2_record;
    const bool native_mesh_primitive_address_enabled =
-      dev->dev.chip == AGX_CHIP_G17P &&
+      agx_chip_gen1_mesh(dev->dev.chip) &&
       vs->info.stage == MESA_SHADER_MESH &&
       vs->info.uvs.mesh_primitive_page &&
       vs->info.mesh.primitive_stride_B != 0;
@@ -11066,8 +11067,13 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
+   /* Mesh lines read the bias from the root (hk_shader.c line_bias_root_B).
+    * G16G sets it only on devices that can draw meshes, so its other devices
+    * keep their root uploads. */
    if (IS_DIRTY(VP_VIEWPORTS) &&
-       (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip))) {
+       (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip) ||
+        (agx_chip_gen1_mesh(dev->dev.chip) &&
+         dev->vk.enabled_features.meshShader))) {
       const float height = dyn->vp.viewports[0].height;
       const float bias = height != 0.0f ? 1.0f / (32.0f * height) : 0.0f;
       if (desc->root.line_y_bias != bias) {
@@ -11540,7 +11546,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             vk_command_buffer_set_error(&cmd->vk,VK_ERROR_FEATURE_NOT_PRESENT);
             return;
          }
-         if (dev->dev.chip == AGX_CHIP_G17P &&
+         if (agx_chip_gen1_mesh(dev->dev.chip) &&
              (!hw_vs->info.mesh.max_vertices ||
               hw_vs->info.mesh.max_vertices > 256 ||
               !hw_vs->info.mesh.max_primitives ||
@@ -11554,11 +11560,11 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             
 
 
-            .raw_prefix = {dev->dev.chip == AGX_CHIP_G17P
+            .raw_prefix = {agx_chip_gen1_mesh(dev->dev.chip)
                            ? hw_vs->info.uvs.size |
                              ((hw_vs->info.uvs.size + 1) << 8)
                            : 0x500u|hw_vs->info.uvs.size,
-                           dev->dev.chip == AGX_CHIP_G17P
+                           agx_chip_gen1_mesh(dev->dev.chip)
                               ? 0x30 |
                                 (hw_vs->info.mesh.primitive_stride_B ? 0x80 : 0)
                               : 0, 0, 0},
@@ -11573,12 +11579,12 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
 
             .raw_tail = {0,
-               dev->dev.chip == AGX_CHIP_G17P
+               agx_chip_gen1_mesh(dev->dev.chip)
                   ? ((hw_vs->info.mesh.max_primitives - 1) & 0x1ff) |
                     (((hw_vs->info.mesh.max_primitives - 1) >> 4) << 16)
                   : 1,
                mesh_threadgroup,
-               dev->dev.chip == AGX_CHIP_G17P
+               agx_chip_gen1_mesh(dev->dev.chip)
                   ? DIV_ROUND_UP(hw_vs->info.mesh.primitive_stride_B *
                                  hw_vs->info.mesh.max_primitives, 4) : 0,
                0},
@@ -11587,7 +11593,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
           * ordinary mesh output extent uses the same encoding as G17S.
           * Threadgroup memory is allocated separately by the shader program.
           */
-         if (dev->dev.chip == AGX_CHIP_G17P ||
+         if (agx_chip_gen1_mesh(dev->dev.chip) ||
              dev->dev.chip == AGX_CHIP_G17S) {
             if (!agx_vdm_m5_mesh_set_output_limits(
                    &state, hw_vs->info.mesh.max_vertices,
@@ -11609,7 +11615,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             return;
          }
          out += AGX_VDM_MESH_STATE_LENGTH;
-         if (dev->dev.chip == AGX_CHIP_G17P) {
+         if (agx_chip_gen1_mesh(dev->dev.chip)) {
             if (!hk_g17p_emit_native_bind_tail(cmd, cs, &out, false)) {
                vk_command_buffer_set_error(&cmd->vk,
                                            VK_ERROR_FEATURE_NOT_PRESENT);
@@ -13369,10 +13375,10 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *task_api = gfx->shaders[MESA_SHADER_TASK];
-   const bool sw_task = task_api && dev->dev.chip == AGX_CHIP_G17P;
+   const bool sw_task = task_api && agx_chip_gen1_mesh(dev->dev.chip);
    if (!gfx->shaders[MESA_SHADER_MESH] ||
        (task_api && !sw_task && dev->dev.chip != AGX_CHIP_G17S) ||
-       (dev->dev.chip != AGX_CHIP_G17P &&
+       (!agx_chip_gen1_mesh(dev->dev.chip) &&
         (dev->dev.chip != AGX_CHIP_G17S ||
          !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2)))) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -13382,7 +13388,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
       hk_draw_mesh_sw_task(cmd, grid, cpu_grid, draw_id, count_address);
       return;
    }
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_chip_gen1_mesh(dev->dev.chip)) {
       hk_draw_mesh_g17p(cmd, grid, cpu_grid, draw_id, count_address);
       return;
    }

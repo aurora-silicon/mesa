@@ -100,10 +100,40 @@ struct hk_addr_range {
 #define HK_G17P_RT_KERNEL_FEATURES                                             \
    (DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
 
+/* G16G (the base M4) shares G17P's AGX3B encoding and HAL200 records, and so
+ * the GEN1 mesh and ray-tracing paths (agx_chip_gen1_mesh(),
+ * agx_chip_gen1_rt()). Until those pass the Vulkan CTS on G16G hardware it
+ * exposes them only when asked: ASAHI_MESA_DEBUG=g16gmesh and/or g16grt. */
+static inline bool
+hk_g16g_opted_in(const struct agx_device *dev, uint32_t flag)
+{
+   return dev->chip == AGX_CHIP_G16G && (dev->debug & flag);
+}
+
+/* Whether the device exposes VK_EXT_mesh_shader on the GEN1 native mesh path
+ * (native mesh, software task). */
+static inline bool
+hk_gen1_mesh_exposed(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          hk_g16g_opted_in(dev, AGX_DBG_G16G_MESH);
+}
+
+/* Whether the device may expose the GEN1 hardware ray-tracing runtime, before
+ * the kernel features it also needs. */
+static inline bool
+hk_gen1_rt_chip(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          hk_g16g_opted_in(dev, AGX_DBG_G16G_RT);
+}
+
+/* Native ray tracing on the GEN1 runtime: G17P, and G16G when opted in. The
+ * name predates G16G; the kernel contract is the same on both. */
 static inline bool
 hk_g17p_rt_enabled(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P &&
+   return hk_gen1_rt_chip(dev) &&
           (dev->params.features & HK_G17P_RT_KERNEL_FEATURES) ==
              HK_G17P_RT_KERNEL_FEATURES;
 }
@@ -123,10 +153,22 @@ hk_g16s_as_enabled(const struct agx_device *dev)
           (dev->params.features & required) == required;
 }
 
+/* An AS-only G16G device, like the M4 Pro above: the kernel bounds AS builds
+ * but does not admit traversal. */
+static inline bool
+hk_g16g_as_enabled(const struct agx_device *dev)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+                             DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD;
+   return hk_g16g_opted_in(dev, AGX_DBG_G16G_RT) &&
+          (dev->params.features & required) == required;
+}
+
 static inline bool
 hk_gen1_as_enabled(const struct agx_device *dev)
 {
-   return hk_g17p_rt_enabled(dev) || hk_g16s_as_enabled(dev);
+   return hk_g17p_rt_enabled(dev) || hk_g16s_as_enabled(dev) ||
+          hk_g16g_as_enabled(dev);
 }
 
 /* Whether a logical device enables any ray-tracing feature. Only such a

@@ -3767,7 +3767,7 @@ hk_compile_rt_kernel(
     * a substitute for the advertised depth bound. Legacy generations are
     * unchanged.
     */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (hk_gen1_rt_chip(&dev->dev) &&
        !hk_rt_inlining_fits(b->shader, 1u << 20)) {
       ralloc_free(b->shader);
       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -3825,7 +3825,7 @@ hk_compile_rt_kernel(
    hk_rt_optimize_nir(b->shader);
 
    if (agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3C ||
-       dev->dev.chip == AGX_CHIP_G17P) {
+       hk_gen1_rt_chip(&dev->dev)) {
       bool indirect = false;
       nir_foreach_function_impl(impl, b->shader) {
          nir_foreach_block(block, impl) {
@@ -3975,7 +3975,7 @@ enum hk_rt_binary_executable {
 static bool
 hk_rt_binaries_native(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip);
+   return hk_gen1_rt_chip(&dev->dev) || agx_chip_g17_m5(dev->dev.chip);
 }
 
 static void
@@ -4091,11 +4091,12 @@ hk_rt_binary_serialize(struct hk_device *dev,
    return !blob->out_of_memory;
 }
 
-/* RT pipelines use the pipeline cache on G17P, where they are tested. */
+/* RT pipelines use the pipeline cache on G17P, where they are tested, and on
+ * an opted-in G16G, which compiles them the same way. */
 static bool
 hk_rt_cache_supported(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P;
+   return hk_gen1_rt_chip(&dev->dev);
 }
 
 static struct vk_pipeline_cache *
@@ -4489,7 +4490,7 @@ hk_create_ray_tracing_pipeline(
 
    /* Keep the existing defensive ceiling before key construction or NIR
     * cloning. G17P advertises 31 levels; legacy generations three. */
-   const uint32_t max_depth = dev->dev.chip == AGX_CHIP_G17P ?
+   const uint32_t max_depth = hk_gen1_rt_chip(&dev->dev) ?
       HK_G17P_MAX_REQUESTED_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH;
    if (create_info->maxPipelineRayRecursionDepth > max_depth)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
