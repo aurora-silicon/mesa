@@ -13041,8 +13041,11 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
           draw.index_buffer >= limit || !range_B ||
           range_B > limit - draw.index_buffer || !draw.b.count[0] ||
           offset_B >= range_B ||
-          (!zero_indices && count_B > range_B - offset_B))
+          (!zero_indices && count_B > range_B - offset_B)) {
+         mesa_loge("native G17P indexed draw requires a valid "
+                   "uint8/uint16/uint32 range");
          goto refused;
+      }
 
       const uint64_t ib = draw.index_buffer + offset_B;
       const uint64_t rem_B = range_B - offset_B;
@@ -13410,8 +13413,17 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
    const bool software_index_fetch =
       cmd->state.gfx.shaders[MESA_SHADER_GEOMETRY] ||
       cmd->state.gfx.shaders[MESA_SHADER_TESS_EVAL];
+   /* A direct draw of a topology without adjacency reaches
+    * hk_g17p_emit_draw() with these very values, unless it turns out to
+    * need index robustness (hk_flush_gfx_state()) and takes the robust path
+    * instead. hk_g17p_emit_draw() checks the range as it encodes it, so
+    * checking it here as well, and evaluating robustness for that, would do
+    * both twice for every such draw. */
    if (agx_chip_native_agx3(dev->dev.chip) && draw_.indexed &&
-       !software_index_fetch) {
+       !software_index_fetch &&
+       (agx_is_indirect(draw_.b) ||
+        mesa_prim_has_adjacency(
+           vk_topology_to_mesa(dyn->ia.primitive_topology)))) {
       uint64_t address;
       uint32_t size_word;
       const bool valid_index_size =
