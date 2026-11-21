@@ -19,7 +19,6 @@
 #include "hk_entrypoints.h"
 #include "hk_queue.h"
 #include "hk_pipeline_statistics_core.h"
-#include "hk_queue.h"
 #include "hk_shader.h"
 #include "hk_acceleration_structure.h"
 
@@ -43,6 +42,29 @@
 struct hk_query_report {
    uint64_t value;
 };
+
+bool
+hk_query_wait_has_loss_status(const struct hk_device *dev)
+{
+   /* Match hk_check_status's usable kernel/host error sources. A feature bit
+    * for a status mirror is insufficient if registration failed. */
+   return dev->vm_status_mirror.word || dev->dev.async_errors ||
+          (!dev->dev.is_virtio &&
+           (dev->dev.params.features & DRM_ASAHI_FEATURE_VM_STATUS));
+}
+
+static bool
+hk_query_record(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
+                 uint32_t first, uint32_t count, bool reset)
+{
+   if (!pool->wait)
+      return true;
+   if (hk_query_wait_record(&cmd->query_wait_ops, pool->wait, first, count,
+                             reset))
+      return true;
+   vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+   return false;
+}
 static_assert(sizeof(struct hk_query_report) == sizeof(uint64_t),
               "CPU result ABI requires contiguous u64 reports");
 
@@ -231,12 +253,16 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+
    if ((!dev->g17p_native_as && !dev->m5_native_as) || pool->vk.query_type != queryType ||
        firstQuery > pool->vk.query_count ||
        accelerationStructureCount > pool->vk.query_count - firstQuery) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
+   if (!hk_query_record(cmd, pool, firstQuery, accelerationStructureCount,
+                        false))
+      return;
    if (!accelerationStructureCount || !hk_query_command_cs(cmd))
       return;
    for (uint32_t i = 0; i < accelerationStructureCount; ++i) {
@@ -578,6 +604,10 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Query pool zero");
 
+   if (set_available &&
+       !hk_query_record(cmd, pool, first_index, num_queries, false))
+      return;
+
    if (agx_native_graphics(&dev->dev)) {
       emit_zero_queries_g17p(cmd, pool, first_index, num_queries,
                              set_available);
@@ -671,6 +701,7 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       if (!hk_pipeline_statistics_layout_init(
              pool->vk.query_count, pool->vk.pipeline_statistics, &layout) ||
           layout.size_B > SIZE_MAX) {
+         hk_query_wait_pool_destroy(pool->wait);
          vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
@@ -773,6 +804,17 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       memset(oq_index, 0xff, occlusion_queries * sizeof(*oq_index));
    pool->oq_queries = occlusion_queries;
 
+   /* Reject invalid bounds and finish resource construction before allocating
+    * per-query WAIT metadata. Failure before here owns no wait-pool state. */
+   if (hk_query_wait_has_loss_status(dev)) {
+      pool->wait = hk_query_wait_pool_create(&dev->query_wait,
+                                             pCreateInfo->queryCount);
+      if (!pool->wait) {
+         hk_DestroyQueryPool(device, hk_query_pool_to_handle(pool), pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
    if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
       host_zero_queries(dev, pool, 0, pool->vk.query_count, false);
 
@@ -790,6 +832,8 @@ hk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
 
    if (!pool)
       return;
+
+   hk_query_wait_pool_destroy(pool->wait);
 
    uint16_t *oq_index = hk_pool_oq_index_ptr(pool);
 
@@ -817,6 +861,8 @@ hk_ResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery,
    VK_FROM_HANDLE(hk_device, dev, device);
 
    host_zero_queries(dev, pool, firstQuery, queryCount, false);
+   if (pool->wait)
+      hk_query_wait_host_reset(pool->wait, firstQuery, queryCount);
 
    for (uint32_t i = 0; pool->oq_submit && i < queryCount; i++)
       p_atomic_set(&pool->oq_submit[firstQuery + i].point, 0);
@@ -837,6 +883,9 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
     * synchronization. Zeroing is compute on every generation, so the
     * ordering is one compute stream everything after waits on. */
    if (!queryCount)
+      return;
+
+   if (!hk_query_record(cmd, pool, firstQuery, queryCount, true))
       return;
 
    cmd->sync.kind_override = HK_SYNC_ALL;
@@ -880,6 +929,8 @@ hk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
 
    /* The stamp rides on a command's native start or end timestamp; which
     * command, and what it must wait on, follows from the stage. */
+   if (!hk_query_record(cmd, pool, query, 1, false))
+      return;
    hk_sync_write_timestamp(cmd, stage, req);
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
@@ -1112,6 +1163,8 @@ hk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    hk_flush_deferred_clears(cmd);
    VK_FROM_HANDLE(hk_query_pool, pool, queryPool);
 
+   if (!hk_query_record(cmd, pool, query, 1, false))
+      return;
    hk_cmd_begin_end_query(cmd, pool, query, index, 0, true);
 
    /* From the Vulkan spec:
@@ -1149,8 +1202,6 @@ hk_query_is_available(struct hk_device *dev, struct hk_query_pool *pool,
       return report->value != LIBAGX_QUERY_UNAVAILABLE;
    }
 }
-
-#define HK_QUERY_TIMEOUT 2000000000ull
 
 void
 hk_query_note_submit(struct hk_cmd_buffer *cmd, struct hk_queue *queue,
@@ -1736,6 +1787,9 @@ hk_oq_submission_done(struct hk_device *dev, struct hk_query_pool *pool,
 static bool
 hk_queues_idle(struct hk_device *dev)
 {
+   uint64_t serial, after;
+   if (!hk_query_wait_quiescent(&dev->query_wait, &serial))
+      return false;
    vk_foreach_queue(vk_queue, &dev->vk) {
       struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
 
@@ -1752,23 +1806,15 @@ hk_queues_idle(struct hk_device *dev)
           point < submitted)
          return false;
    }
-   return true;
+   return hk_query_wait_quiescent(&dev->query_wait, &after) && serial == after;
 }
 
-/* Wait until query becomes available. *never is set, with VK_SUCCESS, for a
- * query that no submitted work will make available.
- *
- * On M5 the kernel fails a command caught in another command's GPU recovery
- * as a victim: its fence completes with an error, the VM stays usable (its
- * status word stays zero; hk_check_status() loses the device otherwise),
- * and the command does not write the queries it would have ended or
- * timestamped. Vulkan only says a query that never becomes available "may"
- * lose the device (vkGetQueryPoolResults, VK_QUERY_RESULT_WAIT_BIT); losing
- * it here would turn the survivable victim into a device loss. So once
- * every queue is idle with the device intact, report the query unavailable
- * instead of waiting for the timeout. */
+/* Without an observable loss source, retaining the original finite wait
+ * avoids introducing an indefinite wait on a retired error fence. The legacy
+ * busy spin and two-second deadline remain unresolved on those kernels. */
+#define HK_QUERY_TIMEOUT 2000000000ull
 static VkResult
-hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
+hk_query_wait_for_available_legacy(struct hk_device *dev, struct hk_query_pool *pool,
                             uint32_t query, bool *never)
 {
    uint64_t abs_timeout_ns = os_time_get_absolute_timeout(HK_QUERY_TIMEOUT);
@@ -1800,6 +1846,82 @@ hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
    }
 
    return vk_device_set_lost(&dev->vk, "query timeout");
+}
+
+struct hk_query_wait_context {
+   struct hk_device *dev;
+   struct hk_query_pool *pool;
+   uint32_t query;
+};
+
+static bool
+hk_query_wait_ready(void *data)
+{
+   struct hk_query_wait_context *ctx = data;
+   return hk_query_is_available(ctx->dev, ctx->pool, ctx->query);
+}
+
+static VkResult
+hk_query_wait_status(void *data)
+{
+   struct hk_query_wait_context *ctx = data;
+   return vk_device_check_status(&ctx->dev->vk);
+}
+
+static bool
+hk_query_wait_idle(void *data)
+{
+   struct hk_query_wait_context *ctx = data;
+   return hk_queues_idle(ctx->dev);
+}
+
+static int
+hk_query_wait_completion(void *data, void *producer_queue, uint64_t point,
+                          uint64_t deadline)
+{
+   struct hk_query_wait_context *ctx = data;
+   struct hk_queue *queue = producer_queue;
+   return drmSyncobjTimelineWait(ctx->dev->dev.fd, &queue->drm.syncobj,
+                                 &point, 1, deadline,
+                                 DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
+}
+
+static VkResult
+hk_query_wait_error(void *data, int error)
+{
+   struct hk_query_wait_context *ctx = data;
+   if (error == -ETIMEDOUT)
+      return vk_device_set_lost(&ctx->dev->vk,
+                                 "query %u unavailable after producer completion",
+                                 ctx->query);
+   return vk_device_set_lost(&ctx->dev->vk, "query completion wait: %d", error);
+}
+
+/* M5 recovery victims may retire without writing the query while their VM
+ * remains usable. Preserve the intact-device/idle decision and both final
+ * rechecks; G17P does not take this path. */
+static VkResult
+hk_query_wait_for_available(struct hk_device *dev, struct hk_query_pool *pool,
+                            uint32_t query, bool *never)
+{
+   if (!pool->wait)
+      return hk_query_wait_for_available_legacy(dev, pool, query, never);
+   struct hk_query_wait_context ctx = {dev, pool, query};
+   const struct hk_query_wait_ops ops = {
+      .available = hk_query_wait_ready,
+      .status = hk_query_wait_status,
+      .idle = hk_query_wait_idle,
+      .completion = hk_query_wait_completion,
+      .error = hk_query_wait_error,
+   };
+   VkResult result = hk_query_wait_available(
+      pool->wait, query, agx_chip_g17_m5(dev->dev.chip), never, &ops, &ctx);
+   if (result == VK_SUCCESS && *never) {
+      mesa_logw_once("query %u became unavailable for good: all submitted "
+                     "work completed without writing it (a command the "
+                     "kernel failed as a recovery victim)", query);
+   }
+   return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

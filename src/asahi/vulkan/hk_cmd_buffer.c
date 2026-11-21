@@ -378,6 +378,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
       _mesa_set_destroy(cmd->m5_pushed_images, NULL);
    util_dynarray_fini(&cmd->sync_pass_records);
    util_dynarray_fini(&cmd->oq_ends);
+   hk_query_wait_recording_finish(&cmd->query_wait_ops);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
 }
@@ -477,6 +478,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    if (cmd->m5_pushed_images)
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
    util_dynarray_clear(&cmd->oq_ends);
+   hk_query_wait_recording_finish(&cmd->query_wait_ops);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    if (dev->dev.params.gpu_generation == 13 ||

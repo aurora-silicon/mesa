@@ -1437,7 +1437,45 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
       }
    }
 
-   return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+   if (!hk_query_wait_has_loss_status(dev))
+      return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+
+   /* Borealis does not expose KHR_internally_synchronized_queues. External
+    * synchronization of this API queue orders registration before the common
+    * runtime can defer or redirect its submissions. */
+   bool queries = false;
+   for (uint32_t i = 0; i < submitCount; i++) {
+      for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
+         VK_FROM_HANDLE(hk_cmd_buffer, cmd,
+                        pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops,
+                                         vk_queue);
+         queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
+      }
+   }
+   if (!queries)
+      return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+
+   struct hk_query_wait_batch *batch = hk_query_wait_batch_create();
+   if (!batch)
+      return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+   struct hk_queue *real = vk_queue->real_queue
+      ? container_of(vk_queue->real_queue, struct hk_queue, vk) : queue;
+   for (uint32_t i = 0; i < submitCount; i++) {
+      for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
+         VK_FROM_HANDLE(hk_cmd_buffer, cmd,
+                        pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+         if (cmd->query_wait_ops.size &&
+             !hk_query_wait_enqueue(&dev->query_wait, real, cmd,
+                                    &cmd->query_wait_ops, batch, vk_queue)) {
+            hk_query_wait_batch_finish(&dev->query_wait, batch, true);
+            return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+      }
+   }
+   VkResult result = vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+   hk_query_wait_batch_finish(&dev->query_wait, batch, result != VK_SUCCESS);
+   return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -2784,8 +2822,50 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    const bool has_compute =
       queue->kick.watched && hk_submit_has_compute(submit);
 
+   /* Snapshot metadata before submission: a completed command buffer may be
+    * reset/freed before this callback returns. Queued registrations precede
+    * the common runtime's pending-payload waits; only accepted ioctls publish
+    * a completion point. */
+   struct hk_query_wait_producer **producers = NULL;
+   bool queries = false;
+   if (hk_query_wait_has_loss_status(dev)) {
+      for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+         struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
+         queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
+      }
+   }
+   if (queries) {
+      producers = calloc(submit->command_buffer_count, sizeof(*producers));
+      if (!producers)
+         return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+      /* One query for this queue, independent of the number of pool slots.
+       * This retires old metadata even for GPU-only query consumers. */
+      uint64_t completed = 0;
+      if (!drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &completed, 1))
+         hk_query_wait_prune(&dev->query_wait, queue, completed);
+      for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+         struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
+         if (!hk_query_wait_claim(&dev->query_wait, queue, cmd,
+                                  &cmd->query_wait_ops, &producers[i],
+                                  submit->api_queue)) {
+            for (unsigned j = 0; j < i; j++)
+               hk_query_wait_publish(&dev->query_wait, producers[j], 0, false);
+            free(producers);
+            return vk_error(queue, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+      }
+   }
+
    bool untouched;
    VkResult result = queue_submit(dev, queue, submit, &untouched);
+   if (producers) {
+      for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+         hk_query_wait_publish(&dev->query_wait, producers[i],
+                                queue->drm.timeline_value,
+                                result == VK_SUCCESS);
+      }
+      free(producers);
+   }
    if (result != VK_SUCCESS && !untouched)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
    else if (result == VK_SUCCESS && has_compute)
@@ -3096,6 +3176,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
 {
    /* Stop/join the submit worker before releasing anything it can use. */
    vk_queue_finish(&queue->vk);
+   hk_query_wait_finish_queue(&dev->query_wait, queue);
    hk_query_stamps_clear_queue(dev, queue);
    hk_cmd_pending_finish_queue(dev, queue);
    drmSyncobjDestroy(dev->dev.fd, queue->drm.syncobj);

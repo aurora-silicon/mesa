@@ -100,6 +100,8 @@ hk_files = files(
   'hk_private.h',
   'hk_query_oq.c',
   'hk_query_pool.c',
+  'hk_query_wait.c',
+  'hk_query_wait.h',
   'hk_query_reset.c',
   'hk_query_pool.h',
   'hk_drm_render_core.c',
@@ -137,7 +139,32 @@ hk_drirc = custom_target(
   ],
 )
 
+# Manual hardware workload: explicit opt-in, outside default builds/tests and
+# installation. Building it does not authorize device probing or execution.
+if get_option('asahi-query-wait-bench')
+  executable('hk-query-wait-bench',
+    files('tests/hk-query-wait-bench.c', '../lib/agx_chip.c'),
+    include_directories : [inc_include, inc_src, inc_asahi],
+    dependencies : [dependency('vulkan'), dep_libdrm, dep_dl, dep_thread],
+    build_by_default : false,
+    install : false,
+  )
+endif
+
 if with_tests
+  if host_machine.system() == 'linux'
+    test('hk_query_wait_bench_profile',
+      executable('hk_query_wait_bench_profile_test',
+        files('tests/test-hk-query-wait-bench-profile.c', '../lib/agx_chip.c'),
+        include_directories : [include_directories('../lib'), inc_include, inc_src]),
+      suite : ['asahi'])
+    test('hk_query_wait', executable('hk_query_wait_test',
+      files('tests/test-hk-query-wait.c', 'hk_query_wait.c'),
+      include_directories : [include_directories('.'), inc_include, inc_src],
+      dependencies : [idep_mesautil, dep_thread],
+      link_args : ['-Wl,--wrap=calloc', '-Wl,--wrap=realloc']), suite : ['asahi'])
+  endif
+
   test('hk_execution_allowance',
     executable('hk_execution_allowance_test',
       files('tests/test-hk-execution-allowance.c'),
@@ -1217,6 +1244,31 @@ if with_tests
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk]),
     timeout : 30, suite : ['asahi'])
+
+endif
+
+if with_tests and host_machine.system() == 'linux'
+  hk_query_wait_wiring_test = executable('hk_query_wait_wiring_test',
+    files('tests/test-hk-query-wait-wiring.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [
+      '-Wl,--wrap=hk_sync_write_timestamp',
+      '-Wl,--wrap=hk_sync_flush_pending_timestamp',
+      '-Wl,--wrap=hk_sync_end_cs_if_timestamped',
+      '-Wl,--wrap=hk_sync_src_dep', '-Wl,--wrap=hk_sync_get_cs_after',
+      '-Wl,--wrap=hk_flush_deferred_clears_why',
+      '-Wl,--wrap=hk_cmd_invalidate_graphics_state',
+      '-Wl,--wrap=hk_cmd_invalidate_compute_state',
+      '-Wl,--wrap=os_time_get_nano',
+      '-Wl,--wrap=os_time_get_absolute_timeout',
+      '-Wl,--wrap=_vk_device_set_lost',
+    ])
+  test('hk_query_wait_wiring', hk_query_wait_wiring_test,
+    timeout : 30, suite : ['asahi'])
+  test('hk_query_wait_ordered_wiring', hk_query_wait_wiring_test,
+    args : ['--probe-ordered-reset'], timeout : 8, suite : ['asahi'])
 endif
 
 if with_tests
@@ -1224,7 +1276,8 @@ if with_tests
     files('tests/test-hk-query-stamps.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
-    dependencies : [hk_deps], link_with : [libhk]),
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : ['-Wl,--wrap=calloc']),
     timeout : 30, suite : ['asahi'])
   test('hk_query_no_access', executable('hk_query_no_access_test',
     files('tests/test-hk-query-no-access.c'),

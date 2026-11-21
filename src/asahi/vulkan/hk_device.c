@@ -1063,6 +1063,12 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_alloc;
 
+   if (!hk_query_wait_device_init(&dev->query_wait)) {
+      result = vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      vk_device_finish(&dev->vk);
+      goto fail_alloc;
+   }
+
    dev->vk.shader_ops = &hk_device_shader_ops;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
    dev->may_alias_memory = hk_device_may_alias_memory(dev, instance);
@@ -1390,6 +1396,7 @@ fail_dev:
 fail_fd:
    close(dev->dev.fd);
 fail_init:
+   hk_query_wait_device_finish(&dev->query_wait);
    vk_device_finish(&dev->vk);
 fail_alloc:
    vk_free(&dev->vk.alloc, dev);
@@ -1438,6 +1445,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    /* No submit thread is left to call into the kicker. */
    hk_compute_kick_finish(dev);
 
+   hk_query_wait_device_finish(&dev->query_wait);
    vk_device_finish(&dev->vk);
 
    /* All submit workers/queues are gone. No command bytes can be handed to
