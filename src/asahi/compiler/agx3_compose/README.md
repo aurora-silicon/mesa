@@ -38,6 +38,10 @@ The encoder does not test a row's shape when it applies it. The generator
 refuses a field id that no table has, a deposit that leaves its 16-bit word,
 and a form that reaches a deposit into a word beyond its size.
 
+Apple's encoder tries the forms of a mnemonic by ascending size, the entry
+point breaking ties. Each table lists its forms in that order as well
+(`apple_order`), for the callers that want Apple's choice.
+
 The descriptions were made once from the C tables that used to be checked
 in. Those repeated every choice group in every form that uses it. A
 description names each distinct group once and is otherwise the same data:

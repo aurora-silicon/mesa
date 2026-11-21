@@ -85,9 +85,12 @@ typedef struct { uint32_t node; uint16_t mnemonic; uint8_t ep, size; } agx3_form
 
 typedef struct {
    /* In (mnemonic, ep) order.  mnemonic_forms[m] is one more than the index
-    * of mnemonic m's first form, 0 if the table has none. */
+    * of mnemonic m's first form, 0 if the table has none.  apple_order has
+    * the forms of each mnemonic again, in the order Apple's encoder tries
+    * them: by ascending size, ep breaking ties. */
    const agx3_form *forms; uint32_t num_forms;
    const uint16_t *mnemonic_forms;
+   const uint16_t *apple_order;
    const agx3_node *nodes;
    const agx3_group *groups;
    const agx3_fixed *fixeds;

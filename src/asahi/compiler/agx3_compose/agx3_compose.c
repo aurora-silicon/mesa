@@ -279,10 +279,9 @@ int32_t agx3_form_index(const agx3_table *t, enum agx3_mnemonic mnemonic,
 
 /*
  * Apple's encoder tries a mnemonic's encoding points by ascending size, the
- * ep number breaking ties, and keeps the first that encodes the field vector
- * (the forms[].size order of the generated table; see agx3_compose.h). The
- * forms of one mnemonic are contiguous in a table, which is sorted by
- * (mnemonic, ep).
+ * ep number breaking ties, and keeps the first that encodes the field vector.
+ * The forms of one mnemonic are contiguous in a table, and apple_order lists
+ * them in that order.
  */
 int32_t
 agx3_compose_apple_order_known(const agx3_table *t,
@@ -290,30 +289,11 @@ agx3_compose_apple_order_known(const agx3_table *t,
                                const uint64_t fields[AGX3_MAX_FIELDS],
                                const uint64_t nonzero[3], uint8_t *out)
 {
-   const uint32_t first = first_form(t, mnemonic);
-   uint32_t end = first;
-   while (end < t->num_forms && t->forms[end].mnemonic == mnemonic)
-      end++;
-   if (end == first)
-      return -1;
-
-   /* At most a few dozen forms per mnemonic: try them smallest first. */
-   bool tried[64] = {false};
-   if (end - first > 64)
-      return -1;
-   for (unsigned n = 0; n < end - first; ++n) {
-      int32_t best = -1;
-      for (uint32_t f = first; f < end; ++f) {
-         if (tried[f - first])
-            continue;
-         if (best < 0 || t->forms[f].size < t->forms[best].size ||
-             (t->forms[f].size == t->forms[best].size &&
-              t->forms[f].ep < t->forms[best].ep))
-            best = (int32_t)f;
-      }
-      tried[best - first] = true;
-      if (agx3_compose_known(t, (uint32_t)best, fields, nonzero, out))
-         return best;
+   for (uint32_t i = first_form(t, mnemonic);
+        i < t->num_forms && t->forms[i].mnemonic == mnemonic; i++) {
+      const uint32_t form = t->apple_order[i];
+      if (agx3_compose_known(t, form, fields, nonzero, out))
+         return (int32_t)form;
    }
    return -1;
 }

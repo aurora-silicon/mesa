@@ -384,8 +384,14 @@ def print_c(name, D, out):
             out.write('[AGX3_MN_%s] = %s,\n' %
                       (form[1], cell('mnemonic_forms', i + 1, 16)))
     out.write('};\n')
+    # Each mnemonic's forms by ascending size, ep breaking ties.
+    order = sorted(range(len(D['forms'])), key=lambda i: (
+        D['forms'][i][1].encode(), D['forms'][i][3], D['forms'][i][2]))
+    out.write('static const uint16_t apple_order[] = {\n%s,\n};\n' % ','.join(
+        cell('apple_order', i, 16) for i in order))
     out.write('const agx3_table %s_table = {\n'
-              '   forms, %d, mnemonic_forms, nodes, groups, fixeds, predrefs,\n'
+              '   forms, %d, mnemonic_forms, apple_order, nodes, groups, fixeds,\n'
+              '   predrefs,\n'
               '   preds, cmds, lutpool, setpool, keys, uses, slices,\n'
               '};\n' % (name, len(D['forms'])))
 

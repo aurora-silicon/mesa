@@ -187,6 +187,19 @@ main(int argc, char **argv)
             fail++;
          }
 
+         /* apple_order has each mnemonic's forms in the mnemonic's own
+          * range of the table, by ascending size, then ep. */
+         const agx3_form *o = &t->forms[t->apple_order[i]];
+         const agx3_form *po = i > 0 ? &t->forms[t->apple_order[i - 1]] : NULL;
+         if (t->apple_order[i] >= t->num_forms || o->mnemonic != f->mnemonic ||
+             (po && po->mnemonic == o->mnemonic &&
+              (po->size > o->size ||
+               (po->size == o->size && po->ep >= o->ep)))) {
+            fprintf(stderr, "FAIL form order at %s.ep%u (agx3%c)\n", name,
+                    f->ep, letter);
+            fail++;
+         }
+
          if (i > 0) {
             const agx3_form *prev = &t->forms[i - 1];
             if (prev->mnemonic > f->mnemonic ||
