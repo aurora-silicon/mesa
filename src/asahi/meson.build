@@ -58,7 +58,8 @@ endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
-  # state changes (scissor, viewport, cull mode, depth op, color blend).
+  # state changes (scissor, viewport, cull mode, depth op, color blend), and
+  # after a change to dynamic state the tail is not built from.
   test(
     'hk-g17p-bind-tail-state-change',
     prog_python,
@@ -71,7 +72,7 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_CHIP=g17p',
       'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
       'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
-      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,2',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,3',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
     depends : [_dev_icd, libvulkan_asahi],

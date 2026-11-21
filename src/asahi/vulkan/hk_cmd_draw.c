@@ -210,6 +210,9 @@ hk_cmd_buffer_dirty_render_pass(struct hk_cmd_buffer *cmd)
 {
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
+   /* None of the states below has changed. */
+   hk_g17p_bind_tail_unverify(cmd);
+
    /* These depend on color attachment count */
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES);
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_ENABLES);
@@ -8462,6 +8465,134 @@ hk_g17p_bind_tail_refused(unsigned line)
    return false;
 }
 
+/* Whether a dirty bit is set for any dynamic state a HAL200 bind tail is
+ * built from: exactly the state hk_g17p_bind_tail_dyn() copies. */
+static inline bool
+hk_g17p_bind_tail_dyn_dirty(const struct vk_dynamic_graphics_state *dyn)
+{
+   return IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
+          IS_DIRTY(VP_SCISSOR_COUNT) || IS_DIRTY(VP_SCISSORS) ||
+          IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE) ||
+          IS_DIRTY(RS_RASTERIZER_DISCARD_ENABLE) ||
+          IS_DIRTY(RS_RASTERIZATION_STREAM) ||
+          IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
+          IS_DIRTY(RS_POLYGON_MODE) || IS_DIRTY(RS_CULL_MODE) ||
+          IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(RS_DEPTH_BIAS_ENABLE) ||
+          IS_DIRTY(RS_DEPTH_BIAS_FACTORS) || IS_DIRTY(RS_LINE_WIDTH) ||
+          IS_DIRTY(RS_LINE_MODE) || IS_DIRTY(DS_DEPTH_TEST_ENABLE) ||
+          IS_DIRTY(DS_DEPTH_WRITE_ENABLE) || IS_DIRTY(DS_DEPTH_COMPARE_OP) ||
+          IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
+          IS_DIRTY(DS_STENCIL_TEST_ENABLE) || IS_DIRTY(DS_STENCIL_OP) ||
+          IS_DIRTY(DS_STENCIL_COMPARE_MASK) ||
+          IS_DIRTY(DS_STENCIL_WRITE_MASK) || IS_DIRTY(DS_STENCIL_REFERENCE) ||
+          IS_DIRTY(TS_DOMAIN_ORIGIN) || IS_DIRTY(CB_ATTACHMENT_COUNT) ||
+          IS_DIRTY(CB_BLEND_EQUATIONS);
+}
+
+static void
+hk_g17p_bind_tail_dyn(const struct vk_dynamic_graphics_state *dyn,
+                      struct hk_g17p_bind_tail_dyn *key)
+{
+#define X(name, member) key->name = dyn->member;
+   HK_G17P_BIND_TAIL_DYN(X)
+#undef X
+   key->uses_blend_constant = hk_uses_blend_constant(&dyn->cb);
+
+   /* The builder refuses counts beyond these and builds no tail. */
+   memcpy(key->viewports, dyn->vp.viewports,
+          MIN2(dyn->vp.viewport_count, ARRAY_SIZE(key->viewports)) *
+             sizeof(key->viewports[0]));
+   memcpy(key->scissors, dyn->vp.scissors,
+          MIN2(dyn->vp.scissor_count, ARRAY_SIZE(key->scissors)) *
+             sizeof(key->scissors[0]));
+}
+
+void
+hk_g17p_bind_tail_unverify(struct hk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   struct hk_g17p_prepared_bind_tail *prepared = &cmd->state.gfx.g17p_bind_tail;
+
+   if (!prepared->dyn_verified)
+      return;
+
+   /* With no dirty bit set, the live state is still the one the tail was
+    * built from: save it, so the tail can be compared with what follows.
+    * Otherwise that state is already gone. */
+   prepared->dyn_saved = !hk_g17p_bind_tail_dyn_dirty(dyn);
+   if (prepared->dyn_saved)
+      hk_g17p_bind_tail_dyn(dyn, &prepared->dyn);
+   prepared->dyn_verified = false;
+}
+
+/* Whether key holds the live state. Members are compared as bytes, so a
+ * float matches only itself. Out of line: only an unverified tail gets
+ * here, and inlining this gave every caller of the check a stack frame. */
+static __attribute__((noinline)) bool
+hk_g17p_bind_tail_dyn_equal(const struct vk_dynamic_graphics_state *dyn,
+                            const struct hk_g17p_bind_tail_dyn *key)
+{
+   /* The viewports and scissors first: they change the most. A different
+    * count is found by the list below. */
+   if (memcmp(key->viewports, dyn->vp.viewports,
+              MIN2(key->viewport_count, ARRAY_SIZE(key->viewports)) *
+                 sizeof(key->viewports[0])) ||
+       memcmp(key->scissors, dyn->vp.scissors,
+              MIN2(key->scissor_count, ARRAY_SIZE(key->scissors)) *
+                 sizeof(key->scissors[0])))
+      return false;
+
+#define X(name, member)                                                        \
+   if (memcmp(&key->name, &dyn->member, sizeof(key->name)))                    \
+      return false;
+   HK_G17P_BIND_TAIL_DYN(X)
+#undef X
+
+   return key->uses_blend_constant == hk_uses_blend_constant(&dyn->cb);
+}
+
+/* Whether the dynamic state the prepared tail was built from is the live
+ * one. For a verified tail (dyn_verified) no dirty bit of that state means
+ * no change, and a dirty bit means a change. Otherwise a dirty bit says
+ * nothing, so compare the state the tail was built from, if it was saved.
+ *
+ * A draw may ask more than once. Nothing changes the dynamic state within a
+ * draw; this driver may set a dirty bit, which can only turn the answer for
+ * a verified tail into "no", and the draw then builds the tail again. */
+static inline bool
+hk_g17p_bind_tail_dyn_live(const struct vk_dynamic_graphics_state *dyn,
+                           const struct hk_g17p_prepared_bind_tail *prepared)
+{
+   /* Most draws that republish have set no dynamic state at all. */
+   if (likely(prepared->dyn_verified))
+      return !vk_dynamic_graphics_state_any_dirty(dyn) ||
+             !hk_g17p_bind_tail_dyn_dirty(dyn);
+
+   return prepared->dyn_saved &&
+          hk_g17p_bind_tail_dyn_equal(dyn, &prepared->dyn);
+}
+
+/* Every draw ends by clearing the dynamic dirty bits. tail_published: the
+ * draw found the prepared bind tail to be built from the live state, or
+ * built it from that state, whether or not it had to send it; with the dirty
+ * bits gone it is verified. Otherwise, if a dirty bit of a verified tail's
+ * state goes, the trace of the change goes with it, and the state the tail
+ * was built from was never saved. */
+static inline void
+hk_gfx_clear_dynamic_dirty(struct hk_cmd_buffer *cmd, bool tail_published)
+{
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct hk_g17p_prepared_bind_tail *prepared = &cmd->state.gfx.g17p_bind_tail;
+
+   if (tail_published)
+      prepared->dyn_verified = true;
+   else if (prepared->dyn_verified && hk_g17p_bind_tail_dyn_dirty(dyn))
+      prepared->dyn_verified = prepared->dyn_saved = false;
+
+   vk_dynamic_graphics_state_clear_dirty(dyn);
+}
+
 static bool
 hk_g17p_bind_tail_state_matches(
    const struct hk_cmd_buffer *cmd,
@@ -8550,7 +8681,6 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
       gfx->g17p_bind_tail_memo.state_cpu = memo_state.cpu;
       gfx->g17p_bind_tail_memo.state_compact = (uint32_t)memo_state.gpu;
 
-      prepared->dynamic_generation = dyn->generation;
       prepared->descriptor_generation = gfx->descriptors.generation;
       prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
       prepared->root = gfx->root;
@@ -9073,7 +9203,10 @@ hk_g17p_build_native_bind_tail(struct hk_cmd_buffer *cmd,
    gfx->g17p_bind_tail_memo.state_cpu = state.cpu;
    gfx->g17p_bind_tail_memo.state_compact = (uint32_t)state.gpu;
    gfx->g17p_bind_tail_memo.state_size = state_size;
-   prepared->dynamic_generation = dyn->generation;
+   /* Built from the live state: the state it was built from before is not
+    * to be compared with any more. The clear that ends this draw verifies
+    * the tail. */
+   prepared->dyn_verified = prepared->dyn_saved = false;
    prepared->descriptor_generation = gfx->descriptors.generation;
    prepared->vertex_buffer_generation = gfx->root_vertex_buffer_generation;
    prepared->root = gfx->root;
@@ -9131,7 +9264,7 @@ hk_g17p_bind_tail_state_matches(
       &cmd->vk.dynamic_graphics_state;
    const struct hk_rendering_state *render = &gfx->render;
 
-   return prepared->dynamic_generation == dyn->generation &&
+   return hk_g17p_bind_tail_dyn_live(dyn, prepared) &&
           prepared->render_color0 ==
              (render->color_att_count == 1
                  ? render->color_att[0].iview : NULL) &&
@@ -9184,9 +9317,9 @@ hk_g17p_prepared_bind_tail_matches(
           prepared->vertex_buffer_generation ==
              gfx->vertex_buffer_generation &&
           prepared->root == gfx->root &&
+          hk_g17p_bind_tail_state_matches(cmd, prepared) &&
           prepared->fragment_dma_set_base ==
-             hk_g17p_dma_set_base(cmd, prepared->fragment_shader) &&
-          hk_g17p_bind_tail_state_matches(cmd, prepared);
+             hk_g17p_dma_set_base(cmd, prepared->fragment_shader);
 }
 
 static bool
@@ -11015,15 +11148,17 @@ hk_gfx_republishes_render_state(struct hk_cmd_buffer *cmd)
  * G17P, the native HAL200 bind tail: the vertex-program publication of every
  * draw that republishes render state.  Shared by hk_flush_dynamic_state_slow()
  * and hk_g17p_emit_indirect_record(), so both emit exactly the same records.
- * tail_known_match: see hk_g17p_emit_native_bind_tail().  Returns false, with
- * the command buffer error set and cs->current at the failed record, when
- * publication is refused. */
+ * tail_known_match: see hk_g17p_emit_native_bind_tail().  tail_decided: the
+ * draw found the prepared tail to be built from the live state, or built it,
+ * for hk_gfx_clear_dynamic_dirty().  Returns false, with the command buffer
+ * error set and cs->current at the failed record, when publication is
+ * refused. */
 static bool
 hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              uint8_t **out_p, struct hk_shader *hw_vs,
                              uint64_t pipeline_program, struct agx_draw draw,
                              bool ordinary_draw_path, bool tail_known_match,
-                             bool *tail_emitted)
+                             bool *tail_emitted, bool *tail_decided)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
@@ -11031,6 +11166,7 @@ hk_agx3_publish_vertex_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint8_t *out = *out_p;
 
    *tail_emitted = false;
+   *tail_decided = false;
    const struct agx_vdm_state_update_program_info *program =
       &hw_vs->agx3_vdm_state_update;
    const bool pipeline_va_valid =
@@ -11182,6 +11318,7 @@ tail:
          cs->current = out;
          return false;
       }
+      *tail_decided = true;
    }
 
    *out_p = out;
@@ -11868,14 +12005,14 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       case AGX_CS_GENERATION_G15:
       case AGX_CS_GENERATION_HAL200:
       case AGX_CS_GENERATION_HAL300: {
-         bool tail_emitted = false;
+         bool tail_emitted = false, tail_decided = false;
          if (!hk_agx3_publish_vertex_state(
                 cmd, cs, &out, hw_vs, pipeline_program, *draw,
                 ordinary_draw_path,
                 prepared_varyings && gfx->root == prepared_varyings_root,
-                &tail_emitted))
+                &tail_emitted, &tail_decided))
             return;
-         if (agx_chip_native_agx3(dev->dev.chip)) {
+         if (tail_decided) {
             g17p_native_ppp_handled = true;
             *g17p_native_bind_tail_emitted_out = tail_emitted;
          }
@@ -11976,7 +12113,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    if (vk_command_buffer_has_error(&cmd->vk))
       return;
 
-   vk_dynamic_graphics_state_clear_dirty(dyn);
+   hk_gfx_clear_dynamic_dirty(cmd, g17p_native_ppp_handled);
    gfx->shaders_dirty = 0;
    gfx->linked_dirty = 0;
    gfx->dirty = 0;
@@ -12042,7 +12179,7 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        cs->g17p_bind_tail.viewport_count != viewport_count ||
        gfx->g17p_bind_tail_memo.hw_vs != hw_vs ||
        gfx->g17p_bind_tail_memo.fs != fs ||
-       gfx->g17p_bind_tail.dynamic_generation != dyn->generation ||
+       !hk_g17p_bind_tail_dyn_live(dyn, &gfx->g17p_bind_tail) ||
        gfx->g17p_bind_tail.in_meta != cmd->in_meta ||
        gfx->g17p_bind_tail.linked_vs != linked_vs ||
        gfx->g17p_bind_tail.linked_fs != linked_fs ||
@@ -12091,11 +12228,15 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    hk_reserve_scratch(cmd, cs, hw_vs);
    const uint64_t pipeline_program =
       hk_upload_usc_words(cmd, hw_vs, linked_vs);
-   bool tail_emitted = false;
+   bool tail_emitted = false, tail_decided = false;
    if (!hk_agx3_publish_vertex_state(cmd, cs, &out, hw_vs, pipeline_program,
-                                     draw, true, false, &tail_emitted))
+                                     draw, true, false, &tail_emitted,
+                                     &tail_decided))
       return true;
    *g17p_native_bind_tail_emitted_out = tail_emitted;
+   /* No dirty bit is set and none is cleared, so tail_decided has no clear
+    * to go to: a verified tail stays verified. Whatever unverifies a tail
+    * dirties state too, which sends the next draw to the slow flush. */
 
    cs->current = out;
    if (vk_command_buffer_has_error(&cmd->vk))
@@ -13627,7 +13768,7 @@ hk_record_mesh_launch(struct hk_cmd_buffer *cmd, uint32_t draw_id)
    hk_note_pre_raster_images(cmd, cs);
    hk_m5_note_render_resources(cmd, cs);
    cs->stats.cmds++;
-   vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
+   hk_gfx_clear_dynamic_dirty(cmd, false);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
    gfx->descriptors.root_dirty = false;
 }
@@ -13978,7 +14119,7 @@ hk_draw_mesh_native(struct hk_cmd_buffer *cmd, uint64_t grid,
    hk_upload_stat(cmd, draws, 1);
    hk_note_pre_raster_images(cmd, cs);
    cs->stats.cmds++;
-   vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
+   hk_gfx_clear_dynamic_dirty(cmd, false);
    gfx->dirty = gfx->shaders_dirty = gfx->linked_dirty = 0;
    gfx->descriptors.root_dirty = false;
 }
@@ -14251,7 +14392,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    /* An indirect count is not known when the draw is recorded. */
    cs->g17p_primitive_bound = UINT64_MAX;
 
-   bool tail_emitted = false;
+   bool tail_emitted = false, tail_decided = false;
    if (republishes) {
       struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
       struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
@@ -14298,14 +14439,14 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
       if (!hk_agx3_publish_vertex_state(
              cmd, cs, &out, hw_vs, pipeline_program, draw, true,
              prepared_varyings && gfx->root == prepared_varyings_root,
-             &tail_emitted))
+             &tail_emitted, &tail_decided))
          return;
 
       cs->current = out;
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
 
-      vk_dynamic_graphics_state_clear_dirty(dyn);
+      hk_gfx_clear_dynamic_dirty(cmd, tail_decided);
       gfx->shaders_dirty = 0;
       gfx->linked_dirty = 0;
       gfx->dirty = 0;

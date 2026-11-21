@@ -267,17 +267,14 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       cmd->vk.last_graphics_pipeline = NULL;
       assert(save->dynamic.vi == &cmd->state.gfx._dynamic_vi);
       assert(save->dynamic.ms.sample_locations == &cmd->state.gfx._dynamic_sl);
-      /* The generation must not go back with the state it describes.
-       * Restoring it would let the next meta operation, which repeats the
-       * same state changes from the same starting point, reach the very
-       * generation an earlier one had: a bind tail prepared for that earlier
-       * operation then "matches" with stale viewport/scissor state (two
-       * vkCmdClearAttachments rectangles in one dynamic-rendering instance
-       * split by a barrier drew the second one through the first's
-       * viewport). Everything restored is dirty below anyway. */
-      const uint64_t generation = cmd->vk.dynamic_graphics_state.generation;
+      /* This replaces every dynamic state at once, and only the states the
+       * application had set become dirty below. A bind tail prepared for the
+       * meta operation must not pass for current on the strength of its
+       * dirty bits (two vkCmdClearAttachments rectangles in one
+       * dynamic-rendering instance split by a barrier drew the second one
+       * through the first's viewport). */
+      hk_g17p_bind_tail_unverify(cmd);
       cmd->vk.dynamic_graphics_state = save->dynamic;
-      cmd->vk.dynamic_graphics_state.generation = generation + 1;
       cmd->state.gfx._dynamic_vi = save->_dynamic_vi;
       cmd->state.gfx._dynamic_sl = save->_dynamic_sl;
       memcpy(cmd->vk.dynamic_graphics_state.dirty,
