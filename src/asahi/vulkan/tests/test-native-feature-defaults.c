@@ -42,6 +42,19 @@ main(void)
    assert(!hk_g16s_as_enabled(&dev));
    unsetenv("ASAHI_G17P_RT_DISABLE");
 
+   /* G16G decides GEN1 ray tracing directly from kernel features. */
+   dev = (struct agx_device){0};
+   dev.chip = AGX_CHIP_G16G;
+   dev.params.chip_id = 0x8132;
+   dev.params.gpu_generation = 16;
+   dev.params.gpu_variant = 'G';
+   dev.params.features = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+   assert(!hk_g17p_rt_enabled(&dev) && !hk_g16g_as_enabled(&dev));
+   dev.params.features = HK_G17P_RT_KERNEL_FEATURES;
+   assert(hk_g17p_rt_enabled(&dev));
+   dev.params.features = DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT;
+   assert(!hk_g17p_rt_enabled(&dev));
+
    assert(!hk_m5_task_record(0));
    assert(hk_m5_task_record(DRM_ASAHI_FEATURE_TASK_MESH_STORAGE));
 

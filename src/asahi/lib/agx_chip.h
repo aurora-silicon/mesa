@@ -959,6 +959,18 @@ agx_chip_has_native_render_context(enum agx_chip chip)
    return agx_chip_info(chip)->quirks & AGX_QUIRK_NATIVE_RENDER_CONTEXT;
 }
 
+/* Whether the chip can run the GEN1 hardware ray-tracing runtime: the AGX3B
+ * intersect_ray/continue_ray encodings (whose witnessed chip lists in
+ * agx3_pack.c name both), GEN1 acceleration-structure nodes and the HAL200
+ * records. G17P is where the runtime was grounded and is qualified. Exposure
+ * is Borealis's decision, and it requires the kernel's ray-query or bounded
+ * AS-build features (hk_g17p_rt_enabled(), hk_g16g_as_enabled()). */
+static inline bool
+agx_chip_gen1_rt(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
+}
+
 /* Whether the native indirect compute pair (grid helper plus the 24-byte
  * mode-2 launch) is qualified.  G15 reads the same mode-2 record and the same
  * six-word geometry (three global thread counts, three local sizes); other

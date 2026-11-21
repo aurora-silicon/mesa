@@ -107,10 +107,13 @@ struct hk_addr_range {
 #define HK_G17P_RT_KERNEL_FEATURES                                             \
    (DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS | DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
 
+/* Native ray tracing on the GEN1 runtime: G17P and G16G, decided from the
+ * kernel feature bits. The name predates G16G; the kernel contract is the same
+ * on both. */
 static inline bool
 hk_g17p_rt_enabled(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P &&
+   return agx_chip_gen1_rt(dev->chip) &&
           (dev->params.features & HK_G17P_RT_KERNEL_FEATURES) ==
              HK_G17P_RT_KERNEL_FEATURES;
 }
@@ -131,10 +134,32 @@ hk_g16s_as_enabled(const struct agx_device *dev)
           (dev->params.features & required) == required;
 }
 
+/* An AS-only G16G device, like the M4 Pro above: the kernel bounds AS builds
+ * but does not admit traversal. */
+static inline bool
+hk_g16g_as_enabled(const struct agx_device *dev)
+{
+   const uint64_t required = DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
+                             DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD;
+   return dev->chip == AGX_CHIP_G16G &&
+          (dev->params.features & required) == required;
+}
+
+/* Whether the device uses the GEN1 hardware ray-tracing runtime properties and
+ * pipeline lowering: always on G17P, and on G16G whenever the kernel admits
+ * GEN1 ray tracing or bounded AS builds. */
+static inline bool
+hk_gen1_rt_chip(const struct agx_device *dev)
+{
+   return dev->chip == AGX_CHIP_G17P ||
+          hk_g17p_rt_enabled(dev) || hk_g16g_as_enabled(dev);
+}
+
 static inline bool
 hk_gen1_as_enabled(const struct agx_device *dev)
 {
-   return hk_g17p_rt_enabled(dev) || hk_g16s_as_enabled(dev);
+   return hk_g17p_rt_enabled(dev) || hk_g16s_as_enabled(dev) ||
+          hk_g16g_as_enabled(dev);
 }
 
 /* Whether a logical device enables any ray-tracing feature. Only such a
