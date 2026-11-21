@@ -7,6 +7,7 @@
 #pragma once
 
 #include <xf86drm.h>
+#include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
@@ -546,6 +547,23 @@ struct agx_encoder {
  * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
+/* Everything a native Ioto graphics program is built from
+ * (agx_build_g17p_graphics_program()), and the program built from it. */
+struct agx_g17p_program_inputs {
+   const struct agx_compiled_shader *shader;
+   const struct agx_linked_shader *linked;
+   /* The linked code the program enters. The batch holds its buffer, so
+    * unlike the two pointers above this address cannot come back as another
+    * shader's while the batch lives. */
+   uint64_t shader_va;
+   /* The texture and sampler tables, or zero. The pair of them is uploaded
+    * for the program, so its range below has no address. */
+   uint64_t resources[2];
+   struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint8_t range_count;
+   uint64_t program;
+};
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -563,6 +581,9 @@ struct agx_batch {
    uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
+   /* The last program of the hardware vertex stage and of the fragment
+    * stage. The same inputs give the same program, so it is kept. */
+   struct agx_g17p_program_inputs g17p_program[2];
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;

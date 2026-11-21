@@ -6785,6 +6785,26 @@ agx_graphics_tps_frame(const struct agx_device *dev,
    return dev->chip == AGX_CHIP_G18G ? ALIGN_POT(frame, 16) : frame;
 }
 
+static bool
+agx_g17p_program_inputs_equal(const struct agx_g17p_program_inputs *a,
+                              const struct agx_g17p_program_inputs *b)
+{
+   if (a->shader != b->shader || a->linked != b->linked ||
+       a->shader_va != b->shader_va ||
+       a->resources[0] != b->resources[0] ||
+       a->resources[1] != b->resources[1] ||
+       a->range_count != b->range_count)
+      return false;
+
+   for (unsigned i = 0; i < a->range_count; ++i) {
+      if (a->ranges[i].start_halfs != b->ranges[i].start_halfs ||
+          a->ranges[i].size_halfs != b->ranges[i].size_halfs ||
+          a->ranges[i].address != b->ranges[i].address)
+         return false;
+   }
+   return true;
+}
+
 static uint32_t
 agx_build_g17p_graphics_program(struct agx_batch *batch,
                                 struct agx_compiled_shader *cs,
@@ -6826,8 +6846,12 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       return agx_usc_addr(dev, batch->g17p_fragment_program);
    }
 
-   struct agx3_ioto_uniform_range
-      ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   struct agx_g17p_program_inputs inputs;
+   inputs.shader = cs;
+   inputs.linked = linked;
+   inputs.shader_va = linked->bo->va->addr + linked->entry_offset;
+   inputs.resources[0] = inputs.resources[1] = 0;
+   struct agx3_ioto_uniform_range *ranges = inputs.ranges;
    size_t count = 0;
    const mesa_shader_stage stage = cs->stage;
    /* A hardware vertex program -- the vertex shader, a tessellation
@@ -6848,18 +6872,12 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
           (batch->ctx->stage[stage].custom_borders &&
            !cs->g17p_custom_border_emulation))
          return 0;
-      const uint64_t pointers[2] = {
-         batch->stage_uniforms[stage].texture_base,
-         batch->samplers[stage],
-      };
-      const uint64_t pointer_va = agx_pool_upload_aligned(
-         &batch->pool, pointers, sizeof(pointers), 8);
-      if (!pointer_va)
-         return 0;
+      inputs.resources[0] = batch->stage_uniforms[stage].texture_base;
+      inputs.resources[1] = batch->samplers[stage];
+      /* The pair is uploaded below, once the program is known to be new. */
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = 0,
          .size_halfs = 8,
-         .address = pointer_va,
       };
    }
 
@@ -6912,7 +6930,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          ++length;
       }
       if (!table || (start & 1) || (length & 1) ||
-          count == ARRAY_SIZE(ranges))
+          count == ARRAY_SIZE(inputs.ranges))
          return 0;
 
       ranges[count++] = (struct agx3_ioto_uniform_range){
@@ -6926,7 +6944,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       const struct agx_rodata *rodata = &cs->b.info.rodata;
       const uint64_t size_B = (uint64_t)rodata->size_16 * 2;
       if (!cs->bo || !cs->bo->va || (rodata->base_uniform & 1) ||
-          (rodata->size_16 & 1) || count == ARRAY_SIZE(ranges) ||
+          (rodata->size_16 & 1) || count == ARRAY_SIZE(inputs.ranges) ||
           rodata->offset > cs->bo->size ||
           size_B > cs->bo->size - rodata->offset)
          return 0;
@@ -6938,13 +6956,34 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
    }
 
    if (stage == MESA_SHADER_FRAGMENT && linked->g17p_emrt_heap_base) {
-      if (!batch->g17p_emrt_heap || count == ARRAY_SIZE(ranges))
+      if (!batch->g17p_emrt_heap || count == ARRAY_SIZE(inputs.ranges))
          return 0;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = linked->g17p_emrt_heap_base,
          .size_halfs = 4,
          .address = batch->g17p_emrt_heap,
       };
+   }
+
+   /* The program is a function of its shader, of this batch's tilebuffer
+    * layout and of the inputs gathered above: the same inputs as last time
+    * are the same program. */
+   inputs.range_count = count;
+   struct agx_g17p_program_inputs *last =
+      &batch->g17p_program[stage == MESA_SHADER_FRAGMENT];
+   if (agx_g17p_program_inputs_equal(last, &inputs)) {
+      if (full_va)
+         *full_va = last->program;
+      if (stage == MESA_SHADER_FRAGMENT)
+         batch->g17p_fragment_program = last->program;
+      return agx_usc_addr(dev, last->program);
+   }
+
+   if (resource_pair) {
+      ranges[0].address = agx_pool_upload_aligned(
+         &batch->pool, inputs.resources, sizeof(inputs.resources), 8);
+      if (!ranges[0].address)
+         return 0;
    }
 
    size_t capacity;
@@ -6972,7 +7011,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
          : AGX_PASS_TYPE_OPAQUE;
    struct agx3_g17p_graphics_program_desc desc = {
       .program_va = t.gpu,
-      .shader_va = linked->bo->va->addr + linked->entry_offset,
+      .shader_va = inputs.shader_va,
       .uniform_ranges = ranges,
       .uniform_range_count = count,
       .shader_binary_size = linked->size,
@@ -7013,6 +7052,16 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
 
    agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
                        program_length);
+   if (resource_pair)
+      ranges[0].address = 0;
+   last->shader = cs;
+   last->linked = linked;
+   last->shader_va = inputs.shader_va;
+   memcpy(last->resources, inputs.resources, sizeof(last->resources));
+   memcpy(last->ranges, ranges, count * sizeof(ranges[0]));
+   last->range_count = count;
+   last->program = t.gpu;
+
    if (full_va)
       *full_va = t.gpu;
    if (cs->stage == MESA_SHADER_FRAGMENT) {
