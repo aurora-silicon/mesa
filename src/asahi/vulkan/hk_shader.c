@@ -208,9 +208,12 @@ hk_fs_structure_key_bits(void)
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
-   /* This could be optimized but it doesn't matter. */
-   return pdev->dev.debug |
-          hk_fs_structure_key_bits();
+   /* This could be optimized but it doesn't matter. Whether compute
+    * launches take scratch decides optional_spills, so it names the cache
+    * too. */
+   const bool launch_scratch = hk_compute_launch_takes_scratch(&pdev->dev);
+   return pdev->dev.debug | hk_fs_structure_key_bits() |
+          ((uint64_t)launch_scratch << 31);
 }
 
 const nir_shader_compiler_options *
@@ -5440,6 +5443,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .dev = agx_gather_device_key(&dev->dev),
       .no_stop = nir->info.stage == MESA_SHADER_FRAGMENT,
       .has_scratch = !nir->info.internal,
+      .optional_spills =
+         !nir->info.internal && hk_compute_launch_takes_scratch(&dev->dev),
       .promote_constants = true,
       .promote_textures = true,
       /* hk_buffer_addr_format() and hk_ubo_addr_format() bound robust

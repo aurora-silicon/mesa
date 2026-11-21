@@ -535,6 +535,13 @@ struct agx_shader_key {
    /* Whether scratch memory is available in the given shader stage */
    bool has_scratch;
 
+   /* Whether the program's launch also takes the scratch of optional spills,
+    * such as those of the sampled compute register cap
+    * (agx_sampled_compute_register_cap()). Some launch paths refuse scratch,
+    * or bound its size, even where has_scratch is set.
+    */
+   bool optional_spills;
+
    /* Whether we're compiling the helper program used for scratch allocation.
     * This has special register allocation requirements.
     */
@@ -785,6 +792,14 @@ struct agx_occupancy {
 
 struct agx_occupancy agx_occupancy_for_register_count(unsigned halfregs);
 unsigned agx_max_registers_for_occupancy(unsigned occupancy);
+
+/* General half-registers one thread can allocate on this device, or 0 when
+ * the encoding's register file is not known. */
+unsigned agx_register_file_halves(const struct agx_device_key *dev);
+
+/* Register budget for compute programs with several texture reads, derived
+ * from the register file and the occupancy steps; 0 means no cap. */
+unsigned agx_sampled_compute_register_cap(const struct agx_device_key *dev);
 
 /* Vertex attributes a vertex prolog can hand to the main shader on this
  * device through the register ABI (AGX_ABI_VIN_ATTRIB): component i of the

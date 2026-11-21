@@ -48,6 +48,79 @@ agx_max_registers_for_occupancy(unsigned occupancy)
    return max_regs;
 }
 
+unsigned
+agx_register_file_halves(const struct agx_device_key *dev)
+{
+   switch (dev->encoding) {
+   case AGX_ISA_ENCODING_AGX2:
+      return AGX_NUM_REGS;
+   case AGX_ISA_ENCODING_AGX3B:
+      return AGX3B_NUM_REGS;
+   case AGX_ISA_ENCODING_AGX3C:
+      /* G18G compiles as AGX3C with emit_agx3d; both files end at r125. */
+      return dev->emit_agx3d ? AGX3D_NUM_REGS : AGX3C_NUM_REGS;
+   case AGX_ISA_ENCODING_AGX3D:
+      return AGX3D_NUM_REGS;
+   default:
+      return 0;
+   }
+}
+
+/*
+ * A compute program that issues several texture reads spends much of its
+ * time waiting on them, and more resident threads hide that wait. Capping its
+ * registers trades scratch spills for those threads. The cap follows from two
+ * properties of the device:
+ *
+ *  - the occupancy steps (occupancies[] above): how many threads a core keeps
+ *    resident at each per-thread register budget, and
+ *  - the per-thread register file (agx_register_file_halves()).
+ *
+ * The target is 5/8 of the most threads a core keeps resident (the first
+ * step): 640 of 1024 threads, 20 of 32 SIMD groups. The cap is the largest
+ * budget that still reaches that step, 160 halves with the current steps.
+ * Tuned on G17C against the uncapped file and a 192-half cap.
+ * A device gets no cap when the cap would not raise its resident threads
+ * above what its whole file allows, or when its register file is unknown
+ * (agx_register_file_halves() returns 0).
+ *
+ * AGX2 and AGX3C currently resolve to 160: their files (256 and 252 halves)
+ * reach 384 threads uncapped, so the cap raises that to 640. AGX3B (192
+ * halves) already reaches 512, too small a step, so it gets no cap. G18G gets
+ * no cap, as it takes no scratch for compute. All encodings share one
+ * occupancy table; a part whose steps differ needs its own table before this
+ * derivation is right for it.
+ */
+unsigned
+agx_sampled_compute_register_cap(const struct agx_device_key *dev)
+{
+   /* G18G launches compute without scratch (hk_dispatch_g17g_native()
+    * refuses it), so the spills the cap trades for threads would refuse the
+    * launch there.
+    */
+   if (dev->emit_agx3d || dev->encoding == AGX_ISA_ENCODING_AGX3D)
+      return 0;
+
+   const unsigned file = agx_register_file_halves(dev);
+   if (!file)
+      return 0;
+
+   const unsigned target = occupancies[0].max_threads * 5 / 8;
+   const unsigned cap = agx_max_registers_for_occupancy(target);
+
+   /* The spills only pay for a large step in resident threads: half again
+    * as many or more. 384 -> 640 threads gained on G17C; 512 -> 640 lost
+    * 7-10% on G16G with the same sample workload.
+    */
+   const unsigned capped = agx_occupancy_for_register_count(cap).max_threads;
+   const unsigned uncapped =
+      agx_occupancy_for_register_count(file).max_threads;
+   if (cap >= file || capped * 2 < uncapped * 3)
+      return 0;
+
+   return cap;
+}
+
 /* Crude cycle model for G13G */
 enum alu_unit {
    NONE,

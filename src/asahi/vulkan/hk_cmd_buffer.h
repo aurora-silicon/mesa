@@ -3004,6 +3004,22 @@ void hk_cmd_dispatch_unaligned(VkCommandBuffer commandBuffer,
 void hk_cmd_dispatch_indirect_addr(VkCommandBuffer command_buffer,
                                    VkDeviceAddress address);
 
+/* Whether a compute launch on this device can take the scratch frame its
+ * shader's register spills need. hk_dispatch_g17g_native() launches no
+ * scratch on G18G, and hk_dispatch_m5_native() takes it only with the
+ * kernel's compute resources, which carry the frame on M5. The compiler only
+ * spills to an occupancy cap (optional_spills) where this holds, so the
+ * dispatch paths refuse scratch by this same rule. */
+static inline bool
+hk_compute_launch_takes_scratch(const struct agx_device *dev)
+{
+   if (dev->chip == AGX_CHIP_G18G)
+      return false;
+   if (agx_chip_g17_m5(dev->chip))
+      return dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES;
+   return true;
+}
+
 static inline void
 hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                             struct hk_shader *s, struct agx_grid grid,
