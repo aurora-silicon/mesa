@@ -2908,6 +2908,9 @@ void hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs);
  * reached through more than one virtual address (hk_cdm_alias_scope()). A
  * trailing strong flush without memory scope is upgraded in place. The caller
  * ensures space for one barrier record. */
+void hk_init_discarded_storage_images(struct hk_cmd_buffer *cmd,
+                                      const VkDependencyInfo *info);
+
 void hk_cdm_visibility_flush(struct hk_device *dev, struct hk_cs *cs,
                              bool memory);
 

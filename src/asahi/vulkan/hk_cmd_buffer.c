@@ -1214,6 +1214,60 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    return hk_barrier_classify(info, &state);
 }
 
+/* Shader stores can update only part of a compression tile. When memory is
+ * reused, initialize the discarded subresources before any shader can
+ * interpret their old compression metadata. */
+void
+hk_init_discarded_storage_images(struct hk_cmd_buffer *cmd,
+                                 const VkDependencyInfo *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (dev->dev.chip != AGX_CHIP_G17C)
+      return;
+
+   bool cleared = false;
+   for (uint32_t i = 0; i < info->imageMemoryBarrierCount; i++) {
+      const VkImageMemoryBarrier2 *bar = &info->pImageMemoryBarriers[i];
+      if (bar->oldLayout != VK_IMAGE_LAYOUT_UNDEFINED ||
+          bar->newLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+         continue;
+
+      VK_FROM_HANDLE(hk_image, image, bar->image);
+      if (!(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) ||
+          !image->planes[0].layout.compressed)
+         continue;
+
+      /* Execute an ownership transition once, on acquire. */
+      if (image->vk.sharing_mode == VK_SHARING_MODE_EXCLUSIVE &&
+          bar->srcQueueFamilyIndex != bar->dstQueueFamilyIndex &&
+          bar->dstQueueFamilyIndex != cmd->vk.pool->queue_family_index)
+         continue;
+
+      if (!cleared) {
+         hk_flush_deferred_clears(cmd);
+         hk_cmd_buffer_end_compute(cmd);
+         hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_XFER);
+         hk_sync_xfer_begin(cmd);
+         cleared = true;
+      }
+
+      const uint32_t zero[4] = {0};
+      hk_clear_image(cmd, image, PIPE_FORMAT_NONE, zero, &bar->subresourceRange,
+                     true);
+   }
+
+   if (cleared) {
+      hk_sync_xfer_end(cmd);
+      struct hk_cs *cs = cmd->current_cs.cs;
+      if (cs && hk_cdm_visibility_flush_needed(dev, cs, true)) {
+         hk_ensure_cs_has_space(cmd, cs, AGX3_CDM_BARRIER_SIZE);
+         hk_cdm_visibility_flush(dev, cs, true);
+      }
+      hk_cmd_buffer_end_compute(cmd);
+      hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
                        const VkDependencyInfo *pDependencyInfo)
@@ -1358,6 +1412,8 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, flush, true);
    }
+
+   hk_init_discarded_storage_images(cmd, pDependencyInfo);
 
    /* The dependency this barrier recorded is the one a continued instance
     * applies to its stream (hk_sync_merge_rendering()); a stream it created
