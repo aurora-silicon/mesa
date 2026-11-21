@@ -81,8 +81,8 @@ TEST_F(PreamblePriority, EveryFragmentBeatsAColdBranch)
    ralloc_free(s);
 }
 
-/* Only AGX3B weights: AGX3C and the older encodings keep the plain order. */
-TEST_F(PreamblePriority, UnweightedOffAGX3B)
+/* AGX3C and the older encodings weight the same way as AGX3B. */
+TEST_F(PreamblePriority, WeightedOnEveryEncoding)
 {
    const bool agx3[] = {false, true};
    const bool agx3c[] = {false, true};
@@ -90,7 +90,8 @@ TEST_F(PreamblePriority, UnweightedOffAGX3B)
       nir_shader *s = cold_branch_shader();
       unsigned sizes[] = {0, 1000, 1000};
       ASSERT_TRUE(agx_nir_opt_preamble(s, sizes, agx3[i], agx3c[i], &flatten));
-      EXPECT_GT(main_loads(s, 4), 0u) << "agx3c " << agx3c[i];
+      EXPECT_EQ(main_loads(s, 4), 0u) << "agx3c " << agx3c[i];
+      EXPECT_GT(main_loads(s, 1), 0u) << "agx3c " << agx3c[i];
       ralloc_free(s);
    }
 }
