@@ -22,7 +22,7 @@
  *
  * AGX3 now has separate decoders and encoders. Device support remains a
  * stricter question: G17P is admitted only through its exact T8140 contract,
- * while other AGX3 identities stay outside the runnable Honeykrisp path until
+ * while other AGX3 identities stay outside the runnable Borealis path until
  * their independently-versioned pieces are connected.
  */
 
@@ -200,7 +200,7 @@ enum agx_submission_model {
 #define AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE (8)
 
 /*
- * Whether Honeykrisp drives a chip through its native AGX3 path: AGX3b shaders
+ * Whether Borealis drives a chip through its native AGX3 path: AGX3b shaders
  * loaded by Ioto programs, VDM/PPP/CDM records in the HAL200 layout, Gen9
  * descriptors with heap-indexed textures and samplers, firmware-owned USC
  * private memory and no helper programs.
@@ -341,7 +341,7 @@ extern "C" {
 #endif
 
 /* Return the exact command-stream architecture, or UNKNOWN.  Recognition does
- * not imply a complete Honeykrisp upload-to-submit path.  Callers opening a
+ * not imply a complete Borealis upload-to-submit path.  Callers opening a
  * device must check agx_chip_driver_supported, not only UNKNOWN. */
 enum agx_chip
 agx_chip_from_params(const struct drm_asahi_params_global *params);
@@ -649,7 +649,7 @@ agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
 }
 
 /* Whether an image load misses a store made earlier in the same invocation,
- * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
+ * so Borealis forwards the stored value to the load. A18 Pro's loads
  * behave this way; G15 loads observe the invocation's own stores. */
 static inline bool
 agx_chip_image_load_misses_own_store(enum agx_chip chip)

@@ -238,7 +238,7 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    /* Slots are compacted to the attributes the shader reads, so the caller
     * must have refused any shader reading more than AGX_MAX_ATTRIBS of them
-    * (hk_compile_shader does). Reading attribs[] past that was the Fallout:
+    * (brl_compile_shader does). Reading attribs[] past that was the Fallout:
     * New Vegas new-game crash: DXVK's 18-attribute fixed-function vertex
     * shader fetched a garbage key from the stack here.
     */

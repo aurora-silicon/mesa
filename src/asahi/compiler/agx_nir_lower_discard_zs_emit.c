@@ -133,7 +133,7 @@ as_zs_store(nir_instr *instr)
  * Depth/stencil become a single store_zs_agx per block, and that becomes
  * export_agx, which the backend requires in the exit block. Frontends store
  * outputs once at the end, but a pass can later move already-lowered output
- * stores into control flow. Honeykrisp's ordinary-descriptor specialization
+ * stores into control flow. Borealis's ordinary-descriptor specialization
  * clones the whole fragment body into an if/else, so the G17P pass-through
  * depth write from agx_nir_lower_frag_sidefx lands once in each branch
  * (dEQP-VK.glsl.builtin_var.fragdepth.*: "Invalid block form" abort). Route

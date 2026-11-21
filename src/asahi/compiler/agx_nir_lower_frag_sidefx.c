@@ -37,8 +37,8 @@ insert_late_test(nir_builder *b, bool g17p)
 
 /*
  * This pass runs from agx_preprocess_nir, which drivers may call more than once
- * on the same shader: Honeykrisp preprocesses at shader creation
- * (hk_preprocess_nir) and again while lowering (hk_lower_nir). The late test
+ * on the same shader: Borealis preprocesses at shader creation
+ * (brl_preprocess_nir) and again while lowering (brl_lower_nir). The late test
  * must be inserted exactly once. Two sample_mask instructions on the same path
  * run the depth/stencil test twice per sample, which the sample_mask contract
  * documented in agx_nir_lower_sample_mask.c forbids.
@@ -69,9 +69,9 @@ has_sample_mask(nir_shader *s)
 
 /*
  * The hardware skips a fragment shader with side effects outright when the
- * depth test is NEVER, so the driver does not program NEVER at all: hk forces
+ * depth test is NEVER, so the driver does not program NEVER at all: Borealis forces
  * the depth comparison to ALWAYS whenever a side-effecting shader is drawn
- * under VK_COMPARE_OP_NEVER (hk_cmd_draw.c, draw.force_never_in_shader, in
+ * under VK_COMPARE_OP_NEVER (brl_cmd_draw.c, draw.force_never_in_shader, in
  * both the common FRAGMENT_FACE path and the native HAL200 depth words) and
  * expects the shader to emulate the test instead.
  *

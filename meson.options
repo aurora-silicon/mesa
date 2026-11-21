@@ -194,11 +194,12 @@ option(
   value : ['auto'],
   choices : ['auto', 'amd', 'broadcom', 'freedreno', 'intel', 'intel_hasvk',
              'panfrost', 'swrast', 'virtio', 'imagination',
-             'microsoft-experimental', 'nouveau', 'asahi', 'gfxstream',
-             'kosmickrisp', 'all'],
+             'microsoft-experimental', 'nouveau', 'borealis', 'asahi',
+             'gfxstream', 'kosmickrisp', 'all'],
   description : 'List of vulkan drivers to build. If this is set to auto ' +
                 'all drivers applicable to the target OS/architecture ' +
-                'will be built'
+                'will be built. \'asahi\' is a deprecated alias for ' +
+                '\'borealis\'.'
 )
 
 # Note that the freedreno gallium driver doesn't support KGSL.

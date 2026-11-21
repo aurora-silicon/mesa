@@ -8,7 +8,7 @@
 #include "asahi/lib/agx_abi.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/lib/agx_pbe_agx3_core.h"
-#include "asahi/vulkan/hk_native_descriptor.h"
+#include "borealis/vulkan/brl_native_descriptor.h"
 #include "util/macros.h"
 
 #include <stdio.h>
@@ -141,7 +141,7 @@ test_feature_gates(void)
 static void
 test_g17p_txf_sampler(void)
 {
-   /* Same byte-exact sampler-zero vector as Honeykrisp's known-good G17P
+   /* Same byte-exact sampler-zero vector as Borealis's known-good G17P
     * texture.read() path. The full hardware heap element is 32 bytes. */
    static const uint8_t expected[AGX_GALLIUM_SAMPLER_AGX3_SIZE] = {
       0x00, 0x00, 0x0e, 0x68, 0x1b, 0x00, 0x00, 0x00,
@@ -167,7 +167,7 @@ test_g17p_txf_sampler(void)
                 sizeof(sampler)) != 0);
 
    /* G18G packs the same fetch sampler as G17G's Gen5 record (the generation
-    * hk_pack_native_sampler emits there): the compare-mode selector is set
+    * brl_pack_native_sampler emits there): the compare-mode selector is set
     * even without a comparison. */
    static const uint8_t expected_g18g[AGX_GALLIUM_SAMPLER_AGX3_SIZE] = {
       0x00, 0x00, 0x0f, 0x68, 0x1b, 0x04, 0x00, 0x00,
@@ -517,7 +517,7 @@ test_agx3_pbe(void)
    bad[6].dimension = AGX_TEXTURE_DIMENSION_1D;
    bad[7].mode = AGX_IMAGE_MODE_SPARSE;
 
-   /* sRGB on store is Gen9-only, as in hk_pack_native_pbe(). */
+   /* sRGB on store is Gen9-only, as in brl_pack_native_pbe(). */
    struct AGX_PBE srgb = rt;
    srgb.srgb = true;
    CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
@@ -544,7 +544,7 @@ test_agx3_pbe(void)
       }
    }
 
-   /* Match the exact shared/Honeykrisp Gen9 layered EOT descriptor. Array
+   /* Match the exact shared/Borealis Gen9 layered EOT descriptor. Array
     * storage is tiled, base-level-only and Gen9-only; every adjacent shape
     * stays closed. */
    struct AGX_PBE array = rt;
@@ -576,7 +576,7 @@ test_agx3_pbe(void)
    CHECK(memcmp(native.opaque, expected_array.bytes,
                 sizeof(expected_array.bytes)) == 0);
    /* A mipmapped array level and a 3D level take the Gen9 mip packets
-    * Honeykrisp stores storage images with. */
+    * Borealis stores storage images with. */
    array.level = 1;
    array.levels = 2;
    CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
@@ -603,11 +603,11 @@ test_agx3_pbe(void)
 }
 
 /* Image atomics decode one packed addressing word from the G17P storage
- * tail; Gallium and Honeykrisp must write it identically. */
+ * tail; Gallium and Borealis must write it identically. */
 /* G17P's compressed colour render target as agx_batch_upload_pbe() builds it
  * for an end-of-tile store: GPU tiling, one level, one layer, the metadata
  * address in the extended word. These are the native bytes
- * test-hk-native-descriptor.c pins for Honeykrisp: a live 1024x1024 RGBA8
+ * test-brl-native-descriptor.c pins for Borealis: a live 1024x1024 RGBA8
  * record and independent packets at display sizes.
  */
 static void
@@ -697,7 +697,7 @@ test_g17p_image_atomic_sw(void)
       const bool ok_a = agx_g17p_pack_image_atomic_sw(
          cases[i].level_offset_B, cases[i].tile_w, cases[i].tile_h,
          cases[i].layer_stride_B, cases[i].samples, &a);
-      const bool ok_b = hk_pack_g17p_image_atomic_sw(
+      const bool ok_b = brl_pack_g17p_image_atomic_sw(
          cases[i].level_offset_B, cases[i].tile_w, cases[i].tile_h,
          cases[i].layer_stride_B, cases[i].samples, &b);
       CHECK(ok_a == ok_b);

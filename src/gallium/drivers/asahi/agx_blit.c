@@ -227,7 +227,7 @@ asahi_compute_blit_supported(enum agx_chip chip,
    /* Gallium's compute blitter reaches agx_launch_grid() and therefore
     * agx_cdm_launch(), whose packet is the AGX2 compute command format, and
     * agx_upload_textures()'s legacy storage PBE descriptor. AGX3-encoding
-    * parts need the native Ioto program/launch path Honeykrisp already uses;
+    * parts need the native Ioto program/launch path Borealis already uses;
     * on HAL200 the internal block-image kernel aborts in
     * agx_native_descriptor_rejected("storage PBE") before it is ever
     * submitted. Take the fully supported render blitter until native Gallium

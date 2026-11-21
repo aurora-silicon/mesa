@@ -2698,7 +2698,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
         (normalized || I->format == AGX_FORMAT_I8)));
    /* A bindless store names its descriptor set's uniform halves as the PBE
     * heap (f79) and carries the PBE record index in a GPR (f92);
-    * hk_g17p_lower_storage_records() converts the byte offset to that index.
+    * brl_g17p_lower_storage_records() converts the byte offset to that index.
     * Heap and index are independent operands, and the state operand's form
     * is independent of f70 (normalized data): int and uint encode alike. */
    const bool heap_state =
@@ -2726,7 +2726,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
     * staged like z: Gallium describes its PBE as 3D (agx_batch_upload_pbe), a
     * single-level 3D slice being a 2D-array layer. The G17P PACK_IMGWIR layer
     * did not reach the G17G write (every layer landed in layer 0). G17C takes
-    * the layer operand, and its array descriptors (Honeykrisp keeps them, and
+    * the layer operand, and its array descriptors (Borealis keeps them, and
     * Gallium does on G17C) need it: their layer count does not shrink with
     * the selected mip level, unlike 3D depth.
     */
@@ -2910,7 +2910,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
    } else {
       const uint16_t base = heap_uniform_base + (d.image_value == 1 ? 4 : 0);
       const uint8_t staging_slot = d.image_value == 0 ? 1 : 2;
-      /* hk's read/write state-0 ABI points state 0 at the texture/PBE pair
+      /* Borealis's read/write state-0 ABI points state 0 at the texture/PBE pair
        * (agx_shader_key::g17p_storage_image_pair); record 0 there is the
        * texture, which as a PBE describes a far larger surface and sends the
        * stores past the image. Take the PBE as record 1 of the same heap. */
@@ -10044,10 +10044,10 @@ agx3_g17p_mrt_partition(const struct agx3_g17p_mrt_protocol *p,
 }
 
 /* Metal has no geometry or tessellation-control stage: Apple compiles both as
- * kernels, and Honeykrisp launches them the same way, through CDM. Their
+ * kernels, and Borealis launches them the same way, through CDM. Their
  * texture fetches must therefore take the kernel path here. The unstaged form
  * returns only x and y on AGX3B -- see the `staged` decision below -- and it
- * also leaves the staging footprint unknown, which makes hk_dispatch_g17p_
+ * also leaves the staging footprint unknown, which makes brl_dispatch_g17p_
  * native() refuse the dispatch outright. */
 static inline bool
 agx3_stage_runs_as_kernel(mesa_shader_stage stage)
@@ -10381,7 +10381,7 @@ agx3_g17p_mrt_protocol(agx_context *ctx)
    const bool single_target_blend =
       ctx->key->fs.nr_samples > 1 && tile_loads && !multi_block;
 
-   /* A multisample eMRT epilog may have a single resident partition: hk
+   /* A multisample eMRT epilog may have a single resident partition: Borealis
     * spills reloaded multisample attachments wider than
     * AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE, leaving one eight-byte
     * target in the tile and the others as image stores, which carry no pixel
@@ -16049,10 +16049,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                  I->sr == AGX_SR_COVERAGE_MASK)) &&
                ctx->stage == MESA_SHADER_FRAGMENT;
             /* A G17P tessellation-control program is a compute dispatch
-             * (hk_launch_tess(); hk_shader.c gives it the compute
+             * (brl_launch_tess(); brl_shader.c gives it the compute
              * texture/sampler heaps), so SR34/SR36 read the same subgroup
              * state as in compute. So is the main geometry kernel
-             * (hk_launch_gs_prerast()), which runs one GS invocation per
+             * (brl_launch_gs_prerast()), which runs one GS invocation per
              * thread. M5 object (task) and mesh programs read SR34 the same
              * way: a native G17G first-thread election in an object
              * shader reads SR34 into a half register. A G17P mesh program is
@@ -17171,7 +17171,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
          /* A 32-bit roundeven had no handler here and fell through to the
           * select core, whose f32rint encoding point holds its source in a
           * six-bit field and therefore refuses any source above r63. That is
-          * not a rare shape: hk lowers every float texture result through a
+          * not a rare shape: Borealis lowers every float texture result through a
           * scaled-view recovery whose integer fetch ends in fround_even, and
           * one unrolled loop of texelFetch() puts those sources well past
           * r63. A refusal is fatal -- the shader does not compile and
@@ -21333,7 +21333,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                                      &encoded_wait))
                   AGX3_REFUSE(I);
                /* Neither form has a field for slot 7 or 8, which AGX3C hands
-                * out once more results are in flight: hk's image-to-buffer
+                * out once more results are in flight: Borealis's image-to-buffer
                 * copy loads four texels a thread, and its UNORM repack
                 * sat(texel + -0.0) can wait on a texel load that got slot 8.
                 * Retire such a wait through the band carrier on the

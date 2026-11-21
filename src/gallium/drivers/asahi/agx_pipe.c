@@ -442,7 +442,7 @@ agx_twiddled_allowed(const struct agx_resource *pres)
 }
 
 /* G17P depth: a private, single-level, single-layer, single-sample Z32F
- * depth buffer, as Honeykrisp compresses (hk_g17p_compression_depth_format()).
+ * depth buffer, as Borealis compresses (brl_g17p_compression_depth_format()).
  * ZLS writes it compressed through the metadata agx_batch already passes, and
  * the compressed Gen9 2D texture packet reads it. On the M4 Max this is
  * byte-identical to plain depth through depth testing across passes,
@@ -461,7 +461,7 @@ agx_g17p_private_depth_compression_allowed(const struct agx_device *dev,
 /* G17P compresses a private, single-level, single-layer, single-sample 2D
  * colour image of agx_g17p_compression_color_format(): written by the
  * compressed Gen9 2D PBE (end-of-tile stores, blits, staging uploads) and
- * read by the compressed texture descriptor, the packets Honeykrisp
+ * read by the compressed texture descriptor, the packets Borealis
  * compresses its own G17P colour images with. Nothing decompresses such an
  * image in place: its format never spills from the tilebuffer, and it is
  * neither shared nor scanned out, so a feedback loop or a shader-image
@@ -1420,7 +1420,7 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       agx_batch_init_state(batch);
       const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
       /* A spilling multisample tilebuffer clears every target with the
-       * draw, as Honeykrisp does: a background clear of the resident targets
+       * draw, as Borealis does: a background clear of the resident targets
        * would leave the draw's epilog to preserve them by reading the tile
        * back, a multisample eMRT shape the packer refuses. On G17P such a
        * tilebuffer is always wider than the uncovered-tile limit, which
@@ -1734,8 +1734,8 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    /* G17P treats an absent ZLS allocation as an inactive depth surface.  Its
     * native render command keeps the clear register at 1.0 in that state;
     * zero is only a real clear value when depth or stencil storage exists.
-    * Honeykrisp submits M5 renders on the G17 runtime the same way
-    * (hk_drm_g17p_depth_clear). */
+    * Borealis submits M5 renders on the G17 runtime the same way
+    * (brl_drm_g17p_depth_clear). */
    if ((agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
         agx_m5_render_resources(dev)) && !zres &&
        !sres)

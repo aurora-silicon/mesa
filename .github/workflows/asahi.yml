@@ -1,6 +1,6 @@
 name: asahi
 
-# Builds the Asahi Gallium and Honeykrisp Vulkan drivers with their unit tests
+# Builds the Asahi Gallium and Borealis Vulkan drivers with their unit tests
 # on 64-bit Arm Linux and runs the asahi test suite.
 
 on:
@@ -40,7 +40,7 @@ jobs:
       - name: Configure
         run: |
           CC="ccache clang" CXX="ccache clang++" meson setup build \
-            -Dgallium-drivers=asahi -Dvulkan-drivers=asahi \
+            -Dgallium-drivers=asahi -Dvulkan-drivers=borealis \
             -Dplatforms=wayland,x11 -Dbuild-tests=true -Dtools=drm-shim
 
       - name: Build

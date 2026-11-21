@@ -5065,7 +5065,7 @@ agx3_alu_rcp(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
     * enforces that, so the gate here only has to agree with it. At 128 it did
     * not: AGX_NUM_REGS is 256 half-registers, so a shader under any real
     * register pressure gets a reciprocal whose destination is above 128, and
-    * hk_shader.c turns a packer refusal into VK_ERROR_FEATURE_NOT_PRESENT for
+    * brl_shader.c turns a packer refusal into VK_ERROR_FEATURE_NOT_PRESENT for
     * the whole pipeline. Three of the ten distinct programs three.js compiles
     * for its first few examples died on `rcp [d32:reg140 s0=32:reg86.abs]`. */
    const bool m5 = enc == AGX_ISA_ENCODING_AGX3C;

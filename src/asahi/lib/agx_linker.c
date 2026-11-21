@@ -151,7 +151,7 @@ static const uint8_t sample_loop_footer[] = {
  * 1 KiB closure the witness proved on hardware.  So this rule reproduces the
  * witness byte for byte rather than merely resembling it.
  *
- * Honeykrisp's compute path guarantees no preamble, so the constant program
+ * Borealis's compute path guarantees no preamble, so the constant program
  * is the witness's minimal terminating one.
  */
 #define AGX3_CONTAINER_LEAD        0x340u

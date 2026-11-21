@@ -1,13 +1,13 @@
 Borealis render-pass barriers
 =============================
 
-``hk_barrier_classify()`` decides whether an in-pass dependency needs a
+``brl_barrier_classify()`` decides whether an in-pass dependency needs a
 physical render boundary. Its result is a set of reasons, rather than a
 test for a nonzero destination access mask. It has no GPU or DRM dependency;
-``hk_barrier`` in the Asahi Meson test suite exercises the production function.
+``brl_barrier`` in the Asahi Meson test suite exercises the production function.
 
 The API render-pass instance remains open across physical splits. Dependencies
-still go through ``hk_sync_pass_barrier()`` and expire at its end. A continued
+still go through ``brl_sync_pass_barrier()`` and expire at its end. A continued
 render waits for the preceding physical render. A software vertex stream
 excludes in-pass fragment-only destinations; otherwise introducing geometry or
 tessellation work after a local barrier could create a forward dependency on

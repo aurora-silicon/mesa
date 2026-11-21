@@ -422,7 +422,7 @@ struct agx_fs_epilog_key {
 };
 
 /* Apply framebuffer rules which are properties of the hardware generation,
- * not API state. Keep Gallium and Honeykrisp on the same epilog contract. */
+ * not API state. Keep Gallium and Borealis on the same epilog contract. */
 void agx_fs_epilog_apply_device_policy(enum agx_chip chip,
                                        struct agx_fs_epilog_key *key);
 

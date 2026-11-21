@@ -273,7 +273,7 @@ if _vulkan_drivers.contains('auto')
     if host_machine.cpu_family().startswith('x86')
       _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'nouveau', 'swrast']
     elif ['aarch64'].contains(host_machine.cpu_family())
-      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'asahi']
+      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'borealis']
     elif ['arm'].contains(host_machine.cpu_family())
       _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno']
     elif ['mips', 'mips64', 'ppc', 'ppc64', 'riscv32', 'riscv64'].contains(host_machine.cpu_family())
@@ -296,7 +296,18 @@ elif _vulkan_drivers.contains('all')
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
                       'imagination', 'microsoft-experimental',
-                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp']
+                      'nouveau', 'borealis', 'gfxstream', 'kosmickrisp']
+endif
+
+# Borealis was built as 'asahi' before it was renamed. Keep accepting the old
+# name so existing build scripts and packaging keep working.
+if _vulkan_drivers.contains('asahi')
+  warning('-Dvulkan-drivers=asahi is deprecated, use -Dvulkan-drivers=borealis')
+  _vk_renamed = []
+  foreach _d : _vulkan_drivers
+    _vk_renamed += _d == 'asahi' ? 'borealis' : _d
+  endforeach
+  _vulkan_drivers = _vk_renamed
 endif
 
 with_intel_vk = _vulkan_drivers.contains('intel')
@@ -311,7 +322,7 @@ with_imagination_vk = _vulkan_drivers.contains('imagination')
 with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
-with_asahi_vk = _vulkan_drivers.contains('asahi')
+with_asahi_vk = _vulkan_drivers.contains('borealis')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
 with_any_vk = _vulkan_drivers.length() != 0

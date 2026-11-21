@@ -704,7 +704,7 @@ subgroup_instr(const nir_instr *instr)
 
 /* Whether every active lane of the quad has all samples in `killed`.
  * Spelled with the AGX quad ballot directly (subgroup lowering has already
- * run when hk lowers discards) and as a compare against zero, the quad
+ * run when Borealis lowers discards) and as a compare against zero, the quad
  * ballot form G17P encodes. */
 static nir_def *
 quad_fully_killed(nir_builder *b, nir_def *killed)
@@ -1552,7 +1552,7 @@ agx_nir_lower_g18_tile_samples(nir_shader *s, unsigned nr_samples)
 bool
 agx_nir_lower_g17p_1x_tile_samples(nir_shader *s)
 {
-   /* Honeykrisp advertises only one sample on G17P.  Per-sample epilog
+   /* Borealis advertises only one sample on G17P.  Per-sample epilog
     * lowering still materializes `1 << sample_id`, but sample_id can only be
     * zero.  Native 1x fragments encode the ordinary whole-pixel LSTCOL/LLDCOL
     * forms, which carry no sample operand. */

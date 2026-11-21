@@ -401,7 +401,7 @@ libagx_buffer_texture_offset(constant struct agx_texture_packed *ptr, uint x)
  * Whether texel x of a texel buffer lies in an unbound sparse page, from the
  * device-wide map of non-resident pages: a 16-byte header, then one bit per
  * 16 KiB page of [heap_base, heap_base + heap_size), set while the page is
- * not resident.  The descriptor is the plain linear 2D texture hk builds over
+ * not resident.  The descriptor is the plain linear 2D texture Borealis builds over
  * the buffer's read-only alias, AGX_TEXTURE_BUFFER_WIDTH texels wide, so the
  * texel size is its row stride over its width.  Out-of-bounds texels, RGB32
  * views and buffers outside the heap count as resident.

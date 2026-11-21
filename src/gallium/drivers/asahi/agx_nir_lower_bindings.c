@@ -1144,7 +1144,7 @@ agx_nir_rebind_g17p_texture_crawls(nir_shader *shader)
  * bindless image handle is the stage texture table (the uniform) plus a byte
  * offset into it, and every descriptor in that table, texture or PBE, is one
  * record wide. Divide the offset by the record size for the stores that reach
- * the backend. This is the Gallium side of hk_g17p_lower_storage_records().
+ * the backend. This is the Gallium side of brl_g17p_lower_storage_records().
  *
  * It must run after the sysval layout has assigned the table's uniform to the
  * handle, and after texture lowering: atomics and multisampled stores are

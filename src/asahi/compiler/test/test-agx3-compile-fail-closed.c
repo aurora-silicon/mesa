@@ -612,7 +612,7 @@ check_g17p_subgroup_quad_compute(bool valid_lane)
  *
  *   agx3_pack_binary.c: no grounded AGX3 encoding for quad_shuffle
  *     [d16:reg13 s0=16:reg13 s1=32:reg2 ...]
- *   hk: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
+ *   borealis: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
  *
  * measured on Neo (G17P, A18 Pro).  The backend widens that shape to the
  * 32-bit register-lane form, which is the same one nir_lower_subgroups
@@ -1028,21 +1028,21 @@ check_shared_atomic_compute(enum agx_isa_encoding encoding)
 
 /*
  * Mirrors the G17P milestone compute probe shader in the shape the AGX3
- * backend actually receives it, i.e. after Honeykrisp lowering:
+ * backend actually receives it, i.e. after Borealis lowering:
  *
  *   - the deliberately-oversized 65-entry constant array becomes
- *     nir->constant_data plus a load_constant, and hk_nir_lower_descriptors.c
+ *     nir->constant_data plus a load_constant, and brl_nir_lower_descriptors.c
  *     (lower_load_constant, :66-93) rewrites that into a speculatable global
  *     load through the root descriptor's cs.constant_data_addr;
  *   - the SSBO store becomes a global store through a descriptor-set pointer;
- *   - hk_shader.c lower_uniforms (:1026-1057) turns load_root_agx and
+ *   - brl_shader.c lower_uniforms (:1026-1057) turns load_root_agx and
  *     load_descriptor_set_agx into load_preamble uniform reads.
  *
  * No other AGX3 test compiles a compute shader carrying NIR constant data,
- * and hk_dispatch_g17p_native() has no fallback: if this shape does not
+ * and brl_dispatch_g17p_native() has no fallback: if this shape does not
  * compile, or if the promoted-constant range that falls out of it is not
- * 32-bit aligned in both base and size, hk_g17p_compute_uniform_ranges()
- * (hk_cmd_dispatch.c:168-196) rejects the dispatch with
+ * 32-bit aligned in both base and size, brl_g17p_compute_uniform_ranges()
+ * (brl_cmd_dispatch.c:168-196) rejects the dispatch with
  * VK_ERROR_FEATURE_NOT_PRESENT.  Both facts are asserted here.
  */
 static bool
@@ -1050,7 +1050,7 @@ check_constant_data_compute(enum agx_isa_encoding encoding, bool soft_fault)
 {
    static const uint8_t end[] = {0x0e, 0x00, 0x00, 0x00};
 
-   /* Byte offset of cs.constant_data_addr inside the Honeykrisp root
+   /* Byte offset of cs.constant_data_addr inside the Borealis root
     * descriptor table.  The exact value is immaterial to the encoding; what
     * matters is that the address is loaded out of the root rather than being
     * an immediate.
@@ -1098,10 +1098,10 @@ check_constant_data_compute(enum agx_isa_encoding encoding, bool soft_fault)
 
    agx_preprocess_nir(b.shader);
 
-   /* Exactly the backend key hk_compile_shader() builds for a G17P compute
-    * shader with one descriptor set (hk_shader.c:1220-1250): root == 0 for
+   /* Exactly the backend key brl_compile_shader() builds for a G17P compute
+    * shader with one descriptor set (brl_shader.c:1220-1250): root == 0 for
     * compute, so reserved_preamble == 4 * (1 + set_count), and G17P forces
-    * no_preamble because hk_g17p_compute_shader_supported() refuses a
+    * no_preamble because brl_g17p_compute_shader_supported() refuses a
     * preamble.  soft_fault is exercised both
     * ways: the kernel advertises DRM_ASAHI_FEATURE_SOFT_FAULTS whenever its
     * fault_control module parameter is 0xb, which is the default, but
@@ -1146,7 +1146,7 @@ check_constant_data_compute(enum agx_isa_encoding encoding, bool soft_fault)
    if (!valid)
       fprintf(stderr,
               "AGX3 constant-data shader does not satisfy "
-              "hk_g17p_compute_shader_supported(): binary_size %u "
+              "brl_g17p_compute_shader_supported(): binary_size %u "
               "main_offset %u main_size %u instrs %u local_size %u "
               "scratch %u preamble_scratch %u has_preamble %u nr_gprs %u "
               "push_count %u tex %u smp %u heap %u txf %u "
@@ -1183,13 +1183,13 @@ check_constant_data_compute(enum agx_isa_encoding encoding, bool soft_fault)
                        (uint64_t)part.info.binary_size - rodata->offset)) {
          fprintf(stderr,
                  "AGX3 constant-data rodata range (base %u, size_16 %u) is "
-                 "not bindable by hk_g17p_compute_uniform_ranges()\n",
+                 "not bindable by brl_g17p_compute_uniform_ranges()\n",
                  rodata->base_uniform, rodata->size_16);
          valid = false;
       }
 
       /* The rodata range must sit above the root/descriptor-set uniforms that
-       * hk_agx3_g17p_root_range() already claims, or the two Ioto uniform
+       * brl_agx3_g17p_root_range() already claims, or the two Ioto uniform
        * ranges would overlap.
        */
       if (valid && rodata->base_uniform < 4 * (1 + 1)) {
@@ -1412,11 +1412,11 @@ check_preamble_entry_gpr(enum agx_isa_encoding encoding, bool g18g,
 }
 
 /*
- * hk_nir_lower_descriptors.c lower_load_constant (:66-93), reproduced so this
- * test can run the same ordering Honeykrisp does without linking libhk.
+ * brl_nir_lower_descriptors.c lower_load_constant (:66-93), reproduced so this
+ * test can run the same ordering Borealis does without linking libbrl.
  */
 static bool
-lower_load_constant_like_hk(nir_builder *b, nir_intrinsic_instr *intr,
+lower_load_constant_like_brl(nir_builder *b, nir_intrinsic_instr *intr,
                             UNUSED void *data)
 {
    if (intr->intrinsic != nir_intrinsic_load_constant)
@@ -1501,8 +1501,8 @@ g17p_backend_key(enum agx_isa_encoding encoding, struct agx_shader_key *key)
  * The pass-ordering contract for G17P constant data, pinned in both
  * directions.
  *
- * Honeykrisp must run nir_opt_large_constants BEFORE agx_preprocess_nir
- * (hk_shader.c hk_preprocess_nir_internal).  Run it after and the array is
+ * Borealis must run nir_opt_large_constants BEFORE agx_preprocess_nir
+ * (brl_shader.c brl_preprocess_nir_internal).  Run it after and the array is
  * already scratch, nir_opt_large_constants has no function_temp variable left
  * to move, and the shader reaches the backend as stack_store/stack_load.
  * AGX3B now has a grounded dynamic/static TPS path for that fallback.
@@ -1521,7 +1521,7 @@ check_constant_array_ordering(enum agx_isa_encoding encoding, bool ordered)
    agx_preprocess_nir(b.shader);
 
    NIR_PASS(_, b.shader, nir_shader_intrinsics_pass,
-            lower_load_constant_like_hk, nir_metadata_control_flow, NULL);
+            lower_load_constant_like_brl, nir_metadata_control_flow, NULL);
    agx_preprocess_nir(b.shader);
 
    const bool has_constants = b.shader->constant_data_size != 0;
@@ -1563,7 +1563,7 @@ check_constant_array_ordering(enum agx_isa_encoding encoding, bool ordered)
 
       if (encoding == AGX_ISA_ENCODING_AGX3B) {
          /* The grounded AGX3B TPS backend must preserve it in a launchable,
-          * bounded private frame. hk_g17p_compute_shader_supported() already
+          * bounded private frame. brl_g17p_compute_shader_supported() already
           * admits this same 4096-byte bound. */
          if (valid)
             valid = compiled && part.binary != NULL &&

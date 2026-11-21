@@ -2732,7 +2732,7 @@ test_m5_array_sample(void)
 }
 
 /* Apple's native fragment-array instructions use the complete Apple sample
- * ABI: f83/f112=4/8 plus direct f31/f37 layer selection. Honeykrisp's
+ * ABI: f83/f112=4/8 plus direct f31/f37 layer selection. Borealis's
  * descriptor heaps instead require the independently qualified 0/4 profile
  * paired with the PACK_SMPIR private layer selected by f77=2. Keep both exact
  * encodings without erasing the native immediate/register provenance.

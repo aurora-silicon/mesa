@@ -80,7 +80,7 @@ struct agx_unlinked_uvs_layout {
 static_assert(sizeof(struct agx_unlinked_uvs_layout) == 88, "packed");
 
 /* Both copies of a canonical layout's varyings fit the G17P native vertex
- * program's 125 user words (HK_AGX3_G17P_MAX_USER_WORDS).
+ * program's 125 user words (BRL_AGX3_G17P_MAX_USER_WORDS).
  */
 #define AGX_UVS_CANONICAL_MAX_WORDS 124
 

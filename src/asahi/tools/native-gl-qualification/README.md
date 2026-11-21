@@ -13,12 +13,12 @@ CTS revision, binary SHA256 and deqp-runner version. Do not mix builds between
 the two driver paths. Do not use an x86 DRM-shim build as a hardware result.
 
 An overlay has `usr/lib64/` or `usr/lib/` with Mesa EGL, GLX, GBM, Gallium,
-Honeykrisp, the `gbm/dri_gbm.so` backend, and relative `dri/asahi_dri.so` and
+Borealis, the `gbm/dri_gbm.so` backend, and relative `dri/asahi_dri.so` and
 `dri/zink_dri.so` links.
 `with-mesa.py` checks that its library links remain inside the overlay, creates
 absolute loader JSON files, and overrides library search paths only in the
 child. Native runs unset both driver selectors so the loader selects Asahi.
-Zink runs select Zink and the overlay's Honeykrisp ICD explicitly. Mesa's shader
+Zink runs select Zink and the overlay's Borealis ICD explicitly. Mesa's shader
 cache is disabled by default; `--cache on` explicitly enables it for warm runs.
 
 Package a native aarch64 release build with `DESTDIR` (never a system install):
@@ -34,7 +34,7 @@ python3 src/asahi/tools/native-gl-qualification/make-overlay.py \
 Alternatively extract the matching native RPM artifact into a fresh staging
 directory with `rpm2cpio`/`cpio`, then run the same packager with the recorded
 source commit. Select the native artifact, not FEX or source RPMs. The packager
-checks source identity in Gallium/Honeykrisp, ELF architecture and absence of
+checks source identity in Gallium/Borealis, ELF architecture and absence of
 LLVM/SPIRV-Tools runtime dependencies, and records SHA256 hashes and dynamic
 dependencies in `MANIFEST.json`. Preserve the original RPM/archive checksums.
 It includes Mesa's license notices from the source tree containing the kit;
@@ -183,7 +183,7 @@ temporarily; Mesa libraries stay entirely in the overlay.
 Confirm the **greeter** gnome-shell PID (not the user's compositor) maps the
 candidate `libgallium` path. Zink symlinks also resolve to libgallium, so absence
 of `zink_dri.so` in maps is not proof of native GL; inspect the filtered driver
-selectors in its environment and absence of `libvulkan_asahi.so` too. Repeat
+selectors in its environment and absence of `libvulkan_borealis.so` too. Repeat
 the avatar test on the real greeter, with a fresh launch. Preserve capture,
 journal interval, loaded library identity and result.
 

@@ -1,0 +1,912 @@
+/*
+ * Copyright 2024 Valve Corporation
+ * Copyright 2024 Alyssa Rosenzweig
+ * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
+ * SPDX-License-Identifier: MIT
+ */
+#include "brl_device_memory.h"
+
+#include "brl_device.h"
+#include "brl_queue.h"
+#include "brl_entrypoints.h"
+#include "brl_image.h"
+#include "brl_instance.h"
+#include "brl_physical_device.h"
+
+#include "asahi/lib/agx_bo.h"
+#include "util/u_atomic.h"
+#include "util/u_debug.h"
+#include "vk_common_entrypoints.h"
+
+#include "asahi/lib/agx_device.h"
+#include "util/log.h"
+#include "util/os_misc.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+/* GPU memory is system memory that the kernel cannot evict or swap, and
+ * heapBudget is only advisory, so the heap limit alone lets a process (or
+ * several) take every free page and invoke the OOM killer on the desktop.
+ * Refuse an allocation of 1 MiB or more that would leave less than
+ * max(1 GiB, 2% of RAM) available. Applications that allocate per tensor
+ * (tens of MiB per call) are covered. Smaller allocations always pass:
+ * below the reserve every vkAllocateMemory would fail, including ones the
+ * compositor needs.
+ */
+#define BRL_MEMORY_RESERVE_MIN   (1ull << 30)
+#define BRL_MEMORY_CHECK_MIN     (1ull << 20)
+
+static bool
+brl_system_memory_fits(uint64_t size)
+{
+   uint64_t available, total;
+
+   if (size < BRL_MEMORY_CHECK_MIN)
+      return true;
+
+   /* If the kernel does not tell us, only the heap limit applies. */
+   if (!os_get_available_system_memory(&available))
+      return true;
+
+   uint64_t reserve = BRL_MEMORY_RESERVE_MIN;
+   if (os_get_total_physical_memory(&total))
+      reserve = MAX2(reserve, total / 50);
+
+   return available >= size + reserve;
+}
+
+/* Supports opaque fd only */
+const VkExternalMemoryProperties brl_opaque_fd_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+};
+
+/* Supports opaque fd and dma_buf. */
+const VkExternalMemoryProperties brl_dma_buf_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT |
+                             VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+};
+
+/* Host allocations can be imported, nothing can be exported from them. */
+const VkExternalMemoryProperties brl_host_ptr_mem_props = {
+   .externalMemoryFeatures = VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .exportFromImportedHandleTypes = 0,
+   .compatibleHandleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+};
+
+static enum agx_bo_flags
+brl_memory_type_flags(const VkMemoryType *type,
+                     VkExternalMemoryHandleTypeFlagBits handle_types)
+{
+   unsigned flags = 0;
+
+   if (handle_types)
+      flags |= AGX_BO_SHARED | AGX_BO_SHAREABLE;
+
+   return flags;
+}
+
+static void
+brl_add_ext_bo_locked(struct brl_device *dev, struct agx_bo *bo)
+{
+   uint32_t id = bo->uapi_handle;
+
+   unsigned count = util_dynarray_num_elements(&dev->external_bos.list,
+                                               struct asahi_ccmd_submit_res);
+
+   for (unsigned i = 0; i < count; i++) {
+      struct asahi_ccmd_submit_res *p = util_dynarray_element(
+         &dev->external_bos.list, struct asahi_ccmd_submit_res, i);
+
+      if (p->res_id == id) {
+         ++*util_dynarray_element(&dev->external_bos.counts, unsigned, i);
+         return;
+      }
+   }
+
+   struct asahi_ccmd_submit_res res = {
+      .res_id = id,
+      .flags = ASAHI_EXTRES_READ | ASAHI_EXTRES_WRITE,
+   };
+   util_dynarray_append(&dev->external_bos.list, res);
+   util_dynarray_append_typed(&dev->external_bos.counts, unsigned, 1);
+}
+
+static void
+brl_add_ext_bo(struct brl_device *dev, struct agx_bo *bo)
+{
+   if (dev->dev.is_virtio) {
+      u_rwlock_wrlock(&dev->external_bos.lock);
+      brl_add_ext_bo_locked(dev, bo);
+      u_rwlock_wrunlock(&dev->external_bos.lock);
+   }
+}
+
+static void
+brl_remove_ext_bo_locked(struct brl_device *dev, struct agx_bo *bo)
+{
+   uint32_t id = bo->uapi_handle;
+   unsigned count = util_dynarray_num_elements(&dev->external_bos.list,
+                                               struct asahi_ccmd_submit_res);
+
+   for (unsigned i = 0; i < count; i++) {
+      struct asahi_ccmd_submit_res *p = util_dynarray_element(
+         &dev->external_bos.list, struct asahi_ccmd_submit_res, i);
+
+      if (p->res_id == id) {
+         unsigned *ctr =
+            util_dynarray_element(&dev->external_bos.counts, unsigned, i);
+         if (!--*ctr) {
+            *ctr = util_dynarray_pop(&dev->external_bos.counts, unsigned);
+            *p = util_dynarray_pop(&dev->external_bos.list,
+                                   struct asahi_ccmd_submit_res);
+         }
+         return;
+      }
+   }
+
+   UNREACHABLE("BO not found");
+}
+
+static void
+brl_remove_ext_bo(struct brl_device *dev, struct agx_bo *bo)
+{
+   if (dev->dev.is_virtio) {
+      u_rwlock_wrlock(&dev->external_bos.lock);
+      brl_remove_ext_bo_locked(dev, bo);
+      u_rwlock_wrunlock(&dev->external_bos.lock);
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_GetMemoryFdPropertiesKHR(VkDevice device,
+                            VkExternalMemoryHandleTypeFlagBits handleType,
+                            int fd,
+                            VkMemoryFdPropertiesKHR *pMemoryFdProperties)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   struct brl_physical_device *pdev = brl_device_physical(dev);
+   struct agx_bo *bo;
+
+   switch (handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+      bo = agx_bo_import(&dev->dev, fd);
+      if (bo == NULL)
+         return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      break;
+   default:
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
+
+   uint32_t type_bits = 0;
+   for (unsigned t = 0; t < ARRAY_SIZE(pdev->mem_types); t++) {
+      const unsigned flags =
+         brl_memory_type_flags(&pdev->mem_types[t], handleType);
+      if (!(flags & ~bo->flags))
+         type_bits |= (1 << t);
+   }
+
+   pMemoryFdProperties->memoryTypeBits = type_bits;
+
+   agx_bo_unreference(&dev->dev, bo);
+
+   return VK_SUCCESS;
+}
+
+/* Memory priority 1.0 asks the kernel to release the memory after the VM's
+ * other BOs when it reclaims idle memory; any other priority leaves it to the
+ * kernel's default policy. */
+static void
+brl_set_memory_priority(struct brl_device *dev, struct brl_device_memory *mem,
+                       float priority)
+{
+   const bool keep = priority >= 1.0f;
+   if (keep == mem->keep_resident)
+      return;
+
+   int ret = agx_bo_set_resident(&dev->dev, mem->bo, keep);
+   if (ret) {
+      mesa_logw("memory priority %.2f: GEM_RESIDENCY failed: %s", priority,
+                strerror(-ret));
+      return;
+   }
+
+   mem->keep_resident = keep;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+brl_SetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory,
+                              float priority)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   VK_FROM_HANDLE(brl_device_memory, mem, memory);
+
+   brl_set_memory_priority(dev, mem, priority);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_GetMemoryHostPointerPropertiesEXT(
+   VkDevice device, VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer,
+   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   struct brl_physical_device *pdev = brl_device_physical(dev);
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+       !agx_has_userptr(&dev->dev))
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   const uint64_t alignment =
+      pdev->vk.properties.minImportedHostPointerAlignment;
+   if ((uintptr_t)pHostPointer % alignment)
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   /* The application's own mapping is cacheable, and the GPU coherent with
+    * it: offer the cached types. */
+   uint32_t type_bits = 0;
+   for (unsigned t = 0; t < pdev->mem_type_count; t++) {
+      if (pdev->mem_types[t].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+         type_bits |= 1u << t;
+   }
+
+   pMemoryHostPointerProperties->memoryTypeBits = type_bits;
+   return VK_SUCCESS;
+}
+
+DEBUG_GET_ONCE_BOOL_OPTION(m5_host_alias_trace, "ASAHI_M5_HOST_ALIAS_TRACE",
+                           false)
+
+/* The class of the mappings over [pointer, pointer + size) in
+ * /proc/self/maps (brl_host_maps_classify_fd()); BRL_HOST_MAP_OTHER when the
+ * file cannot be read. */
+static enum brl_host_map_class
+brl_host_maps_classify_self(const void *pointer, uint64_t size)
+{
+   const uintptr_t start = (uintptr_t)pointer;
+   if (size == 0 || size > UINTPTR_MAX - start)
+      return BRL_HOST_MAP_OTHER;
+
+   const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return BRL_HOST_MAP_OTHER;
+   const enum brl_host_map_class cls =
+      brl_host_maps_classify_fd(fd, start, start + (uintptr_t)size);
+   close(fd);
+   return cls;
+}
+
+/* M5 with host_alias.dynamic: enter a host import into the device's set, so
+ * brl_cdm_alias_scope() asks for memory scope while it may alias
+ * (brl_host_import_aliases()). A GPU-writable import of pages that are all
+ * private anonymous memory of this process (/proc/self/maps), and that no
+ * other live import overlaps, has its pages at no other GPU address. A
+ * read-only one needs only private mappings: the GPU writes none of its
+ * pages through it, and writes them through another address only through a
+ * writable import of a shared mapping, which aliases itself, or of the same
+ * pages, which overlaps it. An import whose maps cannot be read aliases.
+ * The mappings are read before the kernel pins the pages (before_pin) and
+ * again now, and the worse of the two counts, so an application that
+ * replaces the mapping meanwhile is not taken at its word. What the maps
+ * cannot show: pages a private mapping holds that are pinned already, see
+ * brl_host_alias.h on mremap.
+ *
+ * Costs two reads of /proc/self/maps up to the lines that cover the range.
+ * The imports that began to alias count in alias_live (brl_device_alias_add()),
+ * before the import is returned. */
+static VkResult
+brl_host_import_track(struct brl_device *dev, struct brl_device_memory *mem,
+                     const void *pointer, uint64_t size,
+                     enum brl_host_map_class before_pin)
+{
+   if (!dev->host_alias.dynamic) {
+      /* Under the per-device rule nothing is tracked; say the import
+       * happened, so a trace shows whether an application imports at all. */
+      if (agx_chip_g17_m5(dev->dev.chip) && debug_get_option_m5_host_alias_trace())
+         fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " (per-device rule)\n",
+                 pointer, size);
+      return VK_SUCCESS;
+   }
+
+   const uintptr_t start = (uintptr_t)pointer;
+   const uintptr_t end =
+      size <= UINTPTR_MAX - start ? start + (uintptr_t)size : UINTPTR_MAX;
+   const enum brl_host_map_class cls =
+      MAX2(before_pin, brl_host_maps_classify_self(pointer, size));
+
+   const bool gpu_writes = !(mem->bo->flags & AGX_BO_READONLY);
+   const struct brl_host_import import = {
+      .start = start,
+      .end = end,
+      .owner = mem,
+      .gpu_writes = gpu_writes,
+      .maps_alias = brl_host_import_maps_alias(gpu_writes, cls),
+   };
+
+   /* The count changes with the set, under its lock, so a free of an
+    * overlapping import never subtracts ahead of this add
+    * (brl_device_alias_add()). The patch runs after the lock is released. */
+   simple_mtx_lock(&dev->host_alias.lock);
+   const int began = brl_host_imports_add(&dev->host_alias.imports, &import);
+   const bool first = began > 0 && brl_device_alias_add(dev, (uint32_t)began);
+   simple_mtx_unlock(&dev->host_alias.lock);
+   if (began < 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   mem->host_alias_tracked = true;
+   if (first)
+      brl_device_alias_began(dev, BRL_ALIAS_CAUSE_IMPORT);
+
+   if (debug_get_option_m5_host_alias_trace())
+      fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " writes=%u maps=%u "
+              "began=%d live=%u\n", pointer, size, gpu_writes, (unsigned)cls,
+              began, p_atomic_read(&dev->alias_live));
+   return VK_SUCCESS;
+}
+
+static void
+brl_host_import_untrack(struct brl_device *dev, struct brl_device_memory *mem)
+{
+   if (!mem->host_alias_tracked)
+      return;
+
+   simple_mtx_lock(&dev->host_alias.lock);
+   const unsigned stopped =
+      brl_host_imports_remove(&dev->host_alias.imports, mem);
+   brl_device_alias_put(dev, stopped);
+   simple_mtx_unlock(&dev->host_alias.lock);
+   mem->host_alias_tracked = false;
+
+   if (debug_get_option_m5_host_alias_trace())
+      fprintf(stderr, "M5_HOST_ALIAS free %p stopped=%u live=%u\n",
+              (void *)mem, stopped, p_atomic_read(&dev->alias_live));
+}
+
+/* Memory mapped again in the capture/replay region (replay_va) counts from
+ * its mapping to its release (brl_device_va_alias_get()). */
+static void
+brl_memory_release_replay_va(struct brl_device *dev,
+                            struct brl_device_memory *mem)
+{
+   if (!mem->replay_va)
+      return;
+   agx_va_free(&dev->dev, mem->replay_va, true);
+   mem->replay_va = NULL;
+   brl_device_va_alias_put(dev);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+                  const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   struct brl_physical_device *pdev = brl_device_physical(dev);
+   struct brl_device_memory *mem;
+   VkResult result = VK_SUCCESS;
+
+   const VkImportMemoryFdInfoKHR *fd_info =
+      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+   const VkExportMemoryAllocateInfo *export_info =
+      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
+   const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
+   const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
+      pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
+   const VkMemoryPriorityAllocateInfoEXT *priority_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
+   const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
+   /* The mappings over a host import before its pages are pinned
+    * (brl_host_import_track()). */
+   enum brl_host_map_class host_maps_before_pin = BRL_HOST_MAP_OTHER;
+
+   VkExternalMemoryHandleTypeFlagBits handle_types = 0;
+   if (export_info != NULL)
+      handle_types |= export_info->handleTypes;
+   if (fd_info != NULL)
+      handle_types |= fd_info->handleType;
+
+   const unsigned flags = brl_memory_type_flags(type, handle_types);
+
+   uint32_t alignment = 16384; /* Apple page size */
+
+   struct brl_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
+   if (pAllocateInfo->allocationSize > UINT64_MAX - (alignment - 1))
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   /* No size beyond the heap can be satisfied. Refuse it before creating a
+    * BO: a request whose page rounding below wraps to 0 would otherwise
+    * reach agx_bo_create() as a 0-byte BO and fail in the kernel. */
+   if (!(fd_info && fd_info->handleType) &&
+       pAllocateInfo->allocationSize > heap->size) {
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "allocationSize %" PRIu64 " exceeds heap %u "
+                       "(%" PRIu64 " bytes)",
+                       (uint64_t)pAllocateInfo->allocationSize,
+                       type->heapIndex, (uint64_t)heap->size);
+   }
+
+   /* The spec requires allocationSize > 0 when nothing is imported
+    * (VUID-VkMemoryAllocateInfo-allocationSize-07897), but CTS
+    * cooperative_matrix.op_constant_null creates zero-sized buffers and
+    * allocates their zero-sized requirements. Back such an allocation with
+    * one page, so it can still be bound and mapped, rather than fail it with
+    * VK_ERROR_OUT_OF_DEVICE_MEMORY. */
+   const uint64_t aligned_size =
+      align64(MAX2(pAllocateInfo->allocationSize, 1), alignment);
+   uint64_t used = p_atomic_read(heap->used);
+   if (used > heap->size || aligned_size > heap->size - used)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   mem = vk_device_memory_create(&dev->vk, pAllocateInfo, pAllocator,
+                                 sizeof(*mem));
+   if (!mem)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   mem->map = NULL;
+   if (fd_info && fd_info->handleType) {
+      assert(
+         fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
+         fd_info->handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+
+      mem->bo = agx_bo_import(&dev->dev, fd_info->fd);
+      if (mem->bo == NULL) {
+         result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+         goto fail_alloc;
+      }
+      assert(!(flags & ~mem->bo->flags));
+      mem->alias_import = true;
+   } else if (host_info && host_info->handleType) {
+      /* The pointer and the size are multiples of
+       * minImportedHostPointerAlignment (VUID-VkImportMemoryHostPointerInfoEXT-
+       * pHostPointer-01749, VUID-VkMemoryAllocateInfo-allocationSize-01745).
+       * Memory the kernel cannot pin for writing (a read-only mapping of a
+       * file) is refused: nothing in the API keeps a buffer bound to it from
+       * being a transfer destination or a storage buffer the GPU writes. An
+       * application that only reads such memory on the GPU asks for it with
+       * hk_host_memory_read_only. With hk_host_memory_import_read_only only
+       * such a range is taken, and a range the kernel can pin for writing is
+       * refused, also with hk_host_memory_read_only: the GPU then writes
+       * through no host import (brl_cdm_alias_scope()). Otherwise, on M5,
+       * brl_host_import_track() decides below whether this import may alias.
+       */
+      assert(host_info->handleType ==
+             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
+      const struct brl_instance *instance = brl_physical_device_instance(pdev);
+      const enum agx_host_ptr_access access =
+         instance->drirc.misc.host_memory_import_read_only
+            ? AGX_HOST_PTR_READ_ONLY
+         : instance->drirc.misc.host_memory_read_only ? AGX_HOST_PTR_ANY
+                                                       : AGX_HOST_PTR_WRITABLE;
+      if (dev->host_alias.dynamic)
+         host_maps_before_pin = brl_host_maps_classify_self(
+            host_info->pHostPointer, pAllocateInfo->allocationSize);
+      mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
+                                       pAllocateInfo->allocationSize, access);
+      if (mem->bo == NULL) {
+         const int err = errno;
+         result = vk_errorf(dev,
+                            err == ENOMEM ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                                          : VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "importing %" PRIu64 " bytes of host memory at %p: %s",
+                            (uint64_t)pAllocateInfo->allocationSize,
+                            host_info->pHostPointer, strerror(err));
+         goto fail_alloc;
+      }
+      mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
+   } else {
+      enum agx_bo_flags flags = 0;
+      if (handle_types)
+         flags |= AGX_BO_SHAREABLE;
+      /* A failed WSI export must not leave pinned backing in the BO cache.
+       * Successful exports already acquire AGX_BO_SHARED. */
+      if (dev->dev.chip == AGX_CHIP_G17P &&
+          vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
+         flags |= AGX_BO_NO_CACHE;
+      if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
+         flags |= AGX_BO_WRITEBACK;
+
+      /* A BO from the cache allocates nothing new. If the kernel purged it
+       * meanwhile, one allocation can still pass the check. */
+      if (!brl_system_memory_fits(aligned_size) &&
+          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags)) {
+         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "Not enough free system memory for %" PRIu64
+                            " MiB", aligned_size >> 20);
+         goto fail_alloc;
+      }
+
+      /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
+       * only virtual address space. */
+      mem->bo = agx_bo_create(&dev->dev, aligned_size, 64 * 1024, flags,
+                              "App memory");
+      if (!mem->bo) {
+         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto fail_alloc;
+      }
+   }
+
+   /* VK_EXT_descriptor_buffer capture/replay: image descriptors embed the
+    * address of the image's memory, so memory allocated for capture/replay
+    * also maps at an address in the capture/replay region, the captured one
+    * on replay when that is one. Buffers and images bound to it take that
+    * address (brl_device_memory_addr()); buffers with a capture/replay address
+    * of their own keep it. */
+   if ((mem->vk.alloc_flags &
+        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
+       dev->vk.enabled_features.descriptorBufferCaptureReplay &&
+       dev->dev.replay_heap_initialized) {
+      const uint64_t fixed_addr =
+         capture_info ? capture_info->opaqueCaptureAddress : 0;
+      mem->replay_va = agx_va_alloc(
+         &dev->dev, mem->bo->size, 64 * 1024,
+         AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
+      if (mem->replay_va &&
+          (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
+                       mem->bo->size, 0,
+                       DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
+           agx_bo_bind(&dev->dev, mem->bo,
+                       agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
+                       mem->bo->size, 0, DRM_ASAHI_BIND_READ))) {
+         agx_va_free(&dev->dev, mem->replay_va, true);
+         mem->replay_va = NULL;
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         goto fail_alloc;
+      }
+      /* An address this region cannot take was not captured with the
+       * feature (on a device without it, it is the BO's own address): keep
+       * buffer device address replay as it was, through the buffers' own
+       * capture/replay addresses. */
+      /* The memory is reached through two read-write addresses now. */
+      if (mem->replay_va)
+         brl_device_va_alias_get(dev, BRL_ALIAS_CAUSE_CAPTURE_REPLAY);
+   }
+
+   if (mem->vk.alloc_flags &
+       VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
+      mem->opaque_capture_address =
+         mem->replay_va ? mem->replay_va->addr
+         : capture_info && capture_info->opaqueCaptureAddress
+            ? capture_info->opaqueCaptureAddress
+            : mem->bo->va->addr;
+   }
+
+   /* Shadow map in case this is used for a sparse resident buffer */
+   int ret = agx_bo_bind(&dev->dev, mem->bo,
+                         agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
+                         mem->bo->size, 0, DRM_ASAHI_BIND_READ);
+   if (ret) {
+      /* The bind fails once the VM carries a sticky error. */
+      brl_memory_release_replay_va(dev, mem);
+      agx_bo_unreference(&dev->dev, mem->bo);
+      mem->bo = NULL;
+      vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   if (host_info && host_info->handleType) {
+      result = brl_host_import_track(dev, mem, host_info->pHostPointer,
+                                    mem->bo->size, host_maps_before_pin);
+      if (result != VK_SUCCESS) {
+         brl_memory_release_replay_va(dev, mem);
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return result;
+      }
+   }
+
+   /* An fd or dma-buf import has an address of its own, and another import,
+    * of this device or of another device or process, may map the same pages:
+    * it counts for its lifetime (brl_cdm_alias_scope()). An export reaches
+    * other devices and processes only across a submission boundary, after
+    * the memory-scoped flush that ends every command; brought back into this
+    * device it is an import, which counts here. */
+   if (fd_info && fd_info->handleType) {
+      mem->alias_fd = true;
+      brl_device_alias_get(dev, 1, BRL_ALIAS_CAUSE_FD);
+   }
+
+   if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
+      brl_add_ext_bo(dev, mem->bo);
+
+   if (mem->alias_import)
+      p_atomic_inc(&dev->va_alias_resources);
+
+   if (priority_info)
+      brl_set_memory_priority(dev, mem, priority_info->priority);
+
+   uint64_t heap_used = p_atomic_add_return(heap->used, mem->bo->size);
+   if (heap_used > heap->size) {
+      brl_FreeMemory(device, brl_device_memory_to_handle(mem), pAllocator);
+      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Out of heap memory");
+   }
+
+   if (fd_info && fd_info->handleType) {
+      /* From the Vulkan spec:
+       *
+       *    "Importing memory from a file descriptor transfers ownership of
+       *    the file descriptor from the application to the Vulkan
+       *    implementation. The application must not perform any operations on
+       *    the file descriptor after a successful import."
+       *
+       * Only consume it after heap accounting has accepted the allocation;
+       * every failure must leave the caller's file descriptor open.
+       */
+      close(fd_info->fd);
+   }
+
+   *pMem = brl_device_memory_to_handle(mem);
+
+   return VK_SUCCESS;
+
+fail_alloc:
+   vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+brl_FreeMemory(VkDevice device, VkDeviceMemory _mem,
+              const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   VK_FROM_HANDLE(brl_device_memory, mem, _mem);
+   struct brl_physical_device *pdev = brl_device_physical(dev);
+
+   if (!mem)
+      return;
+
+   brl_device_quiesce_lost_submissions(dev);
+
+   const VkMemoryType *type = &pdev->mem_types[mem->vk.memory_type_index];
+   struct brl_memory_heap *heap = &pdev->mem_heaps[type->heapIndex];
+   p_atomic_add(heap->used, -((int64_t)mem->bo->size));
+
+   if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
+      brl_remove_ext_bo(dev, mem->bo);
+
+   /* Freeing a mapped memory object unmaps it. The shared mapping goes with
+    * the BO; an owned one belongs to this object alone. */
+   if (mem->map_owned)
+      agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+
+   /* The BO may outlive this object in the BO cache. */
+   brl_set_memory_priority(dev, mem, 0.5f);
+
+   brl_memory_release_replay_va(dev, mem);
+
+   if (mem->alias_import)
+      p_atomic_dec(&dev->va_alias_resources);
+
+   /* No work that may still run reaches this memory any more. */
+   brl_host_import_untrack(dev, mem);
+   if (mem->alias_fd)
+      brl_device_alias_put(dev, 1);
+
+   agx_bo_unreference(&dev->dev, mem->bo);
+
+   vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+                 void **ppData)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   VK_FROM_HANDLE(brl_device_memory, mem, pMemoryMapInfo->memory);
+
+   if (mem == NULL) {
+      *ppData = NULL;
+      return VK_SUCCESS;
+   }
+
+   const VkDeviceSize offset = pMemoryMapInfo->offset;
+   const VkDeviceSize size = vk_device_memory_range(
+      &mem->vk, pMemoryMapInfo->offset, pMemoryMapInfo->size);
+
+   void *fixed_addr = NULL;
+   if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
+      const VkMemoryMapPlacedInfoEXT *placed_info = vk_find_struct_const(
+         pMemoryMapInfo->pNext, MEMORY_MAP_PLACED_INFO_EXT);
+      fixed_addr = placed_info->pPlacedAddress;
+   }
+
+   /* From the Vulkan spec version 1.0.32 docs for MapMemory:
+    *
+    *  * If size is not equal to VK_WHOLE_SIZE, size must be greater than 0
+    *    assert(size != 0);
+    *  * If size is not equal to VK_WHOLE_SIZE, size must be less than or
+    *    equal to the size of the memory minus offset
+    */
+   assert(size > 0);
+   assert(offset + size <= mem->bo->size);
+
+   if (size != (size_t)size) {
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "requested size 0x%" PRIx64 " does not fit in %u bits",
+                       size, (unsigned)(sizeof(size_t) * 8));
+   }
+
+   /* From the Vulkan 1.2.194 spec:
+    *
+    *    "memory must not be currently host mapped"
+    */
+   if (mem->map != NULL) {
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "Memory object already mapped.");
+   }
+
+   /* Host memory the kernel could only pin read-only has no mapping the
+    * application may write through, and Vulkan has no read-only mapping. */
+   if ((mem->bo->flags & AGX_BO_HOST_PTR) && (mem->bo->flags & AGX_BO_READONLY)) {
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "read-only host memory cannot be mapped");
+   }
+
+   /* Bound a placed mapping by the memory object, not the BO: the BO cache
+    * may have handed us one up to twice as large, and the application has
+    * reserved only mem->vk.size at this address.
+    *
+    * An exported allocation and its imports into this device are distinct
+    * memory objects over one agx_bo. Each maps, unmaps, frees and reserves
+    * independently, so each gets a mapping of its own rather than the BO's
+    * shared one, which unmapping any of them would otherwise tear down
+    * under the others. A BO only one memory object can reach keeps the
+    * cached mapping. */
+   if (mem->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)) {
+      mem->map = agx_bo_map_owned(mem->bo, fixed_addr, mem->vk.size,
+                                  &mem->map_size);
+      mem->map_owned = mem->map != NULL;
+   }
+   if (!mem->map_owned)
+      mem->map = agx_bo_map_placed(mem->bo, fixed_addr, mem->vk.size);
+   if (mem->map == NULL) {
+      *ppData = NULL;
+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                       "failed to map memory BO handle %u",
+                       mem->bo->uapi_handle);
+   }
+
+   assert(!fixed_addr || mem->map == fixed_addr);
+   *ppData = mem->map + offset;
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_UnmapMemory2KHR(VkDevice device,
+                   const VkMemoryUnmapInfoKHR *pMemoryUnmapInfo)
+{
+   VK_FROM_HANDLE(brl_device_memory, mem, pMemoryUnmapInfo->memory);
+
+   if (mem == NULL)
+      return VK_SUCCESS;
+
+   if (mem->map_owned) {
+      if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+         VK_FROM_HANDLE(brl_device, dev, device);
+
+         /* Exactly this object's mapping, as below. */
+         void *err = mmap(mem->map, mem->map_size, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+         if (err == MAP_FAILED) {
+            return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                             "Failed to map over original mapping");
+         }
+      } else {
+         agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+      }
+      mem->map = NULL;
+      mem->map_size = 0;
+      mem->map_owned = false;
+      return VK_SUCCESS;
+   }
+
+   /* Imported host memory stays mapped where the application put it
+    * (VUID-VkMemoryUnmapInfo-flags-09579 excludes reserving it). */
+   if (mem->bo->flags & AGX_BO_HOST_PTR) {
+      mem->map = NULL;
+      return VK_SUCCESS;
+   }
+
+   if (pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT) {
+      VK_FROM_HANDLE(brl_device, dev, device);
+
+      /* Reserve exactly what was mapped. A placed map covers the
+       * VkDeviceMemory's allocationSize, not the cached BO's size, and
+       * PROT_NONE'ing the difference lands on address space the application
+       * reserved for itself -- the guard pages dEQP-VK.memory.map_placed.*
+       * fills and reads back. */
+      void *err = mmap(mem->bo->_map, agx_bo_map_size(mem->bo), PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      if (err == MAP_FAILED) {
+         return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                          "Failed to map over original mapping");
+      }
+      mem->bo->_map = NULL;
+      mem->bo->_map_size = 0;
+   } else {
+      if (mem->bo->_map) {
+         munmap(mem->bo->_map, agx_bo_map_size(mem->bo));
+         mem->bo->_map = NULL;
+         mem->bo->_map_size = 0;
+      }
+   }
+
+   mem->map = NULL;
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_FlushMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
+                           const VkMappedMemoryRange *pMemoryRanges)
+{
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_InvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
+                                const VkMappedMemoryRange *pMemoryRanges)
+{
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+brl_GetDeviceMemoryCommitment(VkDevice device, VkDeviceMemory _mem,
+                             VkDeviceSize *pCommittedMemoryInBytes)
+{
+   VK_FROM_HANDLE(brl_device_memory, mem, _mem);
+
+   *pCommittedMemoryInBytes = mem->bo->size;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+brl_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
+                  int *pFD)
+{
+   VK_FROM_HANDLE(brl_device, dev, device);
+   VK_FROM_HANDLE(brl_device_memory, memory, pGetFdInfo->memory);
+
+   switch (pGetFdInfo->handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
+      *pFD = agx_bo_export(&dev->dev, memory->bo);
+      if (*pFD < 0 && dev->dev.chip == AGX_CHIP_G17P)
+         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return VK_SUCCESS;
+   default:
+      assert(!"unsupported handle type");
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "vkGetMemoryFdKHR: unsupported handle type 0x%x",
+                       pGetFdInfo->handleType);
+   }
+}
+
+VKAPI_ATTR uint64_t VKAPI_CALL
+brl_GetDeviceMemoryOpaqueCaptureAddress(
+   UNUSED VkDevice device,
+   const VkDeviceMemoryOpaqueCaptureAddressInfo *pInfo)
+{
+   VK_FROM_HANDLE(brl_device_memory, memory, pInfo->memory);
+
+   return memory->opaque_capture_address;
+}

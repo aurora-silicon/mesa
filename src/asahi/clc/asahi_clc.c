@@ -377,17 +377,17 @@ target_supports_program(const char *target, const nir_function *func)
           /* VK_KHR_ray_tracing_pipeline's indirect trace-rays setup.  One
            * invocation, three constant loads, three global stores and a shift
            * -- no atomics, no barriers, no printf, no scratch.  Its ARITHMETIC
-           * has a host oracle (test-hk-ray-tracing-core's launch
+           * has a host oracle (test-brl-ray-tracing-core's launch
            * decomposition, which the direct path uses for the same numbers);
            * its MACHINE CODE has never executed, exactly like the rest of the
            * ray-tracing-pipeline path it serves, which is why that whole path
-           * is behind HK_G17P_UNVERIFIED_FEATURES.  Do not read this entry as
+           * is behind BRL_G17P_UNVERIFIED_FEATURES.  Do not read this entry as
            * a claim that it runs. */
           !strcmp(func->name, "libagx_trace_rays_indirect_setup") ||
           /* Its per-raygen-kernel sibling: the same one-invocation shape
            * (constant loads of the record, the raygen handle and the launch
            * dimensions; one VkDispatchIndirectCommand store per kernel; the
-           * same shift/compare arithmetic, with hk_rt_launch_group_count as
+           * same shift/compare arithmetic, with brl_rt_launch_group_count as
            * the host oracle).  No atomics, barriers, printf or scratch.
            * Qualifying its compilation here is not an execution claim; the
            * hardware test of the per-raygen dispatch covers it. */

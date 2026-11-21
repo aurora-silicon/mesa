@@ -493,7 +493,7 @@ agx_params_driver_supported(const struct drm_asahi_params_global *params)
 
    switch (chip) {
    case AGX_CHIP_G17P: {
-      /* Honeykrisp's first AGX3 path is the exact T8140/A18 Pro contract.
+      /* Borealis's first AGX3 path is the exact T8140/A18 Pro contract.
        * Do not let the shared G17P ISA name admit another SoC or topology. */
       const bool a18_pro =
          params->chip_id == 0x8140 && params->num_clusters_total == 1;

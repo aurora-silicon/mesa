@@ -627,7 +627,7 @@ agx_m5_render_resources(const struct agx_device *dev)
  * reject the longer packet with EINVAL. The G17 runtime's M5 command set
  * reads them too (the M5 colour background's specifier is
  * 0xffff800000000040). Every other chip keeps the original layout, as
- * Honeykrisp does in hk_drm_render_command_size().
+ * Borealis does in brl_drm_render_command_size().
  */
 static inline uint16_t
 agx_render_command_size(const struct agx_device *dev)

@@ -43,7 +43,7 @@ struct asahi_g17p_stream_stats {
    unsigned tessellated_draws;
    unsigned state_updates;
    /* Every VDM memory-barrier record in the stream, and the subset of them
-    * that separate one draw body from a later one.  hk_cs_init_graphics()
+    * that separate one draw body from a later one.  brl_cs_init_graphics()
     * always opens a stream with one barrier before any draw exists, so only
     * the second number describes inter-draw ordering. */
    unsigned barriers;

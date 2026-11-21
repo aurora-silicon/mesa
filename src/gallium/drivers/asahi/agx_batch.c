@@ -187,8 +187,8 @@ agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder)
  * per-field maximum after evaluating each entry on its own. A list is
  * therefore a set: identical entries add nothing, so keep each distinct one
  * once (a batch of a thousand draws of one program sends one record). The
- * records follow Honeykrisp's: hk_m5_note_render_resources(),
- * hk_cmd_buffer.c's tile record and hk_m5_compute_resources().
+ * records follow Borealis's: brl_m5_note_render_resources(),
+ * brl_cmd_buffer.c's tile record and brl_m5_compute_resources().
  */
 void
 agx_batch_note_m5_render_program(
@@ -217,7 +217,7 @@ agx_batch_note_m5_compute_program(
 /* The tile record: a fragment-stage entry carrying the render's imageblock
  * and the largest storage of its background and end-of-tile programs. The
  * multisample bytes are the native per-sample-count footprint, as
- * hk_cmd_buffer.c computes it. */
+ * brl_cmd_buffer.c computes it. */
 void
 agx_batch_set_m5_tile_program(struct agx_batch *batch,
                               const struct asahi_bg_eot *const *programs,
@@ -2134,7 +2134,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
        * its prefix (every compute command of this submission) therefore
        * orders render after both the compute results and all prior work,
        * including ioctl input syncs on older kernels that attach them only to
-       * the first hardware command (hk's first_sq rule). Software attachment
+       * the first hardware command (Borealis's first_sq rule). Software attachment
        * and resource commands do not advance the hardware prefixes.
        * Every dispatch of a G18G split prepass went out as its own
        * submission above, and naming one here would be a barrier on a

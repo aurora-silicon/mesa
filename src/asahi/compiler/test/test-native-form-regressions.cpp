@@ -1199,7 +1199,7 @@ TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
 }
 
 /* A G17P state-0 storage image that the shader also reads names its
- * texture/PBE descriptor pair through state 0 (hk's read/write ABI): record 0
+ * texture/PBE descriptor pair through state 0 (Borealis's read/write ABI): record 0
  * is the texture, which read as a PBE describes a far larger surface, so the
  * store must take record 1. A write-only image's state 0 is the PBE itself and
  * keeps record 0. Only the immediate descriptor index may differ. */
@@ -5078,7 +5078,7 @@ TEST(NativeForms, Gen1MeshClipCullPointSizeFollowHardwareUVSOrder)
 
 TEST(NativeForms, Gen1MeshLayerExportsFromThreadgroupMemory)
 {
-   /* A per-primitive layer (hk's multiview lowering writes one) reaches the
+   /* A per-primitive layer (Borealis's multiview lowering writes one) reaches the
     * exported layer/viewport vertex word from threadgroup memory: the export
     * must not read it back from the primitive's record in device memory. The
     * record keeps its copy for a fragment shader reading gl_Layer.

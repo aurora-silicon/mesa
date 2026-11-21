@@ -535,7 +535,7 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
          return false;
       varyings->components[slot] = varyings->primitive_comps[slot];
    }
-   /* Like the M5 vertex stage (hk_lower_hw_vs with layer_as_varying), the
+   /* Like the M5 vertex stage (brl_lower_hw_vs with layer_as_varying), the
     * layer is also a flat user word for fragment reads, zero when only the
     * viewport is written, and a written viewport is one as well. */
    if (varyings->lv) {
@@ -740,7 +740,7 @@ m5_mesh_line_bias(nir_builder *b, const nir_shader *s,
  *
  * A native M5 mesh draw takes flat inputs from the vertex its PPP
  * flat-shading selector names, the draw's provoking vertex (see the native
- * mesh note at fields.flat_shading_vertex in hk_cmd_draw.c), and the draw
+ * mesh note at fields.flat_shading_vertex in brl_cmd_draw.c), and the draw
  * root carries the same selector (load_provoking_last). Per-primitive words
  * are flat inputs (agx_nir_lower_m5_mesh_fragment), so only the provoking
  * vertex of a primitive needs them; its other corners keep naming API

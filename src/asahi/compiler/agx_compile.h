@@ -181,11 +181,11 @@ struct agx_shader_info {
    bool has_preamble;
    /* The program performs an atomic on global memory (buffer, image or
     * device-address atomics). Submit packing keeps such programs apart where
-    * another kernel queue could run beside them (hk_queue.c). */
+    * another kernel queue could run beside them (brl_queue.c). */
    bool uses_global_atomics;
    /* The program (main or preamble) contains a loop, so its run time is not
     * bounded by its static instruction count. Submit packing keeps at most
-    * one such stream per packed command (hk_pack.c). */
+    * one such stream per packed command (brl_pack.c). */
    bool has_loops;
    /* Native constant-program live-ins. External G17P launch needs the
     * uniform-input prelude when a uniform half is read before definition. */
@@ -660,7 +660,7 @@ struct agx_shader_key {
     * form, and the 8-bit-integer and R11G11B10 end-of-tile classes. */
    bool g18_native_mixed;
 
-   /* A Honeykrisp hardware vertex binary adjacent to software geometry or
+   /* A Borealis hardware vertex binary adjacent to software geometry or
     * transform feedback. The API VS hardware variant may expose only values
     * consumed by GS/XFB, while the generated post-GS raster VS may expose only
     * values GS produced. Both may therefore have a sparse terminal UVS

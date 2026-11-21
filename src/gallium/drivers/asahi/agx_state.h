@@ -301,7 +301,7 @@ struct agx_compiled_shader {
     * write-control record occupy uniform halves 0..15. */
    bool g17p_storage_write;
 
-   /* The variant contains Honeykrisp-style custom-border emulation. */
+   /* The variant contains Borealis-style custom-border emulation. */
    bool g17p_custom_border_emulation;
 
    /* G17G: the fragment runs per sample by repeating its body once per
@@ -404,7 +404,7 @@ struct agx_uncompiled_shader {
       unsigned nr_bindful_textures, nr_bindful_images;
 
       /* Texture-table records per image: a texture and a PBE descriptor,
-       * plus on G17P the software tail Honeykrisp's storage descriptor
+       * plus on G17P the software tail Borealis's storage descriptor
        * carries (see AGX_G17P_IMAGE_ATOMIC_SW_OFFSET).
        */
       uint8_t image_records;

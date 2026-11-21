@@ -729,7 +729,7 @@ agx_ioto_load_absolute(struct agx_ioto_load_core *core,
     * to hand `allocation->temp_half` to BOTH -- `queued->base.half` and
     * `queued->data.half` were literally the same register -- so the LDDEV
     * wrote its result over the address it had just been given.  For the
-    * Honeykrisp root-descriptor load that is r0:r1 holding 0x2ffff6c540 and a
+    * Borealis root-descriptor load that is r0:r1 holding 0x2ffff6c540 and a
     * four-dword LDDEV landing on halves 0..7, i.e. the base is destroyed by
     * the very load that reads it, and the loaded value is itself a pointer the
     * shader then dereferences.

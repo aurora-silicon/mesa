@@ -319,7 +319,7 @@
          descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
-         Nothing hk builds reaches it today (the widest stride any path
+         Nothing Borealis builds reaches it today (the widest stride any path
          produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
          which is 16383 after the shift), so this is a latent overrun; the
          declared width is what makes the guard real. -->
@@ -374,7 +374,7 @@
          descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
-         Nothing hk builds reaches it today (the widest stride any path
+         Nothing Borealis builds reaches it today (the widest stride any path
          produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
          which is 16383 after the shift), so this is a latent overrun; the
          declared width is what makes the guard real. -->
@@ -421,7 +421,7 @@
          descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
-         Nothing hk builds reaches it today (the widest stride any path
+         Nothing Borealis builds reaches it today (the widest stride any path
          produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
          which is 16383 after the shift), so this is a latent overrun; the
          declared width is what makes the guard real. -->

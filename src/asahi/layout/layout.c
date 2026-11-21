@@ -193,15 +193,15 @@ ail_initialize_gpu_tiled(struct ail_layout *layout)
       }
       /* The exception to the above: mipmapped arrays the GPU can write. A
        * store to a layer of an array is described as a 3D store on the chips
-       * that encode layered stores in z (G17G and G17S in Honeykrisp and
-       * Gallium, G18G in Gallium; hk_image_view.c, agx_state.c), with the
+       * that encode layered stores in z (G17G and G17S in Borealis and
+       * Gallium, G18G in Gallium; brl_image_view.c, agx_state.c), with the
        * depth scaled by the level. The 3D slice stride follows a mip chain as
        * deep as the described depth. That chain can have more levels than the
        * array's, and a compact stride cannot hold the difference; a
        * page-aligned one can.
        *
        * Both drivers mark every uncompressed image writeable, and
-       * Honeykrisp's buffer-to-image copies store through such a layered
+       * Borealis's buffer-to-image copies store through such a layered
        * view, so this pads every uncompressed mipmapped array under this
        * policy, including on G17C, which keeps the array form. Do not narrow
        * it to shader-storage usage: uploads to small mipmapped arrays and

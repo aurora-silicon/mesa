@@ -388,7 +388,7 @@ test_g17p_user_window_fits_ppp_pointer_field(void)
 /*
  * The user window must clear the ABSOLUTE 36-bit shr(3) pointer that USC
  * Texture and USC Sampler carry, which is narrower than the compact VDM
- * pointer. Gallium binds graphics through those records on G17P; Honeykrisp
+ * pointer. Gallium binds graphics through those records on G17P; Borealis
  * does not, which is why this only ever fired on the GL path.
  *
  * The bound is checked against the generated packer's own constant rather

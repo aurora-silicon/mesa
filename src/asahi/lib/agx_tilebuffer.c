@@ -943,7 +943,7 @@ agx_g17p_rt0_tile_layout_supported(const struct agx_tilebuffer_layout *tib)
       agx_tilebuffer_physical_format(tib, 0) ==
          PIPE_FORMAT_R11G11B10_FLOAT;
    /* RGB9E5 keeps multisample words too; its resolve runs after the pass
-    * (hk_agx3_g17p_direct_color_resolve_supported). */
+    * (brl_agx3_g17p_direct_color_resolve_supported). */
    const bool r9g9b9e5f = tib->sample_size_B == 8 &&
       tib->logical_format[0] == PIPE_FORMAT_R9G9B9E5_FLOAT &&
       agx_tilebuffer_physical_format(tib, 0) == PIPE_FORMAT_R9G9B9E5_FLOAT;

@@ -268,7 +268,7 @@ test_independent_generation_axes(void)
 
    /* Codegen and device support are separate axes. G17P has the exact
     * T8140/HAL200 path; the other AGX3 identities have encoders but not a
-    * complete Honeykrisp device path. */
+    * complete Borealis device path. */
    CHECK(agx_chip_codegen_supported(AGX_CHIP_G15P));
    CHECK(agx_chip_codegen_supported(AGX_CHIP_G15G));
    CHECK(agx_chip_codegen_supported(AGX_CHIP_G17P));

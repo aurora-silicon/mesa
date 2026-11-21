@@ -13,7 +13,7 @@
 #include "asahi/compiler/agx_debug.h"
 #include "asahi/compiler/agx3_compute_program.h"
 #include "asahi/compiler/agx3_graphics_program.h"
-#include "asahi/vulkan/hk_g17p_patch.h"
+#include "borealis/vulkan/brl_g17p_patch.h"
 #include "asahi/compiler/agx3_transcode.h"
 #include "asahi/compiler/agx_nir.h"
 #include "asahi/genxml/agx_pack.h"
@@ -86,7 +86,7 @@
 
 /* EXP-G1b's native access::write argument is a resolved PBE pointer followed
  * by this 32-byte control record. This is the same captured record used by
- * Honeykrisp's G17P compute storage path. */
+ * Borealis's G17P compute storage path. */
 static const uint8_t agx_g17p_native_write_control[32] = {
    0x08, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00,
 };
@@ -854,7 +854,7 @@ agx_swtnl_can_tessellate(void)
    return can;
 }
 
-/* M5 tessellates on the GPU (agx_draw_patches), as hk does, when the CPU path
+/* M5 tessellates on the GPU (agx_draw_patches), as Borealis does, when the CPU path
  * cannot: in a build without LLVM the draw module drops every patch. With
  * LLVM the CPU path is the qualified one. The GPU path still loses some
  * shapes, among them tessellation feeding a geometry shader, which M5 does
@@ -1903,7 +1903,7 @@ agx_g18_native_ms_spills(const struct agx_batch *batch)
           agx_tilebuffer_spills(tib);
 }
 
-/* The Gen9 path proven by Honeykrisp resolves a 2x/4x colour tile directly
+/* The Gen9 path proven by Borealis resolves a 2x/4x colour tile directly
  * into an ordinary single-sample PBE target. Gallium exposes exactly that WSI
  * contract through pipe_framebuffer_state::resolve: the multisample colour
  * attachment is transient and resolve names the image presented by the
@@ -2584,7 +2584,7 @@ agx_nir_lower_g18_image_index(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* hk_g17p_native_cprog_qualified(): the bounded native protocol launches it */
+/* brl_g17p_native_cprog_qualified(): the bounded native protocol launches it */
 static bool
 agx_g17p_fs_cprog_qualified(const struct agx_shader_info *info)
 {
@@ -2665,7 +2665,7 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
         * preamble", agx_g17p_append_compute()) and it has no AGX2 fallback
         * to run one, so a tessellation or geometry stage with a preamble
         * could never launch there. M5 likewise, now that its tessellation
-        * and geometry stages run on the GPU too (hk refuses their
+        * and geometry stages run on the GPU too (Borealis refuses their
         * preambles on M5 as well). */
        .no_preamble = agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G ||
                        agx_chip_g17_m5(dev->chip),
@@ -2673,7 +2673,7 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
    };
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      /* G17P fragment Layer is a flat coefficient, as in Honeykrisp. The
+      /* G17P fragment Layer is a flat coefficient, as in Borealis. The
        * compute grid-Z register is not a fragment Layer system value. */
       NIR_PASS(_, nir, agx_nir_lower_interpolation,
                agx_native_graphics(dev) || dev->chip == AGX_CHIP_G18G);
@@ -2799,7 +2799,7 @@ agx_compile_nir_tile(struct agx_device *dev, nir_shader *nir,
       }
    }
 
-   /* G17P fragment constant program, as hk_g17p_compile_fs_cprog(): a fragment
+   /* G17P fragment constant program, as brl_g17p_compile_fs_cprog(): a fragment
     * that reads descriptor-backed memory compiles a clone with the native
     * constant program and keeps it only when the native protocol can launch
     * it; anything else compiles as before, without a preamble. */
@@ -3114,7 +3114,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
       const unsigned keyed_samples = key->nr_samples ? key->nr_samples : 1;
       /* G17P has no recovered samples-log2 special register, and the variant
        * key already carries the raster sample count, so fold it into the
-       * shader as hk_shader.c does. gl_SampleMaskIn, gl_SampleID and
+       * shader as brl_shader.c does. gl_SampleMaskIn, gl_SampleID and
        * interpolateAtSample() all read it. */
       if (agx_native_graphics(dev) && agx_nir_needs_sample_count(nir))
          NIR_PASS(_, nir, agx_nir_specialize_sample_count,
@@ -3124,7 +3124,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
        * the same thing, so collapsing sample shading to per-pixel is exact --
        * and it is what has to happen here, because G17P has no sample loop
        * for the linker to splice and asking for one would drop the draw
-       * outright. hk_shader.c does the same on the Vulkan side. Do it before
+       * outright. brl_shader.c does the same on the Vulkan side. Do it before
        * the epilog split, so the link key records the collapse too.
        * G18G has no sample loop for the linker to splice either; there a
        * multisample stencil resolve still rasterizes into a single-sample
@@ -3225,7 +3225,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
 
       /* G17G has no external sample loop either. Repeat the body once per
        * sample instead, each copy with its own colour exports, as
-       * Honeykrisp's G17P path and Apple's compiler do; the epilog repeats
+       * Borealis's G17P path and Apple's compiler do; the epilog repeats
        * itself the same way (build_g17p_fs_epilog). A shader whose
        * per-sample exports would not fit the register file keeps the
        * per-pixel form, which the link refuses. */
@@ -4074,7 +4074,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
       agx_gallium_preprocess_nir(dev, nir);
    }
 
-   /* The native stack protocol only encodes whole words; Honeykrisp gets
+   /* The native stack protocol only encodes whole words; Borealis gets
     * this from agx_preprocess_nir_g17p(). */
    if (agx_native_graphics(dev))
       agx3_nir_lower_scratch_words(nir);
@@ -4488,7 +4488,7 @@ build_g17p_fs_epilog(nir_builder *b, const void *key_)
        (key->nr_samples == 2 || key->nr_samples == 4)) {
       /* The main fragment exported every sample's colours (G17G's per-sample
        * unroll). Build the per-pixel epilog, then store and blend each sample
-       * from its own colours, as Honeykrisp's build_g17p_fs_epilog does. */
+       * from its own colours, as Borealis's build_g17p_fs_epilog does. */
       struct agx_fs_epilog_key pixel = *key;
       pixel.link.sample_shading = false;
       pixel.defer_monolithic_msaa = true;
@@ -4633,7 +4633,7 @@ asahi_fast_link(struct agx_context *ctx, struct agx_uncompiled_shader *so,
       /* G17P device loads return packed raw lanes. Its vertex prolog must
        * convert them rather than expect AGX2's formatted widening loads.
        * G17G fetches 8/16-bit normalized attributes only as raw integers
-       * (a native S8NORM fetch was refused: draw.random), as Honeykrisp's
+       * (a native S8NORM fetch was refused: draw.random), as Borealis's
        * G17P prolog does, and converts them explicitly. */
       prolog = agx_build_meta_shader_internal(
          ctx,
@@ -4966,7 +4966,7 @@ agx_update_fs(struct agx_batch *batch)
 
    /* G17P coverage updates use different native words at one and several
     * samples, including discard-only main shaders. Keep their raster sample
-    * count in the main key, matching Honeykrisp and the linked shader parts.
+    * count in the main key, matching Borealis and the linked shader parts.
     * Other generations need variants for sample-dependent shader operations.
     * A G17G fragment shader that runs per sample is unrolled over the sample
     * count, so the count belongs in its variant key too.
@@ -5581,7 +5581,7 @@ agx_gallium_g17p_tile_layout_supported(struct agx_tilebuffer_layout *tib)
 
    /* Layer selection lives in the proven array BG/EOT programs and PBE
     * descriptor. It does not change the physical tile allocation, so validate
-    * that allocation through the same bounded RT0 contract Honeykrisp uses. */
+    * that allocation through the same bounded RT0 contract Borealis uses. */
    struct agx_tilebuffer_layout physical = *tib;
    physical.layered = false;
    return agx_g17p_rt0_tile_layout_supported(&physical);
@@ -5726,7 +5726,7 @@ agx_image_address_metadata(uint32_t out[10], const struct pipe_image_view *view)
 
 /*
  * The record after a G17P storage image's texture/PBE pair carries the
- * software words Honeykrisp's Gen9 storage descriptor keeps there, at the same
+ * software words Borealis's Gen9 storage descriptor keeps there, at the same
  * offsets from the texture descriptor: the native texture-table index of the
  * image's texture, the packed addressing word image atomics read through
  * libagx_image_texel_address_gen9(), and for multisampled images the aligned
@@ -5752,7 +5752,7 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
 
    struct agx_resource *rsrc = agx_resource(view->resource);
    if (rsrc->base.target == PIPE_BUFFER) {
-      /* Same software texel-buffer metadata as Honeykrisp. The native
+      /* Same software texel-buffer metadata as Borealis. The native
        * descriptors already include the view byte offset, so the extra
        * coordinate offset is zero; atomics use the exact bound byte address. */
       const uint32_t size =
@@ -5774,7 +5774,7 @@ agx_g17p_fill_storage_tail(uint8_t *tail, unsigned record_size_B,
    const unsigned samples = util_res_sample_count(&rsrc->base);
    const bool linear = layout->tiling == AIL_TILING_LINEAR;
    /* Multisampled storage is bound as a linear buffer starting at its level,
-    * so its level offset is zero, as in hk's pack_pbe(). */
+    * so its level offset is zero, as in Borealis's pack_pbe(). */
    const unsigned level = samples > 1 ? 0 : view->u.tex.level;
 
    if (samples > 1) {
@@ -6133,7 +6133,7 @@ agx_sampler_heap_add(struct agx_device *dev, struct agx_sampler_heap *heap,
  * with its own compare enable. G17G's Gen5 record overlaps the compare
  * function with the reduction mode and selects the compare interpretation
  * with compare_mode; the comparison itself is requested by the sample
- * instruction. This mirrors hk_pack_native_sampler(), including LEQUAL for a
+ * instruction. This mirrors brl_pack_native_sampler(), including LEQUAL for a
  * sampler without a comparison. */
 static void
 agx_pack_g17_api_sampler(enum agx_chip chip, void *out,
@@ -6234,7 +6234,7 @@ agx_native_sampler_state(const struct pipe_sampler_state *state,
  * with its own compare enable. G17G's Gen5 record overlaps the compare
  * function with the reduction mode and selects the compare interpretation
  * with compare_mode; the comparison itself is requested by the sample
- * instruction. This mirrors hk_pack_native_sampler(), including LEQUAL for a
+ * instruction. This mirrors brl_pack_native_sampler(), including LEQUAL for a
  * sampler without a comparison. */
 
 static void
@@ -6257,7 +6257,7 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
    if (native || g18) {
       /* Keep ordinary sampler handles stable at i+1.  If any sampler needs a
        * custom border, reserve a disjoint clamp-to-zero bank at slot 33, as
-       * Honeykrisp does with its second sampler plane. */
+       * Borealis does with its second sampler plane. */
       const bool query_lod = cs->so && cs->so->info.uses_query_lod;
       unsigned count = nr_samplers;
       if (custom_borders)
@@ -6273,7 +6273,7 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
       memset(T.cpu, 0, sampler_length * count);
 
       /* Native indexed read() and sample() share this table. Match
-       * Honeykrisp's ABI by keeping the exact texel-fetch sampler at zero and
+       * Borealis's ABI by keeping the exact texel-fetch sampler at zero and
        * placing API samplers after it. */
       if (!agx_gallium_pack_g17p_txf_sampler(dev->chip, T.cpu))
          {
@@ -6394,7 +6394,7 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
    if (agx_chip_g17_m5(dev->chip)) {
       /* Keep ordinary sampler handles stable at i+1.  If any sampler needs a
        * custom border, reserve a disjoint clamp-to-zero bank at slot 33, as
-       * Honeykrisp does with its second sampler plane. */
+       * Borealis does with its second sampler plane. */
       const unsigned count = custom_borders
                                 ? AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE +
                                      ctx->stage[stage].sampler_count
@@ -6404,7 +6404,7 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
       memset(T.cpu, 0, sampler_length * count);
 
       /* Native indexed read() and sample() share this table. Match
-       * Honeykrisp's ABI by keeping the exact texel-fetch sampler at zero and
+       * Borealis's ABI by keeping the exact texel-fetch sampler at zero and
        * placing API samplers after it. */
       if (!agx_gallium_pack_g17p_txf_sampler(dev->chip, T.cpu)) {
          agx_native_descriptor_reject_batch(batch, "texel-fetch sampler");
@@ -6840,7 +6840,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       },
    };
    if (fs_cprog) {
-      /* As hk_upload_g17p_graphics_program(): the main shader's own upload
+      /* As brl_upload_g17p_graphics_program(): the main shader's own upload
        * holds the constant program; linking relocates only the main part. */
       const struct agx_shader_info *pi = &cs->b.info;
       desc.constant_program = (struct agx_ioto_constant_program){
@@ -7193,23 +7193,23 @@ agx_build_agx3_graphics_program(struct agx_batch *batch,
 /* M5-family native program cache. Composing a G17G Ioto program costs tens of
  * microseconds of CPU, and Gallium needs one per stage per draw because the
  * uniform tables it names are uploaded per draw: on the M5 Pro that composer
- * took 86% of Minecraft's GL CPU time (~1,800 draws per frame). Honeykrisp
+ * took 86% of Minecraft's GL CPU time (~1,800 draws per frame). Borealis
  * keeps the composed bytes per linked shader and patches only the range
- * addresses (hk_g17p_gfx_loader_create()); do the same. The template is
+ * addresses (brl_g17p_gfx_loader_create()); do the same. The template is
  * composed in the address-independent form (every range loads its own base
  * with full-width LDIMMs), so one template fits every address the draw's
  * tables get, and only the shape (imageblock, range starts and sizes) keys it.
  * The bytes don't depend on the program's own address (no constant program),
- * which Honeykrisp relies on as well; ASAHI_MESA_DEBUG=verify checks every
+ * which Borealis relies on as well; ASAHI_MESA_DEBUG=verify checks every
  * patched program against a fresh composition. */
 struct agx_m5_graphics_template {
    struct agx_m5_graphics_template *next;
    struct agx_ioto_g17p_imageblock imageblock;
-   uint16_t range_start[HK_G17P_PATCH_MAX_RANGES];
-   uint16_t range_size[HK_G17P_PATCH_MAX_RANGES];
+   uint16_t range_start[BRL_G17P_PATCH_MAX_RANGES];
+   uint16_t range_size[BRL_G17P_PATCH_MAX_RANGES];
    uint8_t range_count;
    uint16_t length;
-   struct hk_g17p_patch_plan plan;
+   struct brl_g17p_patch_plan plan;
    uint8_t bytes[];
 };
 
@@ -7231,7 +7231,7 @@ agx_m5_graphics_template_matches(const struct agx_m5_graphics_template *t,
           t->range_size[i] != d->uniform_ranges[i].size_halfs)
          return false;
    }
-   return hk_g17p_patch_plan_fits(&t->plan, d->uniform_ranges);
+   return brl_g17p_patch_plan_fits(&t->plan, d->uniform_ranges);
 }
 
 static void
@@ -7241,7 +7241,7 @@ agx_m5_graphics_template_emit(const struct agx_m5_graphics_template *t,
 {
    program->length = t->length;
    memcpy(program->bytes, t->bytes, t->length);
-   hk_g17p_patch_plan_apply(&t->plan, desc->uniform_ranges, program->bytes);
+   brl_g17p_patch_plan_apply(&t->plan, desc->uniform_ranges, program->bytes);
 }
 
 /* Write the program for desc (whose program_va isn't needed) from the linked
@@ -7255,7 +7255,7 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
                                struct agx3_g17p_graphics_program *program)
 {
    if (!agx_chip_g17_m5(dev->chip) ||
-       desc->uniform_range_count > HK_G17P_PATCH_MAX_RANGES)
+       desc->uniform_range_count > BRL_G17P_PATCH_MAX_RANGES)
       return false;
 
    simple_mtx_lock(&agx_m5_template_lock);
@@ -7286,7 +7286,7 @@ agx_m5_graphics_program_cached(struct agx_device *dev,
       created = rzalloc_size(linked, sizeof(*created) +
                                         composed->program.length);
       if (created &&
-          hk_g17p_patch_plan_init(&created->plan, d.uniform_ranges,
+          brl_g17p_patch_plan_init(&created->plan, d.uniform_ranges,
                                   d.uniform_range_count, composed->relocations,
                                   composed->relocation_count,
                                   composed->program.length, true)) {
@@ -7559,8 +7559,8 @@ agx_build_native_g17g_graphics_program(struct agx_batch *batch,
                                program.length))
       AGX3_PROGRAM_REFUSE("program upload");
    if (agx_m5_render_resources(dev)) {
-      /* The kernel sizes the render's pools from this (hk_cmd_draw.c,
-       * hk_m5_note_render_resources): primary storage is the larger of the
+      /* The kernel sizes the render's pools from this (brl_cmd_draw.c,
+       * brl_m5_note_render_resources): primary storage is the larger of the
        * spill frame and the SPECTPR frame; a vertex program's secondary
        * storage is twice its staging extent; a fragment program carries the
        * render's imageblock. */
@@ -7789,7 +7789,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
     * generator; the G17P path below cannot encode it. */
    if (g17g) {
       /* An indirect-local grid comes only from the geometry prepass of a
-       * tessellated draw (agx_launch_gs_prerast), as in hk. */
+       * tessellated draw (agx_launch_gs_prerast), as in Borealis. */
       if ((dev->chip != AGX_CHIP_G17P && !g17g) ||
           (g17g && grid.mode != AGX_CDM_MODE_DIRECT &&
            !(indirect_local && agx_m5_gpu_tess(batch->ctx) &&
@@ -7903,7 +7903,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
          /* The program announces how it will be launched.  An indirectly
           * launched one takes its dimensions from the geometry block; a record
           * that selects indirect mode while its program still announces
-          * DIRECT_ADD3 runs no invocations at all.  hk_cmd_dispatch.c picks the
+          * DIRECT_ADD3 runs no invocations at all.  brl_cmd_dispatch.c picks the
           * kind the same way. */
          .ldshdr_f1 = indirect_local ? AGX3_G17P_INDIRECT_MAIN_LDSHDR_F1
                                      : AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
@@ -7912,7 +7912,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
        * header carrying a 48-bit pipeline VA, where agx_cdm_launch()'s AGX2
        * packet has only a two-word header and a 26-bit pipeline field. The
        * program is the graphics generator's non-fragment form, exactly as
-       * hk_cmd_dispatch.c drives it. */
+       * brl_cmd_dispatch.c drives it. */
       struct agx3_g17p_compute_program native;
       struct agx3_compute_program g17g_launch;
       size_t program_length;
@@ -7970,7 +7970,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       if (indirect_local) {
          /* The kernel that writes this grid is already its own dispatch earlier
           * in the stream, behind a full barrier, so the launch stands alone.
-          * M5 reads the local size from the grid too (hk_dispatch_m5_native). */
+          * M5 reads the local size from the grid too (brl_dispatch_m5_native). */
          if (!(g17g ? agx3_m5_native_indirect_dispatch_append(
                          &g17g_launch, grid.ptr, NULL, 5, &sink)
                     : agx3_g17p_native_indirect_compute_launch_append(
@@ -8009,7 +8009,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
                                      grid))
             return false;
 
-         /* The dispatch's storage, as hk_m5_compute_resources() lists it.
+         /* The dispatch's storage, as brl_m5_compute_resources() lists it.
           * This path refuses spills, so only the workgroup's shared memory
           * and size vary. */
          if (agx_m5_render_resources(dev)) {
@@ -8043,7 +8043,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
    /* The thread-private frame SPECTPR declares: register spills, and the
     * 16-byte word a device atomic returns its old value through. Declaring
     * less than the code uses is not refused by anything; the dispatch just
-    * never completes. Same frame hk_cmd_dispatch.c declares. */
+    * never completes. Same frame brl_cmd_dispatch.c declares. */
    const uint32_t tps_size =
       !info ? 0
       : linked ? MAX2(linked->scratch_size, linked->agx3_spectpr_scratch_size)
@@ -8158,7 +8158,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
        * that selects indirect mode while its program still announces
-       * DIRECT_ADD3 runs no invocations at all.  hk_cmd_dispatch.c picks the
+       * DIRECT_ADD3 runs no invocations at all.  brl_cmd_dispatch.c picks the
        * kind the same way. */
       .ldshdr_f1 = indirect_local ? AGX3_G17P_INDIRECT_MAIN_LDSHDR_F1
                                   : AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
@@ -8182,7 +8182,7 @@ agx_g17p_append_compute(struct agx_batch *batch,
     * stream through memory, with no barrier of their own in between. The
     * launch's weak tail orders them on HAL200. On G15, a dependency inside
     * the stream is published only by the wide flush, so there every launch
-    * ends in it, as Honeykrisp's software stages do. */
+    * ends in it, as Borealis's software stages do. */
    const uint8_t barrier_flags =
       agx_chip_cdm_wide_visibility(dev->chip) ? 0x5 : 0;
    if (indirect_local) {
@@ -8244,7 +8244,7 @@ agx_g18_append_compute(struct agx_batch *batch,
    /* The thread-private frame SPECTPR declares: register spills, and the
     * 16-byte word a device atomic returns its old value through. Declaring
     * less than the code uses is not refused by anything; the dispatch just
-    * never completes. Same frame hk_cmd_dispatch.c declares. */
+    * never completes. Same frame brl_cmd_dispatch.c declares. */
    const uint32_t tps_size =
       !info ? 0
       : linked ? MAX2(linked->scratch_size, linked->agx3_spectpr_scratch_size)
@@ -8409,7 +8409,7 @@ agx_g18_append_compute(struct agx_batch *batch,
       /* The program announces how it will be launched.  An indirectly
        * launched one takes its dimensions from the geometry block; a record
        * that selects indirect mode while its program still announces
-       * DIRECT_ADD3 runs no invocations at all.  hk_cmd_dispatch.c picks the
+       * DIRECT_ADD3 runs no invocations at all.  brl_cmd_dispatch.c picks the
        * kind the same way. */
       .ldshdr_f1 = indirect_local ? AGX3_G17P_INDIRECT_MAIN_LDSHDR_F1
                                   : AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
@@ -8418,7 +8418,7 @@ agx_g18_append_compute(struct agx_batch *batch,
     * header carrying a 48-bit pipeline VA, where agx_cdm_launch()'s AGX2
     * packet has only a two-word header and a 26-bit pipeline field. The
     * program is the graphics generator's non-fragment form, exactly as
-    * hk_cmd_dispatch.c drives it. */
+    * brl_cmd_dispatch.c drives it. */
    struct agx3_g17p_compute_program native;
    struct agx3_compute_program g17g_launch;
    size_t program_length;
@@ -8903,9 +8903,9 @@ agx_m5_precomp_admitted(enum libagx_program program, bool in_tess)
    }
 }
 
-/* A precompiled kernel on G17G, G17S and G17C, as hk_dispatch_precomp_m5()
+/* A precompiled kernel on G17G, G17S and G17C, as brl_dispatch_precomp_m5()
  * launches it: the M5 compute program with the kernel's spill frame and
- * threadgroup memory, and the M5 launch record. Unlike hk, each dispatch is
+ * threadgroup memory, and the M5 launch record. Unlike Borealis, each dispatch is
  * its own command (agx_batch_submit()), as on the API compute path. */
 static void
 agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
@@ -9039,7 +9039,7 @@ agx_launch_precomp_g17_m5(struct agx_batch *batch, struct agx_grid grid,
       return;
    }
 
-   /* The spill frame and threadgroup memory, as hk_m5_compute_resources()
+   /* The spill frame and threadgroup memory, as brl_m5_compute_resources()
     * lists them. The check above admits a spill frame on this feature. */
    if (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES) {
       const struct drm_asahi_compute_program profile = {
@@ -9166,7 +9166,7 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
          .uniform_ranges = ranges,
          .uniform_range_count = range_count,
          .shader_binary_size = cs->info.main_size,
-         /* The kernel's thread-private spill frame, as hk declares it. The
+         /* The kernel's thread-private spill frame, as Borealis declares it. The
           * software tessellator's emitting pass spills (68 bytes for
           * triangles); launched with no frame it never completes, which is
           * how every tessellated draw with a level above one used to time
@@ -9231,7 +9231,7 @@ agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
       return;
    }
 
-   /* M5 launches the tessellation and geometry kernels (as hk does) and
+   /* M5 launches the tessellation and geometry kernels (as Borealis does) and
     * refuses the batch for every other one, instead of dereferencing a
     * missing program on the AGX2 path below. */
    if (agx_chip_g17_m5(dev->chip)) {
@@ -9418,7 +9418,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
          return agx_reject_g17g_tile(batch, "M5 colour-free tile shader ABI");
       range_count = 0;
    } else if (store) {
-      /* Match the M5 native EOT ABI already used by Honeykrisp: the PBE
+      /* Match the M5 native EOT ABI already used by Borealis: the PBE
        * table pointer occupies u0..3 and the tile offset occupies u4..5.
        */
       /* Complete native G18 programs, including coordinates and all stores. */
@@ -9505,7 +9505,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
                return agx_reject_g17g_tile(batch, "M5 reload texture");
          }
          struct agx_gallium_sampler_descriptor samplers[2] = {0};
-         /* Same Gen5 texel-fetch sampler as hk_pack_native_txf_sampler(G17G).
+         /* Same Gen5 texel-fetch sampler as brl_pack_native_txf_sampler(G17G).
           * Gen5's comparison mode bit is required even for a non-shadow fetch.
           */
          agx_pack(samplers[0].opaque, SAMPLER_GEN5, cfg) {
@@ -9623,7 +9623,7 @@ agx_build_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key,
  * numbered, each keeping its tile offset; reloads come before clears, because
  * a reload reads its texture and sampler pointers from uniform halves 0..7,
  * which a target-zero clear value would otherwise overlap. This is the
- * Gallium form of hk_build_g17p_mixed_bg_eot().
+ * Gallium form of brl_build_g17p_mixed_bg_eot().
  */
 static struct asahi_bg_eot
 agx_g17p_build_mixed_bg_eot(struct agx_batch *batch,
@@ -9949,7 +9949,7 @@ agx_build_native_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key
          return agx_reject_g17g_tile(batch, "M5 colour-free tile shader ABI");
       range_count = 0;
    } else if (store) {
-      /* Match the M5 native EOT ABI already used by Honeykrisp: the PBE
+      /* Match the M5 native EOT ABI already used by Borealis: the PBE
        * table pointer occupies u0..3 and the tile offset occupies u4..5.
        */
       /* The ABI is the uniform layout above (eight staged halves); the
@@ -10013,7 +10013,7 @@ agx_build_native_g17g_bg_eot(struct agx_batch *batch, struct agx_bg_eot_key *key
                             &sampler_view))
          return agx_reject_g17g_tile(batch, "M5 reload texture");
       struct agx_gallium_sampler_descriptor sampler = {0};
-      /* Same Gen5 texel-fetch sampler as hk_pack_native_txf_sampler(G17G).
+      /* Same Gen5 texel-fetch sampler as brl_pack_native_txf_sampler(G17G).
        * Gen5's comparison mode bit is required even for a non-shadow fetch.
        */
       agx_pack(sampler.opaque, SAMPLER_GEN5, cfg) {
@@ -10865,7 +10865,7 @@ agx_batch_init_state(struct agx_batch *batch)
    }
 
    if ((dev->chip == AGX_CHIP_G18G || agx_chip_g17_m5(dev->chip))) {
-      /* Same fixed-layout initial state as Honeykrisp's M5 path. These
+      /* Same fixed-layout initial state as Borealis's M5 path. These
        * records establish the processor's initial state even for clear-only
        * batches; the AGX2 selector graph cannot initialize HAL300.
        */
@@ -11069,7 +11069,7 @@ agx_point_object_type(struct agx_rasterizer *rast)
 #define IS_DIRTY(ST)    !!(ctx->dirty & AGX_DIRTY_##ST)
 
 /* HAL300 uses full Ioto program pointers and separate viewport/base/graphics
- * PPP records. Use the same captured codecs as Honeykrisp; the legacy USC and
+ * PPP records. Use the same captured codecs as Borealis; the legacy USC and
  * HAL200 bind-tail layouts are not compatible with this command processor.
  */
 static bool
@@ -11614,7 +11614,7 @@ agx_encode_native_g17g_state(struct agx_batch *batch, uint8_t *out)
          ((UINT32_C(1) << clip_dist_words) - 1),
       .cull_mode = rast->base.cull_face,
       .front_face_ccw = rast->base.front_ccw, .point_size_output = psiz,
-      /* The same provoking vertex as the VDM selector above. Honeykrisp
+      /* The same provoking vertex as the VDM selector above. Borealis
        * programs both on M5 (46478b5cfdc: with the PPP selector left at 0,
        * clipped last-vertex triangles took their flat inputs from vertex 0),
        * and the G18G captures carry 2 here for GL's last-vertex default. */
@@ -11911,7 +11911,7 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
    agx_pack_fragment_face_2(&face_2, object_type, &ctx->fs->b.info);
    /* G17P's native depth contract must preserve late shader side effects.
     * An unchanged depth output alone does not permit early rejection when
-    * image or SSBO stores precede the fragment tests. Match Honeykrisp's
+    * image or SSBO stores precede the fragment tests. Match Borealis's
     * native face packing rather than inheriting the AGX2 depth-only word. */
    if (!agx_ppp_hal200_fragment_face_depth_pack(
           dev->chip, agx_translate_depth_layout(ctx->fs->b.info.depth_layout),
@@ -12027,7 +12027,7 @@ agx_g17p_emit_bind_state(struct agx_batch *batch, uint8_t *out,
 }
 
 /* HAL300 uses full Ioto program pointers and separate viewport/base/graphics
- * PPP records. Use the same captured codecs as Honeykrisp; the legacy USC and
+ * PPP records. Use the same captured codecs as Borealis; the legacy USC and
  * HAL200 bind-tail layouts are not compatible with this command processor.
  */
 static bool
@@ -13594,8 +13594,8 @@ agx_ensure_cmdbuf_has_space(struct agx_batch *batch, struct agx_encoder *enc,
    } else if (vdm && agx_chip_g17_m5(dev->chip)) {
       /* The M5 command processor adds the render-context base to a Stream
        * Link target, as it does to a PPP payload pointer: an absolute target
-       * is read 0x1000000000 above the new chunk. Honeykrisp makes the same
-       * translation in hk_cmd_buffer_emit_cs_jump(). */
+       * is read 0x1000000000 above the new chunk. Borealis makes the same
+       * translation in brl_cmd_buffer_emit_cs_jump(). */
       uint64_t compact = 0;
       struct agx_vdm_stream_link_core link;
       const bool packed = agx_m5_vdm_compact(T.gpu, &compact) &&
@@ -14082,7 +14082,7 @@ agx_needs_passthrough_gs(struct agx_context *ctx,
    /* TODO: this is really sloppy, we should add a VDM kernel for this.
     *
     * M5 rasterizes no geometry-shader draw; its tessellation prepass counts
-    * the primitives instead (agx_draw_patches), as hk does.
+    * the primitives instead (agx_draw_patches), as Borealis does.
     */
    if ((indirect || info->mode == MESA_PRIM_PATCHES) && ctx->active_queries &&
        ctx->prims_generated[0] &&
@@ -14537,7 +14537,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_INVOCATIONS]);
 
    /* Primitives generated: elsewhere a passthrough geometry shader counts
-    * them (agx_needs_passthrough_gs), on M5 the prefix sum does, as in hk.
+    * them (agx_needs_passthrough_gs), on M5 the prefix sum does, as in Borealis.
     * poly_increment_counters() skips a null pointer. */
    uint64_t prims_generated =
       m5 && ctx->active_queries && ctx->prims_generated[0]
@@ -16335,7 +16335,7 @@ agx_launch(struct agx_batch *batch, struct agx_grid grid,
             /* This lowering accepts exactly image unit 0 with no sampled
              * textures, whose paired PBE is descriptor 1. State 0 therefore
              * receives that resolved descriptor and the native write control
-             * directly, matching Honeykrisp's write-only ABI. G18G's root is
+             * directly, matching Borealis's write-only ABI. G18G's root is
              * the PBE and its sampler-shaped state record only, eight halves,
              * as native run112 kick 19 launch 1 loads it. */
             pointers[0] = batch->stage_uniforms[stage].texture_base +

@@ -383,7 +383,7 @@ TEST_F(G17PMSAAEpilog, PerSampleKillsUseOneCoverageUpdate)
  * G17S at 2x and 4x. */
 TEST_F(G17PMSAAEpilog, M5PerSampleKillsUseOneTestingUpdate)
 {
-   /* hk_native_fs_registers() on M5: the whole register file (AGX_NUM_REGS). */
+   /* brl_native_fs_registers() on M5: the whole register file (AGX_NUM_REGS). */
    const unsigned m5_registers = 256;
    for (unsigned samples : {2u, 4u}) {
       SCOPED_TRACE(samples);
@@ -412,7 +412,7 @@ TEST_F(G17PMSAAEpilog, M5PerSampleKillsUseOneTestingUpdate)
       nir_builder_instr_insert(&b, &store->instr);
       b.shader->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DATA0);
 
-      /* As Honeykrisp orders it on M5: discards to demotes, the unroll, then
+      /* As Borealis orders it on M5: discards to demotes, the unroll, then
        * the coverage lowering. */
       agx_nir_lower_discard_zs_emit(b.shader);
       agx_fs_epilog_link_info link = {};

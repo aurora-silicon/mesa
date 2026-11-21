@@ -24,7 +24,7 @@ struct agx3_ioto_load_packer {
    enum agx_chip chip;
    enum agx_ioto_load_encoding encoding;
    bool copy_wait_emitted;
-   /* HK_G17P_NATIVE_ESL_WAIT (v51y, default off): GPU0 carries the slot
+   /* BRL_G17P_NATIVE_ESL_WAIT (v51y, default off): GPU0 carries the slot
     * wait on the first COPY of a round instead of the four-NOP drain. */
    bool gpu0_copy_wait;
    /* Optional known input set, borrowed for the complete load transaction.

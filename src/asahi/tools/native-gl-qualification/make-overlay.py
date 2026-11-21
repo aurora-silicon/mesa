@@ -28,7 +28,7 @@ assert len(choices) == 1, 'ambiguous/missing staged Mesa'
 src = choices[0]
 out = a.output / 'usr/lib64'
 out.mkdir(parents=True)
-required = ['libEGL_mesa.so.0', 'libGLX_mesa.so.0', 'libgbm.so.1', 'libvulkan_asahi.so']
+required = ['libEGL_mesa.so.0', 'libGLX_mesa.so.0', 'libgbm.so.1', 'libvulkan_borealis.so']
 gallium = list(src.glob('libgallium-*.so'))
 if not gallium:
     gallium = list((src / 'dri').glob('libgallium-*.so'))
@@ -52,7 +52,7 @@ for alias, subdir in files:
     key = str(subdir / name)
     if key not in seen:
         data = real.read_bytes()
-        if alias in gallium or alias.name == 'libvulkan_asahi.so':
+        if alias in gallium or alias.name == 'libvulkan_borealis.so':
             assert ('git-' + a.commit[:10]).encode() in data, ('source identity', alias)
         header = subprocess.check_output(['readelf', '-h', str(real)], text=True)
         assert re.search(r'Machine:\s*' + re.escape(a.architecture) + r'\s*$', header, re.M), header

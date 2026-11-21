@@ -776,7 +776,7 @@ g17p_indexed_image_fetch_shape(const nir_intrinsic_instr *intr)
     */
    /* Admit exactly the dimensions agx3_emit_texture_fetch() encodes for an
     * image load: 2D, 2D array and 3D. Vulkan storage cube views are packed as
-    * 2D-array descriptors by hk_image_view, and agx_emit_image_load() already
+    * 2D-array descriptors by brl_image_view, and agx_emit_image_load() already
     * maps both cube forms onto AGX_DIM_2D_ARRAY. They therefore use the same
     * qualified fetch as an ordinary array image; rejecting the original NIR
     * dimension here only leaves its unencodable software descriptor handle in
@@ -1624,7 +1624,7 @@ g17p_lower_storage_image(nir_shader *shader,
    }
 
    /* The texture record sits one 32-byte record before the PBE (asserted in
-    * hk_descriptor_set.h). */
+    * brl_descriptor_set.h). */
    if (load) {
       if ((texture_offset_B & 7) != 0 ||
           pbe_offset_B != texture_offset_B + 32)
@@ -1880,7 +1880,7 @@ agx_nir_lower_g18g_storage_image(struct nir_shader *shader,
 
    /* Read-write: Gallium's G18G form. One table holds the
     * image's texture descriptor (entry 0, read by image_load) and its PBE
-    * (entry 1, written by image_store); the hk storage descriptor already
+    * (entry 1, written by image_store); the Borealis storage descriptor already
     * keeps them adjacent (PBE = texture + 32). Point the store at entry 1. */
    nir_foreach_function_impl(impl, shader) {
       nir_builder b = nir_builder_create(impl);
@@ -1901,13 +1901,13 @@ agx_nir_lower_g18g_storage_image(struct nir_shader *shader,
 }
 
 /* G18G, several storage images: one native state table spanning their
- * descriptors. hk stores a storage image as texture32 then PBE32 in its
+ * descriptors. Borealis stores a storage image as texture32 then PBE32 in its
  * descriptor set, and the G18G state-0 route reads its table straight from
  * set memory (entry 0 = the bound address). With the table based at the
  * lowest texture descriptor, image i loads through entry (texture_i - base) /
  * 32 and stores through the entry after it, the read-write form
  * agx_nir_lower_g18g_storage_image already uses for one image. Loads and
- * stores only (hk lowers image atomics to global atomics before this pass),
+ * stores only (Borealis lowers image atomics to global atomics before this pass),
  * every image in one set; anything else declines. Runs only after the
  * single-image route declined. */
 #define G18G_MAX_STORAGE_IMAGES 8
@@ -1986,7 +1986,7 @@ agx_nir_lower_g18g_storage_images(
             }
             case nir_intrinsic_bindless_image_atomic:
             case nir_intrinsic_bindless_image_atomic_swap:
-               /* hk lowers image atomics to global atomics before this pass;
+               /* Borealis lowers image atomics to global atomics before this pass;
                 * one still here is not a shape this table route knows. */
                ok = false;
                break;
@@ -2345,7 +2345,7 @@ agx_nir_lower_g18g_combined_tables(struct nir_shader *shader,
    for (unsigned i = 0; i < texture_count; ++i)
       out.textures[out.texture_count++] = textures[i];
    /* The handle names the descriptor's sampler word; the published heap
-    * index sits 8 bytes after it (hk_sampled_image_descriptor_layout). */
+    * index sits 8 bytes after it (brl_sampled_image_descriptor_layout). */
    for (unsigned i = 0; i < sampler_count; ++i)
       out.samplers[out.sampler_count++] = (struct agx_g18g_table_entry){
          samplers[i].set, samplers[i].offset_B + 8};

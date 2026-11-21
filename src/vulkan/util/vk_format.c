@@ -291,9 +291,9 @@ vk_format_to_pipe_format(VkFormat vkformat)
        * format -- silently mis-sizing every copy of these images.
        *
        * Anything that must tell luma-first from chroma-first, or 10- from 12-
-       * from 16-bit, reads the VkFormat itself (hk_packed_ycbcr_bits(),
-       * hk_packed_ycbcr_luma_first()).  This mapping is deliberately only about
-       * block geometry, and it agrees with the format hk_format_to_pipe_format()
+       * from 16-bit, reads the VkFormat itself (brl_packed_ycbcr_bits(),
+       * brl_packed_ycbcr_luma_first()).  This mapping is deliberately only about
+       * block geometry, and it agrees with the format brl_format_to_pipe_format()
        * already lays these images out with.
        */
       case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:

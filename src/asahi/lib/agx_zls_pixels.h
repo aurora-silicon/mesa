@@ -18,7 +18,7 @@
  * same render publishes 0x00ff00ff), and so does G18G (the J873 256x256 depth and stencil renders
  * publish 0x00ff00ff). All treat zero as the inactive encoding rather than a
  * minus-one 1x1 surface, so a render with no depth or stencil storage
- * publishes zero on each. Honeykrisp's hk_drm_*_zls_pixels() are the
+ * publishes zero on each. Borealis's brl_drm_*_zls_pixels() are the
  * witnesses for these three rules; this is the same packing where Gallium
  * and the Vulkan driver can share it.
  */
