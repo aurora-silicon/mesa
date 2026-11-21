@@ -190,7 +190,10 @@ hk_query_wait_record(struct util_dynarray *ops, struct hk_query_wait_pool *pool,
                      uint32_t first, uint32_t count, bool reset)
 {
    assert(first <= pool->count && count <= pool->count - first);
-   if (!count)
+   /* GPU resets do not produce availability. Do not retain recording ops
+    * for them: enqueue and claim both use an empty recording to skip work.
+    * The caller still emits/orders the actual GPU reset. */
+   if (!count || reset)
       return true;
    struct hk_query_wait_op *op =
       util_dynarray_grow(ops, struct hk_query_wait_op, 1);
@@ -242,6 +245,9 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
                       const void *recording, const struct util_dynarray *ops,
                       struct hk_query_wait_batch *batch)
 {
+   if (!ops->size)
+      return true;
+
    size_t count = 0;
    util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
       if (!op->reset) {
@@ -392,6 +398,12 @@ hk_query_wait_quiescent(struct hk_query_wait_device *dev, uint64_t *serial)
    return idle;
 }
 
+static uint64_t
+query_wait_now(const struct hk_query_wait_ops *ops, void *data)
+{
+   return ops->now ? ops->now(data) : os_time_get_nano();
+}
+
 VkResult
 hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
                         bool victims, bool *never,
@@ -399,6 +411,7 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
 {
    struct hk_query_wait_device *dev = pool->dev;
    *never = false;
+   bool spin = true;
    for (;;) {
       if (ops->available(data))
          return VK_SUCCESS;
@@ -415,10 +428,23 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
          return VK_SUCCESS;
       }
 
-      const uint64_t now = ops->now ? ops->now(data) : os_time_get_nano();
-      const uint64_t deadline =
-         MIN2(now, INT64_MAX - HK_QUERY_WAIT_INTERVAL_NS) +
-         HK_QUERY_WAIT_INTERVAL_NS;
+      if (spin) {
+         spin = false;
+         const uint64_t start = query_wait_now(ops, data);
+         for (unsigned i = 0; i < HK_QUERY_WAIT_SPIN_POLLS &&
+                              query_wait_now(ops, data) - start <
+                                 HK_QUERY_WAIT_SPIN_NS; i++) {
+            if (ops->available(data)) {
+               /* Like the blocking path, never hide loss behind readiness
+                * which became visible since the preceding status check. */
+               return ops->status(data);
+            }
+         }
+         status = ops->status(data);
+         if (status != VK_SUCCESS)
+            return status;
+      }
+
       struct hk_query_wait_producer *producer = NULL;
       mtx_lock(&dev->mutex);
       list_for_each_entry(struct hk_query_wait_link, q,
@@ -428,6 +454,10 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
          if (producer)
             break;
       }
+      const uint64_t interval = producer ? HK_QUERY_WAIT_COMPLETION_NS
+                                         : HK_QUERY_WAIT_INTERVAL_NS;
+      const uint64_t now = query_wait_now(ops, data);
+      const uint64_t deadline = MIN2(now, INT64_MAX - interval) + interval;
       if (producer) {
          p_atomic_inc(&producer->refs);
          mtx_unlock(&dev->mutex);

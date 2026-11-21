@@ -37,6 +37,9 @@ struct fixture {
    int queue[2];
    uint64_t point[2], completion_at[2];
    uint64_t now, ready_at, loss_at, publish_at;
+   uint64_t clock_step;
+   unsigned initial_polls;
+   int completion_error, changed_error;
    unsigned available, statuses, completions, changes, errors;
    bool race_ready, race_loss, idle;
    bool publish_pending;
@@ -98,6 +101,8 @@ available(void *data)
 {
    struct fixture *f = data;
    f->available++;
+   if (!f->completions && !f->changes)
+      f->initial_polls++;
    assert(f->now <= UINT64_C(5000000000));
    return f->now >= f->ready_at;
 }
@@ -127,7 +132,10 @@ idle(void *data)
 static uint64_t
 now(void *data)
 {
-   return ((struct fixture *)data)->now;
+   struct fixture *f = data;
+   uint64_t value = f->now;
+   f->now += f->clock_step;
+   return value;
 }
 
 static int
@@ -138,8 +146,13 @@ completion(void *data, void *queue, uint64_t point, uint64_t deadline)
    assert(queue == &f->queue[q]);
    assert(point == f->point[q] && point != 0);
    assert(deadline > f->now);
-   assert(deadline - f->now <= HK_QUERY_WAIT_INTERVAL_NS);
+   assert(deadline - f->now <= UINT64_C(1000000));
    f->completions++;
+   if (f->completion_error) {
+      if (f->completion_error == -EINTR)
+         f->loss_at = f->now;
+      return f->completion_error;
+   }
    if (f->completion_at[q] <= deadline) {
       f->now = f->completion_at[q];
       if (f->idle_after_completion)
@@ -157,6 +170,8 @@ changed(void *data, struct hk_query_wait_device *dev, uint64_t deadline)
    assert(deadline > f->now);
    assert(deadline - f->now <= HK_QUERY_WAIT_INTERVAL_NS);
    f->changes++;
+   if (f->changed_error)
+      return f->changed_error;
    if (f->publish_pending && deadline >= f->publish_at) {
       f->now = f->publish_at;
       f->publish_pending = false;
@@ -210,8 +225,10 @@ test_waits(void)
    accept(&f, 0, 1);
    f.ready_at = f.completion_at[0] = UINT64_C(2200000000);
    assert(wait(&f, false, &never) == VK_SUCCESS && !never);
-   assert(f.now == f.ready_at && f.completions == 22 && !f.errors);
-   printf("delayed producer: success at 2200 ms, 22 bounded DRM waits\n");
+   assert(f.now == f.ready_at && f.completions == 2200 && !f.errors);
+   assert(f.initial_polls == 1025);
+   assert(f.available <= f.initial_polls + f.completions);
+   printf("delayed producer: success at 2200 ms, 2200 bounded DRM waits\n");
    finish(&f);
 
    init(&f);
@@ -219,9 +236,9 @@ test_waits(void)
    accept(&f, 0, 11);
    f.ready_at = 1;
    assert(wait(&f, false, &never) == VK_SUCCESS && !never);
-   assert(f.now == HK_QUERY_WAIT_INTERVAL_NS && f.completions == 1);
+   assert(f.now == UINT64_C(1000000) && f.completions == 1);
    assert(f.completion_at[0] == UINT64_MAX);
-   printf("availability before host-dependent tail: extra 99999999 ns\n");
+   printf("availability before host-dependent tail: extra 999999 ns\n");
    finish(&f);
 
    for (unsigned state = 0; state < 3; state++) {
@@ -234,13 +251,14 @@ test_waits(void)
          accept(&f, 0, 3);
       f.loss_at = 1;
       assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST);
-      assert(f.now == HK_QUERY_WAIT_INTERVAL_NS && !f.errors);
+      assert(f.now == (state == 2 ? UINT64_C(1000000) :
+                                   HK_QUERY_WAIT_INTERVAL_NS) && !f.errors);
       assert(f.completions == (state == 2));
       if (reserved)
          hk_query_wait_publish(&f.dev, reserved, 0, false);
       finish(&f);
    }
-   printf("queued/reserved/accepted loss: extra 99999999 ns in each state\n");
+   printf("queued/reserved loss: <100 ms; accepted loss: <1 ms (fake time)\n");
 
    init(&f);
    enqueue(&f, 0);
@@ -256,9 +274,127 @@ test_waits(void)
    f.publish_at = UINT64_C(250000000);
    f.ready_at = f.completion_at[0] = UINT64_C(2200000000);
    assert(wait(&f, false, &never) == VK_SUCCESS);
-   assert(f.changes == 3 && f.completions == 20 && !f.errors);
+   assert(f.changes == 3 && f.completions == 1950 && !f.errors);
    assert(f.now == f.ready_at);
    finish(&f);
+}
+
+/* A single spin budget belongs to the host call, not to each timeout. The
+ * frozen clock in test_waits also verifies the independent poll-count cap. */
+static void
+test_spin_and_errors(void)
+{
+   struct fixture f;
+   bool never;
+   init(&f);
+   f.clock_step = 1000;
+   f.ready_at = 20000;
+   assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+   assert(!f.completions && !f.changes);
+   assert(f.now <= 51000 && f.initial_polls <= 51);
+   printf("short availability: returned in spin at %llu ns, no blocking\n",
+          (unsigned long long)f.now);
+   finish(&f);
+
+   init(&f);
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   f.clock_step = 1000;
+   f.ready_at = f.completion_at[0] = UINT64_C(2200000000);
+   assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+   assert(f.initial_polls <= 51);
+   /* One availability test per subsequent wait, no repeated spinning. */
+   assert(f.available <= f.initial_polls + f.completions);
+   assert(f.now >= f.ready_at && f.now <= f.ready_at + 1000);
+   printf("long wait: %u initial polls, %u completion waits, %u total polls\n",
+          f.initial_polls, f.completions, f.available);
+   finish(&f);
+
+   init(&f);
+   f.clock_step = 1000;
+   f.ready_at = f.loss_at = 20000;
+   assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST);
+   assert(!f.completions && !f.changes);
+   finish(&f);
+
+   for (unsigned mode = 0; mode < 3; mode++) {
+      init(&f);
+      if (mode != 2) {
+         enqueue(&f, 0);
+         accept(&f, 0, 1);
+         f.completion_error = mode ? -EINTR : -EIO;
+      } else {
+         f.changed_error = thrd_error;
+      }
+      /* EINTR retries and then observes loss; fatal errors use error(). */
+      assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST);
+      assert(f.errors == (mode != 1));
+      finish(&f);
+   }
+}
+
+static void
+test_future_producers(void)
+{
+   struct fixture f;
+   bool never;
+   init(&f);
+   f.idle = true;
+   f.publish_pending = true;
+   f.publish_at = UINT64_C(2500000000);
+   f.ready_at = f.completion_at[0] = UINT64_C(2600000000);
+   assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+   assert(f.now == f.ready_at && f.changes == 25 && f.completions == 100);
+   printf("initially idle: future producer registered at 2500 ms, success at 2600 ms\n");
+   finish(&f);
+
+   init(&f);
+   f.idle = true;
+   f.publish_pending = true;
+   f.publish_at = UINT64_C(2500000000);
+   f.ready_at = UINT64_C(2600000000);
+   /* Applying the existing victim rule universally would return before the
+    * exact same future producer. This models the proposed rule, not a GPU. */
+   assert(wait(&f, true, &never) == VK_SUCCESS && never);
+   assert(f.now == 0 && f.publish_pending && !f.completions && !f.changes);
+   printf("universal idle rule counterexample: never=true before future writer\n");
+   finish(&f);
+
+   init(&f);
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   f.completion_at[0] = 1;
+   f.idle_after_completion = true;
+   f.loss_at = UINT64_C(300000000);
+   assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST && !never);
+   assert(f.now > f.completion_at[0] && f.completions == 1 && f.changes == 3);
+   assert(!f.errors);
+   printf("signaled producer without availability: waits; sticky loss still propagates\n");
+   finish(&f);
+}
+
+static void
+test_reset_only(void)
+{
+   struct fixture f;
+   init(&f);
+   struct util_dynarray resets = {0};
+   /* Reset tracking must allocate neither recording storage nor a producer,
+    * and claim must terminate even on repeated submit/fallback paths. */
+   allocation_failure = 1;
+   assert(hk_query_wait_record(&resets, f.pool, 0, 4, true));
+   assert(!resets.size && !resets.data && allocation_failure == 1);
+   for (unsigned i = 0; i < 2; i++) {
+      assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets, &resets, NULL));
+      struct hk_query_wait_producer *p = NULL;
+      assert(hk_query_wait_claim(&f.dev, &f.queue[0], &resets, &resets, &p));
+      assert(!p && list_is_empty(&f.dev.producers) && allocation_failure == 1);
+      hk_query_wait_publish(&f.dev, p, 1, true);
+   }
+   allocation_failure = 0;
+   hk_query_wait_recording_finish(&resets);
+   finish(&f);
+   puts("reset-only: no recording/tracker allocation; repeated enqueue/claim terminates");
 }
 
 static void
@@ -674,7 +810,21 @@ main(int argc, char **argv)
       measure(delay);
       return 0;
    }
+   if (argc == 3 && !strcmp(argv[1], "--case")) {
+      if (!strcmp(argv[2], "reset"))
+         test_reset_only();
+      else if (!strcmp(argv[2], "spin"))
+         test_spin_and_errors();
+      else if (!strcmp(argv[2], "waits"))
+         test_waits();
+      else
+         assert(!"unknown case");
+      return 0;
+   }
    assert(argc == 1);
+   test_reset_only();
+   test_spin_and_errors();
+   test_future_producers();
    test_waits();
    test_retirement();
    test_epochs_and_failure();

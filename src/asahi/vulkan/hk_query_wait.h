@@ -10,6 +10,16 @@
  * one blocking operation, not a deadline for producing a query result. */
 #define HK_QUERY_WAIT_INTERVAL_NS UINT64_C(100000000)
 
+/* One initial spin per host wait, never per completion timeout. The poll cap
+ * also bounds work if the clock does not advance. These are candidate tuning
+ * parameters, not measured hardware latency/CPU guarantees. */
+#define HK_QUERY_WAIT_SPIN_NS UINT64_C(50000)
+#define HK_QUERY_WAIT_SPIN_POLLS 1024
+
+/* A queue timeline point covers the entire submission, not just the query
+ * write. Recheck availability sooner while that point is still pending. */
+#define HK_QUERY_WAIT_COMPLETION_NS UINT64_C(1000000)
+
 struct hk_query_wait_pool;
 struct hk_query_wait_batch;
 struct hk_query_wait_producer;

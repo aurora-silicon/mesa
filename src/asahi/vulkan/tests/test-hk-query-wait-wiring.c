@@ -26,7 +26,8 @@ __typeof__(hk_cmd_invalidate_graphics_state)
 __typeof__(hk_cmd_invalidate_compute_state)
    __wrap_hk_cmd_invalidate_compute_state;
 
-static unsigned stamps, submissions;
+static unsigned stamps, submissions, resets;
+static bool reset_only;
 static unsigned expected_live;
 static bool fail_submission;
 static bool tracking_expected = true;
@@ -108,7 +109,9 @@ struct hk_cs *
 __wrap_hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
                             const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
 {
-   (void)cmd;
+   assert(cmd->state.query_reset_recording);
+   assert(cmd->sync.kind_override == HK_SYNC_ALL);
+   resets++;
    (void)dep;
    return NULL;
 }
@@ -138,9 +141,17 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct hk_device *dev = (void *)vk_queue->base.device;
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    uint64_t serial;
-   if (!tracking_expected) {
+   if (!tracking_expected || reset_only) {
       assert(hk_query_wait_quiescent(&dev->query_wait, &serial));
       assert(list_is_empty(&dev->query_wait.producers));
+      if (reset_only) {
+         struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[0];
+         assert(!cmd->query_wait_ops.size);
+         struct hk_query_wait_producer *p;
+         assert(hk_query_wait_claim(&dev->query_wait, queue, cmd,
+                                    &cmd->query_wait_ops, &p));
+         assert(!p);
+      }
       return VK_SUCCESS;
    }
    /* This assertion fails if the production API entrypoint omits its early
@@ -150,7 +161,7 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    assert(submit->command_buffer_count == 1);
    struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[0];
    assert(util_dynarray_num_elements(&cmd->query_wait_ops,
-                                     struct hk_query_wait_op) == 6);
+                                     struct hk_query_wait_op) == 3);
    if (fail_submission)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    struct hk_query_wait_producer *p;
@@ -230,34 +241,6 @@ main(void)
    VkQueryPool handle = hk_query_pool_to_handle(&pool);
    VkCommandBuffer cmd = hk_cmd_buffer_to_handle(primary);
 
-   hk_CmdResetQueryPool(cmd, handle, 0, 1);
-   hk_CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, handle,
-                         0);
-   assert(
-      vk_enqueue_cmd_reset_query_pool(&secondary->vk.cmd_queue, handle, 1, 1));
-   assert(vk_enqueue_cmd_write_timestamp2(
-      &secondary->vk.cmd_queue, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, handle,
-      1));
-   VkCommandBuffer secondary_handle = hk_cmd_buffer_to_handle(secondary);
-   hk_CmdExecuteCommands(cmd, 1, &secondary_handle);
-   hk_CmdExecuteCommands(cmd, 1, &secondary_handle);
-   assert(stamps == 3);
-   unsigned n = 0;
-   util_dynarray_foreach(&primary->query_wait_ops, struct hk_query_wait_op,
-                         op) {
-      assert(op->pool == pool.wait && op->count == 1);
-      assert(op->first == (n < 2 ? 0 : 1));
-      assert(op->reset == !(n++ & 1));
-   }
-   assert(n == 6 && reports[0] == 17 && reports[1] == 23);
-   uint64_t output[2] = {0};
-   assert(hk_GetQueryPoolResults(
-             hk_device_to_handle(dev), handle, 0, 1, sizeof(output), output,
-             sizeof(output),
-             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
-          VK_SUCCESS);
-   assert(output[0] == 17 && output[1] == 1);
-
    struct hk_queue queue = {0};
    const VkDeviceQueueCreateInfo qi = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -274,6 +257,43 @@ main(void)
       .commandBufferInfoCount = 1,
       .pCommandBufferInfos = &ci,
    };
+   reset_only = true;
+   hk_CmdResetQueryPool(cmd, handle, 0, 1);
+   assert(resets == 1 && !primary->query_wait_ops.size);
+   assert(!primary->state.query_reset_recording && !primary->sync.kind_override);
+   for (unsigned i = 0; i < 2; i++)
+      assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
+                             VK_NULL_HANDLE) == VK_SUCCESS);
+   reset_only = false;
+
+   hk_CmdResetQueryPool(cmd, handle, 0, 1);
+   hk_CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, handle,
+                         0);
+   assert(
+      vk_enqueue_cmd_reset_query_pool(&secondary->vk.cmd_queue, handle, 1, 1));
+   assert(vk_enqueue_cmd_write_timestamp2(
+      &secondary->vk.cmd_queue, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, handle,
+      1));
+   VkCommandBuffer secondary_handle = hk_cmd_buffer_to_handle(secondary);
+   hk_CmdExecuteCommands(cmd, 1, &secondary_handle);
+   hk_CmdExecuteCommands(cmd, 1, &secondary_handle);
+   assert(stamps == 3 && resets == 4);
+   unsigned n = 0;
+   util_dynarray_foreach(&primary->query_wait_ops, struct hk_query_wait_op,
+                         op) {
+      assert(op->pool == pool.wait && op->count == 1);
+      assert(op->first == (n++ == 0 ? 0 : 1));
+      assert(!op->reset);
+   }
+   assert(n == 3 && reports[0] == 17 && reports[1] == 23);
+   uint64_t output[2] = {0};
+   assert(hk_GetQueryPoolResults(
+             hk_device_to_handle(dev), handle, 0, 1, sizeof(output), output,
+             sizeof(output),
+             VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
+          VK_SUCCESS);
+   assert(output[0] == 17 && output[1] == 1);
+
    for (unsigned i = 0; i < 2; i++) {
       expected_live = i + 1;
       assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
