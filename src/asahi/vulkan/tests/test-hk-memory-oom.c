@@ -66,9 +66,10 @@ __wrap_os_get_total_physical_memory(uint64_t *size)
  * reference counting, VA release and WSI object cleanup use production code. */
 static struct agx_bo *
 mock_bo_alloc(struct agx_device *dev, size_t size, size_t align,
-              enum agx_bo_flags flags)
+              enum agx_bo_flags flags, struct agx_va *va)
 {
    ++bo_calls;
+   assert(va == NULL);
    if (limited && size > limit - host - pinned - cached) {
       ++kernel_oom_attempts;
       return NULL;

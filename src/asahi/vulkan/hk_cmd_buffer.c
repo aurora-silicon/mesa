@@ -180,19 +180,24 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-/* Writes the stream words of the patch sites. M5 command memory is mapped
- * uncached (hk_g17p_cached_cmd_memory() is G17P-only), so the words need no
- * cache maintenance, only to be stored whole (the GPU may read the stream
- * meanwhile when the alias count leaves 0) and made visible before the
- * submission or host signal that lets the GPU run them. */
+/* Writes the stream words of the patch sites. Each is stored whole (the GPU
+ * may read the stream meanwhile when the alias count leaves 0) and made
+ * visible before the submission or host signal that lets the GPU run them:
+ * written back from the CPU cache where command memory is cached
+ * (hk_g17p_cached_cmd_memory()), else only fenced. */
 void
 hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
 {
    if (p_atomic_read(&cmd->alias_patched) || !cmd->alias_sites.size)
       return;
 
-   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site)
+   const bool cached =
+      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
+   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
+      if (cached)
+         util_flush_range_no_fence(site->word, sizeof(*site->word));
+   }
 
    __sync_synchronize();
    if (util_has_cache_ops())
@@ -200,25 +205,8 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
    p_atomic_set(&cmd->alias_patched, 1);
 }
 
-void
-hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
-                               const void *from_end, uint8_t *to, size_t skip)
-{
-   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
-      const uint8_t *word = (const uint8_t *)site->word;
-      if (word < (const uint8_t *)from || word >= (const uint8_t *)from_end)
-         continue;
-
-      /* A site in the folded leading record moves to the trailing record
-       * that absorbed it. */
-      const size_t offset = word - (const uint8_t *)from;
-      site->word = (uint32_t *)(offset < skip ? to - AGX3_CDM_BARRIER_SIZE
-                                              : to + offset - skip);
-   }
-}
-
 /* At vkEndCommandBuffer, once nothing moves the streams any more: a command
- * buffer that uses events gets memory scope throughout
+ * buffer that waits for a host-set event gets memory scope throughout
  * (hk_cmd_alias_scope()), one recorded while a resource may alias by now is
  * written at once, and any other waits in host_alias.cmd_buffers for
  * hk_device_patch_alias_sites(), besides the check at submission. */
@@ -228,7 +216,7 @@ hk_cmd_buffer_end_alias_sites(struct hk_cmd_buffer *cmd)
    if (!cmd->alias_sites.size)
       return;
 
-   if (cmd->state.uses_events) {
+   if (cmd->state.alias_host_wait) {
       hk_cmd_buffer_patch_alias_sites(cmd);
       return;
    }
@@ -1071,8 +1059,8 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
        * with ENOTSUPP ("G18 compute admission rejected ... stream_bytes=52").
        */
       if (cs->type == HK_CS_CDM && !cs->g18_dispatch_sealed) {
-         /* With host_alias.dynamic, every stream holding work ends with the
-          * memory-scoped strong flush, also where its last record is an
+         /* M5 with host_alias.dynamic: every stream holding work ends with
+          * the memory-scoped strong flush, also where its last record is an
           * application barrier recorded without memory scope. Each command
           * then writes back what it wrote by its end, as the memory scope of
           * each barrier did under the per-device rule, so a later command
@@ -1082,8 +1070,11 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           * another device's, process's or API's mapping of the same pages,
           * which Vulkan orders after this work only at a submission
           * boundary. Submit packing keeps the scope only at a packet's end
-          * while no resource may alias. */
-         if (dev->host_alias.dynamic &&
+          * while no resource may alias. The end of a G17P command already
+          * publishes its writes to every address (bt xsub with the second
+          * address created while the writer runs reads exact), so G17P
+          * streams end with their own records. */
+         if (dev->host_alias.dynamic && agx_chip_g17_m5(dev->dev.chip) &&
              hk_cdm_visibility_flush_needed(dev, cs, true)) {
             if (cs->current != cs->weak_barrier_end &&
                 cs->current != cs->strong_flush_end)

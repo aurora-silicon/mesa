@@ -390,7 +390,7 @@ agx_bind_timestamps(struct agx_device *dev, struct agx_bo *bo, uint32_t *handle)
 
 static struct agx_bo *
 agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
-             enum agx_bo_flags flags)
+             enum agx_bo_flags flags, struct agx_va *va)
 {
    struct agx_bo *bo;
    unsigned handle = 0;
@@ -411,6 +411,7 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    int ret = drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_CREATE, &gem_create);
    if (ret) {
       fprintf(stderr, "DRM_IOCTL_ASAHI_GEM_CREATE failed: %m\n");
+      agx_va_free(dev, va, false);
       return NULL;
    }
 
@@ -432,7 +433,7 @@ agx_bo_alloc(struct agx_device *dev, size_t size, size_t align,
    bo->prime_fd = -1;
 
    enum agx_va_flags va_flags = flags & AGX_BO_LOW_VA ? AGX_VA_USC : 0;
-   bo->va = agx_va_alloc(dev, size, bo->align, va_flags, 0);
+   bo->va = va ?: agx_va_alloc(dev, size, bo->align, va_flags, 0);
    if (!bo->va) {
       fprintf(stderr, "Failed to allocate BO VMA\n");
       agx_bo_free(dev, bo);

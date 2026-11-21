@@ -907,11 +907,13 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
 /* Whether memory can be mapped at a second GPU virtual address at any time
  * in the life of `dev`, from what it enabled (hk_cdm_alias_scope()):
  *
- * - sparse buffers and images, and capture/replay buffers, have an address
- *   of their own, and the memory bound to them keeps its own as well;
- * - an fd import of memory from elsewhere gets an address of its own, and
- *   another import may map the same pages (two dma-bufs over one memfd, or
- *   a dma-buf and a host import of its pages);
+ * - sparse buffers and images, and capture/replay buffers of
+ *   VK_EXT_buffer_device_address, have an address of their own, and the
+ *   memory bound to them keeps its own as well;
+ * - an fd import gets an address of its own. Importing one GEM object again,
+ *   our own export included, gives the same BO and address (agx_bo_import()),
+ *   but two dma-bufs can share pages under different GEM objects (two
+ *   udmabufs over one memfd), and a host import may map a dma-buf's pages;
  * - a host import gets an address of its own, and the same pages may be
  *   imported again, or be mapped by the application at a second virtual
  *   address that another import, or memory of another kind, reaches. With
@@ -919,19 +921,20 @@ hk_init_g17p_grid_helper(struct hk_device *dev,
  *   GPU, so the GPU writes no imported page and a read through the import
  *   cannot miss a write through another address.
  *
- * Nothing else maps memory the GPU writes at two addresses: the read-only
- * shadow of every allocation is read only through sparse and capture/replay
- * buffers, and the driver's other second mappings (descriptor tables,
- * acceleration structure tables, shader code) hold memory written by the
- * CPU alone. The structures of these features may only be used when they
- * are enabled, so a device that enabled none of them never has such memory.
+ * Nothing else maps memory the GPU writes at two addresses: capture/replay
+ * memory has its address in the capture/replay region alone, and other
+ * buffers and images bound to it take that address; the read-only shadow of
+ * every allocation is read only through sparse buffers; and the driver's
+ * other second mappings (descriptor tables, acceleration structure tables,
+ * shader code) hold memory written by the CPU alone. The structures of these
+ * features may only be used when they are enabled, so a device that enabled
+ * none of them never has such memory.
  *
- * On M5 every resource through which these features map memory at a second
- * address is seen as it is created, so the scope follows the live ones
- * instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers and image
- * planes with an address of their own and memory mapped again for
- * descriptor buffer capture/replay (va_alias_resources), fd and dma-buf
- * imports, and host imports that may alias (hk_host_import_aliases()). An
+ * With VA-tagged caches every resource through which these features map
+ * memory at a second address is seen as it is created, so the scope follows
+ * the live ones instead (host_alias.dynamic, hk_cdm_alias_scope()): buffers
+ * and image planes with an address of their own, fd and dma-buf imports,
+ * and host imports that may alias (hk_host_import_aliases()). An
  * acceleration structure's address is its buffer's, also on replay, so its
  * capture/replay is covered by the buffer's. An import of private anonymous
  * memory of this process (malloc, aligned_alloc, an anonymous private mmap)
@@ -952,13 +955,7 @@ hk_device_may_alias_memory(const struct hk_device *dev,
        f->sparseResidencyImage2D || f->sparseResidencyImage3D ||
        f->sparseResidency2Samples || f->sparseResidency4Samples ||
        f->sparseResidency8Samples || f->sparseResidency16Samples ||
-       f->sparseResidencyAliased)
-      return true;
-
-   if (f->bufferDeviceAddressCaptureReplay ||
-       f->bufferDeviceAddressCaptureReplayEXT ||
-       f->descriptorBufferCaptureReplay ||
-       f->accelerationStructureCaptureReplay)
+       f->sparseResidencyAliased || f->bufferDeviceAddressCaptureReplayEXT)
       return true;
 
    if (ext->KHR_external_memory_fd || ext->EXT_external_memory_dma_buf)
@@ -992,13 +989,8 @@ hk_device_trace_alias_reasons(const struct hk_device *dev,
                       f->sparseResidency8Samples || f->sparseResidency16Samples,
                    "sparseResidencyNSamples");
    HK_ALIAS_REASON(f->sparseResidencyAliased, "sparseResidencyAliased");
-   HK_ALIAS_REASON(f->bufferDeviceAddressCaptureReplay ||
-                      f->bufferDeviceAddressCaptureReplayEXT,
-                   "bufferDeviceAddressCaptureReplay");
-   HK_ALIAS_REASON(f->descriptorBufferCaptureReplay,
-                   "descriptorBufferCaptureReplay");
-   HK_ALIAS_REASON(f->accelerationStructureCaptureReplay,
-                   "accelerationStructureCaptureReplay");
+   HK_ALIAS_REASON(f->bufferDeviceAddressCaptureReplayEXT,
+                   "bufferDeviceAddressCaptureReplayEXT");
    HK_ALIAS_REASON(ext->KHR_external_memory_fd, "KHR_external_memory_fd");
    HK_ALIAS_REASON(ext->EXT_external_memory_dma_buf, "EXT_external_memory_dma_buf");
    HK_ALIAS_REASON(ext->EXT_external_memory_host &&
@@ -1069,9 +1061,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    simple_mtx_init(&dev->host_alias.cmd_lock, mtx_plain);
    list_inithead(&dev->host_alias.cmd_buffers);
    u_rwlock_init(&dev->host_alias.patch_lock);
-   dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
+   /* dev->dev is opened below: the chip comes from pdev. */
+   dev->host_alias.trace = hk_va_tagged_caches(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
-   if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
+   if (dev->may_alias_memory && hk_va_tagged_caches(pdev->dev.chip) &&
        !debug_get_option_m5_host_alias_static()) {
       /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
       const struct agx3_cdm_barrier_info info = {
@@ -1175,10 +1168,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       }
    }
 
-   /* Capture-replay buffers reserve their VA and bind the fill page until
-    * memory is bound, like sparse buffers, so they need it too. */
+   /* VK_EXT_buffer_device_address capture/replay buffers reserve their VA
+    * and bind the fill page until memory is bound, like sparse buffers, so
+    * they need it too (hk_CreateBuffer()). */
    if (dev->vk.enabled_features.sparseBinding ||
-       dev->vk.enabled_features.bufferDeviceAddressCaptureReplay) {
+       dev->vk.enabled_features.bufferDeviceAddressCaptureReplayEXT) {
       dev->sparse_fill = agx_bo_create(&dev->dev, AIL_PAGESIZE, 0, 0,
                                        "Sparse fill page");
       if (!dev->sparse_fill || !agx_bo_map(dev->sparse_fill)) {

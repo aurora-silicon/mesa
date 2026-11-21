@@ -1128,9 +1128,13 @@ struct hk_cs {
     * (struct hk_alias_site) does not move it. */
    void *memory_flush_end;
 
-   /* M5: patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
+   /* Patch sites recorded in this stream (hk_cmd_buffer::alias_sites),
     * which a merge moves with its bytes. */
    uint32_t alias_sites;
+
+   /* current just after a barrier record that is a patch site: a later
+    * launch must not drop it (hk_tess_batch_stage()). */
+   void *alias_pin;
 
    /* AGX3 CDM: the value of current just after a standalone barrier that is
     * the stream's *first* record. Apple's emitter only opens a stream with a
@@ -1450,12 +1454,10 @@ hk_sync_later(struct hk_cs *a, struct hk_cs *b)
 void *hk_cmd_buffer_emit_cs_jump(struct hk_cmd_buffer *cmd, void *current,
                                  uint64_t target, bool vdm);
 
-/* Moves the patch sites of cmd in [from, from_end), copied to `to` without
- * their first `skip` bytes, which were folded into the record just before
- * `to` (hk_cs_merge_cdm_until()). */
-void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
-                                    const void *from, const void *from_end,
-                                    uint8_t *to, size_t skip);
+static inline void hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd,
+                                                  const void *from,
+                                                  const void *from_end,
+                                                  uint8_t *to, size_t skip);
 
 /*
  * Helper to merge two compute control streams, concatenating the second control
@@ -1517,6 +1519,11 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       if (b->alias_sites && a->cmd == b->cmd)
          hk_cmd_buffer_move_alias_sites(a->cmd, b->start, b_current, dst,
                                         b_skip);
+      a->alias_pin =
+         b->alias_pin && a->cmd == b->cmd
+            ? dst + ((uint8_t *)b->alias_pin - (uint8_t *)b->start) - b_skip
+         : a->current == dst ? a->alias_pin
+                             : NULL;
 
       /* These markers point just past an emitted barrier. Preserve them in
        * the destination root so another adjacent merge still has an exact
@@ -1550,6 +1557,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->strong_flush_end = b->strong_flush_end;
       a->weak_barrier_end = b->weak_barrier_end;
       a->memory_flush_end = b->memory_flush_end;
+      a->alias_pin = b->alias_pin;
       a->app_dispatch_end = NULL;
    }
 
@@ -1752,6 +1760,10 @@ struct hk_cmd_buffer {
        * observe this recording before its submission completes. */
       bool uses_events;
 
+      /* A wait for an event the host may set, whose first synchronization
+       * scope holds host operations (hk_CmdWaitEvents2()). */
+      bool alias_host_wait;
+
       /* Scoped around direct/indirect AS builds, including their meta blits. */
       bool as_build_recording;
 
@@ -1901,7 +1913,7 @@ struct hk_cmd_buffer {
     * reference. */
    struct hk_ioto_arena ioto;
 
-   /* M5 with hk_device::host_alias.dynamic: the application dependencies
+   /* With hk_device::host_alias.dynamic: the application dependencies
     * recorded without memory scope (struct hk_alias_site), written once an
     * import may alias (hk_cdm_alias_scope()). alias_patched (atomic) once
     * they are; alias_registered (atomic) while alias_link is in
@@ -1926,9 +1938,34 @@ struct hk_alias_site {
    uint32_t value;
 };
 
+/* Moves the patch sites of cmd in [from, from_end), copied to `to` without
+ * their first `skip` bytes, which were folded into the record just before
+ * `to` (hk_cs_merge_cdm_until()). */
+static inline void
+hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
+                               const void *from_end, uint8_t *to, size_t skip)
+{
+   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
+      const uint8_t *word = (const uint8_t *)site->word;
+      if (word < (const uint8_t *)from || word >= (const uint8_t *)from_end)
+         continue;
+
+      /* A site in the folded leading record moves to the trailing record
+       * that absorbed it. */
+      const size_t offset = word - (const uint8_t *)from;
+      site->word = (uint32_t *)(offset < skip ? to - AGX3_CDM_BARRIER_SIZE
+                                              : to + offset - skip);
+   }
+}
+
 /* Whether an application dependency recorded now needs memory scope: as
  * hk_cdm_alias_scope(), and also, with host_alias.dynamic, in a command
- * buffer that uses events. */
+ * buffer that waits for an event the host may set. Such a wait is the one way
+ * an execution that already started can reach memory aliased after it
+ * started (VUID-vkCmdWaitEvents2-pEvents-03839), and by then the CDM may
+ * have read the records past the wait (about 256 bytes of stream on G17P),
+ * so writing its sites comes too late. Setting an event, as DXVK does for
+ * its event queries, lets nothing in. */
 bool hk_cmd_alias_scope(struct hk_cmd_buffer *cmd);
 
 /* After an application dependency was recorded into cs without memory scope
