@@ -32,7 +32,6 @@ static inline uint64_t wmask(unsigned width) {
 static bool wide_pred_ok(const agx3_table *t, const uint64_t *fields,
                          const agx3_pred *p)
 {
-   if (p->field >= AGX3_MAX_FIELDS) return false;
    uint64_t v = fields[p->field];
    switch (p->kind) {
    case 0: return v == p->a;
@@ -65,7 +64,6 @@ static inline bool preds_test(const agx3_table *t, const uint64_t *fields,
 
 static bool deposit(ctx *c, uint8_t word, uint16_t mask, uint16_t value)
 {
-   if (word >= c->nwords) return false;
    if (c->written[word] & mask & (c->words[word] ^ value)) return false;
    c->words[word] = (uint16_t)((c->words[word] & ~mask) | (value & mask));
    c->written[word] |= mask;
@@ -160,7 +158,6 @@ static bool apply_node(ctx *c, const agx3_node *n)
    }
    for (uint16_t i = 0; i < n->cmd_n; i++) {
       const agx3_cmd *cmd = &c->t->cmds[n->cmd_off + i];
-      if (cmd->field >= AGX3_MAX_FIELDS) return false;
       uint64_t value = c->fields[cmd->field], transformed;
       if (cmd->lut_n) {
          if (value >= cmd->lut_n) return false;
@@ -170,8 +167,9 @@ static bool apply_node(ctx *c, const agx3_node *n)
          if (value & ~c->t->slices[cmd->lut_off])
             c->wide[cmd->field >> 6] |= 1ull << (cmd->field & 63);
       }
-      uint16_t bits = (uint16_t)((transformed >> cmd->src_shift) & wmask(cmd->width));
-      if (!deposit(c, cmd->word, (uint16_t)(wmask(cmd->width) << cmd->dst_shift),
+      const unsigned mask = (1u << cmd->width) - 1;
+      const unsigned bits = (unsigned)(transformed >> cmd->src_shift) & mask;
+      if (!deposit(c, cmd->word, (uint16_t)(mask << cmd->dst_shift),
                    (uint16_t)(bits << cmd->dst_shift)))
          return false;
    }

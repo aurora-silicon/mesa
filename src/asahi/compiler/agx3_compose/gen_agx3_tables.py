@@ -21,7 +21,8 @@ same change, and --verify has nothing to compare that table with.
 Every run, with or without --verify, checks the exclusive flags and the key
 indexes it prints against the predicates of the alternatives (check_keys()),
 and what it prints of each node's consumption against the node's rows
-(check_uses(), check_slices()). The encoder trusts them.
+(check_uses(), check_slices()), and the shape of every row (check_rows()).
+The encoder trusts them.
 """
 
 import argparse
@@ -132,6 +133,35 @@ def check_slices(groups, forms):
         fields(root, 'form %s %d' % (mnemonic, ep))
 
 
+def check_rows(groups, forms):
+    """What the encoder does not test when it applies a row: a field id is
+    one, a deposit stays inside its 16-bit word, and a form reaches no
+    deposit into a word it does not have."""
+    for node in [alt for alts in groups for alt in alts] + [f[3] for f in forms]:
+        preds, fixeds, cmds, _ = node
+        for field in [p[0] for p in preds] + [c[0] for c in cmds]:
+            require(0 <= field < agx3_table.NUM_FIELDS, 'no field %d', field)
+        for _, _, dst_shift, width, src_shift, _ in cmds:
+            require(width >= 1 and dst_shift + width <= 16 and src_shift < 64,
+                    'a deposit of %d bits from bit %d to bit %d',
+                    width, src_shift, dst_shift)
+
+    under = {}
+
+    def last_word(node):
+        words = [f[0] for f in node[1]] + [c[1] for c in node[2]]
+        for g in node[3]:
+            if g not in under:
+                under[g] = max(last_word(alt) for alt in groups[g])
+            words.append(under[g])
+        return max(words, default=-1)
+
+    for mnemonic, ep, size, root in forms:
+        require(size % 2 == 0 and last_word(root) < size // 2,
+                'form %s %d of %d bytes deposits into word %d',
+                mnemonic, ep, size, last_word(root))
+
+
 def dense(name, groups, forms):
     """The arrays of the C table, as lists of tuples in struct field order."""
     pools = {k: Pool() for k in ('fixeds', 'predrefs', 'preds', 'cmds',
@@ -181,8 +211,6 @@ def dense(name, groups, forms):
         slices = direct_slices(n)
         whole = set(p[0] for p in preds) | set(c[0] for c in cmds if c[5])
         consumed = whole | set(slices)
-        require(max(consumed, default=0) < agx3_table.NUM_FIELDS,
-                'no field %d', max(consumed, default=0))
         use = tuple(sum(1 << (f - w) for f in fields if w <= f < w + 64)
                     for fields in (consumed, whole) for w in (0, 64, 128))
         cmds = [((pools['lutpool'].add(lut), len(lut)) if lut else
@@ -370,6 +398,7 @@ def main():
     args = parser.parse_args()
 
     name, groups, forms = agx3_table.parse(args.description)
+    check_rows(groups, forms)
     check_slices(groups, forms)
     D = dense(name, groups, forms)
     check_keys(D, groups)
