@@ -1061,7 +1061,8 @@ agx_swtnl_applies(struct agx_context *ctx)
 
 /* Textures of the CPU stages: a linear copy of every level and layer the
  * view covers, read through the transfer path (which detiles), in the
- * layout the draw module samples from. */
+ * layout the draw module samples from. Returns false when the copy cannot be
+ * made. */
 struct swtnl_texture {
    void *data;
 };
@@ -1076,8 +1077,9 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    uint32_t img_stride[PIPE_MAX_TEXTURE_LEVELS] = {0};
    uint32_t mip_offsets[PIPE_MAX_TEXTURE_LEVELS] = {0};
 
+   /* Not copied: buffer and multisampled textures. */
    if (tex->target == PIPE_BUFFER || tex->nr_samples > 1)
-      return false;
+      return true;
 
    const unsigned first_level = view->u.tex.first_level;
    const unsigned last_level = view->u.tex.last_level;
@@ -1091,15 +1093,24 @@ swtnl_map_texture(struct agx_context *ctx, mesa_shader_stage s, unsigned i,
    const enum pipe_format format = view->format;
    const unsigned bs = util_format_get_blocksize(format);
 
-   size_t size = 0;
+   /* The draw module takes 32-bit strides and offsets, and samples with
+    * signed 32-bit offsets: a copy larger than llvmpipe's limit for the same
+    * sampling code (2 GiB) does not fit, so the draw goes without it. */
+   uint64_t size = 0;
    for (unsigned l = first_level; l <= last_level; ++l) {
       const unsigned w = u_minify(tex->width0, l), h = u_minify(tex->height0, l);
       const unsigned d = tex->target == PIPE_TEXTURE_3D ? u_minify(tex->depth0, l)
                                                          : layers;
-      mip_offsets[l] = size;
-      row_stride[l] = util_format_get_stride(format, w);
-      img_stride[l] = row_stride[l] * util_format_get_nblocksy(format, h);
-      size += (size_t)img_stride[l] * d;
+      const uint64_t row_B = util_format_get_stride(format, w);
+      const uint64_t img_B = row_B * util_format_get_nblocksy(format, h);
+
+      size += img_B * d;
+      if (size > (1ull << 31))
+         return false;
+
+      mip_offsets[l] = size - img_B * d;
+      row_stride[l] = row_B;
+      img_stride[l] = img_B;
    }
 
    uint8_t *data = calloc(1, size + 64);
@@ -1369,7 +1380,7 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       draw_set_samplers(draw, st, samplers, nr_samplers);
       for (unsigned i = 0; i < nr_views; ++i) {
          if (views[i])
-            swtnl_map_texture(ctx, st, i, views[i], &textures[st][i]);
+            mapped &= swtnl_map_texture(ctx, st, i, views[i], &textures[st][i]);
       }
    }
 
@@ -1406,14 +1417,15 @@ agx_swtnl_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    util_dynarray_clear(&r->acc_indices);
    r->acc_count = r->cur_base = 0;
 
-   /* A buffer that could not be mapped leaves the draw out. */
+   /* A buffer or texture that could not be mapped or copied leaves the draw
+    * out. */
    if (mapped) {
       draw_vbo(draw, info, 0, NULL, draw_info, 1, ctx->patch_vertices);
       draw_flush(draw);
       agx_swtnl_flush(r);
    } else {
-      mesa_loge("asahi: CPU vertex stages: a buffer could not be mapped, "
-                "draw skipped");
+      mesa_loge("asahi: CPU vertex stages: a buffer or texture could not be "
+                "mapped, draw skipped");
    }
 
    for (unsigned i = 0; i < num_targets; ++i) {
