@@ -360,6 +360,13 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
       else
          plane_count = MAX2(plane_count, sampler->plane_count);
 
+      /* A null converted image and a standalone sampler each have a single
+       * output record in vkGetDescriptorEXT, even with two filter modes.
+       * Any converted sample of the null image stops at its first plane.
+       */
+      if (view_planes == 0 && sampler->vk.ycbcr_conversion)
+         plane_count = MIN2(plane_count, binding_layout->stride / native.stride);
+
       for (uint8_t plane = 0; plane < plane_count; plane++) {
          /* We need to replicate the last sampler plane out to all image
           * planes due to sampler table entry limitations. See
@@ -874,7 +881,7 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
           sizeof(push_set->layout_hash));
    push_set->layout_flags = layout->vk.flags;
    push_set->size = layout->non_variable_descriptor_buffer_size;
-   assert(layout->non_variable_descriptor_buffer_size < sizeof(push_set->data));
+   assert(layout->non_variable_descriptor_buffer_size <= sizeof(push_set->data));
    struct hk_descriptor_set set = {
       .layout = layout,
       .size = sizeof(push_set->data),
@@ -1512,6 +1519,9 @@ hk_GetDescriptorEXT(VkDevice _device,
          desc = (struct hk_buffer_address){
             .base_addr = info->address,
             .size = MIN2(info->range, UINT32_MAX),
+            .sparse_map_page = type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                                  ? hk_sparse_map_page_at(dev, info->address)
+                                  : 0,
          };
       }
       write_desc(&set, 0, 0, &desc, sizeof(desc));
