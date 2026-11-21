@@ -39,6 +39,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include "util/cache_ops.h"
@@ -2728,14 +2729,14 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
 }
 
 static bool
-hk_submit_has_compute(const struct vk_queue_submit *submit)
+hk_submit_has_cs(const struct vk_queue_submit *submit, enum hk_cs_type type)
 {
    for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
       struct hk_cmd_buffer *cmdbuf =
          (struct hk_cmd_buffer *)submit->command_buffers[i];
 
       list_for_each_entry(struct hk_cs, cs, &cmdbuf->control_streams, node) {
-         if (cs->type == HK_CS_CDM)
+         if (cs->type == type)
             return true;
       }
    }
@@ -2765,7 +2766,7 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
     * with the kernel it can complete, and the application may then free or
     * reset them while this callback is still running on a submit thread. */
    const bool has_compute =
-      queue->kick.watched && hk_submit_has_compute(submit);
+      queue->kick.watched && hk_submit_has_cs(submit, HK_CS_CDM);
 
    bool untouched;
    VkResult result = queue_submit(dev, queue, submit, &untouched);
@@ -2773,6 +2774,10 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       result = vk_queue_set_lost(&queue->vk, "Submit failed");
    else if (result == VK_SUCCESS && has_compute)
       hk_compute_kick_note(dev, queue);
+
+   /* For hk_queue_submit_hint(), on a later vkQueueSubmit() caller. */
+   __atomic_store_n(&queue->placement.submitted, queue->drm.timeline_value,
+                    __ATOMIC_RELAXED);
 
    if (dev->dev.debug & AGX_DBG_SYNC) {
       /* Wait for completion */
@@ -2790,6 +2795,105 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    }
 
    return result;
+}
+
+/* M5: whether vkQueueSubmit() runs a submission on the runtime's submit
+ * thread or on its caller (vk_queue::submit_hint).
+ *
+ * The kernel submission is most of the CPU time of a light submission, and
+ * while it runs on the application's thread, that thread records nothing.
+ * With a backlog of GPU work, the submit thread overlaps the two; the
+ * submission reaches the GPU a little later, which the backlog hides. When
+ * the application waits for each submission, there is no backlog and the
+ * thread handoff would only add to every round trip, so submissions stay
+ * inline until the queue is deep (placement.enter timeline points in
+ * flight) and come back inline once it is shallow again (placement.leave),
+ * whenever the thread is idle. A compute submission's kernel time is
+ * close to the whole CPU time of a light submission, so by default
+ * (HK_SUBMIT_THREAD=render) only submissions with render work move.
+ *
+ * The points in flight are estimated from the last submitted point and the
+ * highest point seen reached. That estimate only over-counts: a timeline
+ * query refreshes it when the over-count alone would move the submission.
+ */
+static enum vk_queue_submit_hint
+hk_queue_submit_hint(struct vk_queue *vk_queue,
+                     const struct vk_queue_submit *submit)
+{
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   /* A shared queue's work is on its backing queue's timeline. */
+   struct hk_queue *real =
+      vk_queue->real_queue
+         ? container_of(vk_queue->real_queue, struct hk_queue, vk)
+         : queue;
+   struct hk_device *dev = hk_queue_device(queue);
+   const bool threaded =
+      vk_queue->submit.mode == VK_QUEUE_SUBMIT_MODE_THREADED;
+   const bool moves =
+      queue->placement.policy == HK_SUBMIT_THREAD_ALL
+         ? submit->command_buffer_count > 0
+         : hk_submit_has_cs(submit, HK_CS_VDM);
+
+   if (!moves)
+      return threaded ? VK_QUEUE_SUBMIT_HINT_INLINE : VK_QUEUE_SUBMIT_HINT_KEEP;
+
+   const uint64_t submitted =
+      __atomic_load_n(&real->placement.submitted, __ATOMIC_RELAXED);
+   uint64_t reached = __atomic_load_n(&real->placement.reached, __ATOMIC_RELAXED);
+   uint64_t depth = submitted > reached ? submitted - reached : 0;
+
+   /* Decided by the over-count alone: no query. */
+   if (!threaded && depth < queue->placement.enter)
+      return VK_QUEUE_SUBMIT_HINT_KEEP;
+   if (threaded && depth <= queue->placement.leave)
+      return VK_QUEUE_SUBMIT_HINT_INLINE;
+
+   uint64_t point = 0;
+   if (drmSyncobjQuery(dev->dev.fd, &real->drm.syncobj, &point, 1) == 0 &&
+       point > reached) {
+      reached = point;
+      __atomic_store_n(&real->placement.reached, point, __ATOMIC_RELAXED);
+   }
+   depth = submitted > reached ? submitted - reached : 0;
+
+   if (threaded)
+      return depth <= queue->placement.leave ? VK_QUEUE_SUBMIT_HINT_INLINE
+                                             : VK_QUEUE_SUBMIT_HINT_KEEP;
+   return depth >= queue->placement.enter ? VK_QUEUE_SUBMIT_HINT_THREAD
+                                          : VK_QUEUE_SUBMIT_HINT_KEEP;
+}
+
+/* HK_SUBMIT_THREAD: render (default), all, or 0 to keep every submission on
+ * vkQueueSubmit()'s caller. HK_SUBMIT_THREAD_DEPTH: timeline points in flight
+ * from which submissions move to the submit thread (default 6); they come
+ * back at a third of it. MESA_VK_ENABLE_SUBMIT_THREAD, when set, decides
+ * instead: the hint is only used in the runtime's on-demand mode.
+ */
+static void
+hk_queue_init_placement(struct hk_device *dev, struct hk_queue *queue,
+                        bool kick)
+{
+   queue->placement.policy = HK_SUBMIT_THREAD_OFF;
+   queue->placement.submitted = queue->drm.timeline_value;
+   queue->placement.reached = queue->drm.timeline_value;
+
+   /* The kicker submits to its own queue from its own thread. */
+   if (!agx_chip_g17_m5(dev->dev.chip) || dev->dev.is_virtio || kick ||
+       dev->vk.submit_mode != VK_QUEUE_SUBMIT_MODE_THREADED_ON_DEMAND)
+      return;
+
+   const char *policy = debug_get_option("HK_SUBMIT_THREAD", "render");
+   if (!strcmp(policy, "render"))
+      queue->placement.policy = HK_SUBMIT_THREAD_RENDER;
+   else if (!strcmp(policy, "all"))
+      queue->placement.policy = HK_SUBMIT_THREAD_ALL;
+   else
+      return;
+
+   const int64_t enter = debug_get_num_option("HK_SUBMIT_THREAD_DEPTH", 6);
+   queue->placement.enter = CLAMP(enter, 1, 1 << 20);
+   queue->placement.leave = queue->placement.enter / 3;
+   queue->vk.submit_hint = hk_queue_submit_hint;
 }
 
 void
@@ -2992,6 +3096,7 @@ hk_queue_create(struct hk_device *dev,
     * reusing point 1 lets it return before the first submit has completed. */
    queue->drm.timeline_value = initial_value;
    queue->drm.signalled_value = initial_value;
+   hk_queue_init_placement(dev, queue, kick);
 
    if ((dev->dev.chip == AGX_CHIP_G17P ||
         agx_chip_g17_m5(dev->dev.chip)) &&

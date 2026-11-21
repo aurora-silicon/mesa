@@ -111,6 +111,32 @@ struct hk_queue {
       /* Timeline point of the latest submission to a sibling. */
       uint64_t last_point;
    } sib;
+
+   /* M5: where vkQueueSubmit() runs a submission (hk_queue_submit_hint()):
+    * on the runtime's submit thread while the queue is deep, otherwise on
+    * the calling thread.
+    */
+   struct {
+      /* Which submissions may move to the thread, HK_SUBMIT_THREAD. */
+      enum hk_submit_thread_policy {
+         HK_SUBMIT_THREAD_OFF,
+         HK_SUBMIT_THREAD_RENDER,
+         HK_SUBMIT_THREAD_ALL,
+      } policy;
+
+      /* Timeline points in flight from which they move to the thread, and
+       * at or below which they come back inline.
+       */
+      uint32_t enter, leave;
+
+      /* The queue timeline value after the latest kernel submission, stored
+       * by the serialized submission, and the highest point the hint has
+       * seen reached. Both are read by vkQueueSubmit()'s caller without a
+       * lock (atomics): they only estimate how much work is in flight.
+       */
+      uint64_t submitted;
+      uint64_t reached;
+   } placement;
 };
 
 static inline struct hk_device *

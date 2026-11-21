@@ -42,6 +42,22 @@ struct vk_sync_wait;
 struct vk_sync_signal;
 struct vk_sync_timeline_point;
 
+/** Where a driver wants a submission to run, see vk_queue::submit_hint */
+enum vk_queue_submit_hint {
+   /** Keep the queue's current submit mode. */
+   VK_QUEUE_SUBMIT_HINT_KEEP = 0,
+
+   /** Start the queue's submit thread, which takes this submission and the
+    * following ones.
+    */
+   VK_QUEUE_SUBMIT_HINT_THREAD,
+
+   /** Submit on the calling thread. Only asked while the queue's submit
+    * thread is idle.
+    */
+   VK_QUEUE_SUBMIT_HINT_INLINE,
+};
+
 struct vk_queue {
    struct vk_object_base base;
 
@@ -71,6 +87,23 @@ struct vk_queue {
    VkResult (*driver_submit)(struct vk_queue *queue,
                              struct vk_queue_submit *submit);
 
+   /** Optional driver hook placing submissions on or off the submit thread
+    *
+    * Only used when the device submit mode is
+    * `VK_QUEUE_SUBMIT_MODE_THREADED_ON_DEMAND`. It is called from
+    * vkQueueSubmit() on the calling thread, before the submission is queued:
+    * while the queue has no submit thread, to ask whether to start one, and
+    * while its submit thread is idle, to ask whether to submit inline
+    * instead. A submission goes inline only once the thread has finished
+    * everything queued before it and every wait of the submission already
+    * has a pending payload, so submission order is unchanged. This lets a
+    * driver take the kernel submission off the application's thread while
+    * the GPU has a backlog, and keep it inline, without a thread handoff,
+    * while the application waits for each submission.
+    */
+   enum vk_queue_submit_hint (*submit_hint)(struct vk_queue *queue,
+                                            const struct vk_queue_submit *submit);
+
    struct {
       /** Current submit mode
        *
@@ -96,6 +129,13 @@ struct vk_queue {
 
       bool thread_run;
       thrd_t thread;
+
+      /** A submission is being submitted inline although the queue is in
+       * `VK_QUEUE_SUBMIT_MODE_THREADED` (see submit_hint). The submit thread
+       * leaves the submissions queued after it until it is done. Protected
+       * by mutex.
+       */
+      bool inline_busy;
    } submit;
 
    struct {

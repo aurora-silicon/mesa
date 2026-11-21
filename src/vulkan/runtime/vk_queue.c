@@ -756,9 +756,13 @@ vk_queue_submit_final(struct vk_queue *queue,
        * submission that failed without losing the device (out of memory)
        * returns its error with the semaphores untouched, as vkQueueSubmit
        * requires; the deferred and threaded callers lose the queue anyway.
+       * An inline submission (submit_hint) is immediate: it has a caller.
+       * The submit thread never runs while one is in progress, so it reads
+       * inline_busy as false here.
        */
       if (result == VK_ERROR_DEVICE_LOST || vk_queue_is_lost(queue) ||
-          queue->submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE) {
+          (queue->submit.mode != VK_QUEUE_SUBMIT_MODE_IMMEDIATE &&
+           !queue->submit.inline_busy)) {
          result = vk_queue_set_lost(queue, "queue::driver_submit failed");
          vk_queue_submit_signal_dropped(queue, submit);
       }
@@ -860,7 +864,10 @@ vk_queue_submit_thread_func(void *_data)
          return 1;
       }
 
-      if (list_is_empty(&queue->submit.submits)) {
+      /* An inline submission (submit_hint) runs ahead of everything queued
+       * after it.
+       */
+      if (list_is_empty(&queue->submit.submits) || queue->submit.inline_busy) {
          int ret = cnd_wait(&queue->submit.push, &queue->submit.mutex);
          if (ret == thrd_error) {
             vk_queue_set_lost(queue, "cnd_wait failed");
@@ -1175,11 +1182,81 @@ vk_queue_submit_move_binary_waits_to_temps(struct vk_device *device,
    return VK_SUCCESS;
 }
 
+/* Whether the queue's submit thread has nothing queued or in progress and no
+ * inline submission is running. A submission is removed from the list only
+ * after its driver_submit() returned. Caller holds submit.mutex.
+ */
+static bool
+vk_queue_submit_thread_idle_locked(struct vk_queue *queue)
+{
+   return list_is_empty(&queue->submit.submits) &&
+          !queue->submit.inline_busy && !queue->_lost.lost;
+}
+
+/* Asks the driver's submit_hint() where this submission runs. It may start
+ * the submit thread, or, while the thread is idle, claim the queue for an
+ * inline submission (*inline_submit), which vk_queue_end_inline_submit()
+ * releases.
+ */
+static VkResult
+vk_queue_place_submit(struct vk_queue *queue, struct vk_queue_submit *submit,
+                      bool *inline_submit)
+{
+   *inline_submit = false;
+
+   if (queue->submit.mode == VK_QUEUE_SUBMIT_MODE_IMMEDIATE) {
+      if (queue->submit_hint(queue, submit) == VK_QUEUE_SUBMIT_HINT_THREAD)
+         return vk_queue_enable_submit_thread(queue);
+      return VK_SUCCESS;
+   }
+
+   assert(queue->submit.mode == VK_QUEUE_SUBMIT_MODE_THREADED);
+
+   mtx_lock(&queue->submit.mutex);
+   bool idle = vk_queue_submit_thread_idle_locked(queue);
+   mtx_unlock(&queue->submit.mutex);
+   if (!idle ||
+       queue->submit_hint(queue, submit) != VK_QUEUE_SUBMIT_HINT_INLINE)
+      return VK_SUCCESS;
+
+   /* Only the submit thread waits for a payload to become pending. Any
+    * failure here is the thread's to report as well.
+    */
+   if (submit->wait_count > 0 &&
+       vk_sync_wait_many(queue->base.device, submit->wait_count,
+                         submit->waits, VK_SYNC_WAIT_PENDING,
+                         0) != VK_SUCCESS)
+      return VK_SUCCESS;
+
+   /* Recheck: with VK_KHR_internally_synchronized_queues another thread may
+    * have queued work meanwhile.
+    */
+   mtx_lock(&queue->submit.mutex);
+   if (vk_queue_submit_thread_idle_locked(queue)) {
+      queue->submit.inline_busy = true;
+      *inline_submit = true;
+   }
+   mtx_unlock(&queue->submit.mutex);
+
+   return VK_SUCCESS;
+}
+
+static void
+vk_queue_end_inline_submit(struct vk_queue *queue)
+{
+   mtx_lock(&queue->submit.mutex);
+   queue->submit.inline_busy = false;
+   if (!list_is_empty(&queue->submit.submits))
+      cnd_signal(&queue->submit.push);
+   mtx_unlock(&queue->submit.mutex);
+}
+
 static VkResult
 vk_queue_submit(struct vk_queue *queue,
                 struct vk_queue_submit *submit)
 {
    struct vk_device *device = queue->base.device;
+   bool inline_submit = false;
    VkResult result;
 
    /* If this device supports threaded submit, we can't rely on the client
@@ -1202,7 +1279,17 @@ vk_queue_submit(struct vk_queue *queue,
          goto fail;
    }
 
-   switch (queue->submit.mode) {
+   if (queue->submit_hint != NULL &&
+       device->submit_mode == VK_QUEUE_SUBMIT_MODE_THREADED_ON_DEMAND) {
+      result = vk_queue_place_submit(queue, submit, &inline_submit);
+      if (unlikely(result != VK_SUCCESS))
+         goto fail;
+   }
+
+   /* An inline submission takes the immediate path; nothing is queued
+    * before it, and the submit thread waits for it to finish.
+    */
+   switch (inline_submit ? VK_QUEUE_SUBMIT_MODE_IMMEDIATE : queue->submit.mode) {
    case VK_QUEUE_SUBMIT_MODE_IMMEDIATE:
       /* If threaded submit is possible on this device, we need to ensure that
        * binary semaphore payloads get reset so that any other threads can
@@ -1259,6 +1346,8 @@ vk_queue_submit(struct vk_queue *queue,
          }
       }
 
+      if (inline_submit)
+         vk_queue_end_inline_submit(queue);
       vk_queue_submit_destroy(queue, submit);
       return result;
 
@@ -1281,6 +1370,8 @@ vk_queue_submit(struct vk_queue *queue,
    UNREACHABLE("Invalid submit mode");
 
 fail:
+   if (inline_submit)
+      vk_queue_end_inline_submit(queue);
    vk_queue_submit_destroy(queue, submit);
    return result;
 }
