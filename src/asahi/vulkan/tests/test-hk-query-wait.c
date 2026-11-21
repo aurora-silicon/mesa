@@ -226,7 +226,7 @@ test_waits(void)
    f.ready_at = f.completion_at[0] = UINT64_C(2200000000);
    assert(wait(&f, false, &never) == VK_SUCCESS && !never);
    assert(f.now == f.ready_at && f.completions == 2200 && !f.errors);
-   assert(f.initial_polls == 1025);
+   assert(f.initial_polls == 1);
    assert(f.available <= f.initial_polls + f.completions);
    printf("delayed producer: success at 2200 ms, 2200 bounded DRM waits\n");
    finish(&f);
@@ -251,14 +251,13 @@ test_waits(void)
          accept(&f, 0, 3);
       f.loss_at = 1;
       assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST);
-      assert(f.now == (state == 2 ? UINT64_C(1000000) :
-                                   HK_QUERY_WAIT_INTERVAL_NS) && !f.errors);
+      assert(f.now == UINT64_C(1000000) && !f.errors);
       assert(f.completions == (state == 2));
       if (reserved)
          hk_query_wait_publish(&f.dev, reserved, 0, false);
       finish(&f);
    }
-   printf("queued/reserved loss: <100 ms; accepted loss: <1 ms (fake time)\n");
+   printf("queued/reserved/accepted loss: <1 ms (fake time)\n");
 
    init(&f);
    enqueue(&f, 0);
@@ -274,25 +273,26 @@ test_waits(void)
    f.publish_at = UINT64_C(250000000);
    f.ready_at = f.completion_at[0] = UINT64_C(2200000000);
    assert(wait(&f, false, &never) == VK_SUCCESS);
-   assert(f.changes == 3 && f.completions == 1950 && !f.errors);
+   assert(f.changes == 250 && f.completions == 1950 && !f.errors);
    assert(f.now == f.ready_at);
    finish(&f);
 }
 
-/* A single spin budget belongs to the host call, not to each timeout. The
- * frozen clock in test_waits also verifies the independent poll-count cap. */
+/* Availability is checked after blocking, without an initial or repeated
+ * spin. Advancing and frozen clocks both exercise the production helper. */
 static void
-test_spin_and_errors(void)
+test_rechecks_and_errors(void)
 {
    struct fixture f;
    bool never;
    init(&f);
+   enqueue(&f, 0);
    f.clock_step = 1000;
    f.ready_at = 20000;
    assert(wait(&f, false, &never) == VK_SUCCESS && !never);
-   assert(!f.completions && !f.changes);
-   assert(f.now <= 51000 && f.initial_polls <= 51);
-   printf("short availability: returned in spin at %llu ns, no blocking\n",
+   assert(!f.completions && f.changes == 1);
+   assert(f.now == UINT64_C(1000000) && f.initial_polls == 1);
+   printf("queued availability: returned after blocking at %llu ns, no spin\n",
           (unsigned long long)f.now);
    finish(&f);
 
@@ -302,7 +302,7 @@ test_spin_and_errors(void)
    f.clock_step = 1000;
    f.ready_at = f.completion_at[0] = UINT64_C(2200000000);
    assert(wait(&f, false, &never) == VK_SUCCESS && !never);
-   assert(f.initial_polls <= 51);
+   assert(f.initial_polls == 1);
    /* One availability test per subsequent wait, no repeated spinning. */
    assert(f.available <= f.initial_polls + f.completions);
    assert(f.now >= f.ready_at && f.now <= f.ready_at + 1000);
@@ -311,10 +311,20 @@ test_spin_and_errors(void)
    finish(&f);
 
    init(&f);
+   enqueue(&f, 0);
+   f.ready_at = UINT64_C(2200000000);
+   assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+   assert(f.now == f.ready_at && f.changes == 2200 && !f.completions);
+   assert(f.initial_polls == 1 && f.available == f.changes + 1);
+   puts("long queued work: 2200 condition waits, no spin or total deadline");
+   finish(&f);
+
+   init(&f);
+   enqueue(&f, 0);
    f.clock_step = 1000;
    f.ready_at = f.loss_at = 20000;
    assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST);
-   assert(!f.completions && !f.changes);
+   assert(!f.completions && f.changes == 1);
    finish(&f);
 
    for (unsigned mode = 0; mode < 3; mode++) {
@@ -331,6 +341,68 @@ test_spin_and_errors(void)
       assert(f.errors == (mode != 1));
       finish(&f);
    }
+}
+
+/* A live writer can publish availability before the submit callback has
+ * published its accepted completion point. Test each unaccepted state with
+ * a frozen clock, including loss arriving with availability on the wake. */
+static void
+test_unaccepted_availability(unsigned state)
+{
+   for (unsigned lost = 0; lost < 2; lost++) {
+      struct fixture f;
+      bool never;
+      init(&f);
+      struct hk_query_wait_batch *batch = NULL;
+      struct hk_query_wait_producer *reserved = NULL;
+      if (state == 0) {
+         batch = hk_query_wait_batch_create();
+         assert(batch);
+         assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &f.recording,
+                                      &f.recording, batch));
+      } else {
+         enqueue(&f, 0);
+         if (state == 2)
+            reserved = claim(&f, 0);
+      }
+      f.ready_at = 1;
+      if (lost)
+         f.loss_at = 1;
+      assert(wait(&f, false, &never) ==
+             (lost ? VK_ERROR_DEVICE_LOST : VK_SUCCESS));
+      assert(!never && f.now == UINT64_C(1000000));
+      assert(f.changes == 1 && !f.completions && !f.errors);
+      assert(f.initial_polls == 1);
+      if (reserved)
+         hk_query_wait_publish(&f.dev, reserved, 0, false);
+      if (batch)
+         hk_query_wait_batch_finish(&f.dev, batch, false);
+      finish(&f);
+   }
+   printf("%s availability/loss: 999999 ns extra blocking, no accepted point\n",
+          state == 0 ? "registered" : state == 1 ? "queued" : "reserved");
+}
+
+static void
+test_idle_rechecks(void)
+{
+   for (unsigned unrelated = 0; unrelated < 2; unrelated++) {
+      struct fixture f;
+      bool never;
+      init(&f);
+      if (unrelated) {
+         hk_query_wait_recording_finish(&f.recording);
+         assert(hk_query_wait_record(&f.recording, f.pool, 1, 1, false));
+         enqueue(&f, 0);
+         accept(&f, 0, 1);
+      }
+      f.ready_at = 1;
+      assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+      assert(f.now == HK_QUERY_WAIT_INTERVAL_NS && f.changes == 1);
+      assert(!f.completions && f.initial_polls == 1);
+      finish(&f);
+   }
+   puts("idle/unrelated-slot producer: 100 ms fallback, no spin or false loss");
 }
 
 static void
@@ -673,7 +745,7 @@ registration_changed(void *data, struct hk_query_wait_device *dev,
    mtx_unlock(&t->lock);
    /* The producer registers after the announcement above, contending on the
     * still-held tracking mutex. A longer test guard distinguishes a missed
-    * notification from the normal 100 ms predicate-check fallback. */
+    * notification from the normal bounded predicate-check fallback. */
    deadline = os_time_get_nano() + UINT64_C(2000000000);
    struct timespec ts = {deadline / 1000000000, deadline % 1000000000};
    int ret = u_cnd_monotonic_timedwait(&dev->changed, &dev->mutex, &ts);
@@ -813,17 +885,26 @@ main(int argc, char **argv)
    if (argc == 3 && !strcmp(argv[1], "--case")) {
       if (!strcmp(argv[2], "reset"))
          test_reset_only();
-      else if (!strcmp(argv[2], "spin"))
-         test_spin_and_errors();
+      else if (!strcmp(argv[2], "rechecks"))
+         test_rechecks_and_errors();
       else if (!strcmp(argv[2], "waits"))
          test_waits();
+      else if (!strcmp(argv[2], "registered"))
+         test_unaccepted_availability(0);
+      else if (!strcmp(argv[2], "queued"))
+         test_unaccepted_availability(1);
+      else if (!strcmp(argv[2], "reserved"))
+         test_unaccepted_availability(2);
       else
          assert(!"unknown case");
       return 0;
    }
    assert(argc == 1);
    test_reset_only();
-   test_spin_and_errors();
+   test_rechecks_and_errors();
+   for (unsigned state = 0; state < 3; state++)
+      test_unaccepted_availability(state);
+   test_idle_rechecks();
    test_future_producers();
    test_waits();
    test_retirement();

@@ -36,27 +36,33 @@ and the actual publication time. For example, from the source root::
    timeout 6s build/src/asahi/vulkan/hk_query_wait_test --measure-delayed 150
    timeout 6s build/src/asahi/vulkan/hk_query_wait_test --measure-delayed 2200
 
-The local hybrid candidate spins only once per host wait call, for at most
-50 microseconds or 1024 availability polls, whichever comes first. The poll
-limit also bounds work with a frozen test clock. Status is checked before
-and after the spin, including before returning newly visible availability.
-Accepted producer waits request at most 1 ms per completion wait; registration
-condition waits retain the existing 100 ms fallback. Neither interval is a
-deadline for producing the result. The parameters are tuning candidates, not
-hardware performance guarantees; shorter completion slices increase status
-checks and DRM waits, whose cost remains to be measured.
+The local candidate does not spin. Both completion waits and condition waits
+request at most 1 ms while the queried slot has any live registered, queued,
+reserved or accepted writer. Availability can precede the submit callback's
+publication of an accepted timeline point, so shortening only accepted-producer
+waits misses that case. With no matching writer, condition waits retain the
+100 ms fallback: registration broadcasts under the tracking mutex, atomically
+with the predicate change. A writer for another query does not shorten an idle
+slot's wait. None of these intervals is a deadline for producing the result.
 
-Fake-time tests exercise availability just after an accepted-producer check
-and observe 999,999 ns of extra blocking while the submission remains pending.
-A query available at 20 microseconds returns during the initial spin without
-blocking. Long-work tests bound total spinning across 2200 completion waits,
-and an initially idle device can receive its first producer after 2500 ms.
-These are production-helper models, not GPU/kernel performance evidence.
-Actual latency also includes scheduling, locking and status-query costs. An
-accepted submission's final point is a blocking opportunity, never proof that
-the queried value is available. No independent query-publication kernel event
-is assumed. Live before/after measurements and CTS still require separate
-authorization before publication or merge.
+The initial 50-microsecond spin from the earlier candidate was removed: it can
+be exhausted before a delayed producer runs, and the approved short hardware
+comparison did not establish a latency benefit. These parameters remain tuning
+candidates; shorter condition/completion slices increase availability/status
+checks and may increase CPU/DRM work. Any revised build needs fresh physical
+measurements, not the earlier candidate's results.
+
+Fake-time tests place availability just after a check for registered, queued,
+reserved and accepted writers and observe 999,999 ns of extra blocking without
+waiting for the accepted point or submission completion. They check loss with
+availability on the same wake, long valid work, a future producer registering
+after 2500 ms of idle, unrelated query slots and no busy spin. These are
+production-helper models, not GPU/kernel performance evidence. Actual latency
+also includes scheduling, locking and status-query costs. A timeline point is
+a blocking opportunity, never proof that the queried value is available. No
+independent query-publication kernel event or universal idle/loss rule is added.
+Live measurements and CTS still require separate authorization before
+publication or merge.
 
 Private physical workload (separate authorization required)
 ----------------------------------------------------------

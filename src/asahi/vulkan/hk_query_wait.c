@@ -398,12 +398,6 @@ hk_query_wait_quiescent(struct hk_query_wait_device *dev, uint64_t *serial)
    return idle;
 }
 
-static uint64_t
-query_wait_now(const struct hk_query_wait_ops *ops, void *data)
-{
-   return ops->now ? ops->now(data) : os_time_get_nano();
-}
-
 VkResult
 hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
                         bool victims, bool *never,
@@ -411,7 +405,6 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
 {
    struct hk_query_wait_device *dev = pool->dev;
    *never = false;
-   bool spin = true;
    for (;;) {
       if (ops->available(data))
          return VK_SUCCESS;
@@ -428,35 +421,23 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
          return VK_SUCCESS;
       }
 
-      if (spin) {
-         spin = false;
-         const uint64_t start = query_wait_now(ops, data);
-         for (unsigned i = 0; i < HK_QUERY_WAIT_SPIN_POLLS &&
-                              query_wait_now(ops, data) - start <
-                                 HK_QUERY_WAIT_SPIN_NS; i++) {
-            if (ops->available(data)) {
-               /* Like the blocking path, never hide loss behind readiness
-                * which became visible since the preceding status check. */
-               return ops->status(data);
-            }
-         }
-         status = ops->status(data);
-         if (status != VK_SUCCESS)
-            return status;
-      }
-
       struct hk_query_wait_producer *producer = NULL;
+      bool pending = false;
       mtx_lock(&dev->mutex);
       list_for_each_entry(struct hk_query_wait_link, q,
                           &pool->queries[query].producers, link) {
+         /* Links retain live writers for this slot even before queue_submit
+          * returns and publishes an accepted point. Their availability can
+          * already be visible, so the condvar needs the same short recheck. */
+         pending = true;
          if (q->producer->state == HK_QUERY_ACCEPTED)
             producer = q->producer;
          if (producer)
             break;
       }
-      const uint64_t interval = producer ? HK_QUERY_WAIT_COMPLETION_NS
-                                         : HK_QUERY_WAIT_INTERVAL_NS;
-      const uint64_t now = query_wait_now(ops, data);
+      const uint64_t interval = pending ? HK_QUERY_WAIT_PRODUCER_NS
+                                        : HK_QUERY_WAIT_INTERVAL_NS;
+      const uint64_t now = ops->now ? ops->now(data) : os_time_get_nano();
       const uint64_t deadline = MIN2(now, INT64_MAX - interval) + interval;
       if (producer) {
          p_atomic_inc(&producer->refs);
