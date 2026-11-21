@@ -629,6 +629,9 @@ fixup_border_zs(enum pipe_format orig, union pipe_color_union *c)
    }
 }
 
+static void agx_pack_native_sampler_entries(enum agx_chip chip,
+                                            struct agx_sampler_state *so);
+
 static void *
 agx_create_sampler_state(struct pipe_context *pctx,
                          const struct pipe_sampler_state *state)
@@ -698,6 +701,10 @@ agx_create_sampler_state(struct pipe_context *pctx,
       /* Neutralize the bindless-safe descriptor. XXX: This is a hack. */
       so->desc_without_custom_border.opaque[1] &= ~(1u << 23);
    }
+
+   const struct agx_device *dev = agx_device(pctx->screen);
+   if (agx_chip_native_agx3(dev->chip))
+      agx_pack_native_sampler_entries(dev->chip, so);
 
    return so;
 }
@@ -6317,6 +6324,53 @@ agx_native_sampler_state(const struct pipe_sampler_state *state,
    };
 }
 
+/* Pack every native table entry of an API sampler. Each is a function of the
+ * sampler state and the chip alone, so it is packed when the state is created
+ * and copied into a table from then on. */
+static void
+agx_pack_native_sampler_entries(enum agx_chip chip,
+                                struct agx_sampler_state *so)
+{
+   const struct pipe_sampler_state *state = &so->base;
+   struct agx_gallium_native_sampler entry = agx_native_sampler_state(
+      state, so->uses_custom_border ? AGX_BORDER_COLOUR_OPAQUE_WHITE
+                                    : so->border_colour);
+
+   if (agx_gallium_pack_native_sampler(chip,
+                                       &so->native[AGX_NATIVE_SAMPLER_API],
+                                       &entry))
+      so->native_packed |= BITFIELD_BIT(AGX_NATIVE_SAMPLER_API);
+
+   /* A Gen4 sampler has no bias field to carry the API bias into the LOD
+    * query, so the query reads the ordinary entry. */
+   so->native[AGX_NATIVE_SAMPLER_QUERY_LOD] = so->native[AGX_NATIVE_SAMPLER_API];
+   if (agx_chip_sampler_has_lod_bias(chip)) {
+      agx_unpack(NULL, &so->native[AGX_NATIVE_SAMPLER_API], SAMPLER_HAL200,
+                 cfg);
+      cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
+      AGX_SAMPLER_HAL200_pack(so->native[AGX_NATIVE_SAMPLER_QUERY_LOD].opaque,
+                              &cfg);
+   }
+
+   if (!so->uses_custom_border)
+      return;
+
+   entry.border_colour = AGX_BORDER_COLOUR_TRANSPARENT_BLACK;
+   if (agx_shadow_gather_custom_border(chip))
+      entry.compare_enable = false;
+   if (agx_gallium_pack_native_sampler(chip,
+                                       &so->native[AGX_NATIVE_SAMPLER_CLAMP],
+                                       &entry))
+      so->native_packed |= BITFIELD_BIT(AGX_NATIVE_SAMPLER_CLAMP);
+
+   if (agx_shadow_gather_custom_border(chip)) {
+      entry.border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE;
+      if (agx_gallium_pack_native_sampler(
+             chip, &so->native[AGX_NATIVE_SAMPLER_PROBE], &entry))
+         so->native_packed |= BITFIELD_BIT(AGX_NATIVE_SAMPLER_PROBE);
+   }
+}
+
 
 /* API sampler state in the native heap records. G17P is the HAL200 record
  * with its own compare enable. G17G's Gen5 record overlaps the compare
@@ -6380,18 +6434,19 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
          uint8_t *out = (uint8_t *)T.cpu + sampler_length * (i + 1);
          if (sampler) {
             const struct pipe_sampler_state *state = &sampler->base;
-            const struct agx_gallium_native_sampler native =
-               agx_native_sampler_state(
-                  state, sampler->uses_custom_border
-                            ? AGX_BORDER_COLOUR_OPAQUE_WHITE
-                            : sampler->border_colour);
-            if (g18)
+            if (g18) {
                agx_pack_g17_api_sampler(dev->chip, out, state,
-                                        native.border_colour,
+                                        sampler->uses_custom_border
+                                           ? AGX_BORDER_COLOUR_OPAQUE_WHITE
+                                           : sampler->border_colour,
                                         !ctx->support_lod_bias);
-            else if (!agx_gallium_pack_native_sampler(dev->chip, (void *)out,
-                                                      &native))
-               agx_native_descriptor_rejected(dev, "sampler");
+            } else {
+               memcpy(out, &sampler->native[AGX_NATIVE_SAMPLER_API],
+                      sampler_length);
+               if (!(sampler->native_packed &
+                     BITFIELD_BIT(AGX_NATIVE_SAMPLER_API)))
+                  agx_native_descriptor_rejected(dev, "sampler");
+            }
 
             if (sampler->uses_custom_border) {
                uint16_t clamp_handle;
@@ -6404,28 +6459,26 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
                uint8_t *clamp = (uint8_t *)T.cpu +
                                 sampler_length * clamp_handle;
-               struct agx_gallium_native_sampler clamp_state =
-                  agx_native_sampler_state(
-                     state, AGX_BORDER_COLOUR_TRANSPARENT_BLACK);
                if (g18) {
                   agx_pack_g17_api_sampler(dev->chip, clamp, state,
                                            AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
                                            !ctx->support_lod_bias);
                   continue;
                }
-               if (agx_shadow_gather_custom_border(dev->chip))
-                  clamp_state.compare_enable = false;
-               if (!agx_gallium_pack_native_sampler(dev->chip, (void *)clamp,
-                                                    &clamp_state))
+               memcpy(clamp, &sampler->native[AGX_NATIVE_SAMPLER_CLAMP],
+                      sampler_length);
+               if (!(sampler->native_packed &
+                     BITFIELD_BIT(AGX_NATIVE_SAMPLER_CLAMP)))
                   agx_native_descriptor_rejected(dev,
                                                  "custom-border sampler");
 
                if (agx_shadow_gather_custom_border(dev->chip)) {
-                  clamp_state.border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE;
                   uint8_t *probe = (uint8_t *)T.cpu + sampler_length *
                      (AGX_GALLIUM_G17P_BORDER_NONCOMPARE_BASE + i);
-                  if (!agx_gallium_pack_native_sampler(dev->chip, (void *)probe,
-                                                       &clamp_state))
+                  memcpy(probe, &sampler->native[AGX_NATIVE_SAMPLER_PROBE],
+                         sampler_length);
+                  if (!(sampler->native_packed &
+                        BITFIELD_BIT(AGX_NATIVE_SAMPLER_PROBE)))
                      agx_native_descriptor_rejected(dev,
                                                     "custom-border probe sampler");
                }
@@ -6461,8 +6514,15 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
                (const uint8_t *)T.cpu + sampler_length * (i + 1);
             uint8_t *query = (uint8_t *)T.cpu + sampler_length *
                (AGX_GALLIUM_G17P_QUERY_LOD_BASE + i);
-            /* A Gen4 sampler has no bias field to carry the API bias into
-             * the LOD query, so the query reads the ordinary entry. */
+            if (sampler && native) {
+               memcpy(query, &sampler->native[AGX_NATIVE_SAMPLER_QUERY_LOD],
+                      sampler_length);
+               continue;
+            }
+            /* G18G, whose samplers are not packed ahead, and an unbound slot,
+             * which takes the null entry with no bias. A Gen4 sampler has no
+             * bias field to carry the API bias into the LOD query, so the
+             * query reads the ordinary entry. */
             if (!agx_chip_sampler_has_lod_bias(dev->chip)) {
                memcpy(query, ordinary, sampler_length);
                continue;

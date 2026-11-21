@@ -1260,6 +1260,18 @@ struct agx_query {
    struct agx_ptr ptr;
 };
 
+enum agx_native_sampler_entry {
+   /* The sampler itself; with a custom border colour it clamps to one. */
+   AGX_NATIVE_SAMPLER_API,
+   /* Custom border colour: the companion that clamps to zero, and where the
+    * chip takes it, the probe without a comparison. */
+   AGX_NATIVE_SAMPLER_CLAMP,
+   AGX_NATIVE_SAMPLER_PROBE,
+   /* The entry a LOD query reads: the sampler with its LOD bias. */
+   AGX_NATIVE_SAMPLER_QUERY_LOD,
+   AGX_NATIVE_SAMPLER_ENTRIES,
+};
+
 struct agx_sampler_state {
    struct pipe_sampler_state base;
 
@@ -1281,6 +1293,12 @@ struct agx_sampler_state {
 
    /* LOD bias packed as fp16, the form we'll pass to the shader */
    uint16_t lod_bias_as_fp16;
+
+   /* The entries a native per-stage sampler table can hold for this sampler
+    * (agx_upload_samplers()), packed once here. native_packed has a bit for
+    * each entry the chip's sampler layout could express. */
+   struct agx_gallium_sampler_descriptor native[AGX_NATIVE_SAMPLER_ENTRIES];
+   uint8_t native_packed;
 };
 
 struct agx_sampler_view {
