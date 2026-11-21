@@ -18,7 +18,7 @@ static bool
 agx_vdm_decode_is_hal300(enum agx_chip chip)
 {
    return agx_chip_hal300_records(chip) || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
 }
 
 bool

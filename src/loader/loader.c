@@ -54,6 +54,7 @@
 #include "util/u_debug.h"
 #include "git_sha1.h"
 
+#include "asahi/lib/agx_drm_names.h"
 #include "drm-uapi/nouveau_drm.h"
 
 #define MAX_DRM_DEVICES 64
@@ -208,6 +209,50 @@ nouveau_zink_predicate(int fd, const char *driver)
 #endif
 }
 
+/* GL on the GPUs the asahi Gallium driver refuses (the M5 Ultra today) runs
+ * through zink over Borealis. Such a GPU is one whose device tree node has a
+ * compatible agx_gallium_refuses_gpu() lists, the same list the Gallium
+ * screen checks. libdrm reads the compatibles from sysfs without opening the
+ * device, so a GL stack (EGL, GBM, the DRI frontends) needs no
+ * MESA_LOADER_DRIVER_OVERRIDE. Both of the Mac's devices take zink: the GPU
+ * (AGX_DRM_DRIVER_NAMES) and the display controller ("apple", which has no
+ * GPU of its own and would otherwise reach the asahi driver through kmsro).
+ * Every other device, the other M5 members included, keeps its driver.
+ */
+static bool
+asahi_zink_predicate(int fd, const char *kernel_driver)
+{
+#ifndef HAVE_LIBDRM
+   return false;
+#else
+   bool gpu = agx_is_native_drm_driver(kernel_driver);
+   if (!gpu && strcmp(kernel_driver, "apple") != 0)
+      return false;
+
+   /* The GPU's own node, or for the display controller every DRM device. */
+   drmDevicePtr devices[MAX_DRM_DEVICES];
+   int num_devices = gpu ? (drmGetDevice2(fd, 0, &devices[0]) == 0)
+                         : drmGetDevices2(0, devices, MAX_DRM_DEVICES);
+   bool refused = false;
+
+   for (int i = 0; i < num_devices && !refused; i++) {
+      drmDevicePtr dev = devices[i];
+
+      if (dev->bustype != DRM_BUS_PLATFORM ||
+          !(dev->available_nodes & (1 << DRM_NODE_RENDER)) ||
+          !dev->deviceinfo.platform || !dev->deviceinfo.platform->compatible)
+         continue;
+
+      for (char **c = dev->deviceinfo.platform->compatible; *c && !refused;
+           c++)
+         refused = agx_gallium_refuses_gpu(*c, NULL);
+   }
+
+   if (num_devices > 0)
+      drmFreeDevices(devices, num_devices);
+   return refused;
+#endif
+}
 
 /**
  * Goes through all the platform devices whose driver is on the given list and
@@ -801,6 +846,11 @@ loader_get_driver_for_fd(int fd)
    driver = loader_get_pci_driver(fd);
    if (!driver)
       driver = loader_get_kernel_driver_name(fd);
+
+   if (driver && asahi_zink_predicate(fd, driver)) {
+      free(driver);
+      driver = strdup("zink");
+   }
 
    return driver;
 }

@@ -105,6 +105,8 @@ static const struct chip_case chip_cases[] = {
     "G17S", true, false},
    {17, 'C', 4, AGX_CHIP_G17C, AGX_ISA_AGX3, AGX_ISA_ENCODING_AGX3C,
     "G17C", true, false},
+   {17, 'D', 8, AGX_CHIP_G17D, AGX_ISA_AGX3, AGX_ISA_ENCODING_AGX3C,
+    "G17D", true, false},
 
    /* M6 (J873): the third AGX3 encoding. */
    {18, 'G', 1, AGX_CHIP_G18G, AGX_ISA_AGX3, AGX_ISA_ENCODING_AGX3D,
@@ -374,7 +376,7 @@ test_invalid_identity(void)
    CHECK_EQ(chip_for(19, 'G', 1), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(15, 'A', 1), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(16, 'D', 8), AGX_CHIP_UNKNOWN);
-   CHECK_EQ(chip_for(17, 'D', 8), AGX_CHIP_UNKNOWN);
+   CHECK_EQ(chip_for(18, 'D', 8), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(13, 'P', 1), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(13, 'G', 0), AGX_CHIP_UNKNOWN);
    CHECK_EQ(chip_for(17, 'S', DRM_ASAHI_MAX_CLUSTERS + 1),

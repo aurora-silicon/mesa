@@ -319,7 +319,10 @@ agx3_m5_native_compute_dispatch_append(
    uint8_t staged[AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE];
    const struct agx3_cdm_barrier_info barrier = {
       .chip = program->chip, .flags = barrier_flags,
-      .flush_memory = agx_chip_g17_m5(program->chip) && barrier_flags == 5,
+      .flush_memory = agx_chip_g17_m5(program->chip) &&
+                      (barrier_flags == 5 ||
+                       (barrier_flags == 0 &&
+                        agx_chip_m5_barriers_memory_scoped(program->chip))),
    };
    if (!agx3_g17p_native_compute_launch_pack(program, grid, staged) ||
        !agx3_cdm_barrier_pack(&barrier, staged + AGX3_CDM_DIRECT_LAUNCH_SIZE))
@@ -451,7 +454,10 @@ agx3_m5_native_indirect_dispatch_append(
    }
    const struct agx3_cdm_barrier_info barrier = {
       .chip=program->chip, .flags=barrier_flags,
-      .flush_memory = agx_chip_g17_m5(program->chip) && barrier_flags == 5,
+      .flush_memory = agx_chip_g17_m5(program->chip) &&
+                      (barrier_flags == 5 ||
+                       (barrier_flags == 0 &&
+                        agx_chip_m5_barriers_memory_scoped(program->chip))),
    };
    if (!agx3_cdm_barrier_pack(&barrier, bytes + launch_size))
       return false;
