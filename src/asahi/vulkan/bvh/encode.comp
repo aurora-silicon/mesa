@@ -146,14 +146,14 @@ invert_affine(mat3x4 otw)
 }
 
 void
-encode_leaf(uint32_t index, uint32_t leaf_nodes_offset)
+encode_leaf(uint32_t ir_index, uint32_t out_index, uint32_t leaf_nodes_offset)
 {
    uint32_t ir_size = ir_leaf_node_size();
    uint32_t out_size = output_leaf_node_size();
 
-   VOID_REF ir_leaf = OFFSET(args.intermediate_bvh, index * ir_size);
+   VOID_REF ir_leaf = OFFSET(args.intermediate_bvh, ir_index * ir_size);
    VOID_REF out_leaf =
-      OFFSET(args.output_bvh, leaf_nodes_offset + index * out_size);
+      OFFSET(args.output_bvh, leaf_nodes_offset + out_index * out_size);
 
    switch (args.geometry_type) {
    case VK_GEOMETRY_TYPE_TRIANGLES_KHR: {
@@ -233,10 +233,14 @@ encode_internal(uint32_t index, uint32_t internal_count,
       DEREF(dst).bounds[child] = inflate(DEREF(ir_node).aabb);
 
       if (ir_child_offset < args.root_offset) {
-         uint32_t leaf_index = ir_child_offset / ir_size;
+         /* The builder keeps each leaf at its primitive's index, inactive
+          * ones included, so active leaves are not the first ones. Each leaf
+          * has one parent, which encodes it into the next free output slot:
+          * the leaf array then holds exactly the active leaves. */
+         uint32_t slot = atomicAdd(DEREF(args.header).dst_leaf_node_offset, 1);
+         encode_leaf(ir_child_offset / ir_size, slot, leaf_nodes_offset);
          DEREF(dst).children[child] =
-            (leaf_nodes_offset + leaf_index * out_size) |
-            output_leaf_node_type();
+            (leaf_nodes_offset + slot * out_size) | output_leaf_node_type();
       } else {
          uint32_t src_index =
             (ir_child_offset - args.root_offset) / SIZEOF(vk_ir_box_node);
@@ -279,8 +283,4 @@ main()
 
    if (id < internal_count)
       encode_internal(id, internal_count, leaf_nodes_offset);
-
-   uint32_t leaf_id = id - args.internal_node_bound;
-   if (id >= args.internal_node_bound && leaf_id < leaf_count)
-      encode_leaf(leaf_id, leaf_nodes_offset);
 }

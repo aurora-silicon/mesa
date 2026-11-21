@@ -231,7 +231,10 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;
    }
-   if ((!dev->g17p_native_as && !dev->m5_native_as) || pool->vk.query_type != queryType ||
+   /* M5 without the native builder keeps the common BVH layout. */
+   const bool m5_common_bvh = agx_chip_g17_m5(dev->dev.chip) && !dev->m5_native_as;
+   if ((!dev->g17p_native_as && !dev->m5_native_as && !m5_common_bvh) ||
+       pool->vk.query_type != queryType ||
        firstQuery > pool->vk.query_count ||
        accelerationStructureCount > pool->vk.query_count - firstQuery) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
@@ -251,6 +254,10 @@ hk_CmdWriteAccelerationStructuresPropertiesKHR(
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR ? 0 :
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR ? 1 :
             queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR ? 2 : 3);
+      } else if (m5_common_bvh) {
+         libagx_hk_bvh_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
+            vk_acceleration_structure_get_va(as),
+            hk_query_report_addr(dev, pool, firstQuery + i), kind);
       } else {
          libagx_agx3_as_property(cmd, agx_1d(1), AGX_BARRIER_ALL,
             ALIGN_POT(vk_acceleration_structure_get_va(as), UINT64_C(1024)),
