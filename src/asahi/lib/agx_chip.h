@@ -448,6 +448,40 @@ agx_chip_sampler_generation(enum agx_chip chip)
              : AGX_SAMPLER_GENERATION_UNKNOWN;
 }
 
+/*
+ * Whether an indirect indexed VDM Index List bounds its index fetch in
+ * hardware the way robustBufferAccess2 requires: indices past the record's
+ * index-buffer size (index_buffer_size_word, dwords minus one) read as 0.
+ *
+ * What is established, and by what:
+ *   - The record carries that word on every AGX3 command-stream generation:
+ *     the G15 and HAL200 records (agx_vdm_hal200_indirect_draw_pack) and the
+ *     HAL300 one, which adds only the Unk 2 word before it
+ *     (agx_vdm_index_list_indirect_pack_words). That is packet layout.
+ *   - Zero substitution for out-of-range indices is measured on G17C only
+ *     (J716c): dEQP-VK.robustness.index_access.*,
+ *     dEQP-VK.robustness.vertex_access.*index* and a bit-exact equivalence
+ *     probe against the software rewrite (partial and full out-of-range
+ *     draws, 32-bit firstIndex wrap, signed vertexOffset, multi-draw
+ *     firstInstance, primitive restart, indirect count).
+ *
+ * Unverified: what the fetch returns past the size word on G15, G16G and
+ * G17P (HAL200 records; rows on an M3, an M4, an A18 Pro and an M4 Pro), on
+ * G17G and G17S (HAL300 records; rows on an M5 and an M5 Pro) and on G18G.
+ * Any of them may clamp, wrap or read memory instead. A passing row of the
+ * same CTS groups and probe on a generation is what adds it here; until
+ * then it keeps the software rewrite. AGX2 does not have it: its Index List
+ * does not read out-of-range indices as zero (libagx_draw_robust_index).
+ *
+ * The bound is dword granular, so callers still rewrite draws whose range
+ * does not end on a dword: 8-bit indices and unaligned 16-bit ranges.
+ */
+static inline bool
+agx_chip_vdm_indirect_index_bounds(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17C;
+}
+
 /* Native sampler heap element size. The packed state word remains eight
  * bytes, but G15 and later place it at offset zero of a 32-byte sparse heap
  * element. Zero means the heap ABI is not proven for this identity. */
