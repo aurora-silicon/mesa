@@ -48,12 +48,13 @@
  * (the arithmetic image atomics use) unless word 1 has HK_M5_STORE_2D; it
  * takes it for atomics when word 0 is nonzero, updating the texel in memory.
  *
- * The packer admits a compressed layered PBE only as a one-layer 2D array,
- * never 3D, so a one-layer layered storage view of a compressed image (on
- * G17S, a single-layer 2D storage image, hk_image.c) cannot take the 3D
- * store. Its PBE is the image's compressed 2D PBE at the view's level, and
- * its record is word 0 zero, word 1 HK_M5_STORE_2D, word 2 the level size and
- * word 3 one: layered stores then store to that PBE at (x, y), and drop
+ * The packer admits a compressed layered PBE only as a one-layer 2D array
+ * of a one-level image, never 3D, so a one-layer layered storage view of a
+ * compressed image (on G17S and G17C, a single-layer 2D storage image,
+ * hk_image.c) cannot take the 3D store, nor on G17C the layered store of a
+ * mipmapped image. Its PBE is the image's compressed 2D PBE at the view's
+ * level, and its record is word 0 zero, word 1 HK_M5_STORE_2D, word 2 the
+ * level size and word 3 one: layered stores then store to that PBE at (x, y), and drop
  * layers other than 0. Atomics keep the native op, which the record's zero
  * word 0 selects: no compressed storage format has image atomics.
  */

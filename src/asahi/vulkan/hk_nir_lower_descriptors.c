@@ -678,7 +678,9 @@ spread_bits_16(nir_builder *b, nir_def *v)
  * A one-layer view of a compressed image has a 2D PBE instead, which its
  * record marks (HK_M5_STORE_2D): layered stores store to it at (x, y), with
  * the same bounds check, so layers other than 0 are dropped. Its record's
- * word 0 is zero, so atomics keep the native op.
+ * word 0 is zero, so atomics keep the native op. This is the only record on
+ * the M5 Max (G17C), whose layered stores take a layer operand: every other
+ * view keeps the native layered store there.
  *
  * Block stores (image_store_block_agx) are not windowed: on M5 nothing emits
  * them for an application storage view (meta copies take the tiled or

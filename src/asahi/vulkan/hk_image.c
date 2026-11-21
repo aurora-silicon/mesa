@@ -549,8 +549,15 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
     * UINT, SINT, FLOAT). None of these formats has image atomics, so such an
     * image compresses when hk_can_compress() finds only formats of the
     * image's channel layout in the list. */
+   /* A placed G17C image may alias another image with the same layout.
+    * Apply the format and view compatibility checks below to these images. */
+   const bool g17c_storage = dev->chip == AGX_CHIP_G17C &&
+                             info->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                             (info->mipLevels == 1 ||
+                              info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
    const VkImageCreateFlags allowed_flags =
-      VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+      VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+      (g17c_storage ? VK_IMAGE_CREATE_ALIAS_BIT : 0);
    const VkBaseInStructure *ext = info->pNext;
    const bool format_list_only =
       (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && ext &&
@@ -577,7 +584,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    if (dev->chip == AGX_CHIP_G17P)
       return false;
 
-   if (dev->chip != AGX_CHIP_G17S || plane ||
+   if ((!g17c_storage && dev->chip != AGX_CHIP_G17S) || plane ||
        (info->pNext && !format_list_only) ||
        (info->flags & ~allowed_flags) ||
        info->imageType != VK_IMAGE_TYPE_2D || info->extent.depth != 1 ||
@@ -611,6 +618,12 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       break;
    case VK_FORMAT_R32G32_SFLOAT: bit = 16; break;
    case VK_FORMAT_R32G32B32A32_SFLOAT: bit = 32; break;
+   case VK_FORMAT_R8_UNORM:
+   case VK_FORMAT_R8G8_UNORM:
+      if (!g17c_storage)
+         return false;
+      bit = 64;
+      break;
    case VK_FORMAT_R8G8B8A8_UNORM: bit = 64; break;
    case VK_FORMAT_R16G16B16A16_UNORM:
    case VK_FORMAT_R16G16B16A16_SNORM:

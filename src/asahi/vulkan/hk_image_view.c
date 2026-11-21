@@ -511,6 +511,11 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
          translate_image_view_type(view->vk.view_type, msaa, layers > 1,
                                    usage, usage != HK_DESC_USAGE_SAMPLED);
 
+      const bool layered_store =
+         generation == 10 && agx_chip_g17_m5(dev->dev.chip) && !eot &&
+         layout->tiling != AIL_TILING_LINEAR &&
+         cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
+
       /* The M5 and M5 Pro (G17G, G17S) write a layered image as 3D, with the
        * layer in the z coordinate (agx3_pack_binary.c); only the M5 Max
        * (G17C) takes a layer operand. Describe those stores as 3D, as
@@ -518,17 +523,17 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
        * End-of-tile stores use block access and keep their own dimension.
        */
       const bool layers_as_3d =
-         generation == 10 && agx_chip_g17_m5(dev->dev.chip) &&
-         dev->dev.chip != AGX_CHIP_G17C && !eot &&
-         layout->tiling != AIL_TILING_LINEAR &&
-         cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
+         layered_store && dev->dev.chip != AGX_CHIP_G17C;
 
-      /* The packer admits no compressed 3D PBE. A one-layer storage view of a
-       * compressed image instead gets the image's 2D PBE, and its store
-       * record makes layered stores store to it in 2D (hk_native_descriptor.h).
+      /* The packer admits no compressed 3D PBE, and a compressed 2D array
+       * PBE only for level 0 of a one-level image. A one-layer storage view
+       * of a compressed image instead gets the image's 2D PBE, and its store
+       * record makes layered stores store to it in 2D (hk_native_descriptor.h)
+       * on every M5 part, whether its layered stores are 3D or take a layer
+       * operand.
        */
       const bool store_2d =
-         layers_as_3d && store_window_out &&
+         layered_store && store_window_out &&
          usage == HK_DESC_USAGE_STORAGE && layout->compressed &&
          layers == 1 && !msaa && denom.x == 1 && denom.y == 1 &&
          hk_pack_m5_store_2d(u_minify(layout->width_px, level),
