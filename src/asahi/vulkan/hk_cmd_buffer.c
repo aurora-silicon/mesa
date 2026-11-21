@@ -358,6 +358,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 
    hk_ioto_arena_finish(cmd);
    hk_cmd_buffer_release_bos(cmd, &dev->dev);
+   util_dynarray_clear(&cmd->meta_push_saves);
 }
 
 static void
@@ -371,6 +372,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
    hk_free_resettable_cmd_buffer(cmd);
    util_dynarray_fini(&cmd->alias_sites);
    util_dynarray_fini(&cmd->large_bos);
+   util_dynarray_fini(&cmd->meta_push_saves);
    free(cmd->retained_set);
    if (cmd->m5_pushed_images)
       _mesa_set_destroy(cmd->m5_pushed_images, NULL);
@@ -410,6 +412,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
 
    cmd->large_bos = UTIL_DYNARRAY_INIT;
    cmd->alias_sites = UTIL_DYNARRAY_INIT;
+   cmd->meta_push_saves = UTIL_DYNARRAY_INIT;
    list_inithead(&cmd->alias_link);
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
@@ -1794,9 +1797,10 @@ hk_push_descriptor_set(struct hk_cmd_buffer *cmd,
    struct hk_descriptor_set_layout *set_layout =
       vk_to_hk_descriptor_set_layout(pipeline_layout->set_layouts[info->set]);
 
-   hk_push_descriptor_set_update(push_set, set_layout,
-                                 info->descriptorWriteCount,
-                                 info->pDescriptorWrites);
+   if (!hk_push_descriptor_set_update(push_set, set_layout,
+                                      info->descriptorWriteCount,
+                                      info->pDescriptorWrites))
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1829,9 +1833,10 @@ hk_cmd_buffer_flush_push_descriptors(struct hk_cmd_buffer *cmd,
 {
    u_foreach_bit(set_idx, desc->push_dirty) {
       struct hk_push_descriptor_set *push_set = desc->push[set_idx];
-      /* Only the bytes the pushed layout uses; the rest is never read */
+      /* Only the bytes the pushed layout uses; the rest is never read.
+       * hk_push_descriptor_set_begin() keeps that within the storage. */
+      STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= HK_PUSH_DESCRIPTOR_SET_SIZE);
       const uint32_t size = MAX2(push_set->size, HK_MIN_UBO_ALIGNMENT);
-      assert(size <= sizeof(push_set->data));
       const uint64_t push_set_addr =
          hk_pool_upload(cmd, push_set->data, size, HK_MIN_UBO_ALIGNMENT);
 
@@ -1868,9 +1873,10 @@ hk_CmdPushDescriptorSetWithTemplate2KHR(
       hk_m5_note_push_template(cmd, template,
                                pPushDescriptorSetWithTemplateInfo->pData);
 
-   hk_push_descriptor_set_update_template(
-      push_set, set_layout, template,
-      pPushDescriptorSetWithTemplateInfo->pData);
+   if (!hk_push_descriptor_set_update_template(
+          push_set, set_layout, template,
+          pPushDescriptorSetWithTemplateInfo->pData))
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
 }
 
 static uint64_t
@@ -4470,7 +4476,9 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    case AGX_CS_GENERATION_HAL200:
    case AGX_CS_GENERATION_HAL300: {
       struct agx_vdm_barrier_core barrier;
-      if (!agx_vdm_barrier_core_pack(dev->dev.chip, &barrier)) {
+      const bool admits_inval =
+         dev->dev.params.features & DRM_ASAHI_FEATURE_VDM_USC_INVALIDATE;
+      if (!agx_vdm_barrier_core_pack(dev->dev.chip, admits_inval, &barrier)) {
          mesa_loge("no grounded AGX3 initial VDM barrier for %s",
                    agx_chip_name(dev->dev.chip));
          vk_command_buffer_set_error(&cmd->vk,

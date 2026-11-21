@@ -113,6 +113,19 @@ fresh matched target/proposal physical measurements remain necessary. Status
 and error callbacks stay outside the tracking mutex; only final availability
 is checked under it.
 
+Current-target stamp tracking integration
+-----------------------------------------
+
+The wait tracker and the kernel-bound query-word stamp tracker remain separate.
+Queue teardown joins the worker before clearing both trackers and destroying
+its syncobj. Pool destruction unlinks wait state and removes stamp entries
+before unbinding the kernel handle. Stamp ranges and their feature gate remain
+part of reset/write emission; they do not establish host WAIT generations.
+Wait metadata is allocated only after pool bounds/resource construction succeeds,
+so oversized timestamp rejection cannot first allocate a huge wait tracker.
+A calloc-blocked CPU control verifies that error path without large allocation.
+Combined M5 NO_QUERY_ACCESS behavior and recovery still need physical validation.
+
 The CPU-only regression and bounded fault-model probes are::
 
    timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_wiring_test --probe-ordered-reset
