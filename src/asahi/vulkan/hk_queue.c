@@ -1429,7 +1429,8 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
       for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
          VK_FROM_HANDLE(hk_cmd_buffer, cmd,
                         pSubmits[i].pCommandBufferInfos[j].commandBuffer);
-         queries |= cmd->query_wait_ops.size != 0;
+         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops);
+         queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
       }
    }
    if (!queries)
@@ -2805,7 +2806,8 @@ hk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    if (hk_query_wait_has_loss_status(dev)) {
       for (unsigned i = 0; i < submit->command_buffer_count; i++) {
          struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
-         queries |= cmd->query_wait_ops.size != 0;
+         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops);
+         queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
       }
    }
    if (queries) {

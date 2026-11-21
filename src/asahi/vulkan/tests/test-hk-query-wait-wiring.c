@@ -77,7 +77,7 @@ __wrap_hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                                VkPipelineStageFlags2 stage,
                                struct agx_timestamp_req req)
 {
-   assert((!tracking_expected || cmd->query_wait_ops.size) && req.addr);
+   assert((!tracking_expected || hk_query_wait_has_writers(&cmd->query_wait_ops)) && req.addr);
    assert(stage == VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
    stamps++;
 }
@@ -143,10 +143,10 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    uint64_t serial;
    if (!tracking_expected || reset_only) {
       assert(hk_query_wait_quiescent(&dev->query_wait, &serial));
-      assert(list_is_empty(&dev->query_wait.producers));
+      assert(list_length(&dev->query_wait.producers) == expected_live);
       if (reset_only) {
          struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[0];
-         assert(!cmd->query_wait_ops.size);
+         assert(!hk_query_wait_has_writers(&cmd->query_wait_ops));
          struct hk_query_wait_producer *p;
          assert(hk_query_wait_claim(&dev->query_wait, queue, cmd,
                                     &cmd->query_wait_ops, &p));
@@ -161,7 +161,7 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    assert(submit->command_buffer_count == 1);
    struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[0];
    assert(util_dynarray_num_elements(&cmd->query_wait_ops,
-                                     struct hk_query_wait_op) == 3);
+                                     struct hk_query_wait_op) == 6);
    if (fail_submission)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    struct hk_query_wait_producer *p;
@@ -259,12 +259,14 @@ main(void)
    };
    reset_only = true;
    hk_CmdResetQueryPool(cmd, handle, 0, 1);
-   assert(resets == 1 && !primary->query_wait_ops.size);
+   assert(resets == 1 && primary->query_wait_ops.size);
+   assert(!hk_query_wait_has_writers(&primary->query_wait_ops));
    assert(!primary->state.query_reset_recording && !primary->sync.kind_override);
    for (unsigned i = 0; i < 2; i++)
       assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
                              VK_NULL_HANDLE) == VK_SUCCESS);
    reset_only = false;
+   hk_query_wait_recording_finish(&primary->query_wait_ops);
 
    hk_CmdResetQueryPool(cmd, handle, 0, 1);
    hk_CmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, handle,
@@ -282,10 +284,10 @@ main(void)
    util_dynarray_foreach(&primary->query_wait_ops, struct hk_query_wait_op,
                          op) {
       assert(op->pool == pool.wait && op->count == 1);
-      assert(op->first == (n++ == 0 ? 0 : 1));
-      assert(!op->reset);
+      assert(op->first == (n < 2 ? 0 : 1));
+      assert(op->reset == !(n++ & 1));
    }
-   assert(n == 3 && reports[0] == 17 && reports[1] == 23);
+   assert(n == 6 && reports[0] == 17 && reports[1] == 23);
    uint64_t output[2] = {0};
    assert(hk_GetQueryPoolResults(
              hk_device_to_handle(dev), handle, 0, 1, sizeof(output), output,
@@ -302,6 +304,43 @@ main(void)
    assert(submissions == 2);
    hk_query_wait_prune(&dev->query_wait, &queue, 36);
    assert(list_length(&dev->query_wait.producers) == 1);
+
+   /* A real reset-only entrypoint/submit/replay does not invalidate the
+    * earlier accepted writer. GPU emission is replaced above, so model its
+    * completed memory write explicitly. This proves the metadata gap, not
+    * actual GPU execution or a lost write. */
+   struct hk_cmd_buffer *reset_cmd = calloc(1, sizeof(*reset_cmd));
+   assert(reset_cmd);
+   init_cmd(reset_cmd, dev);
+   reset_cmd->vk.pool = &command_pool;
+   uint64_t before_reset = dev->query_wait.serial;
+   hk_CmdResetQueryPool(hk_cmd_buffer_to_handle(reset_cmd), handle, 0, 2);
+   assert(reset_cmd->query_wait_ops.size);
+   assert(!hk_query_wait_has_writers(&reset_cmd->query_wait_ops));
+   VkCommandBufferSubmitInfo reset_ci = ci;
+   reset_ci.commandBuffer = hk_cmd_buffer_to_handle(reset_cmd);
+   VkSubmitInfo2 reset_si = si;
+   reset_si.pCommandBufferInfos = &reset_ci;
+   reset_only = true;
+   expected_live = 1;
+   for (unsigned replay = 0; replay < 2; replay++) {
+      assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &reset_si,
+                             VK_NULL_HANDLE) == VK_SUCCESS);
+      assert(dev->query_wait.serial == before_reset);
+      reports[0] = reports[1] = UINT64_MAX; /* model reset execution */
+      assert(hk_GetQueryPoolResults(
+                hk_device_to_handle(dev), handle, 0, 1, sizeof(output), output,
+                sizeof(output), VK_QUERY_RESULT_64_BIT |
+                                   VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
+             VK_NOT_READY);
+      assert(output[1] == 0 && list_length(&dev->query_wait.producers) == 1);
+   }
+   reset_only = false;
+   hk_query_wait_recording_finish(&reset_cmd->query_wait_ops);
+   vk_object_base_finish(&reset_cmd->vk.base);
+   free(reset_cmd);
+   puts("reset-only API submit/replay retains invalidation ranges without a writer; reset memory is modelled");
+
    hk_ResetQueryPool(hk_device_to_handle(dev), handle, 0, 2);
    assert(reports[0] == UINT64_MAX && reports[1] == UINT64_MAX);
    assert(list_is_empty(&dev->query_wait.producers));
@@ -326,6 +365,7 @@ main(void)
    struct hk_query_wait_pool *saved_wait = pool.wait;
    pool.wait = NULL;
    dev->dev.params.features = 0;
+   expected_live = 0;
    tracking_expected = false;
    fail_submission = false;
    hk_CmdResetQueryPool(cmd, handle, 0, 1);

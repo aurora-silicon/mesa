@@ -1312,6 +1312,10 @@ static VkResult
 hk_query_wait_error(void *data, int error)
 {
    struct hk_query_wait_context *ctx = data;
+   if (error == -ETIMEDOUT)
+      return vk_device_set_lost(&ctx->dev->vk,
+                                 "query %u unavailable after producer completion",
+                                 ctx->query);
    return vk_device_set_lost(&ctx->dev->vk, "query completion wait: %d", error);
 }
 

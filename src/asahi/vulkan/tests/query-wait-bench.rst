@@ -64,6 +64,58 @@ independent query-publication kernel event or universal idle/loss rule is added.
 Live measurements and CTS still require separate authorization before
 publication or merge.
 
+Retired writers and reset generations
+------------------------------------
+
+For a slot without a GPU reset since its last host reset, observed completion
+of its latest registered writer now retains missing-write evidence. Once no
+writer remains, the first reader observation starts a shared two-second grace.
+Availability and sticky loss are rechecked before a generation-checked final
+decision. A newer registration or host reset clears the evidence and deadline;
+unrelated queue/query activity does not restart it. Queued, reserved and
+accepted work has no overall timeout. Cancellation, teardown and host-reset
+unlinking are not completion evidence. The existing M5 idle/victim rule and
+the finite legacy path remain separate.
+
+This is a conservative partial diagnostic. GPU resets can make a successfully
+written query unavailable again, including after the old producer completed.
+Record reset ranges so submission can suppress the diagnostic for that slot
+until its next host reset. Suppression starts before execution, also for
+failed/deferred submissions, and survives writer/reset recording replay.
+Ordered reset records do not prove execution order across queues or identify
+an executed GPU generation. Missing-write timeouts after GPU resets remain
+open; a sticky historical retired flag would be unsafe. No GPU memory layout,
+reset emission, cache flush, timestamp write or synchronization is changed.
+
+Reset-only recordings retain range metadata and pool references again, but
+create no producer or batch, allocate no producer-pointer array and issue no
+tracker completion query on submission. On aarch64 the slot grows from 16 to
+48 bytes and the per-writer link from 32 to 40 bytes; a recording op remains
+24 bytes. A fresh reset-only recording first allocates the dynarray's 64-byte
+minimum capacity; subsequent growth is amortized. Submission scans the ops
+and locks the tracker to invalidate reset ranges at registration and again
+before actual submission. This is additional host memory/locking work, not a
+measured performance claim. Repeated invalidation while suppressed does not
+bump the device serial or broadcast. Only availability is read under the
+tracking mutex at the final decision; status/error callbacks, which can log
+through application debug callbacks, remain outside it.
+
+The CPU-only regression and bounded fault-model probes are::
+
+   timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_test --case retired-reset-future
+   timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_test --probe-retired-missing completion
+   timeout -k 1s 8s build/src/asahi/vulkan/hk_query_wait_test --probe-retired-missing prune
+
+The probes use a three-second fake-time watchdog returning VK_ERROR_UNKNOWN;
+exit one means no independent missing-write exit was observed. They return
+device loss at two seconds on the corrected host-reset path. These probes
+inject absent availability after a successful mock completion; they are not
+valid Vulkan GPU fault reproductions. The reset/reuse control models a
+completed reset before the reader, then registers a future writer at 2500 ms.
+It must still succeed, including when the old writer is pruned before reading.
+The default suite also checks deadline status/registration/reset races, sticky
+loss, unrelated churn and generation recovery by host reset.
+
 Private physical workload (separate authorization required)
 ----------------------------------------------------------
 

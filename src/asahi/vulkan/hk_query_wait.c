@@ -8,6 +8,14 @@
 
 struct hk_query_wait_query {
    struct list_head producers;
+   struct hk_query_wait_link *latest;
+   uint64_t generation;
+   uint64_t deadline;
+   bool retired;
+   /* Without an execution-ordered GPU generation token, a later GPU reset
+    * can explain missing availability. Suppress the diagnostic until the
+    * next host reset, including failed/deferred/replayed reset submits. */
+   bool gpu_reset;
 };
 
 struct hk_query_wait_pool {
@@ -26,6 +34,7 @@ struct hk_query_wait_link {
    struct list_head link;
    struct hk_query_wait_producer *producer;
    struct hk_query_wait_pool *pool;
+   uint32_t query;
 };
 
 enum hk_query_wait_state {
@@ -33,6 +42,7 @@ enum hk_query_wait_state {
    HK_QUERY_QUEUED,
    HK_QUERY_RESERVED,
    HK_QUERY_ACCEPTED,
+   HK_QUERY_COMPLETED,
    HK_QUERY_RETIRED,
    HK_QUERY_FAILED,
 };
@@ -75,6 +85,9 @@ unlink_query(struct hk_query_wait_link *q)
 {
    if (!q->pool)
       return;
+   struct hk_query_wait_query *slot = &q->pool->queries[q->query];
+   if (slot->latest == q)
+      slot->latest = NULL;
    list_del(&q->link);
    pool_unref(q->pool);
    q->pool = NULL;
@@ -88,8 +101,15 @@ retire(struct hk_query_wait_device *dev, struct hk_query_wait_producer *p,
        enum hk_query_wait_state state)
 {
    p->state = state;
-   for (size_t i = 0; i < p->count; i++)
-      unlink_query(&p->queries[i]);
+   for (size_t i = 0; i < p->count; i++) {
+      struct hk_query_wait_link *link = &p->queries[i];
+      if (link->pool && state == HK_QUERY_COMPLETED) {
+         struct hk_query_wait_query *slot = &link->pool->queries[link->query];
+         if (slot->latest == link && !slot->gpu_reset)
+            slot->retired = true;
+      }
+      unlink_query(link);
+   }
    list_del(&p->link);
    batch_unref(p->batch);
    p->batch = NULL;
@@ -148,6 +168,10 @@ reset_locked(struct hk_query_wait_pool *pool, uint32_t first, uint32_t count)
       list_for_each_entry_safe(struct hk_query_wait_link, p, &q->producers,
                                link)
          unlink_query(p);
+      q->latest = NULL;
+      q->generation++;
+      q->deadline = 0;
+      q->retired = q->gpu_reset = false;
    }
    list_for_each_entry_safe(struct hk_query_wait_producer, p, &dev->producers,
                             link) {
@@ -190,10 +214,9 @@ hk_query_wait_record(struct util_dynarray *ops, struct hk_query_wait_pool *pool,
                      uint32_t first, uint32_t count, bool reset)
 {
    assert(first <= pool->count && count <= pool->count - first);
-   /* GPU resets do not produce availability. Do not retain recording ops
-    * for them: enqueue and claim both use an empty recording to skip work.
-    * The caller still emits/orders the actual GPU reset. */
-   if (!count || reset)
+   /* Resets invalidate completion evidence, but are never writers and need
+    * no producer allocation. Actual GPU emission/order remains the caller's. */
+   if (!count)
       return true;
    struct hk_query_wait_op *op =
       util_dynarray_grow(ops, struct hk_query_wait_op, 1);
@@ -210,6 +233,55 @@ hk_query_wait_recording_finish(struct util_dynarray *ops)
    util_dynarray_foreach(ops, struct hk_query_wait_op, op)
       pool_unref(op->pool);
    util_dynarray_fini(ops);
+}
+
+bool
+hk_query_wait_has_writers(const struct util_dynarray *ops)
+{
+   util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
+      if (!op->reset)
+         return true;
+   }
+   return false;
+}
+
+static void
+invalidate_resets_locked(struct hk_query_wait_device *dev,
+                         const struct util_dynarray *ops)
+{
+   bool changed = false;
+   util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
+      if (!op->reset || op->pool->destroyed)
+         continue;
+      for (uint32_t i = op->first; i < op->first + op->count; i++) {
+         struct hk_query_wait_query *q = &op->pool->queries[i];
+         changed |= !q->gpu_reset;
+         if (!q->gpu_reset)
+            q->generation++;
+         q->gpu_reset = true;
+         q->retired = false;
+         q->deadline = 0;
+         q->latest = NULL;
+      }
+   }
+   if (changed) {
+      dev->serial++;
+      u_cnd_monotonic_broadcast(&dev->changed);
+   }
+}
+
+void
+hk_query_wait_invalidate_resets(struct hk_query_wait_device *dev,
+                               const struct util_dynarray *ops)
+{
+   util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
+      if (!op->reset)
+         continue;
+      mtx_lock(&dev->mutex);
+      invalidate_resets_locked(dev, ops);
+      mtx_unlock(&dev->mutex);
+      return;
+   }
 }
 
 struct hk_query_wait_batch *
@@ -245,8 +317,10 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
                       const void *recording, const struct util_dynarray *ops,
                       struct hk_query_wait_batch *batch)
 {
-   if (!ops->size)
+   if (!hk_query_wait_has_writers(ops)) {
+      hk_query_wait_invalidate_resets(dev, ops);
       return true;
+   }
 
    size_t count = 0;
    util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
@@ -272,6 +346,7 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
       p_atomic_inc(&batch->refs);
 
    mtx_lock(&dev->mutex);
+   invalidate_resets_locked(dev, ops);
    size_t n = 0;
    util_dynarray_foreach(ops, struct hk_query_wait_op, op) {
       struct hk_query_wait_pool *pool = op->pool;
@@ -286,7 +361,12 @@ hk_query_wait_enqueue(struct hk_query_wait_device *dev, void *queue,
          *link = (struct hk_query_wait_link){
             .producer = p,
             .pool = pool,
+            .query = i,
          };
+         q->latest = q->gpu_reset ? NULL : link;
+         q->generation++;
+         q->retired = false;
+         q->deadline = 0;
          p_atomic_inc(&pool->refs);
          list_addtail(&link->link, &q->producers);
       }
@@ -304,10 +384,13 @@ hk_query_wait_claim(struct hk_query_wait_device *dev, void *queue,
                     struct hk_query_wait_producer **out)
 {
    *out = NULL;
-   if (!ops->size)
+   if (!hk_query_wait_has_writers(ops)) {
+      hk_query_wait_invalidate_resets(dev, ops);
       return true;
+   }
    for (;;) {
       mtx_lock(&dev->mutex);
+      invalidate_resets_locked(dev, ops);
       list_for_each_entry(struct hk_query_wait_producer, p, &dev->producers,
                           link) {
          if ((p->state == HK_QUERY_REGISTERED || p->state == HK_QUERY_QUEUED) &&
@@ -363,7 +446,7 @@ hk_query_wait_prune(struct hk_query_wait_device *dev, void *queue,
                             link) {
       if (p->queue == queue && p->state == HK_QUERY_ACCEPTED &&
           p->point <= completed)
-         retire(dev, p, HK_QUERY_RETIRED);
+         retire(dev, p, HK_QUERY_COMPLETED);
    }
    mtx_unlock(&dev->mutex);
 }
@@ -438,6 +521,33 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
       const uint64_t interval = pending ? HK_QUERY_WAIT_PRODUCER_NS
                                         : HK_QUERY_WAIT_INTERVAL_NS;
       const uint64_t now = ops->now ? ops->now(data) : os_time_get_nano();
+      struct hk_query_wait_query *slot = &pool->queries[query];
+      if (!pending && slot->retired) {
+         if (!slot->deadline)
+            slot->deadline = MIN2(now, INT64_MAX - HK_QUERY_WAIT_RETIRED_NS) +
+                             HK_QUERY_WAIT_RETIRED_NS;
+         if (now >= slot->deadline) {
+            /* Status/error can log and invoke application debug callbacks.
+             * Keep them outside the tracker lock, then validate this slot's
+             * generation under the lock. Unrelated activity cannot restart
+             * its grace. The final readiness read/decision is serialized
+             * with reset and new registration. */
+            uint64_t generation = slot->generation;
+            mtx_unlock(&dev->mutex);
+            status = ops->status(data);
+            if (status != VK_SUCCESS)
+               return status;
+            mtx_lock(&dev->mutex);
+            if (generation != slot->generation || !slot->retired ||
+                slot->gpu_reset || !list_is_empty(&slot->producers)) {
+               mtx_unlock(&dev->mutex);
+               continue;
+            }
+            bool available = ops->available(data);
+            mtx_unlock(&dev->mutex);
+            return available ? ops->status(data) : ops->error(data, -ETIMEDOUT);
+         }
+      }
       const uint64_t deadline = MIN2(now, INT64_MAX - interval) + interval;
       if (producer) {
          p_atomic_inc(&producer->refs);
@@ -446,7 +556,7 @@ hk_query_wait_available(struct hk_query_wait_pool *pool, uint32_t query,
             ops->completion(data, producer->queue, producer->point, deadline);
          mtx_lock(&dev->mutex);
          if (!ret && producer->state == HK_QUERY_ACCEPTED)
-            retire(dev, producer, HK_QUERY_RETIRED);
+            retire(dev, producer, HK_QUERY_COMPLETED);
          mtx_unlock(&dev->mutex);
          producer_unref(producer);
          if (ret && ret != -ETIME && ret != -EINTR)

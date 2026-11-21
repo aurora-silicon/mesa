@@ -17,6 +17,10 @@
  * This is a tuning candidate, not a hardware latency/CPU guarantee. */
 #define HK_QUERY_WAIT_PRODUCER_NS UINT64_C(1000000)
 
+/* Diagnostic grace after observing completion of the current host-reset
+ * generation's last registered writer, with no live writer left. */
+#define HK_QUERY_WAIT_RETIRED_NS UINT64_C(2000000000)
+
 struct hk_query_wait_pool;
 struct hk_query_wait_batch;
 struct hk_query_wait_producer;
@@ -45,6 +49,9 @@ bool hk_query_wait_record(struct util_dynarray *ops,
                           struct hk_query_wait_pool *pool, uint32_t first,
                           uint32_t count, bool reset);
 void hk_query_wait_recording_finish(struct util_dynarray *ops);
+bool hk_query_wait_has_writers(const struct util_dynarray *ops);
+void hk_query_wait_invalidate_resets(struct hk_query_wait_device *dev,
+                                    const struct util_dynarray *ops);
 
 struct hk_query_wait_batch *hk_query_wait_batch_create(void);
 void hk_query_wait_batch_finish(struct hk_query_wait_device *dev,
@@ -67,7 +74,9 @@ bool hk_query_wait_quiescent(struct hk_query_wait_device *dev,
 
 /* Completion is only a blocking opportunity. Availability is authoritative,
  * including when it precedes later host-dependent work in the submission.
- * The clock and condition-wait overrides are for deterministic host tests. */
+ * The clock and condition-wait overrides are for deterministic host tests.
+ * available also runs under the tracking mutex at the final missing-write
+ * decision and must not reenter this tracker. Status/error remain unlocked. */
 struct hk_query_wait_ops {
    bool (*available)(void *data);
    VkResult (*status)(void *data);

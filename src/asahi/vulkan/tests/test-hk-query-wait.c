@@ -37,13 +37,21 @@ struct fixture {
    int queue[2];
    uint64_t point[2], completion_at[2];
    uint64_t now, ready_at, loss_at, publish_at;
+   uint64_t watchdog_at;
    uint64_t clock_step;
    unsigned initial_polls;
    int completion_error, changed_error;
    unsigned available, statuses, completions, changes, errors;
    bool race_ready, race_loss, idle;
    bool publish_pending;
+   unsigned publish_queue;
    bool idle_after_completion;
+   uint64_t event_at;
+   void (*event)(struct fixture *f);
+   void (*deadline_event)(struct fixture *f);
+   unsigned deadline_statuses;
+   struct hk_query_wait_producer *reserved;
+   struct hk_query_wait_batch *batch;
 };
 
 static void
@@ -54,6 +62,8 @@ init(struct fixture *f)
    f->pool = hk_query_wait_pool_create(&f->dev, 4);
    assert(f->pool);
    f->ready_at = f->loss_at = f->publish_at = UINT64_MAX;
+   f->watchdog_at = UINT64_MAX;
+   f->event_at = UINT64_MAX;
    f->completion_at[0] = f->completion_at[1] = UINT64_MAX;
    assert(hk_query_wait_record(&f->recording, f->pool, 0, 1, false));
 }
@@ -111,7 +121,18 @@ static VkResult
 status(void *data)
 {
    struct fixture *f = data;
+   assert(mtx_trylock(&f->dev.mutex) == thrd_success);
+   mtx_unlock(&f->dev.mutex);
    f->statuses++;
+   if (f->now == HK_QUERY_WAIT_RETIRED_NS && ++f->deadline_statuses == 3 &&
+       f->deadline_event) {
+      void (*event)(struct fixture *) = f->deadline_event;
+      f->deadline_event = NULL;
+      event(f);
+   }
+   /* A diagnostic stop, deliberately distinct from device loss. */
+   if (f->now >= f->watchdog_at)
+      return VK_ERROR_UNKNOWN;
    return f->now >= f->loss_at ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
@@ -172,11 +193,20 @@ changed(void *data, struct hk_query_wait_device *dev, uint64_t deadline)
    f->changes++;
    if (f->changed_error)
       return f->changed_error;
+   if (f->event && deadline >= f->event_at) {
+      f->now = f->event_at;
+      void (*event)(struct fixture *) = f->event;
+      f->event = NULL;
+      mtx_unlock(&dev->mutex);
+      event(f);
+      mtx_lock(&dev->mutex);
+      return thrd_success;
+   }
    if (f->publish_pending && deadline >= f->publish_at) {
       f->now = f->publish_at;
       f->publish_pending = false;
       mtx_unlock(&dev->mutex);
-      accept(f, 0, 7);
+      accept(f, f->publish_queue, f->point[f->publish_queue] + 7);
       mtx_lock(&dev->mutex);
       return thrd_success;
    }
@@ -189,7 +219,10 @@ error(void *data, int err)
 {
    struct fixture *f = data;
    assert(err);
+   assert(mtx_trylock(&f->dev.mutex) == thrd_success);
+   mtx_unlock(&f->dev.mutex);
    f->errors++;
+   f->loss_at = f->now;
    return VK_ERROR_DEVICE_LOST;
 }
 
@@ -451,11 +484,11 @@ test_reset_only(void)
    struct fixture f;
    init(&f);
    struct util_dynarray resets = {0};
-   /* Reset tracking must allocate neither recording storage nor a producer,
-    * and claim must terminate even on repeated submit/fallback paths. */
-   allocation_failure = 1;
+   /* Retain reset ranges, but enqueue/claim must allocate no producer and
+    * terminate even on repeated submit/fallback paths. */
    assert(hk_query_wait_record(&resets, f.pool, 0, 4, true));
-   assert(!resets.size && !resets.data && allocation_failure == 1);
+   assert(resets.size && !hk_query_wait_has_writers(&resets));
+   allocation_failure = 1;
    for (unsigned i = 0; i < 2; i++) {
       assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets, &resets, NULL));
       struct hk_query_wait_producer *p = NULL;
@@ -466,7 +499,307 @@ test_reset_only(void)
    allocation_failure = 0;
    hk_query_wait_recording_finish(&resets);
    finish(&f);
-   puts("reset-only: no recording/tracker allocation; repeated enqueue/claim terminates");
+   puts("reset-only: range metadata retained; no producer allocation; repeated enqueue/claim terminates");
+}
+
+/* Model a completed write, then an ordered, completed GPU reset-only submit,
+ * then a host reader before another thread submits the next writer. The GPU
+ * reset's execution is modelled by changing ready_at, not by executing a GPU.
+ * Submitting the reset op must allocate no producer. Whether the old
+ * writer was already pruned or is retired by this reader must not turn that
+ * old completion into evidence that the new generation lost a write.
+ *
+ * Replay the same writer and reset recording: a recording is not a generation.
+ */
+static void
+test_retired_reset_future(void)
+{
+   for (unsigned pruned = 0; pruned < 2; pruned++) {
+      struct fixture f;
+      bool never;
+      init(&f);
+      struct util_dynarray resets = {0};
+      assert(hk_query_wait_record(&resets, f.pool, 0, 1, true));
+      assert(resets.size && !hk_query_wait_has_writers(&resets));
+      for (unsigned replay = 0; replay < 3; replay++) {
+         f.now = 0;
+         hk_query_wait_host_reset(f.pool, 0, 1);
+         f.completion_at[0] = 0;
+         enqueue(&f, 0);
+         accept(&f, 0, 1 + replay);
+         f.ready_at = 0;
+         assert(available(&f));
+         if (pruned)
+            hk_query_wait_prune(&f.dev, &f.queue[0], 1 + replay);
+
+         /* The reset invalidates evidence, without a writer allocation. */
+         allocation_failure = 1;
+         assert(hk_query_wait_enqueue(&f.dev, &f.queue[0], &resets,
+                                      &resets, NULL));
+         uint64_t serial = f.dev.serial;
+         struct hk_query_wait_producer *p = NULL;
+         assert(hk_query_wait_claim(&f.dev, &f.queue[0], &resets,
+                                    &resets, &p));
+         assert(!p && f.dev.serial == serial && allocation_failure == 1);
+         allocation_failure = 0;
+         f.ready_at = UINT64_MAX; /* completed GPU reset */
+
+         f.publish_pending = true;
+         f.publish_queue = 1;
+         f.publish_at = UINT64_C(2500000000);
+         f.ready_at = UINT64_C(2600000000);
+         f.completion_at[1] = f.ready_at;
+         unsigned completions = f.completions, changes = f.changes;
+         assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+         assert(f.now == f.ready_at && !f.publish_pending);
+         assert(f.changes - changes == 25);
+         assert(f.completions - completions == 100 + !pruned);
+         assert(list_is_empty(&f.dev.producers));
+      }
+      hk_query_wait_recording_finish(&resets);
+      finish(&f);
+   }
+   puts("GPU reset-only after completed/pruned writer: future replay at 2500 ms succeeds at 2600 ms (CPU model)");
+}
+
+/* Missing-write regression. The
+ * status callback stops fake time at 3 s and an external process watchdog
+ * should bound the invocation too. UNKNOWN means the helper had no exit of
+ * its own; this is a fault model, not a valid Vulkan/GPU failure reproduction.
+ */
+static int
+probe_retired_missing(bool pruned)
+{
+   struct fixture f;
+   bool never;
+   init(&f);
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   f.completion_at[0] = 0;
+   if (pruned)
+      hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+   f.watchdog_at = UINT64_C(3000000000);
+   VkResult ret = wait(&f, false, &never);
+   printf("retired-missing (%s): result=%d never=%d fake_ms=%llu completion_waits=%u condition_waits=%u live=%u\n",
+          pruned ? "prune" : "completion", ret, never,
+          (unsigned long long)(f.now / 1000000), f.completions, f.changes,
+          list_length(&f.dev.producers));
+   bool finite_exit = ret == VK_ERROR_DEVICE_LOST && !never;
+   if (finite_exit)
+      assert(f.now == HK_QUERY_WAIT_RETIRED_NS && f.errors == 1);
+   puts(finite_exit ? "PASS: helper exited before watchdog" :
+                     "UNRESOLVED: only the test watchdog ended the wait");
+   finish(&f);
+   return finite_exit ? 0 : 1;
+}
+
+static void
+unrelated_churn(struct fixture *f)
+{
+   struct util_dynarray ops = {0};
+   assert(hk_query_wait_record(&ops, f->pool, 1, 1, false));
+   struct hk_query_wait_producer *p;
+   assert(hk_query_wait_enqueue(&f->dev, &f->queue[1], &ops, &ops, NULL));
+   assert(hk_query_wait_claim(&f->dev, &f->queue[1], &ops, &ops, &p));
+   hk_query_wait_publish(&f->dev, p, ++f->point[1], true);
+   hk_query_wait_prune(&f->dev, &f->queue[1], f->point[1]);
+   hk_query_wait_recording_finish(&ops);
+   f->event = unrelated_churn;
+   f->event_at = f->now + HK_QUERY_WAIT_INTERVAL_NS;
+}
+
+static void
+new_writer(struct fixture *f)
+{
+   enqueue(f, 0);
+   accept(f, 0, f->point[0] + 1);
+   f->ready_at = f->completion_at[0] = UINT64_C(4500000000);
+}
+
+static void
+new_registered(struct fixture *f)
+{
+   f->batch = hk_query_wait_batch_create();
+   assert(f->batch);
+   assert(hk_query_wait_enqueue(&f->dev, &f->queue[0], &f->recording,
+                                &f->recording, f->batch));
+   f->ready_at = UINT64_C(4500000000);
+}
+
+static void
+new_queued(struct fixture *f)
+{
+   enqueue(f, 0);
+   f->ready_at = UINT64_C(4500000000);
+}
+
+static void
+new_reserved(struct fixture *f)
+{
+   new_queued(f);
+   f->reserved = claim(f, 0);
+}
+
+static void
+host_reset(struct fixture *f)
+{
+   hk_query_wait_host_reset(f->pool, 0, 1);
+   f->publish_pending = true;
+   f->publish_at = UINT64_C(2500000000);
+   f->ready_at = f->completion_at[0] = UINT64_C(2600000000);
+}
+
+static void
+gpu_reset(struct fixture *f)
+{
+   struct util_dynarray ops = {0};
+   assert(hk_query_wait_record(&ops, f->pool, 0, 1, true));
+   assert(hk_query_wait_enqueue(&f->dev, &f->queue[1], &ops, &ops, NULL));
+   hk_query_wait_recording_finish(&ops);
+   f->publish_pending = true;
+   f->publish_at = UINT64_C(2500000000);
+   f->ready_at = f->completion_at[0] = UINT64_C(4500000000);
+}
+
+static void
+deadline_ready(struct fixture *f)
+{
+   f->ready_at = f->now;
+}
+
+static void
+deadline_loss(struct fixture *f)
+{
+   f->loss_at = f->now;
+}
+
+static void
+test_retired_generations(void)
+{
+   /* Churn on another slot/queue must not restart the queried slot's grace. */
+   struct fixture f;
+   bool never;
+   init(&f);
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+   f.event = unrelated_churn;
+   f.event_at = HK_QUERY_WAIT_INTERVAL_NS;
+   assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST && !never);
+   assert(f.now == HK_QUERY_WAIT_RETIRED_NS && f.errors == 1);
+   finish(&f);
+
+   void (*events[])(struct fixture *) = {
+      new_writer, host_reset, gpu_reset, new_registered, new_queued, new_reserved,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(events); i++) {
+      init(&f);
+      enqueue(&f, 0);
+      accept(&f, 0, 1);
+      hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+      f.event = events[i];
+      f.event_at = UINT64_C(1900000000);
+      assert(wait(&f, false, &never) == VK_SUCCESS && !never);
+      assert(f.now == f.ready_at && !f.errors);
+      if (f.reserved)
+         hk_query_wait_publish(&f.dev, f.reserved, 0, false);
+      if (f.batch)
+         hk_query_wait_batch_finish(&f.dev, f.batch, true);
+      finish(&f);
+   }
+
+   /* Exercise the unlocked final status callback itself: registration or
+    * reset during it invalidates the slot snapshot. Availability and sticky
+    * loss on that boundary must win over the missing-write diagnostic. */
+   void (*final_events[])(struct fixture *) = {
+      new_writer, host_reset, gpu_reset, deadline_ready, deadline_loss,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(final_events); i++) {
+      init(&f);
+      enqueue(&f, 0);
+      accept(&f, 0, 1);
+      hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+      f.deadline_event = final_events[i];
+      assert(wait(&f, false, &never) ==
+             (i == 4 ? VK_ERROR_DEVICE_LOST : VK_SUCCESS));
+      assert(!never && !f.errors && !f.deadline_event);
+      finish(&f);
+   }
+
+   /* Host reset unlinks an accepted writer even if it has not completed.
+    * Failure/cancel and queue teardown also provide no completion evidence.
+    * These are helper lifetime tests, not valid concurrent Vulkan resets. */
+   for (unsigned i = 0; i < 4; i++) {
+      init(&f);
+      enqueue(&f, 0);
+      if (i == 0) {
+         accept(&f, 0, 1);
+         hk_query_wait_host_reset(f.pool, 0, 1);
+      } else if (i == 1) {
+         hk_query_wait_publish(&f.dev, claim(&f, 0), 0, false);
+      } else if (i == 2) {
+         accept(&f, 0, 1);
+         hk_query_wait_finish_queue(&f.dev, &f.queue[0]);
+      } else {
+         accept(&f, 0, 1);
+         hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+         enqueue(&f, 0);
+         hk_query_wait_publish(&f.dev, claim(&f, 0), 0, false);
+      }
+      f.watchdog_at = UINT64_C(3000000000);
+      assert(wait(&f, false, &never) == VK_ERROR_UNKNOWN && !never);
+      assert(!f.errors);
+      finish(&f);
+   }
+
+   /* The older completed instance cannot poison a newer pending writer. */
+   init(&f);
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   enqueue(&f, 1);
+   accept(&f, 1, 1);
+   hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+   f.ready_at = f.completion_at[1] = UINT64_C(4500000000);
+   assert(wait(&f, false, &never) == VK_SUCCESS && !never && !f.errors);
+   finish(&f);
+
+   /* A host reset recovers diagnostic coverage after GPU-reset uncertainty. */
+   init(&f);
+   gpu_reset(&f);
+   hk_query_wait_host_reset(f.pool, 0, 1);
+   f.publish_pending = false;
+   f.ready_at = UINT64_MAX;
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+   assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST && !never);
+   assert(f.now == HK_QUERY_WAIT_RETIRED_NS && f.errors == 1);
+   finish(&f);
+
+   /* Explicitly retain the unresolved GPU-reset-generation case. */
+   init(&f);
+   gpu_reset(&f);
+   f.publish_pending = false;
+   f.ready_at = UINT64_MAX;
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+   f.watchdog_at = UINT64_C(3000000000);
+   assert(wait(&f, false, &never) == VK_ERROR_UNKNOWN && !never && !f.errors);
+   finish(&f);
+
+   /* Merely recording an unsubmitted reset does not suppress diagnostics. */
+   init(&f);
+   struct util_dynarray unsubmitted = {0};
+   assert(hk_query_wait_record(&unsubmitted, f.pool, 0, 1, true));
+   enqueue(&f, 0);
+   accept(&f, 0, 1);
+   hk_query_wait_prune(&f.dev, &f.queue[0], 1);
+   assert(wait(&f, false, &never) == VK_ERROR_DEVICE_LOST && !never);
+   assert(f.now == HK_QUERY_WAIT_RETIRED_NS && f.errors == 1);
+   hk_query_wait_recording_finish(&unsubmitted);
+   finish(&f);
+   puts("retired grace: per-slot churn, newer writers, resets, cancellation, final status races and host-reset recovery passed");
 }
 
 static void
@@ -582,6 +915,9 @@ test_allocation_failure(void)
    struct util_dynarray failed_recording = {0};
    allocation_failure = 1;
    assert(!hk_query_wait_record(&failed_recording, f.pool, 0, 1, false));
+   assert(!failed_recording.size);
+   allocation_failure = 1;
+   assert(!hk_query_wait_record(&failed_recording, f.pool, 0, 1, true));
    assert(!failed_recording.size);
    hk_query_wait_recording_finish(&failed_recording);
    struct hk_query_wait_producer *p;
@@ -876,6 +1212,10 @@ measure(unsigned delay_ms)
 int
 main(int argc, char **argv)
 {
+   if (argc == 3 && !strcmp(argv[1], "--probe-retired-missing")) {
+      assert(!strcmp(argv[2], "completion") || !strcmp(argv[2], "prune"));
+      return probe_retired_missing(!strcmp(argv[2], "prune"));
+   }
    if (argc == 3 && !strcmp(argv[1], "--measure-delayed")) {
       unsigned delay = strtoul(argv[2], NULL, 10);
       assert(delay == 150 || delay == 2200);
@@ -885,6 +1225,8 @@ main(int argc, char **argv)
    if (argc == 3 && !strcmp(argv[1], "--case")) {
       if (!strcmp(argv[2], "reset"))
          test_reset_only();
+      else if (!strcmp(argv[2], "retired-reset-future"))
+         test_retired_reset_future();
       else if (!strcmp(argv[2], "rechecks"))
          test_rechecks_and_errors();
       else if (!strcmp(argv[2], "waits"))
@@ -901,6 +1243,10 @@ main(int argc, char **argv)
    }
    assert(argc == 1);
    test_reset_only();
+   test_retired_reset_future();
+   assert(probe_retired_missing(false) == 0);
+   assert(probe_retired_missing(true) == 0);
+   test_retired_generations();
    test_rechecks_and_errors();
    for (unsigned state = 0; state < 3; state++)
       test_unaccepted_availability(state);
