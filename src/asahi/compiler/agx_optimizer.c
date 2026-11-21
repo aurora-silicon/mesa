@@ -386,6 +386,32 @@ agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
    }
 }
 
+
+/* The byte offset agx3_translate_mem() would encode for an immediate index:
+ * the index at its full scale plus the instruction's byte displacement.
+ */
+static bool
+device_immediate_index_fits(const agx_instr *I, uint64_t imm)
+{
+   if (!I->memory_byte_offset)
+      return true;
+
+   unsigned w = 0;
+   if (I->format == AGX_FORMAT_I16 || I->format == AGX_FORMAT_F16)
+      w = 1;
+   else if (I->format == AGX_FORMAT_I32)
+      w = 2;
+
+   const unsigned total_shift =
+      (unsigned)I->shift + (I->memory_index_is_bytes ? 0 : w);
+   if (total_shift > 32)
+      return false;
+
+   const int64_t bytes =
+      ((int64_t)(uint32_t)imm << total_shift) + I->memory_byte_offset;
+   return bytes >= INT16_MIN && bytes <= INT16_MAX;
+}
+
 static void
 agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
@@ -573,6 +599,14 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if ((I->op == AGX_OPCODE_LOCAL_LOAD || I->op == AGX_OPCODE_DEVICE_LOAD ||
            I->op == AGX_OPCODE_STACK_STORE) &&
           s != 1)
+         continue;
+      /* A device access with a byte displacement takes an immediate index
+       * only as part of that displacement, which must stay a signed 16-bit
+       * byte offset; otherwise keep the index in its register.
+       */
+      if (((I->op == AGX_OPCODE_DEVICE_LOAD && s == 1) ||
+           (I->op == AGX_OPCODE_DEVICE_STORE && s == 2)) &&
+          !device_immediate_index_fits(I, def->imm))
          continue;
       if (I->op == AGX_OPCODE_SPLIT)
          continue;
