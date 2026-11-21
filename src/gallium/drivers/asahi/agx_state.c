@@ -14989,6 +14989,15 @@ agx_g17g_mrt_spills_encodable(struct agx_context *ctx)
       if (!surf->texture)
          continue;
 
+      /* Integer attachments keep the split. With one in the framebuffer,
+       * the one-pass path gives wrong integer results on the M5 (G17G,
+       * J704): every two-output dEQP-GLES31 builtin with an integer output
+       * (uaddCarry, usubBorrow, frexp; 80 cases) fails, and passes with
+       * the split. It was measured with RGBA8/RGBA16F/RGBA8 only.
+       */
+      if (util_format_is_pure_integer(surf->format))
+         return false;
+
       struct agx_gallium_texture_descriptor texture;
       struct agx_gallium_pbe_descriptor pbe;
       struct pipe_image_view view = image_view_for_surface(surf);
