@@ -8,6 +8,7 @@
  *
  *   LD_PRELOAD=libasahi_noop_drm_shim.so ASAHI_SHIM_CHIP=g17p \
  *   VK_DRIVER_FILES=<icd.json> brl-draw-state-bench [draws] [rounds] [scenario]
+ *                                                  [new-pass]
  *
  * The scenarios differ in what changes between two draws, which decides how
  * much of the per-draw render state a native AGX3 chip builds again:
@@ -25,6 +26,15 @@
  *
  * Each round records `draws` draws; the result is the fastest and the median
  * round. Compare two drivers by alternating runs of this program.
+ *
+ * With `all` for the scenario, more state changes follow, each on a pipeline
+ * whose every state set here is dynamic. They are not timed rows: together
+ * with ASAHI_MESA_DEBUG=perf, which prints what became of the bind tail of
+ * each recording, they are the list run-draw-state-reuse.py checks. With
+ * `new-pass` after the scenario, every draw of the loop is in a rendering
+ * instance of its own. Naming a scenario enables the device features those
+ * states need; a run without one creates the device the timed rows were
+ * measured on.
  */
 #include <inttypes.h>
 #include <stdbool.h>
@@ -57,12 +67,40 @@ enum scenario {
    STENCIL_REF,
    VIEWPORT,
    INDEXED,
+   TIMED_SCENARIOS,
+   /* Only with `all` or by name, on the all-dynamic pipeline. */
+   SAME_VIEWPORT = TIMED_SCENARIOS,
+   STENCIL_REF_BACK,
+   SCISSOR,
+   CULL_MODE,
+   FRONT_FACE,
+   DEPTH_COMPARE,
+   DEPTH_TEST,
+   DEPTH_WRITE,
+   DEPTH_BIAS,
+   STENCIL_OP,
+   STENCIL_WRITE_MASK,
+   STENCIL_COMPARE_MASK,
+   TOPOLOGY,
+   STENCIL_TEST,
+   DEPTH_BIAS_ENABLE,
+   LINE_WIDTH,
+   POLYGON_MODE,
+   DEPTH_CLAMP,
+   DEPTH_CLIP,
+   BLEND_EQUATION,
    SCENARIOS,
 };
 
 static const char *names[SCENARIOS] = {
    "plain",          "base-instance",  "restart-enable", "blend-constants",
    "push-constants", "stencil-ref",    "viewport",       "indexed",
+   "same-viewport",  "stencil-ref-back", "scissor",      "cull-mode",
+   "front-face",     "depth-compare",  "depth-test",     "depth-write",
+   "depth-bias",     "stencil-op",     "stencil-write-mask",
+   "stencil-compare-mask", "topology", "stencil-test", "depth-bias-enable",
+   "line-width",     "polygon-mode",   "depth-clamp",    "depth-clip",
+   "blend-equation",
 };
 
 static VkDevice dev;
@@ -148,7 +186,8 @@ module(const uint32_t *code, size_t size)
 }
 
 static VkPipeline
-pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
+pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs,
+         bool all_dynamic)
 {
    const VkPipelineShaderStageCreateInfo stages[2] = {
       {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -213,10 +252,29 @@ pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
       VK_DYNAMIC_STATE_BLEND_CONSTANTS,
       VK_DYNAMIC_STATE_STENCIL_REFERENCE,
       VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
+      /* The all-dynamic pipeline has these as well. */
+      VK_DYNAMIC_STATE_CULL_MODE,
+      VK_DYNAMIC_STATE_FRONT_FACE,
+      VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+      VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+      VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+      VK_DYNAMIC_STATE_DEPTH_BIAS,
+      VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+      VK_DYNAMIC_STATE_STENCIL_OP,
+      VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+      VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+      VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+      VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+      VK_DYNAMIC_STATE_LINE_WIDTH,
+      VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
+      VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
+      VK_DYNAMIC_STATE_DEPTH_CLIP_ENABLE_EXT,
+      VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
    };
    const VkPipelineDynamicStateCreateInfo dynamic = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-      .dynamicStateCount = sizeof(dynamic_states) / sizeof(dynamic_states[0]),
+      .dynamicStateCount =
+         all_dynamic ? sizeof(dynamic_states) / sizeof(dynamic_states[0]) : 5,
       .pDynamicStates = dynamic_states,
    };
    const VkFormat color_format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -253,6 +311,7 @@ main(int argc, char **argv)
    const unsigned draws = argc > 1 ? strtoul(argv[1], NULL, 0) : 4096;
    const unsigned rounds = argc > 2 ? strtoul(argv[2], NULL, 0) : 51;
    const char *only = argc > 3 ? argv[3] : NULL;
+   const bool new_pass = argc > 4 && !strcmp(argv[4], "new-pass");
    if (!draws || !rounds || rounds > 4096)
       return 2;
 
@@ -275,8 +334,32 @@ main(int argc, char **argv)
    VkPhysicalDeviceProperties props;
    vkGetPhysicalDeviceProperties(phys, &props);
 
+   /* What the all-dynamic pipeline needs, asked for with a scenario only. */
+   VkPhysicalDeviceDepthClipEnableFeaturesEXT clip_features = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT,
+      .depthClipEnable = VK_TRUE,
+   };
+   VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic3 = {
+      .sType =
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT,
+      .pNext = &clip_features,
+      .extendedDynamicState3DepthClampEnable = VK_TRUE,
+      .extendedDynamicState3PolygonMode = VK_TRUE,
+      .extendedDynamicState3ColorBlendEquation = VK_TRUE,
+      .extendedDynamicState3DepthClipEnable = VK_TRUE,
+   };
+   const VkPhysicalDeviceFeatures features = {
+      .depthClamp = VK_TRUE,
+      .fillModeNonSolid = VK_TRUE,
+      .wideLines = VK_TRUE,
+   };
+   const char *const extensions[] = {
+      VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
+      VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
+   };
    VkPhysicalDeviceVulkan13Features features13 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+      .pNext = only ? &dynamic3 : NULL,
       .dynamicRendering = VK_TRUE,
    };
    const float priority = 1.0f;
@@ -290,8 +373,17 @@ main(int argc, char **argv)
       .pNext = &features13,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &queue_info,
+      .enabledExtensionCount = only ? 2 : 0,
+      .ppEnabledExtensionNames = extensions,
+      .pEnabledFeatures = only ? &features : NULL,
    };
    CHECK(vkCreateDevice(phys, &device_info, NULL, &dev));
+#define EXT(name) const PFN_##name name = (PFN_##name)vkGetDeviceProcAddr(dev, #name)
+   EXT(vkCmdSetPolygonModeEXT);
+   EXT(vkCmdSetDepthClampEnableEXT);
+   EXT(vkCmdSetDepthClipEnableEXT);
+   EXT(vkCmdSetColorBlendEquationEXT);
+#undef EXT
 
    const VkImageView color = attachment(
       VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -338,9 +430,12 @@ main(int argc, char **argv)
    CHECK(vkCreatePipelineLayout(dev, &layout_info, NULL, &layout));
    const VkShaderModule fs = module(bench_frag, sizeof(bench_frag));
    const VkPipeline plain = pipeline(
-      layout, module(bench_vert, sizeof(bench_vert)), fs);
+      layout, module(bench_vert, sizeof(bench_vert)), fs, false);
    const VkPipeline base_instance = pipeline(
-      layout, module(bench_base_vert, sizeof(bench_base_vert)), fs);
+      layout, module(bench_base_vert, sizeof(bench_base_vert)), fs, false);
+   const VkPipeline all_dynamic =
+      only ? pipeline(layout, module(bench_vert, sizeof(bench_vert)), fs, true)
+           : VK_NULL_HANDLE;
 
    const VkCommandPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -386,6 +481,17 @@ main(int argc, char **argv)
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
    };
    const VkRect2D scissor = {{8, 8}, {SIZE - 16, SIZE - 16}};
+   /* The pipeline's equation, and one that differs in its operation. */
+   const VkColorBlendEquationEXT blend_add = {
+      .srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR,
+      .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,
+      .colorBlendOp = VK_BLEND_OP_ADD,
+      .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+      .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+      .alphaBlendOp = VK_BLEND_OP_ADD,
+   };
+   VkColorBlendEquationEXT blend_subtract = blend_add;
+   blend_subtract.colorBlendOp = VK_BLEND_OP_SUBTRACT;
 
    uint64_t *times = malloc(rounds * sizeof(*times));
    if (!times)
@@ -393,8 +499,9 @@ main(int argc, char **argv)
 
    printf("driver %s, %u draws per round, %u rounds\n", props.deviceName,
           draws, rounds);
+   const bool all = only && !strcmp(only, "all");
    for (unsigned s = 0; s < SCENARIOS; ++s) {
-      if (only && strcmp(only, names[s]))
+      if (only ? !all && strcmp(only, names[s]) : s >= TIMED_SCENARIOS)
          continue;
 
       for (unsigned round = 0; round < rounds; ++round) {
@@ -402,7 +509,9 @@ main(int argc, char **argv)
          CHECK(vkBeginCommandBuffer(cmd, &begin));
          vkCmdBeginRendering(cmd, &rendering);
          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                           s == BASE_INSTANCE ? base_instance : plain);
+                           s == BASE_INSTANCE     ? base_instance
+                           : s >= TIMED_SCENARIOS ? all_dynamic
+                                                  : plain);
          const VkViewport viewport = {0, 0, SIZE - 1, SIZE, 0.0f, 1.0f};
          const float constants[4] = {0.5f, 0.5f, 0.5f, 0.5f};
          const float offset[4] = {0};
@@ -411,6 +520,32 @@ main(int argc, char **argv)
          vkCmdSetBlendConstants(cmd, constants);
          vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
          vkCmdSetPrimitiveRestartEnable(cmd, VK_FALSE);
+         if (s >= TIMED_SCENARIOS) {
+            /* What the plain pipeline has, but where a scenario alternates
+             * between two values, the one of its odd draws: every draw of
+             * the loop below then changes the state. */
+            vkCmdSetScissor(cmd, 0, 1, &(VkRect2D){{9, 8}, {SIZE - 16, SIZE - 16}});
+            vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
+            vkCmdSetFrontFace(cmd, VK_FRONT_FACE_CLOCKWISE);
+            vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS);
+            vkCmdSetDepthTestEnable(cmd, VK_TRUE);
+            vkCmdSetDepthWriteEnable(cmd, VK_TRUE);
+            vkCmdSetDepthBiasEnable(cmd,
+                                    s == DEPTH_BIAS || s == DEPTH_BIAS_ENABLE);
+            vkCmdSetDepthBias(cmd, 1.0f, 0.0f, 1.0f);
+            vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                              VK_STENCIL_OP_KEEP, VK_STENCIL_OP_INVERT,
+                              VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+            vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+            vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+            vkCmdSetPrimitiveTopology(cmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+            vkCmdSetStencilTestEnable(cmd, VK_TRUE);
+            vkCmdSetLineWidth(cmd, 1.0f);
+            vkCmdSetPolygonModeEXT(cmd, VK_POLYGON_MODE_FILL);
+            vkCmdSetDepthClampEnableEXT(cmd, VK_TRUE);
+            vkCmdSetDepthClipEnableEXT(cmd, VK_TRUE);
+            vkCmdSetColorBlendEquationEXT(cmd, 0, 1, &blend_add);
+         }
          vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16,
                             offset);
          vkCmdBindIndexBuffer(cmd, index_buffer, 0, VK_INDEX_TYPE_UINT16);
@@ -419,6 +554,11 @@ main(int argc, char **argv)
 
          const uint64_t start = now_ns();
          for (unsigned d = 0; d < draws; ++d) {
+            if (new_pass) {
+               vkCmdEndRendering(cmd);
+               vkCmdBeginRendering(cmd, &rendering);
+            }
+
             switch (s) {
             case RESTART_ENABLE:
                vkCmdSetPrimitiveRestartEnable(cmd, d & 1);
@@ -443,6 +583,82 @@ main(int argc, char **argv)
                vkCmdSetViewport(cmd, 0, 1, &v);
                break;
             }
+            case SAME_VIEWPORT:
+               vkCmdSetViewport(cmd, 0, 1, &viewport);
+               break;
+            case STENCIL_REF_BACK:
+               /* Away and back: the same value, set twice. */
+               vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 2);
+               vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+               break;
+            case SCISSOR:
+               vkCmdSetScissor(cmd, 0, 1,
+                               &(VkRect2D){{8 + (d & 1), 8}, {SIZE - 16, SIZE - 16}});
+               break;
+            case CULL_MODE:
+               vkCmdSetCullMode(cmd, (d & 1) ? VK_CULL_MODE_BACK_BIT
+                                             : VK_CULL_MODE_NONE);
+               break;
+            case FRONT_FACE:
+               vkCmdSetFrontFace(cmd, (d & 1) ? VK_FRONT_FACE_CLOCKWISE
+                                              : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+               break;
+            case DEPTH_COMPARE:
+               vkCmdSetDepthCompareOp(cmd, (d & 1) ? VK_COMPARE_OP_LESS
+                                                   : VK_COMPARE_OP_LESS_OR_EQUAL);
+               break;
+            case DEPTH_TEST:
+               vkCmdSetDepthTestEnable(cmd, d & 1);
+               break;
+            case DEPTH_WRITE:
+               vkCmdSetDepthWriteEnable(cmd, d & 1);
+               break;
+            case DEPTH_BIAS:
+               vkCmdSetDepthBias(cmd, (d & 1) ? 1.0f : 2.0f, 0.0f, 1.0f);
+               break;
+            case STENCIL_OP:
+               vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                 VK_STENCIL_OP_KEEP,
+                                 (d & 1) ? VK_STENCIL_OP_INVERT
+                                         : VK_STENCIL_OP_REPLACE,
+                                 VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+               break;
+            case STENCIL_WRITE_MASK:
+               vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                        1 + (d & 1));
+               break;
+            case STENCIL_COMPARE_MASK:
+               vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                          1 + (d & 1));
+               break;
+            case TOPOLOGY:
+               vkCmdSetPrimitiveTopology(
+                  cmd, (d & 1) ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                               : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+               break;
+            case STENCIL_TEST:
+               vkCmdSetStencilTestEnable(cmd, d & 1);
+               break;
+            case DEPTH_BIAS_ENABLE:
+               vkCmdSetDepthBiasEnable(cmd, d & 1);
+               break;
+            case LINE_WIDTH:
+               vkCmdSetLineWidth(cmd, (d & 1) ? 1.0f : 2.0f);
+               break;
+            case POLYGON_MODE:
+               vkCmdSetPolygonModeEXT(cmd, (d & 1) ? VK_POLYGON_MODE_FILL
+                                                   : VK_POLYGON_MODE_LINE);
+               break;
+            case DEPTH_CLAMP:
+               vkCmdSetDepthClampEnableEXT(cmd, d & 1);
+               break;
+            case DEPTH_CLIP:
+               vkCmdSetDepthClipEnableEXT(cmd, d & 1);
+               break;
+            case BLEND_EQUATION:
+               vkCmdSetColorBlendEquationEXT(
+                  cmd, 0, 1, (d & 1) ? &blend_add : &blend_subtract);
+               break;
             default:
                break;
             }

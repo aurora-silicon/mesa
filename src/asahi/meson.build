@@ -79,6 +79,28 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     suite : ['asahi'],
   )
 
+  if meson.can_run_host_binaries()
+    # What becomes of the prepared bind tail when one state changes between two
+    # draws, on every native chip profile; recorded, nothing submitted.
+    foreach chip : ['g15g', 'g15s', 'g15c', 'g16g', 'g17p']
+      test(
+        'brl-draw-state-reuse-' + chip,
+        prog_python,
+        args : [
+          files('vulkan/tests/run-draw-state-reuse.py'),
+          libasahi_noop_drm_shim,
+          hk_draw_state_bench,
+        ],
+        env : [
+          'ASAHI_SHIM_CHIP=' + chip,
+          'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+        ],
+        depends : [_dev_icd, libvulkan_asahi],
+        suite : ['asahi'],
+      )
+    endforeach
+  endif
+
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.
   test(

@@ -929,7 +929,7 @@ if with_tests
   )
 
   # Host-only: times draw recording, submits nothing. See the file header.
-  executable(
+  hk_draw_state_bench = executable(
     'brl-draw-state-bench',
     files('tests/hk_draw_state_bench.c'),
     include_directories : [inc_include],
