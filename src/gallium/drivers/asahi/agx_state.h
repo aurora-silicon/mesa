@@ -1193,6 +1193,26 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
                       const struct pipe_draw_start_count_bias *draw);
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
 
+/* The CPU stages read a bound buffer range through a mapping of its resource.
+ * The range is bound as the application gave it and can extend past the end
+ * of the resource, for example when the buffer's data store is later replaced
+ * by a smaller one. Returns the bytes of the range inside the resource: 0 when
+ * it starts at or past the end. */
+static inline unsigned
+agx_buffer_range_in_resource(const struct pipe_resource *prsc, unsigned offset,
+                             unsigned size)
+{
+   if (offset >= prsc->width0)
+      return 0;
+
+   return MIN2(size, prsc->width0 - offset);
+}
+
+bool agx_cpu_bind_constant_buffer(struct agx_context *ctx,
+                                  struct draw_context *draw,
+                                  mesa_shader_stage s, unsigned i,
+                                  struct pipe_transfer **transfer);
+
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
 bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);

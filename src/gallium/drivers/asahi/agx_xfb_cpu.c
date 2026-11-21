@@ -246,6 +246,36 @@ map_buffer(struct agx_context *ctx, struct pipe_resource *prsc, unsigned usage,
                                 transfer);
 }
 
+/* Constant buffer i of stage s for the draw module: the part of the bound
+ * range inside its resource, or nothing when no byte of it is. Returns false
+ * when the resource cannot be mapped. */
+bool
+agx_cpu_bind_constant_buffer(struct agx_context *ctx, struct draw_context *draw,
+                             mesa_shader_stage s, unsigned i,
+                             struct pipe_transfer **transfer)
+{
+   const struct pipe_constant_buffer *cb = &ctx->stage[s].cb[i];
+   const uint8_t *ptr = cb->user_buffer;
+   unsigned size = ptr ? cb->buffer_size : 0;
+   bool mapped = true;
+
+   if (!ptr && cb->buffer) {
+      size = agx_buffer_range_in_resource(cb->buffer, cb->buffer_offset,
+                                          cb->buffer_size);
+      if (size) {
+         ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, transfer);
+         mapped = ptr != NULL;
+         if (ptr)
+            ptr += cb->buffer_offset;
+         else
+            size = 0;
+      }
+   }
+
+   draw_set_mapped_constant_buffer(draw, s, i, ptr, size);
+   return mapped;
+}
+
 void
 agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *draw_info)
@@ -260,6 +290,7 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    struct draw_so_target targets[PIPE_MAX_SO_BUFFERS];
    struct draw_so_target *target_ptrs[PIPE_MAX_SO_BUFFERS] = {0};
    unsigned num_targets = ctx->streamout.num_targets;
+   bool mapped = true;
 
    const struct pipe_rasterizer_state rast = {
       .flatshade_first = ctx->rast->base.flatshade_first,
@@ -292,7 +323,8 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else if (vb->buffer.resource) {
          ptr = map_buffer(ctx, vb->buffer.resource, PIPE_MAP_READ,
                           &vb_transfers[i]);
-         size = vb->buffer.resource->width0;
+         size = ptr ? vb->buffer.resource->width0 : 0;
+         mapped &= ptr != NULL;
       }
 
       draw_set_mapped_vertex_buffer(draw, i, ptr, size);
@@ -306,24 +338,15 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
       } else {
          indices = map_buffer(ctx, info->index.resource, PIPE_MAP_READ,
                               &ib_transfer);
-         available = info->index.resource->width0;
+         available = indices ? info->index.resource->width0 : 0;
+         mapped &= indices != NULL;
       }
       draw_set_indexes(draw, indices, info->index_size, available);
    }
 
-   struct agx_stage *stage = &ctx->stage[MESA_SHADER_VERTEX];
-   u_foreach_bit(i, stage->cb_mask) {
-      const struct pipe_constant_buffer *cb = &stage->cb[i];
-      const uint8_t *ptr = cb->user_buffer;
-
-      if (!ptr && cb->buffer) {
-         ptr = map_buffer(ctx, cb->buffer, PIPE_MAP_READ, &cb_transfers[i]);
-         if (ptr)
-            ptr += cb->buffer_offset;
-      }
-
-      draw_set_mapped_constant_buffer(draw, MESA_SHADER_VERTEX, i, ptr,
-                                      cb->buffer_size);
+   u_foreach_bit(i, ctx->stage[MESA_SHADER_VERTEX].cb_mask) {
+      mapped &= agx_cpu_bind_constant_buffer(ctx, draw, MESA_SHADER_VERTEX, i,
+                                             &cb_transfers[i]);
    }
 
    for (unsigned i = 0; i < num_targets; ++i) {
@@ -342,6 +365,7 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
                                        &so_transfers[i]),
          .internal_offset = offset_B,
       };
+      mapped &= targets[i].mapping != NULL;
       atgt->stride = vs->xfb_strides[i] * 4;
       target_ptrs[i] = &targets[i];
    }
@@ -352,8 +376,14 @@ agx_xfb_cpu_draw(struct agx_context *ctx, const struct pipe_draw_info *info,
    memset(r->written, 0, sizeof(r->written));
    memset(r->generated, 0, sizeof(r->generated));
 
-   draw_vbo(draw, info, 0, NULL, draw_info, 1, 0);
-   draw_flush(draw);
+   /* A buffer that could not be mapped leaves the draw out. */
+   if (mapped) {
+      draw_vbo(draw, info, 0, NULL, draw_info, 1, 0);
+      draw_flush(draw);
+   } else {
+      mesa_loge("asahi: transform feedback on the CPU: a buffer could not be "
+                "mapped, draw skipped");
+   }
 
    for (unsigned i = 0; i < num_targets; ++i) {
       if (!target_ptrs[i])
