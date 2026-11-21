@@ -1139,6 +1139,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_fd;
    }
 
+   /* The kernel can start the first commands of a long submission while it
+    * validates the rest, so a profile may ask for shorter submissions. */
+   dev->submit_batch_size = instance->drirc.performance.submit_batch_size;
+
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
