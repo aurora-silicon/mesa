@@ -78,7 +78,7 @@ Use a fresh process with one absolute private ICD manifest in
 program verifies that it was actually mapped, requires exactly Mesa's default
 Vulkan vendor ID and the Borealis driver ID, and prints observed IDs and library
 mapping before identity rejection. Native Apple hardware identity is verified
-separately through the kernel parameters. Workload version three reports both
+separately through the kernel parameters. Workload version four reports both
 the raw GPU generation/variant and the normalized driver profile.
 
 The preflight reads the native kernel's global parameters using the enumerated
@@ -128,6 +128,40 @@ contains configuration and measurement JSON Lines, including VkResult,
 availability, wall/process/reader CPU, actual host signal time/result and
 retirement result. Nonzero exit is expected for the long failing baseline;
 preserve its output and exit status rather than dropping that sample.
+
+Local candidate measurement modes (not yet run on hardware)
+----------------------------------------------------------
+
+Workload version four additionally reports CPU and wall time around the single
+``vkQueueSubmit2`` call. ``--timestamps N`` records between 1 and 1024 ordered
+BOTTOM_OF_PIPE timestamps in that command buffer, with separate query slots.
+With normal readback, only query zero is read with WAIT. The subsequent fence
+status is sampled after the timed reader region: ``VK_NOT_READY`` proves a
+still-pending tail at that sample; ``VK_SUCCESS`` does not locate the fence
+signal relative to availability or reader return. A 1024-timestamp tail is
+bounded real work, not a synthetic host wait inside a command buffer, and may
+be too short to demonstrate early publication on a particular driver. Report
+that case as inconclusive if no pending tail is observed.
+
+``--submit-only --delay-ms 0`` skips host query readback entirely and signals
+the timeline gate immediately after the reader handshake. Use timestamp counts
+1, 128 and 1024 to measure submit CPU cost even without WAIT readers.
+``--reset-only`` requires that mode and replaces the timestamp writes with one
+GPU reset of the specified number of slots. This isolates reset-only recording
+from timestamp writer registration. It does not measure all recording costs or
+steady-state frame throughput. Each invocation still makes just one submit,
+keeps resources alive through retirement and retains the exact-device guards.
+For example, after separate approval::
+
+   timeout -k 2s 12s env VK_DRIVER_FILES=/PRIVATE/asahi_icd.aarch64.json \
+      /PRIVATE/hk-query-wait-bench --run --delay-ms 0 --timestamps 1024 \
+      --submit-only --library /PRIVATE/libvulkan_asahi.so
+
+The identical workload binary must be used for target baseline, current public
+PR and local candidate. Compare submit CPU and wall distributions separately
+from reader CPU, wall and signal-to-return latency. More frequent completion
+checks can cost more CPU/DRM operations even with only one initial spin; no
+physical benefit is established by compilation or CPU-only models.
 
 Comparison and path verification
 -------------------------------

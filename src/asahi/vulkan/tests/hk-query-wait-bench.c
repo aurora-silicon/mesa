@@ -167,15 +167,18 @@ signal_later(void *data)
 int
 main(int argc, char **argv)
 {
-   bool run = false, probe = false;
+   bool run = false, probe = false, submit_only = false, reset_only = false;
+   unsigned timestamps = 1;
    const char *library = NULL;
    unsigned delay_ms = 2200;
    for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--help")) {
          puts(
-            "hk-query-wait-bench --probe|--run --library ABSOLUTE_PRIVATE_ICD_LIBRARY [--delay-ms 2200]\n"
+            "hk-query-wait-bench --probe|--run --library ABSOLUTE_PRIVATE_ICD_LIBRARY [--delay-ms 2200] [--timestamps 1..1024] [--submit-only] [--reset-only]\n"
             "Requires one absolute process-local VK_DRIVER_FILES manifest.\n"
-            "--probe enumerates hardware; --run also submits one timestamp.\n"
+            "--probe enumerates hardware; --run submits one command buffer.\n"
+            "--submit-only skips WAIT readback and requires --delay-ms 0.\n"
+            "--reset-only records GPU resets and requires --submit-only.\n"
             "The old driver may report device loss before the host release.\n"
             "Neither hardware mode is a build/test step. Use a separately approved test machine.\n"
             "Output is JSON Lines; each invocation is one fresh-device measurement.");
@@ -184,6 +187,16 @@ main(int argc, char **argv)
          run = true;
       } else if (!strcmp(argv[i], "--probe")) {
          probe = true;
+      } else if (!strcmp(argv[i], "--submit-only")) {
+         submit_only = true;
+      } else if (!strcmp(argv[i], "--reset-only")) {
+         reset_only = true;
+      } else if (!strcmp(argv[i], "--timestamps") && i + 1 < argc) {
+         char *end;
+         unsigned long value = strtoul(argv[++i], &end, 10);
+         require(*argv[i] && !*end && value >= 1 && value <= 1024,
+                 "timestamp count must be an integer from 1 through 1024");
+         timestamps = value;
       } else if (!strcmp(argv[i], "--library") && i + 1 < argc) {
          library = argv[++i];
       } else if (!strcmp(argv[i], "--delay-ms") && i + 1 < argc) {
@@ -198,6 +211,10 @@ main(int argc, char **argv)
    }
    require(run != probe && library && library[0] == '/',
            "choose --probe or --run and an absolute --library; use --help");
+   require(!submit_only || delay_ms == 0,
+           "--submit-only requires --delay-ms 0");
+   require(!reset_only || submit_only,
+           "--reset-only requires --submit-only (reset is not a writer)");
    const char *icd = getenv("VK_DRIVER_FILES");
    require(icd && icd[0] == '/' && !strchr(icd, ':'),
            "set VK_DRIVER_FILES to one absolute private ICD manifest");
@@ -208,7 +225,7 @@ main(int argc, char **argv)
    const VkApplicationInfo app = {
       .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
       .pApplicationName = "HK query wait benchmark",
-      .applicationVersion = 3,
+      .applicationVersion = 4,
       .apiVersion = VK_API_VERSION_1_3,
    };
    const VkInstanceCreateInfo instance_info = {
@@ -236,7 +253,7 @@ main(int argc, char **argv)
       .pNext = &driver,
    };
    vkGetPhysicalDeviceProperties2(physical, &properties);
-   printf("{\"kind\":\"identity\",\"workload_version\":3,\"vendor_id\":%u,"
+   printf("{\"kind\":\"identity\",\"workload_version\":4,\"vendor_id\":%u,"
           "\"device_id\":%u,\"driver_id\":%u,\"expected_library\":",
           properties.properties.vendorID, properties.properties.deviceID,
           driver.driverID);
@@ -285,7 +302,7 @@ main(int argc, char **argv)
          break;
    }
    require(family < count, "no timestamp-capable graphics/compute queue");
-   printf("{\"kind\":\"configuration\",\"workload_version\":3,\"device\":");
+   printf("{\"kind\":\"configuration\",\"workload_version\":4,\"device\":");
    json_string(properties.properties.deviceName);
    printf(",\"driver\":");
    json_string(driver.driverInfo);
@@ -333,11 +350,11 @@ main(int argc, char **argv)
    const VkQueryPoolCreateInfo pi = {
       .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
       .queryType = VK_QUERY_TYPE_TIMESTAMP,
-      .queryCount = 1,
+      .queryCount = timestamps,
    };
    VkQueryPool pool;
    CHECK(vkCreateQueryPool(device, &pi, NULL, &pool));
-   vkResetQueryPool(device, pool, 0, 1);
+   vkResetQueryPool(device, pool, 0, timestamps);
    const VkSemaphoreTypeCreateInfo type = {
       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
       .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
@@ -368,7 +385,11 @@ main(int argc, char **argv)
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
    };
    CHECK(vkBeginCommandBuffer(cmd, &bi));
-   vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, pool, 0);
+   if (reset_only)
+      vkCmdResetQueryPool(cmd, pool, 0, timestamps);
+   else
+      for (unsigned i = 0; i < timestamps; i++)
+         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, pool, i);
    CHECK(vkEndCommandBuffer(cmd));
    const VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
    VkFence fence;
@@ -391,7 +412,11 @@ main(int argc, char **argv)
       .commandBufferInfoCount = 1,
       .pCommandBufferInfos = &cbi,
    };
+   uint64_t submit_cpu0 = ns(CLOCK_THREAD_CPUTIME_ID);
+   uint64_t submit_wall0 = ns(CLOCK_MONOTONIC);
    CHECK(vkQueueSubmit2(queue, 1, &submit, fence));
+   uint64_t submit_wall = ns(CLOCK_MONOTONIC) - submit_wall0;
+   uint64_t submit_cpu = ns(CLOCK_THREAD_CPUTIME_ID) - submit_cpu0;
    struct release release = {
       .device = device,
       .semaphore = semaphore,
@@ -410,15 +435,28 @@ main(int argc, char **argv)
    release.entered = true;
    pthread_cond_signal(&release.condition);
    pthread_mutex_unlock(&release.mutex);
-   VkResult ret = vkGetQueryPoolResults(
-      device, pool, 0, 1, sizeof(result), result, sizeof(result),
-      VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT |
-         VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+   VkResult ret = VK_SUCCESS;
+   if (!submit_only)
+      ret = vkGetQueryPoolResults(
+         device, pool, 0, 1, sizeof(result), result, sizeof(result),
+         VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT |
+            VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
    uint64_t end = ns(CLOCK_MONOTONIC);
    uint64_t process1 = ns(CLOCK_PROCESS_CPUTIME_ID);
    uint64_t cpu1 = ns(CLOCK_THREAD_CPUTIME_ID);
+   /* Query zero may be visible while the remaining timestamps are pending.
+    * Fence status is observed after the timed reader region, not a timestamp
+    * of the availability write. NOT_READY proves a pending tail; SUCCESS does
+    * not prove that the fence was already signaled at reader return. */
+   VkResult fence_at_return = vkGetFenceStatus(device, fence);
    pthread_join(thread, NULL);
    VkResult retired = vkWaitForFences(device, 1, &fence, true, 5000000000);
+   printf("{\"kind\":\"submit_measurement\",\"query_count\":%u,"
+          "\"reset_only\":%s,\"submit_only\":%s,\"submit_wall_ns\":%llu,"
+          "\"submit_cpu_ns\":%llu,\"fence_at_return\":%d}\n",
+          timestamps, reset_only ? "true" : "false",
+          submit_only ? "true" : "false", (unsigned long long)submit_wall,
+          (unsigned long long)submit_cpu, fence_at_return);
    printf("{\"kind\":\"measurement\",\"delay_ms\":%u,\"result\":%d,"
           "\"availability\":%llu,\"timestamp\":%llu,\"wall_ns\":%llu,"
           "\"reader_cpu_ns\":%llu,\"process_cpu_ns\":%llu,"
@@ -441,7 +479,8 @@ main(int argc, char **argv)
    vkDestroyInstance(instance, NULL);
    pthread_cond_destroy(&release.condition);
    pthread_mutex_destroy(&release.mutex);
-   return ret == VK_SUCCESS && result[1] != 0 && release.result == VK_SUCCESS &&
+   return ret == VK_SUCCESS && (submit_only || result[1] != 0) &&
+                release.result == VK_SUCCESS &&
                 retired == VK_SUCCESS
              ? 0
              : 1;
