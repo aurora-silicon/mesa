@@ -222,14 +222,22 @@ bool agx3_compose_known(const agx3_table *t, uint32_t form,
    return true;
 }
 
-bool agx3_compose(const agx3_table *t, uint32_t form,
-                  const uint64_t fields[AGX3_MAX_FIELDS], uint8_t *out)
+/* Which fields are nonzero. */
+static void nonzero_fields(const uint64_t fields[AGX3_MAX_FIELDS],
+                           uint64_t nonzero[3])
 {
-   uint64_t nonzero[3] = {0};
+   memset(nonzero, 0, 3 * sizeof(nonzero[0]));
    for (unsigned i = 0; i < AGX3_MAX_FIELDS; i++) {
       if (fields[i])
          nonzero[i >> 6] |= 1ull << (i & 63);
    }
+}
+
+bool agx3_compose(const agx3_table *t, uint32_t form,
+                  const uint64_t fields[AGX3_MAX_FIELDS], uint8_t *out)
+{
+   uint64_t nonzero[3];
+   nonzero_fields(fields, nonzero);
    return agx3_compose_known(t, form, fields, nonzero, out);
 }
 
@@ -279,8 +287,10 @@ int32_t agx3_form_index(const agx3_table *t, enum agx3_mnemonic mnemonic,
  * (mnemonic, ep).
  */
 int32_t
-agx3_compose_apple_order(const agx3_table *t, enum agx3_mnemonic mnemonic,
-                         const uint64_t fields[AGX3_MAX_FIELDS], uint8_t *out)
+agx3_compose_apple_order_known(const agx3_table *t,
+                               enum agx3_mnemonic mnemonic,
+                               const uint64_t fields[AGX3_MAX_FIELDS],
+                               const uint64_t nonzero[3], uint8_t *out)
 {
    const uint32_t first = first_form(t, mnemonic);
    uint32_t end = first;
@@ -304,8 +314,17 @@ agx3_compose_apple_order(const agx3_table *t, enum agx3_mnemonic mnemonic,
             best = (int32_t)f;
       }
       tried[best - first] = true;
-      if (agx3_compose(t, (uint32_t)best, fields, out))
+      if (agx3_compose_known(t, (uint32_t)best, fields, nonzero, out))
          return best;
    }
    return -1;
+}
+
+int32_t
+agx3_compose_apple_order(const agx3_table *t, enum agx3_mnemonic mnemonic,
+                         const uint64_t fields[AGX3_MAX_FIELDS], uint8_t *out)
+{
+   uint64_t nonzero[3];
+   nonzero_fields(fields, nonzero);
+   return agx3_compose_apple_order_known(t, mnemonic, fields, nonzero, out);
 }

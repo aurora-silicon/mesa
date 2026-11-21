@@ -148,6 +148,13 @@ int32_t agx3_compose_apple_order(const agx3_table *t,
                                  const uint64_t fields[AGX3_MAX_FIELDS],
                                  uint8_t *out);
 
+/* agx3_compose_apple_order() with nonzero as for agx3_compose_known(). */
+int32_t agx3_compose_apple_order_known(const agx3_table *t,
+                                       enum agx3_mnemonic mnemonic,
+                                       const uint64_t fields[AGX3_MAX_FIELDS],
+                                       const uint64_t nonzero[3],
+                                       uint8_t *out);
+
 /* A mnemonic's spelling, "?" for AGX3_MN_NONE and for no mnemonic at all;
  * and back: AGX3_MN_NONE for a name no table has. */
 const char *agx3_mnemonic_name(enum agx3_mnemonic mnemonic);
