@@ -735,6 +735,7 @@ if with_tests
          'test/test-ftz-subgroup-minmax.cpp',
          'test/test-m5-half-widen-once.cpp',
          'test/test-m5-byte-to-float.cpp',
+         'test/test-compute-licm.cpp',
          'test/test-fold-narrowed-half.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',

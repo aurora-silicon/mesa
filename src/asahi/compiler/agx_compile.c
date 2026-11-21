@@ -9691,6 +9691,16 @@ agx_lower_front_face(struct nir_builder *b, nir_intrinsic_instr *intr,
  */
 #define AGX_G17P_EXPENSIVE_FLATTEN_LIMIT 24
 
+/* Loop-invariant code motion (agx_nir_opt_licm) runs on M5, and on compute
+ * shaders of every generation, where the workgroup size bounds the register
+ * file it may fill.
+ */
+static bool
+agx_hoists_loop_invariants(const nir_shader *nir, bool m5)
+{
+   return m5 || mesa_shader_stage_is_compute(nir->info.stage);
+}
+
 /*
  * Standard NIR optimization loop. This is run in agx_preprocess_nir, then once
  * again at shader variant compile time. Unless there was a complex shader key,
@@ -10426,14 +10436,23 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    }
 
    /* Reassociate before forming preambles because it makes preambles more
-    * effective. Clean up after. On M5, also order the loop-invariant terms of
-    * a chain in a loop first, so accumulations of per-iteration constants
-    * (robustness loops add the same size queries every iteration) are summed
-    * once in the preamble instead of once per term and iteration.
+    * effective. Clean up after. Where loop invariants are hoisted, also order
+    * the loop-invariant terms of a chain in a loop first, so accumulations of
+    * per-iteration constants (robustness loops add the same size queries
+    * every iteration) are summed once in the preamble instead of once per
+    * term and iteration.
+    *
+    * AGX has no scalar ALU in the main shader: in a loop a convergent term is
+    * vector math like any other. Rank invariance above convergence, so
+    * that a shared-memory address of uniform and per-lane parts plus a loop
+    * counter (coopMatLoad in a K loop) adds only the counter in the loop.
     */
+   const bool hoist = agx_hoists_loop_invariants(nir, m5);
    nir_opt_reassociate_loop(
       nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-              (m5 ? nir_reassociate_loop_invariant : 0));
+              (hoist ? nir_reassociate_loop_invariant |
+                          nir_reassociate_loop_invariant_first
+                     : 0));
 
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
@@ -16259,11 +16278,16 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       assign_coefficient_regs(nir, &info->varyings.fs);
    }
 
-   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
+   /* Without it, llama.cpp's coopmat mul_mm recomputed the lane coordinates
+    * of each coopMatLoad and the invariant parts of its addresses on every K
+    * step (G17P: 20 of 70 instructions per 16 multiplies).
+    */
+   if (agx_hoists_loop_invariants(nir, key->dev.encoding ==
+                                          AGX_ISA_ENCODING_AGX3C)) {
       /* Hoist only what the register file can hold through the loop: the
        * file a workgroup allows (agx_ra), less what spilling reserves.
        */
-      unsigned regs = ROUND_DOWN_TO(AGX3C_NUM_REGS, 8);
+      unsigned regs = ROUND_DOWN_TO(agx_num_regs(key->dev.encoding), 8);
       if (mesa_shader_stage_is_compute(nir->info.stage)) {
          const unsigned threads = nir->info.workgroup_size_variable
             ? 1024

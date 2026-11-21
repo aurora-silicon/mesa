@@ -70,3 +70,69 @@ TEST_F(nir_opt_reassociate_test, loop_invariance_off)
    ASSERT_FALSE(nir_opt_reassociate(b->shader, (nir_reassociate_options)0));
    ASSERT_FALSE(invariant_pair());
 }
+
+/* Inside a loop, r = (c + v) + d with c convergent and d divergent, both
+ * defined before the loop, and v a convergent value loaded in the loop: by
+ * convergence first, c + v is added in the loop before d; with invariance
+ * first, c + d can leave the loop and only v is added in it.
+ */
+static bool
+adds_pair(nir_function_impl *impl, nir_def *p, nir_def *q)
+{
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_iadd || list_is_empty(&alu->def.uses))
+            continue;
+         nir_def *a = alu->src[0].src.ssa, *c = alu->src[1].src.ssa;
+         while (nir_def_is_alu(a) && nir_def_as_alu(a)->op == nir_op_mov)
+            a = nir_def_as_alu(a)->src[0].src.ssa;
+         while (nir_def_is_alu(c) && nir_def_as_alu(c)->op == nir_op_mov)
+            c = nir_def_as_alu(c)->src[0].src.ssa;
+         if ((a == p && c == q) || (a == q && c == p))
+            return true;
+      }
+   }
+   return false;
+}
+
+static void
+build_mixed(nir_builder *b, nir_def **c, nir_def **d)
+{
+   *c = nir_load_subgroup_id(b);
+   *d = nir_load_local_invocation_index(b);
+
+   nir_loop *loop = nir_push_loop(b);
+   nir_def *v = nir_load_global(b, 1, 32, nir_imm_int64(b, 0));
+   nir_def *root = nir_iadd(b, nir_iadd(b, *c, v), *d);
+   nir_store_global(b, root, nir_u2u64(b, *d));
+   nir_break_if(b, nir_undef(b, 1, 1));
+   nir_pop_loop(b, loop);
+}
+
+TEST_F(nir_opt_reassociate_test, loop_invariance_below_convergence)
+{
+   nir_def *c, *d;
+   build_mixed(b, &c, &d);
+   nir_opt_reassociate(
+      b->shader, (nir_reassociate_options)(nir_reassociate_scalar_math |
+                                            nir_reassociate_loop_invariant));
+   nir_validate_shader(b->shader, NULL);
+   nir_opt_dce(b->shader);
+   ASSERT_FALSE(adds_pair(b->impl, c, d));
+}
+
+TEST_F(nir_opt_reassociate_test, loop_invariance_above_convergence)
+{
+   nir_def *c, *d;
+   build_mixed(b, &c, &d);
+   ASSERT_TRUE(nir_opt_reassociate(
+      b->shader, (nir_reassociate_options)(nir_reassociate_scalar_math |
+                                            nir_reassociate_loop_invariant |
+                                            nir_reassociate_loop_invariant_first)));
+   nir_validate_shader(b->shader, NULL);
+   nir_opt_dce(b->shader);
+   ASSERT_TRUE(adds_pair(b->impl, c, d));
+}
