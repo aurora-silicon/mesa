@@ -81,6 +81,16 @@ hk_g17p_cached_cmd_memory(const struct agx_device *dev)
    return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
 }
 
+/* These command-pool ranges are cleaned and fenced together at
+ * EndCommandBuffer. Application-updated descriptors and retired Ioto chunks
+ * have separate publication lifetimes. */
+static inline bool
+hk_cached_cmd_uploads(const struct agx_device *dev)
+{
+   return (dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G17C) &&
+          util_has_cache_ops();
+}
+
 struct hk_cmd_pool;
 
 void hk_cmd_pool_clean_vdm(const struct hk_vdm_allocation *allocation);
