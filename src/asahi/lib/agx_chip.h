@@ -48,7 +48,8 @@ enum agx_chip {
    AGX_CHIP_G16C,
 
    /* G17P/G17A remain on the HAL200/AGX3b side of the boundary. The M5
-    * G/S/C parts use AGX3c.
+    * G/S/C/D parts use AGX3c. G17D is the M5 Ultra: T6050 with two dies and
+    * eight clusters.
     *
     * G17P is an instruction-set and firmware-HAL profile (AGX3b shaders,
     * HAL200 firmware interface), not one SoC. agx_chip_from_params() maps
@@ -64,6 +65,7 @@ enum agx_chip {
    AGX_CHIP_G17G,
    AGX_CHIP_G17S,
    AGX_CHIP_G17C,
+   AGX_CHIP_G17D,
 
    /* The M6 base part (J873, T8152). Its command-stream records are the
     * M5 HAL300 ones, but its shaders use a third AGX3 encoding. */
@@ -370,10 +372,10 @@ unsigned agx_chip_sampler_heap_element_size_reference(enum agx_chip chip);
  * driver build runs under FEX. */
 #define AGX_CHIP_TABLE(G13G, G13X, G14G, G14X, G15P, G15G, G15S, G15C, G15D,  \
                        G16P, G16G, G16S, G16C, G17P, G17A, G17G, G17S, G17C,  \
-                       G18G)                                                   \
+                       G17D, G18G)                                             \
    {                                                                           \
       G13G, G13X, G14G, G14X, G15P, G15G, G15S, G15C, G15D, G16P, G16G, G16S,  \
-      G16C, G17P, G17A, G17G, G17S, G17C, G18G,                                \
+      G16C, G17P, G17A, G17G, G17S, G17C, G17D, G18G,                          \
    }
 
 /* The table is positional (C++ translation units include this header and
@@ -386,8 +388,8 @@ static_assert(AGX_CHIP_G13G == 0 && AGX_CHIP_G13X == 1 && AGX_CHIP_G14G == 2 &&
                  AGX_CHIP_G16S == 11 && AGX_CHIP_G16C == 12 &&
                  AGX_CHIP_G17P == 13 && AGX_CHIP_G17A == 14 &&
                  AGX_CHIP_G17G == 15 && AGX_CHIP_G17S == 16 &&
-                 AGX_CHIP_G17C == 17 && AGX_CHIP_G18G == 18 &&
-                 AGX_CHIP_UNKNOWN == 19,
+                 AGX_CHIP_G17C == 17 && AGX_CHIP_G17D == 18 &&
+                 AGX_CHIP_G18G == 19 && AGX_CHIP_UNKNOWN == 20,
               "AGX_CHIP_TABLE is ordered by enum agx_chip");
 
 static inline enum agx_command_stream_generation
@@ -404,7 +406,8 @@ agx_chip_command_stream_generation(enum agx_chip chip)
       AGX_CS_GENERATION_HAL200, AGX_CS_GENERATION_HAL200,
       AGX_CS_GENERATION_HAL200, AGX_CS_GENERATION_HAL200,
       AGX_CS_GENERATION_HAL300, AGX_CS_GENERATION_HAL300,
-      AGX_CS_GENERATION_HAL300, AGX_CS_GENERATION_HAL300);
+      AGX_CS_GENERATION_HAL300, AGX_CS_GENERATION_HAL300,
+      AGX_CS_GENERATION_HAL300);
    return (unsigned)chip < AGX_CHIP_UNKNOWN
              ? (enum agx_command_stream_generation)table[chip]
              : AGX_CS_GENERATION_UNKNOWN;
@@ -423,7 +426,8 @@ agx_chip_descriptor_generation(enum agx_chip chip)
       AGX_DESCRIPTOR_GENERATION_9, AGX_DESCRIPTOR_GENERATION_9,
       AGX_DESCRIPTOR_GENERATION_9, AGX_DESCRIPTOR_GENERATION_9,
       AGX_DESCRIPTOR_GENERATION_10, AGX_DESCRIPTOR_GENERATION_10,
-      AGX_DESCRIPTOR_GENERATION_10, AGX_DESCRIPTOR_GENERATION_10);
+      AGX_DESCRIPTOR_GENERATION_10, AGX_DESCRIPTOR_GENERATION_10,
+      AGX_DESCRIPTOR_GENERATION_10);
    return (unsigned)chip < AGX_CHIP_UNKNOWN
              ? (enum agx_descriptor_generation)table[chip]
              : AGX_DESCRIPTOR_GENERATION_UNKNOWN;
@@ -442,7 +446,8 @@ agx_chip_sampler_generation(enum agx_chip chip)
       AGX_SAMPLER_GENERATION_GEN4_HAL200, AGX_SAMPLER_GENERATION_GEN4_HAL200,
       AGX_SAMPLER_GENERATION_GEN4_HAL200, AGX_SAMPLER_GENERATION_GEN4_HAL200,
       AGX_SAMPLER_GENERATION_GEN5, AGX_SAMPLER_GENERATION_GEN5,
-      AGX_SAMPLER_GENERATION_GEN5, AGX_SAMPLER_GENERATION_GEN5);
+      AGX_SAMPLER_GENERATION_GEN5, AGX_SAMPLER_GENERATION_GEN5,
+      AGX_SAMPLER_GENERATION_GEN5);
    return (unsigned)chip < AGX_CHIP_UNKNOWN
              ? (enum agx_sampler_generation)table[chip]
              : AGX_SAMPLER_GENERATION_UNKNOWN;
@@ -532,7 +537,7 @@ static inline bool
 agx_chip_g17_m5(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C || chip == AGX_CHIP_G17D;
 }
 
 /* Whether consecutive application dispatches of one CDM stream may omit the
@@ -546,6 +551,21 @@ static inline bool
 agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 {
    return agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Whether the part's compute barriers need memory scope even where no memory
+ * is reached through a second GPU address: every launch's ordering record has
+ * it (0x6000017c), and every dependency the driver flushes for takes the
+ * memory-scoped strong flush (hk_cdm_alias_scope()). On the M5 Ultra (G17D,
+ * J775D) under the per-resource rule (host_alias.dynamic, hk_CreateDevice()),
+ * 6 cases of a 117-case compute CTS subset, 2059 to 2160 of 8520 ycbcr cases (a
+ * different set from run to run) and 270 of 5310 host_image_copy cases failed,
+ * and llama.cpp's output was wrong. With memory scope on every barrier all of
+ * them pass. Why the M5 Ultra needs it is not established. */
+static inline bool
+agx_chip_m5_barriers_memory_scoped(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17D;
 }
 
 /* Number of helper-table slots in the USC code-container lead block.  G15
@@ -735,9 +755,9 @@ bool agx_params_driver_supported(
 bool agx_params_g18g_bringup_supported(
    const struct drm_asahi_params_global *params);
 
-/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S) and M5 Max (T6050, G17C)
- * kernel contracts the driver admits. This is not a declaration of a complete
- * or conformant device path. */
+/* Exact M5 (T8142, G17G), M5 Pro (T6050, G17S), M5 Max (T6050, G17C) and M5
+ * Ultra (T6050, G17D) kernel contracts the driver admits. This is not a
+ * declaration of a complete or conformant device path. */
 bool agx_params_m5_supported(
    const struct drm_asahi_params_global *params);
 

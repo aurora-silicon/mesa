@@ -88,6 +88,7 @@ agx_chip_from_params(const struct drm_asahi_params_global *params)
       case 'G': return AGX_CHIP_G17G;
       case 'S': return AGX_CHIP_G17S;
       case 'C': return AGX_CHIP_G17C;
+      case 'D': return AGX_CHIP_G17D;
       default: return AGX_CHIP_UNKNOWN;
       }
    case 18:
@@ -126,6 +127,7 @@ agx_chip_isa(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
    case AGX_CHIP_G18G:
       return AGX_ISA_AGX3;
 
@@ -171,6 +173,7 @@ agx_chip_isa_encoding(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_ISA_ENCODING_AGX3C;
 
    /* The agx3d encoding table, shared with G18M and G19P. */
@@ -210,6 +213,7 @@ agx_chip_command_stream_generation_reference(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_CS_GENERATION_HAL300;
 
    /* The record format, not the kernel HAL: the J873 native captures decode
@@ -252,6 +256,7 @@ agx_chip_descriptor_generation_reference(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_DESCRIPTOR_GENERATION_10;
 
    /* The J873 colour render's PBE descriptor (ffe40a02 00007f80 00005800
@@ -292,6 +297,7 @@ agx_chip_sampler_generation_reference(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_SAMPLER_GENERATION_GEN5;
 
    /* The J873 texture-sample render's sampler (Metal's default descriptor
@@ -348,6 +354,7 @@ agx_chip_submission_model(enum agx_chip chip)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return AGX_SUBMISSION_MODEL_SKSM;
 
    /* On macOS 26A428 the G18G GPU has only SKSM channels, for 3D, TA
@@ -574,12 +581,19 @@ agx_chip_exact_product_name(enum agx_chip chip)
 bool
 agx_params_m5_supported(const struct drm_asahi_params_global *params)
 {
-   if (!params || params->num_dies != 1 ||
-       params->usc_generation != AGX_ISA_AGX3 ||
+   if (!params || params->usc_generation != AGX_ISA_AGX3 ||
        params->gpu_hal_generation != DRM_ASAHI_GPU_HAL_300)
       return false;
 
    const enum agx_chip chip = agx_chip_from_params(params);
+   /* T6050 M5 Ultra (J775D): G17D, two dies, eight clusters. */
+   if (chip == AGX_CHIP_G17D)
+      return params->chip_id == 0x6050 && params->num_dies == 2 &&
+             params->num_clusters_total == 8;
+
+   if (params->num_dies != 1)
+      return false;
+
    return (chip == AGX_CHIP_G17G && params->chip_id == 0x8142 &&
            params->num_clusters_total == 1) ||
           /* T6050 M5 Pro (J714s/J716s): G17S, one die, two clusters. */
@@ -662,6 +676,7 @@ agx_chip_name(enum agx_chip chip)
    case AGX_CHIP_G17G: return "G17G";
    case AGX_CHIP_G17S: return "G17S";
    case AGX_CHIP_G17C: return "G17C";
+   case AGX_CHIP_G17D: return "G17D";
    case AGX_CHIP_G18G: return "G18G";
    case AGX_CHIP_UNKNOWN:
    default: return "unknown";

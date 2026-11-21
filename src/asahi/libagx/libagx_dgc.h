@@ -633,6 +633,7 @@ agx_vdm_draw_size(enum agx_chip chip, struct agx_draw draw)
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
       return 0;
    default:
       break;
@@ -678,6 +679,7 @@ agx_vdm_barrier(GLOBAL uint32_t *out, enum agx_chip chip,
    case AGX_CHIP_G17G:
    case AGX_CHIP_G17S:
    case AGX_CHIP_G17C:
+   case AGX_CHIP_G17D:
    case AGX_CHIP_G18G:
       /* With the USC cache invalidate where the kernel admits it
        * (agx_vdm_barrier_core.h). */

@@ -13,6 +13,7 @@
 #include "asahi/layout/layout.h"
 #include "asahi/genxml/agx3_cmdstream.h"
 #include "asahi/lib/agx_g17p_compression.h"
+#include "asahi/lib/agx_drm_names.h"
 #include "asahi/lib/agx_zls_pixels.h"
 #include "asahi/lib/decode.h"
 #include "drm-uapi/asahi_drm.h"
@@ -3088,6 +3089,17 @@ agx_screen_create(int fd, struct renderonly *ro,
 
    /* Try to open an AGX device */
    if (!agx_open_device(agx_screen, &agx_screen->dev)) {
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
+   /* GL on the M5 Ultra runs through zink over Borealis; this driver's M5
+    * paths have not run there. Refuse the GPUs agx_drm_names.h lists, so
+    * zink is the only GL path. */
+   if (agx_gallium_refuses_gpu(NULL, agx_chip_name(agx_screen->dev.chip))) {
+      fprintf(stderr, "Apple %s: GL runs through zink\n",
+              agx_chip_name(agx_screen->dev.chip));
+      agx_close_device(&agx_screen->dev);
       ralloc_free(agx_screen);
       return NULL;
    }
