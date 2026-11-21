@@ -1109,6 +1109,23 @@ hk_supported_shader_stages(const struct vk_features *features)
    return stages;
 }
 
+/* G18G queues report no timestamp support (timestampValidBits 0) unless
+ * HK_G18G_TIMESTAMPS=1. Each vkCmdResetQueryPool is a compute dispatch, and
+ * on G18G a compute -> render dependency costs 5-9 ms per frame in the
+ * kernel's submission path (an upload alone 0.7 ms, a clear alone 1.2 ms,
+ * both in one command buffer 5-9 ms). libplacebo resets its timer pool every
+ * frame, so mpv --vo=gpu-next --gpu-api=vulkan dropped 60-97 of the 450
+ * frames of a 15 s 30 fps 640x360 clip; without timers it dropped none.
+ * Timestamps after a clear-only render pass are also refused by the G18
+ * kernel ("render admission rejected MultisampleControl(0)"), so they are
+ * not qualified. */
+static bool
+hk_queue_timestamps(const struct agx_device *dev)
+{
+   return dev->chip != AGX_CHIP_G18G ||
+          debug_get_bool_option("HK_G18G_TIMESTAMPS", false);
+}
+
 static void
 hk_get_device_properties(const struct agx_device *dev,
                          const struct hk_instance *instance,
@@ -1391,7 +1408,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .sampledImageStencilSampleCounts = sample_counts,
       .storageImageSampleCounts = storage_sample_counts,
       .maxSampleMaskWords = 1,
-      .timestampComputeAndGraphics = true,
+      .timestampComputeAndGraphics = hk_queue_timestamps(dev),
       /* FIXME: Is timestamp period actually 1? */
       .timestampPeriod = 1.0f,
       .maxClipDistances = 8,
@@ -2624,7 +2641,8 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
       {
          p->queueFamilyProperties.queueFlags = queue_family->queue_flags;
          p->queueFamilyProperties.queueCount = queue_family->queue_count;
-         p->queueFamilyProperties.timestampValidBits = 64;
+         p->queueFamilyProperties.timestampValidBits =
+            hk_queue_timestamps(&pdev->dev) ? 64 : 0;
          p->queueFamilyProperties.minImageTransferGranularity =
             (VkExtent3D){1, 1, 1};
 
