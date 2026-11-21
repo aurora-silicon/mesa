@@ -594,6 +594,44 @@ agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
 }
 
 /*
+ * Whether the texture unit bounds an integer texel fetch to the Vulkan view
+ * and returns the robustImageAccess2 value (zero, alpha one for a missing
+ * channel) for an out-of-range coordinate, layer, LOD or sample, given
+ * operands that fit the 16-bit hardware fields. Shaders then only saturate
+ * wider operands before they are narrowed (AGX_NIR_TEXTURE_HW_TXF_BOUNDS)
+ * instead of predicating every fetch on the descriptor's size.
+ *
+ * What is established, and by what: on G17C (J716c), 52,256 robustness and
+ * texelFetch CTS cases plus a 33-case out-of-range probe (LOD and sample
+ * 65536/-65536, layer 65536, negative and large x/y/z, restricted
+ * subresource views, null descriptors, float and integer missing alpha).
+ *
+ * Unverified elsewhere:
+ *   - G17G and G17S share the Gen10 descriptor layout with G17C, which shows
+ *     the descriptor is compatible, not how their texture unit treats an
+ *     out-of-view fetch. G17G has one measurement (be91d344340): a 2D-array
+ *     texel fetch past the view's last layer returns zero, and layer 65536
+ *     wraps to layer 0. Spatial bounds, LOD and sample bounds and missing
+ *     alpha are not measured on either. Rows: an M5 (G17G), an M5 Pro
+ *     (G17S).
+ *   - G18G uses the Gen10 layout too, but its texture lowering
+ *     (agx_nir_lower_texture_for_generation) always applies the software
+ *     predicate and its behaviour is not measured, so it stays off so that
+ *     no caller can skip the predicate there.
+ *   - Gen9 parts (G15, G16, G17P) keep the software bounds: native 2D
+ *     accesses outside the view alias other texels of the image on G17P
+ *     (agx_chip_explicit_robust_image_bounds and the G17P lowering).
+ *
+ * A passing row of the same CTS groups and probe on a generation is what
+ * adds it here.
+ */
+static inline bool
+agx_chip_hw_texel_fetch_bounds(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17C;
+}
+
+/*
  * Whether the Apple9 imageblock applies: up to 128 bytes a sample in a full
  * 32 KiB (32768-byte) tile. Apple's Metal feature set tables give G15 (M3)
  * and G17P (A18 Pro) the same Apple9 limits.
