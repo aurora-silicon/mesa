@@ -1231,7 +1231,8 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    if (cs->type == HK_CS_CDM) {
       const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      if (agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P &&
+      if (((agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P) ||
+           agx_chip_g17_m5(dev->dev.chip)) &&
           (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)) {
          /* The logical compute queue already orders these GPU commands by
           * their mandatory kick parents. Adding the timestamp's same-CDM
