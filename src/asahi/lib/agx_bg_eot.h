@@ -26,6 +26,8 @@ struct agx_precompiled_shader {
    struct agx_precompiled_kernel_info info;
 };
 
+struct agx_bg_eot_ioto_cache;
+
 struct agx_bg_eot_cache {
    struct agx_device *dev;
    struct agx_pool pool;
@@ -33,6 +35,9 @@ struct agx_bg_eot_cache {
 
    /* Map from agx_bg_eot_key to agx_bg_eot_shader */
    struct hash_table *ht;
+
+   /* Device-level BG/EOT Ioto program + argument cache (G17P). */
+   struct agx_bg_eot_ioto_cache *ioto_cache;
 
    struct agx_precompiled_shader *precomp[LIBAGX_NUM_PROGRAMS];
 };

@@ -7,6 +7,7 @@
 #include <assert.h>
 #include "agx_abi.h"
 #include "agx_bg_eot.h"
+#include "asahi/lib/agx_bg_eot_ioto.h"
 #include "agx_bo.h"
 #include "agx_compile.h"
 #include "agx_compiler.h"
@@ -398,16 +399,61 @@ is_attachment_stored(const VkRenderingAttachmentInfo *att)
 /* LDSHDR's fetch span saturates from 321 bytes of text on, so a longer
  * program, such as a multi-target mixed-format reload, loads exactly like the
  * main fragment shaders of any size. */
-static bool
-hk_g17p_bg_eot_shader_supported(const struct agx_bg_eot_shader *shader)
+static uint64_t
+hk_bg_eot_cmd_upload(void *ctx, const void *data, uint32_t size,
+                     uint32_t alignment, struct agx_bo **out_bo)
 {
-   return shader && shader->bo && shader->bo->va && shader->ptr != 0 &&
-          shader->info.binary_size > 0 &&
-          shader->info.main_offset < shader->info.binary_size &&
-          shader->info.main_size <=
-             shader->info.binary_size - shader->info.main_offset &&
-          !shader->info.has_preamble && shader->info.rodata.size_16 == 0 &&
-          shader->info.nr_gprs > 0;
+   struct hk_cmd_buffer *cmd = ctx;
+   if (out_bo)
+      *out_bo = NULL;
+   return hk_pool_upload(cmd, data, size, alignment);
+}
+
+static bool
+hk_bg_eot_cmd_reserve(void *ctx, size_t capacity, const char *label,
+                      struct agx_bg_eot_ioto_reservation *out)
+{
+   struct hk_cmd_buffer *cmd = ctx;
+   struct hk_ioto_reservation r;
+   if (!hk_cmd_reserve_ioto_program(cmd, capacity, label, &r))
+      return false;
+   *out = (struct agx_bg_eot_ioto_reservation){
+      .map = r.map,
+      .va = r.va,
+      .bo = NULL,
+   };
+   return true;
+}
+
+static uint64_t
+hk_bg_eot_cmd_publish(void *ctx, const struct agx_bg_eot_ioto_reservation *r,
+                      size_t length)
+{
+   struct hk_cmd_buffer *cmd = ctx;
+   const struct hk_ioto_reservation hr = {.map = r->map, .va = r->va};
+   return hk_cmd_publish_ioto_program(cmd, &hr, length);
+}
+
+static inline struct agx_bg_eot_ioto_sink
+hk_bg_eot_cmd_sink(struct hk_cmd_buffer *cmd)
+{
+   return (struct agx_bg_eot_ioto_sink){
+      .ctx = cmd,
+      .upload = hk_bg_eot_cmd_upload,
+      .reserve = hk_bg_eot_cmd_reserve,
+      .publish = hk_bg_eot_cmd_publish,
+   };
+}
+
+static inline struct hk_bg_eot
+hk_bg_eot_from_ioto_result(const struct agx_bg_eot_ioto_result *res)
+{
+   return (struct hk_bg_eot){
+      .usc = res->program_va,
+      .primary_storage_B = res->primary_storage_B,
+      .staging_storage_B = res->staging_storage_B,
+      .rsrc_spec = res->rsrc_spec,
+   };
 }
 
 /* Build the BG or EOT program of an AGX_G17P_MRT_MIXED layout. Only the
@@ -421,45 +467,6 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
                            const VkRenderingInfo *info, bool store)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct agx_bg_eot_key key = *framebuffer_key;
-   memset(key.tib.logical_format, 0, sizeof(key.tib.logical_format));
-   memset(key.tib.spilled, 0, sizeof(key.tib.spilled));
-   memset(key.tib._offset_B, 0, sizeof(key.tib._offset_B));
-   memset(key.op, 0, sizeof(key.op));
-   key.mixed_mrt = true;
-   /* Multisample targets are stored unresolved: a multi-target pass
-    * resolves afterwards, from the multisample images. */
-   key.multisample_store = store && key.tib.nr_samples > 1;
-
-   const VkRenderingAttachmentInfo *atts[HK_MAX_RTS];
-   struct hk_image_view *views[HK_MAX_RTS];
-   static const enum agx_bg_eot_op order[] = {AGX_BG_LOAD, AGX_BG_CLEAR,
-                                              AGX_EOT_STORE};
-   unsigned count = 0, reloads = 0;
-   for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
-      for (unsigned rt = 0; rt < HK_MAX_RTS; ++rt) {
-         if (framebuffer_key->op[rt] != order[i])
-            continue;
-
-         struct hk_image_view *view = cmd->state.gfx.render.color_att[rt].iview;
-         if (count == ARRAY_SIZE(views) || rt >= info->colorAttachmentCount ||
-             !view ||
-             view->vk.image->samples != MAX2(key.tib.nr_samples, 1) ||
-             info->pColorAttachments[rt].imageView == VK_NULL_HANDLE) {
-            vk_command_buffer_set_error(&cmd->vk,
-                                        VK_ERROR_FORMAT_NOT_SUPPORTED);
-            return (struct hk_bg_eot){0};
-         }
-
-         key.tib.logical_format[count] = framebuffer_key->tib.logical_format[rt];
-         key.tib._offset_B[count] = framebuffer_key->tib._offset_B[rt];
-         key.op[count] = order[i];
-         atts[count] = &info->pColorAttachments[rt];
-         views[count++] = view;
-         reloads += order[i] == AGX_BG_LOAD;
-      }
-   }
-
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
    if (hk_pbe_descriptor_size(descriptor_generation) !=
@@ -471,428 +478,93 @@ hk_build_g17p_mixed_bg_eot(struct hk_cmd_buffer *cmd,
       return (struct hk_bg_eot){0};
    }
 
-   const bool clears = !store && count > reloads;
-   if (clears)
-      key.reserved_preamble = 4 + 8 * count;
+   struct agx_bg_eot_key key = *framebuffer_key;
+   memset(key.tib.logical_format, 0, sizeof(key.tib.logical_format));
+   memset(key.tib.spilled, 0, sizeof(key.tib.spilled));
+   memset(key.tib._offset_B, 0, sizeof(key.tib._offset_B));
+   memset(key.op, 0, sizeof(key.op));
+   key.mixed_mrt = true;
+   /* Multisample targets are stored unresolved: a multi-target pass
+    * resolves afterwards, from the multisample images. */
+   key.multisample_store = store && key.tib.nr_samples > 1;
 
-   struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&dev->bg_eot, &key);
-   if (!hk_g17p_bg_eot_shader_supported(shader) ||
-       (!store && (shader->info.push_count != key.reserved_preamble ||
-                   shader->info.uses_txf != (reloads > 0)))) {
-      mesa_loge("G17P %s shader declined: supported=%u push=%u want=%u "
-                "uses_txf=%u want=%u count=%u reloads=%u samples=%u "
-                "layered=%u sample_size=%uB",
-                store ? "EOT" : "background",
-                hk_g17p_bg_eot_shader_supported(shader),
-                shader ? shader->info.push_count : 0,
-                key.reserved_preamble,
-                shader ? shader->info.uses_txf : 0, reloads > 0, count,
-                reloads, key.tib.nr_samples, key.tib.layered,
-                key.tib.sample_size_B);
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return (struct hk_bg_eot){0};
-   }
+   static const enum agx_bg_eot_op order[] = {AGX_BG_LOAD, AGX_BG_CLEAR,
+                                              AGX_EOT_STORE};
+   uint8_t pbe_descs[HK_MAX_RTS][AGX_BG_EOT_DESC_SIZE] = {0};
+   uint8_t tex_descs[HK_MAX_RTS][AGX_BG_EOT_DESC_SIZE] = {0};
+   uint32_t clear_values[HK_MAX_RTS][4] = {0};
+   unsigned count = 0, reloads = 0, clears = 0;
 
-   const enum agx3_g17p_rt0_bg_op bg_op =
-      count == 0         ? AGX3_G17P_RT0_BG_NONE
-      : reloads == count ? AGX3_G17P_RT0_BG_RELOAD
-      : reloads          ? AGX3_G17P_RT0_BG_CLEAR_RELOAD
-                         : AGX3_G17P_RT0_BG_CLEAR;
-   const size_t program_capacity =
-      count == 0  ? AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE
-      : store     ? (count > 4 ? AGX_IOTO_G17P_OCTA_EOT_PROGRAM_MAX_SIZE
-                               : AGX_IOTO_G17P_QUAD_EOT_PROGRAM_MAX_SIZE)
-      : count > 4 ? AGX_IOTO_G17P_OCTA_BACKGROUND_PROGRAM_MAX_SIZE
-      : bg_op == AGX3_G17P_RT0_BG_CLEAR_RELOAD
-         ? AGX_IOTO_G17P_CLEAR_RELOAD_PROGRAM_MAX_SIZE
-         : AGX_IOTO_G17P_RT0_RELOAD_PROGRAM_MAX_SIZE;
-   struct hk_ioto_reservation reservation;
-   if (!hk_cmd_reserve_ioto_program(cmd, program_capacity,
-                                    "G17P mixed MRT Ioto program",
-                                    &reservation))
-      return (struct hk_bg_eot){0};
+   static_assert(sizeof(struct hk_native_pbe_descriptor) == AGX_BG_EOT_DESC_SIZE,
+                 "native PBE table stride");
+   static_assert(
+      sizeof(struct hk_native_texture_descriptor) == AGX_BG_EOT_DESC_SIZE,
+      "native texture table stride");
+   static_assert(sizeof(VkClearColorValue) == 16, "fixed ABI");
 
-   const struct agx_ioto_g17p_imageblock imageblock = {
-      .sample_size_B = key.tib.sample_size_B,
-      .nr_samples = key.tib.nr_samples,
-      .tile_size_px = key.tib.tile_size,
-   };
-   const uint8_t *program_bytes;
-   size_t program_length;
-   uint64_t resource_spec;
-   struct hk_agx3_g17p_graphics_program empty_program;
-   struct agx3_g17p_rt0_eot_program eot_program;
-   struct agx3_g17p_rt0_bg_program bg_program;
-   if (count == 0) {
-      const struct hk_agx3_g17p_graphics_program_desc desc = {
-         .program_va = reservation.va,
-         .shader_va = shader->ptr + shader->info.main_offset,
-         .shader_binary_size = shader->info.binary_size,
-         .scratch_size = shader->info.scratch_size,
-         .nr_gprs = shader->info.nr_gprs,
-         .compiler_d_valid = shader->info.agx3_staging_known,
-         .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-         .fragment = true,
-         .imageblock = imageblock,
-      };
-      if (!hk_agx3_g17p_basic_graphics_program_generate(
-             dev->dev.chip, &desc, &empty_program) ||
-          !agx3_g17p_rt0_bg_resource_spec(dev->dev.chip, bg_op,
-                                          &resource_spec)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
-      }
-      program_bytes = empty_program.bytes;
-      program_length = empty_program.length;
-   } else if (store) {
-      static_assert(sizeof(struct hk_native_pbe_descriptor) ==
-                       AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE,
-                    "native PBE table stride");
-      /* A layered pass stores through the 2D-ARRAY block image store, so its
-       * targets need the array-shaped PBE descriptor. The plain BG/EOT
-       * descriptor is deliberately flattened to one layer -- pack_pbe() forces
-       * layers = 1 for HK_DESC_USAGE_BG_EOT -- and handing it to an array
-       * store writes the wrong surface. This mirrors the single-target path.
-       */
-      struct hk_native_pbe_descriptor pbe_arguments[HK_MAX_RTS] = {0};
-      for (unsigned rt = 0; rt < count; ++rt) {
-         if (!(key.tib.layered ? views[rt]->planes[0].layered_eot_pbe_valid
-                               : views[rt]->planes[0].eot_pbe_valid)) {
+   for (unsigned i = 0; i < ARRAY_SIZE(order); ++i) {
+      for (unsigned rt = 0; rt < HK_MAX_RTS; ++rt) {
+         if (framebuffer_key->op[rt] != order[i])
+            continue;
+
+         struct hk_image_view *view = cmd->state.gfx.render.color_att[rt].iview;
+         if (count == HK_MAX_RTS || rt >= info->colorAttachmentCount ||
+             !view ||
+             view->vk.image->samples != MAX2(key.tib.nr_samples, 1) ||
+             info->pColorAttachments[rt].imageView == VK_NULL_HANDLE) {
             vk_command_buffer_set_error(&cmd->vk,
                                         VK_ERROR_FORMAT_NOT_SUPPORTED);
             return (struct hk_bg_eot){0};
          }
-         pbe_arguments[rt] = key.tib.layered ? views[rt]->planes[0].layered_eot
-                                             : views[rt]->planes[0].eot;
-      }
 
-      const uint64_t pbe_argument_va = hk_pool_upload(
-         cmd, pbe_arguments, count * AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE, 32);
-      if (!pbe_argument_va)
-         return (struct hk_bg_eot){0};
+         if (store) {
+            if (!(key.tib.layered ? view->planes[0].layered_eot_pbe_valid
+                                  : view->planes[0].eot_pbe_valid)) {
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FORMAT_NOT_SUPPORTED);
+               return (struct hk_bg_eot){0};
+            }
+            const struct hk_native_pbe_descriptor *pbe =
+               key.tib.layered ? &view->planes[0].layered_eot
+                               : &view->planes[0].eot;
+            memcpy(pbe_descs[count], pbe, AGX_BG_EOT_DESC_SIZE);
+         } else if (order[i] == AGX_BG_LOAD) {
+            const struct hk_native_texture_descriptor *tex =
+               key.tib.layered ? &view->planes[0].layered_background
+                               : &view->planes[0].background;
+            memcpy(tex_descs[reloads++], tex, AGX_BG_EOT_DESC_SIZE);
+         } else if (order[i] == AGX_BG_CLEAR) {
+            memcpy(clear_values[clears++],
+                   &info->pColorAttachments[rt].clearValue.color, 16);
+         }
 
-      const struct agx3_g17p_rt0_eot_program_desc desc = {
-         .program_va = reservation.va,
-         .shader_va = shader->ptr + shader->info.main_offset,
-         .pbe_argument_va = pbe_argument_va,
-         .imageblock_offset_B = key.tib._offset_B[0],
-         .attachment_count = count,
-         .imageblock_offset1_B = key.tib._offset_B[1],
-         .imageblock_offset2_B = key.tib._offset_B[2],
-         .imageblock_offset3_B = key.tib._offset_B[3],
-         .imageblock_offset4_B = key.tib._offset_B[4],
-         .imageblock_offset5_B = key.tib._offset_B[5],
-         .imageblock_offset6_B = key.tib._offset_B[6],
-         .imageblock_offset7_B = key.tib._offset_B[7],
-         .mixed_mrt = count > 1,
-         .shader_binary_size = shader->info.binary_size,
-         .scratch_size = shader->info.scratch_size,
-         .nr_gprs = shader->info.nr_gprs,
-         .staging_halfs = shader->info.agx3_staging_known
-                             ? shader->info.agx3_staging_halfs
-                             : 0,
-         .imageblock = imageblock,
-      };
-      if (!agx3_g17p_rt0_eot_program_generate(dev->dev.chip, &desc,
-                                               &eot_program)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
+         key.tib.logical_format[count] = framebuffer_key->tib.logical_format[rt];
+         key.tib._offset_B[count] = framebuffer_key->tib._offset_B[rt];
+         key.op[count] = order[i];
+         count++;
       }
-      program_bytes = eot_program.bytes;
-      program_length = eot_program.length;
-      resource_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC;
-   } else {
-      struct agx3_g17p_rt0_bg_program_desc desc = {
-         .program_va = reservation.va,
-         .shader_va = shader->ptr + shader->info.main_offset,
-         .shader_binary_size = shader->info.binary_size,
-         .scratch_size = shader->info.scratch_size,
-         .nr_gprs = shader->info.nr_gprs,
-         .staging_halfs = shader->info.agx3_staging_halfs,
-         .clear_push_halfs = shader->info.push_count,
-         .clear_start_halfs = 4 + 8 * reloads,
-         .staging_known = shader->info.agx3_staging_known,
-         .op = bg_op,
-         .imageblock = imageblock,
-      };
-
-      if (clears) {
-         static_assert(sizeof(atts[0]->clearValue.color) == 16, "fixed ABI");
-         VkClearColorValue clear_values[HK_MAX_RTS];
-         for (unsigned rt = reloads; rt < count; ++rt)
-            clear_values[rt - reloads] = atts[rt]->clearValue.color;
-         desc.clear_value_va = hk_pool_upload(
-            cmd, clear_values, 16 * (count - reloads), 16);
-         if (!desc.clear_value_va)
-            return (struct hk_bg_eot){0};
-      }
-
-      if (reloads) {
-         /* Target n reads native texture index 2n; the odd entries between
-          * them stay zero. */
-         static_assert(sizeof(struct hk_native_texture_descriptor) ==
-                          AGX_TEXTURE_GEN9_LENGTH,
-                       "native texture table stride");
-         struct hk_native_texture_descriptor textures[2 * HK_MAX_RTS - 1] = {0};
-         for (unsigned rt = 0; rt < reloads; ++rt)
-            textures[2 * rt] = key.tib.layered
-                                  ? views[rt]->planes[0].layered_background
-                                  : views[rt]->planes[0].background;
-         const uint64_t texture_va = hk_pool_upload(
-            cmd, textures, (2 * reloads - 1) * AGX_TEXTURE_GEN9_LENGTH,
-            AGX_TEXTURE_GEN9_LENGTH);
-         const uint64_t sampler_va =
-            dev->rodata.bo && dev->rodata.bo->va ? dev->rodata.bo->va->addr : 0;
-         if (!texture_va || !sampler_va)
-            return (struct hk_bg_eot){0};
-         const uint64_t pointers[2] = {texture_va, sampler_va};
-         const uint64_t table =
-            hk_pool_upload(cmd, pointers, sizeof(pointers), 8);
-         if (!table)
-            return (struct hk_bg_eot){0};
-         desc.texture_pointer_va = table;
-         desc.sampler_pointer_va = table + sizeof(uint64_t);
-      }
-
-      if (!agx3_g17p_rt0_bg_program_generate(dev->dev.chip, &desc,
-                                             &bg_program) ||
-          !agx3_g17p_rt0_bg_resource_spec(dev->dev.chip, bg_op,
-                                          &resource_spec)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
-      }
-      program_bytes = bg_program.bytes;
-      program_length = bg_program.length;
    }
 
-   memcpy(reservation.map, program_bytes, program_length);
-   const uint64_t published =
-      hk_cmd_publish_ioto_program(cmd, &reservation, program_length);
-   if (!published)
-      return (struct hk_bg_eot){0};
-
-   return (struct hk_bg_eot){
-      .usc = published,
-      .rsrc_spec = resource_spec,
+   const struct agx_bg_eot_g17p_mixed_desc desc = {
+      .key = key,
+      .store = store,
+      .count = count,
+      .reloads = reloads,
+      .pbe_descs = pbe_descs,
+      .tex_descs = tex_descs,
+      .sampler_va = dev->rodata.bo && dev->rodata.bo->va
+                       ? dev->rodata.bo->va->addr
+                       : 0,
+      .clear_values = clear_values,
    };
-}
-
-/* The native dual- and multi-target background and EOT programs carry one op
- * for every target: agx3_g17p_rt0_bg_program_generate() selects a single
- * RELOAD/CLEAR/CLEAR_RELOAD program, and the EOT builtin stores every target
- * it names. A layout whose live targets do not share one op -- an attachment
- * that is not stored beside one that is, or a clear beside a reload -- cannot
- * be expressed that way, which is what the multi/dual guards below refuse.
- *
- * The mixed builder can express it: it groups targets into LOAD, then CLEAR,
- * then STORE, drops the untouched ones, and carries each target's own tile
- * offset and PBE descriptor. Route there rather than refusing. */
-static bool
-hk_g17p_bg_eot_ops_uniform(const struct agx_bg_eot_key *key)
-{
-   bool seen = false;
-   enum agx_bg_eot_op first = AGX_BG_EOT_NONE;
-
-   for (unsigned rt = 0; rt < ARRAY_SIZE(key->tib.logical_format); ++rt) {
-      if (key->tib.logical_format[rt] == PIPE_FORMAT_NONE)
-         continue;
-      if (!seen) {
-         first = key->op[rt];
-         seen = true;
-      } else if (key->op[rt] != first) {
-         return false;
-      }
+   const struct agx_bg_eot_ioto_sink sink = hk_bg_eot_cmd_sink(cmd);
+   struct agx_bg_eot_ioto_result res = {0};
+   if (!agx_bg_eot_build_g17p_mixed(&dev->bg_eot, &desc, &sink, &res)) {
+      if (!vk_command_buffer_has_error(&cmd->vk))
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return (struct hk_bg_eot){0};
    }
-   return true;
-}
-
-/* Packed clear: a single-sample R8G8B8A8_UNORM RT0 clear is packed on the
- * CPU and the background program stores the word directly (COPY + LSTCOL
- * instead of two FLTNORMs + LSTCOL per pixel). Apple's background clear
- * converts per pixel (fltnorm, fltnorm, lstcol); this is one instruction per
- * pixel cheaper. */
-
-/* The Vulkan float-to-UNORM conversion (round to nearest even, clamp, NaN to
- * zero) of one clear component. */
-static uint32_t
-hk_g17p_unorm8(float x)
-{
-   return x == x ? (uint32_t)_mesa_float_to_unorm(x, 8) : 0;
-}
-
-/* frg-codegen v4 BG/EOT device cache.
- *
- * The per-recording cache above dies with every vkResetCommandBuffer, so an
- * application that re-records each frame (the depth-2 benchmark, most games)
- * regenerates and republishes its background and end-of-tile launch programs
- * for every pass: about a third of the host-side recording cost of a light
- * pass (frg-codegen/v4/hostpath profile). For the single-attachment,
- * unspilled, non-resolving layouts the RT0 builder handles, the programs
- * depend only on the BG/EOT key, the attachment's clear value and ops, and the
- * descriptors of its image view -- all value-compared below -- plus
- * device-lifetime state (the precompiled BG/EOT shaders, rodata). Build those
- * programs and their argument blocks once into device-lifetime memory and
- * reuse them from any command buffer. Entries are immutable and never freed
- * before the device; the cache stops growing at a fixed bound. */
-#define HK_G17P_BG_EOT_DEV_ENTRIES       256
-#define HK_G17P_BG_EOT_DEV_CHUNK         (64 * 1024)
-#define HK_G17P_BG_EOT_DEV_MAX_CHUNKS    8
-#define HK_G17P_BG_EOT_DEV_PROGRAM_MAX   256
-#define HK_G17P_BG_EOT_DEV_DATA_MAX      512
-
-struct hk_g17p_bg_eot_dev_key {
-   struct agx_tilebuffer_layout tib;
-   uint32_t layers;
-   uint32_t color_attachment_count;
-   uint32_t incomplete_render_area;
-   uint32_t view;
-   uint32_t samples;
-   uint32_t format;
-   uint32_t load_op;
-   uint32_t store_op;
-   VkClearColorValue clear;
-   struct hk_native_pbe_descriptor eot, layered_eot;
-   struct hk_native_texture_descriptor background, layered_background;
-   uint32_t pbe_valid;
-};
-
-struct hk_g17p_bg_eot_dev_entry {
-   struct hk_g17p_bg_eot_dev_key key;
-   uint64_t hash;
-   struct hk_bg_eot program[4];
-   uint8_t valid_variants;
-};
-
-struct hk_g17p_bg_eot_arena {
-   struct agx_bo *bo;
-   uint8_t *map;
-   uint64_t base;
-   uint32_t cursor, capacity;
-};
-
-struct hk_g17p_bg_eot_dev_cache {
-   simple_mtx_t lock;
-   struct hk_g17p_bg_eot_arena program, data;
-   struct agx_bo *bos[2 * HK_G17P_BG_EOT_DEV_MAX_CHUNKS];
-   unsigned bo_count, count;
-   bool full;
-   /* Open-addressed index: entry number + 1, or 0 when free. */
-   uint16_t index[2 * HK_G17P_BG_EOT_DEV_ENTRIES];
-   struct hk_g17p_bg_eot_dev_entry entries[HK_G17P_BG_EOT_DEV_ENTRIES];
-};
-
-void
-hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev)
-{
-   dev->g17p_bg_eot_dev_cache = NULL;
-   if (!agx_chip_native_agx3(dev->dev.chip))
-      return;
-   struct hk_g17p_bg_eot_dev_cache *dc = calloc(1, sizeof(*dc));
-   if (!dc)
-      return;
-   simple_mtx_init(&dc->lock, mtx_plain);
-   dev->g17p_bg_eot_dev_cache = dc;
-}
-
-void
-hk_g17p_bg_eot_dev_cache_finish(struct hk_device *dev)
-{
-   struct hk_g17p_bg_eot_dev_cache *dc = dev->g17p_bg_eot_dev_cache;
-   if (!dc)
-      return;
-   for (unsigned i = 0; i < dc->bo_count; ++i)
-      agx_bo_unreference(&dev->dev, dc->bos[i]);
-   simple_mtx_destroy(&dc->lock);
-   free(dc);
-   dev->g17p_bg_eot_dev_cache = NULL;
-}
-
-/* Make room for `need` bytes at `align` in an arena, opening a new chunk if
- * required. Programs live in the USC window exactly like the per-recording
- * Ioto arena; argument blocks in ordinary memory like hk_pool_upload(). */
-static bool
-hk_g17p_bg_eot_arena_room(struct hk_device *dev,
-                          struct hk_g17p_bg_eot_dev_cache *dc,
-                          struct hk_g17p_bg_eot_arena *a, bool exec,
-                          uint32_t need, uint32_t align)
-{
-   if (a->map && align_uintptr(a->cursor, align) + need <= a->capacity)
-      return true;
-   if (dc->bo_count >= ARRAY_SIZE(dc->bos))
-      return false;
-   struct agx_bo *bo = agx_bo_create(
-      &dev->dev, HK_G17P_BG_EOT_DEV_CHUNK,
-      exec ? AGX_IOTO_PROGRAM_ALIGNMENT : 0,
-      exec ? (AGX_BO_EXEC | AGX_BO_LOW_VA) : 0,
-      exec ? "G17P BG/EOT device programs" : "G17P BG/EOT device arguments");
-   if (!bo)
-      return false;
-   void *map = agx_bo_map(bo);
-   if (!map || !bo->va) {
-      agx_bo_unreference(&dev->dev, bo);
-      return false;
-   }
-   dc->bos[dc->bo_count++] = bo;
-   a->bo = bo;
-   a->map = map;
-   a->base = bo->va->addr;
-   a->cursor = 0;
-   a->capacity = bo->size > UINT32_MAX ? UINT32_MAX : (uint32_t)bo->size;
-   return align_uintptr(0, align) + need <= a->capacity;
-}
-
-static struct agx_ptr
-hk_g17p_bg_eot_arena_take(struct hk_g17p_bg_eot_arena *a, uint32_t size,
-                          uint32_t align)
-{
-   const uint32_t offset = (uint32_t)align_uintptr(a->cursor, align);
-   assert(a->map && offset + size <= a->capacity);
-   a->cursor = offset + size;
-   return (struct agx_ptr){.cpu = a->map + offset, .gpu = a->base + offset};
-}
-
-/* Allocation sites of the RT0 builder: the per-recording pool, or the
- * device cache when one is being filled (its room was reserved up front). */
-static uint64_t
-hk_g17p_bg_eot_upload(struct hk_cmd_buffer *cmd,
-                      struct hk_g17p_bg_eot_dev_cache *dc, const void *data,
-                      uint32_t size, uint32_t alignment)
-{
-   if (!dc)
-      return hk_pool_upload(cmd, data, size, alignment);
-   struct agx_ptr T = hk_g17p_bg_eot_arena_take(&dc->data, size, alignment);
-   memcpy(T.cpu, data, size);
-   return T.gpu;
-}
-
-static bool
-hk_g17p_bg_eot_reserve(struct hk_cmd_buffer *cmd,
-                       struct hk_g17p_bg_eot_dev_cache *dc, size_t capacity,
-                       const char *label, struct hk_ioto_reservation *r)
-{
-   if (!dc)
-      return hk_cmd_reserve_ioto_program(cmd, capacity, label, r);
-   assert(capacity <= HK_G17P_BG_EOT_DEV_PROGRAM_MAX);
-   struct agx_ptr T = hk_g17p_bg_eot_arena_take(
-      &dc->program, (uint32_t)capacity, AGX_IOTO_PROGRAM_ALIGNMENT);
-   *r = (struct hk_ioto_reservation){.map = T.cpu, .va = T.gpu};
-   return true;
-}
-
-static uint64_t
-hk_g17p_bg_eot_publish(struct hk_cmd_buffer *cmd,
-                       struct hk_g17p_bg_eot_dev_cache *dc,
-                       const struct hk_ioto_reservation *r, size_t length)
-{
-   if (!dc)
-      return hk_cmd_publish_ioto_program(cmd, r, length);
-   struct hk_g17p_bg_eot_arena *a = &dc->program;
-   assert(r->va >= a->base && length > 0);
-   const uint64_t offset = r->va - a->base;
-   /* Give back the over-reservation, as hk_cmd_publish_ioto_program does. */
-   a->cursor = (uint32_t)(offset + length);
-   agx_bo_assert_range(a->bo, offset, length);
-   return r->va;
+   return hk_bg_eot_from_ioto_result(&res);
 }
 
 /* Fill the value key of a render pass whose BG/EOT programs the RT0 builder
@@ -903,11 +575,11 @@ static bool
 hk_g17p_bg_eot_dev_key_init(struct hk_cmd_buffer *cmd,
                             const VkRenderingInfo *info,
                             bool incomplete_render_area,
-                            struct hk_g17p_bg_eot_dev_key *dk)
+                            struct agx_bg_eot_ioto_cache_key *dk)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_rendering_state *render = &cmd->state.gfx.render;
-   if (!dev->g17p_bg_eot_dev_cache || info->colorAttachmentCount > 1 ||
+   if (!dev->bg_eot.ioto_cache || info->colorAttachmentCount > 1 ||
        agx_tilebuffer_spills(&render->tilebuffer) ||
        agx_g17p_classify_mrt(&render->tilebuffer) == AGX_G17P_MRT_MIXED)
       return false;
@@ -916,7 +588,7 @@ hk_g17p_bg_eot_dev_key_init(struct hk_cmd_buffer *cmd,
    memcpy(&dk->tib, &render->tilebuffer, sizeof(dk->tib));
    dk->layers = render->cr.layers;
    dk->color_attachment_count = info->colorAttachmentCount;
-   dk->incomplete_render_area = incomplete_render_area;
+   dk->flags = incomplete_render_area ? 1u : 0u;
    if (info->colorAttachmentCount == 1 &&
        info->pColorAttachments[0].imageView != VK_NULL_HANDLE) {
       const VkRenderingAttachmentInfo *att = &info->pColorAttachments[0];
@@ -930,95 +602,47 @@ hk_g17p_bg_eot_dev_key_init(struct hk_cmd_buffer *cmd,
       dk->load_op = att->loadOp;
       dk->store_op = att->storeOp;
       if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
-         dk->clear = att->clearValue.color;
-      dk->eot = iview->planes[0].eot;
-      dk->layered_eot = iview->planes[0].layered_eot;
-      dk->background = iview->planes[0].background;
-      dk->layered_background = iview->planes[0].layered_background;
+         memcpy(dk->clear, &att->clearValue.color, sizeof(dk->clear));
+      memcpy(dk->eot, &iview->planes[0].eot, sizeof(dk->eot));
+      memcpy(dk->layered_eot, &iview->planes[0].layered_eot,
+             sizeof(dk->layered_eot));
+      memcpy(dk->background, &iview->planes[0].background,
+             sizeof(dk->background));
+      memcpy(dk->layered_background, &iview->planes[0].layered_background,
+             sizeof(dk->layered_background));
       dk->pbe_valid = (iview->planes[0].eot_pbe_valid ? 1 : 0) |
                       (iview->planes[0].layered_eot_pbe_valid ? 2 : 0);
    }
    return true;
 }
 
-static uint64_t
-hk_g17p_bg_eot_dev_hash(const struct hk_g17p_bg_eot_dev_key *dk)
-{
-   static_assert(sizeof(*dk) % sizeof(uint64_t) == 0,
-                 "word-addressable BG/EOT device key");
-   const uint8_t *bytes = (const uint8_t *)dk;
-   uint64_t hash = UINT64_C(0x9e3779b97f4a7c15);
-   for (unsigned i = 0; i < sizeof(*dk) / sizeof(uint64_t); ++i) {
-      uint64_t word;
-      memcpy(&word, bytes + i * sizeof(word), sizeof(word));
-      hash ^= word + UINT64_C(0x9e3779b97f4a7c15) + (hash << 6) +
-              (hash >> 2);
-   }
-   return hash;
-}
-
-static struct hk_g17p_bg_eot_dev_entry *
-hk_g17p_bg_eot_dev_find(struct hk_g17p_bg_eot_dev_cache *dc,
-                        const struct hk_g17p_bg_eot_dev_key *dk,
-                        uint64_t hash)
-{
-   const unsigned mask = ARRAY_SIZE(dc->index) - 1;
-   static_assert((ARRAY_SIZE(((struct hk_g17p_bg_eot_dev_cache *)0)->index) &
-                  (ARRAY_SIZE(((struct hk_g17p_bg_eot_dev_cache *)0)->index) -
-                   1)) == 0,
-                 "power-of-two index");
-   for (unsigned i = hash & mask;; i = (i + 1) & mask) {
-      if (!dc->index[i])
-         return NULL;
-      struct hk_g17p_bg_eot_dev_entry *e = &dc->entries[dc->index[i] - 1];
-      if (e->hash == hash && !memcmp(&e->key, dk, sizeof(*dk)))
-         return e;
-   }
-}
-
-/* The index is twice the entry bound, so a free slot always exists. */
-static struct hk_g17p_bg_eot_dev_entry *
-hk_g17p_bg_eot_dev_insert(struct hk_g17p_bg_eot_dev_cache *dc,
-                          const struct hk_g17p_bg_eot_dev_key *dk,
-                          uint64_t hash)
-{
-   if (dc->count >= HK_G17P_BG_EOT_DEV_ENTRIES)
-      return NULL;
-   const unsigned mask = ARRAY_SIZE(dc->index) - 1;
-   unsigned i = hash & mask;
-   while (dc->index[i])
-      i = (i + 1) & mask;
-   struct hk_g17p_bg_eot_dev_entry *e = &dc->entries[dc->count];
-   memcpy(&e->key, dk, sizeof(*dk));
-   e->hash = hash;
-   e->valid_variants = 0;
-   memset(e->program, 0, sizeof(e->program));
-   dc->index[i] = (uint16_t)(++dc->count);
-   return e;
-}
-
-static struct hk_bg_eot
-hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
-                     struct agx_bg_eot_key *key,
-                     const VkRenderingInfo *info, bool store,
-                     bool partial_render,
-                     struct hk_g17p_bg_eot_dev_cache *dc, bool *in_device)
+static bool
+hk_build_g17p_bg_eot_with_sink(struct hk_cmd_buffer *cmd,
+                               struct agx_bg_eot_key *key,
+                               const VkRenderingInfo *info, bool store,
+                               bool partial_render, bool for_device_cache,
+                               const struct agx_bg_eot_ioto_sink *sink,
+                               struct agx_bg_eot_ioto_result *out)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (in_device)
-      *in_device = false;
+   *out = (struct agx_bg_eot_ioto_result){0};
+
    /* Classification compacts holes internally, so it is invariant under the
-    * explicit key/view compaction below. Keep the result for all subsequent
-    * BG/EOT routing instead of rescanning the eight targets twice. */
+    * explicit key/view compaction below. */
    const enum agx_g17p_mrt_layout mrt = agx_g17p_classify_mrt(&key->tib);
    if (agx_tilebuffer_spills(&key->tib) ||
        mrt == AGX_G17P_MRT_MIXED ||
-       !hk_g17p_bg_eot_ops_uniform(key)) {
+       !agx_g17p_bg_eot_ops_uniform(key)) {
       /* hk_g17p_bg_eot_dev_key_init() admits none of these layouts. */
-      assert(!dc);
-      if (dc)
-         return (struct hk_bg_eot){0};
-      return hk_build_g17p_mixed_bg_eot(cmd, key, info, store);
+      assert(!for_device_cache);
+      if (for_device_cache)
+         return false;
+      struct hk_bg_eot mixed = hk_build_g17p_mixed_bg_eot(cmd, key, info, store);
+      if (!mixed.usc)
+         return false;
+      out->program_va = mixed.usc;
+      out->rsrc_spec = mixed.rsrc_spec;
+      return true;
    }
 
    /* Vulkan keeps unused colour attachments as holes in the logical array.
@@ -1045,14 +669,13 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
    compact_info.pColorAttachments = attachments;
    key = &compact_key;
    info = &compact_info;
+
    if (!store && !partial_render && active_count == 1) {
       const VkRenderingAttachmentInfo *att = &attachments[0];
       const struct hk_rendering_state *render = &cmd->state.gfx.render;
       const bool partial_area = render->area.offset.x || render->area.offset.y ||
          render->area.extent.width < render->cr.width ||
          render->area.extent.height < render->cr.height;
-      /* The EOT resolve writes full tiles. Merge the destination outside the
-       * API rectangle before that store, retaining native MSAA resolution. */
       key->preserve_resolve_outside = partial_area &&
          hk_agx3_g17p_direct_color_resolve_supported(
             &key->tib, active_count,
@@ -1062,22 +685,11 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
    }
    if (!hk_agx3_g17p_rt0_tile_layout_supported(&key->tib)) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return (struct hk_bg_eot){0};
+      return false;
    }
-
-   /* As in the generic BG/EOT path, compile an empty attachmentless program
-    * as 1x. This is only the local shader key: the render state's sample count
-    * remains deferred until a draw supplies it.
-    */
    if (!key->tib.nr_samples)
       key->tib.nr_samples = 1;
 
-   /* Decide from the compacted attachment and its matching view. Vulkan may
-    * leave holes before the sole live color attachment; selecting from
-    * logical slot0 and colorAttachmentCount before compaction loses its
-    * STORE requirement and selects a single-sample EOT for an MS surface.
-    * Keep samples for partial renders, explicit STORE, and resolves that
-    * execute after the pass. Final direct resolves remain single-sampled. */
    if (store && active_count == 1) {
       const VkRenderingAttachmentInfo *att = &attachments[0];
       const struct hk_image_view *iview = color_att[0].iview;
@@ -1123,10 +735,6 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
          (store ? op == AGX_EOT_STORE : (op == AGX_BG_CLEAR || op == AGX_BG_LOAD));
       if ((rt == 0 && !rt0_supported) ||
           (rt != 0 && op != AGX_BG_EOT_NONE && !dual_mrt_rt1 && !multi_mrt_rt)) {
-         /* The refusal is about WHICH target carries WHICH operation in a
-          * layout the G17P background/EOT programs cannot express, and the
-          * deferred VK_ERROR_FEATURE_NOT_PRESENT surfaces much later at
-          * vkEndCommandBuffer with none of that visible. Name it. */
          mesa_loge("G17P %s program declined: rt%u op=%u, ops=%u%u%u%u%u%u%u%u "
                    "mrt=%u dual=%u multi=%u/%u samples=%u layered=%u "
                    "sample_size=%uB",
@@ -1138,7 +746,7 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
                    dual_mrt, multi_mrt, multi_count, key->tib.nr_samples,
                    key->tib.layered, key->tib.sample_size_B);
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
+         return false;
       }
    }
 
@@ -1153,9 +761,6 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
       for (unsigned rt = 0; rt < attachment_count; ++rt) {
          if (info->colorAttachmentCount < attachment_count ||
              key->op[rt] != op || op == AGX_BG_EOT_NONE) {
-            /* DIAGNOSTIC: name the refusal the way the rt0 guard above does.
-             * These two guards refuse silently, which is why this bucket had
-             * no driver-side evidence at all. */
             mesa_loge("G17P %s multi-MRT guard declined: rt%u op=%u op0=%u "
                       "ops=%u%u%u%u%u%u%u%u count=%u attachments=%u mrt=%u "
                       "samples=%u sample_size=%uB",
@@ -1168,7 +773,7 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
                       (unsigned)mrt, key->tib.nr_samples,
                       key->tib.sample_size_B);
             vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-            return (struct hk_bg_eot){0};
+            return false;
          }
       }
    }
@@ -1180,113 +785,39 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
                 (unsigned)key->op[1], info->colorAttachmentCount,
                 (unsigned)mrt, key->tib.nr_samples, key->tib.sample_size_B);
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return (struct hk_bg_eot){0};
+      return false;
    }
+
    key->g17p_packed_clear =
       !store && op == AGX_BG_CLEAR && !dual_mrt_active && !multi_mrt_active &&
       agx_g17p_packed_clear_ok(&key->tib);
-   if (!store && op == AGX_BG_CLEAR)
-      key->reserved_preamble =
-         multi_mrt_active ? 4 + 8 * attachment_count
-         : rgba8_mrt && dual_mrt_active
-            ? AGX3_G17P_RGBA8_MRT_CLEAR_PUSH_HALFS
-         : r11g11b10_mrt && dual_mrt_active
-            ? AGX3_G17P_R11G11B10_MRT_CLEAR_PUSH_HALFS
-         : wboit_mrt && dual_mrt_active
-            ? AGX3_G17P_WBOIT_MRT_CLEAR_PUSH_HALFS
-            : AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
 
-   struct agx_bg_eot_shader *shader =
-      agx_get_bg_eot_shader(&dev->bg_eot, key);
-   const bool shader_resources_match =
-      shader &&
-      (store || (op == AGX_BG_EOT_NONE
-                    ? shader->info.push_count == 0 && !shader->info.uses_txf
-                 : agx3_g17p_rt0_bg_shader_resources_match(
-                      op == AGX_BG_CLEAR ? AGX3_G17P_RT0_BG_CLEAR
-                                         : AGX3_G17P_RT0_BG_RELOAD,
-                      shader->info.push_count, shader->info.uses_txf)));
-   if (!hk_g17p_bg_eot_shader_supported(shader) || !shader_resources_match) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return (struct hk_bg_eot){0};
-   }
+   uint8_t pbe_descs[4][AGX_BG_EOT_DESC_SIZE] = {0};
+   uint8_t tex_descs[7][AGX_BG_EOT_DESC_SIZE] = {0};
+   uint32_t clear_values[4][4] = {0};
+   unsigned tex_desc_count = 0;
+   uint32_t resolve_bounds[4] = {0};
+   bool direct_resolve = false;
 
-   size_t program_capacity;
-   const char *program_label;
-   if (op == AGX_BG_EOT_NONE) {
-      program_capacity = AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE;
-      program_label = "G17P empty tile Ioto program";
-   } else if (store) {
-      program_capacity = multi_mrt_active ? AGX_IOTO_G17P_QUAD_EOT_PROGRAM_MAX_SIZE
-                                        : AGX_IOTO_G17P_RT0_EOT_PROGRAM_SIZE;
-      program_label = "G17P RT0 EOT Ioto program";
-   } else if (op == AGX_BG_CLEAR) {
-      program_capacity =
-         multi_mrt_active ? AGX_IOTO_G17P_QUAD_CLEAR_PROGRAM_MAX_SIZE
-         : rgba8_mrt && dual_mrt_active
-            ? AGX_IOTO_G17P_RGBA8_MRT_CLEAR_PROGRAM_SIZE
-         : r11g11b10_mrt && dual_mrt_active
-            ? AGX_IOTO_G17P_RGBA8_MRT_CLEAR_PROGRAM_SIZE
-         : wboit_mrt && dual_mrt_active
-            ? AGX_IOTO_G17P_WBOIT_MRT_CLEAR_PROGRAM_SIZE
-            : AGX_IOTO_G17P_RT0_CLEAR_PROGRAM_SIZE;
-      program_label = "G17P RT0 clear Ioto program";
-   } else {
-      program_capacity = AGX_IOTO_G17P_RT0_RELOAD_PROGRAM_MAX_SIZE;
-      program_label = "G17P RT0 reload Ioto program";
-   }
-
-   struct hk_ioto_reservation program_reservation;
-   if (!hk_g17p_bg_eot_reserve(cmd, dc, program_capacity, program_label,
-                               &program_reservation))
-      return (struct hk_bg_eot){0};
-
-   void *program_map = program_reservation.map;
-   const uint64_t program_va = program_reservation.va;
-
-   size_t program_length;
-   uint64_t resource_spec;
    if (store && op == AGX_EOT_STORE) {
       struct hk_image_view *iview = color_att[0].iview;
       const VkRenderingAttachmentInfo *att = &info->pColorAttachments[0];
-      /* A direct resolve is the pass's output, so only the pass's final
-       * end-of-tile program may perform one. A partial render is a mid-frame
-       * flush whose tile is reloaded by the draws that follow it, and a
-       * resolve is not reloadable: it averages the samples away. The
-       * mid-frame store therefore writes the multisample surface unresolved,
-       * which is what key->multisample_store selects below.
-       */
-      const bool direct_resolve =
+      direct_resolve =
          !partial_render &&
          hk_agx3_g17p_direct_color_resolve_supported(
             &key->tib, info->colorAttachmentCount,
             att->resolveImageView != VK_NULL_HANDLE,
             att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT,
             att->storeOp == VK_ATTACHMENT_STORE_OP_STORE);
-      struct hk_image_view *target = direct_resolve
-         ? color_att[0].resolve_iview : iview;
-      struct hk_image_view *iview1 = dual_mrt_active
-         ? color_att[1].iview : NULL;
+      struct hk_image_view *target =
+         direct_resolve ? color_att[0].resolve_iview : iview;
+      struct hk_image_view *iview1 = dual_mrt_active ? color_att[1].iview : NULL;
       const bool target_pbe_valid =
-         target && (key->tib.layered
-                       ? target->planes[0].layered_eot_pbe_valid
-                       : target->planes[0].eot_pbe_valid);
+         target && (key->tib.layered ? target->planes[0].layered_eot_pbe_valid
+                                     : target->planes[0].eot_pbe_valid);
       const bool target1_pbe_valid =
-         iview1 && (key->tib.layered
-                       ? iview1->planes[0].layered_eot_pbe_valid
-                       : iview1->planes[0].eot_pbe_valid);
-      /* A G17P end-of-tile program writes either an ordinary single-sample
-       * PBE target -- resolving the tile on the way out -- or, when the key
-       * asked for it, the unresolved multisample surface through the separate
-       * multisample IMGWBLK builtin. Those are different programs, so the
-       * target's sample count has to agree with the one the key selected.
-       *
-       * Without this, storeOp = STORE on a multisample attachment picks
-       * target = iview (direct resolve requires storeOp != STORE), skips the
-       * samples != 1 check below because that is guarded by direct_resolve,
-       * and writes single-sample data into a multisample surface with no
-       * diagnostic. Refuse that combination instead of storing wrong pixels.
-       */
+         iview1 && (key->tib.layered ? iview1->planes[0].layered_eot_pbe_valid
+                                     : iview1->planes[0].eot_pbe_valid);
       const bool multisample_store =
          agx_chip_native_agx3(dev->dev.chip) && key->multisample_store;
       if (!iview || !target ||
@@ -1304,127 +835,44 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
            (!iview1 || !target1_pbe_valid ||
             info->pColorAttachments[1].imageView == VK_NULL_HANDLE))) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
-         return (struct hk_bg_eot){0};
+         return false;
       }
 
       const unsigned descriptor_generation =
          agx_chip_descriptor_generation(dev->dev.chip);
-      if (hk_pbe_descriptor_size(descriptor_generation) !=
-          AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE) {
+      if (hk_pbe_descriptor_size(descriptor_generation) != AGX_BG_EOT_DESC_SIZE) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
+         return false;
       }
-      static_assert(sizeof(struct hk_native_pbe_descriptor) ==
-                       AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE,
-                    "native PBE table stride");
 
-      const struct hk_native_pbe_descriptor target_pbe =
-         key->tib.layered ? target->planes[0].layered_eot
-                          : target->planes[0].eot;
-      struct hk_native_pbe_descriptor target1_pbe = {0};
-      if (dual_mrt_active) {
-         target1_pbe = key->tib.layered ? iview1->planes[0].layered_eot
-                                        : iview1->planes[0].eot;
-      }
-      struct hk_native_pbe_descriptor pbe_arguments[4] = {target_pbe};
-      /* The native resolve averages in linear space when its PBE requests
-       * the sRGB transfer. Ordinary stores already have encoded tile bytes
-       * and retain the unmodified end-of-tile descriptor. */
+      memcpy(pbe_descs[0],
+             key->tib.layered ? &target->planes[0].layered_eot
+                              : &target->planes[0].eot,
+             AGX_BG_EOT_DESC_SIZE);
       if (direct_resolve && util_format_is_srgb(key->tib.logical_format[0]) &&
           !(color_att[0].flags &
             VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR))
-         ((uint8_t *)&pbe_arguments[0])[15] |= 0x20;
-
-      if (dual_mrt_active)
-         pbe_arguments[1] = target1_pbe;
+         pbe_descs[0][15] |= 0x20;
+      if (dual_mrt_active) {
+         memcpy(pbe_descs[1],
+                key->tib.layered ? &iview1->planes[0].layered_eot
+                                 : &iview1->planes[0].eot,
+                AGX_BG_EOT_DESC_SIZE);
+      }
       if (multi_mrt_active) {
          for (unsigned rt = 1; rt < attachment_count; ++rt) {
             struct hk_image_view *view = color_att[rt].iview;
             if (!view || !view->planes[0].eot_pbe_valid ||
                 view->vk.image->samples != 1 ||
                 info->pColorAttachments[rt].imageView == VK_NULL_HANDLE) {
-               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
-               return (struct hk_bg_eot){0};
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FORMAT_NOT_SUPPORTED);
+               return false;
             }
-            pbe_arguments[rt] = view->planes[0].eot;
+            memcpy(pbe_descs[rt], &view->planes[0].eot, AGX_BG_EOT_DESC_SIZE);
          }
       }
-      const size_t pbe_argument_size =
-         multi_mrt_active ? attachment_count * AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE
-         : dual_mrt_active ? AGX_IOTO_G17P_RGBA8_MRT_PBE_ARGUMENT_SIZE
-                         : AGX_IOTO_G17P_RT0_PBE_ARGUMENT_SIZE;
-      const uint64_t pbe_argument_va =
-         hk_g17p_bg_eot_upload(cmd, dc, pbe_arguments, pbe_argument_size, 32);
-      if (!pbe_argument_va)
-         return (struct hk_bg_eot){0};
-
-      const struct agx3_g17p_rt0_eot_program_desc desc = {
-         .program_va = program_va,
-         .shader_va = shader->ptr + shader->info.main_offset,
-         .pbe_argument_va = pbe_argument_va,
-         .imageblock_offset_B = agx_tilebuffer_offset_B(&key->tib, 0),
-         .attachment_count = attachment_count,
-         /* Layered MRT uses the shared array builtin, like Gallium. */
-         .mixed_mrt = attachment_count >= 2,
-         .imageblock_offset1_B =
-            attachment_count > 1 ? agx_tilebuffer_offset_B(&key->tib, 1) : 0,
-         .imageblock_offset2_B = attachment_count > 2 ? agx_tilebuffer_offset_B(&key->tib, 2) : 0,
-         .imageblock_offset3_B = attachment_count > 3 ? agx_tilebuffer_offset_B(&key->tib, 3) : 0,
-         .shader_binary_size = shader->info.binary_size,
-         .scratch_size = shader->info.scratch_size,
-         .nr_gprs = shader->info.nr_gprs,
-         .staging_halfs = shader->info.agx3_staging_known
-                            ? shader->info.agx3_staging_halfs : 0,
-         .imageblock = {
-            .sample_size_B = key->tib.sample_size_B,
-            .nr_samples = key->tib.nr_samples,
-            .tile_size_px = key->tib.tile_size,
-         },
-      };
-      struct agx3_g17p_rt0_eot_program program;
-      if (!agx3_g17p_rt0_eot_program_generate(dev->dev.chip, &desc,
-                                               &program)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
-      }
-
-      memcpy(program_map, program.bytes, program.length);
-      program_length = program.length;
-      resource_spec = AGX_IOTO_G17P_EOT_RESOURCE_SPEC;
-
-      if (direct_resolve)
-         cmd->state.gfx.render.g17p_direct_color_resolve = true;
-   } else if (op == AGX_BG_EOT_NONE) {
-      const struct hk_agx3_g17p_graphics_program_desc desc = {
-         .program_va = program_va,
-         .shader_va = shader->ptr + shader->info.main_offset,
-         .shader_binary_size = shader->info.binary_size,
-         .scratch_size = shader->info.scratch_size,
-         .nr_gprs = shader->info.nr_gprs,
-         .compiler_d_valid = shader->info.agx3_staging_known,
-         .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-         .fragment = true,
-         .imageblock = {
-            .sample_size_B = key->tib.sample_size_B,
-            .nr_samples = key->tib.nr_samples,
-            .tile_size_px = key->tib.tile_size,
-         },
-      };
-      struct hk_agx3_g17p_graphics_program program;
-      if (!hk_agx3_g17p_basic_graphics_program_generate(dev->dev.chip, &desc,
-                                                        &program)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
-      }
-
-      memcpy(program_map, program.bytes, program.length);
-      program_length = program.length;
-      if (!agx3_g17p_rt0_bg_resource_spec(
-             dev->dev.chip, AGX3_G17P_RT0_BG_NONE, &resource_spec)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
-      }
-   } else {
+   } else if (op != AGX_BG_EOT_NONE) {
       const VkRenderingAttachmentInfo *att_info = &info->pColorAttachments[0];
       struct hk_image_view *iview = color_att[0].iview;
       const VkRenderingAttachmentInfo *att_info1 =
@@ -1435,156 +883,121 @@ hk_build_g17p_bg_eot(struct hk_cmd_buffer *cmd,
           (dual_mrt_active &&
            (!iview1 || att_info1->imageView == VK_NULL_HANDLE))) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
-         return (struct hk_bg_eot){0};
+         return false;
       }
       if (multi_mrt_active) {
          for (unsigned rt = 1; rt < attachment_count; ++rt) {
             struct hk_image_view *view = color_att[rt].iview;
             if (!view || view->vk.image->samples != 1 ||
                 info->pColorAttachments[rt].imageView == VK_NULL_HANDLE) {
-               vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
-               return (struct hk_bg_eot){0};
+               vk_command_buffer_set_error(&cmd->vk,
+                                           VK_ERROR_FORMAT_NOT_SUPPORTED);
+               return false;
             }
          }
       }
-
       const unsigned descriptor_generation =
          agx_chip_descriptor_generation(dev->dev.chip);
-      if (hk_texture_descriptor_size(descriptor_generation) != 32 ||
+      if (hk_texture_descriptor_size(descriptor_generation) !=
+             AGX_BG_EOT_DESC_SIZE ||
           agx_chip_sampler_heap_element_size(dev->dev.chip) != 32) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
+         return false;
       }
-
-      struct agx3_g17p_rt0_bg_program_desc desc = {
-         .program_va = program_va,
-         .shader_va = shader->ptr + shader->info.main_offset,
-         .shader_binary_size = shader->info.binary_size,
-         .scratch_size = shader->info.scratch_size,
-         .nr_gprs = shader->info.nr_gprs,
-         .staging_halfs = shader->info.agx3_staging_halfs,
-         .clear_push_halfs = shader->info.push_count,
-         .staging_known = shader->info.agx3_staging_known,
-         .op = op == AGX_BG_CLEAR ? AGX3_G17P_RT0_BG_CLEAR
-                                  : AGX3_G17P_RT0_BG_RELOAD,
-         .imageblock = {
-            .sample_size_B = key->tib.sample_size_B,
-            .nr_samples = key->tib.nr_samples,
-            .tile_size_px = key->tib.tile_size,
-         },
-      };
 
       if (op == AGX_BG_CLEAR) {
-         static_assert(sizeof(att_info->clearValue.color) == 16, "fixed ABI");
-         VkClearColorValue clear_values[4] = {
-            att_info->clearValue.color,
-         };
+         memcpy(clear_values[0], &att_info->clearValue.color, 16);
          if (dual_mrt_active)
-            clear_values[1] = att_info1->clearValue.color;
+            memcpy(clear_values[1], &att_info1->clearValue.color, 16);
          if (multi_mrt_active) {
             for (unsigned rt = 1; rt < attachment_count; ++rt)
-               clear_values[rt] = info->pColorAttachments[rt].clearValue.color;
+               memcpy(clear_values[rt],
+                      &info->pColorAttachments[rt].clearValue.color, 16);
          }
-         if (key->g17p_packed_clear) {
-            /* The background program reads one packed word at uniform 4. */
-            const float *c = att_info->clearValue.color.float32;
-            const uint32_t packed = hk_g17p_unorm8(c[0]) |
-                                    (hk_g17p_unorm8(c[1]) << 8) |
-                                    (hk_g17p_unorm8(c[2]) << 16) |
-                                    (hk_g17p_unorm8(c[3]) << 24);
-            memset(&clear_values[0], 0, sizeof(clear_values[0]));
-            clear_values[0].uint32[0] = packed;
-         }
-         const size_t clear_size =
-            multi_mrt_active ? 16 * attachment_count
-            : rgba8_mrt && dual_mrt_active ? 32
-            : r11g11b10_mrt && dual_mrt_active ? 28
-            : wboit_mrt && dual_mrt_active ? 20 : 16;
-         desc.clear_value_va =
-            hk_g17p_bg_eot_upload(cmd, dc, clear_values, clear_size, 16);
-         if (!desc.clear_value_va)
-            return (struct hk_bg_eot){0};
       } else {
-         /* Native texture-table entries occupy aligned 32-byte slots. RT1 is
-          * native texture index2, so the exact MRT table retains index1 as a
-          * zero gap. */
-         static_assert(sizeof(struct hk_native_texture_descriptor) ==
-                          AGX_TEXTURE_GEN9_LENGTH,
-                       "native texture table stride");
-         struct hk_native_texture_descriptor textures[7] = {
-            key->tib.layered ? iview->planes[0].layered_background
-                             : iview->planes[0].background,
-         };
+         memcpy(tex_descs[0],
+                key->tib.layered ? &iview->planes[0].layered_background
+                                 : &iview->planes[0].background,
+                AGX_BG_EOT_DESC_SIZE);
          if (key->preserve_resolve_outside) {
             const struct hk_image_view *resolve = color_att[0].resolve_iview;
-            textures[2] = key->tib.layered ? resolve->planes[0].layered_background
-                                          : resolve->planes[0].background;
+            memcpy(tex_descs[2],
+                   key->tib.layered ? &resolve->planes[0].layered_background
+                                    : &resolve->planes[0].background,
+                   AGX_BG_EOT_DESC_SIZE);
             const VkRect2D area = cmd->state.gfx.render.area;
-            const uint32_t bounds[4] = {
-               area.offset.x, area.offset.y,
-               area.offset.x + area.extent.width,
-               area.offset.y + area.extent.height,
-            };
-            desc.resolve_bounds_va = hk_g17p_bg_eot_upload(
-               cmd, dc, bounds, sizeof(bounds), 16);
-            if (!desc.resolve_bounds_va)
-               return (struct hk_bg_eot){0};
+            resolve_bounds[0] = area.offset.x;
+            resolve_bounds[1] = area.offset.y;
+            resolve_bounds[2] = area.offset.x + area.extent.width;
+            resolve_bounds[3] = area.offset.y + area.extent.height;
          }
-         if (dual_mrt_active)
-            textures[2] = key->tib.layered
-                             ? iview1->planes[0].layered_background
-                             : iview1->planes[0].background;
+         if (dual_mrt_active) {
+            memcpy(tex_descs[2],
+                   key->tib.layered ? &iview1->planes[0].layered_background
+                                    : &iview1->planes[0].background,
+                   AGX_BG_EOT_DESC_SIZE);
+         }
          if (multi_mrt_active) {
             for (unsigned rt = 1; rt < attachment_count; ++rt)
-               textures[2 * rt] = color_att[rt].iview->planes[0].background;
+               memcpy(tex_descs[2 * rt],
+                      &color_att[rt].iview->planes[0].background,
+                      AGX_BG_EOT_DESC_SIZE);
          }
-         const size_t texture_size = key->preserve_resolve_outside
-            ? 3 * AGX_TEXTURE_GEN9_LENGTH : multi_mrt_active
-            ? (2 * attachment_count - 1) * AGX_TEXTURE_GEN9_LENGTH : dual_mrt_active
-            ? 3 * AGX_TEXTURE_GEN9_LENGTH : AGX_TEXTURE_GEN9_LENGTH;
-         const uint64_t texture_va =
-            hk_g17p_bg_eot_upload(cmd, dc, textures, texture_size,
-                           AGX_TEXTURE_GEN9_LENGTH);
-         const uint64_t sampler_va =
-            dev->rodata.bo && dev->rodata.bo->va ? dev->rodata.bo->va->addr : 0;
-         if (!texture_va || !sampler_va)
-            return (struct hk_bg_eot){0};
-         const uint64_t pointers[2] = {texture_va, sampler_va};
-         const uint64_t table = hk_g17p_bg_eot_upload(cmd, dc, pointers, sizeof(pointers), 8);
-         if (!table)
-            return (struct hk_bg_eot){0};
-         desc.texture_pointer_va = table;
-         desc.sampler_pointer_va = table + sizeof(uint64_t);
-      }
-
-      struct agx3_g17p_rt0_bg_program program;
-      if (!agx3_g17p_rt0_bg_program_generate(dev->dev.chip, &desc,
-                                             &program)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
-      }
-
-      memcpy(program_map, program.bytes, program.length);
-      program_length = program.length;
-      if (!agx3_g17p_rt0_bg_resource_spec(dev->dev.chip, desc.op,
-                                          &resource_spec)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return (struct hk_bg_eot){0};
+         tex_desc_count =
+            key->preserve_resolve_outside ? 3
+            : multi_mrt_active            ? (2 * attachment_count - 1)
+            : dual_mrt_active             ? 3
+                                          : 1;
       }
    }
 
-   const uint64_t published =
-      hk_g17p_bg_eot_publish(cmd, dc, &program_reservation,
-                             program_length);
-   if (!published)
-      return (struct hk_bg_eot){0};
-
-   if (in_device)
-      *in_device = dc != NULL;
-   return (struct hk_bg_eot){
-      .usc = published,
-      .rsrc_spec = resource_spec,
+   const struct agx_bg_eot_g17p_uniform_desc udesc = {
+      .key = *key,
+      .store = store,
+      .op = op,
+      .mrt = mrt,
+      .attachment_count = attachment_count,
+      .slot_count = attachment_count,
+      .attachment_mask = BITFIELD_MASK(attachment_count),
+      .first_rt = 0,
+      .dual_mrt_active = dual_mrt_active,
+      .multi_mrt_active = multi_mrt_active,
+      .pbe_descs = pbe_descs,
+      .clear_values = clear_values,
+      .tex_descs = tex_descs,
+      .tex_desc_count = tex_desc_count,
+      .resolve_bounds = {resolve_bounds[0], resolve_bounds[1],
+                         resolve_bounds[2], resolve_bounds[3]},
+      .sampler_va = dev->rodata.bo && dev->rodata.bo->va
+                       ? dev->rodata.bo->va->addr
+                       : 0,
    };
+   if (!agx_bg_eot_build_g17p_uniform(&dev->bg_eot, &udesc, sink, out)) {
+      if (!vk_command_buffer_has_error(&cmd->vk))
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   if (direct_resolve)
+      cmd->state.gfx.render.g17p_direct_color_resolve = true;
+   return !vk_command_buffer_has_error(&cmd->vk);
+}
+
+struct hk_g17p_bg_eot_build_ctx {
+   struct hk_cmd_buffer *cmd;
+   struct agx_bg_eot_key *key;
+   const VkRenderingInfo *info;
+   bool store;
+   bool partial_render;
+};
+
+static bool
+hk_g17p_bg_eot_cache_build_cb(void *ctx,
+                              const struct agx_bg_eot_ioto_sink *sink,
+                              struct agx_bg_eot_ioto_result *out)
+{
+   struct hk_g17p_bg_eot_build_ctx *b = ctx;
+   return hk_build_g17p_bg_eot_with_sink(b->cmd, b->key, b->info, b->store,
+                                         b->partial_render, true, sink, out);
 }
 
 struct hk_g17p_bg_eot_cache_key {
@@ -1689,25 +1102,23 @@ hk_g17p_bg_eot_cache_get(struct hk_cmd_buffer *cmd,
    cached->dev_entry = NULL;
    cached->valid = true;
 
-   /* frg-codegen v4 BG/EOT device cache: one value lookup per new
-    * pass. A hit fills every variant this recording will ask for; a miss
-    * attaches a fresh device entry that hk_build_bg_eot() fills. */
-   struct hk_g17p_bg_eot_dev_cache *dc = dev->g17p_bg_eot_dev_cache;
-   struct hk_g17p_bg_eot_dev_key dkey;
+   /* Device-level BG/EOT Ioto cache: one value lookup per new pass. A hit
+    * fills every variant this recording will ask for; a miss attaches a fresh
+    * device entry that hk_build_bg_eot() fills. */
+   struct agx_bg_eot_ioto_cache *dc = dev->bg_eot.ioto_cache;
+   struct agx_bg_eot_ioto_cache_key dkey;
    if (dc && hk_g17p_bg_eot_dev_key_init(cmd, info, incomplete_render_area,
                                          &dkey)) {
-      const uint64_t dhash = hk_g17p_bg_eot_dev_hash(&dkey);
-      simple_mtx_lock(&dc->lock);
-      struct hk_g17p_bg_eot_dev_entry *de =
-         hk_g17p_bg_eot_dev_find(dc, &dkey, dhash);
-      if (!de && !dc->full)
-         de = hk_g17p_bg_eot_dev_insert(dc, &dkey, dhash);
-      if (de) {
-         memcpy(cached->program, de->program, sizeof(cached->program));
-         cached->valid_variants = de->valid_variants;
+      struct agx_bg_eot_ioto_result progs[AGX_BG_EOT_IOTO_CACHE_VARIANTS];
+      uint8_t valid = 0;
+      cached->dev_entry = agx_bg_eot_ioto_cache_get(dc, &dkey, progs, &valid);
+      if (cached->dev_entry) {
+         for (unsigned v = 0; v < AGX_BG_EOT_IOTO_CACHE_VARIANTS; ++v) {
+            if (valid & BITFIELD_BIT(v))
+               cached->program[v] = hk_bg_eot_from_ioto_result(&progs[v]);
+         }
+         cached->valid_variants = valid;
       }
-      cached->dev_entry = de;
-      simple_mtx_unlock(&dc->lock);
    }
    return cached;
 }
@@ -1956,113 +1367,12 @@ hk_m5_mrt_layout_supported(const struct hk_rendering_state *render)
    return true;
 }
 
-/* A tile shader is device-owned. Cache only its immutable launch bytes;
- * every pass still allocates and publishes its own program and descriptors.
- * Preserve the normal load schedule and fall back for non-fitting addresses. */
-struct hk_m5_tile_template {
-   struct hk_m5_tile_template *next;
-   struct agx3_g17p_graphics_program_desc desc;
-   struct agx3_ioto_uniform_range ranges[HK_G17P_PATCH_MAX_RANGES];
-   struct hk_g17p_patch_plan plan;
-   bool store;
-   uint16_t length;
-   uint8_t bytes[];
-};
-
-static bool
-hk_m5_tile_matches(const struct hk_m5_tile_template *t,
-                   const struct agx3_g17p_graphics_program_desc *d, bool store)
-{
-   const struct agx3_g17p_graphics_program_desc *a = &t->desc;
-   if (t->store != store || a->shader_va != d->shader_va ||
-       a->shader_binary_size != d->shader_binary_size ||
-       a->scratch_size != d->scratch_size || a->nr_gprs != d->nr_gprs ||
-       a->compiler_d_valid != d->compiler_d_valid || a->compiler_d != d->compiler_d ||
-       a->imageblock.sample_size_B != d->imageblock.sample_size_B ||
-       a->imageblock.nr_samples != d->imageblock.nr_samples ||
-       a->imageblock.tile_size_px != d->imageblock.tile_size_px ||
-       a->uniform_range_count != d->uniform_range_count)
-      return false;
-   for (unsigned i = 0; i < d->uniform_range_count; ++i)
-      if (t->ranges[i].start_halfs != d->uniform_ranges[i].start_halfs ||
-          t->ranges[i].size_halfs != d->uniform_ranges[i].size_halfs)
-         return false;
-   return hk_g17p_patch_plan_fits(&t->plan, d->uniform_ranges);
-}
-
-static bool
-hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
-                   const struct agx3_g17p_graphics_program_desc *d, bool store,
-                   struct agx3_g17p_graphics_program *program)
-{
-   if (!d->fragment || d->writes_sample_mask || d->colour_classes ||
-       d->preloaded_root || d->patchable || d->threadgroup_memory_size_B ||
-       d->constant_program.code_size || (d->cprog_inputs && d->cprog_inputs->count) ||
-       d->uniform_range_count > HK_G17P_PATCH_MAX_RANGES)
-      return agx3_g17g_tile_program_generate(dev->dev.chip, d, store, program);
-
-   simple_mtx_lock(&dev->bg_eot.lock);
-   struct hk_m5_tile_template *selected = NULL;
-   unsigned count = 0;
-   for (struct hk_m5_tile_template *t = shader->m5_tile_templates; t; t = t->next) {
-      ++count;
-      if (hk_m5_tile_matches(t, d, store)) {
-         selected = t;
-         break;
-      }
-   }
-   /* Bound memory even for layouts whose addresses change incompatibly. */
-   if (!selected && count < 8) {
-      struct agx3_g17p_graphics_program_template *fresh = calloc(1, sizeof(*fresh));
-      if (fresh && agx3_g17g_tile_program_template_generate(dev->dev.chip, d, store, fresh)) {
-         struct hk_m5_tile_template *t =
-            rzalloc_size(shader, sizeof(*t) + fresh->program.length);
-         if (t && hk_g17p_patch_plan_init(&t->plan, d->uniform_ranges,
-                  d->uniform_range_count, fresh->relocations,
-                  fresh->relocation_count, fresh->program.length, false)) {
-            t->desc = *d;
-            t->desc.uniform_ranges = t->ranges;
-            t->desc.cprog_inputs = NULL;
-            if (d->uniform_range_count)
-               memcpy(t->ranges, d->uniform_ranges,
-                      d->uniform_range_count * sizeof(t->ranges[0]));
-            t->store = store;
-            t->length = fresh->program.length;
-            memcpy(t->bytes, fresh->program.bytes, t->length);
-            t->next = shader->m5_tile_templates;
-            shader->m5_tile_templates = selected = t;
-         } else {
-            ralloc_free(t);
-         }
-      }
-      free(fresh);
-   }
-   simple_mtx_unlock(&dev->bg_eot.lock);
-   if (!selected)
-      return agx3_g17g_tile_program_generate(dev->dev.chip, d, store, program);
-
-   program->length = selected->length;
-   memcpy(program->bytes, selected->bytes, selected->length);
-   hk_g17p_patch_plan_apply(&selected->plan, d->uniform_ranges, program->bytes);
-   if (dev->dev.debug & AGX_DBG_VERIFY) {
-      struct agx3_g17p_graphics_program fresh;
-      if (!agx3_g17g_tile_program_generate(dev->dev.chip, d, store, &fresh) ||
-          fresh.length != program->length ||
-          memcmp(fresh.bytes, program->bytes, program->length)) {
-         mesa_loge("M5 cached tile launch differs from fresh composition");
-         return false;
-      }
-   }
-   return true;
-}
-
 static struct hk_bg_eot
 hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
                      const VkRenderingInfo *info, bool store)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const bool g18 = dev->dev.chip == AGX_CHIP_G18G;
-   const enum agx_chip ioto_chip = g18 ? AGX_CHIP_G17G : dev->dev.chip;
    struct hk_rendering_state *render = &cmd->state.gfx.render;
    /* DONT_CARE allows arbitrary initial tile contents. Reuse the qualified
     * zero-clear program until an empty background program is available.
@@ -2091,8 +1401,7 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
 
    struct agx_bg_eot_shader *shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
-   if (!hk_g17p_bg_eot_shader_supported(shader) ||
-       !shader->info.agx3_staging_known)
+   if (!agx_bg_eot_shader_supported(shader) || !shader->info.agx3_staging_known)
       goto unsupported;
 
    struct agx3_ioto_uniform_range ranges[2];
@@ -2106,8 +1415,6 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
                                           sizeof(view->planes[0].eot), 32);
       if (!pbe)
          return (struct hk_bg_eot){0};
-      /* Native builtin binding0x32 supplies the PBE table address in u0..3;
-       * driver argument5 supplies the zero tile offset in u4..5. */
       const uint64_t arguments[2] = {pbe, 0};
       const uint64_t table = hk_pool_upload(cmd, arguments, sizeof(arguments), 16);
       if (!table)
@@ -2140,66 +1447,19 @@ hk_build_g17g_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       ranges[1] = (struct agx3_ioto_uniform_range){4, 4, table + 8};
       range_count = 2;
    }
-   size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(ioto_chip, ranges, range_count, &capacity))
+
+   const struct agx_bg_eot_ioto_sink sink = hk_bg_eot_cmd_sink(cmd);
+   struct agx_bg_eot_ioto_result res = {0};
+   if (!agx_bg_eot_emit_m5_tile_ioto(&dev->bg_eot, shader, &key->tib, ranges,
+                                     range_count, store, "M5 native tile Ioto",
+                                     &sink, &res, NULL)) {
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return (struct hk_bg_eot){0};
       goto unsupported;
-   if (g18)
-      capacity *= 2;
-   struct hk_ioto_reservation reservation;
-   if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 native tile Ioto",
-                                    &reservation))
-      return (struct hk_bg_eot){0};
-   void *map = reservation.map;
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = reservation.va,
-      .shader_va = shader->ptr + shader->info.main_offset,
-      .shader_binary_size = shader->info.binary_size,
-      .scratch_size = shader->info.scratch_size,
-      .nr_gprs = shader->info.nr_gprs,
-      .compiler_d_valid = shader->info.agx3_staging_known,
-      .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-      .fragment = true,
-      .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
-      .uniform_ranges = ranges,
-      .uniform_range_count = range_count,
-   };
-   struct agx3_g17p_graphics_program program;
-   if (!agx3_g17g_tile_program_generate(ioto_chip, &desc, store, &program))
-      goto unsupported;
-   if (g18) {
-      struct util_dynarray code;
-      util_dynarray_init(&code, NULL);
-      memcpy(util_dynarray_grow_bytes(&code, 1, program.length), program.bytes,
-             program.length);
-      const struct agx3_transcode_ioto ioto = {
-         .api_program = false,
-         .shader_gprs = shader->info.nr_gprs,
-      };
-      const char *why = NULL;
-      unsigned at = 0;
-      const bool ok = agx3_transcode_agx3d_ioto(&code, 0, &ioto, &why, &at) &&
-                      code.size <= capacity && code.size <= sizeof(program.bytes);
-      if (ok) {
-         memcpy(program.bytes, code.data, code.size);
-         program.length = code.size;
-      } else {
-         mesa_loge("hk: G18G tile Ioto not re-encoded: %s at +0x%x",
-                   why ? why : "longer than the reservation", at);
-      }
-      util_dynarray_fini(&code);
-      if (!ok)
-         goto unsupported;
    }
-   if (program.length > capacity)
-      goto unsupported;
-   memcpy(map, program.bytes, program.length);
-   hk_cmd_buffer_retain_bo(cmd, shader->bo);
-   const uint64_t published =
-      hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
-   if (!published)
-      return (struct hk_bg_eot){0};
+   hk_cmd_buffer_retain_bo(cmd, res.shader_bo);
    return (struct hk_bg_eot){
-      .usc = published,
+      .usc = res.program_va,
       .rsrc_spec = store ? 0 : UINT64_C(0xffff800000000040),
    };
 
@@ -2375,38 +1635,22 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          ranges[range_count++] = (struct agx3_ioto_uniform_range){clear_base, 8 * count, table};
       }
    }
-   size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, range_count, &capacity))
+   const struct agx_bg_eot_ioto_sink sink = hk_bg_eot_cmd_sink(cmd);
+   struct agx_bg_eot_ioto_result res = {0};
+   if (!agx_bg_eot_emit_m5_tile_ioto(&dev->bg_eot, shader, &key->tib, ranges,
+                                     range_count, store, "M5 MRT tile program",
+                                     &sink, &res, NULL)) {
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return (struct hk_bg_eot){0};
       goto unsupported;
-   struct hk_ioto_reservation reservation;
-   if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 MRT tile program", &reservation))
-      return (struct hk_bg_eot){0};
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = reservation.va,
-      .shader_va = shader->ptr + shader->info.main_offset,
-      .shader_binary_size = shader->info.binary_size,
-      .scratch_size = shader->info.scratch_size,
-      .nr_gprs = shader->info.nr_gprs,
-      .compiler_d_valid = shader->info.agx3_staging_known,
-      .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-      .fragment = true,
-      .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
-      .uniform_ranges = ranges,
-      .uniform_range_count = range_count,
-   };
-   struct agx3_g17p_graphics_program program;
-   if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
-       program.length > capacity)
-      goto unsupported;
-   memcpy(reservation.map, program.bytes, program.length);
-   hk_cmd_buffer_retain_bo(cmd, shader->bo);
-   uint64_t published = hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
-   if (published && resolving)
+   }
+   hk_cmd_buffer_retain_bo(cmd, res.shader_bo);
+   if (res.program_va && resolving)
       cmd->state.gfx.render.g17p_direct_color_resolve = true;
    return (struct hk_bg_eot){
-      .usc = published,
-      .primary_storage_B = desc.scratch_size,
-      .staging_storage_B = desc.compiler_d,
+      .usc = res.program_va,
+      .primary_storage_B = res.primary_storage_B,
+      .staging_storage_B = res.staging_storage_B,
       .rsrc_spec = store ? 0 : loads && key->tib.nr_samples > 1
          ? UINT64_C(0xffff800000000000) : UINT64_C(0xffff800000000040),
    };
@@ -2452,31 +1696,18 @@ hk_build_m5_empty_bg_eot(struct hk_cmd_buffer *cmd,
        shader->info.uses_txf)
       goto unsupported;
 
-   size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, NULL, 0, &capacity))
+   const struct agx_bg_eot_ioto_sink sink = hk_bg_eot_cmd_sink(cmd);
+   struct agx_bg_eot_ioto_result res = {0};
+   if (!agx_bg_eot_emit_m5_tile_ioto(&dev->bg_eot, shader, &key->tib, NULL, 0,
+                                     store, "M5 empty tile program", &sink,
+                                     &res, NULL)) {
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return (struct hk_bg_eot){0};
       goto unsupported;
-   struct hk_ioto_reservation reservation;
-   if (!hk_cmd_reserve_ioto_program(cmd, capacity,
-                                   "M5 empty tile program", &reservation))
-      return (struct hk_bg_eot){0};
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = reservation.va,
-      .shader_va = shader->ptr,
-      .shader_binary_size = shader->info.binary_size,
-      .nr_gprs = shader->info.nr_gprs,
-      .compiler_d_valid = true,
-      .fragment = true,
-      .imageblock = {key->tib.sample_size_B, MAX2(key->tib.nr_samples, 1),
-                     key->tib.tile_size},
-   };
-   struct agx3_g17p_graphics_program program;
-   if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
-       program.length > capacity)
-      goto unsupported;
-   memcpy(reservation.map, program.bytes, program.length);
-   hk_cmd_buffer_retain_bo(cmd, shader->bo);
+   }
+   hk_cmd_buffer_retain_bo(cmd, res.shader_bo);
    return (struct hk_bg_eot){
-      .usc = hk_cmd_publish_ioto_program(cmd, &reservation, program.length),
+      .usc = res.program_va,
       .rsrc_spec = store ? 0 : UINT64_C(0xffff800000000040),
    };
 
@@ -2637,39 +1868,22 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       ranges[1] = (struct agx3_ioto_uniform_range){4, 4, table + 8};
       range_count = 2;
    }
-   size_t capacity;
-   if (!agx3_g17g_graphics_program_bound(dev->dev.chip, ranges, range_count,
-                                        &capacity))
+   const struct agx_bg_eot_ioto_sink sink = hk_bg_eot_cmd_sink(cmd);
+   struct agx_bg_eot_ioto_result res = {0};
+   if (!agx_bg_eot_emit_m5_tile_ioto(&dev->bg_eot, shader, &key->tib, ranges,
+                                     range_count, store, "M5 tile program",
+                                     &sink, &res, NULL)) {
+      if (vk_command_buffer_has_error(&cmd->vk))
+         return (struct hk_bg_eot){0};
       goto unsupported;
-   struct hk_ioto_reservation reservation;
-   if (!hk_cmd_reserve_ioto_program(cmd, capacity, "M5 tile program", &reservation))
-      return (struct hk_bg_eot){0};
-   const struct agx3_g17p_graphics_program_desc desc = {
-      .program_va = reservation.va,
-      .shader_va = shader->ptr + shader->info.main_offset,
-      .shader_binary_size = shader->info.binary_size,
-      .scratch_size = shader->info.scratch_size,
-      .nr_gprs = shader->info.nr_gprs,
-      .compiler_d_valid = shader->info.agx3_staging_known,
-      .compiler_d = (uint32_t)shader->info.agx3_staging_halfs * 2,
-      .fragment = true,
-      .imageblock = {key->tib.sample_size_B, key->tib.nr_samples, key->tib.tile_size},
-      .uniform_ranges = ranges,
-      .uniform_range_count = range_count,
-   };
-   struct agx3_g17p_graphics_program program;
-   if (!hk_m5_tile_program(dev, shader, &desc, store, &program) ||
-       program.length > capacity)
-      goto unsupported;
-   memcpy(reservation.map, program.bytes, program.length);
-   hk_cmd_buffer_retain_bo(cmd, shader->bo);
-   uint64_t published = hk_cmd_publish_ioto_program(cmd, &reservation, program.length);
-   if (published && final_resolve)
+   }
+   hk_cmd_buffer_retain_bo(cmd, res.shader_bo);
+   if (res.program_va && final_resolve)
       cmd->state.gfx.render.g17p_direct_color_resolve = true;
    return (struct hk_bg_eot){
-      .usc = published,
-      .primary_storage_B = desc.scratch_size,
-      .staging_storage_B = desc.compiler_d,
+      .usc = res.program_va,
+      .primary_storage_B = res.primary_storage_B,
+      .staging_storage_B = res.staging_storage_B,
       .rsrc_spec = store ? 0 : multisample && op == AGX_BG_LOAD
          ? UINT64_C(0xffff800000000000) : UINT64_C(0xffff800000000040),
    };
@@ -2826,42 +2040,31 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          return cache->program[variant];
       }
 
-      /* frg-codegen v4: build this variant into the device-lifetime entry
+      /* Build this variant into the device-lifetime entry that
        * hk_g17p_bg_eot_cache_get() attached, so every later recording of the
-       * same pass reuses it (BG/EOT device cache). */
-      struct hk_g17p_bg_eot_dev_cache *dc = dev->g17p_bg_eot_dev_cache;
-      struct hk_g17p_bg_eot_dev_entry *de = cache ? cache->dev_entry : NULL;
-      struct hk_bg_eot program = {0};
-      bool built = false;
+       * same pass reuses it. */
+      struct agx_bg_eot_ioto_cache *dc = dev->bg_eot.ioto_cache;
+      struct agx_bg_eot_ioto_cache_entry *de = cache ? cache->dev_entry : NULL;
+      struct agx_bg_eot_ioto_result res = {0};
+      bool handled = false;
       if (dc && de) {
-         simple_mtx_lock(&dc->lock);
-         if (de->valid_variants & BITFIELD_BIT(variant)) {
-            program = de->program[variant];
-            built = true;
-         } else if (hk_g17p_bg_eot_arena_room(
-                       dev, dc, &dc->program, true,
-                       HK_G17P_BG_EOT_DEV_PROGRAM_MAX,
-                       AGX_IOTO_PROGRAM_ALIGNMENT) &&
-                    hk_g17p_bg_eot_arena_room(
-                       dev, dc, &dc->data, false,
-                       HK_G17P_BG_EOT_DEV_DATA_MAX, 32)) {
-            bool in_device = false;
-            program = hk_build_g17p_bg_eot(cmd, &key, info, store,
-                                           partial_render, dc, &in_device);
-            built = true;
-            if (program.usc && in_device &&
-                !vk_command_buffer_has_error(&cmd->vk)) {
-               de->program[variant] = program;
-               de->valid_variants |= BITFIELD_BIT(variant);
-            }
-         } else {
-            dc->full = true;
-         }
-         simple_mtx_unlock(&dc->lock);
+         struct hk_g17p_bg_eot_build_ctx bctx = {
+            .cmd = cmd,
+            .key = &key,
+            .info = info,
+            .store = store,
+            .partial_render = partial_render,
+         };
+         handled = agx_bg_eot_ioto_cache_lookup_or_build(
+            &dev->dev, dc, de, variant, hk_g17p_bg_eot_cache_build_cb, &bctx,
+            &res, NULL);
       }
-      if (!built)
-         program = hk_build_g17p_bg_eot(cmd, &key, info, store,
-                                        partial_render, NULL, NULL);
+      if (!handled) {
+         const struct agx_bg_eot_ioto_sink sink = hk_bg_eot_cmd_sink(cmd);
+         hk_build_g17p_bg_eot_with_sink(cmd, &key, info, store, partial_render,
+                                        false, &sink, &res);
+      }
+      struct hk_bg_eot program = hk_bg_eot_from_ioto_result(&res);
       if (cache && program.usc && !vk_command_buffer_has_error(&cmd->vk)) {
          cache->program[variant] = program;
          cache->valid_variants |= BITFIELD_BIT(variant);

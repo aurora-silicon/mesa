@@ -1261,12 +1261,13 @@ agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
                                            last_level, first_layer, last_layer))
       return false;
 
-   if (!agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4) ||
-       !agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_ODD))
+   struct agx_screen *screen = agx_screen(pctx->screen);
+   if (!agx_get_precompiled(&screen->bg_eot, LIBAGX_MIPMAP_UNORM8X4) ||
+       !agx_get_precompiled(&screen->bg_eot, LIBAGX_MIPMAP_UNORM8X4_ODD))
       return false;
 
    const bool has_2level =
-      agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_2LEVEL) != NULL;
+      agx_get_precompiled(&screen->bg_eot, LIBAGX_MIPMAP_UNORM8X4_2LEVEL) != NULL;
 
    struct agx_batch *batch = agx_get_compute_batch(ctx);
    agx_batch_init_state(batch);

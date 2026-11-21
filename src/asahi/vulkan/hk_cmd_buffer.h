@@ -498,14 +498,13 @@ struct hk_bg_eot {
  * remain harmless misses. */
 #define HK_G17P_BG_EOT_CACHE_ENTRIES 16
 #define HK_G17P_BG_EOT_CACHE_KEY_MAX 768
-struct hk_g17p_bg_eot_dev_entry;
+struct agx_bg_eot_ioto_cache_entry;
 
 struct hk_g17p_bg_eot_cache_entry {
    uint8_t key[HK_G17P_BG_EOT_CACHE_KEY_MAX];
    struct hk_bg_eot program[4];
-   /* frg-codegen v4: the device-lifetime entry this pass fills or reuses,
-    * or NULL. */
-   struct hk_g17p_bg_eot_dev_entry *dev_entry;
+   /* Device-lifetime entry this pass fills or reuses, or NULL. */
+   struct agx_bg_eot_ioto_cache_entry *dev_entry;
    uint64_t hash;
    uint16_t key_size;
    uint8_t valid_variants;
