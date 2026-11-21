@@ -139,8 +139,25 @@ hk_drirc = custom_target(
   ],
 )
 
+# Manual hardware workload: explicit opt-in, outside default builds/tests and
+# installation. Building it does not authorize device probing or execution.
+if get_option('asahi-query-wait-bench')
+  executable('hk-query-wait-bench',
+    files('tests/hk-query-wait-bench.c', '../lib/agx_chip.c'),
+    include_directories : [inc_include, inc_src, inc_asahi],
+    dependencies : [dependency('vulkan'), dep_libdrm, dep_dl, dep_thread],
+    build_by_default : false,
+    install : false,
+  )
+endif
+
 if with_tests
   if host_machine.system() == 'linux'
+    test('hk_query_wait_bench_profile',
+      executable('hk_query_wait_bench_profile_test',
+        files('tests/test-hk-query-wait-bench-profile.c', '../lib/agx_chip.c'),
+        include_directories : [include_directories('../lib'), inc_include, inc_src]),
+      suite : ['asahi'])
     test('hk_query_wait', executable('hk_query_wait_test',
       files('tests/test-hk-query-wait.c', 'hk_query_wait.c'),
       include_directories : [include_directories('.'), inc_include, inc_src],

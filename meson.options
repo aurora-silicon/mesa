@@ -474,6 +474,13 @@ option(
 )
 
 option(
+  'asahi-query-wait-bench',
+  type : 'boolean',
+  value : false,
+  description : 'Build the manual, exact-device Asahi query-wait benchmark (never run or installed)',
+)
+
+option(
   'build-tests',
   type : 'boolean',
   value : false,
