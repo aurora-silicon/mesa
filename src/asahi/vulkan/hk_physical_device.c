@@ -2312,10 +2312,16 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
       supported_extensions.KHR_present_wait = false;
       supported_extensions.KHR_present_wait2 = false;
       supported_extensions.EXT_display_control = false;
+      supported_extensions.EXT_hdr_metadata = false;
+      supported_extensions.EXT_present_timing = false;
+      supported_extensions.GOOGLE_display_timing = false;
       supported_features.presentId = false;
       supported_features.presentId2 = false;
       supported_features.presentWait = false;
       supported_features.presentWait2 = false;
+      supported_features.presentTiming = false;
+      supported_features.presentAtRelativeTime = false;
+      supported_features.presentAtAbsoluteTime = false;
       supported_features.swapchainMaintenance1 = false;
    }
 
