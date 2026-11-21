@@ -2297,6 +2297,28 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);
 
+   /* A compute-only device has no graphics queue, and presenting can blit
+    * through the graphics meta path, which the kernel refuses there. Offer no
+    * swapchain or present extensions, nor their features.
+    */
+   if (agx_compute_only(&pdev->dev)) {
+      supported_extensions.KHR_swapchain = false;
+      supported_extensions.KHR_swapchain_maintenance1 = false;
+      supported_extensions.KHR_swapchain_mutable_format = false;
+      supported_extensions.EXT_swapchain_maintenance1 = false;
+      supported_extensions.KHR_incremental_present = false;
+      supported_extensions.KHR_present_id = false;
+      supported_extensions.KHR_present_id2 = false;
+      supported_extensions.KHR_present_wait = false;
+      supported_extensions.KHR_present_wait2 = false;
+      supported_extensions.EXT_display_control = false;
+      supported_features.presentId = false;
+      supported_features.presentId2 = false;
+      supported_features.presentWait = false;
+      supported_features.presentWait2 = false;
+      supported_features.swapchainMaintenance1 = false;
+   }
+
    struct vk_properties properties;
    hk_get_device_properties(&pdev->dev, instance, &supported_features,
                             &properties);
