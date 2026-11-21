@@ -6572,15 +6572,10 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
 }
 
 static void
-agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
+agx_upload_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
 {
    struct agx_context *ctx = batch->ctx;
-   if (!cs)
-      return;
-
    mesa_shader_stage stage = cs->stage;
-   if (!ctx->stage[stage].dirty)
-      return;
 
    if (ctx->stage[stage].dirty & AGX_STAGE_DIRTY_CONST)
       agx_set_cbuf_uniforms(batch, stage);
@@ -6603,6 +6598,15 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
 
    batch->uniforms.tables[AGX_SYSVAL_STAGE(stage)] =
       agx_pool_upload_aligned(&batch->pool, unif, size, 16);
+}
+
+/* Most draws have no stage with a dirty descriptor. Ask here: the uploads of
+ * agx_upload_descriptors() make it set up a large frame before it can look. */
+static inline void
+agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
+{
+   if (cs && batch->ctx->stage[cs->stage].dirty)
+      agx_upload_descriptors(batch, cs);
 }
 
 static bool
