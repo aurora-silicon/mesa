@@ -1478,17 +1478,61 @@ bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
    return nir_bcsel(b, valid, def, nir_imm_int(b, 0));
 }
 
+/* Fold the constant field displacement into the bounds check so adjacent
+ * fields can share their base-plus-index address.
+ */
+static nir_def *
+bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_scalar offset = nir_scalar_resolved(intr->src[1].ssa, 0);
+   nir_def *bound = intr->src[2].ssa;
+   unsigned bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   unsigned align_offset = nir_intrinsic_align_offset(intr);
+
+   if (!is_op(offset, nir_op_uadd_sat) || offset.def->bit_size != 32 ||
+       bound->bit_size != 32 || align_offset > AGX_ZERO_PAGE_SIZE - bytes ||
+       nir_intrinsic_align_mul(intr) > AGX_ZERO_PAGE_SIZE)
+      return NULL;
+
+   nir_scalar x = nir_scalar_chase_alu_src(offset, 0);
+   nir_scalar y = nir_scalar_chase_alu_src(offset, 1);
+   if (!nir_scalar_is_const(x) && !nir_scalar_is_const(y))
+      return NULL;
+
+   unsigned field = nir_scalar_as_uint(nir_scalar_is_const(x) ? x : y);
+   if (field > AGX_ZERO_PAGE_SIZE - bytes)
+      return NULL;
+
+   /* index + field + bytes <= bound, including when the offset saturates. */
+   nir_def *index = nir_mov_scalar(b, nir_scalar_is_const(x) ? y : x);
+   nir_def *limit = nir_usub_sat(b, bound, nir_imm_int(b, field + bytes - 1));
+   nir_def *record = nir_iadd(b, intr->src[0].ssa, nir_u2u64(b, index));
+
+   /* Adding the displacement must land at the promised alignment even for
+    * an out-of-bounds access.
+    */
+   nir_def *zero = nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS +
+                                    (uint64_t)align_offset - field);
+   return nir_iadd_imm(b, nir_bcsel(b, nir_ult(b, index, limit), record, zero),
+                       field);
+}
+
 static void
-lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
+lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
+                          bool fold_field)
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *base = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
+   nir_def *address = fold_field ? bounded_field_address(b, intr) : NULL;
 
-   /* Bounds check compatibly with the hardware address mode */
-   nir_def *valid = check_in_bounds(b, intr);
-   base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
-   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
+   if (!address) {
+      /* Bounds check compatibly with the hardware address mode */
+      nir_def *valid = check_in_bounds(b, intr);
+      base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
+      address = nir_iadd(b, base, nir_u2u64(b, offset));
+   }
 
    enum gl_access_qualifier access = nir_intrinsic_access(intr);
 
@@ -1498,7 +1542,7 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 
    nir_def *val = nir_load_global(
       b, intr->def.num_components, intr->def.bit_size,
-      nir_iadd(b, base, nir_u2u64(b, offset)),
+      address,
       .align_mul = nir_intrinsic_align_mul(intr),
       .align_offset = nir_intrinsic_align_offset(intr), .access = access);
 
@@ -1506,6 +1550,12 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 }
 
 struct global_load_lowering {
+   /* Share the record address where the unfolded check pays a 64-bit add
+    * per load anyway. On AGX3B the compiler gives device loads an unscaled
+    * 32-bit byte index register (agx_optimize_nir()'s byte_indices), so the
+    * unfolded check needs no 64-bit add and a folded record address would
+    * add one (low add, carry, high add) for every record. */
+   bool fold_field;
    bool soft_fault;
    /* G17P and M5: storage-buffer loads use the soft-fault form as well:
     * load, then zero the value when the access is out of bounds. */
@@ -1702,7 +1752,7 @@ lower_load_global_constant_offset_instr(nir_builder *b,
        (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
         !state->soft_fault)) {
 
-      lower_load_global_bounded(b, intrin);
+      lower_load_global_bounded(b, intrin, state->fold_field);
       return true;
    }
 
@@ -3342,6 +3392,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(progress, nir, nir_opt_move, opts);
 
    struct global_load_lowering global_loads = {
+      .fold_field = agx_chip_isa_encoding(dev->dev.chip) !=
+                    AGX_ISA_ENCODING_AGX3B,
       .soft_fault = agx_has_soft_fault(&dev->dev),
       .storage_result_select = dev->dev.chip == AGX_CHIP_G17P ||
                                agx_chip_g17_m5(dev->dev.chip),
