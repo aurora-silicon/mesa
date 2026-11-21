@@ -62,6 +62,11 @@
  *
  * This is the only G17P policy: every eligible image is compressed, with no
  * runtime opt-out.
+ *
+ * G16G (M4) has the same Gen9 colour packets and AIL layout
+ * (agx_chip_gen9_color_compression()) and takes the single-sample colour
+ * shapes above. Depth/stencil, 2x and the M4 Pro shapes stay on G17P
+ * (agx_chip_gen9_extended_compression()).
  */
 
 /* Colour formats admitted on G17P: plain single-plane formats of 1-8 bytes
@@ -151,10 +156,17 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
                                unsigned plane, const VkImageCreateInfo *info,
                                bool g16s)
 {
-   if (chip != AGX_CHIP_G17P || !info ||
+   /* Chips with Gen9 colour compression alone (G16G) take the single-sample
+    * colour shapes below. Depth/stencil, 2x and the M4 Pro shapes need the
+    * shapes measured on G17P (agx_chip_gen9_extended_compression()). */
+   const bool extended = agx_chip_gen9_extended_compression(chip);
+   if (!agx_chip_gen9_color_compression(chip) || !info ||
        (plane != 0 && !(plane == 1 &&
                         info->format == VK_FORMAT_D32_SFLOAT_S8_UINT)))
       return false;
+   if (!extended && !hk_g17p_compression_color_format(info->format))
+      return false;
+   g16s = g16s && extended;
 
    /* Keep depth/stencil off the G16S colour shapes: their mip chains and
     * standalone S8 reach colour-alias transfer paths that refuse them, which
@@ -180,7 +192,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     * through ZLS, not the background program; it sits under the same
     * condition because it was measured on the same SoCs (M4 Pro, M4 Max). */
    const bool ms2x =
-      !agx_chip_uncovered_tile_ms_reload_defect(chip, chip_id, 2);
+      extended && !agx_chip_uncovered_tile_ms_reload_defect(chip, chip_id, 2);
    /* Not B10G11R11_UFLOAT: a compressed tile of its class reads NaN back as
     * zero, and a render or copy into the attachment must keep NaN. */
    const bool color = hk_g17p_compression_color_format(info->format);

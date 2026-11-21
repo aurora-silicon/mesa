@@ -115,9 +115,10 @@ check_shape(VkFormat format, bool is_zs)
    CHECK(ELIGIBLE(base));
 
    /* Chip and plane. */
+   /* G16G compresses single-sample colour, without the M4 Pro shapes. */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(g16s_eligible((enum agx_chip)chip, 0, &base) ==
-            (chip == AGX_CHIP_G17P));
+            (chip == AGX_CHIP_G17P || (!is_zs && chip == AGX_CHIP_G16G)));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
    CHECK(g16s_eligible(AGX_CHIP_G17P, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));

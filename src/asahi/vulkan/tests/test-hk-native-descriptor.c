@@ -238,6 +238,68 @@ check_gen9_cube_textures(void)
                  sizeof(compressed_expected)) == 0);
 }
 
+/* G16G (M4) on macOS 27.2 (26B123): the read (texture) and write (PBE)
+ * descriptors of a 4096x4096 RGBA8 texture, from our capture of a blit copy
+ * into it. The texture is 64 MiB at 0x10004088000; the 512 KiB of metadata
+ * follows it at 0x10008088000 in the same allocation. They are the texture's
+ * own UNORM view and the UINT view the copy writes through. Borealis packs
+ * the same Gen9 words, so G16G takes agx_chip_gen9_color_compression(). */
+static void
+check_g16g_captured_compressed_rgba8(void)
+{
+   static const struct {
+      enum agx_texture_type type;
+      uint64_t texture[4], pbe[4];
+   } views[] = {
+      {AGX_TEXTURE_TYPE_UNORM,
+       {UINT64_C(0x083ffcfff6880a22), UINT64_C(0x8000001000408800),
+        UINT64_C(0x0000001000808800), 0},
+       {UINT64_C(0x0803ffcfffe40a22), UINT64_C(0x8000001000408800),
+        UINT64_C(0x0000001000808800), 0}},
+      {AGX_TEXTURE_TYPE_UINT,
+       {UINT64_C(0x083ffcfff6884a22), UINT64_C(0x8000001000408800),
+        UINT64_C(0x0000001000808800), 0},
+       {UINT64_C(0x0803ffcfffe44a22), UINT64_C(0x8000001000408800),
+        UINT64_C(0x0000001000808800), 0}},
+   };
+   for (unsigned i = 0; i < sizeof(views) / sizeof(views[0]); ++i) {
+      const struct AGX_TEXTURE t = {
+         AGX_TEXTURE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_GPU,
+         .channels = AGX_CHANNELS_R8G8B8A8,
+         .type = views[i].type,
+         .swizzle_r = AGX_CHANNEL_R, .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B, .swizzle_a = AGX_CHANNEL_A,
+         .width = 4096,
+         .height = 4096,
+         .address = UINT64_C(0x10004088000),
+         .compressed = true,
+         .extended = true,
+         .acceleration_buffer = UINT64_C(0x10008088000),
+      };
+      struct hk_native_texture_descriptor texture;
+      assert(hk_pack_native_texture(9, &texture, &t));
+      assert(memcmp(&texture, views[i].texture, sizeof(views[i].texture)) ==
+             0);
+
+      struct AGX_PBE p = {AGX_PBE_header};
+      p.dimension = AGX_TEXTURE_DIMENSION_2D;
+      p.layout = AGX_LAYOUT_GPU;
+      p.channels = AGX_CHANNELS_R8G8B8A8;
+      p.type = views[i].type;
+      p.swizzle_r = AGX_CHANNEL_R; p.swizzle_g = AGX_CHANNEL_G;
+      p.swizzle_b = AGX_CHANNEL_B; p.swizzle_a = AGX_CHANNEL_A;
+      p.width = p.height = 4096;
+      p.buffer = UINT64_C(0x10004088000);
+      p.acceleration_buffer = UINT64_C(0x10008088000);
+      p.compressed = p.extended = true;
+      struct hk_native_pbe_descriptor pbe;
+      assert(hk_pack_native_pbe(9, &pbe, &p));
+      assert(memcmp(&pbe, views[i].pbe, sizeof(views[i].pbe)) == 0);
+   }
+}
+
 static void
 check_gen9_cube_array_texture(void)
 {
@@ -829,6 +891,7 @@ main(void)
    check_gen9_astc_4x4_texture();
    check_gen9_cube_textures();
    check_gen9_cube_array_texture();
+   check_g16g_captured_compressed_rgba8();
    check_gen9_bc_textures();
 
    /* Ordinary HAL200 2D has no layer-mode bit, even when its backing BO

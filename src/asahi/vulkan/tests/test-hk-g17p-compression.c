@@ -94,9 +94,10 @@ check_shape(VkFormat format, bool is_depth)
    CHECK(ELIGIBLE(base));
 
    /* Chip and plane. */
+   /* G16G takes the single-sample colour shapes alone (check_g16g()). */
    for (unsigned chip = 0; chip <= AGX_CHIP_UNKNOWN; ++chip)
       CHECK(hk_g17p_compression_eligible((enum agx_chip)chip, 0, &base) ==
-            (chip == AGX_CHIP_G17P));
+            (chip == AGX_CHIP_G17P || (!is_depth && chip == AGX_CHIP_G16G)));
    /* Plane 1 is the stencil plane of D32_SFLOAT_S8_UINT alone. */
    CHECK(hk_g17p_compression_eligible(AGX_CHIP_G17P, 1, &base) ==
          (format == VK_FORMAT_D32_SFLOAT_S8_UINT));
@@ -739,6 +740,90 @@ check_m5_msaa_color(void)
    CHECK(!hk_m5_msaa_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
 }
 
+/* G16G (M4): the Gen9 colour packets and layout of G17P
+ * (agx_chip_gen9_color_compression()), and only its single-sample colour
+ * shapes. Depth/stencil, 2x and the M4 Pro shapes stay on G17P, even when a
+ * caller passes the M4 Pro flag. */
+#define G16G(i, m4_pro)                                                       \
+   hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &(i), m4_pro)
+
+static void
+check_g16g(void)
+{
+   const VkImageUsageFlags transfer = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      VK_IMAGE_USAGE_SAMPLED_BIT;
+   const VkImageUsageFlags color_usage =
+      transfer | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   /* The image macOS compresses: a 4096x4096 RGBA8 copy destination. */
+   VkImageCreateInfo i = image(VK_FORMAT_R8G8B8A8_UNORM, 4096, 4096, 1,
+                               transfer);
+   CHECK(G16G(i, false));
+   CHECK(G16G(i, false) == ELIGIBLE(i));
+
+   /* The G17P colour formats and nothing else. */
+   for (unsigned f = 1; f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
+      VkImageCreateInfo c = image((VkFormat)f, 64, 64, 1, color_usage);
+      CHECK(G16G(c, false) == hk_g17p_compression_color_format((VkFormat)f));
+      CHECK(G16G(c, true) == G16G(c, false));
+   }
+
+   /* Depth and the stencil plane stay plain. */
+   VkImageCreateInfo d = image(VK_FORMAT_D32_SFLOAT_S8_UINT, 2408, 1508, 1,
+                               transfer |
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+   CHECK(ELIGIBLE(d));
+   CHECK(!G16G(d, false));
+   CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 1, &d, false));
+   d.format = VK_FORMAT_D16_UNORM;
+   CHECK(ELIGIBLE(d) && !G16G(d, false));
+
+   /* Mip chains and the small-texture rule follow G17P. */
+   VkImageCreateInfo m = image(VK_FORMAT_R8G8B8A8_UNORM, 2048, 2048, 12,
+                               transfer);
+   CHECK(G16G(m, false) == ELIGIBLE(m));
+   m = image(VK_FORMAT_R8G8B8A8_UNORM, 128, 128, 1, transfer);
+   CHECK(G16G(m, false) == ELIGIBLE(m));
+   m.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   CHECK(G16G(m, false) && ELIGIBLE(m));
+
+   /* No 2x attachments, which the M4 Max compresses. */
+   VkImageCreateInfo c = image(VK_FORMAT_R8G8B8A8_UNORM, 2408, 1508, 1,
+                               color_usage);
+   c.samples = VK_SAMPLE_COUNT_2_BIT;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6041, 0, &c, false));
+   CHECK(!G16G(c, false));
+   CHECK(!G16G(c, true));
+
+   /* No layered or 3D colour, which the M4 Pro compresses. */
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.arrayLayers = 2;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6040, 0, &c, true));
+   CHECK(!G16G(c, true));
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.imageType = VK_IMAGE_TYPE_3D;
+   c.extent.depth = 4;
+   CHECK(hk_hal200_compression_eligible(AGX_CHIP_G17P, 0x6040, 0, &c, true));
+   CHECK(!G16G(c, true));
+
+   /* Storage and shared images stay plain, as on G17P. */
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1,
+             color_usage | VK_IMAGE_USAGE_STORAGE_BIT);
+   CHECK(!G16G(c, false));
+   const VkExternalMemoryImageCreateInfo external = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   c = image(VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, color_usage);
+   c.pNext = &external;
+   CHECK(!G16G(c, false));
+   c.pNext = NULL;
+   CHECK(G16G(c, false));
+   CHECK(!hk_g17p_shared_compression_shape(AGX_CHIP_G16G, c.format,
+                                           c.imageType, c.flags, c.usage));
+}
+
 int
 main(void)
 {
@@ -757,6 +842,7 @@ main(void)
    check_m5_color();
    check_m5_msaa_color();
    check_m5_depth_msaa();
+   check_g16g();
    printf("G17P compression policy: %u checks passed\n", checks);
    return 0;
 }

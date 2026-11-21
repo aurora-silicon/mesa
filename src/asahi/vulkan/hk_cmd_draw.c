@@ -5058,7 +5058,7 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
           * need their compressed contents converted before shader stores.
           */
          if ((agx_chip_g17_m5(dev->dev.chip) ||
-              dev->dev.chip == AGX_CHIP_G17P) &&
+              agx_chip_gen9_color_compression(dev->dev.chip)) &&
              !render->tilebuffer.spilled[i])
             continue;
 
@@ -5083,13 +5083,14 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
 
                perf_debug(cmd, "Decompressing in-place");
 
-               /* libagx_decompress has no G17P binary. G17P compresses 1-8
-                * byte colour targets, single-sample or 2x on M4 Pro (not with
-                * multiview), which hk_resident_attachments() keeps in the
-                * tilebuffer, so this is unreachable; fail closed with a
-                * diagnostic rather than a NULL program. */
-               if (dev->dev.chip == AGX_CHIP_G17P) {
-                  mesa_loge_once("G17P: spilled render pass with a compressed "
+               /* libagx_decompress has no AGX3 binary. Gen9 compresses 1-8
+                * byte colour targets: single-sample, which a 128-byte sample
+                * always keeps in the tilebuffer, or 2x on M4 Pro (not with
+                * multiview), which hk_resident_attachments() keeps there. So
+                * this is unreachable; fail closed with a diagnostic rather
+                * than a NULL program. */
+               if (agx_chip_gen9_color_compression(dev->dev.chip)) {
+                  mesa_loge_once("Gen9: spilled render pass with a compressed "
                                  "attachment (%s) is unsupported",
                                  util_format_short_name(layout->format));
                   vk_command_buffer_set_error(&cmd->vk,
