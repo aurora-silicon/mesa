@@ -1092,6 +1092,24 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
                           const agx_index *halfs, unsigned nr_channels)
 {
    agx_index channels[4] = {agx_null()};
+
+   /* AGX3C: unpack each byte in one 16-bit operation: even bytes mask
+    * the low byte and odd bytes shift right by 8, clearing the upper byte. */
+   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !b->shader->key->dev.emit_agx3d) {
+      for (unsigned i = 0; i < nr_channels; ++i) {
+         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], agx_immediate(8))
+                               : agx_and(b, halfs[i / 2], agx_immediate(0xff));
+         if (dest.size == AGX_SIZE_32) {
+            agx_index zext = agx_temp(b->shader, AGX_SIZE_32);
+            agx_mov_to(b, zext, channels[i]);
+            channels[i] = zext;
+         }
+      }
+      agx_emit_collect_to(b, dest, nr_channels, channels);
+      return;
+   }
+
    agx_index shift = agx_mov_imm(b, 32, 8);
    for (unsigned i = 0; i < nr_channels; ++i) {
       agx_index wide = agx_pad_to_32(b, halfs[i / 2]);
@@ -4755,6 +4773,7 @@ agx_lower_agx3_half_converts(agx_context *ctx)
           I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16 &&
           !I->src[1].abs && !I->src[1].neg && !I->src[1].memory)
          continue;
+
 
       if (I->src[0].value == AGX_CONVERT_U8_TO_F &&
           I->round == AGX_ROUND_RTE) {
@@ -8716,6 +8735,95 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                                   AGX_ROUND_RTE);
       }
 
+      /* M5 converts the low byte of a half register to f32 directly. Byte 0
+       * or 2 of a word, as a packed RGBA8 pixel is unpacked, is the low byte
+       * of its low or high half: no mask or shift. Bytes 1 and 3 take a
+       * 16-bit shift of their half. All four read only the halves, so the
+       * word dies at its split and needs no copy. */
+      if (instr->op == nir_op_u2f32 && src_sz == 32 &&
+          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !b->shader->key->dev.emit_agx3d) {
+         nir_scalar x = nir_scalar_chase_movs(
+            nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
+         nir_scalar word = {0};
+         int half = -1;
+         bool high_byte = false;
+         if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_ushr) {
+            nir_scalar k = nir_scalar_chase_alu_src(x, 1);
+            if (nir_scalar_is_const(k) && (nir_scalar_as_uint(k) & 31) == 24) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = 1;
+               high_byte = true;
+            }
+         } else if (nir_scalar_is_alu(x) && nir_scalar_alu_op(x) == nir_op_iand) {
+            for (unsigned i = 0; i < 2; ++i) {
+               nir_scalar k = nir_scalar_chase_alu_src(x, i);
+               if (nir_scalar_is_const(k) && nir_scalar_as_uint(k) == 0xff) {
+                  word = nir_scalar_chase_alu_src(x, 1 - i);
+                  half = 0;
+               }
+            }
+            /* (w >> 8k) & 0xff: byte k of w. */
+            if (half == 0 && nir_scalar_is_alu(word) &&
+                nir_scalar_alu_op(word) == nir_op_ushr) {
+               nir_scalar k = nir_scalar_chase_alu_src(word, 1);
+               const unsigned sh =
+                  nir_scalar_is_const(k) ? nir_scalar_as_uint(k) & 31 : 0;
+               if (sh == 8 || sh == 16 || sh == 24) {
+                  word = nir_scalar_chase_alu_src(word, 0);
+                  half = sh / 16;
+                  high_byte = sh & 8;
+               }
+            }
+         } else if (nir_scalar_is_alu(x) &&
+                    (nir_scalar_alu_op(x) == nir_op_ubitfield_extract ||
+                     nir_scalar_alu_op(x) == nir_op_ubfe)) {
+            nir_scalar off = nir_scalar_chase_alu_src(x, 1);
+            nir_scalar bits = nir_scalar_chase_alu_src(x, 2);
+            if (nir_scalar_is_const(off) && nir_scalar_is_const(bits) &&
+                nir_scalar_as_uint(bits) == 8 && nir_scalar_as_uint(off) < 32 &&
+                !(nir_scalar_as_uint(off) & 7)) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = nir_scalar_as_uint(off) / 16;
+               high_byte = nir_scalar_as_uint(off) & 8;
+            }
+         } else if (nir_scalar_is_alu(x) &&
+                    nir_scalar_alu_op(x) == nir_op_extract_u8) {
+            nir_scalar idx = nir_scalar_chase_alu_src(x, 1);
+            if (nir_scalar_is_const(idx) && nir_scalar_as_uint(idx) < 4) {
+               word = nir_scalar_chase_alu_src(x, 0);
+               half = nir_scalar_as_uint(idx) / 2;
+               high_byte = nir_scalar_as_uint(idx) & 1;
+            }
+         }
+         if (half >= 0 && word.def->bit_size == 32) {
+            agx_index h;
+            nir_scalar narrow = {0};
+            if (nir_scalar_is_alu(word) &&
+                nir_scalar_alu_op(word) == nir_op_u2u32)
+               narrow = nir_scalar_chase_alu_src(word, 0);
+            if (half == 0 && narrow.def && narrow.def->bit_size == 16) {
+               /* The low half of a zero-extended half is the half. */
+               h = agx_extract_nir_src(b, nir_src_for_ssa(narrow.def),
+                                       narrow.comp);
+            } else {
+               agx_index w = agx_extract_nir_src(b, nir_src_for_ssa(word.def),
+                                                 word.comp);
+               h = agx_temp(b->shader, AGX_SIZE_16);
+               agx_subdivide_to(b, h, w, half);
+            }
+            /* The odd bytes: shift the half, whose upper byte is then zero. */
+            if (high_byte) {
+               return agx_convert_to(b, dst,
+                                     agx_immediate(AGX_CONVERT_U16_TO_F),
+                                     agx_ushr(b, h, agx_immediate(8)),
+                                     AGX_ROUND_RTE);
+            }
+            return agx_convert_to(b, dst, agx_immediate(AGX_CONVERT_U8_TO_F),
+                                  h, AGX_ROUND_RTE);
+         }
+      }
+
       enum agx_convert mode = (src_sz == 32)   ? AGX_CONVERT_U32_TO_F
                               : (src_sz == 16) ? AGX_CONVERT_U16_TO_F
                                                : AGX_CONVERT_U8_TO_F;
@@ -10271,7 +10379,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool g18_scans, bool checked_offsets,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
-                 struct agx_shader_info *dma_info)
+                 struct agx_shader_info *dma_info, unsigned m5_unroll_factor,
+                 unsigned *m5_unroll_widest)
 {
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
@@ -10286,6 +10395,55 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(lowered, nir, agx_nir_lower_dynamic_shuffle_xor);
       if (lowered)
          agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
+   /* Counted loops whose trip count is only known at run time: run several
+    * iterations per loop test where the bound allows it. On M5 the loop
+    * control of a short body costs about as much as the body, and the
+    * unrolled body's loads issue together and vectorize below. Bodies of up
+    * to 40 instructions run 8 iterations per test (Metal's compiler unrolls
+    * such loops by 8 when the source asks for it, as Geekbench's Hamming
+    * distance does; SPIR-V carries no such hint), up to 80 run 4, up to 160
+    * run 2. agx_compile_shader_nir compiles again with 4 if 8 costs
+    * occupancy. */
+   if (m5 && !g18_scans) {
+      bool unrolled = false;
+      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
+               320, m5_unroll_widest);
+      if (unrolled)
+         agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
+
+   /* Absolute differences of unsigned bytes in 16-bit arithmetic. */
+   if (m5 && !g18_scans) {
+      bool narrowed = false;
+      NIR_PASS(narrowed, nir, agx_nir_opt_u8_absdiff);
+      if (narrowed) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+
+   /* Zero-extended bytes and halves convert to f32 from their half register. */
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_m5_narrow_to_float);
+
+   /* Consecutive words read together, such as the unrolled iterations' reads
+    * of one array, become one vector load. */
+   /* With soft faults, robust buffer reads are plain reads followed by a
+    * bounds select, so a read past the end is not undefined: leave them. */
+   if (m5 && !g18_scans && !soft_fault) {
+      bool merged = false;
+      NIR_PASS(merged, nir, agx_nir_merge_global_words);
+      if (merged) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_cse);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
    }
 
    /* If soft fault is enabled, we can freely speculate everything. That lets us
@@ -10373,6 +10531,15 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (uniform_atomics)
       NIR_PASS(progress, nir, nir_opt_uniform_atomics, true);
 
+   /* Constant index addends that agx_nir_lower_address cannot see through
+    * its LEA fusion go to M5's byte offsets first. */
+   if (m5 && !g18_scans && !soft_fault) {
+      bool folded = false;
+      NIR_PASS(folded, nir, agx_nir_fold_m5_offsets);
+      if (folded)
+         NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Lower addressing modes. The sooner we do this, the sooner we get rid of
     * amul/aadd instructions and can let nir_opt_algebraic do its job. But we
     * want to vectorize first since nir_opt_load_store_vectorize doesn't know
@@ -10380,6 +10547,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    NIR_PASS(_, nir, agx_nir_lower_address, byte_indices, m5,
             checked_offsets);
+
+   /* Rows at (x + c) * uniform stride: one shared multiply-add, then an add
+    * of a preamble-uniform c * stride per row. */
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_uniform_stride);
 
    /* Now that loads carry an index, a select between two of them can choose
     * the index instead of the loaded data. Run it to a fixed point with the
@@ -10606,7 +10778,13 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * (agx_lower_agx3_half_converts). */
    if (m5 && !g18_scans) {
       NIR_PASS(_, nir, agx_nir_fold_byte_to_float);
-      NIR_PASS(_, nir, agx_nir_fold_ubyte_to_float);
+      /* With the native unsigned path on, the backend converts every byte
+       * of a word, and the low byte of a zero-extended half, from its mask,
+       * shift and extract forms (agx_emit_alu, u2f32). Narrowed to u2u8
+       * here, the unsigned forms come back longer from later passes (byte 2
+       * as split_y, u2u32, split_x, u2u8; byte 1 as a 32-bit shift), so
+       * leave them to the backend. */
+      /* Unsigned byte-to-float stays on the direct AGX3C half-register path. */
    }
 
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
@@ -15951,9 +16129,11 @@ cse_shared_reads_in_phases(nir_shader *nir)
    return any;
 }
 
-bool
-agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
-                       struct agx_shader_part *out)
+static bool
+agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
+                            struct agx_shader_part *out,
+                            unsigned m5_unroll_factor,
+                            unsigned *m5_unroll_widest)
 {
    /* Specialization or shader linking may gather info again after
     * preprocessing, clearing the operation-derived helper flags. Execution
@@ -16247,7 +16427,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                                               : NULL,
       (form_preamble && key->promote_textures) ? &info->sampler_state_count
                                               : NULL,
-      form_preamble ? key : NULL, info);
+      form_preamble ? key : NULL, info, m5_unroll_factor, m5_unroll_widest);
 
    /* Safe uniform-load speculation and if/phi folding have now exposed
     * matching sample copies. Preserve early subset proofs through those
@@ -16393,6 +16573,17 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, fold_w8_word_unpack,
                   nir_metadata_control_flow, NULL);
    }
+
+   /* A workgroup of one subgroup needs only SIMD-group fences. (Runs after
+    * any pass that delimits shared-memory phases by workgroup barriers.) */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !key->dev.emit_agx3d)
+      NIR_PASS(_, nir, agx_nir_narrow_single_subgroup_barriers);
+   /* Larger workgroups: the barriers whose shared traffic stays in
+    * subgroup 0, such as a tree reduction's last five steps. */
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !key->dev.emit_agx3d)
+      NIR_PASS(_, nir, agx_nir_narrow_subgroup0_barriers);
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       nir_print_shader(nir, stdout);
@@ -16577,8 +16768,56 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    return true;
 }
 
+/* M5 unrolls short run-time-counted loops by up to 8 (see agx_optimize_nir).
+ * More iterations per test never pays for fewer resident threads: when the
+ * wider unroll leaves the shader below the occupancy of a register-light
+ * program, compile it again unrolled by at most 4. */
+bool
+agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
+                       struct agx_shader_part *out)
+{
+   const unsigned factor = 8;
+   const bool m5 = key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+                   !key->dev.emit_agx3d;
+   if (!m5)
+      return agx_compile_shader_nir_once(nir, key, out, 4, NULL);
+
+   nir_shader *clone = nir_shader_clone(NULL, nir);
+   const struct agx_shader_key saved_key = *key;
+   unsigned widest = 0;
+   bool ok = agx_compile_shader_nir_once(nir, key, out, factor, &widest);
+   const unsigned full = agx_occupancy_for_register_count(0).max_threads;
+   const unsigned first =
+      ok ? agx_occupancy_for_register_count(out->info.nr_gprs).max_threads : 0;
+   /* Also when the wider unroll did not compile at all. */
+   if (widest > 4 && first < full) {
+      struct agx_shader_part narrow = {0};
+      *key = saved_key;
+      if (agx_compile_shader_nir_once(clone, key, &narrow, 4, NULL) &&
+          agx_occupancy_for_register_count(narrow.info.nr_gprs).max_threads >
+             first) {
+         if (ok)
+            free(out->binary);
+         *out = narrow;
+         ok = true;
+      } else {
+         /* Keep the first result. */
+         if (narrow.binary && narrow.binary != out->binary)
+            free(narrow.binary);
+         *key = saved_key;
+      }
+   }
+   ralloc_free(clone);
+   return ok;
+}
+
 void
 agx_preprocess_nir_m5(nir_shader *nir)
 {
+   /* Before the main optimization loop reassociates the last addition of a
+    * written-out population count into its user. */
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, agx_nir_opt_popcount_idiom);
    agx_preprocess_nir_internal(nir, false, true, false, true, false);
 }
