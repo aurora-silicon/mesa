@@ -26,9 +26,10 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
    struct hk_root_descriptor_table *root = &desc->root;
 
+   /* A compute shader's measured root prefix (hk_compile_nir()); zero for a
+    * shader that was not measured, which takes the whole table. */
    size_t root_size = sizeof(*root);
-   if (dev->dev.chip == AGX_CHIP_G17P &&
-       bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+   if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
       const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
       if (s && s->root_descriptor_size)
          root_size = MIN2(root_size, s->root_descriptor_size);

@@ -5356,12 +5356,17 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       shader->info.agx3_root_reads = hk_nir_root_reads(nir);
    }
 
-   /* Measure while root markers are still explicit. Uniform lowering loads
-    * the root pointer and set bases separately, so retain that prefix too.
-    * Round up for native uniform/global load granularity. */
-   if (dev->dev.chip == AGX_CHIP_G17P)
-      shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
-   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE) {
+   /* Measure while root markers are still explicit, so that
+    * hk_cmd_buffer_upload_root() uploads only the prefix a compute shader
+    * reads. Uniform lowering loads the root pointer and set bases
+    * separately, so retain that prefix too: it is also all that a compute
+    * launch preloads from the root on every generation (the AGX2 USC root
+    * uniform and the AGX3 Ioto root range are both root_desc_addr plus
+    * set_count set bases). Uniform DMA spans over the root come from loads
+    * measured here. Round up for native uniform/global load granularity.
+    * Every other stage keeps the whole table. */
+   shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
+   if (sw_stage == MESA_SHADER_COMPUTE) {
       unsigned bytes = hk_nir_root_size(
          nir, sizeof(struct hk_root_descriptor_table));
       bytes = MAX2(bytes, hk_root_descriptor_offset(sets) +
@@ -8513,8 +8518,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
-   const uint32_t root_descriptor_size = dev->dev.chip == AGX_CHIP_G17P
-      ? blob_read_uint32(blob) : 0;
+   const uint32_t root_descriptor_size = blob_read_uint32(blob);
    uint8_t mesh_primitive_comps[64] = {0};
    if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
       blob_copy_bytes(blob, mesh_primitive_comps, sizeof(mesh_primitive_comps));
@@ -9132,8 +9136,7 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
-   if (dev->dev.chip == AGX_CHIP_G17P)
-      blob_write_uint32(blob, shader->root_descriptor_size);
+   blob_write_uint32(blob, shader->root_descriptor_size);
    if (dev->dev.chip == AGX_CHIP_G17P &&
        shader->info.stage == MESA_SHADER_MESH)
       blob_write_bytes(blob, shader->g17p_mesh_primitive_comps,
