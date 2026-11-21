@@ -53,10 +53,14 @@ static VkResult
 driver_submit(struct vk_queue *queue, struct vk_queue_submit *submit)
 {
    if (queue == &queues[2].vk) {
+      CHECK(submit->api_queue == &queues[2].vk);
       bump(&independent);
       return VK_SUCCESS;
    }
    CHECK(queue == &queues[0].vk);
+   /* The callback receives the backing queue; deferred aliases retain their
+    * original API identity, including when the backing queue submits too. */
+   CHECK(submit->api_queue == &queues[p_atomic_read(&entered)].vk);
    CHECK(p_atomic_inc_return(&active) == 1);
    bump(&entered);
    await(&released);
