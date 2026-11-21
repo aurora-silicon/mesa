@@ -4726,6 +4726,25 @@ clear_attachment_as_image(struct hk_cmd_buffer *cmd,
                   att->clear_colour, &range, false /* partially clear 3D */);
 }
 
+enum hk_clear_layout {
+   HK_CLEAR_PLAIN = BITFIELD_BIT(0),
+   HK_CLEAR_COMPRESSED = BITFIELD_BIT(1),
+};
+static unsigned
+hk_attachment_clear_layout(const struct hk_attachment *att, bool stencil)
+{
+   if (!att->clear || !att->iview)
+      return 0;
+
+   const struct hk_image_view *view = att->iview;
+   const struct hk_image *image =
+      container_of(view->vk.image, struct hk_image, vk);
+   const unsigned plane = stencil && image->plane_count > 1 ? 1 : 0;
+   const bool compressed = ail_is_level_logically_compressed(
+      &image->planes[plane].layout, view->vk.base_mip_level);
+   return compressed ? HK_CLEAR_COMPRESSED : HK_CLEAR_PLAIN;
+}
+
 bool
 hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 {
@@ -4779,10 +4798,34 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * render that writes only its attachments it is not. */
    const bool m5_ms_clear = agx_chip_g17_m5(dev->dev.chip) &&
                             cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
+   /* M5 also keeps selected single-sample clear-only passes as renders.
+    * G17P does not: on an M4 Max (J616C) the same render clears made CS2
+    * about 11% slower (aurora-silicon/mesa#438), although the clears moved
+    * to the render engine as intended. AGX2 has no native BG/EOT programs
+    * (native_eot below), so a kept render cannot clear and store there. */
+   unsigned clear_layout = 0;
+   if (agx_chip_g17_m5(dev->dev.chip) && cs->cr.process_empty_tiles &&
+       !continuation && cs->tib.nr_samples == 1) {
+      for (unsigned i = 0; i < render->color_att_count; ++i)
+         clear_layout |= hk_attachment_clear_layout(&render->color_att[i], false);
+      clear_layout |= hk_attachment_clear_layout(&render->depth_att, false);
+      clear_layout |= hk_attachment_clear_layout(&render->stencil_att, true);
+   }
+
+   /* Keep full uncompressed fills on the render engine. A tiny color clear
+    * also does too little work to pay for a separate compute job. Larger
+    * compressed targets, including shadow depth, keep metadata fast clears. */
+   const bool small_color_clear =
+      clear_layout == HK_CLEAR_COMPRESSED && render->color_att_count == 1 &&
+      render->layer_count == 1 && !render->view_mask &&
+      !render->depth_att.iview && !render->stencil_att.iview &&
+      cs->cr.width <= 32 && cs->cr.height <= 32;
+
    if (native_eot &&
        (continuation ||
         (cs->cr.process_empty_tiles &&
          (output_only_through_eot || m5_ms_clear ||
+          clear_layout == HK_CLEAR_PLAIN || small_color_clear ||
           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
