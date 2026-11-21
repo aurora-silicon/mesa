@@ -3017,8 +3017,8 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
-static void
-agx_ra_impl(agx_context *ctx, bool disable_remat)
+void
+agx_ra(agx_context *ctx)
 {
    ctx->uniforms_written = agx_has_uniform_store(ctx);
    agx_lower_agx3b_atomic_returns(ctx);
@@ -3203,7 +3203,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    /* If we need multiple waves, see if we can rematerialize constants to save
     * waves. If we only have a single wave regardless, this is pointless.
     */
-   if (!disable_remat && effective_demand > agx_round_registers(1) && !spilling) {
+   if (effective_demand > agx_round_registers(1) && !spilling) {
       unsigned effective_demand_remat = agx_calc_register_demand(ctx, true);
 
       /* Worst-case assume we need 6 16-bit registers for constants, for a
@@ -3243,47 +3243,33 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
 
       agx_spill(ctx, max_possible_regs, remat);
 
-      if (agx_is_g18g(&ctx->key->dev)) {
-         /* Rematerialization changes instruction lifetimes. Measure the
-          * actual result before deciding whether the optional wave-saving
-          * budget held.
+      /* Rematerialization changes instruction lifetimes. Measure the actual
+       * result before deciding whether the optional wave-saving budget held.
+       */
+      agx_compute_liveness(ctx);
+      effective_demand = agx_calc_register_demand(ctx, false);
+
+      if (remat && (ctx->remat_fallback_spilled ||
+                    effective_demand > max_possible_regs)) {
+         /* The reduced budget is only an occupancy optimization. The
+          * remat-only pass keeps every value it cannot rematerialize in a
+          * register (agx_spill.c keep_in_registers()), so it can miss that
+          * estimate but never adds scratch traffic, and its result is no
+          * larger than the original program, which fit the full budget.
+          * Retain the rematerialized program and allocate it under the
+          * original hardware budget. This used to recompile fragment
+          * preambles without rematerialization once the remat-only pass had
+          * spilled to scratch.
           */
-         agx_compute_liveness(ctx);
-         effective_demand = agx_calc_register_demand(ctx, false);
-
-         if (remat && (ctx->remat_fallback_spilled ||
-                       effective_demand > max_possible_regs)) {
-            /* The reduced budget is only an occupancy optimization.
-             * Constants reintroduced at their uses can exceed that estimate
-             * even without a scratch spill. Retain the rematerialized
-             * program and allocate under the original hardware budget,
-             * spilling only if needed.
-             */
-            max_possible_regs = full_budget;
-            remat = false;
-            spilling = ctx->remat_fallback_spilled ||
-                       effective_demand > max_possible_regs;
-            if (effective_demand > max_possible_regs) {
-               agx_spill(ctx, max_possible_regs, false);
-               agx_compute_liveness(ctx);
-               effective_demand = agx_calc_register_demand(ctx, false);
-            }
-         }
-      } else {
-         if (remat && ctx->remat_fallback_spilled) {
-            /* The wave-saving remat-only pass could not meet its estimated
-             * budget and spilled to scratch; finish under the full budget. */
-            max_possible_regs = full_budget;
-            remat = false;
-            spilling = true;
+         max_possible_regs = full_budget;
+         remat = false;
+         spilling = ctx->remat_fallback_spilled ||
+                    effective_demand > max_possible_regs;
+         if (effective_demand > max_possible_regs) {
+            agx_spill(ctx, max_possible_regs, false);
             agx_compute_liveness(ctx);
-            if (agx_calc_register_demand(ctx, false) > max_possible_regs)
-               agx_spill(ctx, max_possible_regs, false);
+            effective_demand = agx_calc_register_demand(ctx, false);
          }
-
-         /* After spilling, recalculate liveness and demand */
-         agx_compute_liveness(ctx);
-         effective_demand = agx_calc_register_demand(ctx, false);
       }
 
       /* The resulting program can now be assigned registers */
@@ -3937,17 +3923,4 @@ cleanup:
    free(sizes);
    free(classes);
    free(visited);
-}
-
-void
-agx_ra(agx_context *ctx)
-{
-   agx_ra_impl(ctx, false);
-}
-
-/* Retry from a fresh compiler context, retaining the original full budget. */
-void
-agx_ra_without_remat(agx_context *ctx)
-{
-   agx_ra_impl(ctx, true);
 }
