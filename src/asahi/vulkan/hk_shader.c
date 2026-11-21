@@ -226,9 +226,10 @@ hk_get_spirv_options(struct vk_physical_device *vk_pdev,
                      const struct vk_pipeline_robustness_state *rs)
 {
    return (struct spirv_to_nir_options){
-      .ssbo_addr_format = hk_buffer_addr_format(
-         rs->storage_buffers, rs->null_storage_buffer_descriptor,
-         agx_chip_g17_m5(((struct hk_physical_device *)vk_pdev)->dev.chip)),
+      .ssbo_addr_format = hk_ssbo_addr_format(
+         agx_chip_descriptor_generation(
+            ((struct hk_physical_device *)vk_pdev)->dev.chip),
+         rs),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .ubo_addr_format = hk_ubo_addr_format(rs->uniform_buffers),
       .shared_addr_format = nir_address_format_32bit_offset,
@@ -3237,13 +3238,12 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             agx_chip_sampler_has_lod_bias(dev->dev.chip),
             instance->drirc.misc.d3d_nearest_mip,
             hk_coherent_images_in_memory(&dev->dev),
-            dev->dev.chip == AGX_CHIP_G17G || dev->dev.chip == AGX_CHIP_G17S);
+            agx_chip_layered_store_is_3d(dev->dev.chip));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            hk_buffer_addr_format(rs->storage_buffers,
-                                  rs->null_storage_buffer_descriptor,
-                                  agx_chip_g17_m5(dev->dev.chip)));
+            hk_ssbo_addr_format(
+               agx_chip_descriptor_generation(dev->dev.chip), rs));
    /* While UBO offsets are still 32-bit deref offsets, merge the loads of a
     * block that read the same record: once lowered, their 64-bit addresses
     * hide how they relate. Components of a vector become loads of the whole

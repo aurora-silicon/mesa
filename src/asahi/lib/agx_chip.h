@@ -535,6 +535,17 @@ agx_chip_g17_m5(enum agx_chip chip)
           chip == AGX_CHIP_G17C;
 }
 
+/* Whether the image store instruction has no layer operand, so a store to a
+ * layer of an array is a 3D store with the layer in z (agx3_pack_binary.c).
+ * The image descriptors hk writes (hk_image_view.c) and the store lowering
+ * that reads them (hk_nir_lower_descriptors.c) both follow this, so they
+ * must ask the same question. The M5 Max (G17C) has the layer operand. */
+static inline bool
+agx_chip_layered_store_is_3d(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S;
+}
+
 /* Whether consecutive application dispatches of one CDM stream may omit the
  * ordering barrier between them.  Vulkan orders dispatches only through
  * explicit barriers; every other record (internal or indirect launch, cache

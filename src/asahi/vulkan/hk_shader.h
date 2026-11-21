@@ -782,6 +782,28 @@ hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
    }
 }
 
+/* Generation 10 storage buffer descriptors carry a fifth address word, the
+ * residency map page (storage_address() in hk_nir_lower_descriptors.c), so
+ * their SSBO pointers use the _map address formats.  spirv_to_nir builds the
+ * SSBO derefs, hk_nir_lower_descriptors rewrites their resource indices and
+ * nir_lower_explicit_io consumes them: all three must agree on the number of
+ * address components, so all three take the format from here, keyed on the
+ * descriptor generation the set layouts are built with. */
+static inline bool
+hk_storage_address_has_map(enum agx_descriptor_generation generation)
+{
+   return generation == AGX_DESCRIPTOR_GENERATION_10;
+}
+
+static inline nir_address_format
+hk_ssbo_addr_format(enum agx_descriptor_generation generation,
+                    const struct vk_pipeline_robustness_state *rs)
+{
+   return hk_buffer_addr_format(rs->storage_buffers,
+                                rs->null_storage_buffer_descriptor,
+                                hk_storage_address_has_map(generation));
+}
+
 bool hk_lower_uvs_index(nir_shader *s, mesa_shader_stage sw_stage,
                         unsigned nr_vbos, unsigned uniform_base);
 

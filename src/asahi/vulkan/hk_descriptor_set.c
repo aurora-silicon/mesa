@@ -537,12 +537,13 @@ get_buffer_address(const VkDescriptorBufferInfo *const info, bool read_only)
       hk_buffer_addr_range(buffer, info->offset, info->range, read_only);
    assert(addr_range.range <= UINT32_MAX);
 
-   /* Only M5 lowers storage loads through this word. Elsewhere the word is the
-    * address format's byte offset and must stay zero. */
+   /* With the _map storage address formats (hk_storage_address_has_map())
+    * this word is the residency map page. Elsewhere the word is the address
+    * format's byte offset and must stay zero. */
    uint32_t sparse_map_page = 0;
    if (!read_only && buffer && buffer->sparse_map &&
-       agx_chip_g17_m5(
-          ((const struct hk_device *)buffer->vk.base.device)->dev.chip)) {
+       hk_storage_address_has_map(agx_chip_descriptor_generation(
+          ((const struct hk_device *)buffer->vk.base.device)->dev.chip))) {
       const uint64_t map_addr = buffer->sparse_map->va->addr;
       assert((map_addr % AIL_PAGESIZE) == 0);
       assert((map_addr / AIL_PAGESIZE) <= UINT32_MAX);

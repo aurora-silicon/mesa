@@ -518,8 +518,8 @@ pack_pbe(struct hk_device *dev, struct hk_image_view *view, unsigned view_plane,
        * End-of-tile stores use block access and keep their own dimension.
        */
       const bool layers_as_3d =
-         generation == 10 && agx_chip_g17_m5(dev->dev.chip) &&
-         dev->dev.chip != AGX_CHIP_G17C && !eot &&
+         generation == 10 && agx_chip_layered_store_is_3d(dev->dev.chip) &&
+         !eot &&
          layout->tiling != AIL_TILING_LINEAR &&
          cfg.dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY;
 

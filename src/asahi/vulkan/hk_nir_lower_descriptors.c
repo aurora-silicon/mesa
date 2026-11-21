@@ -2142,8 +2142,6 @@ hk_nir_lower_descriptors(nir_shader *nir,
 
          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT,
 
-      .ssbo_addr_format = hk_buffer_addr_format(
-         rs->storage_buffers, rs->null_storage_buffer_descriptor, false),
       .ubo_addr_format = hk_ubo_addr_format(rs->uniform_buffers),
    };
 
@@ -2159,9 +2157,7 @@ hk_nir_lower_descriptors(nir_shader *nir,
       }
    }
 
-   ctx.ssbo_addr_format = hk_buffer_addr_format(
-      rs->storage_buffers, rs->null_storage_buffer_descriptor,
-      ctx.descriptor_generation == 10);
+   ctx.ssbo_addr_format = hk_ssbo_addr_format(ctx.descriptor_generation, rs);
 
    /* First lower everything but complex SSBOs, then lower complex SSBOs.
     *
