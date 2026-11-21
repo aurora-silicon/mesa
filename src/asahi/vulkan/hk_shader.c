@@ -1548,6 +1548,46 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr,
    }
 
    b->cursor = nir_before_instr(&intr->instr);
+   /* Keep a vec4 array index in elements. The descriptor and the zero page
+    * can each address 4096 such elements. Complete the bounds check before
+    * reducing the index for the GPU's scaled addressing mode. */
+   STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT == 64);
+   STATIC_ASSERT((HK_MAX_UBO_RANGE & (HK_MAX_UBO_RANGE - 1)) == 0);
+   STATIC_ASSERT(HK_MAX_UBO_RANGE <= AGX_ZERO_PAGE_SIZE);
+   STATIC_ASSERT(HK_MAX_INLINE_UNIFORM_BLOCK_SIZE <= HK_MAX_UBO_RANGE);
+   nir_deref_instr *member = path.path[1];
+   nir_scalar initial = nir_scalar_resolved(root->parent.ssa, 3);
+   if (member && member->deref_type == nir_deref_type_struct &&
+       glsl_get_struct_field_offset(root->type, member->strct.index) == 0 &&
+       path.path[2] == leaf && leaf->deref_type == nir_deref_type_array &&
+       nir_deref_instr_array_stride(leaf) == 16 && leaf->arr.index.ssa->bit_size == 32 &&
+       !nir_src_is_const(leaf->arr.index) &&
+       mul >= 16 && (disp % 16) == 0 &&
+       nir_scalar_is_const(initial) && nir_scalar_as_uint(initial) == 0) {
+      nir_def *desc = root->parent.ssa;
+      nir_def *base = nir_pack_64_2x32(b, nir_trim_vector(b, desc, 2));
+      nir_def *bound = nir_channel(b, desc, 2);
+      nir_def *idx = leaf->arr.index.ssa;
+      /* Round the descriptor's size using the advertised 64-byte granule.
+       * No addition to the byte bound can overflow. */
+      nir_def *elements = nir_iadd(b,
+         nir_iand_imm(b, nir_ushr_imm(b, bound, 4), ~3u),
+         nir_bcsel(b, nir_ine_imm(b, nir_iand_imm(b, bound, 63), 0),
+                   nir_imm_int(b, 4), nir_imm_int(b, 0)));
+      nir_def *valid = nir_ult(b, idx, elements);
+      nir_def *safe = nir_bcsel(b, valid, base,
+                                nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      nir_def *element = nir_iand_imm(b, idx, HK_MAX_UBO_RANGE / 16 - 1);
+      nir_def *byte = nir_ishl_imm(b, element, 4);
+      nir_def *value = nir_load_global(b, intr->num_components, 32,
+         nir_iadd(b, safe, nir_u2u64(b, byte)),
+         .align_mul = 16, .align_offset = 0,
+         .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+      nir_def_replace(&intr->def, value);
+      nir_deref_path_finish(&path);
+      return true;
+   }
+
    nir_def *addr = root->parent.ssa;
    /* The deref arithmetic scales each array index into a 32-bit byte offset,
     * which can wrap before the record check below sees it. An index at or
