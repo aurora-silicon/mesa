@@ -704,6 +704,13 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_descriptor_batch_publish', executable('hk_descriptor_batch_publish_test',
+    files('tests/test-hk-descriptor-batch-publish.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections, hk_wrap_test_link_args,
+      '-Wl,--wrap=util_flush_range_no_fence']), suite : ['asahi'])
   test('hk_host_image_copy', executable('hk_host_image_copy_test',
     files('tests/test-hk-host-image-copy.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
