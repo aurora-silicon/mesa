@@ -365,6 +365,35 @@ TEST(AGX3CFirstPassLegalize, FormerlyRetriedShapesNativeAndLegalized)
    }
 }
 
+TEST(AGX3CFirstPassLegalize, RefusalIncludesSourceFilenameAndLine)
+{
+   void *mem = ralloc_context(NULL);
+   agx_shader_key key;
+   agx_builder *b = make_agx3c_builder(mem, &key, kTargets[0]);
+
+   /* Emit a DFDX in a compute shader, which agx3_pack_alu.c refuses. */
+   agx_index r0 = agx_preload(b, agx_register(0, AGX_SIZE_32));
+   agx_index dst = agx_temp(b->shader, AGX_SIZE_32);
+   agx_dfdx_to(b, dst, r0);
+   agx_unit_test(b, dst);
+   agx_stop(b);
+
+   struct agx_shader_info info = {};
+   b->shader->out = &info;
+   agx_ra(b->shader);
+   agx_lower_pseudo(b->shader);
+   agx_foreach_instr_global_safe(b->shader, I) {
+      if (I->op == AGX_OPCODE_UNIT_TEST)
+         agx_remove_instruction(I);
+   }
+   struct util_dynarray bin = UTIL_DYNARRAY_INIT;
+   EXPECT_FALSE(agx3_pack_binary(b->shader, &bin));
+   const std::string refusal = agx3_last_pack_refusal();
+   EXPECT_NE(refusal.find("agx3_pack_alu.c:"), std::string::npos)
+      << "refusal was: " << refusal;
+   util_dynarray_fini(&bin);
+   ralloc_free(mem);
+}
 
 TEST(AGX3CFirstPassLegalize, EndToEndNirCompile)
 {

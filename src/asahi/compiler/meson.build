@@ -57,7 +57,13 @@ libasahi_agx_files = files(
   'agx3_copy_core.c',
   'agx3_isel_core.c',
   'agx3_iadd_core.c',
+  'agx3_pack_alu.c',
   'agx3_pack_binary.c',
+  'agx3_pack_cf.c',
+  'agx3_pack_frag.c',
+  'agx3_pack_mem.c',
+  'agx3_pack_subgroup.c',
+  'agx3_pack_tex.c',
   'agx3_transcode.c',
   'agx3_reencode_cache.c',
   'agx3_binder.c',
@@ -698,7 +704,6 @@ if with_tests
       files(
          'test/test-compact-constants.cpp',
          'test/test-agx3-pack-binary.cpp',
-        'test/test-agx3c-first-pass-legalize.cpp',
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',
@@ -776,6 +781,7 @@ if with_tests
          'test/test-half-bitfield-extract.cpp',
          'test/test-flatten-loads.cpp',
          'test/test-shared-phase-cse.cpp',
+         'test/test-agx3c-first-pass-legalize.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',
