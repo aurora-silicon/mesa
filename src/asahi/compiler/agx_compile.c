@@ -8766,14 +8766,15 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                                   AGX_ROUND_RTE);
       }
 
-      /* M5 converts the low byte of a half register to f32 directly. Byte 0
-       * or 2 of a word, as a packed RGBA8 pixel is unpacked, is the low byte
-       * of its low or high half: no mask or shift. Bytes 1 and 3 take a
-       * 16-bit shift of their half. All four read only the halves, so the
-       * word dies at its split and needs no copy. */
+      /* AGX3B and AGX3C (non-G18G) convert the low byte of a half register to
+       * f32 directly. Byte 0 or 2 of a word, as a packed RGBA8 pixel is
+       * unpacked, is the low byte of its low or high half: no mask or shift.
+       * Bytes 1 and 3 take a 16-bit shift of their half. All four read only
+       * the halves, so the word dies at its split and needs no copy. */
       if (instr->op == nir_op_u2f32 && src_sz == 32 &&
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          !b->shader->key->dev.emit_agx3d) {
+          (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+          !agx_is_g18g(&b->shader->key->dev)) {
          nir_scalar x = nir_scalar_chase_movs(
             nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
          nir_scalar word = {0};

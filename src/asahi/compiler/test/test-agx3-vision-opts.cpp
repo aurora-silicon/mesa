@@ -3,6 +3,10 @@
 #include <cmath>
 #include "agx_test.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_constant_expressions.h"
+#include <functional>
+#include <unordered_map>
+#include <vector>
 #include "util/format/u_format.h"
 extern "C" {
 #include "agx_nir.h"
@@ -2527,3 +2531,737 @@ TEST(AGX3VisionOpts, PackNarrowMuxTreePreNegateAndMaskPeel)
    }
 }
 
+
+TEST(AGX3VisionOpts, Agx3bDirectByteFromWordU2f32)
+{
+   auto compile_unpack = [](enum agx_isa_encoding enc, enum agx_chip chip,
+                            bool emit_agx3d) {
+      nir_builder b = make_compute_shader("u2f32-rgba8-unpack");
+      nir_def *in = make_desc_base(&b, 4);
+      nir_def *out = make_desc_base(&b, 8);
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *w = nir_load_agx(
+         &b, 1, 32, in, gid,
+         .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                              ACCESS_CAN_REORDER),
+         .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+      nir_def *b0 = nir_u2f32(&b, nir_iand_imm(&b, w, 0xff));
+      nir_def *b1 = nir_u2f32(&b, nir_ubitfield_extract_imm(&b, w, 8, 8));
+      nir_def *b2 = nir_u2f32(&b, nir_ubitfield_extract_imm(&b, w, 16, 8));
+      nir_def *b3 = nir_u2f32(&b, nir_ushr_imm(&b, w, 24));
+      nir_def *sum = nir_fadd(&b, nir_fadd(&b, b0, b1), nir_fadd(&b, b2, b3));
+      nir_store_agx(&b, sum, out, gid,
+                    .access = ACCESS_NON_READABLE, .base = 0,
+                    .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_key key = {};
+      key.dev.encoding = enc;
+      key.dev.chip = chip;
+      key.dev.emit_agx3d = emit_agx3d;
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_EQ(part.info.stats.spills, 0u);
+      unsigned instrs = part.info.stats.instrs;
+      free(part.binary);
+      ralloc_free(b.shader);
+      return instrs;
+   };
+
+   /* AGX3B (G15/G16/G17P) matches AGX3C (G17S) direct byte-from-word unpack,
+    * avoiding extra shift/mask ALU instructions needed on AGX2 and G18G. */
+   unsigned agx3b_instrs =
+      compile_unpack(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false);
+   unsigned agx3c_instrs =
+      compile_unpack(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false);
+   unsigned agx2_instrs =
+      compile_unpack(AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false);
+   EXPECT_EQ(agx3b_instrs, agx3c_instrs);
+   EXPECT_LT(agx3b_instrs, agx2_instrs);
+}
+
+TEST(AGX3VisionOpts, HoistRuntimeUnrollGuardBound)
+{
+   auto count_entry_bcsels = [](nir_shader *shader) {
+      unsigned n = 0;
+      nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+      nir_block *entry = nir_start_block(impl);
+      nir_foreach_instr(instr, entry) {
+         if (instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(instr)->op == nir_op_bcsel)
+            n++;
+      }
+      return n;
+   };
+
+   /* Positive control: inner counted loop nested inside two outer loops with
+    * an outer-invariant bound hoists guard_bound() into entry before both
+    * outer loops. */
+   {
+      nir_builder b = make_compute_shader("hoist-guard-bound-2d");
+      nir_def *in = make_desc_base(&b, 4);
+      nir_def *wbuf = make_desc_base(&b, 8);
+      nir_def *out = make_desc_base(&b, 12);
+      nir_def *h = nir_load_preamble(&b, 1, 32, .base = 16);
+      nir_def *w = nir_load_preamble(&b, 1, 32, .base = 20);
+      nir_def *klen = nir_load_preamble(&b, 1, 32, .base = 24);
+
+      nir_variable *y_var = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_variable *x_var = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_variable *k_var = nir_local_variable_create(b.impl, glsl_int_type(), "k");
+      nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+      nir_store_var(&b, y_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *y_loop = nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, y_var);
+         nir_break_if(&b, nir_ige(&b, y, h));
+         nir_store_var(&b, x_var, nir_imm_int(&b, 0), 1);
+         nir_loop *x_loop = nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, x_var);
+            nir_break_if(&b, nir_ige(&b, x, w));
+            nir_store_var(&b, k_var, nir_imm_int(&b, 0), 1);
+            nir_store_var(&b, acc_var, nir_imm_float(&b, 0.0f), 1);
+            nir_loop *k_loop = nir_push_loop(&b);
+            {
+               nir_def *k = nir_load_var(&b, k_var);
+               nir_break_if(&b, nir_ige(&b, k, klen));
+               nir_def *idx = nir_iadd(&b, nir_iadd(&b, y, x), k);
+               nir_def *p = nir_load_agx(
+                  &b, 1, 32, in, idx,
+                  .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                  .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+               nir_def *wt = nir_load_agx(
+                  &b, 1, 32, wbuf, k,
+                  .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+                  .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+               nir_store_var(&b, acc_var,
+                             nir_ffma(&b, nir_u2f32(&b, p), wt, nir_load_var(&b, acc_var)), 1);
+               nir_store_var(&b, k_var, nir_iadd_imm(&b, k, 1), 1);
+            }
+            nir_pop_loop(&b, k_loop);
+            nir_store_agx(&b, nir_load_var(&b, acc_var), out, nir_iadd(&b, y, x),
+                          .access = ACCESS_NON_READABLE, .base = 0,
+                          .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+            nir_store_var(&b, x_var, nir_iadd_imm(&b, x, 1), 1);
+         }
+         nir_pop_loop(&b, x_loop);
+         nir_store_var(&b, y_var, nir_iadd_imm(&b, y, 1), 1);
+      }
+      nir_pop_loop(&b, y_loop);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      unsigned widest = 0;
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, &widest));
+      nir_validate_shader(b.shader, "hoist guard bound 2d");
+      EXPECT_EQ(widest, 8u);
+      EXPECT_GE(count_entry_bcsels(b.shader), 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative control: inner bound depends on the outer loop IV, so
+    * guard_bound() stays inside the outer loop and does not hoist to entry. */
+   {
+      nir_builder b = make_compute_shader("hoist-guard-bound-variant");
+      nir_def *in = make_desc_base(&b, 4);
+      nir_def *out = make_desc_base(&b, 8);
+      nir_def *h = nir_load_preamble(&b, 1, 32, .base = 16);
+
+      nir_variable *y_var = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_variable *k_var = nir_local_variable_create(b.impl, glsl_int_type(), "k");
+      nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_int_type(), "acc");
+      nir_store_var(&b, y_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *y_loop = nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, y_var);
+         nir_break_if(&b, nir_ige(&b, y, h));
+         nir_def *bound = nir_iadd_imm(&b, y, 16);
+         nir_store_var(&b, k_var, nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+         nir_loop *k_loop = nir_push_loop(&b);
+         {
+            nir_def *k = nir_load_var(&b, k_var);
+            nir_break_if(&b, nir_ige(&b, k, bound));
+            nir_def *v = nir_load_agx(
+               &b, 1, 32, in, k,
+               .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+               .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+            nir_store_var(&b, acc_var, nir_iadd(&b, nir_load_var(&b, acc_var), v), 1);
+            nir_store_var(&b, k_var, nir_iadd_imm(&b, k, 1), 1);
+         }
+         nir_pop_loop(&b, k_loop);
+         nir_store_agx(&b, nir_load_var(&b, acc_var), out, y,
+                       .access = ACCESS_NON_READABLE, .base = 0,
+                       .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+         nir_store_var(&b, y_var, nir_iadd_imm(&b, y, 1), 1);
+      }
+      nir_pop_loop(&b, y_loop);
+
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL));
+      nir_validate_shader(b.shader, "hoist guard bound variant");
+      EXPECT_EQ(count_entry_bcsels(b.shader), 0u);
+      ralloc_free(b.shader);
+   }
+}
+
+namespace {
+
+struct NirExecResult {
+   uint32_t out_sum = 0;
+   uint32_t iters = 0;
+   bool hit_step_limit = false;
+};
+
+/* Minimal structured-CF NIR interpreter for testing runtime loop unrolling
+ * across arbitrary runtime inputs (push_constant[0] = start, [4] = bound). */
+static NirExecResult
+exec_loop_nir(nir_shader *shader, uint32_t start_val, uint32_t bound_val,
+              unsigned max_iters = 512)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   std::unordered_map<nir_def *, uint64_t> vals;
+   std::unordered_map<nir_def *, uint64_t> regs;
+   NirExecResult res;
+   nir_block *prev_block = NULL;
+
+   auto get_val = [&](nir_def *d) -> uint64_t {
+      auto it = vals.find(d);
+      EXPECT_NE(it, vals.end()) << "missing SSA value";
+      return it != vals.end() ? it->second : 0;
+   };
+
+   std::function<bool(struct exec_list *)> run_list =
+      [&](struct exec_list *list) -> bool {
+      foreach_list_typed(nir_cf_node, node, node, list) {
+         if (res.hit_step_limit)
+            return true;
+         switch (node->type) {
+         case nir_cf_node_block: {
+            nir_block *blk = nir_cf_node_as_block(node);
+            std::vector<std::pair<nir_def *, uint64_t>> phi_updates;
+            nir_foreach_instr(instr, blk) {
+               if (instr->type == nir_instr_type_phi) {
+                  nir_phi_instr *phi = nir_instr_as_phi(instr);
+                  nir_phi_src *ps = nir_phi_get_src_from_block(phi, prev_block);
+                  EXPECT_NE(ps, nullptr);
+                  if (ps)
+                     phi_updates.push_back({&phi->def, get_val(ps->src.ssa)});
+                  continue;
+               }
+               if (!phi_updates.empty()) {
+                  for (auto &kv : phi_updates)
+                     vals[kv.first] = kv.second;
+                  phi_updates.clear();
+               }
+               switch (instr->type) {
+               case nir_instr_type_load_const: {
+                  nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+                  vals[&lc->def] = nir_const_value_as_uint(lc->value[0], lc->def.bit_size);
+                  break;
+               }
+               case nir_instr_type_undef: {
+                  nir_undef_instr *u = nir_instr_as_undef(instr);
+                  vals[&u->def] = 0;
+                  break;
+               }
+               case nir_instr_type_alu: {
+                  nir_alu_instr *alu = nir_instr_as_alu(instr);
+                  const nir_op_info *info = &nir_op_infos[alu->op];
+                  nir_const_value src_arr[4][NIR_MAX_VEC_COMPONENTS] = {};
+                  nir_const_value *srcs[4];
+                  for (unsigned i = 0; i < info->num_inputs; ++i) {
+                     unsigned bs = alu->src[i].src.ssa->bit_size;
+                     src_arr[i][0] = nir_const_value_for_uint(get_val(alu->src[i].src.ssa), bs);
+                     srcs[i] = src_arr[i];
+                  }
+                  unsigned eval_bs = 0;
+                  if (!nir_alu_type_get_type_size(info->output_type)) {
+                     eval_bs = alu->def.bit_size;
+                  } else {
+                     for (unsigned i = 0; i < info->num_inputs; ++i) {
+                        if (!nir_alu_type_get_type_size(info->input_types[i])) {
+                           eval_bs = alu->src[i].src.ssa->bit_size;
+                           break;
+                        }
+                     }
+                     if (!eval_bs)
+                        eval_bs = alu->def.bit_size;
+                  }
+                  nir_const_value dest[NIR_MAX_VEC_COMPONENTS] = {};
+                  uint16_t poison = 0;
+                  nir_eval_const_opcode(alu->op, dest, &poison, 1, eval_bs, srcs, 0);
+                  vals[&alu->def] = nir_const_value_as_uint(dest[0], alu->def.bit_size);
+                  break;
+               }
+               case nir_instr_type_intrinsic: {
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  switch (intr->intrinsic) {
+                  case nir_intrinsic_load_push_constant: {
+                     uint32_t off = (uint32_t)get_val(intr->src[0].ssa) + nir_intrinsic_base(intr);
+                     vals[&intr->def] = (off == 0) ? start_val : bound_val;
+                     break;
+                  }
+                  case nir_intrinsic_load_preamble: {
+                     vals[&intr->def] = 0;
+                     break;
+                  }
+                  case nir_intrinsic_decl_reg: {
+                     regs[&intr->def] = 0;
+                     break;
+                  }
+                  case nir_intrinsic_load_reg: {
+                     vals[&intr->def] = regs[intr->src[0].ssa];
+                     break;
+                  }
+                  case nir_intrinsic_store_reg: {
+                     regs[intr->src[1].ssa] = get_val(intr->src[0].ssa);
+                     break;
+                  }
+                  case nir_intrinsic_load_agx: {
+                     /* Deterministic per-index payload: (idx * 2654435761u) ^ 0x5a5a5a5au. */
+                     uint32_t idx = (uint32_t)get_val(intr->src[1].ssa);
+                     res.iters++;
+                     if (res.iters > max_iters) {
+                        res.hit_step_limit = true;
+                        return true;
+                     }
+                     vals[&intr->def] = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     break;
+                  }
+                  case nir_intrinsic_store_agx: {
+                     res.out_sum = (uint32_t)get_val(intr->src[0].ssa);
+                     break;
+                  }
+                  default:
+                     ADD_FAILURE() << "unexpected intrinsic " << nir_intrinsic_infos[intr->intrinsic].name;
+                     break;
+                  }
+                  break;
+               }
+               case nir_instr_type_jump: {
+                  nir_jump_instr *j = nir_instr_as_jump(instr);
+                  EXPECT_EQ(j->type, nir_jump_break);
+                  prev_block = blk;
+                  return true;
+               }
+               default:
+                  ADD_FAILURE() << "unexpected instr type";
+                  break;
+               }
+            }
+            for (auto &kv : phi_updates)
+               vals[kv.first] = kv.second;
+            prev_block = blk;
+            break;
+         }
+         case nir_cf_node_if: {
+            nir_if *nif = nir_cf_node_as_if(node);
+            bool cond = (get_val(nif->condition.ssa) & 1u) != 0;
+            bool broke = run_list(cond ? &nif->then_list : &nif->else_list);
+            if (broke)
+               return true;
+            break;
+         }
+         case nir_cf_node_loop: {
+            nir_loop *lp = nir_cf_node_as_loop(node);
+            while (!res.hit_step_limit) {
+               if (run_list(&lp->body))
+                  break;
+            }
+            break;
+         }
+         default:
+            break;
+         }
+      }
+      return false;
+   };
+
+   run_list(&impl->body);
+   return res;
+}
+
+static nir_shader *
+build_counted_sum_shader(bool is_unsigned, bool inclusive, int step,
+                         bool bottom_tested, bool const_bound = false,
+                         uint32_t bound_imm = 0)
+{
+   nir_builder b = make_compute_shader("bin-tail-exec");
+   nir_def *in = nir_load_preamble(&b, 1, 64, .base = 4);
+   nir_def *out = nir_load_preamble(&b, 1, 64, .base = 8);
+   nir_def *start = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 16);
+   nir_def *bound = const_bound
+                       ? nir_imm_int(&b, bound_imm)
+                       : nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 16);
+
+   nir_variable *i_var = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_store_var(&b, i_var, start, 1);
+   nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+
+   auto make_break_cond = [&](nir_def *v) -> nir_def * {
+      if (step > 0) {
+         if (inclusive)
+            return is_unsigned ? nir_ult(&b, bound, v) : nir_ilt(&b, bound, v);
+         return is_unsigned ? nir_uge(&b, v, bound) : nir_ige(&b, v, bound);
+      } else {
+         if (inclusive)
+            return is_unsigned ? nir_ult(&b, v, bound) : nir_ilt(&b, v, bound);
+         return is_unsigned ? nir_uge(&b, bound, v) : nir_ige(&b, bound, v);
+      }
+   };
+
+   nir_loop *lp = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, i_var);
+      if (!bottom_tested)
+         nir_break_if(&b, make_break_cond(i));
+      nir_def *v = nir_load_agx(
+         &b, 1, 32, in, i,
+         .access = (enum gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .base = 0, .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+      nir_def *next_acc = nir_iadd(&b, nir_imul_imm(&b, nir_load_var(&b, acc_var), 3), v);
+      nir_def *next_i = nir_iadd_imm(&b, i, step);
+      nir_store_var(&b, acc_var, next_acc, 1);
+      nir_store_var(&b, i_var, next_i, 1);
+      if (bottom_tested)
+         nir_break_if(&b, make_break_cond(next_i));
+   }
+   nir_pop_loop(&b, lp);
+
+   nir_store_agx(&b, nir_load_var(&b, acc_var), out, nir_imm_int(&b, 0),
+                 .access = ACCESS_NON_READABLE, .base = 0,
+                 .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_copy_prop);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   return b.shader;
+}
+
+} /* namespace */
+
+TEST(AGX3VisionOpts, BinaryTailPeelShapeAndGuards)
+{
+   /* Top-tested REL_LT: wrap is impossible, so binary-peeling eliminates the
+    * scalar remainder loop completely (1 loop total). */
+   {
+      nir_shader *s = build_counted_sum_shader(false, false, 1, false);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL));
+      nir_validate_shader(s, "binary tail top lt");
+      EXPECT_EQ(count_loops(s), 1u);
+      ralloc_free(s);
+   }
+
+   /* Top-tested REL_LE with non-max constant bound: wrap is impossible, so
+    * the scalar remainder loop is eliminated (1 loop total). */
+   {
+      nir_shader *s = build_counted_sum_shader(true, true, 1, false, true, 100u);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL));
+      nir_validate_shader(s, "binary tail const non-max le");
+      EXPECT_EQ(count_loops(s), 1u);
+      ralloc_free(s);
+   }
+
+   /* Top-tested REL_LE with runtime bound keeps a guarded wrap fallback loop
+    * after the 4/2/1 tail so bound == max still wraps like the original. */
+   {
+      nir_shader *s = build_counted_sum_shader(true, true, 1, false);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL));
+      nir_validate_shader(s, "binary tail runtime le wrap guard");
+      EXPECT_EQ(count_loops(s), 2u);
+      ralloc_free(s);
+   }
+
+   /* Negative control: factor=4 does not binary-peel the tail. */
+   {
+      nir_shader *s = build_counted_sum_shader(false, false, 1, false);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 4, 320, NULL));
+      nir_validate_shader(s, "factor4 keeps remainder");
+      EXPECT_EQ(count_loops(s), 2u);
+      ralloc_free(s);
+   }
+}
+
+TEST(AGX3VisionOpts, BinaryTailPeelExecution)
+{
+   const uint32_t trips[] = {0, 1, 3, 7, 8, 9, 15, 16, 100};
+
+   for (bool is_unsigned : {false, true}) {
+      for (bool inclusive : {false, true}) {
+         for (int step : {1, -1}) {
+            for (bool bottom : {false, true}) {
+               nir_shader *ref = build_counted_sum_shader(is_unsigned, inclusive, step, bottom);
+               nir_shader *opt = nir_shader_clone(NULL, ref);
+               ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL))
+                  << "u=" << is_unsigned << " inc=" << inclusive
+                  << " step=" << step << " bot=" << bottom;
+               nir_validate_shader(opt, "binary tail exec");
+
+               for (uint32_t n : trips) {
+                  uint32_t start, bound;
+                  if (step > 0) {
+                     start = is_unsigned ? 10u : (uint32_t)(-5);
+                     if (n == 0) {
+                        if (bottom)
+                           continue; /* bottom-tested loops always run >= 1 iter */
+                        bound = inclusive ? (start - 1u) : start;
+                     } else {
+                        bound = inclusive ? (start + n - 1u) : (start + n);
+                     }
+                  } else {
+                     start = is_unsigned ? 200u : 50u;
+                     if (n == 0) {
+                        if (bottom)
+                           continue;
+                        bound = inclusive ? (start + 1u) : start;
+                     } else {
+                        bound = inclusive ? (start - n + 1u) : (start - n);
+                     }
+                  }
+
+                  NirExecResult r_ref = exec_loop_nir(ref, start, bound);
+                  NirExecResult r_opt = exec_loop_nir(opt, start, bound);
+                  EXPECT_FALSE(r_ref.hit_step_limit);
+                  EXPECT_FALSE(r_opt.hit_step_limit);
+                  EXPECT_EQ(r_opt.iters, r_ref.iters)
+                     << "u=" << is_unsigned << " inc=" << inclusive
+                     << " step=" << step << " bot=" << bottom << " n=" << n;
+                  EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+                     << "u=" << is_unsigned << " inc=" << inclusive
+                     << " step=" << step << " bot=" << bottom << " n=" << n;
+               }
+               ralloc_free(ref);
+               ralloc_free(opt);
+            }
+         }
+      }
+   }
+
+   /* Wrap boundary 1: top-tested unsigned REL_LE at bound == UINT32_MAX
+    * starting at 0xfffffff9 must wrap past 0xffffffff to 0 and keep running
+    * (not terminate after 7 tail iterations). */
+   {
+      nir_shader *ref = build_counted_sum_shader(true, true, 1, false);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+      nir_validate_shader(opt, "wrap u32 le max");
+      NirExecResult r_ref = exec_loop_nir(ref, 0xfffffff9u, 0xffffffffu, 20);
+      NirExecResult r_opt = exec_loop_nir(opt, 0xfffffff9u, 0xffffffffu, 20);
+      EXPECT_TRUE(r_ref.hit_step_limit);
+      EXPECT_TRUE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.iters, r_ref.iters);
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+
+   /* Wrap boundary 2: top-tested signed REL_GE at bound == INT32_MIN starting
+    * at INT32_MIN + 6 must wrap past INT32_MIN to INT32_MAX and keep running. */
+   {
+      nir_shader *ref = build_counted_sum_shader(false, true, -1, false);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+      nir_validate_shader(opt, "wrap s32 ge min");
+      uint32_t start = (uint32_t)(INT32_MIN + 6);
+      uint32_t bound = (uint32_t)INT32_MIN;
+      NirExecResult r_ref = exec_loop_nir(ref, start, bound, 20);
+      NirExecResult r_opt = exec_loop_nir(opt, start, bound, 20);
+      EXPECT_TRUE(r_ref.hit_step_limit);
+      EXPECT_TRUE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.iters, r_ref.iters);
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+
+   /* Constant non-extreme bounds (scalar remainder loop eliminated, 1 loop
+    * total): execute top-tested REL_LE/REL_GE including small bounds near 0
+    * and starts near 0 / INT32_MIN / INT32_MAX that hit the guard `never` arm. */
+   struct ConstCase {
+      bool is_unsigned;
+      int step;
+      uint32_t bound;
+   };
+   const ConstCase const_cases[] = {
+      {true, 1, 100u},                   /* unsigned LE const bound 100 */
+      {true, 1, 2u},                     /* unsigned LE small bound (hits 4-chunk never) */
+      {false, -1, (uint32_t)(-5)},       /* signed GE const bound -5 */
+      {false, -1, (uint32_t)(INT32_MAX - 2)}, /* signed GE near INT32_MAX (hits 4-chunk never) */
+      {false, 1, 100u},                  /* signed LE const bound 100 */
+      {true, -1, 1u},                    /* unsigned GE near 0 */
+   };
+   const uint32_t const_trips[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16};
+   for (const auto &cc : const_cases) {
+      nir_shader *ref = build_counted_sum_shader(cc.is_unsigned, true, cc.step,
+                                                 false, true, cc.bound);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+      nir_validate_shader(opt, "binary tail const bound exec");
+      EXPECT_EQ(count_loops(opt), 1u);
+      for (uint32_t n : const_trips) {
+         if (cc.is_unsigned && cc.step > 0 && n > cc.bound + 1u)
+            continue;
+         if (!cc.is_unsigned && cc.step < 0 &&
+             (int64_t)(int32_t)cc.bound + (int64_t)n - 1 > INT32_MAX)
+            continue;
+         uint32_t start;
+         if (n == 0) {
+            if ((cc.is_unsigned && cc.step > 0 && cc.bound == UINT32_MAX) ||
+                (cc.is_unsigned && cc.step < 0 && cc.bound == 0u))
+               continue;
+            start = cc.step > 0 ? (cc.bound + 1u) : (cc.bound - 1u);
+         } else {
+            start = cc.step > 0 ? (cc.bound - n + 1u) : (cc.bound + n - 1u);
+         }
+         NirExecResult r_ref = exec_loop_nir(ref, start, cc.bound);
+         NirExecResult r_opt = exec_loop_nir(opt, start, cc.bound);
+         EXPECT_FALSE(r_ref.hit_step_limit);
+         EXPECT_FALSE(r_opt.hit_step_limit);
+         EXPECT_EQ(r_opt.iters, r_ref.iters)
+            << "const u=" << cc.is_unsigned << " step=" << cc.step
+            << " bound=" << cc.bound << " n=" << n;
+         EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+            << "const u=" << cc.is_unsigned << " step=" << cc.step
+            << " bound=" << cc.bound << " n=" << n;
+      }
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+
+   /* Starts near 0 / INT32_MIN / INT32_MAX with trip counts 1..7, step +1/-1
+    * (exercises the guard_bound `never` arm on 4- and 2-chunk guards). */
+   for (bool is_unsigned : {false, true}) {
+      for (bool inclusive : {false, true}) {
+         for (int step : {1, -1}) {
+            nir_shader *ref = build_counted_sum_shader(is_unsigned, inclusive,
+                                                       step, false);
+            nir_shader *opt = nir_shader_clone(NULL, ref);
+            ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+            nir_validate_shader(opt, "binary tail near-limit exec");
+            const uint32_t starts[] = {
+               0u,
+               step > 0 ? (is_unsigned ? 0u : (uint32_t)INT32_MIN)
+                        : (is_unsigned ? 6u : (uint32_t)INT32_MAX),
+            };
+            for (uint32_t base_start : starts) {
+               for (uint32_t n = 1; n <= 7; ++n) {
+                  if (is_unsigned && step < 0 && base_start < n)
+                     continue;
+                  uint32_t bound =
+                     step > 0 ? (inclusive ? (base_start + n - 1u) : (base_start + n))
+                              : (inclusive ? (base_start - n + 1u) : (base_start - n));
+                  NirExecResult r_ref = exec_loop_nir(ref, base_start, bound);
+                  NirExecResult r_opt = exec_loop_nir(opt, base_start, bound);
+                  EXPECT_FALSE(r_ref.hit_step_limit);
+                  EXPECT_FALSE(r_opt.hit_step_limit);
+                  EXPECT_EQ(r_opt.iters, r_ref.iters)
+                     << "near u=" << is_unsigned << " inc=" << inclusive
+                     << " step=" << step << " start=" << base_start << " n=" << n;
+                  EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+                     << "near u=" << is_unsigned << " inc=" << inclusive
+                     << " step=" << step << " start=" << base_start << " n=" << n;
+               }
+            }
+            ralloc_free(ref);
+            ralloc_free(opt);
+         }
+      }
+   }
+
+   /* Wrap boundary 3: bottom-tested exact_tail starting at UINT32_MAX with
+    * bound == 5 (REL_LT) wraps to 0 on iteration 0 and must execute 0..4. */
+   {
+      nir_shader *ref = build_counted_sum_shader(true, false, 1, true);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+      nir_validate_shader(opt, "wrap exact_tail u32");
+      NirExecResult r_ref = exec_loop_nir(ref, 0xffffffffu, 5u, 64);
+      NirExecResult r_opt = exec_loop_nir(opt, 0xffffffffu, 5u, 64);
+      EXPECT_FALSE(r_ref.hit_step_limit);
+      EXPECT_FALSE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.iters, 6u);
+      EXPECT_EQ(r_opt.iters, r_ref.iters);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum);
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+}
+
+TEST(AGX3VisionOpts, Agx3bComputeDeviceLoadIlpSchedule)
+{
+   auto run_sched = [](enum agx_isa_encoding enc, enum agx_chip chip,
+                       unsigned extra_live_32) -> unsigned {
+      void *mem = ralloc_context(NULL);
+      struct agx_shader_key key = {};
+      key.dev.encoding = enc;
+      key.dev.chip = chip;
+
+      agx_builder *b = agx_test_builder(mem);
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(mem, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *body = agx_test_block(b->shader);
+      agx_block *exit = agx_test_block(b->shader);
+      body->loop_header = true;
+      agx_block_add_successor(entry, body);
+      agx_block_add_successor(body, body);
+      agx_block_add_successor(body, exit);
+
+      agx_index base = agx_uniform(4, AGX_SIZE_64);
+      agx_index off = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index acc = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index held[100];
+      assert(extra_live_32 <= 100);
+      for (unsigned i = 0; i < extra_live_32; ++i)
+         held[i] = agx_mov_imm(b, 32, 100 + i);
+
+      /* Emit 4 independent device_loads in pressure order (load, immediate use). */
+      b->cursor = agx_after_block(body);
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index addr_off = agx_iadd(b, off, agx_immediate(i * 4), 0);
+         agx_index val = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *ld = agx_device_load_to(
+            b, val, base, addr_off, AGX_FORMAT_I32, 0x1, 0, 0);
+         ld->memory_can_reorder = true;
+         acc = agx_fadd(b, acc, val);
+      }
+      for (unsigned i = 0; i < extra_live_32; ++i)
+         acc = agx_iadd(b, acc, held[i], 0);
+      agx_device_store(b, acc, agx_uniform(8, AGX_SIZE_64), off, AGX_FORMAT_I32,
+                       0x1, 0, 0);
+
+      agx_ilp_schedule(b->shader);
+
+      unsigned loads_before_first_fadd = 0;
+      agx_foreach_instr_in_block(body, I) {
+         if (I->op == AGX_OPCODE_FADD)
+            break;
+         if (I->op == AGX_OPCODE_DEVICE_LOAD)
+            loads_before_first_fadd++;
+      }
+      ralloc_free(mem);
+      return loads_before_first_fadd;
+   };
+
+   /* Positive control: AGX3B compute with headroom batches loads before fadd. */
+   EXPECT_GE(run_sched(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, 0), 2u);
+   /* Negative control 1: High register pressure (near 104-half occupancy cap)
+    * keeps pressure-minimizing order (1 load before first fadd). */
+   EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, 45), 1u);
+   /* Negative control 2: Near AGX3B 192-half general file limit (program_peak
+    * ~190 halves, in 208-half step >= AGX3B_NUM_REGS) refuses load batching. */
+   EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, 93), 1u);
+   /* Negative control 3: AGX2 does not take the AGX3B compute load path. */
+   EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, 0), 1u);
+}

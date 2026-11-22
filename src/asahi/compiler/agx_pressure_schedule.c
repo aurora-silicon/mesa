@@ -1259,19 +1259,32 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
  * into the next step even when the estimate does not grow; so does a program
  * in the last step, where crossing the top spills.
  */
-int
-agx_ilp_m5_device_load_cap(int program_peak)
+/* Shared device-load occupancy cap for AGX3B (192-half general file,
+ * AGX3B_NUM_REGS) and AGX3C/M5 (256-half file, AGX_ILP_M5_MAX_HALVES).
+ * Both architectures use agx_occupancy_for_register_count() in register
+ * allocation (agx_register_allocate.c) to choose register-file occupancy
+ * tiers, so keeping growth within step_top - AGX_ILP_M5_OCCUPANCY_MARGIN
+ * below max_halves preserves resident thread count without pushing either
+ * file into spilling. */
+static int
+agx_ilp_device_load_cap(int program_peak, int max_halves)
 {
-   if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > AGX_ILP_M5_MAX_HALVES)
+   if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > max_halves)
       return 0;
 
    const int step_top =
       agx_occupancy_for_register_count(program_peak).max_registers;
    if (program_peak + AGX_ILP_M5_LOAD_HEADROOM > step_top ||
-       step_top >= AGX_ILP_M5_MAX_HALVES)
+       step_top >= max_halves)
       return 0;
 
    return step_top - AGX_ILP_M5_OCCUPANCY_MARGIN;
+}
+
+int
+agx_ilp_m5_device_load_cap(int program_peak)
+{
+   return agx_ilp_device_load_cap(program_peak, AGX_ILP_M5_MAX_HALVES);
 }
 
 /* Absolute peak register pressure of a block in source order, in halves:
@@ -1412,12 +1425,15 @@ agx_ilp_schedule(agx_context *ctx)
 
    /* M5 fragments: the same occupancy-capped growth as M5 compute where it
     * exceeds the G17P fragment slack below. */
+   const bool agx3b_compute =
+      ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble &&
+      ctx->stage == MESA_SHADER_COMPUTE;
    const bool m5_fragment = m5 && !ctx->is_preamble &&
       ctx->stage == MESA_SHADER_FRAGMENT;
 
    uint8_t *size16 = NULL;
    signed m5_occupancy_cap = 0, m5_load_cap = 0;
-   if (m5_compute || m5_copy || m5_fragment) {
+   if (m5_compute || m5_copy || m5_fragment || agx3b_compute) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1431,12 +1447,14 @@ agx_ilp_schedule(agx_context *ctx)
       agx_foreach_block(ctx, block)
          program_peak = MAX2(program_peak,
                              ilp_block_peak(ctx, block, size16, memctx));
+      const int max_halves =
+         agx3b_compute ? AGX3B_NUM_REGS : AGX_ILP_M5_MAX_HALVES;
       /* Keep a margin for register-allocation alignment. */
-      if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= AGX_ILP_M5_MAX_HALVES) {
+      if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= max_halves) {
          m5_occupancy_cap = agx_occupancy_for_register_count(
             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
             AGX_ILP_M5_OCCUPANCY_MARGIN;
-         m5_load_cap = agx_ilp_m5_device_load_cap(program_peak);
+         m5_load_cap = agx_ilp_device_load_cap(program_peak, max_halves);
       }
    }
 
@@ -1451,12 +1469,15 @@ agx_ilp_schedule(agx_context *ctx)
       /* Device loads too, in and outside loops: the pressure order places
        * each right before its first use, so the block waits for one load at
        * a time, as it would for samples. A copy block keeps its own
-       * schedule. M5 only: not G18G, which compiles as AGX3C with
-       * emit_agx3d. */
-      const bool compute_loads = m5_compute && !ctx->key->dev.emit_agx3d &&
-                                 !copy;
+       * schedule. Applies to M5 (non-G18G) and AGX3B compute. */
+      const bool compute_loads =
+         (m5_compute || agx3b_compute) && !agx_is_g18g(&ctx->key->dev) && !copy;
       const unsigned loads = compute_loads ? ilp_block_device_loads(block) : 0;
-      if (m5_compute || copy || loop_samples) {
+      const bool agx3b_loads = agx3b_compute &&
+                               loads >= AGX_ILP_FS_MIN_SAMPLES &&
+                               m5_load_cap > 0 && !ilp_m5_copy_block(ctx, block);
+      if (m5_compute || copy || loop_samples || agx3b_loads) {
+         bool scheduled = false;
          if ((!in_loop[block->index] || copy || loop_samples || loads) &&
              ilp_block_samples(ctx, block) + loads >=
                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
@@ -1492,19 +1513,25 @@ agx_ilp_schedule(agx_context *ctx)
                                          alu_latency, 16 * alu_latency,
                                          load_growth, 0, false, true,
                                          AGX_ILP_FS_SAMPLE_HALVES, windows[w],
-                                         false, true, true, &dag_state))
+                                         false, true, true, &dag_state)) {
+                     scheduled = true;
                      break;
+                  }
                }
             } else {
-               ilp_schedule_block(ctx, block, memctx, native_uniforms,
-                                  alu_latency, 16 * alu_latency, growth, 0,
-                                  false, true, AGX_ILP_FS_SAMPLE_HALVES,
-                                  copy ? AGX_ILP_M5_COPY_SAMPLES
-                                       : AGX_ILP_FS_HOIST_SAMPLES,
-                                  copy, loads > 0, false, &dag_state);
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, alu_latency,
+                  16 * alu_latency, growth, 0, false, true,
+                  AGX_ILP_FS_SAMPLE_HALVES,
+                  copy ? AGX_ILP_M5_COPY_SAMPLES : AGX_ILP_FS_HOIST_SAMPLES,
+                  copy, loads > 0, false, &dag_state);
             }
          }
-         continue;
+         /* On AGX3B, only skip the shared AGX3 schedule when the load-ILP
+          * window actually succeeded; if all windows exceeded the pressure
+          * budget, fall through cleanly. */
+         if (!agx3b_loads || scheduled)
+            continue;
       }
       /* The old ALU-only classifier predates native SCS traversal. On M5,
        * treat every ordered memory operation and completion barrier as

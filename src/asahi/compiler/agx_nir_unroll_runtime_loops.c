@@ -651,19 +651,134 @@ latch_register(nir_loop *loop, nir_def *value)
    return NULL;
 }
 
+static bool
+cf_list_is_pure_alu_and_reg_stores(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      if (node->type != nir_cf_node_block)
+         return false;
+      nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+         if (instr->type == nir_instr_type_alu ||
+             instr->type == nir_instr_type_load_const ||
+             instr->type == nir_instr_type_undef)
+            continue;
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_store_reg || op == nir_intrinsic_load_reg)
+               continue;
+         }
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
+top_tested_only_phi_live_outs(nir_loop *loop, nir_def **later_bounds,
+                              unsigned nlater)
+{
+   nir_block *header = nir_loop_first_block(loop);
+   nir_block *after = nir_cf_node_as_block(nir_cf_node_next(&loop->cf_node));
+   if (nir_block_first_instr(after) &&
+       nir_block_first_instr(after)->type == nir_instr_type_phi)
+      return false;
+
+   nir_foreach_block_in_cf_node(block, &loop->cf_node) {
+      nir_foreach_instr(instr, block) {
+         nir_def *def = nir_instr_def(instr);
+         if (!def)
+            continue;
+         for (unsigned j = 0; j < nlater; ++j) {
+            if (later_bounds[j] == def)
+               return false;
+         }
+         bool outside = false;
+         nir_foreach_use_including_if(src, def)
+            outside |= !block_in_loop(use_block(src), loop);
+         if (outside && (instr->type != nir_instr_type_phi || block != header))
+            return false;
+      }
+   }
+   return true;
+}
+
+static void
+emit_binary_tail_chunk(nir_builder *b, nir_def *cond, nir_cf_list *head,
+                       nir_cf_list *rest, unsigned count)
+{
+   nir_if *chunk_if = nir_push_if(b, cond);
+   nir_pop_if(b, chunk_if);
+   for (unsigned i = 0; i < count; ++i) {
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      nir_cf_list ch, cr;
+      nir_cf_list_clone(&ch, head, &chunk_if->cf_node, remap);
+      nir_cf_list_clone(&cr, rest, &chunk_if->cf_node, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+      nir_cf_reinsert(&ch, nir_after_cf_list(&chunk_if->then_list));
+      nir_cf_reinsert(&cr, nir_after_cf_list(&chunk_if->then_list));
+   }
+}
+
+static nir_def *
+loop_continue_cond(nir_builder *b, const struct counted_loop *cl, nir_def *v,
+                   nir_def *bound)
+{
+   const bool u = cl->is_unsigned;
+   switch (cl->rel) {
+   case REL_LT: return u ? nir_ult(b, v, bound) : nir_ilt(b, v, bound);
+   case REL_LE: return u ? nir_uge(b, bound, v) : nir_ige(b, bound, v);
+   case REL_GT: return u ? nir_ult(b, bound, v) : nir_ilt(b, bound, v);
+   default:     return u ? nir_uge(b, v, bound) : nir_ige(b, v, bound);
+   }
+}
+
+static bool outer_invariant(nir_def *def, nir_loop *outer, unsigned depth);
+static nir_def *rematerialize(nir_builder *b, nir_def *def, nir_loop *loop,
+                              struct hash_table *remap);
+
+/* Compute guard_bound(bound, k) at the outermost enclosing loop preheader
+ * where `bound` is loop-invariant (or rematerializable from values defined
+ * before that loop), so pure ALU guard computations are not repeated inside
+ * outer pixel loops and can move to the uniform preamble. */
+static nir_def *
+guard_bound_hoisted(nir_function_impl *impl, nir_loop *loop, nir_loop *anchor,
+                    const struct counted_loop *cl, nir_def *bound, unsigned k)
+{
+   nir_loop *outermost = anchor;
+   for (nir_cf_node *p = loop->cf_node.parent; p; p = p->parent) {
+      if (p->type == nir_cf_node_loop) {
+         nir_loop *pl = nir_cf_node_as_loop(p);
+         if (outer_invariant(bound, pl, 8))
+            outermost = pl;
+         else
+            break;
+      }
+   }
+   nir_builder gb = nir_builder_at(nir_before_cf_node(&outermost->cf_node));
+   nir_def *bdef = bound;
+   if (outermost != anchor && !def_outside_loop(bound, outermost)) {
+      struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+      bdef = rematerialize(&gb, bound, outermost, remap);
+      _mesa_hash_table_destroy(remap, NULL);
+   }
+   return guard_bound(&gb, cl, bdef, k);
+}
+
 /* later_bounds: the bounds computed for the loops unrolled after this one,
  * which may name a value this loop leaves (plain pointers, not uses). */
 static void
 unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
-            unsigned factor, nir_def **later_bounds, unsigned nlater)
+            unsigned factor, unsigned max_instrs, nir_def **later_bounds,
+            unsigned nlater, bool allow_binary_tail)
 {
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
 
-   /* The guard bound, in the preheader. */
+   /* The guard bound, hoisted to the outermost enclosing loop preheader where
+    * `bound` is invariant. */
    nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
    b.cursor = nir_after_block_before_jump(pre);
-   nir_def *g = guard_bound(&b, cl, bound, factor);
+   nir_def *g = guard_bound_hoisted(impl, loop, loop, cl, bound, factor);
 
    /* A rotated loop runs its body before its test, so the original loop,
     * reached after the main loop, runs at least one more iteration. When
@@ -680,6 +795,22 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
                            iv_back && back_edge_live_outs(loop, outs, &nouts);
    nir_def *iv0 = exact_tail ? init->src.ssa : NULL;
    nir_def *iv_next = exact_tail ? iv_back->src.ssa : NULL;
+
+   /* Compact step-1/-1 counted loops unrolled by 8 leave 0..7 remainder
+    * iterations (unless the induction variable wraps on REL_LE/REL_GE at an
+    * extreme bound or on an exact_tail first iteration at max/min, handled
+    * below). Binary-peeling the tail (4/2/1, factor - 1 extra copies) removes
+    * the scalar remainder backedge on the non-wrapping path and exposes 4x/2x
+    * load vectorization and ILP while staying within 2 * max_instrs. */
+   const int body_ops = count_unrollable(loop, cl->nif);
+   bool binary_tail =
+      allow_binary_tail && factor == 8 &&
+      (cl->step == 1 || cl->step == -1) &&
+      body_ops > 0 &&
+      (unsigned)body_ops * (2 * factor - 1) <= 2 * max_instrs &&
+      (exact_tail ||
+       (!cl->bottom && cl->offset == 0 &&
+        top_tested_only_phi_live_outs(loop, later_bounds, nlater)));
 
    /* The guard test, in the header after its phis. A top-tested loop runs
     * iteration k when its test passes on v + k * step, k = 0 .. factor - 1,
@@ -741,6 +872,8 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
          nir_cf_node_prev(&nir_loop_last_block(main_loop)->cf_node));
       struct exec_list *cont_list = cl->break_in_then ? &bottom_if->else_list
                                                       : &bottom_if->then_list;
+      if (binary_tail && !cf_list_is_pure_alu_and_reg_stores(cont_list))
+         binary_tail = false;
       nir_cf_list cont;
       nir_cf_extract(&cont, nir_before_cf_list(cont_list),
                      nir_after_cf_list(cont_list));
@@ -769,6 +902,126 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
       nir_cf_list_clone(&copies[2 * i], &head, &main_loop->cf_node, remap);
       nir_cf_list_clone(&copies[2 * i + 1], &rest, &main_loop->cf_node, remap);
       _mesa_hash_table_destroy(remap, NULL);
+   }
+
+   if (binary_tail) {
+      nir_intrinsic_instr *iv_load =
+         nir_def_as_intrinsic(cont_alu->src[iv_src].src.ssa);
+      assert(iv_load->intrinsic == nir_intrinsic_load_reg);
+      nir_def *iv_reg = iv_load->src[0].ssa;
+
+      if (exact_tail) {
+         for (unsigned i = 0; i < nouts; ++i) {
+            if (outs[i].invariant)
+               continue;
+            outs[i].reg = latch_register(loop, outs[i].def);
+            assert(outs[i].reg);
+         }
+      }
+
+      const bool u = cl->is_unsigned;
+      b.cursor = nir_before_cf_node(&loop->cf_node);
+      for (unsigned sub = factor / 2; sub >= 2; sub /= 2) {
+         nir_def *v = nir_load_reg(&b, iv_reg);
+         nir_def *gs = guard_bound_hoisted(impl, loop, main_loop, cl, bound, sub);
+         nir_def *cond;
+         if (cl->rel == REL_LT || cl->rel == REL_LE)
+            cond = u ? nir_ult(&b, v, gs) : nir_ilt(&b, v, gs);
+         else
+            cond = u ? nir_ult(&b, gs, v) : nir_ilt(&b, gs, v);
+         emit_binary_tail_chunk(&b, cond, &head, &rest, sub);
+      }
+
+      nir_def *v = nir_load_reg(&b, iv_reg);
+      nir_def *more = loop_continue_cond(&b, cl, v, bound);
+      nir_def *run = exact_tail ? nir_ior(&b, nir_ieq(&b, v, iv0), more) : more;
+      emit_binary_tail_chunk(&b, run, &head, &rest, 1);
+
+      nir_cf_reinsert(&head, nir_before_cf_node(&main_if->cf_node));
+      nir_cf_reinsert(&rest, nir_after_cf_list(&main_loop->body));
+      for (unsigned i = 1; i < factor; ++i) {
+         nir_cf_reinsert(&copies[2 * i], nir_after_cf_list(&main_loop->body));
+         nir_cf_reinsert(&copies[2 * i + 1], nir_after_cf_list(&main_loop->body));
+      }
+
+      /* Top-tested REL_LT/REL_GT cannot wrap (every continuing iteration has
+       * iv < bound <= max or iv > bound >= min), nor can top-tested
+       * REL_LE/REL_GE with a constant bound away from max/min. Otherwise, an
+       * extreme bound (REL_LE at max / REL_GE at min) or an exact_tail first
+       * iteration at max/min can wrap after the 1-chunk; keep the original
+       * scalar loop guarded by the loop condition so wrap semantics match. */
+      bool needs_wrap_fallback = exact_tail;
+      if (!needs_wrap_fallback && (cl->rel == REL_LE || cl->rel == REL_GE)) {
+         const int64_t extreme =
+            cl->rel == REL_LE ? (u ? (int64_t)UINT32_MAX : (int64_t)INT32_MAX)
+                              : (u ? (int64_t)0 : (int64_t)INT32_MIN);
+         needs_wrap_fallback =
+            !nir_scalar_is_const(cl->bound) ||
+            (u ? (int64_t)nir_scalar_as_uint(cl->bound) == extreme
+               : nir_scalar_as_int(cl->bound) == extreme);
+      }
+
+      if (needs_wrap_fallback) {
+         if (!exact_tail) {
+            /* A top-tested loop already checks the exit condition before its
+             * body, so leaving it bare avoids wrapping a loop in an if while
+             * breaking immediately on the normal non-wrapping path. */
+            return;
+         }
+         b.cursor = nir_before_cf_node(&loop->cf_node);
+         nir_def *v_after = nir_load_reg(&b, iv_reg);
+         nir_def *still_more = loop_continue_cond(&b, cl, v_after, bound);
+         nir_if *wrap_if = nir_push_if(&b, still_more);
+         nir_pop_if(&b, wrap_if);
+         nir_cf_list moved;
+         nir_cf_extract(&moved, nir_before_cf_node(&loop->cf_node),
+                        nir_after_cf_node(&loop->cf_node));
+         nir_cf_reinsert(&moved, nir_before_cf_list(&wrap_if->then_list));
+
+         b.cursor = nir_after_cf_node(&wrap_if->cf_node);
+         struct hash_table *again = _mesa_pointer_hash_table_create(NULL);
+         for (unsigned i = 0; i < nouts; ++i) {
+            nir_def *value = outs[i].invariant
+                                ? rematerialize(&b, outs[i].def, loop, again)
+                                : nir_load_reg(&b, outs[i].reg);
+            nir_foreach_use_including_if_safe(src, outs[i].def) {
+               if (!block_in_loop(use_block(src), loop))
+                  nir_src_rewrite(src, value);
+            }
+            for (unsigned j = 0; j < nlater; ++j) {
+               if (later_bounds[j] == outs[i].def)
+                  later_bounds[j] = value;
+            }
+         }
+         _mesa_hash_table_destroy(again, NULL);
+         b.cursor = nir_after_cf_node(&loop->cf_node);
+         for (unsigned i = 0; i < nouts; ++i) {
+            if (!outs[i].invariant)
+               nir_store_reg(&b, outs[i].def, outs[i].reg);
+         }
+         return;
+      }
+
+      b.cursor = nir_before_cf_node(&loop->cf_node);
+      nir_foreach_instr(instr, nir_loop_first_block(loop)) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+         if (load->intrinsic != nir_intrinsic_load_reg)
+            continue;
+         bool outside = false;
+         nir_foreach_use_including_if(src, &load->def)
+            outside |= !block_in_loop(use_block(src), loop);
+         if (!outside)
+            continue;
+         nir_def *value = nir_load_reg(&b, load->src[0].ssa);
+         nir_foreach_use_including_if_safe(src, &load->def) {
+            if (!block_in_loop(use_block(src), loop))
+               nir_src_rewrite(src, value);
+         }
+      }
+      nir_cf_node_remove(&loop->cf_node);
+      return;
    }
 
    nir_cf_reinsert(&head, nir_before_cf_node(&main_if->cf_node));
@@ -1309,7 +1562,8 @@ loop_has_8bit_load(nir_loop *loop)
 static bool
 unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
                 struct util_dynarray *small_peels,
-                struct util_dynarray *outer3_peels)
+                struct util_dynarray *outer3_peels,
+                struct set *unswitched_inners)
 {
    /* With maximal reconvergence the outer loop's invocations must stay
     * together; the split could separate them. */
@@ -1506,6 +1760,7 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
          nir_cf_reinsert(&list, nir_before_cf_list(&nif->then_list));
          nir_cf_reinsert(&copy, nir_before_cf_list(&nif->else_list));
       }
+      _mesa_set_add(unswitched_inners, inner);
       _mesa_set_add(done, outer);
       progress = true;
    }
@@ -1553,7 +1808,9 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       struct util_dynarray small_peels, outer3_peels;
       util_dynarray_init(&small_peels, NULL);
       util_dynarray_init(&outer3_peels, NULL);
-      if (unswitch_nested(impl, factor, max_instrs, &small_peels, &outer3_peels)) {
+      struct set *unswitched_inners = _mesa_pointer_set_create(NULL);
+      if (unswitch_nested(impl, factor, max_instrs, &small_peels, &outer3_peels,
+                          unswitched_inners)) {
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
          nir_metadata_require(impl, nir_metadata_block_index);
@@ -1630,8 +1887,10 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       util_dynarray_fini(&loops);
 
       for (unsigned i = 0; i < n; ++i)
-         unroll_loop(impl, &candidates[i], bounds[i], factors[i], &bounds[i + 1],
-                     n - i - 1);
+         unroll_loop(impl, &candidates[i], bounds[i], factors[i], max_instrs,
+                     &bounds[i + 1], n - i - 1,
+                     !_mesa_set_search(unswitched_inners, candidates[i].loop));
+      _mesa_set_destroy(unswitched_inners, NULL);
 
       if (n) {
          nir_progress(true, impl, nir_metadata_none);
