@@ -1257,11 +1257,27 @@ struct agx_query {
    struct agx_ptr ptr;
 };
 
+enum agx_native_sampler_valid {
+   AGX_NATIVE_SAMPLER_DESC = BITFIELD_BIT(0),
+   AGX_NATIVE_SAMPLER_CLAMP = BITFIELD_BIT(1),
+   AGX_NATIVE_SAMPLER_PROBE = BITFIELD_BIT(2),
+   AGX_NATIVE_SAMPLER_QUERY_LOD = BITFIELD_BIT(3),
+};
+
 struct agx_sampler_state {
    struct pipe_sampler_state base;
 
    /* Prepared descriptor */
    struct agx_sampler_packed desc, desc_without_custom_border;
+
+   /* Pre-packed AGX3 native sampler descriptors (valid bits in
+    * native_desc_valid). Immutable for the lifetime of the sampler CSO.
+    */
+   struct agx_gallium_sampler_descriptor native_desc;
+   struct agx_gallium_sampler_descriptor native_clamp_desc;
+   struct agx_gallium_sampler_descriptor native_probe_desc;
+   struct agx_gallium_sampler_descriptor native_query_lod_desc;
+   uint8_t native_desc_valid;
 
    /* Whether a custom border colour is required */
    bool uses_custom_border;
@@ -1287,8 +1303,13 @@ struct agx_sampler_view {
    struct agx_resource *rsrc;
    enum pipe_format format;
 
-   /* Prepared descriptor */
+   /* Prepared descriptor and the resource/descriptor generation it matches.
+    * desc_packed_gen == AGX_DESCRIPTOR_GENERATION_UNKNOWN (0) means not yet
+    * packed.
+    */
    struct agx_gallium_texture_descriptor desc;
+   uint64_t desc_generation;
+   enum agx_descriptor_generation desc_packed_gen;
 };
 
 struct agx_screen {
@@ -1366,12 +1387,25 @@ struct agx_resource {
     * times multiplied by the resource size.
     */
    size_t shadowed_bytes;
+
+   /* Monotonic generation bumped whenever backing storage or layout changes
+    * (e.g., shadowing, decompression/reallocation, or separate stencil update).
+    * Initialized to 1 on creation; 0 is reserved as "not yet packed" on
+    * agx_sampler_view.
+    */
+   uint64_t desc_generation;
 };
 
 static inline struct agx_resource *
 agx_resource(struct pipe_resource *pctx)
 {
    return (struct agx_resource *)pctx;
+}
+
+static inline void
+agx_resource_bump_desc_generation(struct agx_resource *rsrc)
+{
+   p_atomic_inc(&rsrc->desc_generation);
 }
 
 static inline bool
