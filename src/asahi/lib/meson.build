@@ -64,6 +64,8 @@ libasahi_lib_files = files(
   'agx_ppp_w_clamp_cull2_core.h',
   'agx_pbe_agx3_core.c',
   'agx_pbe_agx3_core.h',
+  'agx_native_descriptor.c',
+  'agx_native_descriptor.h',
   'agx_scs_layout.c',
   'agx_scs_layout.h',
   'agx_scratch.c',
@@ -613,6 +615,22 @@ if with_tests
         'tests/test-pbe-agx3-core.c',
       ),
       include_directories : [inc_include, inc_src, inc_asahi],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'asahi-lib-native-descriptor',
+    executable(
+      'asahi-lib-native-descriptor',
+      files(
+        'agx_native_descriptor.c',
+        'agx_pbe_agx3_core.c',
+        'tests/test-agx-native-descriptor.c',
+      ),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_agx_pack, idep_mesautil],
+      c_args : [c_msvc_compat_args, no_override_init_args],
     ),
     suite : ['asahi'],
   )
