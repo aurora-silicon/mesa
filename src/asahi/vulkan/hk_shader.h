@@ -10,7 +10,9 @@
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/compiler/agx_nir.h"
 #include "poly/nir/poly_nir.h"
+#include "util/hash_table.h"
 #include "util/macros.h"
+#include "util/u_atomic.h"
 #include "agx_linker.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_pack.h"
@@ -218,6 +220,16 @@ struct hk_fast_link_key_fs {
    struct agx_fs_epilog_key epilog;
 };
 
+/* Bounded lock-free cache of drawn immutable fast-linked variants on
+ * shader->linked. Four pointers (32 B, half a cache line alongside lock/ht)
+ * cover typical per-shader dynamic state variants (e.g. color write mask,
+ * blend, sample count, topology) while keeping the lock-free scan to at most
+ * four acquire loads. Slots fill monotonically under shader->linked.lock only
+ * when a variant is drawn (prelinks stay in ht until drawn), after every field
+ * of the linked shader (including fast_key) is initialized, and remain live
+ * until hk_shader_destroy(). */
+#define HK_SHADER_FAST_LINK_SLOTS 4
+
 struct hk_shader {
    struct agx_shader_part b;
 
@@ -255,6 +267,8 @@ struct hk_shader {
    struct {
       simple_mtx_t lock;
       struct hash_table *ht;
+      struct hk_linked_shader *fast[HK_SHADER_FAST_LINK_SLOTS];
+      uint8_t fast_count;
       bool lazy_ht;
    } linked;
 
@@ -668,7 +682,74 @@ struct hk_linked_shader {
       uint8_t data[HK_MAX_LINKED_USC_SIZE];
       size_t size;
    } usc;
+
+   /* Colour attachments written by a fast-linked fragment program
+    * (hk_fs_color_written()), cached once at link time. */
+   uint8_t fs_color_written;
+
+   /* Immutable fast-link key for lock-free lookups on shader->linked.
+    * Initialized before publishing into shader->linked.fast[]. */
+   union {
+      struct hk_fast_link_key_vs vs;
+      struct hk_fast_link_key_fs fs;
+   } fast_key;
 };
+
+static inline size_t
+hk_fast_link_key_size(mesa_shader_stage stage)
+{
+   if (stage == MESA_SHADER_VERTEX)
+      return sizeof(struct hk_fast_link_key_vs);
+   assert(stage == MESA_SHADER_FRAGMENT);
+   return sizeof(struct hk_fast_link_key_fs);
+}
+
+static inline struct hk_linked_shader *
+hk_shader_fast_link_lookup_lockfree(const struct hk_shader *shader,
+                                    const void *key, size_t key_size)
+{
+   for (unsigned i = 0; i < HK_SHADER_FAST_LINK_SLOTS; ++i) {
+      struct hk_linked_shader *cand = p_atomic_read(&shader->linked.fast[i]);
+      if (!cand)
+         break;
+      if (memcmp(&cand->fast_key, key, key_size) == 0)
+         return cand;
+   }
+   return NULL;
+}
+
+static inline void
+hk_shader_fast_link_promote_locked(struct hk_shader *shader,
+                                   struct hk_linked_shader *linked)
+{
+   simple_mtx_assert_locked(&shader->linked.lock);
+   if (shader->linked.fast_count >= HK_SHADER_FAST_LINK_SLOTS)
+      return;
+   for (unsigned i = 0; i < shader->linked.fast_count; ++i) {
+      if (shader->linked.fast[i] == linked)
+         return;
+   }
+   p_atomic_set(&shader->linked.fast[shader->linked.fast_count], linked);
+   shader->linked.fast_count++;
+}
+
+static inline void
+hk_shader_fast_link_publish_locked(struct hk_shader *shader,
+                                   struct hk_linked_shader *linked,
+                                   const void *key, size_t key_size,
+                                   bool promote_fast)
+{
+   simple_mtx_assert_locked(&shader->linked.lock);
+   memcpy(&linked->fast_key, key, key_size);
+   if (_mesa_hash_table_insert(shader->linked.ht, &linked->fast_key, linked) &&
+       promote_fast) {
+      hk_shader_fast_link_promote_locked(shader, linked);
+   }
+}
+
+struct hk_linked_shader *hk_get_fast_linked(struct hk_device *dev,
+                                            struct hk_shader *shader,
+                                            void *key);
 
 /* Executable resource requirements may differ from the API shader's after
  * specialization. Use this for both loader and surrounding launch records. */

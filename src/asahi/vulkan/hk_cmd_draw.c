@@ -6938,7 +6938,8 @@ hk_get_prolog_epilog(struct hk_device *dev, void *data, size_t data_size,
 
 static struct hk_linked_shader *
 hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
-                             struct hk_fast_link_key_vs *key)
+                             struct hk_fast_link_key_vs *key,
+                             bool promote_fast)
 {
    struct agx_shader_part *prolog =
       hk_get_prolog_epilog(dev, &key->prolog, sizeof(key->prolog),
@@ -6948,24 +6949,18 @@ hk_get_fast_linked_locked_vs(struct hk_device *dev, struct hk_shader *shader,
    if (!prolog)
       return NULL;
 
-   struct hk_fast_link_key *key_clone =
-      ralloc_memdup(shader->linked.ht, key, sizeof(*key));
-   if (!key_clone)
-      return NULL;
-
    struct hk_linked_shader *linked = hk_fast_link_vertex(
       dev, shader, prolog, key->uvs_flat, key->uvs_linear);
-   if (!linked) {
-      ralloc_free(key_clone);
+   if (!linked)
       return NULL;
-   }
 
    /* XXX: Fix this higher up the stack */
    linked->sw_indexing = !key->prolog.hw || key->prolog.adjacency;
    linked->sw_indexing_hw_vs = key->prolog.hw && key->prolog.adjacency;
    linked->b.uses_base_param |= linked->sw_indexing;
 
-   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   hk_shader_fast_link_publish_locked(shader, linked, key, sizeof(*key),
+                                      promote_fast);
    return linked;
 }
 
@@ -7572,9 +7567,13 @@ fail:
 #undef HK_MONO_FAIL
 }
 
+static uint8_t hk_fs_color_written(const struct hk_fast_link_key_fs *key,
+                                   bool preserved_written);
+
 static struct hk_linked_shader *
 hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
-                             struct hk_fast_link_key_fs *key)
+                             struct hk_fast_link_key_fs *key,
+                             bool promote_fast)
 {
    /* TODO: prolog without fs needs to work too... */
    bool needs_prolog = key->prolog.statistics || key->prolog.run_zs_tests ||
@@ -7638,25 +7637,22 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       struct agx_shader_part *mono = hk_g17p_inline_epilog_part(
          dev, shader, &key->epilog, g17p_tile_partitions);
       if (mono) {
-         struct hk_fast_link_key *mono_key_clone =
-            ralloc_memdup(shader->linked.ht, key, sizeof(*key));
          /* An M5 uniform-colour blend variant links with its own launch
           * source. Any other program with its own constant program brings
           * its own uniform layout; link it as the main of a shader
           * describing that layout. */
+         const bool own_layout =
+            !uniform_blend && hk_g17p_mono_own_layout(shader, mono);
          struct hk_shader *layout =
-            !uniform_blend && mono_key_clone &&
-                  hk_g17p_mono_own_layout(shader, mono)
-               ? hk_g17p_layout_shader_create(dev, shader, mono)
-               : NULL;
+            own_layout ? hk_g17p_layout_shader_create(dev, shader, mono) : NULL;
          struct hk_linked_shader *mono_linked = NULL;
-         if (mono_key_clone && uniform_blend)
+         if (uniform_blend)
             mono_linked = hk_fast_link_fragment_variant(dev, shader, mono,
                                                         &key->epilog);
          else if (layout)
             mono_linked = hk_fast_link_part(dev, true, layout, NULL, NULL,
                                             NULL, 0, NULL);
-         else if (mono_key_clone && !hk_g17p_mono_own_layout(shader, mono))
+         else if (!own_layout)
             mono_linked = hk_fast_link_part(dev, true, shader, mono, NULL,
                                             NULL, 0, NULL);
          free(mono->binary);
@@ -7673,11 +7669,12 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                key->epilog.blend_constant_base;
             mono_linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
             mono_linked->g17p_prolog_uses_root = key->prolog.statistics;
-            _mesa_hash_table_insert(shader->linked.ht, mono_key_clone,
-                                    mono_linked);
+            mono_linked->fs_color_written =
+               hk_fs_color_written(key, agx_chip_g17_m5(dev->dev.chip));
+            hk_shader_fast_link_publish_locked(shader, mono_linked, key,
+                                               sizeof(*key), promote_fast);
             return mono_linked;
          }
-         ralloc_free(mono_key_clone);
       }
    }
 
@@ -7714,13 +7711,6 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
       return NULL;
    }
 
-   struct hk_fast_link_key *key_clone =
-      ralloc_memdup(shader->linked.ht, key, sizeof(*key));
-   if (!key_clone) {
-      mesa_loge("fragment fast-link key allocation failed");
-      return NULL;
-   }
-
    struct hk_linked_shader *linked =
       hk_fast_link(dev, true, shader, prolog, epilog, key->nr_samples_shaded);
    if (!linked) {
@@ -7731,23 +7721,22 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
                 link_info, key->epilog.nr_samples, key->nr_samples_shaded,
                 prolog != NULL, shader->b.binary != NULL,
                 epilog->binary != NULL);
-      ralloc_free(key_clone);
       return NULL;
    }
    linked->g17p_blend_constant_base = key->epilog.blend_constant_base;
    linked->g17p_emrt_heap_base = key->epilog.emrt_heap_base;
    linked->g17p_prolog_uses_root = key->prolog.statistics;
+   linked->fs_color_written =
+      hk_fs_color_written(key, agx_chip_g17_m5(dev->dev.chip));
 
-   _mesa_hash_table_insert(shader->linked.ht, key_clone, linked);
+   hk_shader_fast_link_publish_locked(shader, linked, key, sizeof(*key),
+                                      promote_fast);
    return linked;
 }
 
-/*
- * First, look for a fully linked variant. Else, build the required shader
- * parts and link.
- */
-static struct hk_linked_shader *
-hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
+static __attribute__((noinline)) struct hk_linked_shader *
+hk_get_fast_linked_slow(struct hk_device *dev, struct hk_shader *shader,
+                        void *key, bool promote_fast)
 {
    struct hk_linked_shader *linked;
    simple_mtx_lock(&shader->linked.lock);
@@ -7761,11 +7750,13 @@ hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
 
    if (ent) {
       linked = ent->data;
+      if (promote_fast)
+         hk_shader_fast_link_promote_locked(shader, linked);
    } else {
       if (shader->info.stage == MESA_SHADER_VERTEX)
-         linked = hk_get_fast_linked_locked_vs(dev, shader, key);
+         linked = hk_get_fast_linked_locked_vs(dev, shader, key, promote_fast);
       else if (shader->info.stage == MESA_SHADER_FRAGMENT)
-         linked = hk_get_fast_linked_locked_fs(dev, shader, key);
+         linked = hk_get_fast_linked_locked_fs(dev, shader, key, promote_fast);
       else
          UNREACHABLE("invalid stage");
    }
@@ -7774,34 +7765,70 @@ hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
    return linked;
 }
 
+/* Prelink into shader->linked.ht without consuming lock-free fast[] slots so
+ * never-drawn pipeline or shader-object prelinks cannot crowd out hot variants
+ * that are actually drawn (the first draw promotes any ht hit into fast[]). */
+static void
+hk_prelink_fast_linked(struct hk_device *dev, struct hk_shader *shader,
+                       void *key)
+{
+   const size_t key_size = hk_fast_link_key_size(shader->info.stage);
+   if (hk_shader_fast_link_lookup_lockfree(shader, key, key_size))
+      return;
+
+   (void)hk_get_fast_linked_slow(dev, shader, key, false);
+}
+
+/*
+ * First, look for a fully linked variant lock-free. Else, acquire the lock
+ * and search the hash table or build the required shader parts and link.
+ */
+struct hk_linked_shader *
+hk_get_fast_linked(struct hk_device *dev, struct hk_shader *shader, void *key)
+{
+   const size_t key_size = hk_fast_link_key_size(shader->info.stage);
+   struct hk_linked_shader *linked =
+      hk_shader_fast_link_lookup_lockfree(shader, key, key_size);
+   if (likely(linked))
+      return linked;
+
+   return hk_get_fast_linked_slow(dev, shader, key, true);
+}
+
 static __attribute__((hot)) bool
 hk_update_fast_linked(struct hk_cmd_buffer *cmd, struct hk_shader *shader,
                       void *key)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    mesa_shader_stage stage = shader->info.stage;
+   size_t key_size;
 
-   if (stage == MESA_SHADER_VERTEX && gfx->fast_link_vs.valid &&
-       gfx->fast_link_vs.shader == shader &&
-       memcmp(&gfx->fast_link_vs.key, key,
-              sizeof(gfx->fast_link_vs.key)) == 0 &&
-       gfx->linked[stage] != NULL)
-      return true;
+   if (stage == MESA_SHADER_VERTEX) {
+      key_size = sizeof(gfx->fast_link_vs.key);
+      if (gfx->fast_link_vs.valid && gfx->fast_link_vs.shader == shader &&
+          memcmp(&gfx->fast_link_vs.key, key, key_size) == 0 &&
+          gfx->linked[stage] != NULL)
+         return true;
+   } else {
+      assert(stage == MESA_SHADER_FRAGMENT);
+      key_size = sizeof(gfx->fast_link_fs.key);
+      if (gfx->fast_link_fs.valid && gfx->fast_link_fs.shader == shader &&
+          memcmp(&gfx->fast_link_fs.key, key, key_size) == 0 &&
+          gfx->linked[stage] != NULL)
+         return true;
+   }
 
-   if (stage == MESA_SHADER_FRAGMENT && gfx->fast_link_fs.valid &&
-       gfx->fast_link_fs.shader == shader &&
-       memcmp(&gfx->fast_link_fs.key, key,
-              sizeof(gfx->fast_link_fs.key)) == 0 &&
-       gfx->linked[stage] != NULL)
-      return true;
-
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   struct hk_linked_shader *new = hk_get_fast_linked(dev, shader, key);
-   if (!new) {
-      mesa_loge("failed to compile or link required %s shader parts",
-                _mesa_shader_stage_to_string(stage));
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return false;
+   struct hk_linked_shader *new =
+      hk_shader_fast_link_lookup_lockfree(shader, key, key_size);
+   if (unlikely(!new)) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      new = hk_get_fast_linked_slow(dev, shader, key, true);
+      if (!new) {
+         mesa_loge("failed to compile or link required %s shader parts",
+                   _mesa_shader_stage_to_string(stage));
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return false;
+      }
    }
 
    if (gfx->linked[stage] != new) {
@@ -7813,7 +7840,7 @@ hk_update_fast_linked(struct hk_cmd_buffer *cmd, struct hk_shader *shader,
       gfx->fast_link_vs.shader = shader;
       memcpy(&gfx->fast_link_vs.key, key, sizeof(gfx->fast_link_vs.key));
       gfx->fast_link_vs.valid = true;
-   } else if (stage == MESA_SHADER_FRAGMENT) {
+   } else {
       gfx->fast_link_fs.shader = shader;
       memcpy(&gfx->fast_link_fs.key, key, sizeof(gfx->fast_link_fs.key));
       gfx->fast_link_fs.valid = true;
@@ -10210,6 +10237,16 @@ struct hk_fs_link_inputs {
    bool occlusion;
 };
 
+static inline bool
+hk_g17p_fs_may_read_only_early_reject(const struct hk_device *dev,
+                                      const struct hk_shader *fs)
+{
+   return agx_chip_native_agx3(dev->dev.chip) && fs &&
+          fs->b.info.writes_sample_mask && !fs->info.fs.static_tests &&
+          !fs->b.info.early_fragment_tests && !fs->info.fs.writes_memory &&
+          !fs->info.fs.epilog_key.write_z && !fs->info.fs.epilog_key.write_s;
+}
+
 static bool
 hk_g17p_read_only_early_reject_in(const struct hk_device *dev,
                                   const struct hk_shader *fs,
@@ -10221,10 +10258,7 @@ hk_g17p_read_only_early_reject_in(const struct hk_device *dev,
    /* Moving a test ahead of a discard is unobservable only when neither the
     * test nor the skipped fragment has a side effect. The all-live prolog
     * also must not inherit an API-mask or cull-distance kill. */
-   return agx_chip_native_agx3(dev->dev.chip) &&
-          fs->b.info.writes_sample_mask && !fs->info.fs.static_tests &&
-          !fs->b.info.early_fragment_tests && !fs->info.fs.writes_memory &&
-          !fs->info.fs.epilog_key.write_z && !fs->info.fs.epilog_key.write_s &&
+   return hk_g17p_fs_may_read_only_early_reject(dev, fs) &&
           samples == 1 && in->depth_attachment && dyn->ds.depth.test_enable &&
           !dyn->ds.depth.write_enable &&
           dyn->ds.depth.compare_op != VK_COMPARE_OP_ALWAYS &&
@@ -10299,6 +10333,16 @@ agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
    }
 }
 
+/* Shared predicate between hk_vs_link_key_build() and
+ * hk_flush_dynamic_state_slow(): native AGX3 / M5 materializes adjacency into
+ * an index buffer before the hardware vertex program, so primitive topology
+ * only enters the VS prolog key on non-native generations. */
+static inline bool
+hk_vs_link_key_uses_topology(const struct hk_device *dev)
+{
+   return !agx_chip_native_or_m5(dev->dev.chip);
+}
+
 static void
 hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                      enum mesa_prim prim, bool indexed,
@@ -10332,7 +10376,7 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
 
       /* G17P materialises adjacency into an index buffer before the hardware
        * vertex program. Applying the remap again in the prolog is wrong. */
-      if (!agx_chip_native_or_m5(dev->dev.chip))
+      if (hk_vs_link_key_uses_topology(dev))
          key->prolog.adjacency = prim;
    }
 
@@ -10704,7 +10748,7 @@ hk_prelink_fragment(struct hk_device *dev, struct hk_api_shader *fs_api,
    };
    struct hk_fast_link_key_fs key;
    if (hk_fs_link_key_build(dev, fs, &in, &key, false))
-      hk_get_fast_linked(dev, fs, &key);
+      hk_prelink_fast_linked(dev, fs, &key);
 }
 
 void
@@ -10801,7 +10845,7 @@ hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
       hk_vs_link_key_build(dev, hw, true, MESA_PRIM_TRIANGLES, false,
                            AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
                            &key);
-      hk_get_fast_linked(dev, hw, &key);
+      hk_prelink_fast_linked(dev, hw, &key);
    }
 
    struct hk_shader *sw = &vs_api->variants[HK_VS_VARIANT_SW];
@@ -10809,14 +10853,14 @@ hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
       hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, false,
                            AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
                            &key);
-      hk_get_fast_linked(dev, sw, &key);
+      hk_prelink_fast_linked(dev, sw, &key);
 
       const enum agx_index_size sizes[] = {
          AGX_INDEX_SIZE_U8, AGX_INDEX_SIZE_U16, AGX_INDEX_SIZE_U32};
       for (unsigned i = 0; i < ARRAY_SIZE(sizes); ++i) {
          hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, true,
                               sizes[i], false, &no_vi, no_strides, &key);
-         hk_get_fast_linked(dev, sw, &key);
+         hk_prelink_fast_linked(dev, sw, &key);
       }
    }
 }
@@ -11141,31 +11185,10 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   /* The main shader must not run tests if another linked part will. */
-   bool nontrivial_force_early =
-      fs && (fs->b.info.early_fragment_tests &&
-             (fs->b.info.writes_sample_mask || fs->info.fs.writes_memory));
-
-   bool epilog_discards = hk_fs_epilog_discards(fs, dyn, nontrivial_force_early);
-
-   const unsigned early_reject_samples =
-      MAX2(dyn->ms.rasterization_samples, 1);
-   const unsigned early_reject_full_mask =
-      BITFIELD_MASK(dyn->ms.rasterization_samples);
-   const bool early_reject_has_api_mask =
-      (dyn->ms.sample_mask & early_reject_full_mask) != early_reject_full_mask;
-   const bool early_reject_defer_api_mask =
-      agx_chip_native_agx3(dev->dev.chip) && early_reject_has_api_mask &&
-      !nontrivial_force_early;
-   const bool early_reject_prolog_discards =
-      (early_reject_has_api_mask && !early_reject_defer_api_mask) ||
-      hw_vs->info.cull_distance_array_size;
-   const bool early_reject_statistics = hk_stat_enabled(hk_pipeline_stat_addr(
+   const bool fs_may_early_reject =
+      hk_g17p_fs_may_read_only_early_reject(dev, fs);
+   const bool fs_stats_enabled = hk_stat_enabled(hk_pipeline_stat_addr(
       cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT));
-   const bool read_only_early_reject =
-      fs && hk_g17p_read_only_early_reject(
-               cmd, fs, early_reject_samples, early_reject_prolog_discards,
-               early_reject_statistics);
 
    if (fs_dirty || IS_DIRTY(MS_ALPHA_TO_COVERAGE_ENABLE) ||
        IS_DIRTY(MS_RASTERIZATION_SAMPLES) || IS_DIRTY(MS_SAMPLE_MASK) ||
@@ -11174,6 +11197,33 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
        IS_DIRTY(DS_STENCIL_TEST_ENABLE) ||
        (gfx->dirty & HK_DIRTY_OCCLUSION) || desc->root_dirty) {
+      /* The main shader must not run tests if another linked part will. */
+      bool nontrivial_force_early =
+         fs && (fs->b.info.early_fragment_tests &&
+                (fs->b.info.writes_sample_mask || fs->info.fs.writes_memory));
+
+      bool epilog_discards =
+         hk_fs_epilog_discards(fs, dyn, nontrivial_force_early);
+
+      bool read_only_early_reject = false;
+      if (fs_may_early_reject) {
+         const unsigned early_reject_samples =
+            MAX2(dyn->ms.rasterization_samples, 1);
+         const unsigned early_reject_full_mask =
+            BITFIELD_MASK(dyn->ms.rasterization_samples);
+         const bool early_reject_has_api_mask =
+            (dyn->ms.sample_mask & early_reject_full_mask) !=
+            early_reject_full_mask;
+         const bool early_reject_defer_api_mask =
+            early_reject_has_api_mask && !nontrivial_force_early;
+         const bool early_reject_prolog_discards =
+            (early_reject_has_api_mask && !early_reject_defer_api_mask) ||
+            hw_vs->info.cull_distance_array_size;
+         read_only_early_reject = hk_g17p_read_only_early_reject(
+            cmd, fs, early_reject_samples, early_reject_prolog_discards,
+            fs_stats_enabled);
+      }
+
       const uint16_t no_epilog_discard =
          !epilog_discards && !read_only_early_reject ? UINT16_MAX : 0;
       /* A main part compiled with the selector folded (AGX3 static state)
@@ -11198,9 +11248,13 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       linked_prolog->sw_index_size_B !=
          (draw.indexed ? agx_index_size_to_B(draw.index_size) : 0);
 
-   if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
-        IS_DIRTY(VI_BINDING_STRIDES) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
-        vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed ||
+   if (!native_mesh &&
+       (vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed ||
+        (sw_vs->info.vs.use_prolog &&
+         (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
+          IS_DIRTY(VI_BINDING_STRIDES))) ||
+        (hk_vs_link_key_uses_topology(dev) &&
+         IS_DIRTY(IA_PRIMITIVE_TOPOLOGY)) ||
         hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
       struct hk_fast_link_key_vs key;
       hk_fill_fast_link_key_vs(cmd, sw_vs, hw_vs, draw.indexed,
@@ -11262,29 +11316,32 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       gfx->root_vertex_buffer_generation = gfx->vertex_buffer_generation;
    }
 
-   if (vgt_dirty || IS_SHADER_DIRTY(FRAGMENT) ||
+   const bool fs_early_reject_dirty =
+      fs_may_early_reject &&
+      (IS_DIRTY(DS_DEPTH_TEST_ENABLE) || IS_DIRTY(DS_DEPTH_WRITE_ENABLE) ||
+       IS_DIRTY(DS_DEPTH_COMPARE_OP) ||
+       IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
+       IS_DIRTY(DS_STENCIL_TEST_ENABLE) ||
+       (gfx->dirty & HK_DIRTY_OCCLUSION));
+
+   if (IS_SHADER_DIRTY(FRAGMENT) || !gfx->fast_link_fs.valid ||
+       (vgt_dirty && hw_vs->info.cull_distance_array_size !=
+                        gfx->fast_link_fs.key.prolog.cull_distance_size) ||
        IS_DIRTY(MS_RASTERIZATION_SAMPLES) || IS_DIRTY(MS_SAMPLE_MASK) ||
        IS_DIRTY(MS_ALPHA_TO_COVERAGE_ENABLE) ||
        IS_DIRTY(MS_ALPHA_TO_ONE_ENABLE) || IS_DIRTY(CB_LOGIC_OP) ||
        IS_DIRTY(CB_LOGIC_OP_ENABLE) || IS_DIRTY(CB_WRITE_MASKS) ||
        IS_DIRTY(CB_COLOR_WRITE_ENABLES) || IS_DIRTY(CB_ATTACHMENT_COUNT) ||
        IS_DIRTY(CB_BLEND_ENABLES) || IS_DIRTY(CB_BLEND_EQUATIONS) ||
-       IS_DIRTY(CB_BLEND_CONSTANTS) || IS_DIRTY(CB_BLEND_ADVANCED) ||
-       IS_DIRTY(DS_DEPTH_TEST_ENABLE) || IS_DIRTY(DS_DEPTH_WRITE_ENABLE) ||
-       IS_DIRTY(DS_DEPTH_COMPARE_OP) ||
-       IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
-       IS_DIRTY(DS_STENCIL_TEST_ENABLE) ||
-       (gfx->dirty & HK_DIRTY_OCCLUSION) ||
+       IS_DIRTY(CB_BLEND_ADVANCED) ||
        IS_DIRTY(COLOR_ATTACHMENT_MAP) ||
+       fs_early_reject_dirty ||
        /* The only root-derived input of the fragment key is whether the
         * fragment-invocation statistic is enabled. Other root changes (a
         * descriptor bind, push constants, vertex buffers) leave the key and
         * so the linked fragment program unchanged; rebuilding it for every
         * such draw dominated root-only state changes. */
-       hk_stat_enabled(hk_pipeline_stat_addr(
-          cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) !=
-          gfx->fast_link_fs.key.prolog.statistics ||
-       !gfx->fast_link_fs.valid) {
+       fs_stats_enabled != gfx->fast_link_fs.key.prolog.statistics) {
 
       struct hk_fast_link_key_fs key;
       if (!hk_fill_fast_link_key_fs(cmd, fs, hw_vs, &key, true)) {
@@ -11298,7 +11355,7 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          return;
       }
       gfx->fast_link_fs.color_written =
-         hk_fs_color_written(&key, agx_chip_g17_m5(dev->dev.chip));
+         gfx->linked[MESA_SHADER_FRAGMENT]->fs_color_written;
       gfx->fast_link_fs.reads_tib = fs->b.info.reads_tib;
    }
    gfx->render.color_written |= gfx->fast_link_fs.color_written;
