@@ -16655,6 +16655,14 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
             NIR_PASS(_, nir, nir_opt_dce);
             nir_divergence_analysis(nir);
          }
+
+         bool packed_mux = false;
+         NIR_PASS(packed_mux, nir, agx_nir_opt_pack_narrow_mux_tree);
+         if (packed_mux) {
+            NIR_PASS(_, nir, nir_opt_dce);
+            NIR_PASS(_, nir, nir_opt_cse);
+            nir_divergence_analysis(nir);
+         }
       }
    }
 

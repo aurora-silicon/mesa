@@ -382,6 +382,7 @@ bool agx_nir_opt_guard_selected_loads(struct nir_shader *shader);
 bool agx_nir_opt_forward_merge_loads(struct nir_shader *shader);
 bool agx_nir_fold_const_select_alu(struct nir_shader *shader);
 bool agx_nir_opt_narrow_u8_fadd_tree(struct nir_shader *shader);
+bool agx_nir_opt_pack_narrow_mux_tree(struct nir_shader *shader);
 
 bool agx_nir_is_shared_phase_barrier(struct nir_instr *instr);
 bool agx_nir_opt_shared_vec2(struct nir_shader *shader);
