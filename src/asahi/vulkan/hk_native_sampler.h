@@ -5,55 +5,34 @@
 
 #pragma once
 
-#include "asahi/genxml/agx_pack.h"
-#include "asahi/lib/agx_chip.h"
+#include "asahi/lib/agx_native_descriptor.h"
 
-#include <stdbool.h>
-#include <stdint.h>
+#define HK_NATIVE_SAMPLER_MAX_ELEMENT_SIZE    AGX_NATIVE_SAMPLER_MAX_ELEMENT_SIZE
+#define hk_sampler_reduction_mode             agx_native_sampler_reduction_mode
+#define HK_SAMPLER_REDUCTION_WEIGHTED_AVERAGE AGX_NATIVE_SAMPLER_REDUCTION_WEIGHTED_AVERAGE
+#define HK_SAMPLER_REDUCTION_MINIMUM          AGX_NATIVE_SAMPLER_REDUCTION_MINIMUM
+#define HK_SAMPLER_REDUCTION_MAXIMUM          AGX_NATIVE_SAMPLER_REDUCTION_MAXIMUM
+#define hk_native_sampler_state               agx_native_sampler_state
+#define hk_native_sampler_descriptor          agx_native_sampler_descriptor
 
-#define HK_NATIVE_SAMPLER_MAX_ELEMENT_SIZE 32
+static inline bool
+hk_sampler_reduction_supported(enum agx_sampler_generation generation,
+                               enum hk_sampler_reduction_mode reduction_mode)
+{
+   return agx_native_sampler_reduction_supported(generation, reduction_mode);
+}
 
-enum hk_sampler_reduction_mode {
-   HK_SAMPLER_REDUCTION_WEIGHTED_AVERAGE,
-   HK_SAMPLER_REDUCTION_MINIMUM,
-   HK_SAMPLER_REDUCTION_MAXIMUM,
-};
+static inline bool
+hk_pack_native_sampler(enum agx_chip chip,
+                       struct hk_native_sampler_descriptor *out,
+                       const struct hk_native_sampler_state *state)
+{
+   return agx_pack_native_sampler(chip, out, state);
+}
 
-/* Generation-independent sampler semantics.  The packer below is the only
- * place where Honeykrisp selects the Gen4, HAL200, or Gen5 bit layout. */
-struct hk_native_sampler_state {
-   float minimum_lod;
-   float maximum_lod;
-   float lod_bias;
-   unsigned maximum_anisotropy;
-   enum agx_filter magnify;
-   enum agx_filter minify;
-   enum agx_mip_filter mip_filter;
-   enum agx_wrap wrap_s;
-   enum agx_wrap wrap_t;
-   enum agx_wrap wrap_r;
-   enum agx_compare_func compare_func;
-   enum agx_border_colour border_colour;
-   enum hk_sampler_reduction_mode reduction_mode;
-   bool pixel_coordinates;
-   bool compare_enable;
-   bool seamful_cube_maps;
-};
-
-/* An AGX3 heap element is sparse: its eight-byte packed state word remains at
- * offset zero and the remaining 24 bytes are zero.  Keeping the full element
- * here makes upload size and clearing impossible to confuse with word size. */
-struct hk_native_sampler_descriptor {
-   uint32_t opaque[HK_NATIVE_SAMPLER_MAX_ELEMENT_SIZE / sizeof(uint32_t)];
-};
-
-bool hk_sampler_reduction_supported(
-   enum agx_sampler_generation generation,
-   enum hk_sampler_reduction_mode reduction_mode);
-
-bool hk_pack_native_sampler(enum agx_chip chip,
-                            struct hk_native_sampler_descriptor *out,
-                            const struct hk_native_sampler_state *state);
-
-bool hk_pack_native_txf_sampler(enum agx_chip chip,
-                                struct hk_native_sampler_descriptor *out);
+static inline bool
+hk_pack_native_txf_sampler(enum agx_chip chip,
+                           struct hk_native_sampler_descriptor *out)
+{
+   return agx_pack_native_txf_sampler(chip, out);
+}
