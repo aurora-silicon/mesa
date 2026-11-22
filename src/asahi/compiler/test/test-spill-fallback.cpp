@@ -1,0 +1,127 @@
+/* SPDX-License-Identifier: MIT */
+#include <gtest/gtest.h>
+#include "agx_test.h"
+
+TEST(SpillFallback, EdgeStoresReportScratchDuringRematerialization)
+{
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      SCOPED_TRACE(mode);
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = AGX_CHIP_G17P;
+      key.has_scratch = true;
+      b->shader->key = &key;
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->any_cf = true;
+      b->shader->is_preamble = true;
+      agx_block *entry = agx_start_block(b->shader);
+      agx_block *left = agx_test_block(b->shader);
+      agx_block *right = agx_test_block(b->shader);
+      agx_block *join = agx_test_block(b->shader);
+      agx_block_add_successor(entry, left);
+      agx_block_add_successor(entry, right);
+      agx_block_add_successor(left, join);
+      agx_block_add_successor(right, join);
+      agx_index incoming[2];
+      unsigned side = 0;
+      for (agx_block *block : {left, right}) {
+         b->cursor = agx_after_block(block);
+         if (mode == 0)
+            incoming[side] = agx_mov(b, agx_uniform(2 * side, AGX_SIZE_32));
+         else if (mode == 1)
+            incoming[side] = agx_mov_imm(b, 32, 13 + side);
+         else if (mode == 2) {
+            incoming[side] = agx_immediate(13 + side);
+         } else
+            incoming[side] = agx_uniform(2 * side, AGX_SIZE_32);
+         ++side;
+      }
+      b->cursor = agx_after_block(join);
+      agx_index values[16];
+      for (agx_index &value : values) {
+         value = agx_temp(b->shader, AGX_SIZE_32);
+         agx_instr *phi = agx_phi_to(b, value, 2);
+         phi->src[0] = incoming[0];
+         phi->src[1] = incoming[1];
+      }
+      for (agx_index value : values)
+         agx_unit_test(b, value);
+      agx_compute_liveness(b->shader);
+      agx_spill(b->shader, 24, true);
+      EXPECT_TRUE(b->shader->has_spill_pcopy_reserved);
+      EXPECT_TRUE(b->shader->remat_fallback_spilled);
+      unsigned stores = 0;
+      agx_foreach_instr_global(b->shader, I) {
+         stores += I->op == AGX_OPCODE_MOV && I->dest[0].memory;
+      }
+      EXPECT_GT(stores, 0u);
+      ralloc_free(mem);
+   }
+}
+
+/* A value live through a G17P loop that the loop never reads stays spilled
+ * across the loop when the loop body needs every register, instead of being
+ * spilled in the body and reloaded on the back edge on every iteration. */
+TEST(SpillLoopHeader, LiveThroughValueStaysSpilledAcrossLoop)
+{
+   void *mem = ralloc_context(NULL);
+   agx_builder *b = agx_test_builder(mem);
+   agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.has_scratch = true;
+   b->shader->key = &key;
+   b->shader->stage = MESA_SHADER_FRAGMENT;
+   b->shader->any_cf = true;
+
+   agx_block *entry = agx_start_block(b->shader);
+   agx_block *header = agx_test_block(b->shader);
+   agx_block *body = agx_test_block(b->shader);
+   agx_block *exit = agx_test_block(b->shader);
+   header->loop_header = true;
+   agx_block_add_successor(entry, header);
+   agx_block_add_successor(header, body);
+   agx_block_add_successor(header, exit);
+   agx_block_add_successor(body, header);
+
+   /* None of the values is rematerializable */
+   b->cursor = agx_after_block(entry);
+   agx_index through =
+      agx_fadd(b, agx_uniform(0, AGX_SIZE_32), agx_uniform(2, AGX_SIZE_32));
+
+   /* Eight 32-bit values fill the sixteen halves left to values */
+   b->cursor = agx_after_block(body);
+   agx_index values[8];
+   for (unsigned i = 0; i < ARRAY_SIZE(values); ++i) {
+      values[i] = agx_fadd(b, agx_uniform(4 + 2 * i, AGX_SIZE_32),
+                           agx_uniform(2, AGX_SIZE_32));
+   }
+   for (agx_index value : values)
+      agx_unit_test(b, value);
+
+   b->cursor = agx_after_block(exit);
+   agx_unit_test(b, through);
+
+   agx_compute_liveness(b->shader);
+   agx_spill(b->shader, 16 + 8, false);
+
+   unsigned in_loop = 0, stores = 0, fills = 0;
+   agx_foreach_block(b->shader, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op != AGX_OPCODE_MOV ||
+             !(I->dest[0].memory || I->src[0].memory))
+            continue;
+
+         in_loop += block == header || block == body;
+         stores += block == entry && I->dest[0].memory;
+         fills += block == exit && I->src[0].memory;
+      }
+   }
+
+   EXPECT_EQ(in_loop, 0u);
+   EXPECT_EQ(stores, 1u);
+   EXPECT_EQ(fills, 1u);
+   ralloc_free(mem);
+}
