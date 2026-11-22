@@ -478,10 +478,10 @@ test_agx3_pbe(void)
                                      &mipped));
    CHECK(memcmp(native_mip.opaque, native.opaque, sizeof(native.opaque)) != 0);
 
-   /* Gen10 has no mip extension: the same mipped image is refused there, and
-    * the single-level one still encodes. */
-   CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10,
-                                      &native_mip, &mipped));
+   /* Gen10 has no mip extension in Gallium's gate: the same mipped image is
+    * refused there, and the single-level one still encodes. */
+   CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native_mip,
+                                      &mipped));
    memset(&native, 0xa5, sizeof(native));
    CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
                                      &rt));
@@ -517,7 +517,7 @@ test_agx3_pbe(void)
    bad[6].dimension = AGX_TEXTURE_DIMENSION_1D;
    bad[7].mode = AGX_IMAGE_MODE_SPARSE;
 
-   /* sRGB on store is Gen9-only, as in hk_pack_native_pbe(). */
+   /* sRGB on store is Gen9-only in Gallium's gate. */
    struct AGX_PBE srgb = rt;
    srgb.srgb = true;
    CHECK(agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
@@ -705,8 +705,8 @@ test_g17p_compressed_render_target(void)
       CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_9, &native,
                                          &rt));
       rt = original;
-      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10,
-                                         &native, &rt));
+      CHECK(!agx_gallium_pack_native_pbe(AGX_DESCRIPTOR_GENERATION_10, &native,
+                                         &rt));
    }
 }
 
@@ -914,8 +914,9 @@ test_native_packers(void)
       AGX_DESCRIPTOR_GENERATION_9, &native, &mip2));
 
    /* Gallium can sample only level zero from a render target whose backing
-    * allocation still contains a complete miptree.  unk_mipmapped makes that
-    * base-only view extended too, so it requires the allocation's end VA. */
+    * allocation still contains a complete miptree. unk_mipmapped makes that
+    * base-only view extended too; both an explicit range-end VA and zero
+    * pack cleanly, while a misaligned VA is rejected. */
    struct AGX_TEXTURE mipmapped_base = semantic;
    mipmapped_base.layout = AGX_LAYOUT_GPU;
    mipmapped_base.unk_mipmapped = true;
@@ -923,6 +924,9 @@ test_native_packers(void)
    CHECK(agx_gallium_pack_native_texture(
       AGX_DESCRIPTOR_GENERATION_9, &native, &mipmapped_base));
    mipmapped_base.acceleration_buffer = 0;
+   CHECK(agx_gallium_pack_native_texture(
+      AGX_DESCRIPTOR_GENERATION_9, &native, &mipmapped_base));
+   mipmapped_base.acceleration_buffer = UINT64_C(0x100000c004);
    CHECK(!agx_gallium_pack_native_texture(
       AGX_DESCRIPTOR_GENERATION_9, &native, &mipmapped_base));
 
@@ -1159,6 +1163,66 @@ test_gen9_uncompressed_dimensions(void)
    }
 }
 
+static void
+test_reconciled_gallium_edges(void)
+{
+   struct AGX_TEXTURE base = {
+      AGX_TEXTURE_header,
+      .dimension = AGX_TEXTURE_DIMENSION_2D,
+      .layout = AGX_LAYOUT_GPU,
+      .channels = AGX_CHANNELS_R8G8B8A8,
+      .type = AGX_TEXTURE_TYPE_UNORM,
+      .swizzle_r = AGX_CHANNEL_R,
+      .swizzle_g = AGX_CHANNEL_G,
+      .swizzle_b = AGX_CHANNEL_B,
+      .swizzle_a = AGX_CHANNEL_A,
+      .width = 64,
+      .height = 64,
+      .depth = 1,
+      .address = UINT64_C(0x10000080000),
+   };
+   struct agx_gallium_texture_descriptor out, out2;
+
+   /* Gen9 stride/depth overflow guard & AGX_LAYOUT_INTERCHANGE support. */
+   struct AGX_TEXTURE overflow = base;
+   overflow.depth = 0x10001u;
+   CHECK(!agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9, &out,
+                                          &overflow));
+   overflow = base;
+   overflow.layout = AGX_LAYOUT_LINEAR;
+   overflow.stride = 0x100000u;
+   CHECK(!agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9, &out,
+                                          &overflow));
+
+   struct AGX_TEXTURE interchange = base;
+   interchange.layout = AGX_LAYOUT_INTERCHANGE;
+   interchange.stride = 15u << 4;
+   CHECK(agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9, &out,
+                                         &interchange));
+
+   /* Gen9 plain_2d word1[62] workaround covers 2D_MULTISAMPLED. */
+   struct AGX_TEXTURE msaa = base;
+   msaa.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+   msaa.samples = AGX_SAMPLE_COUNT_4;
+   msaa.page_aligned_layers = false;
+   CHECK(agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9, &out,
+                                         &msaa));
+   msaa.page_aligned_layers = true;
+   CHECK(agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_9, &out2,
+                                         &msaa));
+   CHECK(memcmp(&out, &out2, sizeof(out)) == 0);
+
+   /* Gen10 AGX_IMAGE_MODE_SPARSE remaps to 1 (16 KiB sparse pages). */
+   struct AGX_TEXTURE sparse = base;
+   sparse.mode = AGX_IMAGE_MODE_SPARSE;
+   CHECK(agx_gallium_pack_native_texture(AGX_DESCRIPTOR_GENERATION_10, &out,
+                                         &sparse));
+   struct AGX_TEXTURE_GEN10 decoded10;
+   CHECK(AGX_TEXTURE_GEN10_unpack(NULL, (const uint8_t *)out.opaque,
+                                  &decoded10));
+   CHECK(decoded10.image_mode_enable && decoded10.image_mode == 1);
+}
+
 int
 main(void)
 {
@@ -1170,6 +1234,7 @@ main(void)
    test_standard_border_colours();
    test_gen9_uncompressed_mip_views();
    test_gen9_uncompressed_dimensions();
+   test_reconciled_gallium_edges();
    test_native_packers();
    test_agx3_pbe();
    test_g17p_compressed_render_target();
