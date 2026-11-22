@@ -832,6 +832,15 @@ vk_common_CmdBindShadersEXT(VkCommandBuffer commandBuffer,
                     MESA_VK_DYNAMIC_RP_ATTACHMENTS);
          dyn->generation++;
       }
+
+      if (dyn->vi_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT) {
+         dyn->vi_robustness =
+            VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT;
+         BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_VI);
+         BITSET_SET(dyn->changed_since_pipeline_bind, MESA_VK_DYNAMIC_VI);
+         dyn->generation++;
+      }
    }
 
    ops->cmd_bind_shaders(cmd_buffer, stageCount, stages, shaders);

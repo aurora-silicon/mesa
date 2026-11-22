@@ -38,6 +38,28 @@
 
 #define GFX_INPUT_MESH 32
 
+static inline void
+zink_fill_pipeline_robustness(struct zink_screen *screen, bool is_robust,
+                              VkPipelineRobustnessCreateInfoEXT *prci,
+                              const void **pNext)
+{
+   if (!screen->use_pipeline_robustness)
+      return;
+
+   const VkPipelineRobustnessBufferBehaviorEXT behavior =
+      is_robust ? VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT
+                : VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+   *prci = (VkPipelineRobustnessCreateInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT,
+      .pNext = *pNext,
+      .storageBuffers = behavior,
+      .uniformBuffers = behavior,
+      .vertexInputs = behavior,
+      .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DEVICE_DEFAULT_EXT,
+   };
+   *pNext = prci;
+}
+
 VkPipeline
 zink_create_gfx_pipeline(struct zink_screen *screen,
                          struct zink_gfx_program *prog,
@@ -363,6 +385,8 @@ zink_create_gfx_pipeline(struct zink_screen *screen,
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
    pci.layout = prog->base.layout;
    pci.pNext = &state->rendering_info;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   zink_fill_pipeline_robustness(screen, prog->base.is_robust, &prci, &pci.pNext);
    if (!is_mesh) {
       if (needs_vi)
          pci.pVertexInputState = &vertex_input_state;
@@ -435,6 +459,8 @@ zink_create_compute_pipeline(struct zink_screen *screen, struct zink_compute_pro
    VkComputePipelineCreateInfo pci = {0};
    pci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
    pci.layout = comp->base.layout;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   zink_fill_pipeline_robustness(screen, comp->base.is_robust, &prci, &pci.pNext);
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
@@ -695,6 +721,8 @@ zink_create_gfx_pipeline_input(struct zink_screen *screen,
    VkGraphicsPipelineCreateInfo pci = {0};
    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
    pci.pNext = &gplci;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   zink_fill_pipeline_robustness(screen, false, &prci, &pci.pNext);
    pci.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
@@ -821,6 +849,8 @@ create_gfx_pipeline_library(struct zink_screen *screen, struct zink_shader_objec
    VkGraphicsPipelineCreateInfo pci = {0};
    pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
    pci.pNext = &gplci;
+   VkPipelineRobustnessCreateInfoEXT prci;
+   zink_fill_pipeline_robustness(screen, false, &prci, &pci.pNext);
    pci.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_DB)
       pci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;

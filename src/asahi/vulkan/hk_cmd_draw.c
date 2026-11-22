@@ -10299,12 +10299,26 @@ agx_fill_velem_keys(const struct vk_vertex_input_state *vi,
    }
 }
 
+static inline VkPipelineRobustnessBufferBehaviorEXT
+hk_cmd_vertex_input_robustness(const struct hk_device *dev,
+                               const struct vk_dynamic_graphics_state *dyn,
+                               const struct hk_shader *vs)
+{
+   if (HK_PERF(dev, NOROBUST))
+      return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+   if (dyn && dyn->vi_robustness !=
+                 VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+      return dyn->vi_robustness;
+   return hk_vs_vertex_input_robustness(dev, vs);
+}
+
 static void
 hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                      enum mesa_prim prim, bool indexed,
                      enum agx_index_size index_size, bool restart,
                      const struct vk_vertex_input_state *vi,
                      const uint16_t *vi_binding_strides,
+                     VkPipelineRobustnessBufferBehaviorEXT vi_robustness,
                      struct hk_fast_link_key_vs *key)
 {
    *key = (struct hk_fast_link_key_vs){
@@ -10314,14 +10328,7 @@ hk_vs_link_key_build(struct hk_device *dev, struct hk_shader *sw_vs, bool hw,
                                  : 0) +
                              (sw_vs->info.agx3_gen1_fragment_rq ? 168 : 0),
 
-      /* FIXME: handle pipeline robustness "properly" */
-      .prolog.robustness.level =
-         (dev->vk.enabled_features.robustBufferAccess2 ||
-          dev->vk.enabled_features.pipelineRobustness)
-            ? AGX_ROBUSTNESS_D3D
-         : dev->vk.enabled_features.robustBufferAccess
-            ? AGX_ROBUSTNESS_GL
-            : AGX_ROBUSTNESS_DISABLED,
+      .prolog.robustness.level = hk_vk_buffer_robustness_to_agx(vi_robustness),
       .prolog.robustness.soft_fault = agx_has_soft_fault(&dev->dev),
       .prolog.static_vi = !sw_vs->info.vs.use_prolog,
    };
@@ -10420,12 +10427,14 @@ hk_fill_fast_link_key_vs(struct hk_cmd_buffer *cmd, struct hk_shader *sw_vs,
                          enum agx_index_size index_size, bool restart,
                          struct hk_fast_link_key_vs *key)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
-   hk_vs_link_key_build(hk_cmd_buffer_device(cmd), sw_vs, sw_vs == hw_vs,
+   hk_vs_link_key_build(dev, sw_vs, sw_vs == hw_vs,
                         vk_topology_to_mesa(dyn->ia.primitive_topology),
                         indexed, index_size, restart, dyn->vi,
-                        dyn->vi_binding_strides, key);
+                        dyn->vi_binding_strides,
+                        hk_cmd_vertex_input_robustness(dev, dyn, sw_vs), key);
    hk_uvs_fs_masks(cmd, sw_vs, &key->uvs_flat, &key->uvs_linear);
 }
 
@@ -10800,22 +10809,25 @@ hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs_api,
    if (hw_program && hw->compiled && !hw->info.vs.attribs_read) {
       hk_vs_link_key_build(dev, hw, true, MESA_PRIM_TRIANGLES, false,
                            AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
-                           &key);
+                           hk_vs_vertex_input_robustness(dev, hw), &key);
       hk_get_fast_linked(dev, hw, &key);
    }
 
    struct hk_shader *sw = &vs_api->variants[HK_VS_VARIANT_SW];
    if (sw_program && sw->compiled && !sw->info.vs.attribs_read) {
+      const VkPipelineRobustnessBufferBehaviorEXT sw_vi_rob =
+         hk_vs_vertex_input_robustness(dev, sw);
       hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, false,
                            AGX_INDEX_SIZE_U32, false, &no_vi, no_strides,
-                           &key);
+                           sw_vi_rob, &key);
       hk_get_fast_linked(dev, sw, &key);
 
       const enum agx_index_size sizes[] = {
          AGX_INDEX_SIZE_U8, AGX_INDEX_SIZE_U16, AGX_INDEX_SIZE_U32};
       for (unsigned i = 0; i < ARRAY_SIZE(sizes); ++i) {
          hk_vs_link_key_build(dev, sw, false, MESA_PRIM_TRIANGLES, true,
-                              sizes[i], false, &no_vi, no_strides, &key);
+                              sizes[i], false, &no_vi, no_strides, sw_vi_rob,
+                              &key);
          hk_get_fast_linked(dev, sw, &key);
       }
    }
@@ -11197,11 +11209,15 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       (linked_prolog->adjacency || !linked_prolog->hw) &&
       linked_prolog->sw_index_size_B !=
          (draw.indexed ? agx_index_size_to_B(draw.index_size) : 0);
+   const bool vi_robustness_changed =
+      linked_prolog->robustness.level !=
+      hk_vk_buffer_robustness_to_agx(
+         hk_cmd_vertex_input_robustness(dev, dyn, sw_vs));
 
    if (!native_mesh && (IS_DIRTY(VI) || IS_DIRTY(VI_BINDINGS_VALID) ||
         IS_DIRTY(VI_BINDING_STRIDES) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
         vgt_dirty || !gfx->fast_link_vs.valid || sw_index_size_changed ||
-        hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
+        vi_robustness_changed || hk_fast_link_vs_uvs_stale(cmd, sw_vs))) {
       struct hk_fast_link_key_vs key;
       hk_fill_fast_link_key_vs(cmd, sw_vs, hw_vs, draw.indexed,
                                draw.index_size, draw.restart, &key);
@@ -11837,9 +11853,9 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
       return false;
    }
 
-   if (!(dev->vk.enabled_features.robustBufferAccess ||
-         dev->vk.enabled_features.robustBufferAccess2 ||
-         dev->vk.enabled_features.pipelineRobustness))
+   const struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   if (hk_cmd_vertex_input_robustness(dev, &cmd->vk.dynamic_graphics_state, vs) ==
+       VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT)
       return false;
 
    /* A conditionally lowered direct draw has an immutable indirect record:
@@ -12650,17 +12666,10 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    uint32_t draw_state_offset = 0;
-   if (agx_chip_native_agx3(dev->dev.chip) && tail_emitted) {
-      struct agx_ptr draw_state = hk_pool_vdm_alloc(cmd, 8, 4);
-      if (!draw_state.cpu ||
-          !hk_g17p_upload_draw_indices(
-             draw_state.cpu, 8, draw_state.gpu, cs->scissor.size,
-             cs->depth_bias.size,
-             MAX2(cmd->vk.dynamic_graphics_state.vp.viewport_count, 1),
-             &draw_state_offset)) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-         return;
-      }
+   if (agx_chip_native_agx3(dev->dev.chip) && tail_emitted &&
+       !hk_g17p_draw_state_offset(cmd, cs, &draw_state_offset)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
    }
 
    size_t size_B = libagx_draw_robust_index_vdm_size(

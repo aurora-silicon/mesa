@@ -78,7 +78,10 @@ struct hk_shader_info {
           * triangle covering the whole clip-space square in front of the
           * viewer (hk_vs_covers_clip_square()). */
          bool covers_clip_square;
-         uint8_t _pad[6];
+         /* Resolved VkPipelineRobustnessBufferBehaviorEXT for vertex inputs
+          * (0 == DEVICE_DEFAULT falls back to dev->vk.robustness_state). */
+         uint8_t vertex_input_robustness;
+         uint8_t _pad[5];
       } vs;
 
       struct {
@@ -779,6 +782,32 @@ hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness,
                           : nir_address_format_64bit_bounded_global;
    default:
       UNREACHABLE("Invalid robust buffer access behavior");
+   }
+}
+
+static inline VkPipelineRobustnessBufferBehaviorEXT
+hk_vs_vertex_input_robustness(const struct hk_device *dev,
+                              const struct hk_shader *vs)
+{
+   if (HK_PERF(dev, NOROBUST))
+      return VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT;
+   if (vs && vs->info.stage == MESA_SHADER_VERTEX &&
+       vs->info.vs.vertex_input_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+      return vs->info.vs.vertex_input_robustness;
+   return dev->vk.robustness_state.vertex_inputs;
+}
+
+static inline enum agx_robustness_level
+hk_vk_buffer_robustness_to_agx(VkPipelineRobustnessBufferBehaviorEXT behavior)
+{
+   switch (behavior) {
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT:
+      return AGX_ROBUSTNESS_D3D;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT:
+      return AGX_ROBUSTNESS_GL;
+   default:
+      return AGX_ROBUSTNESS_DISABLED;
    }
 }
 

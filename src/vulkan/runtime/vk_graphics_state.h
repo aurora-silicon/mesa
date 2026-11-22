@@ -875,6 +875,9 @@ struct vk_dynamic_graphics_state {
     */
    uint16_t vi_binding_strides[MESA_VK_MAX_VERTEX_BINDINGS];
 
+   /** Resolved vertex input robustness (from pipeline vertex input interface) */
+   VkPipelineRobustnessBufferBehaviorEXT vi_robustness;
+
    /** Input assembly state */
    struct vk_input_assembly_state ia;
 
@@ -1050,6 +1053,11 @@ struct vk_graphics_pipeline_state {
     * create flags or subpass description flags.
     */
    VkImageAspectFlags rasterization_order_access;
+
+   /** Resolved VkPipelineRobustnessCreateInfoEXT::vertexInputs from the
+    * vertex input interface state, or DEVICE_DEFAULT_EXT when not present.
+    */
+   VkPipelineRobustnessBufferBehaviorEXT vi_robustness;
 
    /** Vertex input state */
    const struct vk_vertex_input_state *vi;

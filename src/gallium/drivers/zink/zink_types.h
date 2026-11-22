@@ -1023,6 +1023,7 @@ struct zink_program {
    size_t pipeline_cache_size;
    struct zink_batch_usage *batch_uses;
    bool is_compute;
+   bool is_robust;
    bool can_precompile;
    bool uses_shobj; //whether shader objects are used; programs CANNOT mix shader objects and shader modules
    bool precompile_done;
@@ -1481,6 +1482,7 @@ struct zink_screen {
    bool need_2D_zs;
    bool need_2D_sparse;
    bool can_hic_shader_read;
+   bool use_pipeline_robustness;
 
    uint32_t gfx_queue;
    uint32_t sparse_queue;

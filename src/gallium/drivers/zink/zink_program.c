@@ -1135,6 +1135,7 @@ create_program(struct zink_context *ctx, bool is_compute)
    u_rwlock_init(&pg->pipeline_cache_lock);
    util_queue_fence_init(&pg->cache_fence);
    pg->is_compute = is_compute;
+   pg->is_robust = !!(ctx->flags & PIPE_CONTEXT_ROBUST_BUFFER_ACCESS);
    pg->precompile_done = true;
    pg->ctx = ctx;
    return (void*)pg;
@@ -2504,7 +2505,8 @@ gfx_program_precompile_job(void *data, void *gdata, int thread_index)
    state.optimal_key = state.shader_keys_optimal.key.val;
    generate_gfx_program_modules_optimal(NULL, screen, prog, &state);
    zink_screen_get_pipeline_cache(screen, &prog->base, true);
-   if (!screen->info.have_EXT_shader_object) {
+   if (!screen->info.have_EXT_shader_object &&
+       !(screen->use_pipeline_robustness && prog->base.is_robust)) {
       simple_mtx_lock(&prog->libs->lock);
       zink_create_pipeline_lib(screen, prog, &state);
       simple_mtx_unlock(&prog->libs->lock);
@@ -2569,7 +2571,9 @@ zink_link_gfx_shader(struct pipe_context *pctx, void **shaders)
       print_pipeline_stats(screen, pipeline, &ctx->dbg);
       VKSCR(DestroyPipeline)(screen->dev, pipeline, NULL);
    } else {
-      if (zink_screen(pctx->screen)->info.have_EXT_shader_object)
+      struct zink_screen *screen = zink_screen(pctx->screen);
+      if (screen->info.have_EXT_shader_object &&
+          !(screen->use_pipeline_robustness && prog->base.is_robust))
          prog->base.uses_shobj = ((zshaders[MESA_SHADER_VERTEX] && !zshaders[MESA_SHADER_VERTEX]->info.view_mask) ||
                                   (zshaders[MESA_SHADER_MESH] && !zshaders[MESA_SHADER_MESH]->info.view_mask)) &&
                                  !BITSET_TEST(zshaders[MESA_SHADER_FRAGMENT]->info.system_values_read, SYSTEM_VALUE_SAMPLE_MASK_IN);

@@ -874,7 +874,8 @@ zink_init_screen_caps(struct zink_screen *screen)
       screen->info.feats.features.pipelineStatisticsQuery;
 
    caps->robust_buffer_access_behavior =
-      screen->info.feats.features.robustBufferAccess &&
+      (screen->info.feats.features.robustBufferAccess ||
+       screen->use_pipeline_robustness) &&
       (screen->info.rb2_feats.robustImageAccess2 ||
        screen->driver_compiler_workarounds.lower_robustImageAccess2);
 
@@ -3026,6 +3027,8 @@ init_driver_workarounds(struct zink_screen *screen)
    case VK_DRIVER_ID_MESA_PANVK:
    case VK_DRIVER_ID_MESA_NVK:
    case VK_DRIVER_ID_MESA_KOSMICKRISP:
+   case VK_DRIVER_ID_MESA_HONEYKRISP:
+   case VK_DRIVER_ID_AURORA_BOREALIS:
    case VK_DRIVER_ID_QUALCOMM_PROPRIETARY:
       screen->driver_workarounds.implicit_sync = false;
       break;
@@ -3340,6 +3343,17 @@ static void
 disable_features(struct zink_screen *screen)
 {
    screen->info.mesh_feats.primitiveFragmentShadingRateMeshShader = false;
+
+   if (screen->info.have_EXT_pipeline_robustness &&
+       screen->info.feats.features.robustBufferAccess) {
+      /* Defer buffer robustness to per-pipeline VK_EXT_pipeline_robustness so
+       * non-robust contexts avoid device-wide buffer/index robustness overhead.
+       * Keep nullDescriptor and image robustness intact at the device level.
+       */
+      screen->use_pipeline_robustness = true;
+      screen->info.feats.features.robustBufferAccess = false;
+      screen->info.rb2_feats.robustBufferAccess2 = false;
+   }
 }
 
 static void
@@ -3389,7 +3403,8 @@ init_optimal_keys(struct zink_screen *screen)
          fprintf(stderr, "driver does not support smooth lines\n");
       CHECK_OR_PRINT(maint5_props.polygonModePointSize);
       CHECK_OR_PRINT(rb2_feats.robustImageAccess2);
-      CHECK_OR_PRINT(feats.features.robustBufferAccess);
+      if (!screen->use_pipeline_robustness)
+         CHECK_OR_PRINT(feats.features.robustBufferAccess);
       CHECK_OR_PRINT(rb_image_feats.robustImageAccess);
       printf("\n");
       mesa_logw("zink: force-enabling optimal_keys despite missing features. Good luck!");

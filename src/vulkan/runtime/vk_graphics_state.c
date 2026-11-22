@@ -1613,6 +1613,32 @@ vk_graphics_pipeline_state_fill(const struct vk_device *device,
    if (lib & VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT) {
       needs |= MESA_VK_GRAPHICS_STATE_VERTEX_INPUT_BIT;
       needs |= MESA_VK_GRAPHICS_STATE_INPUT_ASSEMBLY_BIT;
+
+      VkPipelineRobustnessBufferBehaviorEXT vi_rob =
+         device->robustness_state.vertex_inputs;
+      const VkPipelineRobustnessCreateInfoEXT *rob_info =
+         vk_find_struct_const(info->pNext,
+                              PIPELINE_ROBUSTNESS_CREATE_INFO_EXT);
+      if (rob_info &&
+          rob_info->vertexInputs !=
+             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+         vi_rob = rob_info->vertexInputs;
+
+      if (allowed_stages & VK_SHADER_STAGE_VERTEX_BIT) {
+         for (uint32_t i = 0; i < info->stageCount; i++) {
+            if (info->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) {
+               const VkPipelineRobustnessCreateInfoEXT *vs_rob =
+                  vk_find_struct_const(info->pStages[i].pNext,
+                                       PIPELINE_ROBUSTNESS_CREATE_INFO_EXT);
+               if (vs_rob &&
+                   vs_rob->vertexInputs !=
+                      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+                  vi_rob = vs_rob->vertexInputs;
+               break;
+            }
+         }
+      }
+      state->vi_robustness = vi_rob;
    }
 
    if (lib & (VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
@@ -1924,6 +1950,11 @@ vk_graphics_pipeline_state_merge(struct vk_graphics_pipeline_state *dst,
    dst->pipeline_flags |= src->pipeline_flags;
    dst->feedback_loop_not_input_only |= src->feedback_loop_not_input_only;
    dst->rasterization_order_access |= src->rasterization_order_access;
+   if (dst->vi_robustness ==
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT &&
+       src->vi_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+      dst->vi_robustness = src->vi_robustness;
 
    /* Render pass state needs special care because a render pass state may be
     * incomplete (view mask only).  See vk_render_pass_state_init().
@@ -2020,6 +2051,7 @@ vk_graphics_pipeline_state_copy(const struct vk_device *device,
    state->feedback_loop_not_input_only =
       old_state->feedback_loop_not_input_only;
    state->rasterization_order_access = old_state->rasterization_order_access;
+   state->vi_robustness = old_state->vi_robustness;
 
    vk_graphics_pipeline_state_validate(state);
    return VK_SUCCESS;
@@ -2144,6 +2176,7 @@ vk_dynamic_graphics_state_fill(struct vk_dynamic_graphics_state *dyn,
    dyn->feedback_loops = 0;
 
    dyn->rasterization_order_access = p->rasterization_order_access;
+   dyn->vi_robustness = p->vi_robustness;
 
    get_dynamic_state_groups(dyn->set, groups);
 
@@ -2413,6 +2446,19 @@ vk_dynamic_graphics_state_copy(struct vk_dynamic_graphics_state *dst,
     * unconditionally when copying (e.g., secondary command buffer execution).
     */
    dst->rasterization_order_access |= src->rasterization_order_access;
+
+   /* Vertex input robustness belongs to the vertex input interface pipeline
+    * state and may differ between pipelines that share the same vertex shader
+    * library and attribute layout.
+    */
+   if (src->vi_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT &&
+       dst->vi_robustness != src->vi_robustness) {
+      dst->vi_robustness = src->vi_robustness;
+      BITSET_SET(dst->dirty, MESA_VK_DYNAMIC_VI);
+      BITSET_SET(dst->changed_since_pipeline_bind, MESA_VK_DYNAMIC_VI);
+      dst->generation++;
+   }
 
 #undef IS_SET_IN_SRC
 #undef MARK_DIRTY

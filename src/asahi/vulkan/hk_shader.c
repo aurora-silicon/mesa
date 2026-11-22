@@ -170,8 +170,13 @@ struct hk_vs_key {
     * no default layer output (agx_nir_lower_default_layer()) is needed.
     */
    bool no_default_layer;
+
+   /** Resolved VK_EXT_pipeline_robustness vertex input behavior from the
+    * vertex input interface state when lowering vertex inputs statically.
+    */
+   VkPipelineRobustnessBufferBehaviorEXT vertex_input_robustness;
 };
-static_assert(sizeof(struct hk_vs_key) == 260, "packed");
+static_assert(sizeof(struct hk_vs_key) == 264, "packed");
 
 struct hk_mesh_key {
    /** An M5 mesh shader compiled without a fragment shader: write a zero
@@ -595,6 +600,7 @@ hk_populate_vs_key(struct hk_vs_key *key,
 
       agx_fill_velem_keys(state->vi, ~0 /* compacted on use */, key->attribs);
       key->skip_prolog = true;
+      key->vertex_input_robustness = state->vi_robustness;
       key->static_strides =
          !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_VI_BINDING_STRIDES);
 
@@ -7829,6 +7835,16 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             shader->info.vs.use_prolog = !(key && key->vs.skip_prolog);
             shader->info.vs.attribs_read =
                nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
+            shader->info.vs.vertex_input_robustness =
+               HK_PERF(dev, NOROBUST)
+                  ? VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
+               : (key &&
+                  key->vs.vertex_input_robustness !=
+                     VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+                  ? key->vs.vertex_input_robustness
+               : info->robustness
+                  ? info->robustness->vertex_inputs
+                  : dev->vk.robustness_state.vertex_inputs;
 
             if (shader->info.vs.use_prolog) {
                NIR_PASS(_, clone, agx_nir_lower_vs_input_to_prolog);
@@ -7846,24 +7862,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
                struct agx_robustness agx_rs = {
                   .soft_fault = agx_has_soft_fault(&dev->dev),
-
-                  /* Correctly handling GPL + pipeline-robustness requires
-                   * runtime changes, so derive the level from the enabled
-                   * device features exactly as the vertex prolog does
-                   * (hk_cmd_draw.c:3200-3208) rather than pessimising every
-                   * pipeline to D3D.  Hardcoding D3D here made every vertex
-                   * fetch emit an out-of-bounds select even when the
-                   * application never asked for robustness; the two paths
-                   * must agree anyway, since a monolithic VS and a prologue
-                   * fetch the same attributes.
-                   */
-                  .level =
-                     (dev->vk.enabled_features.robustBufferAccess2 ||
-                      dev->vk.enabled_features.pipelineRobustness)
-                        ? AGX_ROBUSTNESS_D3D
-                     : dev->vk.enabled_features.robustBufferAccess
-                        ? AGX_ROBUSTNESS_GL
-                        : AGX_ROBUSTNESS_DISABLED,
+                  .level = hk_vk_buffer_robustness_to_agx(
+                     shader->info.vs.vertex_input_robustness),
                };
 
                if (agx_chip_native_or_m5(dev->dev.chip))
