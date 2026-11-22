@@ -2164,7 +2164,7 @@ hk_cmd_build_acceleration_structures(
    }
 
    const bool was_as_build = cmd->state.as_build_recording;
-   cmd->state.as_build_recording = dev->dev.chip == AGX_CHIP_G17P;
+   cmd->state.as_build_recording = agx_chip_gen1_rt(dev->dev.chip);
    /* Launches of separate build calls, or of a build and the application's
     * work before it, never overlap (hk_dispatch_g17p_native()). */
    if (cmd->current_cs.cs)

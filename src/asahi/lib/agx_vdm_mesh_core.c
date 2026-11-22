@@ -8,7 +8,7 @@
 static bool
 supported(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17P;
+   return chip == AGX_CHIP_G17S || agx_chip_gen1_mesh(chip);
 }
 bool
 agx_vdm_mesh_threadgroup_pack(const uint32_t size[3], uint32_t *word)
@@ -51,7 +51,7 @@ agx_vdm_mesh_state_pack(enum agx_chip chip,
       memset(out, 0, AGX_VDM_MESH_STATE_LENGTH);
    struct agx_vdm_state_vertex_pipeline_pair object, mesh;
    if (!out || !info || !supported(chip) || !info->object_pipeline ||
-       (chip == AGX_CHIP_G17P && !(info->raw_prefix[1] & 0x10)) ||
+       (agx_chip_gen1_mesh(chip) && !(info->raw_prefix[1] & 0x10)) ||
        !info->mesh_pipeline ||
        !agx_vdm_state_vertex_pipeline_pair_pack(
           chip, info->object_pipeline, info->raw_object_template, &object) ||

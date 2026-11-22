@@ -136,6 +136,46 @@ TEST(M5MeshDispatch, PrimitiveFollowsTopology)
    EXPECT_FALSE(agx_vdm_mesh_dispatch_pack(AGX_CHIP_G17S, &info, bytes));
 }
 
+/* G16G writes G17P's HAL200 records: its mesh state and dispatch records
+ * pack to the same bytes, and other AGX3B identities stay refused. */
+TEST(Gen1Mesh, G16GPacksG17PRecords)
+{
+   agx_vdm_mesh_state_info state = {};
+   ASSERT_TRUE(agx_vdm_m5_mesh_set_output_limits(&state, 64, 126, 8));
+   state.raw_prefix[1] = 0x30;
+   state.object_pipeline = UINT64_C(0x10000128000);
+   state.mesh_pipeline = UINT64_C(0x10000129000);
+   state.raw_mesh_template = 0x40;
+   uint8_t g17p[AGX_VDM_MESH_STATE_LENGTH], g16g[AGX_VDM_MESH_STATE_LENGTH];
+   ASSERT_TRUE(agx_vdm_mesh_state_pack(AGX_CHIP_G17P, &state, g17p));
+   ASSERT_TRUE(agx_vdm_mesh_state_pack(AGX_CHIP_G16G, &state, g16g));
+   EXPECT_EQ(memcmp(g17p, g16g, sizeof(g17p)), 0);
+   agx_vdm_mesh_state_info back;
+   ASSERT_TRUE(agx_vdm_mesh_state_unpack(AGX_CHIP_G16G, g16g, sizeof(g16g), &back));
+   EXPECT_EQ(back.mesh_pipeline, state.mesh_pipeline);
+   /* The GEN1 state requires the 0x10 prefix bit on both. */
+   state.raw_prefix[1] = 0;
+   EXPECT_FALSE(agx_vdm_mesh_state_pack(AGX_CHIP_G16G, &state, g16g));
+   EXPECT_FALSE(agx_vdm_mesh_state_pack(AGX_CHIP_G17P, &state, g17p));
+
+   agx_vdm_mesh_dispatch_info dispatch = {};
+   dispatch.threads[0] = 96, dispatch.threads[1] = dispatch.threads[2] = 1;
+   dispatch.local_size[0] = 32, dispatch.local_size[1] = dispatch.local_size[2] = 1;
+   dispatch.primitive = 6;
+   uint8_t d17[AGX_VDM_MESH_DISPATCH_LENGTH], d16[AGX_VDM_MESH_DISPATCH_LENGTH];
+   ASSERT_TRUE(agx_vdm_mesh_dispatch_pack(AGX_CHIP_G17P, &dispatch, d17));
+   ASSERT_TRUE(agx_vdm_mesh_dispatch_pack(AGX_CHIP_G16G, &dispatch, d16));
+   EXPECT_EQ(memcmp(d17, d16, sizeof(d17)), 0);
+
+   for (agx_chip chip : {AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G16S, AGX_CHIP_G13G}) {
+      EXPECT_FALSE(agx_vdm_mesh_dispatch_pack(chip, &dispatch, d16));
+      EXPECT_FALSE(agx_chip_gen1_mesh(chip));
+   }
+   EXPECT_TRUE(agx_chip_gen1_mesh(AGX_CHIP_G16G) && agx_chip_gen1_mesh(AGX_CHIP_G17P));
+   for (agx_chip chip : {AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G18G})
+      EXPECT_FALSE(agx_chip_gen1_mesh(chip));
+}
+
 TEST(M5MeshLimits, RejectsInvalidLimitsWithoutMutation)
 {
    for (const auto &c : {std::array<uint32_t, 3>{0, 1, 4}, {1, 0, 4},

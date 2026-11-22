@@ -353,7 +353,7 @@ hk_get_device_features(
 
       
       .taskShader = supported_extensions->EXT_mesh_shader &&
-                    (dev->chip == AGX_CHIP_G17P ||
+                    (agx_chip_gen1_mesh(dev->chip) ||
                      (dev->chip == AGX_CHIP_G17S &&
                       hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
@@ -1120,8 +1120,9 @@ hk_get_device_properties(const struct agx_device *dev,
       hk_descriptor_generation_is_agx2(descriptor_generation) ||
       agx_chip_native_agx3(dev->chip);
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
-    * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
-   const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
+    * (misc.maximize_invocations_256); no larger mesh workgroup was run. G16G
+    * takes the same lowering. */
+   const uint32_t mesh_threads = agx_chip_gen1_mesh(dev->chip) ? 256 : 1024;
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
@@ -1249,13 +1250,13 @@ hk_get_device_properties(const struct agx_device *dev,
        * maxRayDispatchInvocationCount is bounded by what one compute dispatch
        * can launch, since the launch is exactly a compute dispatch. */
       .shaderGroupHandleSize = HK_RAY_TRACING_GROUP_HANDLE_SIZE,
-      .maxRayRecursionDepth = dev->chip == AGX_CHIP_G17P ?
+      .maxRayRecursionDepth = hk_gen1_rt_chip(dev) ?
          HK_G17P_MAX_RAY_RECURSION_DEPTH : HK_MAX_RAY_RECURSION_DEPTH,
       .maxShaderGroupStride = 16384,
       .shaderGroupBaseAlignment = 64,
       .shaderGroupHandleCaptureReplaySize = sizeof(uint32_t),
       .maxRayDispatchInvocationCount = 1u << 30,
-      .shaderGroupHandleAlignment = dev->chip == AGX_CHIP_G17P ? 1 : 32,
+      .shaderGroupHandleAlignment = hk_gen1_rt_chip(dev) ? 1 : 32,
       .maxRayHitAttributeSize = HK_RAY_HIT_ATTRIBS_SIZE,
 
       .rayTracingInvocationReorderReorderingHint =
@@ -1528,7 +1529,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .requiredSubgroupSizeStages =
          VK_SHADER_STAGE_COMPUTE_BIT |
          (features->rayTracingPipeline ? HK_RAY_TRACING_STAGES : 0) |
-         (dev->chip == AGX_CHIP_G17P && features->meshShader
+         (agx_chip_gen1_mesh(dev->chip) && features->meshShader
              ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT
              : 0),
       .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
@@ -2222,7 +2223,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(&pdev->dev, instance, &supported_extensions);
-   if (hk_g16s_as_enabled(&pdev->dev)) {
+   if (hk_g16s_as_enabled(&pdev->dev) || hk_g16g_as_enabled(&pdev->dev)) {
       supported_extensions.KHR_acceleration_structure = true;
       supported_extensions.KHR_deferred_host_operations = true;
    }
@@ -2306,8 +2307,10 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    }
 
    struct vk_features supported_features;
-   /* G17P runs mesh shaders natively and task shaders in software. */
-   if (pdev->dev.chip == AGX_CHIP_G17P)
+   /* G17P runs mesh shaders natively and task shaders in software; G16G
+    * takes the same path when the kernel advertises RENDER_MESH_OUTPUT
+    * (hk_gen1_mesh_exposed()). */
+   if (hk_gen1_mesh_exposed(&pdev->dev))
       supported_extensions.EXT_mesh_shader = true;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
                           &supported_features);

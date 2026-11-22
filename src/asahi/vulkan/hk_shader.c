@@ -3021,7 +3021,7 @@ hk_native_rq_profile(const struct hk_device *dev)
 bool
 hk_tes_ray_queries_in_compute(const struct hk_device *dev)
 {
-   return dev->dev.chip == AGX_CHIP_G17P &&
+   return agx_chip_gen1_rt(dev->dev.chip) &&
           dev->gen1_native_rq && dev->gen1_native_graphics_rq;
 }
 
@@ -3509,7 +3509,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * child-grid words, and the G17P task kernel after its payload lowering. */
    if (nir->info.stage != MESA_SHADER_MESH &&
        !(nir->info.stage == MESA_SHADER_TASK &&
-         agx_chip_g17p_or_m5(dev->dev.chip))) {
+         (agx_chip_g17_m5(dev->dev.chip) || agx_chip_gen1_mesh(dev->dev.chip)))) {
       if (agx_chip_native_agx3(dev->dev.chip))
          agx_preprocess_nir_native(nir, dev->dev.chip);
       else if (dev->dev.chip == AGX_CHIP_G18G)
@@ -6248,7 +6248,7 @@ hk_build_predicated_mesh_object(enum agx_chip chip)
    nir_pop_if(&b, NULL);
    nir_def *lane = nir_load_local_invocation_index(&b);
    nir_def *value;
-   if (chip == AGX_CHIP_G17P) {
+   if (agx_chip_gen1_mesh(chip)) {
       /* This launch's rows of the grid (hk_mesh_launch_shape()). */
       nir_def *g = nir_load_global_constant(&b, 3, 32, grid, .align_mul = 4);
       nir_def *launch = nir_load_global_constant(&b, 1, 32,
@@ -6891,7 +6891,7 @@ static bool
 hk_mesh_task_grid(struct hk_device *dev, nir_shader *nir,
                   VkShaderCreateFlagsEXT flags)
 {
-   if (dev->dev.chip == AGX_CHIP_G17P) {
+   if (agx_chip_gen1_mesh(dev->dev.chip)) {
       if (nir->info.stage == MESA_SHADER_MESH) {
          if (flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT)
             hk_g17p_mesh_rows(nir);
@@ -7032,7 +7032,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    void *mesh_nir = NULL;
    size_t mesh_nir_size = 0;
    bool reads_primitive_input = false;
-   if (dev->dev.chip == AGX_CHIP_G17P && !mesh_fs &&
+   if (agx_chip_gen1_mesh(dev->dev.chip) && !mesh_fs &&
        nir->info.stage == MESA_SHADER_FRAGMENT &&
        dev->vk.enabled_features.meshShader)
       nir_shader_intrinsics_pass(nir, hk_fs_reads_primitive_input,
@@ -7129,7 +7129,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    /* Per-primitive inputs read zero without a mesh shader's records: a mesh
     * draw uses the twin instead. */
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_chip_gen1_mesh(dev->dev.chip) &&
        nir->info.stage == MESA_SHADER_FRAGMENT) {
       static const struct agx_m5_mesh_varyings no_mesh;
       if (mesh_fs)
@@ -7282,7 +7282,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
    if (sw_stage == MESA_SHADER_MESH) {
       struct hk_shader *shader = hk_main_mesh_variant(obj);
-      if (dev->dev.chip != AGX_CHIP_G17P &&
+      if (!agx_chip_gen1_mesh(dev->dev.chip) &&
           dev->dev.chip != AGX_CHIP_G17S) {
          ralloc_free(nir);
          hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
@@ -7292,12 +7292,12 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          NIR_PASS(_, nir, agx_nir_m5_canonicalize_empty_mesh);
       else
          NIR_PASS(_, nir, hk_g17p_mesh_default_counts);
-      if (agx_chip_g17p_or_m5(dev->dev.chip) &&
+      if ((agx_chip_gen1_mesh(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip)) &&
           nir->info.mesh.primitive_type == MESA_PRIM_POINTS &&
           !(nir->info.outputs_written & VARYING_BIT_PSIZ))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_mesh_default_point_size, nir_metadata_control_flow, NULL);
-      if ((dev->dev.chip == AGX_CHIP_G17P ||
+      if ((agx_chip_gen1_mesh(dev->dev.chip) ||
            (state && agx_chip_g17_m5(dev->dev.chip))) &&
           nir->info.mesh.primitive_type == MESA_PRIM_TRIANGLES &&
           !(nir->info.outputs_read & VARYING_BIT_PSIZ))
@@ -7328,14 +7328,14 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
 
 
       NIR_PASS(_, nir, nir_opt_constant_folding);
-      const bool sw_task = dev->dev.chip == AGX_CHIP_G17P &&
+      const bool sw_task = agx_chip_gen1_mesh(dev->dev.chip) &&
          !(info->flags & VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT);
-      if (dev->dev.chip == AGX_CHIP_G17P)
+      if (agx_chip_gen1_mesh(dev->dev.chip))
          NIR_PASS(_, nir, hk_lower_mesh_queries, !sw_task);
       const bool clip_m1_1 =
          hk_mesh_clip_m1_1(dev->vk.enabled_features.depthClipControl, state);
       /* G17P remaps the exported z instead (agx_nir_lower_gen1_mesh). */
-      if (clip_m1_1 && dev->dev.chip != AGX_CHIP_G17P) {
+      if (clip_m1_1 && !agx_chip_gen1_mesh(dev->dev.chip)) {
          /* Mesh outputs cannot go through output temporaries. Refuse what
           * the lowering cannot convert rather than render the wrong depth. */
          if (!agx_nir_clip_m1_1_complete(nir)) {
@@ -7366,8 +7366,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
    m5_mesh_layout:;
       bool layout_ok = m5_mesh ? agx_m5_mesh_gather_varyings(nir, &varyings)
                               : agx_gen1_mesh_gather_varyings(nir, &varyings);
-      varyings.clip_m1_1 = clip_m1_1 && dev->dev.chip == AGX_CHIP_G17P;
-      if ((dev->dev.chip == AGX_CHIP_G17P || m5_mesh) &&
+      varyings.clip_m1_1 = clip_m1_1 && agx_chip_gen1_mesh(dev->dev.chip);
+      if ((agx_chip_gen1_mesh(dev->dev.chip) || m5_mesh) &&
           nir->info.mesh.primitive_type == MESA_PRIM_LINES)
          varyings.line_bias_root_B = hk_root_descriptor_offset(line_y_bias);
 
@@ -7517,7 +7517,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
        * API write class was gathered. They do not change this declaration. */
       shader->info.writes_external_memory = api_writes_external_memory;
       struct hk_shader *object = &obj->variants[HK_MESH_VARIANT_RAST];
-      if (dev->dev.chip == AGX_CHIP_G17P) {
+      if (agx_chip_gen1_mesh(dev->dev.chip)) {
       nir_shader *object_nir = sw_task
          ? hk_build_task_mesh_object(dev->dev.chip)
          : hk_build_predicated_mesh_object(dev->dev.chip);
@@ -7586,7 +7586,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       /* This compiler-generated object only transports the mesh launch. */
       predicated->info.writes_external_memory = false;
    } else if (sw_stage == MESA_SHADER_TASK &&
-              dev->dev.chip == AGX_CHIP_G17P) {
+              agx_chip_gen1_mesh(dev->dev.chip)) {
       /* The software task stage: a compute kernel run ahead of the render. */
       const unsigned stride_B = LIBAGX_TASK_ENTRY_PAYLOAD_B +
                                 ALIGN_POT(nir->info.task_payload_size, 16);
@@ -8405,7 +8405,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
    /* A fragment shader compiled together with its mesh shader reads the
     * per-primitive records with that mesh shader's record layout. */
-   if (dev->dev.chip == AGX_CHIP_G17P && has_mesh) {
+   if (agx_chip_gen1_mesh(dev->dev.chip) && has_mesh) {
       nir_shader *mesh_nir = NULL, *fs_nir = NULL;
       for (uint32_t i = 0; i < shader_count; i++) {
          if (shaders[i]->info.stage == MESA_SHADER_MESH)
@@ -8548,7 +8548,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    const uint32_t root_descriptor_size = dev->dev.chip == AGX_CHIP_G17P
       ? blob_read_uint32(blob) : 0;
    uint8_t mesh_primitive_comps[64] = {0};
-   if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
+   if (agx_chip_gen1_mesh(dev->dev.chip) && info.stage == MESA_SHADER_MESH)
       blob_copy_bytes(blob, mesh_primitive_comps, sizeof(mesh_primitive_comps));
 
    struct agx_shader_info b_info;
@@ -8741,8 +8741,8 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
    if (blob->overrun || stage >= MESA_SHADER_MESH_STAGES ||
        (clip_z ? !dev->vk.physical->supported_features.depthClipControl
                : dev->vk.enabled_features.depthClipControl) ||
-       (has_mesh_source &&
-        (stage != MESA_SHADER_FRAGMENT || dev->dev.chip != AGX_CHIP_G17P)) ||
+       (has_mesh_source && (stage != MESA_SHADER_FRAGMENT ||
+                            !agx_chip_gen1_mesh(dev->dev.chip))) ||
        (variant_flags2 & ~1u) ||
        (has_fbl_source && stage != MESA_SHADER_FRAGMENT) ||
        (has_source && !sample_variants) ||
@@ -9165,7 +9165,7 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
    if (dev->dev.chip == AGX_CHIP_G17P)
       blob_write_uint32(blob, shader->root_descriptor_size);
-   if (dev->dev.chip == AGX_CHIP_G17P &&
+   if (agx_chip_gen1_mesh(dev->dev.chip) &&
        shader->info.stage == MESA_SHADER_MESH)
       blob_write_bytes(blob, shader->g17p_mesh_primitive_comps,
                        sizeof(shader->g17p_mesh_primitive_comps));
