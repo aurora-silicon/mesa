@@ -939,7 +939,23 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                hoist_samples;
             const bool hoist_i = first_sample[i] < window;
             const bool hoist_b = first_sample[best] < window;
-            better = hoist_i != hoist_b ? hoist_i : i < (unsigned)best;
+            if (in_flight && !hoist_past_writes) {
+               const unsigned tier_i = first_sample[i] < window ? 0
+                                       : first_sample[i] == ~0u ? 1
+                                                                : 2;
+               const unsigned tier_b = first_sample[best] < window ? 0
+                                       : first_sample[best] == ~0u ? 1
+                                                                   : 2;
+               if (tier_i != tier_b)
+                  better = tier_i < tier_b;
+               else if (tier_i == 1)
+                  better = t < best_t ||
+                           (t == best_t && height[i] > height[best]);
+               else
+                  better = i < (unsigned)best;
+            } else {
+               better = hoist_i != hoist_b ? hoist_i : i < (unsigned)best;
+            }
          } else
             better = t < best_t || (t == best_t && height[i] > height[best]);
          if (better) {
@@ -1495,10 +1511,16 @@ agx_ilp_schedule(agx_context *ctx)
                 * whichever first fits the program's occupancy step. This
                 * ranks candidates; register pressure and scoreboard waits
                 * remain what keeps the schedule safe. */
-               static const unsigned windows[] = {4, 2, 1};
+               static const unsigned windows_4[] = {4, 2, 1};
+               static const unsigned windows_8[] = {8, 6, 4, 2, 1};
+               const bool wide_win =
+                  debug_get_bool_option("W36_LOAD_WIN", false);
+               const unsigned *windows = wide_win ? windows_8 : windows_4;
+               const unsigned nwin =
+                  wide_win ? ARRAY_SIZE(windows_8) : ARRAY_SIZE(windows_4);
                const signed load_growth =
                   m5_load_cap > peak ? m5_load_cap - peak : 0;
-               for (unsigned w = 0; w < ARRAY_SIZE(windows); ++w) {
+               for (unsigned w = 0; w < nwin; ++w) {
                   if (ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                          alu_latency, 16 * alu_latency,
                                          load_growth, 0, false, true,

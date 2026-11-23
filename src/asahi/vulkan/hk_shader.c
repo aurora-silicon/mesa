@@ -1479,7 +1479,8 @@ bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
    unsigned bytes = intr->def.num_components * (intr->def.bit_size / 8);
    unsigned align_offset = nir_intrinsic_align_offset(intr);
 
-   if (!is_op(offset, nir_op_uadd_sat) || offset.def->bit_size != 32 ||
+   if (!(is_op(offset, nir_op_uadd_sat) || is_op(offset, nir_op_iadd) ||
+         is_op(offset, nir_op_ior)) || offset.def->bit_size != 32 ||
        bound->bit_size != 32 || align_offset > AGX_ZERO_PAGE_SIZE - bytes ||
        nir_intrinsic_align_mul(intr) > AGX_ZERO_PAGE_SIZE)
       return NULL;
@@ -1490,7 +1491,13 @@ bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
       return NULL;
 
    unsigned field = nir_scalar_as_uint(nir_scalar_is_const(x) ? x : y);
-   if (field > AGX_ZERO_PAGE_SIZE - bytes)
+   nir_scalar record_offset = nir_scalar_is_const(x) ? y : x;
+   uint32_t mask = field ? UINT32_MAX >> (32 - util_last_bit(field)) : 0;
+   bool exact = is_op(offset, nir_op_uadd_sat) ||
+      (is_op(offset, nir_op_iadd) &&
+       nir_instr_as_alu(nir_def_instr(offset.def))->no_unsigned_wrap) ||
+      m5_offset_aligned(record_offset, mask, 12);
+   if (!exact || field > AGX_ZERO_PAGE_SIZE - bytes)
       return NULL;
 
    /* index + field + bytes <= bound, including when the offset saturates. */
@@ -1864,6 +1871,15 @@ lower_load_global_constant_offset_instr(nir_builder *b,
          val = end <= UINT32_MAX
                   ? bounds_check(b, val, nir_imm_int(b, end), bound)
                   : nir_imm_zero(b, val->num_components, val->bit_size);
+      } else if (state->fold_field &&
+                 intrin->intrinsic == nir_intrinsic_load_global_bounded &&
+                 bit_size == 32 && m5_offset_aligned(offs, 3, 12)) {
+         /* The last word index fits in 32 bits even for a vector at the
+          * end of the address space. A partial last word is out of range. */
+         nir_def *last = nir_iadd_imm(b, nir_ushr_imm(b, offset, 2),
+                                      intrin->num_components - 1);
+         nir_def *valid = nir_ult(b, last, nir_ushr_imm(b, bound, 2));
+         val = nir_bcsel(b, valid, val, nir_imm_zero(b, val->num_components, bit_size));
       } else {
          /* Saturation makes a wrapping address fail the unsigned check. */
          offset = nir_uadd_sat(b, offset, nir_imm_int(b, load_size));

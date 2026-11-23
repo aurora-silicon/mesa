@@ -9198,12 +9198,20 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
 
    unsigned tmp_chans = instr->is_sparse ? 8 : 4;
    nir_component_mask_t read_mask = masked ? nir_def_components_read(&instr->def) : 0;
-   if (!is_txf && masked && !instr->is_sparse &&
+   if (masked && !instr->is_sparse &&
        instr->op != nir_texop_tg4 && instr->op != nir_texop_lod &&
        b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        !b->shader->key->dev.emit_agx3d &&
        dst.size == AGX_SIZE_32 && read_mask && !(read_mask & ~0xfu)) {
-      tmp_chans = util_bitcount(read_mask);
+      if (!is_txf) {
+         tmp_chans = util_bitcount(read_mask);
+      } else if (instr->op == nir_texop_txf &&
+                 instr->sampler_dim == GLSL_SAMPLER_DIM_2D &&
+                 !instr->is_array && !instr->is_shadow && !offset_present &&
+                 lod_mode == AGX_LOD_MODE_LOD_MIN &&
+                 util_bitcount(read_mask) <= 2) {
+         tmp_chans = util_bitcount(read_mask);
+      }
    }
 
    agx_index tmp = agx_vec_temp(b->shader, dst.size, tmp_chans);
@@ -10919,6 +10927,18 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
 
    agx_optimize_loop_nir(nir, m5, g17p);
 
+   if (m5 && !g18_scans && mesa_shader_stage_is_compute(nir->info.stage)) {
+      bool unswitched = false;
+      NIR_PASS(unswitched, nir, agx_nir_opt_unswitch_invariant_if);
+      if (unswitched)
+         agx_optimize_loop_nir(nir, m5, g17p);
+
+      bool unrolled = false;
+      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, 4, 320, NULL);
+      if (unrolled)
+         agx_optimize_loop_nir(nir, m5, g17p);
+   }
+
    /* Loops are unrolled now: a subgroup XOR shuffle whose mask is still not
     * a constant takes the general lowering (agx_nir_lower_subgroups.c).
     */
@@ -11260,6 +11280,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       NIR_PASS(_, nir, agx_nir_fold_ubyte_to_float);
    }
 
+   /* Factor shared constant multipliers and shifts in integer add trees before
+    * multiply-add fusion turns them into opaque imadshl_agx instructions.
+    */
+   {
+      bool factored = false;
+      NIR_PASS(factored, nir, agx_nir_opt_factor_const_mul);
+      if (factored)
+         NIR_PASS(_, nir, nir_opt_dce);
+   }
+
    /* Fuse add/sub/multiplies/shifts after running opt_algebraic_late to fuse
     * isub but before shifts are lowered.
     */
@@ -11286,6 +11316,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    /* Do remaining lowering late, since this inserts &s for shifts so we want to
     * do it after fusing constant shifts. Constant folding will clean up.
     */
+   /* Share shifted high-half bitfield extracts on AGX3 before extract16_bfe
+    * folds them into separate IC-pipe bfeil ops. */
+   if (m5 && !g18_scans)
+      NIR_PASS(_, nir, agx_nir_opt_half_bitfield_extract);
+
    /* Must precede agx_nir_lower_algebraic_late, which rewrites extract_u16
     * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
    NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
@@ -14589,6 +14624,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
    /* Lower idiv after an optimization loop so we can constant fold more before
     * nir_opt_idiv_const.
     */
+   NIR_PASS(_, nir, agx_nir_opt_iv_divmod);
    NIR_PASS(_, nir, nir_opt_idiv_const, 16);
 
    nir_lower_idiv_options idiv_options = {
@@ -16969,6 +17005,15 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       assign_coefficient_regs(nir, &info->varyings.fs);
    }
 
+   if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d &&
+       (mesa_shader_stage_is_compute(nir->info.stage) ||
+        nir->info.stage == MESA_SHADER_FRAGMENT)) {
+      bool unswitched_if = false;
+      NIR_PASS(unswitched_if, nir, agx_nir_opt_unswitch_invariant_if);
+      if (unswitched_if)
+         nir_divergence_analysis(nir);
+   }
+
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       /* Hoist only what the register file can hold through the loop: the
        * file a workgroup allows (agx_ra), less what spilling reserves.
@@ -16996,7 +17041,12 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          if (nr_samples >= 4)
             regs = MIN2(regs, 184);
       }
-      NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
+      const bool speculative =
+         key->dev.chip == AGX_CHIP_G17C && !key->is_helper &&
+         !key->dev.emit_agx3d &&
+         (mesa_shader_stage_is_compute(nir->info.stage) ||
+          nir->info.stage == MESA_SHADER_FRAGMENT);
+      NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8, speculative);
    }
 
    if (key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {

@@ -3121,20 +3121,34 @@ agx_ra(agx_context *ctx)
       max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
    }
 
-   /* Keep more waves resident in ordinary G17C compute programs that
+   /* Keep more waves resident in ordinary G17C compute/fragment programs that
     * contain texture reads. Helpers and unspillable programs keep their
     * original hardware budget. */
    if (ctx->key->dev.chip == AGX_CHIP_G17C &&
-       ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
-       !ctx->key->is_helper && ctx->key->has_scratch &&
+       (ctx->stage == MESA_SHADER_COMPUTE ||
+        ctx->stage == MESA_SHADER_FRAGMENT) &&
+       !ctx->is_preamble && !ctx->key->is_helper && ctx->key->has_scratch &&
        !ctx->out->uses_ray_traversal) {
       unsigned samples = 0;
       agx_foreach_instr_global(ctx, I) {
-         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE || I->op == AGX_OPCODE_TEXTURE_LOAD)
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+             I->op == AGX_OPCODE_TEXTURE_LOAD ||
+             I->op == AGX_OPCODE_IMAGE_LOAD)
             samples++;
       }
-      if (samples >= 4)
-         max_possible_regs = MIN2(max_possible_regs, 184);
+      if (samples >= 4) {
+         if (ctx->stage == MESA_SHADER_COMPUTE) {
+            const unsigned cap =
+               (unsigned)debug_get_num_option("W36_CS_CAP", 256);
+            if (cap >= 96 && cap < 256)
+               max_possible_regs = MIN2(max_possible_regs, cap);
+         } else {
+            const unsigned cap =
+               (unsigned)debug_get_num_option("W36_FS_CAP", 184);
+            if (cap >= 96 && cap < 256)
+               max_possible_regs = MIN2(max_possible_regs, cap);
+         }
+      }
    }
 
    /* Match the CEM scratch extent reserved by agx3_pack_binary. */

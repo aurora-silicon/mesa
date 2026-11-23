@@ -184,6 +184,14 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
 
    case AGX_OPCODE_IMAGE_LOAD:
    case AGX_OPCODE_TEXTURE_LOAD:
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !ctx->key->dev.emit_agx3d && !I->sparse &&
+          I->dim == AGX_DIM_2D && I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
+          !I->shadow && !I->offset && !I->query_lod &&
+          I->gather == AGX_GATHER_NONE && size == 2 &&
+          agx_channels(I->dest[d]) == util_bitcount(I->mask) &&
+          util_bitcount(I->mask) <= 2)
+         return util_bitcount(I->mask) * size;
       return (I->sparse ? 8 : 4) * size;
    case AGX_OPCODE_TEXTURE_SAMPLE:
       if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
