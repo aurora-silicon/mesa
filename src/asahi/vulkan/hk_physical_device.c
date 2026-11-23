@@ -291,8 +291,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
-      /* Tested on G17P only. */
-      .EXT_depth_clip_control = dev->chip == AGX_CHIP_G17P,
+      /* Native pre-raster shaders lower the clip-space transform. */
+      .EXT_depth_clip_control = agx_chip_native_agx3(dev->chip),
       .EXT_depth_clip_enable = true,
       /* Qualified on G17P only (the whole binding_model.descriptor_buffer
        * group); other chips share the code but need their own run. */
@@ -775,8 +775,8 @@ hk_get_device_features(
       .floatRepresentation = false,
       .depthBiasExact = true,
 
-      /* VK_EXT_depth_clip_control, tested on G17P only */
-      .depthClipControl = dev->chip == AGX_CHIP_G17P,
+      /* VK_EXT_depth_clip_control */
+      .depthClipControl = supported_extensions->EXT_depth_clip_control,
 
       /* VK_EXT_depth_clip_enable */
       .depthClipEnable = true,
@@ -825,7 +825,7 @@ hk_get_device_features(
       .extendedDynamicState3LineRasterizationMode = true,
       .extendedDynamicState3LineStippleEnable = false,
       .extendedDynamicState3DepthClipNegativeOneToOne =
-         dev->chip == AGX_CHIP_G17P,
+         supported_extensions->EXT_depth_clip_control,
       .extendedDynamicState3ViewportWScalingEnable = false,
       .extendedDynamicState3ViewportSwizzle = false,
       .extendedDynamicState3CoverageToColorEnable = false,
@@ -1093,17 +1093,12 @@ hk_get_device_features(
        */
       features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
 
-      /* Qualified on A18 Pro only. */
-      if (dev->chip == AGX_CHIP_G17P) {
-         features->computeDerivativeGroupQuads = true;
-         features->computeDerivativeGroupLinear = true;
-         features->textureCompressionASTC_HDR = true;
-      }
+      features->textureCompressionASTC_HDR =
+         supported_extensions->EXT_texture_compression_astc_hdr;
    }
 
-   /* Compute derivatives are NIR quad-swap lowering plus explicit-gradient
-    * samples, both available on M5; quad control remains restricted to G17P. */
-   if (agx_chip_g17_m5(dev->chip)) {
+   /* Compute derivatives lower to quad swaps and explicit-gradient samples. */
+   if (supported_extensions->KHR_compute_shader_derivatives) {
       features->computeDerivativeGroupQuads = true;
       features->computeDerivativeGroupLinear = true;
    }
@@ -2304,23 +2299,15 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    if (!hk_shader_fma_supported(pdev->dev.chip))
       supported_extensions.KHR_shader_fma = false;
 
-   if (pdev->dev.chip == AGX_CHIP_G17P) {
-      /* Advanced blending is hardware-qualified on A18 Pro for every
-       * operation and advertised overlap/premultiplication mode, including
-       * coherent sequencing, across the bounded one-attachment profile. */
-      supported_extensions.KHR_compute_shader_derivatives = true;
-      supported_extensions.EXT_shader_atomic_float = true;
-      supported_extensions.EXT_shader_atomic_float2 = true;
-      supported_extensions.EXT_texture_compression_astc_hdr = true;
-   }
+   supported_extensions.EXT_texture_compression_astc_hdr =
+      agx_chip_native_agx3(pdev->dev.chip);
 
-   if (agx_chip_g17_m5(pdev->dev.chip))
-      supported_extensions.KHR_compute_shader_derivatives = true;
+   supported_extensions.KHR_compute_shader_derivatives =
+      agx_chip_native_or_m5(pdev->dev.chip);
 
-   /* AGX3C has no witnessed native float atomic; agx_nir_lower_atomics turns
-    * fp32 add/min/max on buffers, shared memory and (lowered) images into
-    * compare-and-swap loops, so the same feature set is exact on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip)) {
+   /* The native and M5 paths share float32 atomic lowering, including
+    * compare-and-swap loops for operations the hardware cannot encode. */
+   if (agx_chip_native_or_m5(pdev->dev.chip)) {
       supported_extensions.EXT_shader_atomic_float = true;
       supported_extensions.EXT_shader_atomic_float2 = true;
    }
