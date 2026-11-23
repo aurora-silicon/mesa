@@ -1840,6 +1840,57 @@ agx_optimizer_bitop(agx_context *ctx, agx_instr **defs, agx_instr *I)
    }
 }
 
+static void
+agx_optimizer_convert_u8_mask(const agx_context *ctx, agx_instr **defs,
+                              agx_instr *I)
+{
+   /* AGX3C (excluding G18G) natively executes CONVERT U8_TO_F (f32) and
+    * S8_TO_F (f16/f32) reading only the low 8 bits of a 16-bit half register.
+    * Fold away a redundant `and(h, 0xff)` mask such as the even-byte unpack of
+    * a merged u8x2..u8x4 device load.
+    *
+    * U8_TO_F with an f16 destination is intentionally excluded: AGX3C has no
+    * native unsigned-byte-to-f16 int2flt form, so agx_lower_agx3_half_converts
+    * lowers it to `and(src, 0xff)` + U16_TO_F (which reads all 16 bits of the
+    * source half), and the packer likewise emits BAND 0xff + U16_TO_F. */
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+       ctx->key->dev.emit_agx3d || I->nr_dests != 1 || I->nr_srcs != 2 ||
+       I->saturate || I->round != AGX_ROUND_RTE ||
+       I->src[0].type != AGX_INDEX_IMMEDIATE)
+      return;
+
+   const enum agx_convert mode = I->src[0].value;
+   const bool native_byte_cvt =
+      (mode == AGX_CONVERT_U8_TO_F && I->dest[0].size == AGX_SIZE_32) ||
+      (mode == AGX_CONVERT_S8_TO_F &&
+       (I->dest[0].size == AGX_SIZE_16 || I->dest[0].size == AGX_SIZE_32));
+   if (!native_byte_cvt)
+      return;
+
+   agx_index src = I->src[1];
+   if (src.type != AGX_INDEX_NORMAL || src.size != AGX_SIZE_16 ||
+       agx_channels(src) != 1 || src.abs || src.neg || src.memory)
+      return;
+
+   agx_instr *def = defs[src.value];
+   if (!def || def->op != AGX_OPCODE_BITOP ||
+       def->truth_table != UTIL_LUT2(a & b) ||
+       def->dest[0].size != AGX_SIZE_16 || def->nr_srcs != 2)
+      return;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      agx_index mask = def->src[s];
+      agx_index val = def->src[1 - s];
+      if (mask.type == AGX_INDEX_IMMEDIATE && !mask.abs && !mask.neg &&
+          (mask.value & 0xff) == 0xff &&
+          val.type == AGX_INDEX_NORMAL && val.size == AGX_SIZE_16 &&
+          agx_channels(val) == 1 && !val.abs && !val.neg && !val.memory) {
+         I->src[1] = val;
+         return;
+      }
+   }
+}
+
 /*
  * Fuse sign-extends into addition-like instructions.
  */
@@ -1933,6 +1984,8 @@ agx_optimizer_forward(agx_context *ctx)
          agx_optimizer_ballot(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_BITOP) {
          agx_optimizer_bitop(ctx, defs, I);
+      } else if (I->op == AGX_OPCODE_CONVERT) {
+         agx_optimizer_convert_u8_mask(ctx, defs, I);
       } else if (I->op == AGX_OPCODE_IADD || I->op == AGX_OPCODE_IMAD) {
          agx_optimizer_signext(ctx, defs, I);
       }

@@ -1818,3 +1818,68 @@ TEST_F(Optimizer, DeviceLoadImmediateIndexKeepsItsDisplacementEncodable)
    EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32735), AGX_INDEX_IMMEDIATE);
    EXPECT_EQ(device_load_index_type(mem_ctx, 8, 32736), AGX_INDEX_NORMAL);
 }
+
+TEST_F(Optimizer, ConvertU8MaskFoldAGX3C)
+{
+   struct {
+      enum agx_isa_encoding encoding;
+      bool emit_agx3d;
+      enum agx_convert mode;
+      enum agx_size dst_size;
+      uint16_t mask;
+      bool saturate;
+      enum agx_round round;
+      bool expect_fold;
+   } cases[] = {
+      /* Positive cases: AGX3C (non-AGX3D) U8_TO_F f32 and S8_TO_F f16/f32 */
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0xff,
+       false, AGX_ROUND_RTE, true},
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_S8_TO_F, AGX_SIZE_32, 0xff,
+       false, AGX_ROUND_RTE, true},
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_S8_TO_F, AGX_SIZE_16, 0xff,
+       false, AGX_ROUND_RTE, true},
+      /* Wider mask still preserves low 8 bits */
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0x3ff,
+       false, AGX_ROUND_RTE, true},
+      /* Negative cases: U8_TO_F f16, AGX3D, AGX3B, narrow mask, sat/round */
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_16, 0xff,
+       false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3C, true, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0xff,
+       false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0xff,
+       false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0x7f,
+       false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0xff,
+       true, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_SIZE_32, 0xff,
+       false, AGX_ROUND_RTZ, false},
+   };
+
+   for (const auto &c : cases) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = c.encoding;
+      key.dev.emit_agx3d = c.emit_agx3d;
+
+      for (agx_builder *b : {actual, expected}) {
+         b->shader->key = &key;
+         agx_index v = agx_preload(b, hx);
+         agx_index src = v;
+         if (b == actual || !c.expect_fold)
+            src = agx_bitop(b, v, agx_immediate(c.mask), UTIL_LUT2(a & b));
+         else
+            (void)agx_temp(b->shader, AGX_SIZE_16);
+         agx_index out = agx_temp(b->shader, c.dst_size);
+         agx_instr *I =
+            agx_convert_to(b, out, agx_immediate(c.mode), src, c.round);
+         I->saturate = c.saturate;
+         agx_unit_test(b, out);
+      }
+
+      agx_optimize_and_dce(actual->shader);
+      agx_dce(expected->shader, true);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
