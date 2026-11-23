@@ -5472,389 +5472,325 @@ agx3_materialize_f32_source(agx_builder *b, agx_index source)
    return source;
 }
 
+static agx_index
+agx3c_extend_half_int(agx_builder *b, agx_index src, bool is_signed)
+{
+   if (src.type == AGX_INDEX_IMMEDIATE) {
+      return agx_mov_imm(
+         b, 32,
+         is_signed ? (uint32_t)(int32_t)(int16_t)src.value : src.value);
+   }
+   agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+   if (is_signed)
+      agx_signext_to(b, wide, src);
+   else
+      agx_mov_to(b, wide, src);
+   return wide;
+}
+
+static agx_index
+agx3c_materialize_minifloat(agx_builder *b, agx_index src, enum agx_size size)
+{
+   float value = agx_minifloat_decode(src.value);
+   if (src.abs)
+      value = fabsf(value);
+   if (src.neg)
+      value = -value;
+   if (size == AGX_SIZE_16)
+      return agx_mov_imm(b, 16, _mesa_float_to_half(value));
+   uint32_t bits;
+   memcpy(&bits, &value, sizeof(bits));
+   return agx_mov_imm(b, 32, bits);
+}
+
+static bool
+agx3c_is_negzero_imm(agx_index idx)
+{
+   const agx_index z = agx_negzero();
+   return idx.type == AGX_INDEX_IMMEDIATE && idx.value == z.value &&
+          idx.neg == z.neg && idx.abs == z.abs;
+}
+
+static enum agx_icond
+agx3c_reverse_icond(enum agx_icond cond)
+{
+   switch (cond) {
+   case AGX_ICOND_ULT: return AGX_ICOND_UGT;
+   case AGX_ICOND_UGT: return AGX_ICOND_ULT;
+   case AGX_ICOND_SLT: return AGX_ICOND_SGT;
+   case AGX_ICOND_SGT: return AGX_ICOND_SLT;
+   default: return cond;
+   }
+}
+
+static agx_index
+agx3c_apply_f16_sign_mods(agx_builder *b, agx_index src)
+{
+   const bool absolute = src.abs, negate = src.neg;
+   src.abs = false;
+   src.neg = false;
+   if (absolute) {
+      agx_index mask = agx_mov_imm(b, 16, UINT16_C(0x7fff));
+      agx_index cleared = agx_temp(b->shader, AGX_SIZE_16);
+      agx_bitop_to(b, cleared, src, mask, 0x8 /* AND */);
+      src = cleared;
+   }
+   if (negate) {
+      agx_index sign = agx_mov_imm(b, 16, UINT16_C(0x8000));
+      agx_index flipped = agx_temp(b->shader, AGX_SIZE_16);
+      agx_bitop_to(b, flipped, src, sign, 0x6 /* XOR */);
+      src = flipped;
+   }
+   return src;
+}
+
+static agx_index
+agx3c_widen_f16_to_f32(agx_builder *b, agx_index src)
+{
+   agx_index plain = src;
+   plain.abs = false;
+   plain.neg = false;
+   agx_index wide = agx_temp(b->shader, AGX_SIZE_32);
+   agx_fmov_to(b, wide, plain);
+   wide.abs = src.abs;
+   wide.neg = src.neg;
+   return wide;
+}
+
 /*
- * Second G17G attempt only (ctx->agx3_reg_float_consts): many float ALU shapes
- * with a minifloat immediate, or with a half compared against an f32, have no
- * grounded G17G encoding, while the plain register forms do. Materialize each
- * float immediate as an exact register of the width the operand is read at
- * (comparands as f32, everything else at the destination width) and widen a
- * half comparand facing an f32 one. Binary16 values and minifloats are exact
- * in both widths, so results are unchanged.
+ * First-pass AGX3C (G17G / G18G) legalization for operand shapes that have no
+ * native AGX3C encoding. Only shapes that the AGX3C packer genuinely refuses
+ * are rewritten; native minifloat immediates, tied min/max, and native mixed-
+ * width forms are left untouched so code size and register pressure stay
+ * optimal on the first (and only) compilation pass.
  */
 bool
-agx_lower_g17g_retry_float_operands(agx_context *ctx)
+agx_lower_agx3c_unsupported_operands(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       !ctx->agx3_reg_float_consts)
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C)
       return false;
 
+   const bool g18g = ctx->key->dev.emit_agx3d;
    bool progress = false;
    agx_foreach_instr_global_safe(ctx, I) {
       if (I->nr_dests != 1 || I->dest[0].type != AGX_INDEX_NORMAL)
          continue;
 
-      /* G17G has no witnessed unordered LTN/GTN compare-select. They are
-       * exactly the negations of the ordered GE/LE (NaN included): swap the
-       * selected values, or flip an unfused compare's inversion. */
+      /* AGX3C only uses unordered LTN/GTN for native tied minNum/maxNum.
+       * For unfused FCMP and any untied FCMPSEL, LTN/GTN are exactly the
+       * negations of ordered GE/LE (NaN included): swap selected values or
+       * flip FCMP's invert_cond at zero instruction cost. */
       if ((I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4) ||
           I->op == AGX_OPCODE_FCMP) {
          if (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) {
-            I->fcond = I->fcond == AGX_FCOND_LTN ? AGX_FCOND_GE : AGX_FCOND_LE;
-            if (I->op == AGX_OPCODE_FCMPSEL) {
-               agx_index t = I->src[2];
-               I->src[2] = I->src[3];
-               I->src[3] = t;
-            } else {
-               I->invert_cond = !I->invert_cond;
+            const bool tied_minmax =
+               I->op == AGX_OPCODE_FCMPSEL && !I->invert_cond && !I->saturate &&
+               agx_is_equiv(I->src[0], I->src[2]) &&
+               agx_is_equiv(I->src[1], I->src[3]) &&
+               (I->src[0].type == AGX_INDEX_IMMEDIATE ||
+                I->src[0].size == I->dest[0].size) &&
+               (I->src[1].type == AGX_INDEX_IMMEDIATE ||
+                I->src[1].size == I->dest[0].size);
+            if (!tied_minmax) {
+               I->fcond =
+                  I->fcond == AGX_FCOND_LTN ? AGX_FCOND_GE : AGX_FCOND_LE;
+               if (I->op == AGX_OPCODE_FCMPSEL) {
+                  agx_index t = I->src[2];
+                  I->src[2] = I->src[3];
+                  I->src[3] = t;
+               } else {
+                  I->invert_cond = !I->invert_cond;
+               }
+               progress = true;
             }
-            progress = true;
          }
       }
 
-      /* An unfused signed integer comparison is lowered after RA to a 0/1
-       * select; G17G grounds signed conditions only with a 32-bit result
-       * (a loop counter's `i < n` in a 16-bit boolean). Compare into a
-       * 32-bit temporary and narrow it. */
-      /* With half comparands (mediump `a == b` into a boolean), RA turns the
-       * compare into a half 0/1 select on half registers, which G17G has no
-       * form for under any condition. Compare 32-bit extensions instead:
-       * signed (SEQ too) or zero extended, sext as in SIGNEXT above. */
-      if (I->op == AGX_OPCODE_ICMP && I->nr_srcs == 2 &&
-          I->dest[0].size == AGX_SIZE_16 &&
-          I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_16) {
-         bool ok = true;
+      /* Integer compare and compare-select legalization. */
+      if ((I->op == AGX_OPCODE_ICMP && I->nr_srcs == 2) ||
+          (I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4)) {
+         const bool is_icmp = I->op == AGX_OPCODE_ICMP;
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+
+         /* Immediate comparands only fit in 8 unsigned bits without modifiers. */
          for (unsigned s = 0; s < 2; ++s) {
             const agx_index src = I->src[s];
-            ok &= !src.neg && !src.abs && agx_channels(src) == 1 &&
-                  (src.type == AGX_INDEX_NORMAL ||
-                   src.type == AGX_INDEX_UNIFORM ||
-                   src.type == AGX_INDEX_IMMEDIATE);
+            if (src.type != AGX_INDEX_IMMEDIATE ||
+                (src.value <= UINT8_MAX && !src.abs && !src.neg))
+               continue;
+            const agx_index other = I->src[s ^ 1];
+            const unsigned bits =
+               (other.type != AGX_INDEX_IMMEDIATE && other.size == AGX_SIZE_16)
+                  ? 16
+                  : 32;
+            uint32_t value = src.neg ? -(uint32_t)src.value : src.value;
+            if (bits == 16)
+               value &= UINT16_MAX;
+            I->src[s] = agx_mov_imm(&b, bits, value);
+            progress = true;
          }
-         if (ok) {
-            const bool is_signed = I->icond == AGX_ICOND_SLT ||
-                                   I->icond == AGX_ICOND_SGT ||
-                                   I->icond == AGX_ICOND_SEQ;
-            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-            for (unsigned s = 0; s < 2; ++s) {
+
+         /* Selected operands of ICMPSEL must match dest width or be u8 imm. */
+         if (!is_icmp && (I->dest[0].size == AGX_SIZE_16 ||
+                          I->dest[0].size == AGX_SIZE_32)) {
+            const unsigned dest_bits =
+               I->dest[0].size == AGX_SIZE_16 ? 16 : 32;
+            for (unsigned s = 2; s < 4; ++s) {
                const agx_index src = I->src[s];
                if (src.type == AGX_INDEX_IMMEDIATE) {
-                  I->src[s] = agx_mov_imm(
-                     &b, 32,
-                     is_signed ? (uint32_t)(int32_t)(int16_t)src.value
-                               : src.value);
-                  continue;
+                  if (src.value > UINT8_MAX || src.abs || src.neg) {
+                     uint32_t value =
+                        src.neg ? -(uint32_t)src.value : src.value;
+                     if (dest_bits == 16)
+                        value &= UINT16_MAX;
+                     I->src[s] = agx_mov_imm(&b, dest_bits, value);
+                     progress = true;
+                  }
+               } else if ((src.type == AGX_INDEX_NORMAL ||
+                           src.type == AGX_INDEX_UNIFORM) &&
+                          agx_channels(src) == 1 && !src.abs && !src.neg &&
+                          src.size != I->dest[0].size) {
+                  if (I->dest[0].size == AGX_SIZE_16 &&
+                      src.size == AGX_SIZE_32) {
+                     agx_index narrow = agx_temp(ctx, AGX_SIZE_16);
+                     agx_subdivide_to(&b, narrow, src, 0);
+                     I->src[s] = narrow;
+                     progress = true;
+                  } else if (I->dest[0].size == AGX_SIZE_32 &&
+                             src.size == AGX_SIZE_16) {
+                     agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+                     agx_mov_to(&b, wide, src);
+                     I->src[s] = wide;
+                     progress = true;
+                  }
                }
-               agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-               agx_mov_to(&b, wide, src);
-               if (is_signed) {
-                  agx_index bias = agx_mov_imm(&b, 32, 0x8000);
-                  agx_index flipped = agx_temp(ctx, AGX_SIZE_32);
-                  agx_bitop_to(&b, flipped, wide, bias, 0x6 /* XOR */);
-                  agx_index extended = agx_temp(ctx, AGX_SIZE_32);
-                  agx_iadd_to(&b, extended, flipped, agx_neg(bias), 0);
-                  wide = extended;
-               }
-               I->src[s] = wide;
-            }
-            agx_builder after = agx_init_builder(ctx, agx_after_instr(I));
-            agx_index narrow = I->dest[0];
-            agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            I->dest[0] = wide;
-            agx_subdivide_to(&after, narrow, wide, 0);
-            progress = true;
-            continue;
-         }
-      }
-
-      if (I->op == AGX_OPCODE_ICMP && I->dest[0].size == AGX_SIZE_16 &&
-          (I->icond == AGX_ICOND_SLT || I->icond == AGX_ICOND_SGT)) {
-         agx_builder b = agx_init_builder(ctx, agx_after_instr(I));
-         agx_index narrow = I->dest[0];
-         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-         I->dest[0] = wide;
-         agx_subdivide_to(&b, narrow, wide, 0);
-         progress = true;
-         continue;
-      }
-
-      /* An integer compare-select with a half result has no grounded G17G
-       * form for the signed conditions, nor for an immediate comparand or
-       * immediate selected values (GTK's Vulkan vertex shaders select 16-bit
-       * values on a 32-bit `x < n`). Select between 32-bit registers into a
-       * 32-bit temporary and narrow it, as for ICMP above: the selected
-       * values are bit patterns and are zero-extended; an immediate
-       * comparand takes the width of the register it is compared with. */
-      /* With half comparands too (mediump `a < b ? 1 : 0`, registers or
-       * uniforms, which are only lowered later), widen them first:
-       * sign-extended for the signed conditions (SEQ included, so that an
-       * immediate comparand extends the same way as the register), zero-
-       * extended otherwise. G17G has no witnessed sign-extending half add,
-       * so extend as sext(x) = (zext(x) ^ 0x8000) - 0x8000, as SIGNEXT is
-       * lowered above. Every operand is checked before any is rewritten. */
-      /* An immediate first comparand: compare the other way round. */
-      if (I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4 &&
-          I->dest[0].size == AGX_SIZE_16 &&
-          I->src[0].type == AGX_INDEX_IMMEDIATE &&
-          (I->src[1].type == AGX_INDEX_NORMAL ||
-           I->src[1].type == AGX_INDEX_UNIFORM)) {
-         const agx_index t = I->src[0];
-         I->src[0] = I->src[1];
-         I->src[1] = t;
-         switch (I->icond) {
-         case AGX_ICOND_ULT: I->icond = AGX_ICOND_UGT; break;
-         case AGX_ICOND_UGT: I->icond = AGX_ICOND_ULT; break;
-         case AGX_ICOND_SLT: I->icond = AGX_ICOND_SGT; break;
-         case AGX_ICOND_SGT: I->icond = AGX_ICOND_SLT; break;
-         default: break;
-         }
-         progress = true;
-      }
-
-      if (I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4 &&
-          I->dest[0].size == AGX_SIZE_16 &&
-          (I->src[0].type == AGX_INDEX_NORMAL ||
-           I->src[0].type == AGX_INDEX_UNIFORM) &&
-          (I->src[0].size == AGX_SIZE_32 || I->src[0].size == AGX_SIZE_16)) {
-         const bool cmp16 = I->src[0].size == AGX_SIZE_16;
-         const bool is_signed = I->icond == AGX_ICOND_SLT ||
-                                I->icond == AGX_ICOND_SGT ||
-                                I->icond == AGX_ICOND_SEQ;
-         bool ok = true;
-         for (unsigned s = 0; s < 4 && ok; ++s) {
-            const agx_index src = I->src[s];
-            if (src.neg || src.abs)
-               ok = false;
-            else if (src.type == AGX_INDEX_IMMEDIATE)
-               ok = s != 0;
-            else if ((src.type != AGX_INDEX_NORMAL &&
-                      src.type != AGX_INDEX_UNIFORM) ||
-                     agx_channels(src) != 1)
-               ok = false;
-            else if (s < 2)
-               ok = src.size == I->src[0].size;
-            else
-               ok = src.size == AGX_SIZE_16 || src.size == AGX_SIZE_32;
-         }
-         if (!ok)
-            continue;
-
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         for (unsigned s = 0; s < 4; ++s) {
-            agx_index src = I->src[s];
-            const bool compared = s < 2;
-            if (src.type == AGX_INDEX_IMMEDIATE) {
-               uint32_t value = src.value;
-               if (compared && cmp16 && is_signed)
-                  value = (uint32_t)(int32_t)(int16_t)value;
-               I->src[s] = agx_mov_imm(&b, 32, value);
-            } else if (src.size == AGX_SIZE_16 &&
-                       !(compared && !cmp16)) {
-               agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-               agx_mov_to(&b, wide, src);
-               if (compared && is_signed) {
-                  agx_index bias = agx_mov_imm(&b, 32, 0x8000);
-                  agx_index flipped = agx_temp(ctx, AGX_SIZE_32);
-                  agx_bitop_to(&b, flipped, wide, bias, 0x6 /* XOR */);
-                  agx_index extended = agx_temp(ctx, AGX_SIZE_32);
-                  agx_iadd_to(&b, extended, flipped, agx_neg(bias), 0);
-                  wide = extended;
-               }
-               I->src[s] = wide;
             }
          }
-         {
-            agx_index narrow = I->dest[0];
-            agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            I->dest[0] = wide;
-            agx_builder after = agx_init_builder(ctx, agx_after_instr(I));
-            agx_subdivide_to(&after, narrow, wide, 0);
-            progress = true;
+
+         /* G18G's encode_gpu1 integer select has narrower half-comparand
+          * coverage than M5's encode_agx3c: legalize only the combinations
+          * encode_gpu1 refuses. */
+         if (g18g && (I->dest[0].size == AGX_SIZE_16 ||
+                      I->dest[0].size == AGX_SIZE_32)) {
+            if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                I->src[1].type != AGX_INDEX_IMMEDIATE) {
+               agx_index tmp = I->src[0];
+               I->src[0] = I->src[1];
+               I->src[1] = tmp;
+               I->icond = agx3c_reverse_icond(I->icond);
+               progress = true;
+            }
+
+            const bool s0_reg = I->src[0].type == AGX_INDEX_NORMAL ||
+                                I->src[0].type == AGX_INDEX_UNIFORM;
+            const bool s1_imm = I->src[1].type == AGX_INDEX_IMMEDIATE;
+            const bool s1_reg = I->src[1].type == AGX_INDEX_NORMAL ||
+                                I->src[1].type == AGX_INDEX_UNIFORM;
+            const bool cmp_plain =
+               s0_reg && !I->src[0].abs && !I->src[0].neg &&
+               agx_channels(I->src[0]) == 1 &&
+               (s1_imm || (s1_reg && !I->src[1].abs && !I->src[1].neg &&
+                           agx_channels(I->src[1]) == 1));
+            if (cmp_plain) {
+               const bool s0_half = I->src[0].size == AGX_SIZE_16;
+               const bool s1_half = s1_reg && I->src[1].size == AGX_SIZE_16;
+               const bool half_regs = s0_half && s1_half;
+               const bool half_imm = s0_half && s1_imm;
+               const bool mixed_cmp = (s0_half != s1_half) && s1_reg;
+               const bool dest16 = I->dest[0].size == AGX_SIZE_16;
+               const bool is_eq =
+                  I->icond == AGX_ICOND_UEQ || I->icond == AGX_ICOND_SEQ;
+               const bool is_signed = I->icond == AGX_ICOND_SLT ||
+                                      I->icond == AGX_ICOND_SGT ||
+                                      I->icond == AGX_ICOND_SEQ;
+
+               if (half_regs && dest16) {
+                  if (I->icond == AGX_ICOND_UGT) {
+                     agx_index tmp = I->src[0];
+                     I->src[0] = I->src[1];
+                     I->src[1] = tmp;
+                     I->icond = AGX_ICOND_ULT;
+                     progress = true;
+                  } else if (I->icond == AGX_ICOND_SLT ||
+                             I->icond == AGX_ICOND_SGT) {
+                     I->src[0] = agx3c_extend_half_int(&b, I->src[0], true);
+                     I->src[1] = agx3c_extend_half_int(&b, I->src[1], true);
+                     progress = true;
+                  }
+               } else if (half_imm && !is_eq) {
+                  if (dest16 && (I->icond == AGX_ICOND_ULT ||
+                                 I->icond == AGX_ICOND_UGT)) {
+                     I->src[1] = agx_mov_imm(&b, 16, I->src[1].value);
+                     if (I->icond == AGX_ICOND_UGT) {
+                        agx_index tmp = I->src[0];
+                        I->src[0] = I->src[1];
+                        I->src[1] = tmp;
+                        I->icond = AGX_ICOND_ULT;
+                     }
+                     progress = true;
+                  } else {
+                     I->src[0] =
+                        agx3c_extend_half_int(&b, I->src[0], is_signed);
+                     progress = true;
+                  }
+               } else if (half_regs && !dest16) {
+                  const bool ti =
+                     is_icmp || I->src[2].type == AGX_INDEX_IMMEDIATE;
+                  const bool fi =
+                     is_icmp || I->src[3].type == AGX_INDEX_IMMEDIATE;
+                  if ((ti || fi) && (!is_eq || (ti && fi))) {
+                     if (is_icmp) {
+                        I->src[0] =
+                           agx3c_extend_half_int(&b, I->src[0], is_signed);
+                        I->src[1] =
+                           agx3c_extend_half_int(&b, I->src[1], is_signed);
+                        progress = true;
+                     } else if (is_eq && ti && fi) {
+                        I->src[3] = agx_mov_imm(&b, 32, I->src[3].value);
+                        progress = true;
+                     } else {
+                        for (unsigned s = 2; s < 4; ++s) {
+                           if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+                              I->src[s] = agx_mov_imm(&b, 32, I->src[s].value);
+                              progress = true;
+                           }
+                        }
+                     }
+                  }
+               } else if (mixed_cmp) {
+                  /* encode_gpu1 refuses odd half comparands and signed half
+                   * compares into a 16-bit destination. */
+                  const unsigned h = s0_half ? 0 : 1;
+                  I->src[h] = agx3c_extend_half_int(&b, I->src[h], false);
+                  progress = true;
+               }
+            }
          }
          continue;
       }
 
-      /* A 32-bit result selected on half comparands (a bool `==` in a vertex
-       * shader) is grounded on G17G only against an equality immediate of
-       * at most 2. Compare the 32-bit extensions instead, sign-extended for
-       * the signed conditions and zero-extended otherwise, as above. */
-      if (I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4 &&
-          I->dest[0].size == AGX_SIZE_32 && I->src[0].size == AGX_SIZE_16 &&
-          (I->src[0].type == AGX_INDEX_NORMAL ||
-           I->src[0].type == AGX_INDEX_UNIFORM) &&
-          !(I->src[1].type == AGX_INDEX_IMMEDIATE && I->src[1].value <= 2 &&
-            (I->icond == AGX_ICOND_UEQ || I->icond == AGX_ICOND_SEQ))) {
-         const bool is_signed = I->icond == AGX_ICOND_SLT ||
-                                I->icond == AGX_ICOND_SGT ||
-                                I->icond == AGX_ICOND_SEQ;
-         bool ok = true;
-         for (unsigned s = 0; s < 2 && ok; ++s) {
-            const agx_index src = I->src[s];
-            ok = !src.neg && !src.abs &&
-                 (src.type == AGX_INDEX_IMMEDIATE ||
-                  ((src.type == AGX_INDEX_NORMAL ||
-                    src.type == AGX_INDEX_UNIFORM) &&
-                   agx_channels(src) == 1 && src.size == AGX_SIZE_16));
-         }
-         if (ok) {
-            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-            for (unsigned s = 0; s < 2; ++s) {
-               const agx_index src = I->src[s];
-               if (src.type == AGX_INDEX_IMMEDIATE) {
-                  I->src[s] = agx_mov_imm(
-                     &b, 32,
-                     is_signed ? (uint32_t)(int32_t)(int16_t)src.value
-                               : src.value);
-                  continue;
-               }
-               agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-               agx_mov_to(&b, wide, src);
-               if (is_signed) {
-                  agx_index bias = agx_mov_imm(&b, 32, 0x8000);
-                  agx_index flipped = agx_temp(ctx, AGX_SIZE_32);
-                  agx_bitop_to(&b, flipped, wide, bias, 0x6 /* XOR */);
-                  agx_index extended = agx_temp(ctx, AGX_SIZE_32);
-                  agx_iadd_to(&b, extended, flipped, agx_neg(bias), 0);
-                  wide = extended;
-               }
-               I->src[s] = wide;
-            }
-            progress = true;
-            continue;
-         }
-      }
-
-      /* G17G grounds a & ~b (truth table 0x2, 0x4 with the sources
-       * exchanged) only on halves. At 32 bits complement the cleared source
-       * with an XOR against all ones and AND (bitfieldInsert's select). */
-      if (I->op == AGX_OPCODE_BITOP && I->nr_srcs == 2 &&
-          I->dest[0].size == AGX_SIZE_32 &&
-          ((I->truth_table & 0xfu) == 0x2u ||
-           (I->truth_table & 0xfu) == 0x4u)) {
-         const unsigned c = (I->truth_table & 0xfu) == 0x2u ? 1 : 0;
-         const agx_index src = I->src[c];
-         if (!src.neg && !src.abs && src.size == AGX_SIZE_32 &&
-             agx_channels(src) == 1 &&
-             (src.type == AGX_INDEX_NORMAL || src.type == AGX_INDEX_UNIFORM ||
-              src.type == AGX_INDEX_IMMEDIATE)) {
-            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-            if (src.type == AGX_INDEX_IMMEDIATE) {
-               I->src[c] = agx_mov_imm(&b, 32, ~(uint32_t)src.value);
-            } else {
-               agx_index inverted = agx_temp(ctx, AGX_SIZE_32);
-               agx_bitop_to(&b, inverted, src,
-                            agx_mov_imm(&b, 32, UINT32_C(0xffffffff)),
-                            0x6 /* XOR */);
-               I->src[c] = inverted;
-            }
-            I->truth_table = 0x8 /* AND */;
-            progress = true;
-            continue;
-         }
-      }
-
-      /* |a| * |b| at half precision has no grounded G17G form with both
-       * sources absolute: multiply and clear the sign bit (|a*b|, NaNs and
-       * signed zeros included). */
-      if ((I->op == AGX_OPCODE_FMUL || I->op == AGX_OPCODE_HMUL) &&
-          I->nr_srcs == 2 && !I->saturate &&
-          I->dest[0].size == AGX_SIZE_16 &&
-          I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_16 &&
-          I->src[0].abs && I->src[1].abs &&
-          !I->src[0].neg && !I->src[1].neg &&
-          I->src[0].type != AGX_INDEX_IMMEDIATE &&
-          I->src[1].type != AGX_INDEX_IMMEDIATE) {
-         I->src[0].abs = I->src[1].abs = false;
-         agx_index product = agx_temp(ctx, AGX_SIZE_16);
-         agx_index narrow = I->dest[0];
-         I->dest[0] = product;
-         agx_builder after = agx_init_builder(ctx, agx_after_instr(I));
-         agx_bitop_to(&after, narrow, product,
-                      agx_mov_imm(&after, 16, 0x7fff), 0x8 /* AND */);
-         progress = true;
-         continue;
-      }
-
-      /* An f32 -> f16 conversion of a negated or absolute source
-       * (fadd(-x, -0.0) into a half) has no grounded form; convert x and
-       * set the half's sign: XOR 0x8000 for -x, AND 0x7fff for |x|, OR
-       * 0x8000 for -|x|. */
-      if (I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
-          I->dest[0].size == AGX_SIZE_16 && I->src[0].size == AGX_SIZE_32 &&
-          (I->src[0].neg || I->src[0].abs) &&
-          (I->src[0].type == AGX_INDEX_NORMAL ||
-           I->src[0].type == AGX_INDEX_UNIFORM) &&
-          I->src[1].type == AGX_INDEX_IMMEDIATE &&
-          I->src[1].value == agx_negzero().value &&
-          I->src[1].neg == agx_negzero().neg &&
-          I->src[1].abs == agx_negzero().abs) {
-         const bool abs = I->src[0].abs, neg = I->src[0].neg;
-         I->src[0].neg = I->src[0].abs = false;
-         agx_index converted = agx_temp(ctx, AGX_SIZE_16);
-         agx_index narrow = I->dest[0];
-         I->dest[0] = converted;
-         agx_builder after = agx_init_builder(ctx, agx_after_instr(I));
-         agx_bitop_to(&after, narrow, converted,
-                      agx_mov_imm(&after, 16, abs && !neg ? 0x7fff : 0x8000),
-                      abs ? (neg ? 0xe /* OR */ : 0x8 /* AND */)
-                          : 0x6 /* XOR */);
-         progress = true;
-         continue;
-      }
-
-      /* G17G grounds only the 32-bit integer -> float conversions (to f32
-       * and to f16); the byte and half forms are G17P's. Extend the source
-       * to 32 bits first: zero extension, masked to the byte for U8; sign
-       * extension as (x ^ m) - m with m = 0x80 or 0x8000. */
-      /* A byte is exact in f16 and f32, a half integer in f32, so the
-       * rounding mode of those conversions does not matter. */
+      /* A byte is exact in f16 and f32, and a 16-bit integer is exact in f32,
+       * so rounding mode is irrelevant; AGX3C's int2flt encoder requires RTE. */
       if (I->op == AGX_OPCODE_CONVERT && I->nr_srcs == 2 && !I->saturate &&
-          (I->round == AGX_ROUND_RTE || I->dest[0].size == AGX_SIZE_32 ||
-           (I->src[0].type == AGX_INDEX_IMMEDIATE &&
-            (I->src[0].value == AGX_CONVERT_U8_TO_F ||
-             I->src[0].value == AGX_CONVERT_S8_TO_F))) &&
+          I->round != AGX_ROUND_RTE &&
           I->src[0].type == AGX_INDEX_IMMEDIATE &&
           (I->src[0].value == AGX_CONVERT_U8_TO_F ||
            I->src[0].value == AGX_CONVERT_S8_TO_F ||
-           I->src[0].value == AGX_CONVERT_U16_TO_F ||
-           I->src[0].value == AGX_CONVERT_S16_TO_F) &&
-          I->src[1].size == AGX_SIZE_16 &&
-          (I->src[1].type == AGX_INDEX_NORMAL ||
-           I->src[1].type == AGX_INDEX_UNIFORM) &&
-          agx_channels(I->src[1]) == 1 && !I->src[1].abs && !I->src[1].neg) {
-         const enum agx_convert mode = I->src[0].value;
-         const bool byte =
-            mode == AGX_CONVERT_U8_TO_F || mode == AGX_CONVERT_S8_TO_F;
-         const bool is_signed =
-            mode == AGX_CONVERT_S8_TO_F || mode == AGX_CONVERT_S16_TO_F;
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-         agx_mov_to(&b, wide, I->src[1]);
-         if (byte) {
-            agx_index masked = agx_temp(ctx, AGX_SIZE_32);
-            agx_bitop_to(&b, masked, wide, agx_mov_imm(&b, 32, 0xff),
-                         0x8 /* AND */);
-            wide = masked;
-         }
-         if (is_signed) {
-            agx_index bias = agx_mov_imm(&b, 32, byte ? 0x80 : 0x8000);
-            agx_index flipped = agx_temp(ctx, AGX_SIZE_32);
-            agx_bitop_to(&b, flipped, wide, bias, 0x6 /* XOR */);
-            agx_index extended = agx_temp(ctx, AGX_SIZE_32);
-            agx_iadd_to(&b, extended, flipped, agx_neg(bias), 0);
-            wide = extended;
-         }
-         I->src[0] = agx_immediate(is_signed ? AGX_CONVERT_S32_TO_F
-                                             : AGX_CONVERT_U32_TO_F);
-         I->src[1] = wide;
+           (I->dest[0].size == AGX_SIZE_32 &&
+            (I->src[0].value == AGX_CONVERT_U16_TO_F ||
+             I->src[0].value == AGX_CONVERT_S16_TO_F)))) {
          I->round = AGX_ROUND_RTE;
          progress = true;
          continue;
       }
 
-      /* A three-channel tile load (blending into RGB565) has no grounded
-       * G17G form: load all four channels and keep the first three. */
+      /* Three-channel tile loads are natively grounded on AGX3C only at W16
+       * (e.g. F16/I16/UNORM16). For W8/W32 formats, load all four channels and
+       * keep the first three. */
       if (I->op == AGX_OPCODE_LD_TILE && I->mask == 0x7 &&
-          agx_channels(I->dest[0]) == 3) {
+          agx_channels(I->dest[0]) == 3 &&
+          I->format != AGX_FORMAT_I16 && I->format != AGX_FORMAT_F16 &&
+          I->format != AGX_FORMAT_U16NORM && I->format != AGX_FORMAT_S16NORM) {
          agx_index narrow = I->dest[0];
          agx_index wide = agx_vec_temp(ctx, narrow.size, 4);
          I->dest[0] = wide;
@@ -5867,88 +5803,213 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
          continue;
       }
 
-      /* Half derivatives have no grounded G17G form: differentiate the f32
-       * extension and round the result back (f16 -> f32 is exact, and the
-       * f32 difference rounds once to the same half the half unit would
-       * produce for representable values). */
-      if ((I->op == AGX_OPCODE_DFDX || I->op == AGX_OPCODE_DFDY) &&
-          I->nr_srcs == 1 && I->dest[0].size == AGX_SIZE_16 &&
-          I->src[0].size == AGX_SIZE_16 && !I->saturate &&
-          (I->src[0].type == AGX_INDEX_NORMAL ||
-           I->src[0].type == AGX_INDEX_UNIFORM) &&
-          agx_channels(I->src[0]) == 1) {
-         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-         agx_index wide_src = agx_temp(ctx, AGX_SIZE_32);
-         agx_fmov_to(&b, wide_src, I->src[0]);
-         agx_index wide_dst = agx_temp(ctx, AGX_SIZE_32);
-         agx_builder after = agx_init_builder(ctx, agx_after_instr(I));
-         agx_fmov_to(&after, I->dest[0], wide_dst);
-         I->src[0] = wide_src;
-         I->dest[0] = wide_dst;
-         progress = true;
-         continue;
-      }
-
-      /* `imm - x` at 32 bits has no G17G form with the immediate in the
-       * first slot; register subtraction is witnessed. The immediate keeps
-       * its extension: .abs marks a zero-extended source, as for registers
-       * in agx_lower_agx3_widening_iadd(). */
+      /* `imm - x` at 32 bits with a 16-bit immediate (.abs) or > 255 has no
+       * AGX3C immediate-subtract form; materialize the minuend. */
       if (I->op == AGX_OPCODE_IADD && I->nr_srcs == 2 &&
           I->dest[0].size == AGX_SIZE_32 &&
           I->src[0].type == AGX_INDEX_IMMEDIATE && !I->src[0].neg &&
+          (I->src[0].abs || I->src[0].value > UINT8_MAX) &&
           (I->src[1].type == AGX_INDEX_NORMAL ||
            I->src[1].type == AGX_INDEX_UNIFORM) &&
           I->src[1].neg && I->src[1].size == AGX_SIZE_32) {
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
          const agx_index imm = I->src[0];
          I->src[0] = agx_mov_imm(
-            &b, 32, imm.abs ? imm.value : (uint32_t)(int32_t)(int16_t)imm.value);
+            &b, 32,
+            imm.abs ? imm.value : (uint32_t)(int32_t)(int16_t)imm.value);
          progress = true;
          continue;
       }
 
-      /* An unfused float comparison (lowered after RA to a 0/1 select) has
-       * no mixed half/f32 form either: widen the half comparand. */
+      /* HADD: fold minifloat sign mods; materialize unsupported immediates
+       * (two-imm, src.abs with imm, sat with non-negzero imm or sat+neg+imm);
+       * strip register modifiers not encoded by HADD (G18G abs, M5 sat+neg). */
+      if (I->op == AGX_OPCODE_HADD && I->nr_srcs == 2 &&
+          I->dest[0].size == AGX_SIZE_16) {
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         for (unsigned s = 0; s < 2; ++s) {
+            if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+               if (I->src[s].abs) {
+                  I->src[s].value &= 0x7f;
+                  I->src[s].abs = false;
+                  progress = true;
+               }
+               if (I->src[s].neg) {
+                  I->src[s].value ^= 0x80;
+                  I->src[s].neg = false;
+                  progress = true;
+               }
+            }
+         }
+         if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[1].type == AGX_INDEX_IMMEDIATE) {
+            I->src[0] =
+               agx3c_materialize_minifloat(&b, I->src[0], AGX_SIZE_16);
+            progress = true;
+         }
+         if ((I->src[0].type == AGX_INDEX_IMMEDIATE) !=
+             (I->src[1].type == AGX_INDEX_IMMEDIATE)) {
+            const unsigned imm_s = I->src[0].type == AGX_INDEX_IMMEDIATE ? 0 : 1;
+            const unsigned reg_s = imm_s ^ 1;
+            if (I->src[reg_s].abs ||
+                (I->saturate &&
+                 (I->src[reg_s].neg || !agx3c_is_negzero_imm(I->src[imm_s])))) {
+               I->src[imm_s] =
+                  agx3c_materialize_minifloat(&b, I->src[imm_s], AGX_SIZE_16);
+               progress = true;
+            } else if (I->saturate && imm_s == 0 && g18g) {
+               agx_index tmp = I->src[0];
+               I->src[0] = I->src[1];
+               I->src[1] = tmp;
+               progress = true;
+            }
+         }
+         if (I->src[0].type != AGX_INDEX_IMMEDIATE &&
+             I->src[1].type != AGX_INDEX_IMMEDIATE) {
+            for (unsigned s = 0; s < 2; ++s) {
+               if (I->src[s].size != AGX_SIZE_16)
+                  continue;
+               if ((g18g && I->src[s].abs) ||
+                   (!g18g && I->saturate && I->src[s].neg)) {
+                  I->src[s] = agx3c_apply_f16_sign_mods(&b, I->src[s]);
+                  progress = true;
+               }
+            }
+         }
+         continue;
+      }
+
+      /* HFMA: only addend (src[2]) may be a minifloat, and only when unsat and
+       * multiplicands have no modifiers. Register sources cannot carry .abs. */
+      if (I->op == AGX_OPCODE_HFMA && I->nr_srcs == 3 &&
+          I->dest[0].size == AGX_SIZE_16) {
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         for (unsigned s = 0; s < 3; ++s) {
+            if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+               if (I->src[s].abs) {
+                  I->src[s].value &= 0x7f;
+                  I->src[s].abs = false;
+                  progress = true;
+               }
+               if (I->src[s].neg) {
+                  I->src[s].value ^= 0x80;
+                  I->src[s].neg = false;
+                  progress = true;
+               }
+            }
+         }
+         for (unsigned s = 0; s < 2; ++s) {
+            if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+               I->src[s] =
+                  agx3c_materialize_minifloat(&b, I->src[s], AGX_SIZE_16);
+               progress = true;
+            }
+         }
+         if (I->src[2].type == AGX_INDEX_IMMEDIATE &&
+             (I->saturate || I->src[0].abs || I->src[0].neg || I->src[1].abs ||
+              I->src[1].neg)) {
+            I->src[2] =
+               agx3c_materialize_minifloat(&b, I->src[2], AGX_SIZE_16);
+            progress = true;
+         }
+         for (unsigned s = 0; s < 3; ++s) {
+            if (I->src[s].type != AGX_INDEX_IMMEDIATE &&
+                I->src[s].size == AGX_SIZE_16 && I->src[s].abs) {
+               I->src[s] = agx3c_apply_f16_sign_mods(&b, I->src[s]);
+               progress = true;
+            }
+         }
+         continue;
+      }
+
+      /* HMUL encodes register/minifloat (unsat, plain) and register/register
+       * (optional abs when unsat; no neg, no sat+abs). */
+      if (I->op == AGX_OPCODE_HMUL && I->nr_srcs == 2 &&
+          I->dest[0].size == AGX_SIZE_16) {
+         agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+         for (unsigned s = 0; s < 2; ++s) {
+            if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+               if (I->src[s].abs) {
+                  I->src[s].value &= 0x7f;
+                  I->src[s].abs = false;
+                  progress = true;
+               }
+               if (I->src[s].neg) {
+                  I->src[s].value ^= 0x80;
+                  I->src[s].neg = false;
+                  progress = true;
+               }
+               if (I->saturate || I->src[s ^ 1].type == AGX_INDEX_IMMEDIATE) {
+                  I->src[s] =
+                     agx3c_materialize_minifloat(&b, I->src[s], AGX_SIZE_16);
+                  progress = true;
+               }
+            }
+         }
+         for (unsigned s = 0; s < 2; ++s) {
+            if (I->src[s].type == AGX_INDEX_IMMEDIATE ||
+                I->src[s].size != AGX_SIZE_16)
+               continue;
+            if (I->src[s].neg || (I->saturate && I->src[s].abs)) {
+               I->src[s] = agx3c_apply_f16_sign_mods(&b, I->src[s]);
+               progress = true;
+            }
+         }
+         continue;
+      }
+
+      /* Fold .abs/.neg directly into minifloat immediates on float ALU ops so
+       * native immediate encoders (which require plain minifloat bytes) accept
+       * them with zero extra instructions. */
+      if (I->op == AGX_OPCODE_FCMP || I->op == AGX_OPCODE_FCMPSEL ||
+          I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_FMUL ||
+          I->op == AGX_OPCODE_FFMA) {
+         const unsigned float_srcs =
+            (I->op == AGX_OPCODE_FCMP || I->op == AGX_OPCODE_FCMPSEL)
+               ? 2
+               : I->nr_srcs;
+         for (unsigned s = 0; s < float_srcs && s < I->nr_srcs; ++s) {
+            if (I->src[s].type != AGX_INDEX_IMMEDIATE)
+               continue;
+            if (I->src[s].abs) {
+               I->src[s].value &= 0x7f;
+               I->src[s].abs = false;
+               progress = true;
+            }
+            if (I->src[s].neg) {
+               I->src[s].value ^= 0x80;
+               I->src[s].neg = false;
+               progress = true;
+            }
+         }
+      }
+
+      /* Unfused FCMP: nonzero minifloat comparands were materialized earlier
+       * (or could have been -0.0 after folding above). Materialize any
+       * remaining nonzero minifloat comparand, widen half comparands, and
+       * strip register .abs/.neg modifiers (AGX3C/G18G boolean-select encoders
+       * do not carry comparand modifiers) so post-RA lowering to FCMPSEL hits
+       * native zero/register encodings on both M5 and G18G. */
       if (I->op == AGX_OPCODE_FCMP && I->nr_srcs == 2) {
          agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
          for (unsigned s = 0; s < 2; ++s) {
-            if (I->src[s].type != AGX_INDEX_NORMAL ||
-                I->src[s].size != AGX_SIZE_16)
-               continue;
-            agx_index plain = I->src[s];
-            plain.abs = false;
-            plain.neg = false;
-            agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            agx_fmov_to(&b, wide, plain);
-            wide.abs = I->src[s].abs;
-            wide.neg = I->src[s].neg;
-            I->src[s] = wide;
-            progress = true;
-         }
-
-         /* The post-RA lowering selects immediates 1 and 0, and G17G has no
-          * grounded register-compare/immediate-select form at either result
-          * width (WebRender's box-shadow fragment shader). Select between
-          * registers holding 1 and 0 here instead, at 32 bits, and narrow
-          * an integer half result afterwards. */
-         if (I->src[0].type == AGX_INDEX_NORMAL &&
-             I->src[1].type == AGX_INDEX_NORMAL &&
-             I->src[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_32 &&
-             I->nr_dests == 1 &&
-             (I->dest[0].size == AGX_SIZE_16 ||
-              I->dest[0].size == AGX_SIZE_32)) {
-            agx_index one = agx_mov_imm(&b, 32, 1);
-            agx_index zero = agx_mov_imm(&b, 32, 0);
-            agx_index wide = I->dest[0].size == AGX_SIZE_32
-                                ? I->dest[0]
-                                : agx_temp(ctx, AGX_SIZE_32);
-            agx_fcmpsel_to(&b, wide, I->src[0], I->src[1],
-                           I->invert_cond ? zero : one,
-                           I->invert_cond ? one : zero, I->fcond);
-            if (I->dest[0].size == AGX_SIZE_16)
-               agx_subdivide_to(&b, I->dest[0], wide, 0);
-            agx_remove_instruction(I);
-            progress = true;
+            if (I->src[s].type == AGX_INDEX_IMMEDIATE && I->src[s].value != 0) {
+               I->src[s] =
+                  agx3c_materialize_minifloat(&b, I->src[s], AGX_SIZE_32);
+               progress = true;
+            } else if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                        I->src[s].type == AGX_INDEX_UNIFORM) &&
+                       I->src[s].size == AGX_SIZE_16) {
+               I->src[s] = agx3c_widen_f16_to_f32(&b, I->src[s]);
+               progress = true;
+            }
+            if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                 I->src[s].type == AGX_INDEX_UNIFORM) &&
+                I->src[s].size == AGX_SIZE_32 &&
+                (I->src[s].abs || I->src[s].neg)) {
+               I->src[s] = agx3_materialize_f32_source(&b, I->src[s]);
+               progress = true;
+            }
          }
          continue;
       }
@@ -5957,161 +6018,323 @@ agx_lower_g17g_retry_float_operands(agx_context *ctx)
           I->op != AGX_OPCODE_FADD && I->op != AGX_OPCODE_FMUL)
          continue;
 
-      /* A half fabs/fneg, fadd(h.abs/.neg, -0.0) into a half, has no
-       * grounded G17G form. It only touches the sign bit: AND 0x7fff for
-       * |h|, XOR 0x8000 for -h, OR 0x8000 for -|h|, with the 16-bit bit
-       * operations G17G does encode (see the sign extension above). */
-      if (I->op == AGX_OPCODE_FADD && I->nr_srcs == 2 && !I->saturate &&
-          I->dest[0].size == AGX_SIZE_16) {
-         const agx_index z = agx_negzero();
-         int x_slot = -1;
-         for (unsigned s = 0; s < 2; ++s) {
-            if (I->src[s].type == AGX_INDEX_IMMEDIATE &&
-                I->src[s].value == z.value && I->src[s].neg == z.neg &&
-                I->src[s].abs == z.abs)
-               x_slot = !s;
-         }
-         agx_index x = x_slot >= 0 ? I->src[x_slot] : agx_null();
-         if (x_slot >= 0 &&
-             (x.type == AGX_INDEX_NORMAL || x.type == AGX_INDEX_UNIFORM) &&
-             x.size == AGX_SIZE_16 && agx_channels(x) == 1 &&
-             (x.abs || x.neg)) {
-            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
-            const bool abs = x.abs, neg = x.neg;
-            x.abs = x.neg = false;
-            agx_index mask =
-               agx_mov_imm(&b, 16, abs && !neg ? 0x7fff : 0x8000);
-            agx_bitop_to(&b, I->dest[0], x, mask,
-                         abs ? (neg ? 0xe /* OR */ : 0x8 /* AND */)
-                             : 0x6 /* XOR */);
-            agx_remove_instruction(I);
-            progress = true;
-            continue;
-         }
-      }
-
-      /* fadd(x, -0.0) is agx_fmov_to(), i.e. a conversion or plain move
-       * with its own grounded forms: never pull its -0.0 into a register. */
-      if (I->op == AGX_OPCODE_FADD && I->nr_srcs == 2) {
-         const agx_index z = agx_negzero();
-         bool is_fmov = false;
-         for (unsigned s = 0; s < 2; ++s)
-            is_fmov |= I->src[s].type == AGX_INDEX_IMMEDIATE &&
-                       I->src[s].value == z.value &&
-                       I->src[s].neg == z.neg && I->src[s].abs == z.abs;
-         if (is_fmov)
-            continue;
-      }
-
-      const bool select = I->op == AGX_OPCODE_FCMPSEL;
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
 
-      for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         agx_index src = I->src[s];
-         if (src.type != AGX_INDEX_IMMEDIATE)
-            continue;
+      if (I->op == AGX_OPCODE_FCMPSEL && I->nr_srcs == 4) {
+         /* If minifloat-select folding left an unsupported shape (e.g. two
+          * immediates or non-32-bit dest/partner), materialize the minifloat
+          * back to a 32-bit register and clear the flag. */
+         if (I->fcmpsel_minifloat_select) {
+            const bool two_imm = I->src[2].type == AGX_INDEX_IMMEDIATE &&
+                                 I->src[3].type == AGX_INDEX_IMMEDIATE;
+            bool bad_sel = I->dest[0].size != AGX_SIZE_32 || I->saturate ||
+                           two_imm;
+            for (unsigned s = 2; s < 4; ++s) {
+               if (I->src[s].type != AGX_INDEX_IMMEDIATE &&
+                   I->src[s].size != AGX_SIZE_32)
+                  bad_sel = true;
+            }
+            if (bad_sel) {
+               for (unsigned s = 2; s < 4; ++s) {
+                  if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+                     I->src[s] = agx3c_materialize_minifloat(
+                        &b, I->src[s], AGX_SIZE_32);
+                  }
+               }
+               I->fcmpsel_minifloat_select = false;
+               progress = true;
+            }
+         }
 
-         const bool comparand = select && s < 2;
-         enum agx_size size = comparand ? AGX_SIZE_32 : I->dest[0].size;
+         /* Selected operands of FCMPSEL must match dest width or be u8 imm
+          * (or minifloat when fcmpsel_minifloat_select is active). */
+         if (!I->fcmpsel_minifloat_select &&
+             (I->dest[0].size == AGX_SIZE_16 ||
+              I->dest[0].size == AGX_SIZE_32)) {
+            const unsigned dest_bits =
+               I->dest[0].size == AGX_SIZE_16 ? 16 : 32;
+            for (unsigned s = 2; s < 4; ++s) {
+               const agx_index src = I->src[s];
+               if (src.type == AGX_INDEX_IMMEDIATE) {
+                  if (src.value > UINT8_MAX || src.abs || src.neg) {
+                     uint32_t value =
+                        src.neg ? -(uint32_t)src.value : src.value;
+                     if (dest_bits == 16)
+                        value &= UINT16_MAX;
+                     I->src[s] = agx_mov_imm(&b, dest_bits, value);
+                     progress = true;
+                  }
+               } else if ((src.type == AGX_INDEX_NORMAL ||
+                           src.type == AGX_INDEX_UNIFORM) &&
+                          agx_channels(src) == 1 && !src.abs && !src.neg &&
+                          src.size != I->dest[0].size) {
+                  if (I->dest[0].size == AGX_SIZE_16 &&
+                      src.size == AGX_SIZE_32) {
+                     agx_index narrow = agx_temp(ctx, AGX_SIZE_16);
+                     agx_subdivide_to(&b, narrow, src, 0);
+                     I->src[s] = narrow;
+                     progress = true;
+                  } else if (I->dest[0].size == AGX_SIZE_32 &&
+                             src.size == AGX_SIZE_16) {
+                     agx_index wide = agx_temp(ctx, AGX_SIZE_32);
+                     agx_mov_to(&b, wide, src);
+                     I->src[s] = wide;
+                     progress = true;
+                  }
+               }
+            }
+         }
 
-         /* The selected values of a compare-select are raw bit patterns,
-          * not floats (agx_is_float_src): keep them bit-exact. Their ABS
-          * flag only marks a 16-bit immediate. */
-         if (!agx_is_float_src(I, s)) {
-            if (src.neg || (size != AGX_SIZE_16 && size != AGX_SIZE_32))
-               continue;
-            I->src[s] = agx_mov_imm(&b, size == AGX_SIZE_32 ? 32 : 16,
-                                    src.value);
+         /* Both comparands immediate with invert_cond is not folded by
+          * agx_lower_pseudo; materialize src[0]. */
+         if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[1].type == AGX_INDEX_IMMEDIATE) {
+            I->src[0] =
+               agx3c_materialize_minifloat(&b, I->src[0], AGX_SIZE_32);
             progress = true;
-            continue;
          }
 
-         float value = agx_minifloat_decode(src.value);
-         if (src.abs)
-            value = fabsf(value);
-         if (src.neg)
-            value = -value;
-
-         if (size == AGX_SIZE_32) {
-            uint32_t bits;
-            memcpy(&bits, &value, sizeof(bits));
-            I->src[s] = agx_mov_imm(&b, 32, bits);
-         } else if (size == AGX_SIZE_16) {
-            I->src[s] = agx_mov_imm(&b, 16, _mesa_float_to_half(value));
-         } else {
-            continue;
+         /* On M5, the register-select FCMPSEL32 handler only accepts 0.0 as
+          * an immediate comparand (any nonzero minifloat, including -0.0 after
+          * sign folding above, must be a register). */
+         const bool sel_both_imm = I->src[2].type == AGX_INDEX_IMMEDIATE &&
+                                   I->src[3].type == AGX_INDEX_IMMEDIATE;
+         if (!g18g && I->dest[0].size == AGX_SIZE_32 && !sel_both_imm) {
+            for (unsigned s = 0; s < 2; ++s) {
+               if (I->src[s].type == AGX_INDEX_IMMEDIATE &&
+                   I->src[s].value != 0) {
+                  I->src[s] =
+                     agx3c_materialize_minifloat(&b, I->src[s], AGX_SIZE_32);
+                  progress = true;
+               }
+            }
          }
-         progress = true;
-      }
 
-      /* Mixed half/f32 operands have no G17G form for these operations:
-       * compute at f32. A half destination fed by f32 operands gets an f32
-       * temporary and one conversion afterwards (exact for a select, and a
-       * single rounding for arithmetic, as the native mixed op would do). */
-      bool any32 = false, any16 = false;
-      for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL)
-            continue;
-         any32 |= I->src[s].size == AGX_SIZE_32;
-         any16 |= I->src[s].size == AGX_SIZE_16;
-      }
-      const bool dest16 = I->dest[0].size == AGX_SIZE_16;
-      const bool cmp_mixed =
-         select && I->src[0].size != I->src[1].size;
-      /* Half selects are few and patchy on G17G (no LE/GE register form,
-       * for one); the 32-bit register select is witnessed for eq/lt/gt/ge/le.
-       * On this second attempt run every half-destination select there. */
-      const bool sel_mixed =
-         select && (dest16 ||
-                    I->src[2].size != I->dest[0].size ||
-                    I->src[3].size != I->dest[0].size ||
-                    I->src[0].size != I->dest[0].size);
-      const bool alu_mixed =
-         !select && any16 && (any32 || !dest16);
-      if (!cmp_mixed && !sel_mixed && !alu_mixed)
+         /* On G18G, 32-bit FCMPSEL only accepts a half comparand in the
+          * single-half boolean 0/1 form; widen half comparands otherwise.
+          * For untied 16-bit FCMPSEL, widen half comparands whenever both
+          * comparands are half, a comparand is a uniform half, or both
+          * selected operands are registers (so the f32-comparand reg/imm
+          * select path handles it). */
+         if (g18g) {
+            const bool tied_half_minmax =
+               I->dest[0].size == AGX_SIZE_16 && !I->invert_cond &&
+               !I->saturate &&
+               (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
+               agx_is_equiv(I->src[0], I->src[2]) &&
+               agx_is_equiv(I->src[1], I->src[3]);
+            const bool bool_sel =
+               sel_both_imm && I->src[2].value + I->src[3].value == 1;
+            const bool both_half_cmp =
+               I->src[0].type != AGX_INDEX_IMMEDIATE &&
+               I->src[1].type != AGX_INDEX_IMMEDIATE &&
+               I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_16;
+            const bool sel_any_imm = I->src[2].type == AGX_INDEX_IMMEDIATE ||
+                                     I->src[3].type == AGX_INDEX_IMMEDIATE;
+            const bool cmp_any_imm = I->src[0].type == AGX_INDEX_IMMEDIATE ||
+                                     I->src[1].type == AGX_INDEX_IMMEDIATE;
+            if (I->dest[0].size == AGX_SIZE_32 &&
+                (both_half_cmp || !bool_sel)) {
+               for (unsigned s = 0; s < 2; ++s) {
+                  if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                       I->src[s].type == AGX_INDEX_UNIFORM) &&
+                      I->src[s].size == AGX_SIZE_16) {
+                     I->src[s] = agx3c_widen_f16_to_f32(&b, I->src[s]);
+                     progress = true;
+                  }
+               }
+            } else if (I->dest[0].size == AGX_SIZE_16 && !tied_half_minmax) {
+               const bool widen_all_halves =
+                  both_half_cmp || cmp_any_imm || !sel_any_imm;
+               for (unsigned s = 0; s < 2; ++s) {
+                  if ((I->src[s].type == AGX_INDEX_UNIFORM ||
+                       (widen_all_halves &&
+                        I->src[s].type == AGX_INDEX_NORMAL)) &&
+                      I->src[s].size == AGX_SIZE_16) {
+                     I->src[s] = agx3c_widen_f16_to_f32(&b, I->src[s]);
+                     progress = true;
+                  }
+               }
+            }
+         }
+
+         /* Strip .abs/.neg on FCMPSEL comparands: AGX3C/G18G compare-select
+          * encoders do not carry comparand modifiers. */
+         for (unsigned s = 0; s < 2; ++s) {
+            if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                 I->src[s].type == AGX_INDEX_UNIFORM) &&
+                (I->src[s].abs || I->src[s].neg)) {
+               if (I->src[s].size == AGX_SIZE_32)
+                  I->src[s] = agx3_materialize_f32_source(&b, I->src[s]);
+               else if (I->src[s].size == AGX_SIZE_16)
+                  I->src[s] = agx3c_apply_f16_sign_mods(&b, I->src[s]);
+               progress = true;
+            }
+         }
          continue;
+      }
 
-      for (unsigned s = 0; s < I->nr_srcs; ++s) {
-         if (I->src[s].type != AGX_INDEX_NORMAL ||
-             I->src[s].size != AGX_SIZE_16)
-            continue;
-         /* The 32-bit select compares f32: widen half comparands. */
-         if (select && s < 2 && !cmp_mixed && !sel_mixed)
-            continue;
-         /* Selected values are bit patterns: zero-extend them, as the
-          * existing G17G half-select path does. Floats convert (exact). */
-         if (select && s >= 2) {
-            if (I->src[s].abs || I->src[s].neg)
-               continue;
-            agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-            agx_mov_to(&b, wide, I->src[s]);
-            I->src[s] = wide;
+      if (I->op == AGX_OPCODE_FADD && I->nr_srcs == 2) {
+         /* Canonicalize `fadd d16, -0.0, r` -> `fadd d16, r, -0.0`. */
+         if (I->dest[0].size == AGX_SIZE_16 &&
+             agx3c_is_negzero_imm(I->src[0]) &&
+             I->src[1].type != AGX_INDEX_IMMEDIATE) {
+            agx_index tmp = I->src[0];
+            I->src[0] = I->src[1];
+            I->src[1] = tmp;
+            progress = true;
+         }
+
+         /* `fadd d16, mod(r32), -0.0` (f32->f16 conversion of -x or |x|):
+          * AGX3C's narrow_imm_sub_f32 is AGX3B-only, and G18G has no modified
+          * saturating narrow add. Strip the sign modifier on f32 first. */
+         if (I->dest[0].size == AGX_SIZE_16 &&
+             agx3c_is_negzero_imm(I->src[1]) &&
+             I->src[0].type != AGX_INDEX_IMMEDIATE &&
+             I->src[0].size == AGX_SIZE_32 &&
+             (I->src[0].abs || I->src[0].neg) && (!I->saturate || g18g)) {
+            I->src[0] = agx3_materialize_f32_source(&b, I->src[0]);
             progress = true;
             continue;
          }
-         agx_index plain = I->src[s];
-         plain.abs = false;
-         plain.neg = false;
-         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-         agx_fmov_to(&b, wide, plain);
-         wide.abs = I->src[s].abs;
-         wide.neg = I->src[s].neg;
-         I->src[s] = wide;
-         progress = true;
+
+         /* Two-immediate FADD into a half has no AGX3C form. */
+         if (I->dest[0].size == AGX_SIZE_16 &&
+             I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[1].type == AGX_INDEX_IMMEDIATE) {
+            I->src[0] =
+               agx3c_materialize_minifloat(&b, I->src[0], AGX_SIZE_16);
+            I->src[1] =
+               agx3c_materialize_minifloat(&b, I->src[1], AGX_SIZE_16);
+            progress = true;
+         }
+
+         /* Half-destination FADD with an immediate:
+          * - `r32 + -0.0` narrows natively on M5 and G18G.
+          * - `r32 + imm` narrows natively on M5 (`agx3_falu_add_imm_narrow_m5`),
+          *   but not on G18G (materialize `imm` to f32 -> `fadd d16, r32, r32`).
+          * - `mod(h16) + -0.0` (unsat) encodes via `hadd_{neg,abs}_negzero`.
+          * - Any other `h16 + imm` has no AGX3C narrow-FADD immediate form;
+          *   materialize `imm` to f16 so `agx3_falu_add_narrow_m5` encodes it. */
+         if (I->dest[0].size == AGX_SIZE_16 &&
+             ((I->src[0].type == AGX_INDEX_IMMEDIATE) !=
+              (I->src[1].type == AGX_INDEX_IMMEDIATE))) {
+            const unsigned imm_s = I->src[0].type == AGX_INDEX_IMMEDIATE ? 0 : 1;
+            const unsigned reg_s = imm_s ^ 1;
+            const agx_index reg = I->src[reg_s];
+            const bool is_negzero = agx3c_is_negzero_imm(I->src[imm_s]);
+            if (reg.size == AGX_SIZE_16) {
+               const bool native_hadd_mod =
+                  !I->saturate && is_negzero && (reg.abs || reg.neg);
+               if (!native_hadd_mod) {
+                  I->src[imm_s] = agx3c_materialize_minifloat(&b, I->src[imm_s],
+                                                              AGX_SIZE_16);
+                  progress = true;
+               }
+            } else if (reg.size == AGX_SIZE_32 && g18g && !is_negzero) {
+               I->src[imm_s] =
+                  agx3c_materialize_minifloat(&b, I->src[imm_s], AGX_SIZE_32);
+               progress = true;
+            }
+         }
+
+         /* Saturating f32 FADD of a half register/uniform and an immediate
+          * has no AGX3C form; widen the half to f32. */
+         if (I->dest[0].size == AGX_SIZE_32 && I->saturate &&
+             (I->src[0].type == AGX_INDEX_IMMEDIATE ||
+              I->src[1].type == AGX_INDEX_IMMEDIATE)) {
+            for (unsigned s = 0; s < 2; ++s) {
+               if ((I->src[s].type == AGX_INDEX_NORMAL ||
+                    I->src[s].type == AGX_INDEX_UNIFORM) &&
+                   I->src[s].size == AGX_SIZE_16) {
+                  I->src[s] = agx3c_widen_f16_to_f32(&b, I->src[s]);
+                  progress = true;
+               }
+            }
+         }
+
+         /* Plain unsaturated `fadd d32, h16, h16` skips agx3_try_float_modifier
+          * on M5 and misses mixed f32+f16; widen src[0] so native f32+f16->f32
+          * encodes it. */
+         if (I->dest[0].size == AGX_SIZE_32 && !I->saturate &&
+             I->src[0].type != AGX_INDEX_IMMEDIATE &&
+             I->src[1].type != AGX_INDEX_IMMEDIATE &&
+             I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_16 &&
+             !I->src[0].abs && !I->src[0].neg &&
+             !I->src[1].abs && !I->src[1].neg) {
+            I->src[0] = agx3c_widen_f16_to_f32(&b, I->src[0]);
+            progress = true;
+         }
+         continue;
       }
 
-      if (dest16 && (alu_mixed || sel_mixed)) {
-         agx_index narrow = I->dest[0];
-         agx_index wide = agx_temp(ctx, AGX_SIZE_32);
-         I->dest[0] = wide;
-         agx_builder after = agx_init_builder(ctx, agx_after_instr(I));
-         /* A select keeps the low half of its zero-extended bits; an
-          * arithmetic result converts once. */
-         if (select)
-            agx_subdivide_to(&after, narrow, wide, 0);
-         else
-            agx_fmov_to(&after, narrow, wide);
-         progress = true;
+      if (I->op == AGX_OPCODE_FMUL && I->nr_srcs == 2) {
+         /* Two-immediate FMUL has no AGX3C form. */
+         if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[1].type == AGX_INDEX_IMMEDIATE) {
+            I->src[0] = agx3c_materialize_minifloat(&b, I->src[0],
+                                                    I->dest[0].size);
+            progress = true;
+         }
+         /* Narrowing FMUL `d16 = h16 * imm` has no AGX3C form (only `r32 * imm`
+          * narrows); materialize the immediate to f32 to use mixed-half FMUL. */
+         if (I->dest[0].size == AGX_SIZE_16 &&
+             (I->src[0].type == AGX_INDEX_IMMEDIATE) !=
+                (I->src[1].type == AGX_INDEX_IMMEDIATE)) {
+            const unsigned imm_s = I->src[0].type == AGX_INDEX_IMMEDIATE ? 0 : 1;
+            const unsigned reg_s = imm_s ^ 1;
+            if (I->src[reg_s].size == AGX_SIZE_16) {
+               I->src[imm_s] =
+                  agx3c_materialize_minifloat(&b, I->src[imm_s], AGX_SIZE_32);
+               progress = true;
+            }
+         }
+         /* Narrowing mixed-width FMUL (`d16 = r32 * h16`, unsat) hits the
+          * compact mixed-half handler which refuses source modifiers; strip
+          * .abs/.neg on its operands first. */
+         if (I->dest[0].size == AGX_SIZE_16 && !I->saturate &&
+             I->src[0].type != AGX_INDEX_IMMEDIATE &&
+             I->src[1].type != AGX_INDEX_IMMEDIATE &&
+             ((I->src[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16) ||
+              (I->src[0].size == AGX_SIZE_16 && I->src[1].size == AGX_SIZE_32))) {
+            for (unsigned s = 0; s < 2; ++s) {
+               if (I->src[s].abs || I->src[s].neg) {
+                  if (I->src[s].size == AGX_SIZE_32)
+                     I->src[s] = agx3_materialize_f32_source(&b, I->src[s]);
+                  else
+                     I->src[s] = agx3c_apply_f16_sign_mods(&b, I->src[s]);
+                  progress = true;
+               }
+            }
+         }
+         continue;
+      }
+
+      if (I->op == AGX_OPCODE_FFMA && I->nr_srcs == 3) {
+         /* All-immediate FFMA has no AGX3C form. */
+         if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+             I->src[1].type == AGX_INDEX_IMMEDIATE &&
+             I->src[2].type == AGX_INDEX_IMMEDIATE) {
+            I->src[0] = agx3c_materialize_minifloat(&b, I->src[0],
+                                                    I->dest[0].size);
+            progress = true;
+         }
+         /* Two-immediate FFMA (`h16 * imm + imm`) requires a 32-bit register
+          * when dest is f32 or when saturated/abs on a half dest. */
+         if (I->src[2].type == AGX_INDEX_IMMEDIATE &&
+             (I->src[0].type == AGX_INDEX_IMMEDIATE) !=
+                (I->src[1].type == AGX_INDEX_IMMEDIATE)) {
+            const unsigned reg_s = I->src[0].type == AGX_INDEX_IMMEDIATE ? 1 : 0;
+            if ((I->src[reg_s].type == AGX_INDEX_NORMAL ||
+                 I->src[reg_s].type == AGX_INDEX_UNIFORM) &&
+                I->src[reg_s].size == AGX_SIZE_16 &&
+                (I->dest[0].size == AGX_SIZE_32 || I->saturate ||
+                 I->src[reg_s].abs)) {
+               I->src[reg_s] = agx3c_widen_f16_to_f32(&b, I->src[reg_s]);
+               progress = true;
+            }
+         }
+         continue;
       }
    }
    return progress;
@@ -13258,20 +13481,17 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
-                         unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat,
-                         bool agx3_reg_float_consts)
+                         unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
    if (agx_isa_is_agx3(key->dev.encoding) &&
-       !impl->function->is_preamble && !ra_budget_cut &&
-       !agx3_reg_float_consts)
+       !impl->function->is_preamble && !ra_budget_cut)
       NIR_PASS(_, nir, agx_nir_fragment_output_temporaries);
 
    if (agx_isa_is_agx3(key->dev.encoding) &&
        nir->info.stage == MESA_SHADER_VERTEX && !impl->function->is_preamble &&
-       exec_list_length(&impl->body) > 1 && !ra_budget_cut &&
-       !agx3_reg_float_consts)
+       exec_list_length(&impl->body) > 1 && !ra_budget_cut)
       NIR_PASS(_, nir, nir_move_output_stores_to_end);
 
    nir_index_blocks(impl);
@@ -13281,7 +13501,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    ctx->nir = nir;
    ctx->ra_budget_cut = ra_budget_cut;
    ctx->is_preamble = impl->function->is_preamble;
-   ctx->agx3_reg_float_consts = agx3_reg_float_consts;
    if (ctx->is_preamble)
       out->agx3_preamble_static_spill_version = 0;
    ctx->out = out;
@@ -13431,7 +13650,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    agx3_fold_constant_fmovs(ctx);
 
    AGX_PASS(ctx, agx_lower_agx3_cf_constants);
-   AGX_PASS(ctx, agx_lower_g17g_retry_float_operands);
+   AGX_PASS(ctx, agx_lower_agx3c_unsupported_operands);
    AGX_PASS(ctx, agx_lower_agx3_half_iadd_constants);
    AGX_PASS(ctx, agx_lower_agx3_wide_iadd);
    AGX_PASS(ctx, agx3_lower_large_fetch_indices);
@@ -13643,7 +13862,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          return agx_compile_function_nir_attempt(
             nir, impl, key, binary, out, offset_out,
             ra_budget_cut ? ra_budget_cut * 2 : 16, disable_remat,
-            retry_without_remat, agx3_reg_float_consts);
+            retry_without_remat);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -14005,8 +14224,7 @@ static bool
 agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
-                         struct agx_shader_info *out, unsigned *offset_out,
-                         bool agx3_reg_float_consts)
+                         struct agx_shader_info *out, unsigned *offset_out)
 {
    const bool eligible =
       impl->function->is_preamble && nir->info.stage == MESA_SHADER_FRAGMENT &&
@@ -14015,16 +14233,14 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
       debug_get_bool_option("ASAHI_M5_CPROG_REMAT_RETRY", true);
    if (!eligible)
       return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
+                                             offset_out, 0, false, NULL);
 
    /* Preserve all compiler-owned state, including earlier main code/rodata.
     * The first attempt owns a deep NIR clone and a fresh AIR context. */
    nir_shader *attempt = nir_shader_clone(NULL, nir);
    if (!attempt)
       return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
+                                             offset_out, 0, false, NULL);
 
    nir_function_impl *attempt_impl = NULL;
    nir_foreach_function_with_impl(func, candidate, attempt) {
@@ -14039,8 +14255,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    const size_t saved_size = binary->size;
    bool retry = false;
    bool success = agx_compile_function_nir_attempt(
-      attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry,
-      agx3_reg_float_consts);
+      attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry);
    ralloc_free(attempt);
    if (!retry)
       return success;
@@ -14051,8 +14266,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    binary->size = saved_size;
    /* Exactly one retry. Real full-budget spills retain the old refusal. */
    return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                          offset_out, 0, true, NULL,
-                                          agx3_reg_float_consts);
+                                          offset_out, 0, true, NULL);
 }
 
 /*
@@ -16964,25 +17178,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
 
    nir_foreach_function_with_impl(func, impl, nir) {
       unsigned offset;
-      const struct agx_shader_info saved_info = out->info;
-      const struct agx_shader_key saved_key = *key;
-      const unsigned saved_size = binary.size;
       bool compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                               &out->info, &offset, false);
-
-      /* The G17G packer refuses shapes it has no grounded encoding for and
-       * rolls the binary back. Most refusals in real clients (Skia/ANGLE)
-       * are float constants inlined as minifloat immediates; the same
-       * function with those constants in registers encodes. */
-      if (!compiled && key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
-         if (agx_compiler_debug & AGX_DBG_SHADERS)
-            fprintf(stderr, "AGX3: retrying with float constants in registers\n");
-         out->info = saved_info;
-         *key = saved_key;
-         binary.size = saved_size;
-         compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                             &out->info, &offset, true);
-      }
+                                               &out->info, &offset);
 
       if (!compiled) {
          util_dynarray_fini(&binary);
