@@ -32,7 +32,7 @@
 #define COST_JMP_G17P (5)
 
 static uint32_t
-cost_instr(agx_instr *I)
+cost_instr(const agx_context *ctx, agx_instr *I)
 {
    /* TODO: Better heuristic */
    switch (I->op) {
@@ -41,6 +41,17 @@ cost_instr(agx_instr *I)
    case AGX_OPCODE_TEXTURE_LOAD:
    case AGX_OPCODE_TEXTURE_SAMPLE:
       return 50;
+   case AGX_OPCODE_RSQRT:
+   case AGX_OPCODE_SRSQRT:
+   case AGX_OPCODE_RCP:
+   case AGX_OPCODE_LOG2:
+   case AGX_OPCODE_EXP2:
+   case AGX_OPCODE_SIN_PT_1:
+   case AGX_OPCODE_SINC_AGX3:
+      return (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+              !ctx->key->dev.emit_agx3d)
+                ? 16
+                : 1;
    default:
       return 1;
    }
@@ -81,7 +92,7 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
             break;
 
          *must_skip |= testing_coverage_update(ctx, J);
-         cost += cost_instr(J);
+         cost += cost_instr(ctx, J);
       }
    }
 
@@ -101,7 +112,7 @@ cost_between(agx_context *ctx, agx_block *from, agx_instr *from_I,
             break;
 
          *must_skip |= testing_coverage_update(ctx, I);
-         cost += cost_instr(I);
+         cost += cost_instr(ctx, I);
       }
 
       if (block == target) {

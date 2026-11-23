@@ -1176,15 +1176,43 @@ m5_bounded_offset(nir_scalar s, unsigned depth)
    return (struct m5_bounded_offset){.term = s, .scale = 1, .valid = true};
 }
 
-/* Keep memory/control barriers intact even for readonly loads. */
+static bool
+m5_is_pure_non_volatile_read(const nir_intrinsic_instr *in)
+{
+   if (nir_intrinsic_has_access(in) &&
+       (nir_intrinsic_access(in) & ACCESS_VOLATILE))
+      return false;
+
+   switch (in->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_bounded:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_global_constant_offset:
+   case nir_intrinsic_load_global_constant_bounded:
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_shared:
+   case nir_intrinsic_load_scratch:
+   case nir_intrinsic_load_input:
+   case nir_intrinsic_load_interpolated_input:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* Keep memory/control barriers and writes intact even for readonly loads. */
 static bool
 m5_bounded_can_move(nir_instr *first, nir_instr *last)
 {
    for (nir_instr *instr = nir_instr_next(first); instr != last;
         instr = nir_instr_next(instr)) {
-      if (instr->type == nir_instr_type_intrinsic &&
-          !nir_intrinsic_can_reorder(nir_instr_as_intrinsic(instr)))
-         return false;
+      if (instr->type == nir_instr_type_intrinsic) {
+         nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+         if (!nir_intrinsic_can_reorder(in) &&
+             !m5_is_pure_non_volatile_read(in))
+            return false;
+      }
       if (instr->type == nir_instr_type_call || instr->type == nir_instr_type_jump)
          return false;
    }
@@ -1294,8 +1322,13 @@ m5_merge_buffer_words(nir_shader *nir)
             if (instr->type != nir_instr_type_intrinsic)
                continue;
             nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+            const bool mergeable_ssbo =
+               (in->intrinsic == nir_intrinsic_load_global_bounded ||
+                in->intrinsic == nir_intrinsic_load_global) &&
+               !(nir_intrinsic_access(in) & (ACCESS_VOLATILE | ACCESS_COHERENT));
             if (in->num_components != 1 || in->def.bit_size != 32 ||
-                !nir_intrinsic_can_reorder(in) || nir_intrinsic_align(in) < 4)
+                (!nir_intrinsic_can_reorder(in) && !mergeable_ssbo) ||
+                nir_intrinsic_align(in) < 4)
                continue;
             struct m5_word_read r = {.load = in};
             switch (in->intrinsic) {
@@ -1625,6 +1658,77 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
       .align_mul = MIN2(mul, 64u), .align_offset = disp % MIN2(mul, 64u),
       .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
    nir_def_replace(&intr->def, value);
+   return true;
+}
+
+static bool
+hk_lower_full_ssbo_store(nir_builder *b, nir_intrinsic_instr *intr,
+                         void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_deref ||
+       intr->src[1].ssa->bit_size != 32 || intr->num_components < 2 ||
+       intr->num_components > 4 ||
+       nir_intrinsic_write_mask(intr) != BITFIELD_MASK(intr->num_components) ||
+       (nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_COHERENT)))
+      return false;
+
+   nir_deref_instr *leaf = nir_src_as_deref(intr->src[0]);
+   if (leaf->modes != nir_var_mem_ssbo ||
+       (glsl_get_explicit_stride(leaf->type) != 0 &&
+        glsl_get_explicit_stride(leaf->type) != 4))
+      return false;
+
+   uint32_t mul, disp;
+   if (!nir_get_explicit_deref_align(leaf, true, &mul, &disp) ||
+       mul < 4 || (disp & 3))
+      return false;
+
+   nir_deref_path path;
+   nir_deref_path_init(&path, leaf, NULL);
+   nir_deref_instr *root = path.path[0];
+   if (root->deref_type != nir_deref_type_cast ||
+       root->parent.ssa->num_components != 5 ||
+       root->parent.ssa->bit_size != 32) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *addr = root->parent.ssa;
+   for (unsigned i = 1; path.path[i]; ++i)
+      addr = nir_explicit_io_address_from_deref(
+         b, path.path[i], addr, nir_address_format_64bit_bounded_global_map);
+   nir_deref_path_finish(&path);
+
+   nir_def *base = nir_pack_64_2x32(b, nir_trim_vector(b, addr, 2));
+   nir_def *off = nir_channel(b, addr, 3);
+   nir_def *bound = nir_channel(b, addr, 2);
+   enum gl_access_qualifier access = nir_intrinsic_access(intr);
+   unsigned n = intr->num_components;
+   nir_def *limit = nir_usub_sat(b, bound, nir_imm_int(b, n * 4 - 1));
+   nir_def *address = nir_iadd(b, base, nir_u2u64(b, off));
+   nir_def *whole = nir_ult(b, off, limit);
+   if (*(const bool *)data) {
+      /* Preserve the scalar path at sparse-page boundaries, including
+       * derefs already wrapped in the descriptor pass's residency guard. */
+      nir_def *within = nir_u2u32(b, nir_iand_imm(b, address, 0x3fff));
+      whole = nir_iand(b, whole, nir_ult(b, within, nir_imm_int(b, 0x4001 - n * 4)));
+   }
+   nir_def *val = intr->src[1].ssa;
+   nir_if *fast = nir_push_if(b, whole);
+   nir_store_global(b, val, address, .write_mask = BITFIELD_MASK(n),
+                    .align_mul = mul, .align_offset = disp, .access = access);
+   nir_push_else(b, fast);
+   for (unsigned i = 0; i < n; ++i) {
+      nir_def *end_limit = nir_usub_sat(b, bound, nir_imm_int(b, (i + 1) * 4 - 1));
+      nir_push_if(b, nir_ult(b, off, end_limit));
+      nir_store_global(b, nir_channel(b, val, i), nir_iadd_imm(b, address, i * 4),
+                       .write_mask = 1, .align_mul = mul,
+                       .align_offset = (disp + i * 4) % mul, .access = access);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, fast);
+   nir_instr_remove(&intr->instr);
    return true;
 }
 
@@ -3369,6 +3473,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             dev->dev.chip == AGX_CHIP_G17G || dev->dev.chip == AGX_CHIP_G17S);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
+   if (dev->dev.chip == AGX_CHIP_G17C &&
+       rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_lower_full_ssbo_store,
+               nir_metadata_none, (void *)&sparse_store_guards);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
             hk_buffer_addr_format(rs->storage_buffers,
                                   rs->null_storage_buffer_descriptor,

@@ -116,6 +116,10 @@ struct ra_ctx {
     */
    bool early_killed;
    bool transient_texture_used;
+   /* Unread X lane from a recent sample. Stop tracking it after a copy or use,
+    * or when the instruction budget expires.
+    */
+   unsigned recent_sample_ssa, recent_sample_budget;
 
    /* Maintained while assigning registers. Count of registers required, i.e.
     * the maximum register assigned + 1.
@@ -635,6 +639,19 @@ find_best_region_to_evict_impl(struct ra_ctx *rctx, unsigned size,
             any_free = true;
       }
 
+      /* Immediately moving a pending sample to make room for the next
+       * sample serializes both operations. Prefer another legal region
+       * by charging an eviction penalty for overlapping destinations. */
+      if (honor_banks && rctx->recent_sample_budget && rctx->instr &&
+          (rctx->instr->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+           rctx->instr->op == AGX_OPCODE_TEXTURE_LOAD) &&
+          size >= 4) {
+         unsigned reg = rctx->ssa_to_reg[rctx->recent_sample_ssa];
+         if (reg >= base && reg < base + size &&
+             BITSET_TEST(rctx->used_regs[RA_GPR], reg))
+            moves += 2 * size;
+      }
+
       /* Pick the region requiring fewest moves as a heuristic. Regions with no
        * free registers are skipped, since the recursive splitting algorithm
        * requires at least one free register.
@@ -710,6 +727,10 @@ set_ssa_to_reg(struct ra_ctx *rctx, unsigned ssa, unsigned reg)
 {
    enum ra_class cls = rctx->classes[ssa];
    *(rctx->count[cls]) = MAX2(*(rctx->count[cls]), reg + rctx->ncomps[ssa]);
+
+   if (rctx->recent_sample_budget && ssa == rctx->recent_sample_ssa &&
+       rctx->ssa_to_reg[ssa] != reg)
+      rctx->recent_sample_budget = 0;
 
    rctx->ssa_to_reg[ssa] = reg;
 
@@ -1903,7 +1924,7 @@ try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
        dest_end > dest_limit(rctx, I, 0) ||
        (rctx->ssa_to_reg[I->src[first_source].value] & (dest_size - 1)) ||
        ((region_end < dest_end) &&
-        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end)))
+        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end - 1)))
       return;
 
    for (unsigned s = first_source; s <= last_source; ++s) {
@@ -2340,6 +2361,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
       }
    }
 
+   rctx->recent_sample_budget = 0;
    agx_foreach_instr_in_block(block, I) {
       rctx->instr = I;
 
@@ -2363,6 +2385,21 @@ agx_ra_assign_local(struct ra_ctx *rctx)
             }
          }
       }
+      if (rctx->recent_sample_budget)
+         rctx->recent_sample_budget--;
+
+      /* A coalesced split renames the X lane without reading it. All other
+       * uses already depend on the sample completing.
+       */
+      bool rename_sample = rctx->recent_sample_budget && coalesce_split &&
+                           I->src[0].value == rctx->recent_sample_ssa &&
+                           I->dest[0].type == AGX_INDEX_NORMAL;
+      if (rctx->recent_sample_budget && !rename_sample) {
+         agx_foreach_ssa_src(I, s) {
+            if (I->src[s].value == rctx->recent_sample_ssa)
+               rctx->recent_sample_budget = 0;
+         }
+      }
       if (coalesce_split) {
          assert(ra_class_for_index(I->src[0]) == RA_GPR);
          unsigned reg = ssa_to_reg[I->src[0].value];
@@ -2382,6 +2419,9 @@ agx_ra_assign_local(struct ra_ctx *rctx)
 
          unsigned trail = rctx->ncomps[I->src[0].value] - (I->nr_dests * width);
          BITSET_CLEAR_COUNT(used_regs_gpr, reg + (I->nr_dests * width), trail);
+
+         if (rename_sample)
+            rctx->recent_sample_ssa = I->dest[0].value;
 
          agx_set_sources(rctx, I);
          agx_set_dests(rctx, I);
@@ -2576,6 +2616,14 @@ agx_ra_assign_local(struct ra_ctx *rctx)
             continue;
 
          assign_regs(rctx, I->dest[d], pick_regs(rctx, I, d));
+         if (rctx->shader->key->dev.chip == AGX_CHIP_G17C &&
+             rctx->shader->stage == MESA_SHADER_COMPUTE &&
+             (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+              I->op == AGX_OPCODE_TEXTURE_LOAD) &&
+             !I->sparse && util_bitcount(I->mask) <= 2) {
+            rctx->recent_sample_ssa = I->dest[d].value;
+            rctx->recent_sample_budget = 25;
+         }
       }
 
       /* The M5 query entry writes its result register even when nothing reads
@@ -3125,8 +3173,7 @@ agx_ra(agx_context *ctx)
     * contain texture reads. Helpers and unspillable programs keep their
     * original hardware budget. */
    if (ctx->key->dev.chip == AGX_CHIP_G17C &&
-       (ctx->stage == MESA_SHADER_COMPUTE ||
-        ctx->stage == MESA_SHADER_FRAGMENT) &&
+       ctx->stage == MESA_SHADER_FRAGMENT &&
        !ctx->is_preamble && !ctx->key->is_helper && ctx->key->has_scratch &&
        !ctx->out->uses_ray_traversal) {
       unsigned samples = 0;
@@ -3136,19 +3183,8 @@ agx_ra(agx_context *ctx)
              I->op == AGX_OPCODE_IMAGE_LOAD)
             samples++;
       }
-      if (samples >= 4) {
-         if (ctx->stage == MESA_SHADER_COMPUTE) {
-            const unsigned cap =
-               (unsigned)debug_get_num_option("W36_CS_CAP", 256);
-            if (cap >= 96 && cap < 256)
-               max_possible_regs = MIN2(max_possible_regs, cap);
-         } else {
-            const unsigned cap =
-               (unsigned)debug_get_num_option("W36_FS_CAP", 184);
-            if (cap >= 96 && cap < 256)
-               max_possible_regs = MIN2(max_possible_regs, cap);
-         }
-      }
+      if (samples >= 4)
+         max_possible_regs = MIN2(max_possible_regs, 208);
    }
 
    /* Match the CEM scratch extent reserved by agx3_pack_binary. */

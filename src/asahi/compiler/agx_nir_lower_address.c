@@ -400,6 +400,32 @@ format_for_bitsize(unsigned bitsize)
 }
 
 static bool
+rescale_wide_shift(nir_builder *b, nir_scalar *offset, unsigned *shift,
+                   unsigned max_shift, bool sign_extend)
+{
+   nir_scalar value = nir_scalar_chase_movs(*offset);
+   if (value.def->bit_size != 32 || !nir_scalar_is_alu(value) ||
+       nir_scalar_alu_op(value) != nir_op_ishl)
+      return false;
+
+   nir_scalar amount = nir_scalar_chase_alu_src(value, 1);
+   if (!nir_scalar_is_const(amount))
+      return false;
+
+   const unsigned a = nir_scalar_as_uint(amount) & 31;
+   if (*shift + a <= max_shift || *shift >= max_shift)
+      return false;
+
+   nir_def *o = nir_channel(b, value.def, value.comp);
+   const unsigned rest = max_shift - *shift;
+   nir_def *index =
+      sign_extend ? nir_ishr_imm(b, o, rest) : nir_ushr_imm(b, o, rest);
+   *offset = nir_get_scalar(index, 0);
+   *shift = max_shift;
+   return true;
+}
+
+static bool
 pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    if (intr->intrinsic != nir_intrinsic_load_global &&
@@ -440,7 +466,12 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
                peel_scaled_u32(b, options, &offset, &extra_shift,
                                max_shift - shift, op == nir_op_ilea_agx);
 
-            const unsigned total_shift = shift + extra_shift;
+            unsigned total_shift = shift + extra_shift;
+            /* Only an unpeeled offset is the value the access extends. */
+            if (options->byte_offsets && !shift_must_match &&
+                total_shift < format_shift && extra_shift == 0)
+               rescale_wide_shift(b, &offset, &total_shift, max_shift,
+                                  op == nir_op_ilea_agx);
             if (total_shift >= format_shift ||
                 (byte_indices && !shift_must_match && total_shift == 0 &&
                  op == nir_op_ulea_agx && offset.def->bit_size == 32)) {
@@ -464,9 +495,15 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
             nir_scalar narrow;
             uint8_t shift = 0;
             if (!peel_u2u64_index(b, options, nir_scalar_chase_alu_src(base, i),
-                                  &narrow, &shift, max_shift) ||
-                (shift < format_shift &&
-                 !(byte_indices && !shift_must_match && shift == 0)))
+                                  &narrow, &shift, max_shift))
+               continue;
+            if (options->byte_offsets && !shift_must_match && shift == 0) {
+               unsigned wide = shift;
+               if (rescale_wide_shift(b, &narrow, &wide, max_shift, false))
+                  shift = wide;
+            }
+            if (shift < format_shift &&
+                !(byte_indices && !shift_must_match && shift == 0))
                continue;
 
             match = (struct match){
@@ -519,8 +556,31 @@ matched:
 
    if (options->byte_offsets && !shift_must_match &&
        intr->intrinsic != nir_intrinsic_global_atomic &&
-       intr->intrinsic != nir_intrinsic_global_atomic_swap)
+       intr->intrinsic != nir_intrinsic_global_atomic_swap) {
       fold_byte_offset(b, intr, &match, format_shift, max_shift);
+
+      /* A constant added to the base, as to a pointer before it is indexed
+       * ((p + 16) + i): the byte offset adds it after the index in the same
+       * 64-bit sum, so the base needs no add of its own.
+       */
+      nir_scalar base_now = nir_scalar_chase_movs(match.base);
+      if (match.offset.def != NULL && base_now.def->bit_size == 64 &&
+          nir_scalar_is_alu(base_now) &&
+          nir_scalar_alu_op(base_now) == nir_op_iadd) {
+         for (unsigned i = 0; i < 2; ++i) {
+            nir_scalar k = nir_scalar_chase_alu_src(base_now, i);
+            if (!nir_scalar_is_const(k))
+               continue;
+            const int64_t c = nir_scalar_as_int(k);
+            if (c >= INT16_MIN - (int64_t)match.byte_offset &&
+                c <= INT16_MAX - (int64_t)match.byte_offset) {
+               match.base = nir_scalar_chase_alu_src(base_now, 1 - i);
+               match.byte_offset = match.byte_offset + c;
+            }
+            break;
+         }
+      }
+   }
 
    const unsigned mem_base =
       match.shift | ((uint32_t)(uint16_t)match.byte_offset

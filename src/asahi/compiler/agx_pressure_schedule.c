@@ -1511,16 +1511,10 @@ agx_ilp_schedule(agx_context *ctx)
                 * whichever first fits the program's occupancy step. This
                 * ranks candidates; register pressure and scoreboard waits
                 * remain what keeps the schedule safe. */
-               static const unsigned windows_4[] = {4, 2, 1};
-               static const unsigned windows_8[] = {8, 6, 4, 2, 1};
-               const bool wide_win =
-                  debug_get_bool_option("W36_LOAD_WIN", false);
-               const unsigned *windows = wide_win ? windows_8 : windows_4;
-               const unsigned nwin =
-                  wide_win ? ARRAY_SIZE(windows_8) : ARRAY_SIZE(windows_4);
+               static const unsigned windows[] = {4, 2, 1};
                const signed load_growth =
                   m5_load_cap > peak ? m5_load_cap - peak : 0;
-               for (unsigned w = 0; w < nwin; ++w) {
+               for (unsigned w = 0; w < ARRAY_SIZE(windows); ++w) {
                   if (ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                          alu_latency, 16 * alu_latency,
                                          load_growth, 0, false, true,

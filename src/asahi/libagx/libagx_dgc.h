@@ -1106,6 +1106,17 @@ struct libagx_robust_index_draw {
 static_assert(sizeof(struct libagx_robust_index_draw) == 32,
               "robust index batch host/device ABI");
 
+struct libagx_bound_index_draw {
+   struct libagx_robust_index_draw draw;
+   uint64_t base;
+   uint32_t range, topology, restart_index, restart;
+};
+struct libagx_index_list {
+   uint32_t count, pad;
+   struct libagx_bound_index_draw draws[16];
+};
+static_assert(sizeof(struct libagx_bound_index_draw) == 56, "index list row");
+
 /* Software task stage (G17P): one record per task draw. The task kernel
  * stores each workgroup's child grid and payload in its entry, and raises
  * max_children to its child count; the mesh object and mesh shader read them

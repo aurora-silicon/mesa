@@ -12847,10 +12847,59 @@ hk_flush_robust_index_batch(struct hk_cmd_buffer *cmd,
                                   draw->index_buffer_range_B, draw->restart,
                                   batch->restart_index,
                                   hk_libagx_record_chip(dev),
-                                  cmd->state.gfx.topology, draw->index_size);
+                                  cmd->state.gfx.topology, false,
+                                  draw->index_size);
    batch->cs->stats.robust_index_dispatches++;
    batch->cs->stats.robust_index_batches++;
    batch->count = 0;
+}
+
+static void
+hk_m5_prepare_index_draw(struct hk_cmd_buffer *cmd, struct hk_cs *render,
+                         const struct libagx_robust_index_draw *job,
+                         struct agx_draw draw, enum agx_primitive topology,
+                         uint32_t restart_index)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_cs *pre =
+      hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.pre_gfx, true);
+   if (!pre)
+      return;
+   struct libagx_index_list *list = pre->m5_index_list.list;
+   const bool append = list && pre->m5_index_list.render == render &&
+      pre->m5_index_list.end == pre->current &&
+      pre->m5_index_list.epoch == cmd->sync.epoch &&
+      pre->m5_index_list.index_size == draw.index_size &&
+      list->count < ARRAY_SIZE(list->draws);
+   struct agx_ptr upload = {0};
+   if (!append) {
+      upload = hk_pool_alloc(cmd, sizeof(*list), 8);
+      if (!upload.cpu)
+         return;
+      list = upload.cpu;
+      list->count = 0;
+   }
+   list->draws[list->count++] = (struct libagx_bound_index_draw) {
+      .draw = *job, .base = draw.index_buffer,
+      .range = draw.index_buffer_range_B, .topology = topology,
+      .restart = draw.restart, .restart_index = restart_index,
+   };
+   if (append)
+      return;
+   libagx_draw_robust_index_batch(cmd, agx_1d(32 * ARRAY_SIZE(list->draws)),
+                                  AGX_BARRIER_ALL | AGX_PREGFX, upload.gpu,
+                                  hk_heap(cmd), dev->dev.printf_buffer_address,
+                                  0, 0, 0, 0, hk_libagx_record_chip(dev),
+                                  topology, true, draw.index_size);
+   if (vk_command_buffer_has_error(&cmd->vk) || pre != cmd->current_cs.pre_gfx)
+      return;
+   pre->m5_index_list.list = list;
+   pre->m5_index_list.render = render;
+   pre->m5_index_list.end = pre->current;
+   pre->m5_index_list.epoch = cmd->sync.epoch;
+   pre->m5_index_list.index_size = draw.index_size;
+   render->stats.robust_index_dispatches++;
+   render->stats.robust_index_batches++;
 }
 
 static void
@@ -12908,6 +12957,8 @@ hk_emit_robust_index(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       batch->cs = cs;
       batch->draw = draw;
       batch->restart_index = restart_index;
+   } else if (dev->dev.chip == AGX_CHIP_G17C) {
+      hk_m5_prepare_index_draw(cmd, cs, &job, draw, topology, restart_index);
    } else {
       libagx_draw_robust_index(
          cmd, agx_1d(32), AGX_BARRIER_ALL | AGX_PREGFX, target, hk_heap(cmd),

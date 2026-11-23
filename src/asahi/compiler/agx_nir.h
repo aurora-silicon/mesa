@@ -63,6 +63,7 @@ bool agx_nir_select_shifted_half(struct nir_shader *shader);
 bool agx_nir_opt_select_load(struct nir_shader *shader);
 bool agx_nir_opt_flatten_loads(struct nir_shader *shader, unsigned limit,
                                unsigned max_loads);
+bool agx_nir_opt_sink_conditional_loads(struct nir_shader *shader);
 bool agx_nir_opt_sink_loop_sample_uses(struct nir_shader *shader);
 bool agx_nir_opt_hoist_loop_samples(struct nir_shader *shader);
 bool agx_nir_fuse_algebraic_late(struct nir_shader *shader);
@@ -74,7 +75,10 @@ bool agx_nir_lower_layer(struct nir_shader *s);
 bool agx_nir_lower_clip_distance(struct nir_shader *s);
 bool agx_nir_lower_subgroups(struct nir_shader *s);
 bool agx_nir_lower_subgroups_g17p(struct nir_shader *s);
-bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor);
+bool agx_nir_lower_subgroups_m5(struct nir_shader *s, bool native_shuffle_xor,
+                                bool native_float_minmax);
+bool agx_nir_opt_shared_tree_reduce(struct nir_shader *shader);
+bool agx_nir_opt_sink_single_lane_select(struct nir_shader *shader);
 bool agx_nir_flush_subgroup_minmax(struct nir_shader *s);
 bool agx_nir_lower_dynamic_shuffle_xor(struct nir_shader *s);
 bool agx_nir_lower_quad_derivative_ids(struct nir_shader *s);

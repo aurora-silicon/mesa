@@ -1250,10 +1250,19 @@ struct hk_cs {
    bool m5_ppp_emitted_valid;
 
    struct util_dynarray render_resources;
-   /* The render_resources entry the last draw matched or appended, see
-    * hk_m5_note_render_resources(). */
-   uint8_t m5_render_resources_last[3 * sizeof(struct drm_asahi_render_program_v2)];
-   size_t m5_render_resources_last_size;
+   union {
+      struct {
+         uint8_t m5_render_resources_last[3 * sizeof(struct drm_asahi_render_program_v2)];
+         size_t m5_render_resources_last_size;
+      };
+      /* Per-render prepass, while recording contiguous independent repairs. */
+      struct {
+         struct hk_cs *render;
+         void *list;
+         uint32_t *end;
+         uint32_t epoch, index_size;
+      } m5_index_list;
+   };
    struct drm_asahi_render_program tile_resources;
    /* Native AGX3: struct hk_oq_stamp for each immediate write that makes an
     * occlusion query available and could instead ride on the retirement

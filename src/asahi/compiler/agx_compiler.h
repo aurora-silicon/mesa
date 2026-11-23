@@ -1511,6 +1511,39 @@ bool agx3_coalesce_uniform_half_stores(agx_context *ctx);
 bool agx_lower_agx3_device_atomic_sources(agx_context *ctx);
 
 static inline bool
+agx3_mem_immediate_byte_offset(const agx_instr *I, uint32_t index,
+                               int32_t *bytes)
+{
+   unsigned w;
+   switch (I->format) {
+   case AGX_FORMAT_I8:
+      w = 0;
+      break;
+   case AGX_FORMAT_I16:
+   case AGX_FORMAT_F16:
+      w = 1;
+      break;
+   case AGX_FORMAT_I32:
+      w = 2;
+      break;
+   default:
+      return false;
+   }
+
+   const unsigned shift =
+      (unsigned)I->shift + (I->memory_index_is_bytes ? 0 : w);
+   if (index && shift >= 16)
+      return false;
+
+   const int64_t sum = ((int64_t)index << shift) + I->memory_byte_offset;
+   if (sum < INT16_MIN || sum > INT16_MAX)
+      return false;
+
+   *bytes = (int32_t)sum;
+   return true;
+}
+
+static inline bool
 agx3_fcmpsel_tied_minmax(const agx_instr *I)
 {
    return I->nr_srcs == 4 && !I->invert_cond && !I->saturate &&

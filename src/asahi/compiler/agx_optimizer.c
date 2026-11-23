@@ -395,6 +395,14 @@ agx_optimizer_minifloat_select(agx_context *ctx, agx_instr **defs,
    }
 }
 
+static bool
+device_immediate_index_fits(const agx_instr *I, uint64_t imm)
+{
+   int32_t bytes;
+   return !I->memory_byte_offset ||
+          agx3_mem_immediate_byte_offset(I, (uint32_t)imm, &bytes);
+}
+
 static void
 agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
@@ -582,6 +590,10 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       if ((I->op == AGX_OPCODE_LOCAL_LOAD || I->op == AGX_OPCODE_DEVICE_LOAD ||
            I->op == AGX_OPCODE_STACK_STORE) &&
           s != 1)
+         continue;
+      if (((I->op == AGX_OPCODE_DEVICE_LOAD && s == 1) ||
+           (I->op == AGX_OPCODE_DEVICE_STORE && s == 2)) &&
+          !device_immediate_index_fits(I, def->imm))
          continue;
       if (I->op == AGX_OPCODE_SPLIT)
          continue;

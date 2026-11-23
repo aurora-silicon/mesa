@@ -3854,6 +3854,7 @@ struct hk_g17p_tiled_upload_key {
    uint32_t object;
    uint32_t block_B;
    uint32_t elements_per_thread;
+   uint32_t byte_tile_w_log2, byte_tile_h_log2;
 };
 
 struct hk_g17p_tiled_upload_push {
@@ -3880,6 +3881,59 @@ hk_g17p_compact_even16(nir_builder *b, nir_def *v)
    v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 1)), 0x3333);
    v = nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 2)), 0x0f0f);
    return nir_iand_imm(b, nir_ior(b, v, nir_ushr_imm(b, v, 4)), 0x00ff);
+}
+
+/* Copy a 4x4 block of bytes as four aligned row loads and one packed
+ * Morton-order store. Tile dimensions and row alignment are proved when the
+ * dispatch is recorded. Each invocation owns a disjoint 16-byte block. */
+static nir_shader *
+hk_build_tiled_byte_upload(const struct hk_g17p_tiled_upload_key *key)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, NULL, "hk-meta-tiled-byte-upload");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = 8;
+   b->shader->info.workgroup_size[1] = 8;
+   b->shader->info.workgroup_size[2] = 1;
+   nir_def *id = nir_load_global_invocation_id(b, 32);
+   nir_def *rx = nir_ishl_imm(b, nir_channel(b, id, 0), 2);
+   nir_def *ry = nir_ishl_imm(b, nir_channel(b, id, 1), 2);
+   nir_push_if(b, nir_iand(b, nir_ult(b, rx, tiled_upload_push(b, width)),
+                            nir_ult(b, ry, tiled_upload_push(b, height))));
+   {
+      nir_def *pitch = tiled_upload_push(b, src_pitch_B);
+      nir_def *src = tiled_upload_push(b, src);
+      nir_def *base = nir_iadd(b, nir_imul(b, ry, pitch), rx);
+      nir_def *row[4];
+      for (unsigned j = 0; j < 4; ++j) {
+         nir_def *off = nir_iadd(b, base, nir_imul_imm(b, pitch, j));
+         row[j] = nir_load_global(b, 1, 32, nir_iadd(b, src, nir_u2u64(b, off)),
+                                  .align_mul = 4,
+                                  .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+      }
+      nir_def *word[4];
+      for (unsigned j = 0; j < 4; j += 2) {
+         word[j] = nir_pack_32_2x16_split(b, nir_u2u16(b, row[j]),
+                                          nir_u2u16(b, row[j + 1]));
+         word[j + 1] = nir_pack_32_2x16_split(
+            b, nir_unpack_32_2x16_split_y(b, row[j]),
+            nir_unpack_32_2x16_split_y(b, row[j + 1]));
+      }
+      const unsigned w = key->byte_tile_w_log2, h = key->byte_tile_h_log2;
+      nir_def *x = nir_iadd(b, rx, tiled_upload_push(b, x0));
+      nir_def *y = nir_iadd(b, ry, tiled_upload_push(b, y0));
+      nir_def *tile = nir_iadd(b, nir_ushr_imm(b, x, w),
+         nir_imul(b, nir_ushr_imm(b, y, h), tiled_upload_push(b, tiles_per_row)));
+      nir_def *offset = nir_ishl_imm(b, tile, w + h);
+      for (unsigned bit = 2; bit < w; ++bit)
+         offset = nir_ior(b, offset, nir_ishl_imm(b, nir_iand_imm(b, x, 1u << bit), bit));
+      for (unsigned bit = 2; bit < h; ++bit)
+         offset = nir_ior(b, offset, nir_ishl_imm(b, nir_iand_imm(b, y, 1u << bit), bit + 1));
+      nir_def *addr = nir_iadd(b, tiled_upload_push(b, dst), nir_u2u64(b, offset));
+      nir_store_global(b, nir_vec(b, word, 4), addr, .align_mul = 16);
+   }
+   nir_pop_if(b, NULL);
+   return b->shader;
 }
 
 static nir_shader *
@@ -3956,6 +4010,7 @@ hk_g17p_build_tiled_upload(const struct hk_g17p_tiled_upload_key *key)
 /* Whether this upload takes hk_g17p_tiled_upload(), and its shape. */
 static bool
 hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
+                           bool aligned_bytes,
                            const struct hk_g17p_tile_address_config *tile,
                            const struct hk_g17p_uncompressed_copy_plan *plan,
                            struct hk_g17p_tiled_upload_key *key,
@@ -3978,9 +4033,20 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
    const uint64_t x1 = (uint64_t)plan->base_x_el + plan->width_el - 1;
    const uint64_t y1 = (uint64_t)plan->base_y_el + plan->height_el - 1;
    const struct vk_physical_device *pdev = dev->vk.physical;
-   groups[0] = 1u << (area_log2 - 6 - util_logbase2(per_thread));
-   groups[1] = (x1 >> twl) - tx0 + 1;
-   groups[2] = (y1 >> thl) - ty0 + 1;
+
+   const bool packed_bytes = dev->dev.chip == AGX_CHIP_G17C &&
+      aligned_bytes && plan->block_size_B == 1 && twl >= 2 && thl >= 2 &&
+      !((plan->width_el | plan->height_el | plan->base_x_el | plan->base_y_el |
+         plan->buffer_row_stride_B) & 3);
+   if (packed_bytes) {
+      groups[0] = DIV_ROUND_UP(plan->width_el, 32);
+      groups[1] = DIV_ROUND_UP(plan->height_el, 32);
+      groups[2] = 1;
+   } else {
+      groups[0] = 1u << (area_log2 - 6 - util_logbase2(per_thread));
+      groups[1] = (x1 >> twl) - tx0 + 1;
+      groups[2] = (y1 >> thl) - ty0 + 1;
+   }
    for (unsigned i = 0; i < 3; ++i) {
       if (groups[i] > pdev->properties.maxComputeWorkGroupCount[i])
          return false;
@@ -4001,6 +4067,8 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
       .object = HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
       .block_B = plan->block_size_B,
       .elements_per_thread = per_thread,
+      .byte_tile_w_log2 = packed_bytes ? twl : 0,
+      .byte_tile_h_log2 = packed_bytes ? thl : 0,
    };
    return true;
 }
@@ -4028,7 +4096,8 @@ hk_g17p_tiled_upload(struct hk_cmd_buffer *cmd,
    if (pipeline == VK_NULL_HANDLE) {
       const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
-         .nir = hk_g17p_build_tiled_upload(key),
+         .nir = key->byte_tile_w_log2 ? hk_build_tiled_byte_upload(key)
+                                      : hk_g17p_build_tiled_upload(key),
       };
       const VkComputePipelineCreateInfo info = {
          .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -4151,8 +4220,13 @@ hk_g17p_copy_uncompressed_buffer_to_image(
       };
       struct hk_g17p_tiled_upload_key tiled_key;
       uint32_t tiled_groups[3];
+      const bool aligned_bytes = !(base_src & 3) &&
+         !(plan.buffer_slice_stride_B & 3) &&
+         !(layout->layer_stride_B & 15) &&
+         !((base_dst + ail_get_layer_level_B(layout, plan.first_slice, level)) & 15);
       const bool tiled = hk_g17p_tiled_upload_shape(
-         dev, dest_tiled, &tile_config, &plan, &tiled_key, tiled_groups);
+         dev, dest_tiled, aligned_bytes, &tile_config, &plan, &tiled_key,
+         tiled_groups);
 
       for (uint32_t slice = 0; slice < plan.slice_count; ++slice) {
          struct libagx_copy_image_args args = args_template;

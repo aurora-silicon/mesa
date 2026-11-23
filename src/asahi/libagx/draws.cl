@@ -392,9 +392,25 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                uint64_t in_buf_ptr, uint32_t in_buf_range_B,
                                ushort restart, uint32_t restart_index,
                                enum agx_chip chip, enum agx_primitive topology,
+                               ushort varied_bindings,
                                enum agx_index_size index_size__3)
 {
-   constant struct libagx_robust_index_draw *draw = draws + get_group_id(0);
+   uint group = get_group_id(0);
+   constant struct libagx_robust_index_draw *draw;
+   if (varied_bindings) {
+      constant struct libagx_index_list *list = (constant struct libagx_index_list *)draws;
+      if (group >= list->count)
+         return;
+      constant struct libagx_bound_index_draw *row = list->draws + group;
+      draw = &row->draw;
+      in_buf_ptr = row->base;
+      in_buf_range_B = row->range;
+      topology = row->topology;
+      restart_index = row->restart_index;
+      restart = row->restart;
+   } else {
+      draw = draws + group;
+   }
    libagx_draw_robust_index_impl(
       (global uint32_t *)draw->vdm, heap, printf_buffer,
       (constant VkDrawIndexedIndirectCommand *)draw->command, in_buf_ptr,

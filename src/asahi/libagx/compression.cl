@@ -267,6 +267,22 @@ libagx_fast_clear(global uint2 *meta, global uint4 *body, uint width_tl,
    uint samples = 1 << samples_log2__3;
    uint blocksize_B = 1 << blocksize_B_log2__5;
 
+   /* A whole power-of-two array of square 16x16 single-sample tiles has
+    * dense metadata and body packets. Each tile receives the same value,
+    * so visit both physical arrays consecutively. */
+   if (samples_log2__3 == 0 && blocksize_B_log2__5 == 1 &&
+       meta_tile_h_log2 == 4 && width_tl == height_tl &&
+       width_tl && !(width_tl & (width_tl - 1)) &&
+       tile_w_el == tile_h_el && tile_w_el >= 16 &&
+       width_tl * 16 >= tile_w_el) {
+      uint tile = cl_global_id.y * width_tl + cl_global_id.x;
+      meta[cl_global_id.z * meta_layer_stride_tl + tile] = solid_mode;
+      /* 16x16 two-byte texels occupy 32 uint4 words. */
+      body[cl_global_id.z * body_layer_stride_uint4 + 32 * tile] =
+         (uint4)(a, b, c, d);
+      return;
+   }
+
    /* Set the tile to be solid */
    meta[index_metadata(cl_global_id, width_tl, height_tl, meta_layer_stride_tl)] =
       solid_mode;

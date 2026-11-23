@@ -43,6 +43,8 @@ libasahi_agx_files = files(
   'agx_nir_gen1_mesh.c',
   'agx3_mesh_core.c',
   'agx_nir_opt_preamble.c',
+  'agx_nir_opt_sink_conditional_loads.c',
+  'agx_nir_opt_subgroup_reduce.c',
   'agx_lower_64bit.c',
   'agx_lower_divergent_shuffle.c',
   'agx_lower_parallel_copy.c',
