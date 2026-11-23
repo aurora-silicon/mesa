@@ -5051,3 +5051,116 @@ TEST(AGX3VisionOpts, Wave8SwarW8ByteSum)
       ralloc_free(b.shader);
    }
 }
+TEST(AGX3VisionOpts, Wave8SingleArmLoopUnswitchAndDominatingGuard)
+{
+   /* Single-arm-loop invariant-if unswitch: outer loop has if (border) { fast 1-op }
+    * else { nested inner loop }. Must unswitch WITHOUT duplicating the inner loop! */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_single_arm_unswitch");
+      nir_def *border = nir_ieq_imm(&b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0)), 0);
+      nir_def *w = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_def *ksize = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8));
+      nir_variable *xv = nir_local_variable_create(b.impl, glsl_uint_type(), "x");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, xv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_loop *outer = nir_push_loop(&b);
+      {
+         nir_def *x = nir_load_var(&b, xv);
+         nir_break_if(&b, nir_uge(&b, x, w));
+         nir_if *nif = nir_push_if(&b, border);
+         {
+            nir_store_var(&b, acc, nir_iadd_imm(&b, nir_load_var(&b, acc), 1), 1);
+         }
+         nir_push_else(&b, nif);
+         {
+            nir_variable *kv = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+            nir_store_var(&b, kv, nir_imm_int(&b, 0), 1);
+            nir_loop *inner = nir_push_loop(&b);
+            {
+               nir_def *k = nir_load_var(&b, kv);
+               nir_break_if(&b, nir_uge(&b, k, ksize));
+               nir_def *t1 = nir_imul_imm(&b, k, 3);
+               nir_def *t2 = nir_iadd(&b, t1, x);
+               nir_def *t3 = nir_ixor(&b, t2, ksize);
+               nir_def *t4 = nir_ishl_imm(&b, t3, 2);
+               nir_def *v = nir_load_global(&b, 1, 32, nir_u2u64(&b, t4), .align_mul = 4);
+               nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+               nir_store_var(&b, kv, nir_iadd_imm(&b, k, 1), 1);
+            }
+            nir_pop_loop(&b, inner);
+         }
+         nir_pop_if(&b, nif);
+         nir_store_var(&b, xv, nir_iadd_imm(&b, x, 1), 1);
+      }
+      nir_pop_loop(&b, outer);
+      nir_store_global(&b, nir_load_var(&b, acc), nir_imm_int64(&b, 0x1000), .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      EXPECT_TRUE(agx_nir_opt_unswitch_invariant_if(b.shader));
+      nir_validate_shader(b.shader, "wave8 single arm unswitch");
+
+      /* Total loops must be 3: two outer copies + ONE single inner loop (never duplicated!). */
+      unsigned loops = 0, inner_loops = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_cf_node *p = block->cf_node.parent;
+         if (p->type == nir_cf_node_loop &&
+             nir_loop_first_block(nir_cf_node_as_loop(p)) == block) {
+            loops++;
+            for (nir_cf_node *a = p->parent; a; a = a->parent) {
+               if (a->type == nir_cf_node_loop) {
+                  inner_loops++;
+                  break;
+               }
+            }
+         }
+      }
+      EXPECT_EQ(loops, 3u);
+      EXPECT_EQ(inner_loops, 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative: if BOTH arms contain a nested loop, MUST NOT unswitch. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_both_arms_loop");
+      nir_def *cond = nir_ieq_imm(&b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0)), 0);
+      nir_def *w = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_variable *xv = nir_local_variable_create(b.impl, glsl_uint_type(), "x");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, xv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_loop *outer = nir_push_loop(&b);
+      {
+         nir_def *x = nir_load_var(&b, xv);
+         nir_break_if(&b, nir_uge(&b, x, w));
+         nir_if *nif = nir_push_if(&b, cond);
+         {
+            nir_loop *l1 = nir_push_loop(&b);
+            nir_store_var(&b, acc, nir_iadd_imm(&b, nir_load_var(&b, acc), 1), 1);
+            nir_break_if(&b, nir_uge(&b, nir_load_var(&b, acc), w));
+            nir_pop_loop(&b, l1);
+         }
+         nir_push_else(&b, nif);
+         {
+            nir_loop *l2 = nir_push_loop(&b);
+            nir_store_var(&b, acc, nir_iadd_imm(&b, nir_load_var(&b, acc), 2), 1);
+            nir_break_if(&b, nir_uge(&b, nir_load_var(&b, acc), w));
+            nir_pop_loop(&b, l2);
+         }
+         nir_pop_if(&b, nif);
+         nir_store_var(&b, xv, nir_iadd_imm(&b, x, 1), 1);
+      }
+      nir_pop_loop(&b, outer);
+      nir_store_global(&b, nir_load_var(&b, acc), nir_imm_int64(&b, 0x1000), .align_mul = 4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+
+      EXPECT_FALSE(agx_nir_opt_unswitch_invariant_if(b.shader));
+      ralloc_free(b.shader);
+   }
+}
+
+

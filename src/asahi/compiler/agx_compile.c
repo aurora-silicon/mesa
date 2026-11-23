@@ -16922,9 +16922,18 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
       key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !key->dev.emit_agx3d &&
       mesa_shader_stage_is_compute(nir->info.stage);
 
-   if (agx3b_compute) {
+   if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+        key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+       !key->dev.emit_agx3d &&
+       mesa_shader_stage_is_compute(nir->info.stage)) {
       bool unswitched_if = false;
-      NIR_PASS(unswitched_if, nir, agx_nir_opt_unswitch_invariant_if);
+      for (unsigned round = 0; round < 2; ++round) {
+         bool p = false;
+         NIR_PASS(p, nir, agx_nir_opt_unswitch_invariant_if);
+         if (!p)
+            break;
+         unswitched_if = true;
+      }
       if (unswitched_if)
          nir_divergence_analysis(nir);
    }

@@ -177,6 +177,39 @@ loops_inside_ifs(nir_shader *shader)
    return n;
 }
 
+static bool
+cf_list_has_loop(struct exec_list *list)
+{
+   foreach_list_typed(nir_cf_node, n, node, list) {
+      if (n->type == nir_cf_node_loop)
+         return true;
+      if (n->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(n);
+         if (cf_list_has_loop(&nif->then_list) ||
+             cf_list_has_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+static unsigned
+outer_loops_inside_ifs(nir_shader *shader)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_cf_node *parent = block->cf_node.parent;
+         if (parent->type == nir_cf_node_loop &&
+             nir_loop_first_block(nir_cf_node_as_loop(parent)) == block &&
+             parent->parent->type == nir_cf_node_if &&
+             cf_list_has_loop(&nir_cf_node_as_loop(parent)->body))
+            n++;
+      }
+   }
+   return n;
+}
+
 /* The rotated loop's only live-out (the sum) is a back-edge value: the
  * original loop moves under an if, so the main loop needs only 4 iterations
  * left. */
@@ -1221,7 +1254,7 @@ TEST(M5RuntimeLoops, NestedWindowUnswitches)
       EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL)) << "variant " << v;
       nir_validate_shader(s, "box after");
       EXPECT_EQ(count_loops(s), 5u) << "variant " << v;
-      EXPECT_EQ(loops_inside_ifs(s), 2u) << "variant " << v; /* the two outer copies */
+      EXPECT_EQ(outer_loops_inside_ifs(s), 2u) << "variant " << v; /* the two outer copies */
       expect_no_undef_header_phis(s);
       NIR_PASS(_, s, nir_opt_dce);
       nir_validate_shader(s, "box after dce");
@@ -1240,7 +1273,7 @@ TEST(M5RuntimeLoops, NestedWindowUnswitches)
       nir_shader *s = box_filter(v);
       agx_nir_unroll_runtime_loops(s, 8, 320, NULL);
       nir_validate_shader(s, "box refused after");
-      EXPECT_EQ(loops_inside_ifs(s), 0u) << "variant " << v;
+      EXPECT_EQ(outer_loops_inside_ifs(s), 0u) << "variant " << v;
       expect_no_undef_header_phis(s);
       ralloc_free(s);
    }

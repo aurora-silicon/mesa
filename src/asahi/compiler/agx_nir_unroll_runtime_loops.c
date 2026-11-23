@@ -497,9 +497,99 @@ analyze_loop(nir_loop *loop, struct counted_loop *out)
 /* The loop-invariant value G such that "iv < G" (REL_LT, REL_LE) or
  * "iv > G" (REL_GT, REL_GE) proves the next `factor` iterations run without
  * the induction variable wrapping. */
+/* Check whether a dominating `if` proves a lower bound (for step > 0) on
+ * `bound` sufficient to prevent `bound - span` underflow in guard_bound(),
+ * and optionally whether it also proves `loop_continue_cond(iv0, bound)`. */
+static void
+check_dominating_bound_guard(nir_loop *loop, const struct counted_loop *cl,
+                             nir_def *bound, nir_def *iv0, unsigned max_span,
+                             bool *no_underflow, bool *iv0_enters)
+{
+   *no_underflow = false;
+   *iv0_enters = false;
+
+   if (cl->step <= 0 || (cl->rel != REL_LT && cl->rel != REL_LE) ||
+       bound->bit_size != 32)
+      return;
+
+   const bool u = cl->is_unsigned;
+   const int64_t min_val = u ? 0 : INT32_MIN;
+   const int64_t need_min = min_val + (int64_t)max_span;
+   nir_scalar b_s = nir_scalar_resolved(bound, 0);
+   nir_scalar iv0_s = iv0 ? nir_scalar_resolved(iv0, 0) : (nir_scalar){0};
+
+   for (nir_cf_node *node = &loop->cf_node; node->parent; node = node->parent) {
+      if (node->parent->type != nir_cf_node_if)
+         continue;
+      nir_if *pif = nir_cf_node_as_if(node->parent);
+      bool in_then = false;
+      foreach_list_typed(nir_cf_node, c, node, &pif->then_list) {
+         if (c == node) {
+            in_then = true;
+            break;
+         }
+      }
+
+      nir_scalar cond = nir_scalar_resolved(pif->condition.ssa, 0);
+      bool truth = in_then;
+      while (nir_scalar_is_alu(cond) && nir_scalar_alu_op(cond) == nir_op_inot) {
+         cond = nir_scalar_chase_alu_src(cond, 0);
+         truth = !truth;
+      }
+      if (!nir_scalar_is_alu(cond))
+         continue;
+
+      nir_op op = nir_scalar_alu_op(cond);
+      nir_scalar s0 = nir_scalar_chase_alu_src(cond, 0);
+      nir_scalar s1 = nir_scalar_chase_alu_src(cond, 1);
+
+      /* Normalize to: lo < bound (strict=true) or lo <= bound (strict=false) */
+      bool strict = false;
+      nir_scalar lo = {0};
+      bool matched = false;
+
+      const nir_op lt_op = u ? nir_op_ult : nir_op_ilt;
+      const nir_op ge_op = u ? nir_op_uge : nir_op_ige;
+
+      if (truth && op == lt_op && nir_scalar_equal(s1, b_s)) {
+         lo = s0;
+         strict = true;
+         matched = true;
+      } else if (!truth && op == ge_op && nir_scalar_equal(s1, b_s)) {
+         lo = s0;
+         strict = true;
+         matched = true;
+      } else if (truth && op == ge_op && nir_scalar_equal(s0, b_s)) {
+         lo = s1;
+         strict = false;
+         matched = true;
+      } else if (!truth && op == lt_op && nir_scalar_equal(s0, b_s)) {
+         lo = s1;
+         strict = false;
+         matched = true;
+      }
+
+      if (!matched)
+         continue;
+
+      if (nir_scalar_is_const(lo)) {
+         int64_t c = u ? (int64_t)nir_scalar_as_uint(lo)
+                       : (int64_t)nir_scalar_as_int(lo);
+         int64_t lb = strict ? (c + 1) : c;
+         if (lb >= need_min)
+            *no_underflow = true;
+      }
+
+      if (iv0 && nir_scalar_equal(lo, iv0_s)) {
+         if (strict || cl->rel == REL_LE)
+            *iv0_enters = true;
+      }
+   }
+}
+
 static nir_def *
 guard_bound(nir_builder *b, const struct counted_loop *cl, nir_def *bound,
-            unsigned factor)
+            unsigned factor, bool no_underflow)
 {
    const int64_t span = (int64_t)(factor - 1) * (cl->step > 0 ? cl->step : -cl->step);
    const bool u = cl->is_unsigned;
@@ -510,11 +600,13 @@ guard_bound(nir_builder *b, const struct counted_loop *cl, nir_def *bound,
    switch (cl->rel) {
    case REL_LT:
    case REL_LE: {
+      int64_t sub = cl->rel == REL_LT ? span : span - 1;
+      adj = nir_iadd_imm(b, bound, -sub);
+      if (no_underflow)
+         return adj;
       /* bound - span must not wrap below the minimum. */
       nir_def *lowest = nir_imm_int(b, (uint32_t)(min + span));
       valid = u ? nir_uge(b, bound, lowest) : nir_ige(b, bound, lowest);
-      int64_t sub = cl->rel == REL_LT ? span : span - 1;
-      adj = nir_iadd_imm(b, bound, -sub);
       never = nir_imm_int(b, (uint32_t)min);
       break;
    }
@@ -742,7 +834,8 @@ static nir_def *rematerialize(nir_builder *b, nir_def *def, nir_loop *loop,
  * outer pixel loops and can move to the uniform preamble. */
 static nir_def *
 guard_bound_hoisted(nir_function_impl *impl, nir_loop *loop, nir_loop *anchor,
-                    const struct counted_loop *cl, nir_def *bound, unsigned k)
+                    const struct counted_loop *cl, nir_def *bound, unsigned k,
+                    bool no_underflow)
 {
    nir_loop *outermost = anchor;
    for (nir_cf_node *p = loop->cf_node.parent; p; p = p->parent) {
@@ -761,7 +854,7 @@ guard_bound_hoisted(nir_function_impl *impl, nir_loop *loop, nir_loop *anchor,
       bdef = rematerialize(&gb, bound, outermost, remap);
       _mesa_hash_table_destroy(remap, NULL);
    }
-   return guard_bound(&gb, cl, bdef, k);
+   return guard_bound(&gb, cl, bdef, k, no_underflow);
 }
 
 /* later_bounds: the bounds computed for the loops unrolled after this one,
@@ -774,11 +867,7 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
 
-   /* The guard bound, hoisted to the outermost enclosing loop preheader where
-    * `bound` is invariant. */
    nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
-   b.cursor = nir_after_block_before_jump(pre);
-   nir_def *g = guard_bound_hoisted(impl, loop, loop, cl, bound, factor);
 
    /* A rotated loop runs its body before its test, so the original loop,
     * reached after the main loop, runs at least one more iteration. When
@@ -795,6 +884,18 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
                            iv_back && back_edge_live_outs(loop, outs, &nouts);
    nir_def *iv0 = exact_tail ? init->src.ssa : NULL;
    nir_def *iv_next = exact_tail ? iv_back->src.ssa : NULL;
+
+   const unsigned max_span =
+      (factor - 1) * (unsigned)(cl->step > 0 ? cl->step : -cl->step);
+   bool no_underflow = false, iv0_enters = false;
+   check_dominating_bound_guard(loop, cl, bound, iv0, max_span,
+                                &no_underflow, &iv0_enters);
+
+   /* The guard bound, hoisted to the outermost enclosing loop preheader where
+    * `bound` is invariant. */
+   b.cursor = nir_after_block_before_jump(pre);
+   nir_def *g =
+      guard_bound_hoisted(impl, loop, loop, cl, bound, factor, no_underflow);
 
    /* Compact step-1/-1 counted loops unrolled by 8 leave 0..7 remainder
     * iterations (unless the induction variable wraps on REL_LE/REL_GE at an
@@ -923,7 +1024,9 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
       b.cursor = nir_before_cf_node(&loop->cf_node);
       for (unsigned sub = factor / 2; sub >= 2; sub /= 2) {
          nir_def *v = nir_load_reg(&b, iv_reg);
-         nir_def *gs = guard_bound_hoisted(impl, loop, main_loop, cl, bound, sub);
+         nir_def *gs =
+            guard_bound_hoisted(impl, loop, main_loop, cl, bound, sub,
+                                no_underflow);
          nir_def *cond;
          if (cl->rel == REL_LT || cl->rel == REL_LE)
             cond = u ? nir_ult(&b, v, gs) : nir_ilt(&b, v, gs);
@@ -934,15 +1037,49 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
 
       nir_def *v = nir_load_reg(&b, iv_reg);
       nir_def *more = loop_continue_cond(&b, cl, v, bound);
-      nir_def *run = exact_tail ? nir_ior(&b, nir_ieq(&b, v, iv0), more) : more;
+      nir_def *run = (exact_tail && !iv0_enters)
+                        ? nir_ior(&b, nir_ieq(&b, v, iv0), more)
+                        : more;
       emit_binary_tail_chunk(&b, run, &head, &rest, 1);
 
-      nir_cf_reinsert(&head, nir_before_cf_node(&main_if->cf_node));
+      /* Rotate main_loop to a guarded bottom-tested loop: when trip count <
+       * factor we skip entering the loop CF nesting completely, and when
+       * iterating the back-edge test is bottom-tested (enabling AGX3 early
+       * loop compares without a top break_if + jmp_exec_none_after pair). */
+      nir_cf_node_remove(&main_if->cf_node);
+      nir_cf_reinsert(&head, nir_after_cf_list(&main_loop->body));
       nir_cf_reinsert(&rest, nir_after_cf_list(&main_loop->body));
       for (unsigned i = 1; i < factor; ++i) {
          nir_cf_reinsert(&copies[2 * i], nir_after_cf_list(&main_loop->body));
          nir_cf_reinsert(&copies[2 * i + 1], nir_after_cf_list(&main_loop->body));
       }
+
+      b.cursor = nir_after_cf_list(&main_loop->body);
+      nir_def *v_end = nir_load_reg(&b, iv_reg);
+      if (cl->offset && !exact_tail)
+         v_end = nir_iadd_imm(&b, v_end, cl->offset);
+      nir_def *cont_end =
+         (cl->rel == REL_LT || cl->rel == REL_LE)
+            ? (u ? nir_ult(&b, v_end, g) : nir_ilt(&b, v_end, g))
+            : (u ? nir_ult(&b, g, v_end) : nir_ilt(&b, g, v_end));
+      nir_if *bot_if = nir_push_if(&b, nir_inot(&b, cont_end));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, bot_if);
+
+      b.cursor = nir_before_cf_node(&main_loop->cf_node);
+      nir_def *v_init = nir_load_reg(&b, iv_reg);
+      if (cl->offset && !exact_tail)
+         v_init = nir_iadd_imm(&b, v_init, cl->offset);
+      nir_def *cont_init =
+         (cl->rel == REL_LT || cl->rel == REL_LE)
+            ? (u ? nir_ult(&b, v_init, g) : nir_ilt(&b, v_init, g))
+            : (u ? nir_ult(&b, g, v_init) : nir_ilt(&b, g, v_init));
+      nir_if *enter_if = nir_push_if(&b, cont_init);
+      nir_pop_if(&b, enter_if);
+      nir_cf_list main_list;
+      nir_cf_extract(&main_list, nir_before_cf_node(&main_loop->cf_node),
+                     nir_after_cf_node(&main_loop->cf_node));
+      nir_cf_reinsert(&main_list, nir_before_cf_list(&enter_if->then_list));
 
       /* Top-tested REL_LT/REL_GT cannot wrap (every continuing iteration has
        * iv < bound <= max or iv > bound >= min), nor can top-tested
@@ -1733,7 +1870,7 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
       _mesa_hash_table_destroy(remap, NULL);
       if (cl.offset && !cl.bottom)
          iv0 = nir_iadd_imm(&b, iv0, cl.offset);
-      nir_def *g = guard_bound(&b, &cl, bound, f);
+      nir_def *g = guard_bound(&b, &cl, bound, f, false);
       nir_def *cond;
       if (cl.rel == REL_LT || cl.rel == REL_LE)
          cond = cl.is_unsigned ? nir_ult(&b, iv0, g) : nir_ilt(&b, iv0, g);
@@ -1766,7 +1903,7 @@ unswitch_nested(nir_function_impl *impl, unsigned factor, unsigned max_instrs,
       unsigned inner_ord = 0;
       if (split_small) {
          if (split_peel4) {
-            nir_def *g4 = guard_bound(&b, &cl, bound, 4);
+            nir_def *g4 = guard_bound(&b, &cl, bound, 4, false);
             if (cl.rel == REL_LT || cl.rel == REL_LE)
                cond4 = cl.is_unsigned ? nir_ult(&b, iv0, g4) : nir_ilt(&b, iv0, g4);
             else
@@ -2233,7 +2370,8 @@ agx_nir_opt_unswitch_invariant_if(nir_shader *shader)
 
       util_dynarray_foreach(&loops, nir_loop *, lp) {
          nir_loop *loop = *lp;
-         if (!loop_safe_to_unswitch_if(loop, false))
+         const bool has_inner_loop = loop_has_nested_loop(&loop->body);
+         if (!loop_safe_to_unswitch_if(loop, true))
             continue;
 
          nir_if *target = NULL;
@@ -2243,22 +2381,57 @@ agx_nir_opt_unswitch_invariant_if(nir_shader *shader)
                continue;
             nir_if *nif = nir_cf_node_as_if(node);
             unsigned cur_ord = ord++;
-            if (cf_list_has_jump(&nif->then_list) ||
-                cf_list_has_jump(&nif->else_list))
+            if (cf_list_has_outer_jump(&nif->then_list) ||
+                cf_list_has_outer_jump(&nif->else_list))
                continue;
             /* Depth 8 matches outer_invariant() in outer-loop splitting. */
             if (!pure_loop_invariant(nif->condition.ssa, loop, 8))
                continue;
 
-            /* Require at least one substantial arm (>= 12 ops, so a small
-             * select/copy is not worth duplicating the loop for) and at least
-             * 2 loop-invariant ALU/preamble ops exposed across the arms for
-             * subsequent LICM. */
             unsigned t_tot = 0, t_inv = 0, e_tot = 0, e_inv = 0;
             count_arm_work(&nif->then_list, loop, &t_tot, &t_inv);
             count_arm_work(&nif->else_list, loop, &e_tot, &e_inv);
-            if ((t_tot < 12 && e_tot < 12) || (t_inv + e_inv) < 2)
-               continue;
+            const bool t_loop = loop_has_nested_loop(&nif->then_list);
+            const bool e_loop = loop_has_nested_loop(&nif->else_list);
+
+            if (has_inner_loop) {
+               /* Never duplicate an inner loop: only unswitch around `nif`
+                * when all nested loops in `loop` live inside a single arm of
+                * `nif` and the loop-free arm is compact (<= 16 ops, e.g. a
+                * border copy or zero-fill). */
+               if (t_loop == e_loop)
+                  continue;
+               bool other_loop = false;
+               foreach_list_typed(nir_cf_node, sib, node, &loop->body) {
+                  if (sib == &nif->cf_node)
+                     continue;
+                  if (sib->type == nir_cf_node_loop) {
+                     other_loop = true;
+                     break;
+                  }
+                  if (sib->type == nir_cf_node_if) {
+                     nir_if *snif = nir_cf_node_as_if(sib);
+                     if (loop_has_nested_loop(&snif->then_list) ||
+                         loop_has_nested_loop(&snif->else_list)) {
+                        other_loop = true;
+                        break;
+                     }
+                  }
+               }
+               if (other_loop)
+                  continue;
+               const unsigned small_tot = t_loop ? e_tot : t_tot;
+               const unsigned big_tot = t_loop ? t_tot : e_tot;
+               if (small_tot > 16 || big_tot < 8)
+                  continue;
+            } else {
+               /* Require at least one substantial arm (>= 12 ops, so a small
+                * select/copy is not worth duplicating the loop for) and at
+                * least 2 loop-invariant ALU ops exposed across the arms for
+                * subsequent LICM. */
+               if ((t_tot < 12 && e_tot < 12) || (t_inv + e_inv) < 2)
+                  continue;
+            }
 
             target = nif;
             target_ord = cur_ord;
