@@ -484,4 +484,391 @@ TEST(GuardChains, HoistPreservesDominanceAcrossUnhoistedMidBlock)
    ralloc_free(b.shader);
 }
 
+TEST(GuardChains, WeakenOuterGuardAndSinkIneExclusion)
+{
+   for (int extra_use = 0; extra_use < 2; ++extra_use) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "weaken-outer-guard");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *pos_base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *vel_base = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 8);
+      nir_def *r2 = agx_test_load_preamble(&b, 1, 32, 12);
+
+      nir_def *self_pos = make_load_global(
+         &b, 2, 32,
+         nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 3)), 8,
+         (gl_access_qualifier)0);
+      nir_def *self_vel = make_load_global(
+         &b, 2, 32,
+         nir_iadd(&b, vel_base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 3)), 8,
+         (gl_access_qualifier)0);
+
+      nir_def *acc_x = nir_imm_float(&b, 0.0f);
+      nir_def *acc_y = nir_imm_float(&b, 0.0f);
+      nir_def *acc_f = nir_imm_int(&b, 0);
+      nir_def *ine_escape = NULL;
+
+      for (unsigned k = 0; k < 2; ++k) {
+         nir_def *j = k ? nir_iadd_imm(&b, tid, 32 * k) : tid;
+         nir_def *ne = nir_ine(&b, j, wid);
+         if (k == 1)
+            ine_escape = ne;
+         nir_def *j_pos = make_load_global(
+            &b, 2, 32,
+            nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, j), 3)), 8,
+            (gl_access_qualifier)ACCESS_CAN_SPECULATE);
+         nir_def *dx = nir_fsub(&b, nir_channel(&b, self_pos, 0),
+                                nir_channel(&b, j_pos, 0));
+         nir_def *dy = nir_fsub(&b, nir_channel(&b, self_pos, 1),
+                                nir_channel(&b, j_pos, 1));
+         nir_def *d2 = nir_ffma(&b, dx, dx, nir_fmul(&b, dy, dy));
+         nir_def *hit = nir_iand(&b, nir_flt(&b, d2, r2), ne);
+
+         nir_push_if(&b, hit);
+         nir_def *j_vel = make_load_global(
+            &b, 2, 32,
+            nir_iadd(&b, vel_base, nir_ishl_imm(&b, nir_u2u64(&b, j), 3)), 8,
+            (gl_access_qualifier)0);
+         nir_def *inv = nir_frsq(&b, d2);
+         nir_def *nx = nir_fmul(&b, dx, inv);
+         nir_def *ny = nir_fmul(&b, dy, inv);
+         nir_def *dvx = nir_fsub(&b, nir_channel(&b, self_vel, 0),
+                                 nir_channel(&b, j_vel, 0));
+         nir_def *dvy = nir_fsub(&b, nir_channel(&b, self_vel, 1),
+                                 nir_channel(&b, j_vel, 1));
+         nir_def *dot = nir_ffma(&b, dvx, nx, nir_fmul(&b, dvy, ny));
+         nir_def *imp = nir_fmul(&b, dot, nir_imm_float(&b, -0.312f));
+         nir_def *nx_acc = nir_ffma(&b, imp, nx, acc_x);
+         nir_def *ny_acc = nir_ffma(&b, imp, ny, acc_y);
+         nir_def *approaching = nir_flt(&b, dot, nir_imm_float(&b, 0.0f));
+         nir_def *sx = nir_bcsel(&b, approaching, nx_acc, acc_x);
+         nir_def *sy = nir_bcsel(&b, approaching, ny_acc, acc_y);
+         nir_def *sf = nir_ior(&b, acc_f, nir_bcsel(&b, approaching, nir_imm_int(&b, 8), nir_imm_int(&b, 0)));
+         nir_pop_if(&b, NULL);
+         acc_x = nir_if_phi(&b, sx, acc_x);
+         acc_y = nir_if_phi(&b, sy, acc_y);
+         acc_f = nir_if_phi(&b, sf, acc_f);
+      }
+
+      if (extra_use)
+         acc_f = nir_iadd(&b, acc_f, nir_b2i32(&b, ine_escape));
+
+      make_store_global(&b, nir_vec3(&b, acc_x, acc_y, acc_f), out_base, 4);
+      nir_validate_shader(b.shader, "before weaken outer guard");
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after weaken outer guard");
+
+      /* Count nir_op_ine in the entry block (before the coalesced outer if). */
+      nir_block *entry = nir_start_block(b.impl);
+      unsigned ine_in_entry = 0;
+      nir_foreach_instr(instr, entry) {
+         if (instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(instr)->op == nir_op_ine)
+            ine_in_entry++;
+      }
+      if (!extra_use) {
+         /* Both ine exclusions must be sunk inside outer->then_list. */
+         EXPECT_EQ(ine_in_entry, 0u);
+      } else {
+         /* Extra-use ine must stay in entry block; the single-use one sinks. */
+         EXPECT_EQ(ine_in_entry, 1u);
+      }
+
+      struct agx_shader_key key = agx3c_key();
+      key.no_preamble = true;
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_EQ(part.info.scratch_size, 0u);
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(GuardChains, WeakenOuterGuardConjShapesAndNegativeSink)
+{
+   /* Verify all match_conj_with_ine() shapes and negative sinking bounds:
+    * mode 0: bcsel(fge, false, ine)        -- inverted bcsel path -> inot(fge)
+    * mode 1: bcsel(flt, ine, false)        -- non-inverted bcsel path -> flt
+    * mode 2: iand(inot(fge), ine)          -- inot(cmp) as p -> inot(fge)
+    * mode 3: bcsel(inot(flt), false, ine)  -- inot(cmp) + inverted bcsel -> flt
+    * mode 4: iand(flt, inot(ieq))          -- inot(ieq) as q -> flt */
+   for (int mode = 0; mode < 5; ++mode) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "weaken-shapes");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *pos_base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *vel_base = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 8);
+      nir_def *r2 = agx_test_load_preamble(&b, 1, 32, 12);
+
+      nir_def *self_pos = make_load_global(
+         &b, 2, 32,
+         nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 3)), 8,
+         (gl_access_qualifier)0);
+      nir_def *self_vel = make_load_global(
+         &b, 2, 32,
+         nir_iadd(&b, vel_base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 3)), 8,
+         (gl_access_qualifier)0);
+
+      nir_def *acc_x = nir_imm_float(&b, 0.0f);
+      nir_def *acc_y = nir_imm_float(&b, 0.0f);
+      nir_def *acc_f = nir_imm_int(&b, 0);
+
+      /* Shared operand of ine also used inside inner if[0] body: must stay in
+       * entry block rather than sinking into outer->then_list. */
+      nir_def *shared_body = nir_iadd_imm(&b, tid, 77);
+      nir_def *excl_op = NULL;
+
+      for (unsigned k = 0; k < 2; ++k) {
+         nir_def *j = k ? nir_iadd_imm(&b, tid, 32 * k) : tid;
+         nir_def *lhs = k == 0 ? shared_body
+                               : nir_ixor(&b, j, nir_imm_int(&b, 5));
+         if (k == 1)
+            excl_op = lhs;
+         nir_def *q = mode == 4 ? nir_inot(&b, nir_ieq(&b, lhs, wid))
+                                : nir_ine(&b, lhs, wid);
+
+         nir_def *j_pos = make_load_global(
+            &b, 2, 32,
+            nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, j), 3)), 8,
+            (gl_access_qualifier)ACCESS_CAN_SPECULATE);
+         nir_def *dx = nir_fsub(&b, nir_channel(&b, self_pos, 0),
+                                nir_channel(&b, j_pos, 0));
+         nir_def *dy = nir_fsub(&b, nir_channel(&b, self_pos, 1),
+                                nir_channel(&b, j_pos, 1));
+         nir_def *d2 = nir_ffma(&b, dx, dx, nir_fmul(&b, dy, dy));
+
+         nir_def *hit = NULL;
+         switch (mode) {
+         case 0:
+            hit = nir_bcsel(&b, nir_fge(&b, d2, r2), nir_imm_false(&b), q);
+            break;
+         case 1:
+            hit = nir_bcsel(&b, nir_flt(&b, d2, r2), q, nir_imm_false(&b));
+            break;
+         case 2:
+            hit = nir_iand(&b, nir_inot(&b, nir_fge(&b, d2, r2)), q);
+            break;
+         case 3:
+            hit = nir_bcsel(&b, nir_inot(&b, nir_flt(&b, d2, r2)),
+                            nir_imm_false(&b), q);
+            break;
+         case 4:
+            hit = nir_iand(&b, nir_flt(&b, d2, r2), q);
+            break;
+         }
+
+         nir_push_if(&b, hit);
+         nir_def *j_vel = make_load_global(
+            &b, 2, 32,
+            nir_iadd(&b, vel_base, nir_ishl_imm(&b, nir_u2u64(&b, j), 3)), 8,
+            (gl_access_qualifier)0);
+         nir_def *inv = nir_frsq(&b, d2);
+         nir_def *nx = nir_fmul(&b, dx, inv);
+         nir_def *ny = nir_fmul(&b, dy, inv);
+         nir_def *dvx = nir_fsub(&b, nir_channel(&b, self_vel, 0),
+                                 nir_channel(&b, j_vel, 0));
+         nir_def *dvy = nir_fsub(&b, nir_channel(&b, self_vel, 1),
+                                 nir_channel(&b, j_vel, 1));
+         nir_def *dot = nir_ffma(&b, dvx, nx, nir_fmul(&b, dvy, ny));
+         nir_def *imp = nir_fmul(&b, dot, nir_imm_float(&b, -0.312f));
+         nir_def *nx_acc = nir_ffma(&b, imp, nx, acc_x);
+         nir_def *ny_acc = nir_ffma(&b, imp, ny, acc_y);
+         nir_def *sf = k == 0 ? nir_iadd(&b, acc_f, shared_body)
+                              : nir_ior(&b, acc_f, nir_imm_int(&b, 8));
+         nir_pop_if(&b, NULL);
+         acc_x = nir_if_phi(&b, nx_acc, acc_x);
+         acc_y = nir_if_phi(&b, ny_acc, acc_y);
+         acc_f = nir_if_phi(&b, sf, acc_f);
+      }
+
+      make_store_global(&b, nir_vec3(&b, acc_x, acc_y, acc_f), out_base, 4);
+      nir_validate_shader(b.shader, "before weaken shapes");
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after weaken shapes");
+
+      nir_block *entry = nir_start_block(b.impl);
+      unsigned ine_or_ieq_in_entry = 0;
+      unsigned conj_in_entry = 0;
+      nir_foreach_instr(instr, entry) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_op op = nir_instr_as_alu(instr)->op;
+         if (op == nir_op_ine || op == nir_op_ieq)
+            ine_or_ieq_in_entry++;
+         if (op == nir_op_iand || op == nir_op_bcsel)
+            conj_in_entry++;
+      }
+      EXPECT_EQ(ine_or_ieq_in_entry, 0u) << "mode=" << mode;
+      EXPECT_EQ(conj_in_entry, 0u) << "mode=" << mode;
+      /* shared_body is also used inside the inner if body -> must stay in entry. */
+      EXPECT_EQ(nir_def_instr(shared_body)->block, entry) << "mode=" << mode;
+      /* excl_op is used only by ine/ieq -> must sink out of entry. */
+      EXPECT_NE(nir_def_instr(excl_op)->block, entry) << "mode=" << mode;
+
+      /* Verify outer coalesced guard polarity: ior of inot(fge) for modes 0
+       * and 2, and ior of plain flt for modes 1, 3, and 4. */
+      nir_cf_node *next_cf = nir_cf_node_next(&entry->cf_node);
+      ASSERT_NE(next_cf, nullptr) << "mode=" << mode;
+      ASSERT_EQ(next_cf->type, nir_cf_node_if) << "mode=" << mode;
+      nir_if *outer_if = nir_cf_node_as_if(next_cf);
+      nir_instr *cond_instr = nir_def_instr(outer_if->condition.ssa);
+      ASSERT_EQ(cond_instr->type, nir_instr_type_alu) << "mode=" << mode;
+      nir_alu_instr *cond_ior = nir_instr_as_alu(cond_instr);
+      ASSERT_EQ(cond_ior->op, nir_op_ior) << "mode=" << mode;
+      const bool expect_inverted_fge = (mode == 0 || mode == 2);
+      for (unsigned src_i = 0; src_i < 2; ++src_i) {
+         nir_instr *term_i = nir_def_instr(cond_ior->src[src_i].src.ssa);
+         ASSERT_EQ(term_i->type, nir_instr_type_alu)
+            << "mode=" << mode << " src=" << src_i;
+         nir_alu_instr *term = nir_instr_as_alu(term_i);
+         if (expect_inverted_fge) {
+            ASSERT_EQ(term->op, nir_op_inot)
+               << "mode=" << mode << " src=" << src_i;
+            nir_instr *inner_i = nir_def_instr(term->src[0].src.ssa);
+            ASSERT_EQ(inner_i->type, nir_instr_type_alu)
+               << "mode=" << mode << " src=" << src_i;
+            EXPECT_EQ(nir_instr_as_alu(inner_i)->op, nir_op_fge)
+               << "mode=" << mode << " src=" << src_i;
+         } else {
+            EXPECT_EQ(term->op, nir_op_flt)
+               << "mode=" << mode << " src=" << src_i;
+         }
+      }
+
+      struct agx_shader_key key = agx3c_key();
+      key.no_preamble = true;
+      agx_preprocess_nir(b.shader);
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part))
+         << "mode=" << mode;
+      EXPECT_EQ(part.info.scratch_size, 0u) << "mode=" << mode;
+      free(part.binary);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative sinking check: an operand of ine also consumed by a loop-header
+    * phi back-edge must stay in the loop header (prev_block), not sink into
+    * outer->then_list. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "weaken-loop-phi-neg-sink");
+      b.shader->info.workgroup_size[0] = 32;
+      b.shader->info.workgroup_size[1] = 1;
+      b.shader->info.workgroup_size[2] = 1;
+
+      nir_def *tid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wid = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *pos_base = agx_test_load_preamble(&b, 1, 64, 0);
+      nir_def *vel_base = agx_test_load_preamble(&b, 1, 64, 4);
+      nir_def *out_base = agx_test_load_preamble(&b, 1, 64, 8);
+      nir_def *r2 = agx_test_load_preamble(&b, 1, 32, 12);
+
+      nir_def *self_pos = make_load_global(
+         &b, 2, 32,
+         nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 3)), 8,
+         (gl_access_qualifier)0);
+      nir_def *init_idx = tid;
+      nir_block *preheader = nir_cursor_current_block(b.cursor);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_block *header = nir_loop_first_block(loop);
+      nir_phi_instr *idx_phi = nir_phi_instr_create(b.shader);
+      nir_def_init(&idx_phi->instr, &idx_phi->def, 1, 32);
+      nir_phi_instr_add_src(idx_phi, preheader, init_idx);
+
+      b.cursor = nir_after_block(header);
+      nir_def *next_idx = nir_iadd_imm(&b, &idx_phi->def, 1);
+      nir_def *acc = nir_imm_float(&b, 0.0f);
+      nir_def *excl_loop_op = NULL;
+
+      for (unsigned k = 0; k < 2; ++k) {
+         /* Keep load addresses and break on idx_phi so next_idx's only uses
+          * are k=0's ine and the loop-header phi back-edge. */
+         nir_def *load_idx =
+            k == 0 ? &idx_phi->def : nir_iadd_imm(&b, &idx_phi->def, 32);
+         nir_def *lhs =
+            k == 0 ? next_idx : nir_ixor(&b, &idx_phi->def, nir_imm_int(&b, 5));
+         if (k == 1)
+            excl_loop_op = lhs;
+         nir_def *ne = nir_ine(&b, lhs, wid);
+         nir_def *j_pos = make_load_global(
+            &b, 2, 32,
+            nir_iadd(&b, pos_base, nir_ishl_imm(&b, nir_u2u64(&b, load_idx), 3)),
+            8, (gl_access_qualifier)ACCESS_CAN_SPECULATE);
+         nir_def *dx = nir_fsub(&b, nir_channel(&b, self_pos, 0),
+                                nir_channel(&b, j_pos, 0));
+         nir_def *dy = nir_fsub(&b, nir_channel(&b, self_pos, 1),
+                                nir_channel(&b, j_pos, 1));
+         nir_def *d2 = nir_ffma(&b, dx, dx, nir_fmul(&b, dy, dy));
+         nir_def *hit = nir_iand(&b, nir_flt(&b, d2, r2), ne);
+
+         nir_push_if(&b, hit);
+         nir_def *j_vel = make_load_global(
+            &b, 2, 32,
+            nir_iadd(&b, vel_base, nir_ishl_imm(&b, nir_u2u64(&b, wid), 3)), 8,
+            (gl_access_qualifier)0);
+         nir_def *inv = nir_frsq(&b, d2);
+         nir_def *add = nir_ffma(&b, inv, nir_channel(&b, j_vel, 0), acc);
+         nir_def *add2 = nir_ffma(&b, inv, nir_channel(&b, j_vel, 1), add);
+         nir_pop_if(&b, NULL);
+         acc = nir_if_phi(&b, add2, acc);
+      }
+
+      make_store_global(&b, acc, out_base, 4);
+      nir_push_if(&b, nir_ige(&b, &idx_phi->def, nir_imm_int(&b, 4)));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+      nir_block *latch = nir_cursor_current_block(b.cursor);
+      nir_phi_instr_add_src(idx_phi, latch, next_idx);
+      nir_instr_insert(nir_before_block(header), &idx_phi->instr);
+      nir_pop_loop(&b, loop);
+
+      /* Confirm next_idx has only two uses: k=0's ine and the back-edge phi. */
+      unsigned next_idx_uses = 0, next_idx_phi_uses = 0, next_idx_ine_uses = 0;
+      nir_foreach_use_including_if(u, next_idx) {
+         next_idx_uses++;
+         ASSERT_FALSE(nir_src_is_if(u));
+         nir_instr *ui = nir_src_use_instr(u);
+         if (ui->type == nir_instr_type_phi)
+            next_idx_phi_uses++;
+         else if (ui->type == nir_instr_type_alu &&
+                  nir_instr_as_alu(ui)->op == nir_op_ine)
+            next_idx_ine_uses++;
+      }
+      ASSERT_EQ(next_idx_uses, 2u);
+      ASSERT_EQ(next_idx_phi_uses, 1u);
+      ASSERT_EQ(next_idx_ine_uses, 1u);
+
+      nir_validate_shader(b.shader, "before weaken loop phi");
+      EXPECT_TRUE(agx_nir_opt_guard_chains(b.shader));
+      nir_validate_shader(b.shader, "after weaken loop phi");
+
+      /* next_idx feeds idx_phi back-edge -> must stay in header, while
+       * excl_loop_op (used only by k=1's ine) sinks out of header. */
+      EXPECT_EQ(nir_def_instr(next_idx)->block, header);
+      EXPECT_NE(nir_def_instr(excl_loop_op)->block, header);
+      unsigned ine_in_header = 0;
+      nir_foreach_instr(instr, header) {
+         if (instr->type == nir_instr_type_alu &&
+             nir_instr_as_alu(instr)->op == nir_op_ine)
+            ine_in_header++;
+      }
+      EXPECT_EQ(ine_in_header, 0u);
+      ralloc_free(b.shader);
+   }
+}
+
 } // namespace

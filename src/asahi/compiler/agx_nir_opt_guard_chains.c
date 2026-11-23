@@ -1104,6 +1104,199 @@ trace_all_false_value(nir_def *def, nir_if *const *ifs,
 /* Wrap adjacent expensive one-sided divergent `if`s (with only phis between
  * them and all conditions defined before the first `if`) in a combined guard
  * `if (c0 | c1 | ... | c_{k-1})`. */
+
+static bool
+is_selective_range_cmp_op(nir_op op)
+{
+   switch (op) {
+   case nir_op_flt:
+   case nir_op_fge:
+   case nir_op_ilt:
+   case nir_op_ige:
+   case nir_op_ult:
+   case nir_op_uge:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+match_single_use_cmp_in_block(nir_def *def, nir_block *block,
+                              nir_alu_instr **out_cmp, bool *out_inverted)
+{
+   if (def->num_components != 1 || def->bit_size != 1 ||
+       !list_is_singular(&def->uses))
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->block != block || instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (is_selective_range_cmp_op(alu->op)) {
+      *out_cmp = alu;
+      *out_inverted = false;
+      return true;
+   }
+   if (alu->op == nir_op_inot) {
+      nir_def *inner = alu->src[0].src.ssa;
+      if (inner->num_components != 1 || inner->bit_size != 1 ||
+          !list_is_singular(&inner->uses))
+         return false;
+      nir_instr *ii = nir_def_instr(inner);
+      if (ii->block != block || ii->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *ialu = nir_instr_as_alu(ii);
+      if (is_selective_range_cmp_op(ialu->op)) {
+         *out_cmp = ialu;
+         *out_inverted = true;
+         return true;
+      }
+   }
+   return false;
+}
+
+static bool
+is_single_use_ine_in_block(nir_def *def, nir_block *block)
+{
+   if (def->num_components != 1 || def->bit_size != 1 ||
+       !list_is_singular(&def->uses))
+      return false;
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->block != block || instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op == nir_op_ine)
+      return true;
+   if (alu->op == nir_op_inot) {
+      nir_def *inner = alu->src[0].src.ssa;
+      if (inner->num_components != 1 || inner->bit_size != 1 ||
+          !list_is_singular(&inner->uses))
+         return false;
+      nir_instr *ii = nir_def_instr(inner);
+      return ii->block == block && ii->type == nir_instr_type_alu &&
+             nir_instr_as_alu(ii)->op == nir_op_ieq;
+   }
+   return false;
+}
+
+struct weakened_conj {
+   nir_alu_instr *conj;
+   nir_alu_instr *cmp;
+   bool cmp_inverted;
+   nir_def *q_def;
+};
+
+static bool
+match_conj_with_ine(nir_def *cond, nir_block *block, struct weakened_conj *out)
+{
+   if (cond->num_components != 1 || cond->bit_size != 1 ||
+       !list_is_singular(&cond->uses))
+      return false;
+   nir_instr *instr = nir_def_instr(cond);
+   if (instr->block != block || instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+   if (alu->op == nir_op_iand) {
+      for (unsigned s = 0; s < 2; ++s) {
+         nir_def *p = alu->src[s].src.ssa;
+         nir_def *q = alu->src[1 - s].src.ssa;
+         nir_alu_instr *cmp = NULL;
+         bool inv = false;
+         if (is_single_use_ine_in_block(q, block) &&
+             match_single_use_cmp_in_block(p, block, &cmp, &inv)) {
+            *out = (struct weakened_conj){
+               .conj = alu, .cmp = cmp, .cmp_inverted = inv, .q_def = q,
+            };
+            return true;
+         }
+      }
+   } else if (alu->op == nir_op_bcsel) {
+      /* bcsel(cmp, false, q) == (!cmp && q) */
+      if (nir_src_is_const(alu->src[1].src) &&
+          !nir_src_as_bool(alu->src[1].src)) {
+         nir_def *p = alu->src[0].src.ssa;
+         nir_def *q = alu->src[2].src.ssa;
+         nir_alu_instr *cmp = NULL;
+         bool inv = false;
+         if (is_single_use_ine_in_block(q, block) &&
+             match_single_use_cmp_in_block(p, block, &cmp, &inv)) {
+            *out = (struct weakened_conj){
+               .conj = alu, .cmp = cmp, .cmp_inverted = !inv, .q_def = q,
+            };
+            return true;
+         }
+      }
+      /* bcsel(p, q, false) == (p && q) */
+      if (nir_src_is_const(alu->src[2].src) &&
+          !nir_src_as_bool(alu->src[2].src)) {
+         nir_def *p = alu->src[0].src.ssa;
+         nir_def *q = alu->src[1].src.ssa;
+         nir_alu_instr *cmp = NULL;
+         bool inv = false;
+         if (is_single_use_ine_in_block(q, block) &&
+             match_single_use_cmp_in_block(p, block, &cmp, &inv)) {
+            *out = (struct weakened_conj){
+               .conj = alu, .cmp = cmp, .cmp_inverted = inv, .q_def = q,
+            };
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+is_pure_sinkable_alu(const nir_instr *instr)
+{
+   if (instr->type == nir_instr_type_load_const)
+      return true;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   switch (nir_instr_as_alu(instr)->op) {
+   case nir_op_idiv:
+   case nir_op_udiv:
+   case nir_op_imod:
+   case nir_op_umod:
+   case nir_op_irem:
+      return false;
+   default:
+      return true;
+   }
+}
+
+static void
+collect_sinkable_chain(nir_instr *instr, nir_block *prev_block,
+                       struct set *sink_set, unsigned depth)
+{
+   if (depth == 0 || instr->block != prev_block ||
+       _mesa_set_search(sink_set, instr) || !is_pure_sinkable_alu(instr))
+      return;
+   nir_def *def = nir_instr_def(instr);
+   if (!def)
+      return;
+   /* Only sink if every use is already in sink_set (or instr is a root). */
+   _mesa_set_add(sink_set, instr);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i) {
+         nir_def *s = alu->src[i].src.ssa;
+         nir_instr *si = nir_def_instr(s);
+         if (si->block != prev_block || !is_pure_sinkable_alu(si))
+            continue;
+         bool all_in_sink = true;
+         nir_foreach_use_including_if(u, s) {
+            if (nir_src_is_if(u) || !_mesa_set_search(sink_set, nir_src_use_instr(u))) {
+               all_in_sink = false;
+               break;
+            }
+         }
+         if (all_in_sink)
+            collect_sinkable_chain(si, prev_block, sink_set, depth - 1);
+      }
+   }
+}
+
 static bool
 coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
 {
@@ -1240,11 +1433,39 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
          continue;
       }
 
-      /* Build combined condition `c0 | c1 | ... | c_{k-1}` at end of prev_block. */
+      /* If a condition is a conjunction `range_cmp && (a != b)` used only by
+       * ifs[m], weaken the outer guard to `range_cmp` (exact because
+       * `(p && q) => p`) and sink `a != b`, its exclusive pure ALU chain, and
+       * the conjunction into `outer->then_list`, reusing the dominating
+       * compare SSA def directly. */
+      struct weakened_conj weak[MAX_GROUP_IFS] = {};
+      bool has_weak[MAX_GROUP_IFS] = {};
+      bool any_weak = false;
+      for (unsigned m = 0; m < k; ++m) {
+         if (match_conj_with_ine(ifs[m]->condition.ssa, prev_block, &weak[m])) {
+            has_weak[m] = true;
+            any_weak = true;
+         }
+      }
+
+      /* Build combined condition at end of prev_block. Putting each new compare
+       * on the LHS of nir_ior lets agx_nir_fuse_selects fold `ior(cmp, acc)`
+       * into `bcsel(cmp, true, acc)` -> single `fcmpsel`/`icmpsel`. */
       b->cursor = nir_after_block(prev_block);
-      nir_def *any = ifs[0]->condition.ssa;
+      nir_def *outer_terms[MAX_GROUP_IFS];
+      for (unsigned m = 0; m < k; ++m) {
+         if (has_weak[m]) {
+            outer_terms[m] = weak[m].cmp_inverted
+               ? nir_inot(b, &weak[m].cmp->def)
+               : &weak[m].cmp->def;
+         } else {
+            outer_terms[m] = ifs[m]->condition.ssa;
+         }
+      }
+      nir_def *any = outer_terms[0];
       for (unsigned m = 1; m < k; ++m)
-         any = nir_ior(b, any, ifs[m]->condition.ssa);
+         any = any_weak ? nir_ior(b, outer_terms[m], any)
+                        : nir_ior(b, any, outer_terms[m]);
 
       /* Insert outer `if (any)` right before `ifs[0]`, then extract
        * `[ifs[0] .. mids[k-1] phis]` and move it into `outer->then_list`. */
@@ -1256,6 +1477,27 @@ coalesce_adjacent_ifs_in_list(nir_builder *b, struct exec_list *list)
       nir_cf_extract(&chain, nir_before_cf_node(&ifs[0]->cf_node),
                      nir_after_phis(mids[k - 1]));
       nir_cf_reinsert(&chain, nir_before_cf_list(&outer->then_list));
+
+      if (any_weak) {
+         nir_block *then_first = nir_if_first_then_block(outer);
+         struct set *sink_set = _mesa_pointer_set_create(NULL);
+         for (unsigned m = 0; m < k; ++m) {
+            if (!has_weak[m])
+               continue;
+            _mesa_set_add(sink_set, &weak[m].conj->instr);
+            collect_sinkable_chain(nir_def_instr(weak[m].q_def), prev_block,
+                                   sink_set, 8);
+         }
+
+         /* Move sink_set instructions from prev_block to end of then_first in
+          * original topological order so all SSA defs dominate their uses. */
+         nir_foreach_instr_safe(instr, prev_block) {
+            if (!_mesa_set_search(sink_set, instr))
+               continue;
+            nir_instr_move(nir_after_block(then_first), instr);
+         }
+         _mesa_set_destroy(sink_set, NULL);
+      }
 
       nir_block *outer_then_last = nir_if_last_then_block(outer);
       nir_block *outer_else = nir_if_first_else_block(outer);
