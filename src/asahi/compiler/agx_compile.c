@@ -2132,11 +2132,30 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
               nir_src_bit_size(instr->src[0]) == 8 &&
               nir_src_num_components(instr->src[0]) > 1) {
       /* Preserve one W8 vector transaction while packing its register payload
-       * two bytes per 16-bit lane. */
+       * two bytes per 16-bit lane. agx_pack_integer_8_agx3 masks low lanes to
+       * 0xff and shifts high lanes by 8 (and a trailing odd lane is truncated
+       * to 8 bits by device_store), so bypass a redundant u2u8 0xff mask. */
       const unsigned nr = nir_src_num_components(instr->src[0]);
+      const bool bypass_u2u8 = !b->shader->key->dev.emit_agx3d;
       agx_index channels[4] = {agx_null()};
-      for (unsigned i = 0; i < nr; ++i)
+      for (unsigned i = 0; i < nr; ++i) {
+         nir_scalar sc_val = nir_scalar_resolved(instr->src[0].ssa, i);
+         if (bypass_u2u8 && nir_scalar_is_alu(sc_val) &&
+             nir_scalar_alu_op(sc_val) == nir_op_u2u8) {
+            nir_scalar wide = nir_scalar_chase_alu_src(sc_val, 0);
+            if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+                wide.def->num_components == 1 && wide.def->bit_size == 16) {
+               channels[i] = agx_def_index(wide.def);
+               continue;
+            } else if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+                       wide.def->num_components == 1 && wide.def->bit_size == 32) {
+               channels[i] = agx_temp(b->shader, AGX_SIZE_16);
+               agx_subdivide_to(b, channels[i], agx_def_index(wide.def), 0);
+               continue;
+            }
+         }
          channels[i] = agx_extract_nir_src(b, instr->src[0], i);
+      }
 
       agx_index packed[2] = {agx_null()};
       const unsigned nr_packed =
@@ -2156,9 +2175,11 @@ agx_emit_store(agx_builder *b, nir_intrinsic_instr *instr)
       if (nir_scalar_is_alu(sc_val) &&
           nir_scalar_alu_op(sc_val) == nir_op_u2u8) {
          nir_scalar wide = nir_scalar_chase_alu_src(sc_val, 0);
-         if (wide.def->num_components == 1 && wide.def->bit_size == 16) {
+         if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+             wide.def->num_components == 1 && wide.def->bit_size == 16) {
             value = agx_def_index(wide.def);
-         } else if (wide.def->num_components == 1 && wide.def->bit_size == 32) {
+         } else if (!nir_scalar_is_const(wide) && !nir_scalar_is_undef(wide) &&
+                    wide.def->num_components == 1 && wide.def->bit_size == 32) {
             value = agx_temp(b->shader, AGX_SIZE_16);
             agx_subdivide_to(b, value, agx_def_index(wide.def), 0);
          } else {
@@ -13038,6 +13059,280 @@ agx_nir_fragment_output_temporaries(nir_shader *nir)
  * agx_emit_load() then extracts the lanes from the byte-packed word that a
  * 3- or 4-lane W8 load returns on AGX3B.
  */
+
+struct w8_sum_load_entry {
+   nir_intrinsic_instr *load;
+   unsigned seen_mask;
+   nir_def *u2u32_defs[4];
+   unsigned nr_defs;
+};
+
+static bool
+is_packable_w8_sum_load(nir_intrinsic_instr *load, nir_block *block)
+{
+   if ((load->intrinsic != nir_intrinsic_load_agx &&
+        load->intrinsic != nir_intrinsic_load_constant_agx) ||
+       load->instr.block != block || load->def.bit_size != 8 ||
+       (load->def.num_components != 3 && load->def.num_components != 4) ||
+       nir_intrinsic_format(load) != PIPE_FORMAT_R8_UINT ||
+       (nir_intrinsic_base(load) & (AGX_NIR_MEMORY_PACKED_COUNT_MASK |
+                                    AGX_NIR_MEMORY_UNPACK_W8_WORD)) ||
+       (nir_intrinsic_access(load) & (ACCESS_VOLATILE | ACCESS_COHERENT)))
+      return false;
+
+   const unsigned nr = load->def.num_components;
+   unsigned seen = 0;
+   nir_foreach_use_including_if(use, &load->def) {
+      if (nir_src_is_if(use))
+         return false;
+      nir_instr *parent = nir_src_use_instr(use);
+      if (parent->block != block || parent->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (alu->op != nir_op_u2u32 || alu->def.bit_size != 32 ||
+          alu->def.num_components != 1)
+         return false;
+      unsigned comp = alu->src[0].swizzle[0];
+      if (comp >= nr || (seen & BITFIELD_BIT(comp)))
+         return false;
+      seen |= BITFIELD_BIT(comp);
+      if (!list_is_singular(&alu->def.uses))
+         return false;
+      nir_src *add_use = list_first_entry(&alu->def.uses, nir_src, use_link);
+      if (nir_src_is_if(add_use))
+         return false;
+      nir_instr *add_instr = nir_src_use_instr(add_use);
+      if (add_instr->block != block || add_instr->type != nir_instr_type_alu)
+         return false;
+      nir_alu_instr *add = nir_instr_as_alu(add_instr);
+      if (add->op != nir_op_iadd || add->def.bit_size != 32 ||
+          add->def.num_components != 1)
+         return false;
+   }
+   return seen == BITFIELD_MASK(nr);
+}
+
+static bool
+is_single_use_block_iadd32(nir_def *def, nir_block *block)
+{
+   if (def->bit_size != 32 || def->num_components != 1 ||
+       nir_def_instr(def)->block != block ||
+       nir_def_instr(def)->type != nir_instr_type_alu ||
+       !list_is_singular(&def->uses))
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(def));
+   return alu->op == nir_op_iadd;
+}
+
+static int
+w8_sum_load_cmp(const void *pa, const void *pb)
+{
+   const nir_intrinsic_instr *a = *(const nir_intrinsic_instr *const *)pa;
+   const nir_intrinsic_instr *b = *(const nir_intrinsic_instr *const *)pb;
+   return (a->instr.index > b->instr.index) - (a->instr.index < b->instr.index);
+}
+
+/* Fold horizontal sums of unsigned bytes loaded from 3- or 4-byte packed
+ * AGX3 I8 memory transactions using bit-exact 16-bit-lane SWAR:
+ *   even = w & 0x00ff00ff             ([b0, b2] in two 16-bit lanes)
+ *   odd  = (w >> 8) & 0x00ff00ff      ([b1, b3] for nr=4; & 0xff for nr=3)
+ * Up to 32 words (max 32 * 510 = 16320 <= 65535 per 16-bit lane) accumulate
+ * in one packed 32-bit sum without carry between halves, then reduce once
+ * with (s & 0xffff) + (s >> 16). Preserves exact mod-2^32 semantics for all
+ * inputs and lets consecutive loads issue before unpacking. */
+bool
+agx_nir_fold_w8_byte_sum(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      if (impl->function->is_preamble) {
+         nir_no_progress(impl);
+         continue;
+      }
+
+      nir_index_instrs(impl);
+      bool impl_progress = false;
+
+      nir_foreach_block(block, impl) {
+         nir_loop *outer_loop = NULL;
+         for (nir_cf_node *p = block->cf_node.parent; p; p = p->parent) {
+            if (p->type == nir_cf_node_loop)
+               outer_loop = nir_cf_node_as_loop(p);
+         }
+         nir_def *hoisted_mask = NULL;
+
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *root = nir_instr_as_alu(instr);
+            if (root->op != nir_op_iadd || root->def.bit_size != 32 ||
+                root->def.num_components != 1)
+               continue;
+
+            /* Only start from maximal iadd trees within this block. */
+            if (list_is_singular(&root->def.uses)) {
+               nir_src *u = list_first_entry(&root->def.uses, nir_src, use_link);
+               if (!nir_src_is_if(u)) {
+                  nir_instr *ui = nir_src_use_instr(u);
+                  if (ui->block == block && ui->type == nir_instr_type_alu) {
+                     nir_alu_instr *ua = nir_instr_as_alu(ui);
+                     if (ua->op == nir_op_iadd && ua->def.bit_size == 32 &&
+                         ua->def.num_components == 1)
+                        continue;
+                  }
+               }
+            }
+
+            nir_def *stack[128];
+            unsigned sp = 0;
+            stack[sp++] = root->src[0].src.ssa;
+            stack[sp++] = root->src[1].src.ssa;
+
+            nir_def *extras[128];
+            unsigned nr_extras = 0;
+            struct w8_sum_load_entry entries[32];
+            unsigned nr_entries = 0;
+            bool overflow = false;
+
+            while (sp > 0) {
+               nir_def *d = stack[--sp];
+               if (is_single_use_block_iadd32(d, block)) {
+                  nir_alu_instr *a = nir_instr_as_alu(nir_def_instr(d));
+                  if (sp + 2 > ARRAY_SIZE(stack)) {
+                     overflow = true;
+                     break;
+                  }
+                  stack[sp++] = a->src[0].src.ssa;
+                  stack[sp++] = a->src[1].src.ssa;
+                  continue;
+               }
+               if (nir_def_instr(d)->block == block &&
+                   nir_def_instr(d)->type == nir_instr_type_alu) {
+                  nir_alu_instr *a = nir_instr_as_alu(nir_def_instr(d));
+                  if (a->op == nir_op_u2u32 && a->def.bit_size == 32 &&
+                      a->def.num_components == 1 &&
+                      nir_def_instr(a->src[0].src.ssa)->type ==
+                         nir_instr_type_intrinsic) {
+                     nir_intrinsic_instr *ld =
+                        nir_instr_as_intrinsic(nir_def_instr(a->src[0].src.ssa));
+                     if (is_packable_w8_sum_load(ld, block)) {
+                        unsigned idx = 0;
+                        for (; idx < nr_entries; ++idx) {
+                           if (entries[idx].load == ld)
+                              break;
+                        }
+                        if (idx == nr_entries) {
+                           if (nr_entries >= ARRAY_SIZE(entries)) {
+                              overflow = true;
+                              break;
+                           }
+                           entries[nr_entries++] = (struct w8_sum_load_entry){
+                              .load = ld,
+                           };
+                        }
+                        unsigned comp = a->src[0].swizzle[0];
+                        entries[idx].seen_mask |= BITFIELD_BIT(comp);
+                        if (entries[idx].nr_defs < 4)
+                           entries[idx].u2u32_defs[entries[idx].nr_defs++] = d;
+                        continue;
+                     }
+                  }
+               }
+               if (nr_extras >= ARRAY_SIZE(extras)) {
+                  overflow = true;
+                  break;
+               }
+               extras[nr_extras++] = d;
+            }
+            if (overflow || nr_entries == 0)
+               continue;
+
+            nir_intrinsic_instr *complete[32];
+            unsigned nr_complete = 0;
+            bool has_vec4 = false;
+            for (unsigned i = 0; i < nr_entries; ++i) {
+               unsigned nr = entries[i].load->def.num_components;
+               if (entries[i].seen_mask == BITFIELD_MASK(nr)) {
+                  complete[nr_complete++] = entries[i].load;
+                  if (nr == 4)
+                     has_vec4 = true;
+               } else {
+                  for (unsigned j = 0; j < entries[i].nr_defs; ++j) {
+                     if (nr_extras >= ARRAY_SIZE(extras)) {
+                        overflow = true;
+                        break;
+                     }
+                     extras[nr_extras++] = entries[i].u2u32_defs[j];
+                  }
+               }
+            }
+            if (overflow || (!has_vec4 && nr_complete < 2))
+               continue;
+
+            qsort(complete, nr_complete, sizeof(complete[0]), w8_sum_load_cmp);
+
+            if (!hoisted_mask) {
+               nir_builder bm = outer_loop
+                  ? nir_builder_at(nir_before_cf_node(&outer_loop->cf_node))
+                  : nir_builder_at(nir_before_instr(&root->instr));
+               hoisted_mask = nir_imm_int(&bm, 0x00ff00ff);
+            }
+
+            nir_builder b = nir_builder_at(nir_before_instr(&root->instr));
+            nir_def *packed_sum = NULL;
+            for (unsigned i = 0; i < nr_complete; ++i) {
+               nir_intrinsic_instr *orig = complete[i];
+               const unsigned nr = orig->def.num_components;
+               nir_builder bl = nir_builder_at(nir_before_instr(&orig->instr));
+               nir_intrinsic_instr *pl =
+                  nir_intrinsic_instr_create(nir, orig->intrinsic);
+               pl->num_components = 1;
+               pl->src[0] = nir_src_for_ssa(orig->src[0].ssa);
+               pl->src[1] = nir_src_for_ssa(orig->src[1].ssa);
+               nir_intrinsic_set_base(
+                  pl, nir_intrinsic_base(orig) |
+                         (nr << AGX_NIR_MEMORY_PACKED_COUNT_SHIFT));
+               nir_intrinsic_set_format(pl, nir_intrinsic_format(orig));
+               nir_intrinsic_set_sign_extend(pl, nir_intrinsic_sign_extend(orig));
+               nir_intrinsic_set_access(pl, nir_intrinsic_access(orig));
+               nir_def_init(&pl->instr, &pl->def, 1, 32);
+               nir_builder_instr_insert(&bl, &pl->instr);
+
+               nir_def *w = &pl->def;
+               nir_def *even = nir_iand(&b, w, hoisted_mask);
+               nir_def *shifted = nir_ushr_imm(&b, w, 8);
+               nir_def *odd = (nr == 4)
+                  ? nir_iand(&b, shifted, hoisted_mask)
+                  : nir_iand_imm(&b, shifted, 0xff);
+               nir_def *pair = nir_iadd(&b, even, odd);
+               packed_sum = packed_sum ? nir_iadd(&b, packed_sum, pair) : pair;
+            }
+
+            nir_def *lo = nir_iand_imm(&b, packed_sum, 0xffff);
+            nir_def *hi = nir_ushr_imm(&b, packed_sum, 16);
+
+            nir_def *total = NULL;
+            for (unsigned i = 0; i < nr_extras; ++i)
+               total = total ? nir_iadd(&b, total, extras[i]) : extras[i];
+            total = total ? nir_iadd(&b, total, lo) : lo;
+            total = nir_iadd(&b, total, hi);
+
+            nir_def_replace(&root->def, total);
+            impl_progress = true;
+            progress = true;
+         }
+      }
+
+      if (impl_progress)
+         nir_progress(true, impl, nir_metadata_control_flow);
+      else
+         nir_no_progress(impl);
+   }
+
+   return progress;
+}
+
 static bool
 fold_w8_word_unpack(nir_builder *b, nir_intrinsic_instr *load,
                     UNUSED void *data)
@@ -16757,6 +17052,17 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
        * word to fold to. AGX3C (M5, and G18 through it) widens bytes to
        * 32-bit lanes with its own unpack in agx_emit_load(), so this AGX3B
        * extraction is not its form. */
+      if ((key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+          !key->dev.emit_agx3d) {
+         bool swar = false;
+         NIR_PASS(swar, nir, agx_nir_fold_w8_byte_sum);
+         if (swar) {
+            NIR_PASS(_, nir, nir_opt_dce);
+            nir_divergence_analysis(nir);
+         }
+      }
+
       if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, fold_w8_word_unpack,
                   nir_metadata_control_flow, NULL);

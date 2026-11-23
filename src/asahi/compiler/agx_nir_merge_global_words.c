@@ -335,12 +335,200 @@ merge_block(nir_block *block, struct util_dynarray *reads)
    return progress;
 }
 
+struct word_store {
+   nir_intrinsic_instr *store;
+   nir_def *base;
+   nir_scalar offset_scalar;
+   struct lin offset;
+   unsigned elem_bits;
+   unsigned order;
+};
+
+static int
+store_cmp(const void *pa, const void *pb)
+{
+   const struct word_store *a = pa, *b = pb;
+#define CMP(u, v)                                                             \
+   if ((u) != (v))                                                            \
+      return (u) < (v) ? -1 : 1
+   CMP(a->elem_bits, b->elem_bits);
+   CMP(a->base->index, b->base->index);
+   CMP(nir_intrinsic_access(a->store), nir_intrinsic_access(b->store));
+   int t = lin_cmp_terms(&a->offset, &b->offset);
+   if (t)
+      return t;
+   CMP((int32_t)a->offset.constant, (int32_t)b->offset.constant);
+   CMP(a->order, b->order);
+#undef CMP
+   return 0;
+}
+
+static bool
+same_store_record(const struct word_store *a, const struct word_store *b)
+{
+   return a->elem_bits == b->elem_bits &&
+          a->base == b->base &&
+          nir_intrinsic_access(a->store) == nir_intrinsic_access(b->store) &&
+          !lin_cmp_terms(&a->offset, &b->offset);
+}
+
+/* Moving earlier stores in `group[0..count-1]` down to `last` requires that
+ * every instruction strictly between `first` and `last` (other than the stores
+ * being merged) neither terminates/branches nor writes or reads mutable memory. */
+static bool
+stores_can_merge(nir_instr *first, nir_instr *last,
+                 const struct word_store *group, unsigned count)
+{
+   for (nir_instr *instr = nir_instr_next(first); instr != last;
+        instr = nir_instr_next(instr)) {
+      bool in_group = false;
+      for (unsigned j = 0; j < count; j++) {
+         if (&group[j].store->instr == instr) {
+            in_group = true;
+            break;
+         }
+      }
+      if (in_group)
+         continue;
+      if (instr->type == nir_instr_type_call ||
+          instr->type == nir_instr_type_jump ||
+          instr->type == nir_instr_type_tex)
+         return false;
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_terminate:
+      case nir_intrinsic_terminate_if:
+      case nir_intrinsic_demote:
+      case nir_intrinsic_demote_if:
+         return false;
+      default:
+         break;
+      }
+      if (!(nir_intrinsic_infos[intr->intrinsic].flags &
+            NIR_INTRINSIC_CAN_ELIMINATE))
+         return false;
+      if (!nir_intrinsic_can_reorder(intr))
+         return false;
+   }
+   return true;
+}
+
+static bool
+merge_block_stores(nir_block *block, struct util_dynarray *stores)
+{
+   util_dynarray_clear(stores);
+   unsigned order = 0;
+   nir_foreach_instr(instr, block) {
+      order++;
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+      if (in->intrinsic != nir_intrinsic_store_global ||
+          nir_src_num_components(in->src[0]) != 1 ||
+          nir_intrinsic_write_mask(in) != 1)
+         continue;
+      unsigned elem_bits = nir_src_bit_size(in->src[0]);
+      if ((elem_bits != 8 && elem_bits != 16 && elem_bits != 32) ||
+          (nir_intrinsic_access(in) &
+           (ACCESS_VOLATILE | ACCESS_COHERENT | ACCESS_CAN_SPECULATE)) ||
+          nir_intrinsic_align(in) < elem_bits / 8)
+         continue;
+
+      struct word_store s = {.store = in, .elem_bits = elem_bits, .order = order};
+      if (!split_address(in->src[1].ssa, &s.base, &s.offset_scalar))
+         continue;
+      s.offset = (struct lin){.valid = true};
+      lin_parse(&s.offset, s.offset_scalar, 1, 12);
+      if (s.offset.valid && s.offset.n) {
+         lin_normalize(&s.offset);
+         util_dynarray_append(stores, s);
+      }
+   }
+
+   unsigned n = util_dynarray_num_elements(stores, struct word_store);
+   if (n < 2)
+      return false;
+
+   struct word_store *s = stores->data;
+   qsort(s, n, sizeof(*s), store_cmp);
+
+   bool progress = false;
+   for (unsigned i = 0; i < n;) {
+      /* Skip duplicate stores to the same address so WAW order is untouched. */
+      if (i + 1 < n && same_store_record(&s[i], &s[i + 1]) &&
+          s[i + 1].offset.constant == s[i].offset.constant) {
+         uint32_t dup_c = s[i].offset.constant;
+         unsigned end = i + 1;
+         while (end < n && same_store_record(&s[i], &s[end]) &&
+                s[end].offset.constant == dup_c)
+            end++;
+         i = end;
+         continue;
+      }
+
+      const unsigned elem_bytes = s[i].elem_bits / 8;
+      unsigned count = 1;
+      while (i + count < n && count < 4 && same_store_record(&s[i], &s[i + count]) &&
+             s[i + count].offset.constant ==
+                s[i + count - 1].offset.constant + elem_bytes) {
+         /* Do not pull in an offset that has a duplicate later store. */
+         if (i + count + 1 < n && same_store_record(&s[i], &s[i + count + 1]) &&
+             s[i + count + 1].offset.constant == s[i + count].offset.constant)
+            break;
+         count++;
+      }
+
+      unsigned first = i, last = i;
+      while (count >= 2) {
+         first = i;
+         last = i;
+         for (unsigned j = i + 1; j < i + count; j++) {
+            if (s[j].order < s[first].order)
+               first = j;
+            if (s[j].order > s[last].order)
+               last = j;
+         }
+         if (stores_can_merge(&s[first].store->instr, &s[last].store->instr,
+                              &s[i], count))
+            break;
+         count--;
+      }
+
+      if (count < 2) {
+         i++;
+         continue;
+      }
+
+      nir_builder b = nir_builder_at(nir_before_instr(&s[last].store->instr));
+      nir_def *vals[4];
+      for (unsigned j = 0; j < count; j++)
+         vals[j] = s[i + j].store->src[0].ssa;
+      nir_def *vec = nir_vec(&b, vals, count);
+      nir_intrinsic_instr *proto = s[i].store;
+      nir_store_global(&b, vec, proto->src[1].ssa,
+                       .write_mask = nir_component_mask(count),
+                       .align_mul = nir_intrinsic_align_mul(proto),
+                       .align_offset = nir_intrinsic_align_offset(proto),
+                       .access = nir_intrinsic_access(proto));
+      for (unsigned j = 0; j < count; j++)
+         nir_instr_remove(&s[i + j].store->instr);
+
+      progress = true;
+      i += count;
+   }
+   return progress;
+}
+
 bool
 agx_nir_merge_global_words(nir_shader *shader)
 {
    bool any = false;
    struct util_dynarray reads;
+   struct util_dynarray stores;
    util_dynarray_init(&reads, NULL);
+   util_dynarray_init(&stores, NULL);
 
    nir_foreach_function_impl(impl, shader) {
       nir_index_ssa_defs(impl);
@@ -348,9 +536,14 @@ agx_nir_merge_global_words(nir_shader *shader)
       bool progress = false;
       nir_foreach_block(block, impl)
          progress |= merge_block(block, &reads);
+      if (progress)
+         nir_index_ssa_defs(impl);
+      nir_foreach_block(block, impl)
+         progress |= merge_block_stores(block, &stores);
       any |= nir_progress(progress, impl, nir_metadata_control_flow);
    }
 
+   util_dynarray_fini(&stores);
    util_dynarray_fini(&reads);
    return any;
 }
