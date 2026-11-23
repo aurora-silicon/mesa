@@ -3265,3 +3265,95 @@ TEST(AGX3VisionOpts, Agx3bComputeDeviceLoadIlpSchedule)
    /* Negative control 3: AGX2 does not take the AGX3B compute load path. */
    EXPECT_EQ(run_sched(AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, 0), 1u);
 }
+
+static nir_def *
+push_u32(nir_builder *b, unsigned offset)
+{
+   return nir_load_push_constant(b, 1, 32, nir_imm_int(b, offset), .range = 16);
+}
+
+TEST(AGX3VisionOpts, ExactTailConstInitOmitsDeadFallback)
+{
+   auto build_bottom_const_init = [](bool is_unsigned, int32_t init_val) -> nir_shader * {
+      nir_builder b = make_compute_shader("exact_tail_const_init");
+      nir_def *bound = push_u32(&b, 4);
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+
+      nir_variable *iv_var = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, iv_var, nir_imm_int(&b, (uint32_t)init_val), 1);
+      nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *i = nir_load_var(&b, iv_var);
+      nir_def *acc = nir_load_var(&b, acc_var);
+      nir_def *v = nir_load_agx(
+         &b, 1, 32, base, i,
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .format = PIPE_FORMAT_R32_UINT);
+      nir_def *next_acc = nir_iadd(&b, acc, v);
+      nir_def *next_i = nir_iadd_imm(&b, i, 1);
+      nir_store_var(&b, acc_var, next_acc, 1);
+      nir_store_var(&b, iv_var, next_i, 1);
+      nir_def *exit_cond =
+         is_unsigned ? nir_uge(&b, next_i, bound) : nir_ige(&b, next_i, bound);
+      nir_if *ex = nir_push_if(&b, exit_cond);
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, ex);
+      nir_pop_loop(&b, loop);
+
+      nir_store_agx(&b, nir_load_var(&b, acc_var), out, nir_imm_int(&b, 0),
+                    .access = ACCESS_NON_READABLE, .format = PIPE_FORMAT_R32_UINT);
+      nir_lower_vars_to_ssa(b.shader);
+      nir_opt_copy_prop(b.shader);
+      nir_opt_dce(b.shader);
+      return b.shader;
+   };
+
+   /* Positive control: constant non-extreme init (0) with REL_LT omits the dead
+    * wrap fallback loop (leaving only the 8x main loop) and matches reference
+    * execution across trip counts 0 (1 do-while iter) through 17 plus INT32_MIN. */
+   for (bool is_unsigned : {false, true}) {
+      nir_shader *ref = build_bottom_const_init(is_unsigned, 0);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+      nir_validate_shader(opt, "exact_tail const init 0");
+      EXPECT_EQ(count_loops(opt), 1u) << "u=" << is_unsigned;
+
+      const uint32_t bounds[] = {0u, 1u, 2u, 3u, 4u, 7u, 8u, 9u, 15u, 16u, 17u,
+                                 0x80000000u};
+      for (uint32_t bound : bounds) {
+         if (is_unsigned && bound == 0x80000000u)
+            continue;
+         NirExecResult r_ref = exec_loop_nir(ref, 0u, bound, 128);
+         NirExecResult r_opt = exec_loop_nir(opt, 0u, bound, 128);
+         EXPECT_FALSE(r_ref.hit_step_limit);
+         EXPECT_FALSE(r_opt.hit_step_limit);
+         EXPECT_EQ(r_opt.iters, r_ref.iters) << "u=" << is_unsigned << " b=" << bound;
+         EXPECT_EQ(r_opt.out_sum, r_ref.out_sum) << "u=" << is_unsigned << " b=" << bound;
+      }
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+
+   /* Negative control: constant extreme init (INT32_MAX / UINT32_MAX) MUST keep
+    * the wrap fallback loop (2 loops) so iteration 0 wrapping is preserved. */
+   for (bool is_unsigned : {false, true}) {
+      int32_t extreme = is_unsigned ? (int32_t)UINT32_MAX : INT32_MAX;
+      nir_shader *ref = build_bottom_const_init(is_unsigned, extreme);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, NULL));
+      nir_validate_shader(opt, "exact_tail extreme init");
+      EXPECT_EQ(count_loops(opt), 2u) << "u=" << is_unsigned;
+
+      uint32_t wrap_bound = is_unsigned ? 5u : (uint32_t)(INT32_MIN + 5);
+      NirExecResult r_ref = exec_loop_nir(ref, (uint32_t)extreme, wrap_bound, 64);
+      NirExecResult r_opt = exec_loop_nir(opt, (uint32_t)extreme, wrap_bound, 64);
+      EXPECT_EQ(r_opt.iters, 6u);
+      EXPECT_EQ(r_opt.iters, r_ref.iters);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum);
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+}

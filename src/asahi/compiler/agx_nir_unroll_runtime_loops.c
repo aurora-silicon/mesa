@@ -950,7 +950,19 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
        * extreme bound (REL_LE at max / REL_GE at min) or an exact_tail first
        * iteration at max/min can wrap after the 1-chunk; keep the original
        * scalar loop guarded by the loop condition so wrap semantics match. */
-      bool needs_wrap_fallback = exact_tail;
+      bool needs_wrap_fallback = false;
+      if (exact_tail) {
+         /* Iteration 0 runs before testing; wrap on iteration 0 is only
+          * possible if iv0 can equal the extreme in the step direction. */
+         const int64_t step_extreme =
+            cl->step > 0 ? (u ? (int64_t)UINT32_MAX : (int64_t)INT32_MAX)
+                         : (u ? (int64_t)0 : (int64_t)INT32_MIN);
+         nir_scalar iv0_s = nir_scalar_resolved(iv0, 0);
+         needs_wrap_fallback =
+            !nir_scalar_is_const(iv0_s) ||
+            (u ? (int64_t)nir_scalar_as_uint(iv0_s) == step_extreme
+               : nir_scalar_as_int(iv0_s) == step_extreme);
+      }
       if (!needs_wrap_fallback && (cl->rel == REL_LE || cl->rel == REL_GE)) {
          const int64_t extreme =
             cl->rel == REL_LE ? (u ? (int64_t)UINT32_MAX : (int64_t)INT32_MAX)
@@ -1003,6 +1015,23 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
       }
 
       b.cursor = nir_before_cf_node(&loop->cf_node);
+      if (exact_tail) {
+         struct hash_table *again = _mesa_pointer_hash_table_create(NULL);
+         for (unsigned i = 0; i < nouts; ++i) {
+            nir_def *value = outs[i].invariant
+                                ? rematerialize(&b, outs[i].def, loop, again)
+                                : nir_load_reg(&b, outs[i].reg);
+            nir_foreach_use_including_if_safe(src, outs[i].def) {
+               if (!block_in_loop(use_block(src), loop))
+                  nir_src_rewrite(src, value);
+            }
+            for (unsigned j = 0; j < nlater; ++j) {
+               if (later_bounds[j] == outs[i].def)
+                  later_bounds[j] = value;
+            }
+         }
+         _mesa_hash_table_destroy(again, NULL);
+      }
       nir_foreach_instr(instr, nir_loop_first_block(loop)) {
          if (instr->type != nir_instr_type_intrinsic)
             continue;
