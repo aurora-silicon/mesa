@@ -723,11 +723,26 @@ agx_u8_absdiff_uses_match(const nir_alu_instr *instr)
                                       m5_narrow_to_float).render())
     print(nir_algebraic.AlgebraicPass("agx_nir_reassoc_const_offsets",
                                       reassoc_const_offsets).render())
+    # nir_opt_idiv_const lowers signed idiv(a, 2^k) to
+    # imul(imin(imax(a, -1), 1), ushr(iabs(a), k)), which takes 9 AGX ops.
+    # Fold to the exact 3- or 4-op sign-bias shift (bit-exact for all int32_t,
+    # including INT32_MIN).
+    fold_signed_pow2_idiv = []
+    for k in range(1, 31):
+        bias = ('ushr', 'a', 31) if k == 1 else ('ushr', ('ishr', 'a', 31), 32 - k)
+        repl = ('ishr', ('iadd', 'a', bias), k)
+        for sign in (('imin', ('imax', 'a@32', -1), 1),
+                     ('imax', ('imin', 'a@32', 1), -1)):
+            fold_signed_pow2_idiv += [
+                (('imul@32', sign, ('ushr', ('iabs', 'a@32'), k)), repl),
+            ]
+
     print(nir_algebraic.AlgebraicPass("agx_nir_fuse_algebraic_late",
                                       fuse_extr + fuse_ubfe +
                                       fuse_imad + ixor_bcsel +
                                       fold_aligned_bounds + fold_byte_swap +
-                                      fold_selected_f2i32).render())
+                                      fold_selected_f2i32 +
+                                      fold_signed_pow2_idiv).render())
 
 
 if __name__ == '__main__':

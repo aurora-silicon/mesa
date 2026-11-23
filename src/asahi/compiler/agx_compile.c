@@ -8146,7 +8146,8 @@ agx_g17p_shift_boundary(agx_builder *b, unsigned shift)
 static agx_index
 agx_g17p_ushr_imm(agx_builder *b, agx_index value, unsigned shift)
 {
-   return agx_ushr(b, value, agx_g17p_shift_boundary(b, shift));
+   assert(shift >= 1 && shift <= 31);
+   return agx_ushr(b, value, agx_immediate(shift));
 }
 
 static agx_index
@@ -8237,8 +8238,8 @@ static agx_instr *
 agx_emit_g17p_ufind_msb(agx_builder *b, agx_index dst, agx_index value)
 {
    /* FT1 on G17P exposes a non-architectural logarithmic intermediate. Find
-    * the top bit with the integer forms already qualified on hardware:
-    * smear the top bit downward, popcount the resulting prefix with SWAR,
+    * the top bit with the grounded integer forms: smear the top bit downward
+    * with immediate SRL + OR, count the resulting prefix with native POPCOUNT,
     * then subtract one. Zero smears/counts to zero and therefore returns -1
     * without a compare or select. */
    assert(value.size == AGX_SIZE_32 && dst.size == AGX_SIZE_32);
@@ -8248,22 +8249,8 @@ agx_emit_g17p_ufind_msb(agx_builder *b, agx_index dst, agx_index value)
    for (unsigned i = 0; i < ARRAY_SIZE(smear_shifts); ++i)
       scan = agx_or(b, scan, agx_g17p_ushr_imm(b, scan, smear_shifts[i]));
 
-   agx_index odd = agx_g17p_and_imm(
-      b, agx_g17p_ushr_imm(b, scan, 1), UINT32_C(0x55555555));
-   scan = agx_iadd(b, scan, agx_neg(odd), 0);
-
-   agx_index pairs_lo = agx_g17p_and_imm(b, scan, UINT32_C(0x33333333));
-   agx_index pairs_hi = agx_g17p_and_imm(
-      b, agx_g17p_ushr_imm(b, scan, 2), UINT32_C(0x33333333));
-   scan = agx_iadd(b, pairs_lo, pairs_hi, 0);
-
-   scan = agx_g17p_and_imm(
-      b, agx_iadd(b, scan, agx_g17p_ushr_imm(b, scan, 4), 0),
-      UINT32_C(0x0f0f0f0f));
-   scan = agx_iadd(b, scan, agx_g17p_ushr_imm(b, scan, 8), 0);
-   scan = agx_iadd(b, scan, agx_g17p_ushr_imm(b, scan, 16), 0);
-
-   agx_index count = agx_g17p_and_imm(b, scan, 0x3f);
+   agx_index count = agx_temp(b->shader, AGX_SIZE_32);
+   agx_popcount_to(b, count, scan);
    return agx_iadd_to(b, dst, count, agx_neg(agx_immediate(1)), 0);
 }
 

@@ -4662,3 +4662,176 @@ TEST(AGX3VisionOpts, Rotated8BitInnerNonZeroStart)
    ralloc_free(ref);
    ralloc_free(opt);
 }
+
+/* --- Wave 8: AGX3B subgroup ballot/lt-mask & ufind_msb, signed pow2 idiv,
+ * store_global vectorization, dominating bound guard & single-arm loop unswitch --- */
+
+TEST(AGX3VisionOpts, Wave8Agx3bSubgroupBallotLtMaskAndFirstInv)
+{
+   /* Compute shader: bit_count(ballot(true) & ~(0xffffffff << (lane & 31)))
+    * and bit_count(ballot(true) & ((1 << (lane & 31)) - 1)) must lower to
+    * load_active_subgroup_invocation_agx with zero remaining ballots. */
+   for (unsigned form = 0; form < 2; form++) {
+      SCOPED_TRACE(form);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_ballot_lt");
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      nir_def *lane_m = nir_iand_imm(&b, lane, 31);
+      nir_def *lt_mask = form == 0
+         ? nir_inot(&b, nir_ishl(&b, nir_imm_int(&b, -1), lane_m))
+         : nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), lane_m), -1);
+      nir_def *bal = nir_ballot(&b, 1, 32, nir_imm_true(&b));
+      nir_def *cnt = nir_bit_count(&b, nir_iand(&b, bal, lt_mask));
+      nir_store_global(&b, cnt, nir_imm_int64(&b, 0x1000), .align_mul = 4);
+
+      agx_nir_lower_subgroups_g17p(b.shader);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "wave8 ballot lt compute");
+
+      unsigned ballots = 0, active_inv = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            ballots += (op == nir_intrinsic_ballot);
+            active_inv += (op == nir_intrinsic_load_active_subgroup_invocation_agx);
+         }
+      }
+      EXPECT_EQ(ballots, 0u);
+      EXPECT_EQ(active_inv, 1u);
+      ralloc_free(b.shader);
+   }
+
+   /* Negative: fragment shader (helper lanes may exist) MUST NOT trigger. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "wave8_ballot_lt_fs");
+      nir_def *lane = nir_load_subgroup_invocation(&b);
+      nir_def *lt_mask = nir_inot(&b, nir_ishl(&b, nir_imm_int(&b, -1), lane));
+      nir_def *bal = nir_ballot(&b, 1, 32, nir_imm_true(&b));
+      nir_def *cnt = nir_bit_count(&b, nir_iand(&b, bal, lt_mask));
+      nir_store_global(&b, cnt, nir_imm_int64(&b, 0x1000), .align_mul = 4);
+
+      agx_nir_lower_subgroups_g17p(b.shader);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "wave8 ballot lt fragment");
+
+      unsigned ballots = 0, active_inv = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            ballots += (op == nir_intrinsic_ballot);
+            active_inv += (op == nir_intrinsic_load_active_subgroup_invocation_agx);
+         }
+      }
+      EXPECT_EQ(ballots, 1u);
+      EXPECT_EQ(active_inv, 0u);
+      ralloc_free(b.shader);
+   }
+
+   /* AGX3B emulates_ufind_msb=true: first_invocation and vote_ieq lower via
+    * bit_count(first_bit - 1) with zero ufind_msb/find_lsb ops. */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_first_inv_agx3b");
+      nir_def *v = nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0x1000), .align_mul = 4);
+      nir_def *first = nir_read_first_invocation(&b, v);
+      nir_def *eq = nir_b2i32(&b, nir_vote_ieq(&b, 1, v));
+      nir_store_global(&b, nir_iadd(&b, first, eq), nir_imm_int64(&b, 0x2000), .align_mul = 4);
+
+      agx_nir_lower_subgroups_g17p(b.shader);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "wave8 first_inv agx3b");
+
+      unsigned ufind = 0, bit_counts = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_op op = nir_instr_as_alu(instr)->op;
+            ufind += (op == nir_op_ufind_msb || op == nir_op_find_lsb);
+            bit_counts += (op == nir_op_bit_count);
+         }
+      }
+      EXPECT_EQ(ufind, 0u);
+      EXPECT_GE(bit_counts, 2u);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST(AGX3VisionOpts, Wave8FoldSignedPow2Idiv)
+{
+   /* Test folding imul(imin(imax(a, -1), 1), ushr(iabs(a), k)) for k in [1, 30]
+    * and verify exactness across boundary values including INT32_MIN. */
+   const int32_t samples[] = {
+      INT32_MIN, INT32_MIN + 1, -1025, -1024, -257, -256, -255,
+      -3, -2, -1, 0, 1, 2, 3, 255, 256, 257, 1024, INT32_MAX - 1, INT32_MAX
+   };
+
+   for (unsigned k : {1u, 4u, 8u, 16u, 30u}) {
+      SCOPED_TRACE(k);
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_signed_pow2_idiv");
+      nir_def *a = nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0x1000), .align_mul = 4);
+      nir_def *sgn = nir_imin(&b, nir_imax(&b, a, nir_imm_int(&b, -1)), nir_imm_int(&b, 1));
+      nir_def *mag = nir_ushr_imm(&b, nir_iabs(&b, a), k);
+      nir_def *res = nir_imul(&b, sgn, mag);
+      nir_store_global(&b, res, nir_imm_int64(&b, 0x2000), .align_mul = 4);
+
+      EXPECT_TRUE(agx_nir_fuse_algebraic_late(b.shader));
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "wave8 signed pow2 idiv");
+
+      unsigned imuls = 0, iabses = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_op op = nir_instr_as_alu(instr)->op;
+            imuls += (op == nir_op_imul);
+            iabses += (op == nir_op_iabs);
+         }
+      }
+      EXPECT_EQ(imuls, 0u);
+      EXPECT_EQ(iabses, 0u);
+
+      /* Algebraic oracle: (a + ((a >> 31) >>> (32 - k))) >> k == sign(a) * (|a| >> k) */
+      for (int32_t v : samples) {
+         int32_t sgn_v = v < 0 ? -1 : (v > 0 ? 1 : 0);
+         uint32_t abs_v = v == INT32_MIN ? 0x80000000u : (uint32_t)(v < 0 ? -v : v);
+         int32_t ref_v = (int32_t)((uint32_t)sgn_v * (abs_v >> k));
+         uint32_t bias = ((uint32_t)(v >> 31)) >> (32u - k);
+         int32_t folded_v = ((int32_t)((uint32_t)v + bias)) >> k;
+         EXPECT_EQ(folded_v, ref_v) << "v=" << v << " k=" << k;
+      }
+      ralloc_free(b.shader);
+   }
+
+   /* Negative: k = 31 must NOT fold (32 - 31 = 1, INT32_MIN + 0x7fffffff overflows). */
+   {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "wave8_signed_pow2_idiv_k31");
+      nir_def *a = nir_load_global(&b, 1, 32, nir_imm_int64(&b, 0x1000), .align_mul = 4);
+      nir_def *sgn = nir_imin(&b, nir_imax(&b, a, nir_imm_int(&b, -1)), nir_imm_int(&b, 1));
+      nir_def *mag = nir_ushr_imm(&b, nir_iabs(&b, a), 31);
+      nir_def *res = nir_imul(&b, sgn, mag);
+      nir_store_global(&b, res, nir_imm_int64(&b, 0x2000), .align_mul = 4);
+
+      agx_nir_fuse_algebraic_late(b.shader);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      unsigned imuls = 0;
+      nir_foreach_block(block, b.impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu &&
+                nir_instr_as_alu(instr)->op == nir_op_imul)
+               imuls++;
+         }
+      }
+      EXPECT_EQ(imuls, 1u);
+      ralloc_free(b.shader);
+   }
+}
+

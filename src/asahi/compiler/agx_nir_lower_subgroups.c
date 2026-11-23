@@ -24,7 +24,140 @@ struct agx_subgroup_lower_options {
    bool g17p_clustered_float;
    bool native_shuffle_xor;
    bool m5_float_minmax;
+   bool emulates_ufind_msb;
 };
+
+static bool
+is_ballot_true_def(nir_def *def)
+{
+   nir_scalar s = nir_scalar_resolved(def, 0);
+   if (nir_def_instr(s.def)->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *ballot = nir_instr_as_intrinsic(nir_def_instr(s.def));
+   if (ballot->intrinsic != nir_intrinsic_ballot ||
+       !nir_src_is_const(ballot->src[0]) || !nir_src_as_bool(ballot->src[0]))
+      return false;
+
+   for (unsigned i = 1; i < def->num_components; ++i) {
+      nir_scalar c = nir_scalar_resolved(def, i);
+      if (c.def == s.def)
+         continue;
+      if (!nir_scalar_is_const(c) || nir_scalar_as_uint(c) != 0)
+         return false;
+   }
+   return true;
+}
+
+static bool
+is_subgroup_invocation_mod32(nir_def *def)
+{
+   nir_scalar s = nir_scalar_resolved(def, 0);
+   if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iand) {
+      nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+      nir_scalar b = nir_scalar_chase_alu_src(s, 1);
+      if (nir_scalar_is_const(b) && (nir_scalar_as_uint(b) & 31) == 31)
+         s = a;
+      else if (nir_scalar_is_const(a) && (nir_scalar_as_uint(a) & 31) == 31)
+         s = b;
+   }
+   nir_instr *instr = nir_def_instr(s.def);
+   return instr->type == nir_instr_type_intrinsic &&
+          nir_instr_as_intrinsic(instr)->intrinsic ==
+             nir_intrinsic_load_subgroup_invocation;
+}
+
+static bool
+is_subgroup_lt_mask(nir_def *def)
+{
+   nir_scalar s = nir_scalar_resolved(def, 0);
+   if (!nir_scalar_is_alu(s))
+      return false;
+
+   /* Pattern 1 (nir_lower_subgroups): inot(ishl(-1, lane & 31)) */
+   if (nir_scalar_alu_op(s) == nir_op_inot) {
+      nir_scalar sh = nir_scalar_chase_alu_src(s, 0);
+      if (nir_scalar_is_alu(sh) && nir_scalar_alu_op(sh) == nir_op_ishl) {
+         nir_scalar base = nir_scalar_chase_alu_src(sh, 0);
+         nir_scalar cnt = nir_scalar_chase_alu_src(sh, 1);
+         if (nir_scalar_is_const(base) &&
+             nir_scalar_as_uint(base) == UINT32_MAX &&
+             is_subgroup_invocation_mod32(cnt.def))
+            return true;
+      }
+   }
+
+   /* Pattern 2 (nir_opt_algebraic): iadd(ishl(1, lane & 31), -1) */
+   if (nir_scalar_alu_op(s) == nir_op_iadd) {
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_scalar c = nir_scalar_chase_alu_src(s, i);
+         nir_scalar sh = nir_scalar_chase_alu_src(s, 1 - i);
+         if (nir_scalar_is_const(c) && nir_scalar_as_uint(c) == UINT32_MAX &&
+             nir_scalar_is_alu(sh) && nir_scalar_alu_op(sh) == nir_op_ishl) {
+            nir_scalar base = nir_scalar_chase_alu_src(sh, 0);
+            nir_scalar cnt = nir_scalar_chase_alu_src(sh, 1);
+            if (nir_scalar_is_const(base) && nir_scalar_as_uint(base) == 1 &&
+                is_subgroup_invocation_mod32(cnt.def))
+               return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+static bool
+opt_compute_ballot_lt_mask_count(nir_builder *b, nir_instr *instr,
+                                 UNUSED void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_bit_count || alu->def.bit_size != 32 ||
+       alu->def.num_components != 1)
+      return false;
+
+   nir_scalar s = nir_scalar_chase_alu_src(nir_get_scalar(&alu->def, 0), 0);
+   if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_iand ||
+       s.def->bit_size != 32)
+      return false;
+
+   nir_scalar a = nir_scalar_chase_alu_src(s, 0);
+   nir_scalar b_s = nir_scalar_chase_alu_src(s, 1);
+   bool match = (is_ballot_true_def(a.def) && is_subgroup_lt_mask(b_s.def)) ||
+                (is_ballot_true_def(b_s.def) && is_subgroup_lt_mask(a.def));
+   if (!match)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *active_id =
+      nir_u2u32(b, nir_load_active_subgroup_invocation_agx(b, 16));
+   nir_def_rewrite_uses(&alu->def, active_id);
+   nir_instr_remove(instr);
+   return true;
+}
+
+static bool
+opt_compute_ballot_bit_count(nir_builder *b, nir_intrinsic_instr *intr,
+                             UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_ballot_bit_count_exclusive &&
+       intr->intrinsic != nir_intrinsic_ballot_bit_count_inclusive)
+      return false;
+
+   if (intr->def.bit_size != 32 || !is_ballot_true_def(intr->src[0].ssa))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *active_id =
+      nir_u2u32(b, nir_load_active_subgroup_invocation_agx(b, 16));
+   if (intr->intrinsic == nir_intrinsic_ballot_bit_count_inclusive)
+      active_id = nir_iadd_imm(b, active_id, 1);
+
+   nir_def_rewrite_uses(&intr->def, active_id);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
 
 /* M5 shuffles a 32-bit value across the subgroup by a constant lane XOR in
  * one instruction (simd_shuffle_xor with an immediate), where the general
@@ -74,10 +207,17 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_first_invocation: {
+      const struct agx_subgroup_lower_options *agx_options = data;
       nir_def *active_id = nir_load_active_subgroup_invocation_agx(b, 16);
       nir_def *is_first = nir_ieq_imm(b, active_id, 0);
       nir_def *first_bit = nir_ballot(b, 1, 32, is_first);
-      nir_def_rewrite_uses(&intr->def, nir_ufind_msb(b, first_bit));
+      /* first_bit is guaranteed to be a single bit (1u << k) because the
+       * calling lane is active, so popcount(first_bit - 1) == k in 2 ops
+       * without emulating ufind_msb on AGX3B. */
+      nir_def *lane = agx_options->emulates_ufind_msb
+                         ? nir_bit_count(b, nir_iadd_imm(b, first_bit, -1))
+                         : nir_ufind_msb(b, first_bit);
+      nir_def_rewrite_uses(&intr->def, lane);
       return true;
    }
 
@@ -102,8 +242,17 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
        *
        *    ballot(x != broadcast(x, ffs(ballot(true)))) == 0
        */
-      nir_def *active_mask = nir_ballot(b, 1, 32, nir_imm_true(b));
-      nir_def *active_bit = nir_ufind_msb(b, active_mask);
+      const struct agx_subgroup_lower_options *agx_options = data;
+      nir_def *active_bit;
+      if (agx_options->emulates_ufind_msb) {
+         nir_def *active_id = nir_load_active_subgroup_invocation_agx(b, 16);
+         nir_def *first_bit =
+            nir_ballot(b, 1, 32, nir_ieq_imm(b, active_id, 0));
+         active_bit = nir_bit_count(b, nir_iadd_imm(b, first_bit, -1));
+      } else {
+         nir_def *active_mask = nir_ballot(b, 1, 32, nir_imm_true(b));
+         active_bit = nir_ufind_msb(b, active_mask);
+      }
       nir_def *other = nir_read_invocation(b, intr->src[0].ssa, active_bit);
       nir_def *is_ne;
 
@@ -324,13 +473,15 @@ agx_nir_flush_subgroup_minmax(nir_shader *s)
 static bool
 agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
                                  bool optimize_ballot_count,
-                                 bool native_shuffle_xor, bool m5_float_minmax)
+                                 bool native_shuffle_xor, bool m5_float_minmax,
+                                 bool emulates_ufind_msb)
 {
    const struct agx_subgroup_lower_options agx_options = {
       .optimize_ballot_count = optimize_ballot_count,
       .g17p_clustered_float = g17p_clustered_float,
       .native_shuffle_xor = native_shuffle_xor,
       .m5_float_minmax = m5_float_minmax,
+      .emulates_ufind_msb = emulates_ufind_msb,
    };
 
    /* First, do as much common lowering as we can */
@@ -352,7 +503,23 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
 
    bool progress = agx_nir_flush_subgroup_minmax(s);
 
+   /* In compute shaders (no helper invocations), the exclusive/inclusive bit
+    * count of ballot(true) is the hardware active-lane index (+1 for
+    * inclusive). Lower before nir_lower_subgroups expands it to a ballot +
+    * shift + mask + popcount sequence. */
+   if (mesa_shader_stage_is_compute(s->info.stage)) {
+      progress |= nir_shader_intrinsics_pass(
+         s, opt_compute_ballot_bit_count, nir_metadata_control_flow, NULL);
+   }
+
    progress |= nir_lower_subgroups(s, &opts);
+
+   /* Also catch ballot(true) & lt_mask -> popcount after nir_lower_subgroups
+    * (which also covers shaders that construct gl_SubgroupLtMask manually). */
+   if (mesa_shader_stage_is_compute(s->info.stage)) {
+      progress |= nir_shader_instructions_pass(
+         s, opt_compute_ballot_lt_mask_count, nir_metadata_control_flow, NULL);
+   }
 
    /* Then do AGX-only lowerings on top */
    progress |= nir_shader_intrinsics_pass(s, lower, nir_metadata_control_flow,
@@ -364,13 +531,13 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
 bool
 agx_nir_lower_subgroups(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, false, true, false, false);
+   return agx_nir_lower_subgroups_internal(s, false, true, false, false, false);
 }
 
 bool
 agx_nir_lower_subgroups_g17p(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, true, false, false, false);
+   return agx_nir_lower_subgroups_internal(s, true, false, false, false, true);
 }
 
 bool
@@ -389,7 +556,8 @@ agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor,
 
    return agx_nir_lower_subgroups_internal(
       s, false, s->info.stage != MESA_SHADER_FRAGMENT,
-      native_shuffle_xor && compute, native_float_minmax && compute && !ftz32);
+      native_shuffle_xor && compute, native_float_minmax && compute && !ftz32,
+      false);
 }
 
 static bool
