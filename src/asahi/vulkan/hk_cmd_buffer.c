@@ -1416,6 +1416,12 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
       if (!flush)
          return;
 
+      if (!dst_kinds && !flush->stats.cmds && !flush->stats.flushes &&
+          !flush->timestamp.start.handle && !flush->timestamp.end.handle &&
+          !flush->query_access && !flush->query_reset_pending &&
+          !flush->imm_writes.size)
+         flush->host_flush_only = true;
+
       hk_ensure_cs_has_space(cmd, flush, AGX3_CDM_BARRIER_SIZE);
       hk_cdm_visibility_flush(dev, flush, true);
    }

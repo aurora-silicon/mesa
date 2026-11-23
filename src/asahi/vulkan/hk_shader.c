@@ -657,12 +657,13 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
 
+   /* M5 has no read-only early reject to rule out. */
    if ((agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
        state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !state->ms->alpha_to_coverage_enable &&
-       hk_g17p_static_no_early_reject(state))
+       (agx_chip_g17_m5(chip) || hk_g17p_static_no_early_reject(state)))
       key->static_tests = true;
 
    if (chip == AGX_CHIP_G17P && state->ms != NULL &&
@@ -1570,11 +1571,18 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
       access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
    }
 
-   nir_def *val = nir_load_global(
-      b, intr->def.num_components, intr->def.bit_size,
-      address,
-      .align_mul = nir_intrinsic_align_mul(intr),
-      .align_offset = nir_intrinsic_align_offset(intr), .access = access);
+   nir_def *val =
+      intr->intrinsic == nir_intrinsic_load_global_constant_bounded
+         ? nir_load_global_constant(
+              b, intr->def.num_components, intr->def.bit_size,
+              address,
+              .align_mul = nir_intrinsic_align_mul(intr),
+              .align_offset = nir_intrinsic_align_offset(intr), .access = access)
+         : nir_load_global(
+              b, intr->def.num_components, intr->def.bit_size,
+              address,
+              .align_mul = nir_intrinsic_align_mul(intr),
+              .align_offset = nir_intrinsic_align_offset(intr), .access = access);
 
    nir_def_replace(&intr->def, val);
 }
@@ -1587,7 +1595,9 @@ struct global_load_lowering {
    bool storage_result_select;
 };
 
-/* Keep naturally aligned robust UBO loads together. */
+/* Keep naturally aligned robust UBO loads together. Leave constant-offset
+ * loads for nir_lower_explicit_io + agx3_nir_lower_uniform_dma so root/static
+ * UBO contents can be prefetched directly into uniform registers. */
 static bool
 hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 {
@@ -1619,6 +1629,20 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
       return false;
    }
 
+   /* Preserve constant-offset UBO loads for uniform DMA prefetching. */
+   bool const_offset = nir_scalar_is_const(nir_scalar_resolved(root->parent.ssa, 3));
+   for (unsigned i = 1; const_offset && path.path[i]; ++i) {
+      nir_deref_instr *d = path.path[i];
+      if ((d->deref_type == nir_deref_type_array ||
+           d->deref_type == nir_deref_type_ptr_as_array) &&
+          !nir_src_is_const(d->arr.index))
+         const_offset = false;
+   }
+   if (const_offset) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *addr = root->parent.ssa;
    for (unsigned i = 1; path.path[i]; ++i)
@@ -1630,32 +1654,21 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *dat
    nir_def *off = nir_channel(b, addr, 3);
    nir_def *bound = nir_channel(b, addr, 2);
    /* Factor neighboring fields onto the same checked 64-byte record.
-    * The advertised robustness2 size alignment equals the minimum UBO
-    * base alignment. The zero page includes one whole aligned record. */
-   nir_def *record, *field;
-   struct m5_bounded_offset o = m5_bounded_offset(nir_scalar_resolved(off, 0), 12);
-   if (o.valid && (o.scale & 63u) == 0) {
-      if (o.term.def) {
-         nir_def *t = nir_mov_scalar(b, o.term);
-         nir_def *base_off = util_is_power_of_two_nonzero(o.scale)
-            ? nir_ishl_imm(b, t, util_logbase2(o.scale))
-            : nir_imul_imm(b, t, o.scale);
-         uint32_t rec_const = o.constant & ~63u;
-         record = rec_const ? nir_iadd_imm(b, base_off, rec_const) : base_off;
-      } else {
-         record = nir_imm_int(b, o.constant & ~63u);
-      }
-      field = nir_imm_int(b, o.constant & 63u);
-   } else {
-      record = nir_iand_imm(b, off, ~63u);
-      field = nir_ishl_imm(b, nir_iand_imm(b, nir_ushr_imm(b, off, 2), 15u), 2);
-   }
-   nir_def *real = nir_iadd(b, base, nir_u2u64(b, record));
-   nir_def *safe = nir_bcsel(b, nir_ult(b, record, bound), real,
+    * Both maxUniformBufferRange and AGX_ZERO_PAGE_SIZE are 64 KiB, so
+    * keeping the masked offset outside the pointer select preserves exact
+    * robustness2 semantics while allowing base-plus-index device loads. */
+   STATIC_ASSERT(AGX_ZERO_PAGE_SIZE == 65536);
+   nir_def *record = nir_iand_imm(b, off, ~63u);
+   nir_def *valid = nir_ult(b, record, bound);
+   const unsigned alignment = MIN2(mul, 64u);
+   nir_def *safe = nir_bcsel(b, valid, base,
                              nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
-   nir_def *address = nir_iadd(b, safe, nir_u2u64(b, field));
-   nir_def *value = nir_load_global(b, intr->num_components, 32, address,
-      .align_mul = MIN2(mul, 64u), .align_offset = disp % MIN2(mul, 64u),
+   nir_def *index =
+      nir_iand_imm(b, off, (AGX_ZERO_PAGE_SIZE - 1u) & ~(alignment - 1u));
+   index = nir_ior_imm(b, index, disp % alignment);
+   nir_def *address = nir_iadd(b, safe, nir_u2u64(b, index));
+   nir_def *value = nir_load_global_constant(b, intr->num_components, 32, address,
+      .align_mul = alignment, .align_offset = disp % alignment,
       .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
    nir_def_replace(&intr->def, value);
    return true;

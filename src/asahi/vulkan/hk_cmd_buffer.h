@@ -1184,6 +1184,8 @@ struct hk_cs {
    uint32_t pack_dispatches;
    uint64_t pack_threads;
    uint64_t pack_static_work;
+   /* Pure host-visibility flush stream created by a ->HOST pipeline barrier. */
+   bool host_flush_only;
    /* A dispatch in this stream runs a program with global atomics. */
    bool uses_global_atomics;
    /* A dispatch in this stream runs a program with a loop: pack_static_work

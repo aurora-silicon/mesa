@@ -69,6 +69,16 @@ struct hk_queue {
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
 
+   /* M5: monotonic stream sequence counters for eliding redundant standalone
+    * host-visibility flush command buffers when preceding visible-completion
+    * CDM streams already flushed all prior work to memory. */
+   struct {
+      uint64_t vdm_seq;
+      uint64_t cdm_seq;
+      uint64_t flushed_vdm_seq;
+      uint64_t flushed_cdm_seq;
+   } host_flush;
+
    /* Scratch for queue_submit: the resolved sync fields of each stream
     * occurrence of the submission being built (hk_sync_resolve_submit()). */
    struct util_dynarray sync_resolved;

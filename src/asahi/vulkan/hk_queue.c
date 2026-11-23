@@ -1339,6 +1339,7 @@ hk_queue_restart_sync(struct hk_queue *queue)
 {
    const struct hk_sync_queue old = queue->sync;
    memset(&queue->sync, 0, sizeof(queue->sync));
+   memset(&queue->host_flush, 0, sizeof(queue->host_flush));
    queue->sync.exact_prior = old.exact_prior;
    queue->sync.serialize = old.serialize;
    queue->sync.stage_overlap = old.stage_overlap;
@@ -2749,10 +2750,127 @@ hk_pack_runs(struct hk_device *dev, const struct hk_queue *queue,
    return true;
 }
 
+static bool
+hk_cmd_is_pure_host_flush(const struct hk_cmd_buffer *cmdbuf,
+                          uint8_t *vdm_prior, uint8_t *cdm_prior)
+{
+   if (cmdbuf->state.uses_events || cmdbuf->sync.pending_start_ts.handle ||
+       !list_is_singular(&cmdbuf->control_streams))
+      return false;
+
+   const struct hk_cs *cs =
+      list_first_entry(&cmdbuf->control_streams, struct hk_cs, node);
+   if (cs->type != HK_CS_CDM || !cs->host_flush_only ||
+       !cs->visible_completion || cs->stats.cmds ||
+       cs->timestamp.start.handle || cs->timestamp.end.handle ||
+       cs->query_access || cs->query_reset_pending || cs->imm_writes.size ||
+       cs->sync.dep[HK_SYNC_VDM].cut || cs->sync.dep[HK_SYNC_CDM].cut)
+      return false;
+
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+         if (cmdbuf->sync.req[k][sq].cut || cmdbuf->sync.req[k][sq].prior)
+            return false;
+      }
+   }
+
+   *vdm_prior = cs->sync.dep[HK_SYNC_VDM].prior;
+   *cdm_prior = cs->sync.dep[HK_SYNC_CDM].prior;
+   return true;
+}
+
 static VkResult
 queue_submit(struct hk_device *dev, struct hk_queue *queue,
              struct vk_queue_submit *submit, bool *untouched)
 {
+   struct vk_queue_submit filtered = *submit;
+   struct vk_command_buffer **kept_cmds = NULL;
+   struct {
+      uint64_t vdm_seq;
+      uint64_t cdm_seq;
+      uint64_t flushed_vdm_seq;
+      uint64_t flushed_cdm_seq;
+   } next_hf = {
+      .vdm_seq = queue->host_flush.vdm_seq,
+      .cdm_seq = queue->host_flush.cdm_seq,
+      .flushed_vdm_seq = queue->host_flush.flushed_vdm_seq,
+      .flushed_cdm_seq = queue->host_flush.flushed_cdm_seq,
+   };
+   const bool track_host_flush =
+      agx_chip_g17_m5(dev->dev.chip) && !dev->dev.is_virtio &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION);
+
+   if (track_host_flush) {
+      const bool can_elide =
+         !submit->buffer_bind_count && !submit->image_bind_count &&
+         !submit->image_opaque_bind_count;
+      if (submit->wait_count > 0)
+         next_hf.vdm_seq++;
+
+      unsigned kept_count = 0;
+      unsigned elided = 0;
+      for (unsigned i = 0; i < submit->command_buffer_count; ++i) {
+         const struct hk_cmd_buffer *cmdbuf =
+            (const void *)submit->command_buffers[i];
+         uint8_t vdm_prior = 0, cdm_prior = 0;
+         if (can_elide &&
+             hk_cmd_is_pure_host_flush(cmdbuf, &vdm_prior, &cdm_prior)) {
+            const bool need_vdm =
+               vdm_prior && next_hf.flushed_vdm_seq < next_hf.vdm_seq;
+            const bool need_cdm =
+               cdm_prior && next_hf.flushed_cdm_seq < next_hf.cdm_seq;
+            if (!need_vdm && !need_cdm) {
+               if (!kept_cmds) {
+                  kept_cmds = malloc(submit->command_buffer_count *
+                                     sizeof(*kept_cmds));
+                  if (kept_cmds && i)
+                     memcpy(kept_cmds, submit->command_buffers,
+                            i * sizeof(*kept_cmds));
+               }
+               if (kept_cmds) {
+                  elided++;
+                  continue;
+               }
+            }
+            next_hf.cdm_seq++;
+            next_hf.flushed_cdm_seq = next_hf.cdm_seq;
+            if (vdm_prior == HK_SYNC_ALL)
+               next_hf.flushed_vdm_seq = next_hf.vdm_seq;
+         } else {
+            const uint64_t vdm_before_cb = next_hf.vdm_seq;
+            const struct hk_cs *last_vdm_in_cb = NULL;
+            list_for_each_entry(const struct hk_cs, cs,
+                                &cmdbuf->control_streams, node) {
+               if (cs->type == HK_CS_VDM) {
+                  next_hf.vdm_seq++;
+                  last_vdm_in_cb = cs;
+               } else {
+                  next_hf.cdm_seq++;
+                  if (cs->visible_completion) {
+                     next_hf.flushed_cdm_seq = next_hf.cdm_seq;
+                     const bool covers_prior_vdm =
+                        cs->sync.dep[HK_SYNC_VDM].prior == HK_SYNC_ALL;
+                     const bool covers_cb_vdm =
+                        next_hf.vdm_seq == vdm_before_cb ||
+                        (last_vdm_in_cb &&
+                         cs->sync.dep[HK_SYNC_VDM].cut == last_vdm_in_cb);
+                     if (covers_prior_vdm && covers_cb_vdm)
+                        next_hf.flushed_vdm_seq = next_hf.vdm_seq;
+                  }
+               }
+            }
+         }
+         if (kept_cmds)
+            kept_cmds[kept_count] = submit->command_buffers[i];
+         kept_count++;
+      }
+
+      if (elided) {
+         filtered.command_buffer_count = kept_count;
+         filtered.command_buffers = kept_cmds;
+      }
+   }
+
    /* Packing copies the command buffers' streams: no patch site may be
     * written meanwhile (host_alias.patch_lock). The copies are the only CPU
     * reads of stream words at submission; the GPU reads each word whole. */
@@ -2760,20 +2878,30 @@ queue_submit(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(alias_dynamic))
       u_rwlock_rdlock(&dev->host_alias.patch_lock);
    struct hk_packed_runs runs;
-   const bool have_runs = hk_pack_runs(dev, queue, submit, &runs);
+   const bool have_runs = hk_pack_runs(dev, queue, &filtered, &runs);
    if (unlikely(alias_dynamic))
       u_rwlock_rdunlock(&dev->host_alias.patch_lock);
 
-   if (!have_runs)
-      return queue_submit_recordings(dev, queue, submit, submit, NULL,
-                                     untouched);
+   VkResult result;
+   if (!have_runs) {
+      result = queue_submit_recordings(dev, queue, &filtered, submit, NULL,
+                                       untouched);
+   } else {
+      struct vk_queue_submit effective = filtered;
+      effective.command_buffer_count = runs.command_count;
+      effective.command_buffers = runs.commands;
+      result = queue_submit_recordings(dev, queue, &effective, submit,
+                                       runs.bo, untouched);
+      hk_packed_runs_free(dev, &runs);
+   }
+   free(kept_cmds);
 
-   struct vk_queue_submit effective = *submit;
-   effective.command_buffer_count = runs.command_count;
-   effective.command_buffers = runs.commands;
-   VkResult result = queue_submit_recordings(dev, queue, &effective, submit,
-                                             runs.bo, untouched);
-   hk_packed_runs_free(dev, &runs);
+   if (track_host_flush && result == VK_SUCCESS) {
+      queue->host_flush.vdm_seq = next_hf.vdm_seq;
+      queue->host_flush.cdm_seq = next_hf.cdm_seq;
+      queue->host_flush.flushed_vdm_seq = next_hf.flushed_vdm_seq;
+      queue->host_flush.flushed_cdm_seq = next_hf.flushed_cdm_seq;
+   }
    return result;
 }
 
