@@ -665,9 +665,10 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
     * roots on their own bump cursor so allocating one cannot evict a partially
     * used main-upload BO and move that allocator's slow path into the next
     * application command. Ownership remains on the ordinary main BO list. */
-   struct hk_uploader *uploader = agx_native_graphics(&dev->dev)
-                                     ? &cmd->uploader.streams
-                                     : &cmd->uploader.main;
+   struct hk_uploader *uploader =
+      (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
+         ? &cmd->uploader.streams
+         : &cmd->uploader.main;
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
 }
 
@@ -1240,6 +1241,15 @@ hk_init_discarded_storage_images(struct hk_cmd_buffer *cmd,
           bar->dstQueueFamilyIndex != cmd->vk.pool->queue_family_index)
          continue;
 
+      if (bar->newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+          bar->newLayout == VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL ||
+          bar->newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+         const VkClearValue zero_val = {{{0}}};
+         if (hk_defer_clear(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, &zero_val,
+                            1, &bar->subresourceRange))
+            continue;
+      }
+
       if (!cleared) {
          hk_flush_deferred_clears(cmd);
          hk_cmd_buffer_end_compute(cmd);
@@ -1447,7 +1457,8 @@ hk_g17p_can_retain_descriptor_root(struct hk_cmd_buffer *cmd,
                                   const struct hk_descriptor_state *desc)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (!agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+   if (!(agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+         agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) ||
        desc != &gfx->descriptors ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
        gfx->shaders[MESA_SHADER_TESS_CTRL] ||
@@ -3665,6 +3676,16 @@ hk_m5_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
    if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
       hk_m5_verify_fragment_root_shadow(gfx);
 
+   const uint32_t req_size = s->root_descriptor_size
+      ? s->root_descriptor_size
+      : sizeof(struct hk_root_descriptor_table);
+   if (gfx->fs_root && gfx->fs_root_size < req_size) {
+      gfx->fs_root = 0;
+      gfx->fs_root_cpu = NULL;
+      gfx->fs_root_checked_root = 0;
+      gfx->fs_root_fragment_snapshot_cpu = NULL;
+   }
+
    return hk_m5_fragment_root_select(gfx, s->info.agx3_root_reads, true, true);
 }
 
@@ -4782,6 +4803,25 @@ clear_attachment_as_image(struct hk_cmd_buffer *cmd,
                   att->clear_colour, &range, false /* partially clear 3D */);
 }
 
+enum hk_clear_layout {
+   HK_CLEAR_PLAIN = BITFIELD_BIT(0),
+   HK_CLEAR_COMPRESSED = BITFIELD_BIT(1),
+};
+static unsigned
+hk_attachment_clear_layout(const struct hk_attachment *att, bool stencil)
+{
+   if (!att->clear || !att->iview)
+      return 0;
+
+   const struct hk_image_view *view = att->iview;
+   const struct hk_image *image =
+      container_of(view->vk.image, struct hk_image, vk);
+   const unsigned plane = stencil && image->plane_count > 1 ? 1 : 0;
+   const bool compressed = ail_is_level_logically_compressed(
+      &image->planes[plane].layout, view->vk.base_mip_level);
+   return compressed ? HK_CLEAR_COMPRESSED : HK_CLEAR_PLAIN;
+}
+
 bool
 hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
 {
@@ -4835,10 +4875,26 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * render that writes only its attachments it is not. */
    const bool m5_ms_clear = agx_chip_g17_m5(dev->dev.chip) &&
                             cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
+   unsigned clear_layout = 0;
+   if (dev->dev.chip == AGX_CHIP_G17C && cs->cr.process_empty_tiles &&
+       !continuation && cs->tib.nr_samples == 1) {
+      for (unsigned i = 0; i < render->color_att_count; ++i)
+         clear_layout |= hk_attachment_clear_layout(&render->color_att[i], false);
+      clear_layout |= hk_attachment_clear_layout(&render->depth_att, false);
+      clear_layout |= hk_attachment_clear_layout(&render->stencil_att, true);
+   }
+
+   const bool small_color_clear =
+      clear_layout == HK_CLEAR_COMPRESSED && render->color_att_count == 1 &&
+      render->layer_count == 1 && !render->view_mask &&
+      !render->depth_att.iview && !render->stencil_att.iview &&
+      cs->cr.width <= 32 && cs->cr.height <= 32;
+
    if (native_eot &&
        (continuation ||
         (cs->cr.process_empty_tiles &&
          (output_only_through_eot || m5_ms_clear ||
+          clear_layout == HK_CLEAR_PLAIN || small_color_clear ||
           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
@@ -5061,6 +5117,8 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    cmd->state.deferred_clear_flushing = true;
+   hk_cmd_buffer_end_compute(cmd);
+   hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_XFER);
    for (unsigned i = 0; i < cmd->state.deferred_clear_count; ++i) {
       const struct hk_deferred_clear *e = &cmd->state.deferred_clear[i];
       if (unlikely(dev->frame_anatomy)) {
@@ -5102,6 +5160,7 @@ hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why)
    }
    if (cs && !alias_scope)
       hk_cdm_note_alias_site(cmd, cs);
+   hk_cmd_buffer_end_compute(cmd);
    hk_sync_barrier(cmd, HK_SYNC_XFER, HK_SYNC_ALL);
    cmd->state.deferred_clear_flushing = false;
 }
@@ -5187,7 +5246,8 @@ hk_deferred_clear_for(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
 
    if (!e || !(e->aspects & aspect) ||
        (att->loadOp != VK_ATTACHMENT_LOAD_OP_LOAD &&
-        att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE) ||
+        att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE &&
+        att->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) ||
        (att->storeOp != VK_ATTACHMENT_STORE_OP_STORE &&
         att->storeOp != VK_ATTACHMENT_STORE_OP_DONT_CARE) ||
        view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D ||
@@ -5255,7 +5315,7 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    *copy = *info;
    for (unsigned i = 0; i < info->colorAttachmentCount; ++i) {
       color[i] = info->pColorAttachments[i];
-      if (col[i]) {
+      if (col[i] && color[i].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
          color[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
          color[i].clearValue = col[i]->value;
       }
@@ -5263,14 +5323,18 @@ hk_take_deferred_clears(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
    copy->pColorAttachments = color;
    if (z) {
       *depth = *info->pDepthAttachment;
-      depth->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-      depth->clearValue = z->value;
+      if (depth->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+         depth->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         depth->clearValue = z->value;
+      }
       copy->pDepthAttachment = depth;
    }
    if (s) {
       *stencil = *info->pStencilAttachment;
-      stencil->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-      stencil->clearValue = s->value;
+      if (stencil->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+         stencil->loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+         stencil->clearValue = s->value;
+      }
       copy->pStencilAttachment = stencil;
    }
 

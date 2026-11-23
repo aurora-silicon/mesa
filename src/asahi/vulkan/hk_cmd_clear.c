@@ -160,6 +160,8 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                               util_logbase2(layout->sample_count_sa), c[0],
                               c[1], c[2], c[3], word);
          } else if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17C &&
+                    hk_cmd_buffer_device(cmd)->dev.libagx_programs &&
+                    hk_cmd_buffer_device(cmd)->dev.libagx_programs[LIBAGX_FILL_UINT4_BLOCKS] &&
                     size >= 4096 && size % 4096 == 0) {
             libagx_fill_uint4_blocks(cmd, agx_2d(size / 128, layer_count),
                                      AGX_BARRIER_ALL, address, layer_stride_uint4,

@@ -453,10 +453,12 @@ enum drm_asahi_feature {
  * drm_asahi_feature, defined here like bit 32.
  */
 #define DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT ((1ULL) << 38)
+#define DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT ((1ULL) << 39)
 
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR 3
+#define DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR 4
 
 /* GET_PARAMS group VM_STATUS_MIRROR (input only; feature bit 4).
  * handle names a GEM object (at most 64 KiB) of the calling file; offset is a 4-byte-aligned
@@ -470,6 +472,13 @@ struct drm_asahi_vm_status_mirror {
    __u32 handle;
    __u32 offset;
    __u32 flags;
+};
+
+struct drm_asahi_vm_fence_error_mirror {
+   __u32 vm_id;
+   __u32 handle;
+   __u64 offset;
+   __u64 flags;
 };
 
 /* GET_PARAMS group VM_STATUS is an in/out query on the calling file's VM.

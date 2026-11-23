@@ -280,7 +280,8 @@ hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd)
 {
    /* The reverse order is qualified on G17P; the other native AGX3 chips keep
     * recording order until it is measured there. */
-   if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P)
+   if (hk_cmd_buffer_device(cmd)->dev.chip == AGX_CHIP_G17P ||
+       agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
       hk_resolve_oq_reverse(cmd);
    else
       hk_resolve_oq_forward(cmd);

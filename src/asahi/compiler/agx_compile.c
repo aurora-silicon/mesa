@@ -2730,8 +2730,7 @@ agx_expand_tex_to(agx_builder *b, nir_def *def, agx_index src, bool masked)
    agx_index unpacked_channels[8] = {agx_null()};
 
    /* Hardware writes the masked components contiguously, expand out for NIR */
-   agx_emit_split(b, packed_channels, src,
-                  ALIGN_POT(nr_channels, 4) /* XXX: why not nr_channels */);
+   agx_emit_split(b, packed_channels, src, agx_channels(src));
 
    for (unsigned i = 0; i < nr_channels; ++i) {
       unpacked_channels[i] =
@@ -7736,8 +7735,13 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
            I->src[2].size == AGX_SIZE_16) &&
           (I->src[3].type == AGX_INDEX_IMMEDIATE ||
            I->src[3].size == AGX_SIZE_16)) {
+         const bool m5_native_sel16_imm =
+            !agx3_fcmpsel_tied_minmax(I) &&
+            agx3_fcmpsel_gpu1_supported(&ctx->key->dev, I, false);
          for (unsigned s = 2; s < 4; ++s) {
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
+               continue;
+            if (m5_native_sel16_imm && agx3_fcmpsel_gpu1_imm8(I->src[s]))
                continue;
 
             if (ctx->key->dev.chip == AGX_CHIP_G17P) {
@@ -8465,6 +8469,11 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
 
    case nir_op_iadd:
       return agx_iadd_to(b, dst, s0, s1, 0);
+   case nir_op_ulea_agx: {
+      unsigned shift = nir_alu_src_as_uint(instr->src[2]);
+      assert(shift <= 7);
+      return agx_imad_to(b, dst, agx_abs(s1), agx_immediate(1u << shift), s0, 0);
+   }
    case nir_op_imadshl_agx:
       return agx_emit_imadshl_agx(b, instr, dst, s0, s1, s2, s3);
    case nir_op_imsubshl_agx:
@@ -9182,35 +9191,38 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
          sampler = agx_mov_imm(b, 64, sampler.value);
    }
 
-   agx_index tmp = agx_vec_temp(b->shader, dst.size, instr->is_sparse ? 8 : 4);
+   bool masked = (instr->op != nir_texop_tg4) && !instr->is_sparse;
+   bool is_txf = (instr->op == nir_texop_txf || instr->op == nir_texop_txf_ms);
+   if (is_txf)
+      masked = agx_fetch_masked(b, &instr->def, masked);
+
+   unsigned tmp_chans = instr->is_sparse ? 8 : 4;
+   nir_component_mask_t read_mask = masked ? nir_def_components_read(&instr->def) : 0;
+   if (!is_txf && masked && !instr->is_sparse &&
+       instr->op != nir_texop_tg4 && instr->op != nir_texop_lod &&
+       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       !b->shader->key->dev.emit_agx3d &&
+       dst.size == AGX_SIZE_32 && read_mask && !(read_mask & ~0xfu)) {
+      tmp_chans = util_bitcount(read_mask);
+   }
+
+   agx_index tmp = agx_vec_temp(b->shader, dst.size, tmp_chans);
    agx_instr *I = agx_texture_sample_to(
       b, tmp, coords, lod, bindless, texture, sampler, compare_offset,
       agx_tex_dim(instr->sampler_dim, instr->is_array), lod_mode, 0,
       offset_present, !agx_is_null(compare),
       instr->op == nir_texop_lod, agx_gather_for_nir(instr), instr->is_sparse);
 
-   /* The packer reads the G17P offset from the instruction, not from src[5],
-    * so it survives being split away from the comparator above. */
    I->offset_xyz = offset_xyz;
-   /* A C sample's packed parameter is a word, not an unpacked half-float. */
    I->memory_is_packed = packed_lod;
 
-   if (instr->op == nir_texop_txf || instr->op == nir_texop_txf_ms) {
+   if (is_txf) {
       I->op = AGX_OPCODE_TEXTURE_LOAD;
       b->shader->out->uses_txf = true;
       b->shader->out->sampler_state_count =
          MAX2(b->shader->out->sampler_state_count, 1);
    }
 
-   /* Destination masking doesn't seem to work properly for gathers (because
-    * it's mostly pointless), but it does show up in the lowering of
-    * textureGatherOffsets. Don't try to mask the destination for gathers.
-    *
-    * TODO: Check if it works with sparse.
-    */
-   bool masked = (instr->op != nir_texop_tg4) && !instr->is_sparse;
-   if (I->op == AGX_OPCODE_TEXTURE_LOAD)
-      masked = agx_fetch_masked(b, &instr->def, masked);
    I->mask = agx_expand_tex_to(b, &instr->def, tmp, masked);
 }
 
@@ -10396,6 +10408,504 @@ agx_nir_select_shifted_half(nir_shader *nir)
                               nir_metadata_control_flow, NULL);
 }
 
+
+static bool
+agx_match_affine_of(nir_scalar expr, nir_scalar x, nir_scalar *scale_out, nir_scalar *bias_out,
+                    nir_builder *b)
+{
+   if (!nir_scalar_is_alu(expr) || expr.def->bit_size != 32)
+      return false;
+   nir_alu_instr *e = nir_def_as_alu(expr.def);
+   if (e->fp_math_ctrl & nir_fp_exact)
+      return false;
+
+   /* Match ffma(x, s, o) with uniform s, o */
+   if (e->op == nir_op_ffma) {
+      nir_scalar a = nir_scalar_chase_alu_src(expr, 0);
+      nir_scalar m = nir_scalar_chase_alu_src(expr, 1);
+      nir_scalar k = nir_scalar_chase_alu_src(expr, 2);
+      if (k.def->divergent)
+         return false;
+      if (nir_scalar_equal(a, x) && !m.def->divergent) {
+         *scale_out = m;
+         *bias_out = k;
+         return true;
+      }
+      if (nir_scalar_equal(m, x) && !a.def->divergent) {
+         *scale_out = a;
+         *bias_out = k;
+         return true;
+      }
+   }
+
+   /* Match fmul(fadd(x, o), s) or fmul(s, fadd(x, o)) with uniform s, o */
+   if (e->op == nir_op_fmul) {
+      for (unsigned side = 0; side < 2; side++) {
+         nir_scalar inner = nir_scalar_chase_alu_src(expr, side);
+         nir_scalar s = nir_scalar_chase_alu_src(expr, 1 - side);
+         if (s.def->divergent)
+            continue;
+         if (nir_scalar_equal(inner, x)) {
+            *scale_out = s;
+            *bias_out = nir_get_scalar(nir_imm_float(b, 0.0f), 0);
+            return true;
+         }
+         if (nir_scalar_is_alu(inner) &&
+             !(nir_def_as_alu(inner.def)->fp_math_ctrl & nir_fp_exact) &&
+             nir_scalar_alu_op(inner) == nir_op_fadd) {
+            nir_scalar a = nir_scalar_chase_alu_src(inner, 0);
+            nir_scalar o = nir_scalar_chase_alu_src(inner, 1);
+            if (nir_scalar_equal(a, x) && !o.def->divergent) {
+               *scale_out = s;
+               *bias_out = nir_get_scalar(nir_fmul(b, nir_mov_scalar(b, o), nir_mov_scalar(b, s)), 0);
+               return true;
+            }
+            if (nir_scalar_equal(o, x) && !a.def->divergent) {
+               *scale_out = s;
+               *bias_out = nir_get_scalar(nir_fmul(b, nir_mov_scalar(b, a), nir_mov_scalar(b, s)), 0);
+               return true;
+            }
+         }
+      }
+   }
+
+   /* Match fadd(x, o) with uniform o */
+   if (e->op == nir_op_fadd) {
+      nir_scalar a = nir_scalar_chase_alu_src(expr, 0);
+      nir_scalar o = nir_scalar_chase_alu_src(expr, 1);
+      if (nir_scalar_equal(a, x) && !o.def->divergent) {
+         *scale_out = nir_get_scalar(nir_imm_float(b, 1.0f), 0);
+         *bias_out = o;
+         return true;
+      }
+      if (nir_scalar_equal(o, x) && !a.def->divergent) {
+         *scale_out = nir_get_scalar(nir_imm_float(b, 1.0f), 0);
+         *bias_out = a;
+         return true;
+      }
+   }
+
+   return false;
+}
+
+static bool
+agx_nir_m5_opt_affine_bcsel_instr(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->def.bit_size != 32 || alu->def.num_components != 1 ||
+       (alu->fp_math_ctrl & nir_fp_exact))
+      return false;
+
+   /* Pattern 1: bcsel(u_cond, affine(x), x) or bcsel(u_cond, x, affine(x))
+    * -> ffma(x, bcsel(u_cond, s, 1.0), bcsel(u_cond, o, 0.0)) */
+   if (alu->op == nir_op_bcsel) {
+      nir_scalar cond = nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
+      if (cond.def->divergent)
+         return false;
+      nir_scalar t = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+      nir_scalar f = nir_scalar_resolved(alu->src[2].src.ssa, alu->src[2].swizzle[0]);
+      if (t.def->divergent && f.def->divergent) {
+         b->cursor = nir_before_instr(&alu->instr);
+         nir_scalar s, o;
+         if (agx_match_affine_of(t, f, &s, &o, b)) {
+            nir_def *c = nir_mov_scalar(b, cond);
+            nir_def *scale = nir_bcsel(b, c, nir_mov_scalar(b, s), nir_imm_float(b, 1.0f));
+            nir_def *bias = nir_bcsel(b, c, nir_mov_scalar(b, o), nir_imm_float(b, 0.0f));
+            nir_def *res = nir_ffma(b, nir_mov_scalar(b, f), scale, bias);
+            nir_def_rewrite_uses(&alu->def, res);
+            nir_instr_remove(&alu->instr);
+            return true;
+         }
+         if (agx_match_affine_of(f, t, &s, &o, b)) {
+            nir_def *c = nir_mov_scalar(b, cond);
+            nir_def *scale = nir_bcsel(b, c, nir_imm_float(b, 1.0f), nir_mov_scalar(b, s));
+            nir_def *bias = nir_bcsel(b, c, nir_imm_float(b, 0.0f), nir_mov_scalar(b, o));
+            nir_def *res = nir_ffma(b, nir_mov_scalar(b, t), scale, bias);
+            nir_def_rewrite_uses(&alu->def, res);
+            nir_instr_remove(&alu->instr);
+            return true;
+         }
+      }
+      return false;
+   }
+
+   /* Pattern 2: fmul(ffma(x, u_s, u_o), u_k) -> ffma(x, u_s*u_k, u_o*u_k) */
+   if (alu->op == nir_op_fmul) {
+      for (unsigned side = 0; side < 2; side++) {
+         nir_scalar inner = nir_scalar_resolved(alu->src[side].src.ssa, alu->src[side].swizzle[0]);
+         nir_scalar k = nir_scalar_resolved(alu->src[1 - side].src.ssa, alu->src[1 - side].swizzle[0]);
+         if (k.def->divergent || !nir_scalar_is_alu(inner) ||
+             nir_scalar_alu_op(inner) != nir_op_ffma ||
+             (nir_def_as_alu(inner.def)->fp_math_ctrl & nir_fp_exact) ||
+             !list_is_singular(&inner.def->uses))
+            continue;
+         nir_scalar a = nir_scalar_chase_alu_src(inner, 0);
+         nir_scalar m = nir_scalar_chase_alu_src(inner, 1);
+         nir_scalar o = nir_scalar_chase_alu_src(inner, 2);
+         if (o.def->divergent)
+            continue;
+         nir_scalar x, s;
+         if (a.def->divergent && !m.def->divergent) {
+            x = a; s = m;
+         } else if (m.def->divergent && !a.def->divergent) {
+            x = m; s = a;
+         } else {
+            continue;
+         }
+         b->cursor = nir_before_instr(&alu->instr);
+         nir_def *kd = nir_mov_scalar(b, k);
+         nir_def *ns = nir_fmul(b, nir_mov_scalar(b, s), kd);
+         nir_def *no = nir_fmul(b, nir_mov_scalar(b, o), kd);
+         nir_def *res = nir_ffma(b, nir_mov_scalar(b, x), ns, no);
+         nir_def_rewrite_uses(&alu->def, res);
+         nir_instr_remove(&alu->instr);
+         return true;
+      }
+   }
+
+   return false;
+}
+
+static bool
+agx_nir_m5_opt_affine_bcsel(nir_shader *nir)
+{
+   nir_divergence_analysis(nir);
+   bool any = false, progress;
+   do {
+      progress = nir_shader_alu_pass(nir, agx_nir_m5_opt_affine_bcsel_instr,
+                                     nir_metadata_control_flow, NULL);
+      if (progress) {
+         any = true;
+         nir_divergence_analysis(nir);
+      }
+   } while (progress);
+   return any;
+}
+
+
+
+static bool
+agx_nir_m5_fuse_uadd64_32_instr(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if (alu->op != nir_op_iadd || alu->def.bit_size != 64 || alu->def.num_components != 1)
+      return false;
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar u = nir_scalar_resolved(alu->src[i].src.ssa, alu->src[i].swizzle[0]);
+      nir_scalar other = nir_scalar_resolved(alu->src[1 - i].src.ssa, alu->src[1 - i].swizzle[0]);
+      if (!nir_scalar_is_const(other) && nir_scalar_is_const(u)) {
+         uint64_t cv = nir_scalar_as_uint(u);
+         if (cv > 0 && cv <= UINT32_MAX) {
+            b->cursor = nir_before_instr(&alu->instr);
+            nir_def *res = nir_ulea_agx(b, nir_mov_scalar(b, other),
+                                        nir_imm_int(b, (uint32_t)cv),
+                                        nir_imm_int(b, 0));
+            nir_def_rewrite_uses(&alu->def, res);
+            nir_instr_remove(&alu->instr);
+            return true;
+         }
+         continue;
+      }
+      if (!nir_scalar_is_alu(u) || nir_scalar_alu_op(u) != nir_op_u2u64)
+         continue;
+      nir_scalar x = nir_scalar_chase_alu_src(u, 0);
+      if (x.def->bit_size != 32 || nir_scalar_is_const(x))
+         continue;
+            if (nir_scalar_is_const(other))
+         continue;
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *base64 = nir_mov_scalar(b, other);
+      nir_def *off32 = nir_mov_scalar(b, x);
+      nir_def *res = nir_ulea_agx(b, base64, off32, nir_imm_int(b, 0));
+      nir_def_rewrite_uses(&alu->def, res);
+      nir_instr_remove(&alu->instr);
+      return true;
+   }
+   return false;
+}
+
+static bool
+agx_nir_m5_fuse_uadd64_32(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, agx_nir_m5_fuse_uadd64_32_instr,
+                              nir_metadata_control_flow, NULL);
+}
+
+
+struct agx_dep_check {
+   const BITSET_WORD *deps;
+   bool hit;
+};
+
+static bool
+agx_dep_check_src(nir_src *src, void *state)
+{
+   struct agx_dep_check *c = state;
+   if (BITSET_TEST(c->deps, src->ssa->index)) {
+      c->hit = true;
+      return false;
+   }
+   return true;
+}
+
+static bool
+agx_m5_instr_uses_deps(nir_instr *instr, const BITSET_WORD *deps)
+{
+   struct agx_dep_check c = { .deps = deps, .hit = false };
+   nir_foreach_src(instr, agx_dep_check_src, &c);
+   return c.hit;
+}
+
+static bool
+agx_m5_skip_uniform_bounds_block(nir_shader *nir, nir_builder *b, nir_block *block,
+                                 unsigned num_ssa, void *mem_ctx)
+{
+   (void)nir;
+   struct ub_item {
+      nir_alu_instr *alu;
+      nir_def *limit;
+      uint32_t end_imm;
+   };
+   struct util_dynarray items;
+   util_dynarray_init(&items, mem_ctx);
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_alu)
+         continue;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      if (alu->op != nir_op_bounds_agx || alu->def.bit_size != 32 ||
+          alu->def.num_components != 1)
+         continue;
+      nir_scalar end = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+      nir_scalar lim = nir_scalar_resolved(alu->src[2].src.ssa, alu->src[2].swizzle[0]);
+      if (!nir_scalar_is_const(end) || lim.def->divergent ||
+          lim.def->bit_size != 32 || lim.comp != 0)
+         continue;
+      struct ub_item it = {
+         .alu = alu,
+         .limit = lim.def,
+         .end_imm = nir_scalar_as_uint(end),
+      };
+      util_dynarray_append(&items, it);
+   }
+
+   BITSET_WORD *deps = rzalloc_array(mem_ctx, BITSET_WORD, BITSET_WORDS(num_ssa));
+   struct util_dynarray chunk, sink_list;
+   util_dynarray_init(&chunk, mem_ctx);
+   util_dynarray_init(&sink_list, mem_ctx);
+
+   unsigned n = util_dynarray_num_elements(&items, struct ub_item);
+   if (n >= 6u) {
+      struct ub_item *arr = items.data;
+      for (unsigned start = 0; start < n; start++) {
+         nir_def *lim = arr[start].limit;
+         unsigned avail = 0;
+         for (unsigned k = start; k < n; k++) {
+            if (arr[k].limit == lim)
+               avail++;
+         }
+         if (avail < 6u)
+            continue;
+
+         memset(deps, 0, BITSET_WORDS(num_ssa) * sizeof(BITSET_WORD));
+         util_dynarray_clear(&chunk);
+         util_dynarray_clear(&sink_list);
+
+         nir_alu_instr *last_bounds = NULL;
+         uint32_t max_imm = 0;
+         for (nir_instr *cur = &arr[start].alu->instr; cur != NULL; cur = nir_instr_next(cur)) {
+            if (cur->type == nir_instr_type_alu) {
+               nir_alu_instr *a = nir_instr_as_alu(cur);
+               if (a->op == nir_op_bounds_agx && a->def.bit_size == 32 &&
+                   a->def.num_components == 1) {
+                  nir_scalar end = nir_scalar_resolved(a->src[1].src.ssa, a->src[1].swizzle[0]);
+                  nir_scalar l2 = nir_scalar_resolved(a->src[2].src.ssa, a->src[2].swizzle[0]);
+                  if (nir_scalar_is_const(end) && l2.def == lim && l2.comp == 0 &&
+                      !agx_m5_instr_uses_deps(cur, deps)) {
+                     struct ub_item it = { .alu = a, .limit = lim, .end_imm = nir_scalar_as_uint(end) };
+                     util_dynarray_append(&chunk, it);
+                     BITSET_SET(deps, a->def.index);
+                     last_bounds = a;
+                     if (it.end_imm > max_imm)
+                        max_imm = it.end_imm;
+                     if (util_dynarray_num_elements(&chunk, struct ub_item) >= 16u)
+                        break;
+                     continue;
+                  }
+               }
+            }
+
+            if (agx_m5_instr_uses_deps(cur, deps)) {
+               if (cur->type == nir_instr_type_alu) {
+                  nir_alu_instr *dep_alu = nir_instr_as_alu(cur);
+                  BITSET_SET(deps, dep_alu->def.index);
+                  util_dynarray_append(&sink_list, cur);
+                  continue;
+               }
+               break;
+            }
+         }
+
+         unsigned ccount = util_dynarray_num_elements(&chunk, struct ub_item);
+         if (ccount < 6u)
+            continue;
+
+         unsigned last_idx = last_bounds->instr.index;
+         struct ub_item *carr = chunk.data;
+         nir_instr *anchor = &last_bounds->instr;
+         util_dynarray_foreach(&sink_list, nir_instr *, sp) {
+            if ((*sp)->index < last_idx) {
+               nir_instr_move(nir_after_instr(anchor), *sp);
+               anchor = *sp;
+            }
+         }
+
+         b->cursor = nir_after_instr(&last_bounds->instr);
+         nir_def *cold_defs[16];
+         nir_def *hot_defs[16];
+         for (unsigned i = 0; i < ccount; i++) {
+            nir_alu_instr *orig = carr[i].alu;
+            nir_scalar data_s = nir_scalar_resolved(orig->src[0].src.ssa, orig->src[0].swizzle[0]);
+            hot_defs[i] = nir_mov_scalar(b, data_s);
+         }
+         nir_def *oob = nir_ult(b, lim, nir_imm_int(b, max_imm));
+         nir_if *nif = nir_push_if(b, oob);
+         for (unsigned i = 0; i < ccount; i++) {
+            cold_defs[i] = nir_bounds_agx(b, hot_defs[i], nir_imm_int(b, carr[i].end_imm), lim);
+         }
+         nir_pop_if(b, nif);
+
+         for (unsigned i = 0; i < ccount; i++) {
+            nir_def *phi = nir_if_phi(b, cold_defs[i], hot_defs[i]);
+            nir_def_rewrite_uses(&carr[i].alu->def, phi);
+            nir_instr_remove(&carr[i].alu->instr);
+         }
+         return true;
+      }
+   }
+
+   return false;
+}
+
+static bool
+agx_nir_m5_skip_uniform_bounds(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+
+   void *mem_ctx = ralloc_context(NULL);
+   bool any = false, progress;
+   unsigned safety = 0;
+   do {
+      progress = false;
+      nir_divergence_analysis(nir);
+      nir_index_ssa_defs(impl);
+      nir_index_instrs(impl);
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block_safe(block, impl) {
+         if (agx_m5_skip_uniform_bounds_block(nir, &b, block, impl->ssa_alloc, mem_ctx)) {
+            progress = true;
+            any = true;
+            break;
+         }
+      }
+   } while (progress && ++safety < 64);
+
+   ralloc_free(mem_ctx);
+   return nir_progress(any, impl, nir_metadata_none);
+}
+
+static bool
+agx_nir_m5_opt_fminmax_neg_instr(nir_builder *b, nir_alu_instr *alu, UNUSED void *data)
+{
+   if ((alu->op != nir_op_fmin && alu->op != nir_op_fmax &&
+        alu->op != nir_op_fmin_agx && alu->op != nir_op_fmax_agx) ||
+       alu->def.bit_size != 32 || alu->def.num_components != 1 ||
+       nir_alu_instr_is_signed_zero_preserve(alu))
+      return false;
+
+   nir_scalar s0 = nir_scalar_resolved(alu->src[0].src.ssa, alu->src[0].swizzle[0]);
+   nir_scalar s1 = nir_scalar_resolved(alu->src[1].src.ssa, alu->src[1].swizzle[0]);
+
+   /* Fold clamp(x, 0.0, 1.0) -> fsat(x) on fmin_agx/fmax_agx too! */
+   bool is_min = (alu->op == nir_op_fmin || alu->op == nir_op_fmin_agx);
+   for (unsigned side = 0; side < 2; ++side) {
+      nir_scalar cs = side == 0 ? s0 : s1;
+      nir_scalar inner = side == 0 ? s1 : s0;
+      if (!nir_scalar_is_const(cs) || !nir_scalar_is_alu(inner))
+         continue;
+      float outer_c = nir_scalar_as_float(cs);
+      nir_op iop = nir_scalar_alu_op(inner);
+      if (is_min && outer_c == 1.0f && (iop == nir_op_fmax || iop == nir_op_fmax_agx)) {
+         nir_scalar i0 = nir_scalar_chase_alu_src(inner, 0);
+         nir_scalar i1 = nir_scalar_chase_alu_src(inner, 1);
+         if ((nir_scalar_is_const(i0) && nir_scalar_as_float(i0) == 0.0f) ||
+             (nir_scalar_is_const(i1) && nir_scalar_as_float(i1) == 0.0f)) {
+            nir_scalar x = (nir_scalar_is_const(i0) && nir_scalar_as_float(i0) == 0.0f) ? i1 : i0;
+            b->cursor = nir_before_instr(&alu->instr);
+            nir_def_rewrite_uses(&alu->def, nir_fsat(b, nir_mov_scalar(b, x)));
+            nir_instr_remove(&alu->instr);
+            return true;
+         }
+      }
+      if (!is_min && outer_c == 0.0f && (iop == nir_op_fmin || iop == nir_op_fmin_agx)) {
+         nir_scalar i0 = nir_scalar_chase_alu_src(inner, 0);
+         nir_scalar i1 = nir_scalar_chase_alu_src(inner, 1);
+         if ((nir_scalar_is_const(i0) && nir_scalar_as_float(i0) == 1.0f) ||
+             (nir_scalar_is_const(i1) && nir_scalar_as_float(i1) == 1.0f)) {
+            nir_scalar x = (nir_scalar_is_const(i0) && nir_scalar_as_float(i0) == 1.0f) ? i1 : i0;
+            b->cursor = nir_before_instr(&alu->instr);
+            nir_def_rewrite_uses(&alu->def, nir_fsat(b, nir_mov_scalar(b, x)));
+            nir_instr_remove(&alu->instr);
+            return true;
+         }
+      }
+   }
+   bool n0 = nir_scalar_is_alu(s0) && nir_scalar_alu_op(s0) == nir_op_fneg;
+   bool n1 = nir_scalar_is_alu(s1) && nir_scalar_alu_op(s1) == nir_op_fneg;
+   if (!n0 && !n1)
+      return false;
+
+   nir_def *a = NULL, *c = NULL;
+   b->cursor = nir_before_instr(&alu->instr);
+   if (n0 && n1) {
+      a = nir_mov_scalar(b, nir_scalar_chase_alu_src(s0, 0));
+      c = nir_mov_scalar(b, nir_scalar_chase_alu_src(s1, 0));
+   } else if (n0 && nir_scalar_is_const(s1)) {
+      float fv = nir_scalar_as_float(s1);
+      if (!isfinite(fv))
+         return false;
+      a = nir_mov_scalar(b, nir_scalar_chase_alu_src(s0, 0));
+      c = nir_imm_float(b, -fv);
+   } else if (n1 && nir_scalar_is_const(s0)) {
+      float fv = nir_scalar_as_float(s0);
+      if (!isfinite(fv))
+         return false;
+      a = nir_mov_scalar(b, nir_scalar_chase_alu_src(s1, 0));
+      c = nir_imm_float(b, -fv);
+   } else {
+      return false;
+   }
+
+   nir_op flipped;
+   switch (alu->op) {
+   case nir_op_fmin: flipped = nir_op_fmax; break;
+   case nir_op_fmax: flipped = nir_op_fmin; break;
+   case nir_op_fmin_agx: flipped = nir_op_fmax_agx; break;
+   default: flipped = nir_op_fmin_agx; break;
+   }
+   nir_def *res = nir_fneg(b, nir_build_alu2(b, flipped, a, c));
+   nir_def_rewrite_uses(&alu->def, res);
+   nir_instr_remove(&alu->instr);
+   return true;
+}
+
+static bool
+agx_nir_m5_opt_fminmax_neg(nir_shader *nir)
+{
+   return nir_shader_alu_pass(nir, agx_nir_m5_opt_fminmax_neg_instr,
+                              nir_metadata_control_flow, NULL);
+}
+
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
@@ -10548,6 +11058,16 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * the loop's 64-bit add and subtract native. */
    if (g17p || m5)
       NIR_PASS(progress, nir, agx_nir_lower_divmod64, m5);
+   if (m5) {
+      bool fm = false;
+      NIR_PASS(fm, nir, agx_nir_m5_opt_fminmax_neg);
+      if (fm) {
+         NIR_PASS(_, nir, nir_opt_algebraic);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
+   if (m5 && (nir->options->lower_int64_options & nir_lower_iadd64))
+      NIR_PASS(progress, nir, agx_nir_m5_fuse_uadd64_32);
    NIR_PASS(progress, nir, nir_lower_int64);
 
    /* If we lowered actual int64 arithmetic (not folded into the address
@@ -10571,7 +11091,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     */
    nir_opt_reassociate_loop(
       nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-              (m5 ? nir_reassociate_loop_invariant : 0));
+              (m5 ? nir_reassociate_loop_invariant | nir_reassociate_loop_invariant_first : 0));
 
    /* Lower fmin/fmax before optimizing preambles so we can see across uniform
     * expressions. Do it after nir_opt_reassociate because nir_opt_reassociate
@@ -10622,6 +11142,15 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (sizes[2] == 0)
          sizes[2]++;
 
+      if (m5 && !nir->info.internal) {
+         bool af = false;
+         NIR_PASS(af, nir, agx_nir_m5_opt_affine_bcsel);
+         if (af) {
+            NIR_PASS(_, nir, nir_opt_algebraic);
+            NIR_PASS(_, nir, nir_opt_dce);
+            NIR_PASS(_, nir, nir_opt_cse);
+         }
+      }
       NIR_PASS(_, nir, agx_nir_opt_preamble, sizes, byte_indices || m5, m5,
                &peephole_select_options);
 
@@ -10692,6 +11221,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    if (byte_indices && !m5)
       NIR_PASS(_, nir, agx_nir_export_select_flags_as_halves, true);
 
+   if (m5 && !nir->info.internal) {
+      bool skipped = false;
+      NIR_PASS(skipped, nir, agx_nir_m5_skip_uniform_bounds);
+      if (skipped) {
+         NIR_PASS(_, nir, nir_opt_copy_prop);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+   }
    /* After the selects of trivial if-else statements exist. */
    if (m5) {
       bool folded = false;
@@ -10780,8 +11317,9 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * the arm is skipped. Sink leaves it at the top of that block; moving it on
     * to its use would make each load wait alone instead of overlapping.
     */
+   const bool sink_ssbo = g17p || (m5 && !g18_scans);
    NIR_PASS(_, nir, nir_opt_sink,
-            g17p ? move_all : move_all & ~nir_move_load_ssbo);
+            sink_ssbo ? move_all : move_all & ~nir_move_load_ssbo);
    NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
    NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
 
@@ -12980,13 +13518,106 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+
 static bool
-agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+agx_is_cheap_cross_block_remat(const agx_instr *I)
+{
+   if (I->nr_dests != 1 || I->dest[0].type != AGX_INDEX_NORMAL ||
+       I->dest[0].memory || agx_channels(I->dest[0]) != 1)
+      return false;
+   if (I->op == AGX_OPCODE_ICMPSEL && I->nr_srcs == 4 &&
+       (I->src[1].type == AGX_INDEX_IMMEDIATE || I->src[1].type == AGX_INDEX_UNIFORM) &&
+       (I->src[2].type == AGX_INDEX_UNIFORM || I->src[2].type == AGX_INDEX_IMMEDIATE) &&
+       (I->src[3].type == AGX_INDEX_UNIFORM || I->src[3].type == AGX_INDEX_IMMEDIATE))
+      return true;
+   if (I->op == AGX_OPCODE_MOV_IMM && I->nr_srcs == 0)
+      return true;
+   return false;
+}
+
+static void
+agx_opt_remat_uniform_selects(agx_context *ctx)
+{
+   if (ctx->is_preamble)
+      return;
+   unsigned orig_alloc = ctx->alloc;
+   agx_instr **defs = calloc(orig_alloc, sizeof(agx_instr *));
+   agx_block **def_blk = calloc(orig_alloc, sizeof(agx_block *));
+   unsigned *uses_other_blk = calloc(orig_alloc, sizeof(unsigned));
+   unsigned *uses_same_blk = calloc(orig_alloc, sizeof(unsigned));
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block(block, I) {
+         if (agx_is_cheap_cross_block_remat(I) && I->dest[0].value < orig_alloc) {
+            defs[I->dest[0].value] = I;
+            def_blk[I->dest[0].value] = block;
+         }
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (v < orig_alloc && defs[v]) {
+               if (I->op == AGX_OPCODE_PHI) {
+                  uses_same_blk[v]++;
+               } else if (block != def_blk[v]) {
+                  uses_other_blk[v]++;
+               } else {
+                  uses_same_blk[v]++;
+               }
+            }
+         }
+      }
+   }
+   agx_foreach_block(ctx, block) {
+      agx_index *blk_clone = NULL;
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (I->op == AGX_OPCODE_PHI)
+            continue;
+         agx_foreach_ssa_src(I, s) {
+            unsigned v = I->src[s].value;
+            if (v >= orig_alloc || !defs[v] || block == def_blk[v] || !uses_other_blk[v])
+               continue;
+            if (!blk_clone)
+               blk_clone = calloc(orig_alloc, sizeof(agx_index));
+            if (agx_is_null(blk_clone[v])) {
+               agx_instr *orig = defs[v];
+               agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+               agx_index dst = agx_temp(ctx, orig->dest[0].size);
+               if (orig->op == AGX_OPCODE_MOV_IMM) {
+                  agx_mov_imm_to(&b, dst, orig->imm);
+               } else {
+                  agx_instr *c = agx_icmpsel_to(&b, dst, orig->src[0], orig->src[1],
+                                                orig->src[2], orig->src[3], orig->icond);
+                  c->invert_cond = orig->invert_cond;
+               }
+               blk_clone[v] = dst;
+            }
+            agx_index repl = blk_clone[v];
+            repl.abs = I->src[s].abs;
+            repl.neg = I->src[s].neg;
+            I->src[s] = repl;
+         }
+      }
+      free(blk_clone);
+   }
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (I->nr_dests == 1 && I->dest[0].type == AGX_INDEX_NORMAL &&
+             I->dest[0].value < orig_alloc && defs[I->dest[0].value] == I &&
+             uses_other_blk[I->dest[0].value] && !uses_same_blk[I->dest[0].value]) {
+            agx_remove_instruction(I);
+         }
+      }
+   }
+   free(defs);
+   free(def_blk);
+   free(uses_other_blk);
+   free(uses_same_blk);
+}
+
+static bool
+agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
-                         unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat,
-                         bool agx3_reg_float_consts)
+                         unsigned ra_budget_cut, bool agx3_reg_float_consts)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
@@ -13338,24 +13969,15 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Record provenance before RA can create stack instructions. */
    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
-   if (disable_remat)
-      agx_ra_without_remat(ctx);
-   else
-      agx_ra(ctx);
+   if (agx_chip_g17_m5(ctx->key->dev.chip))
+      agx_opt_remat_uniform_selects(ctx);
+   agx_ra(ctx);
 
    /* A failed allocation is refused and retried below; its AIR is not a
     * program to validate (agx_validate exits on it). */
    if (!ctx->ra_failed)
-      agx_validate(ctx, disable_remat ? "agx_ra_without_remat" : "agx_ra");
+      agx_validate(ctx, "agx_ra");
 
-   /* The occupancy rematerialization attempt has already modified AIR.
-    * Discard the entire context; changing its budget cannot undo spills. */
-   if (retry_without_remat && ctx->remat_fallback_spilled) {
-      *retry_without_remat = true;
-      binary->size = initial_binary_size;
-      ralloc_free(ctx);
-      return false;
-   }
    if (ctx->ra_failed) {
       /* Spilling only targets total demand; pinned values can still leave the
        * shuffle no room. Recompile with an ever smaller spill budget. */
@@ -13364,10 +13986,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          binary->size = initial_binary_size;
          /* Constant promotion and others accumulate into out. */
          *out = initial_out;
-         return agx_compile_function_nir_attempt(
+         return agx_compile_function_nir(
             nir, impl, key, binary, out, offset_out,
-            ra_budget_cut ? ra_budget_cut * 2 : 16, disable_remat,
-            retry_without_remat, agx3_reg_float_consts);
+            ra_budget_cut ? ra_budget_cut * 2 : 16, agx3_reg_float_consts);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -13705,61 +14326,6 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    return true;
 }
 
-/* Retry eligible preambles without changing scratch admission or launch rules. */
-static bool
-agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
-                         struct agx_shader_key *key,
-                         struct util_dynarray *binary,
-                         struct agx_shader_info *out, unsigned *offset_out,
-                         bool agx3_reg_float_consts)
-{
-   const bool eligible =
-      impl->function->is_preamble && nir->info.stage == MESA_SHADER_FRAGMENT &&
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-      (key->g17p_native_uniforms || key->agx3_native_cprog) &&
-      debug_get_bool_option("ASAHI_M5_CPROG_REMAT_RETRY", true);
-   if (!eligible)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
-
-   /* Preserve all compiler-owned state, including earlier main code/rodata.
-    * The first attempt owns a deep NIR clone and a fresh AIR context. */
-   nir_shader *attempt = nir_shader_clone(NULL, nir);
-   if (!attempt)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
-
-   nir_function_impl *attempt_impl = NULL;
-   nir_foreach_function_with_impl(func, candidate, attempt) {
-      if (func->is_preamble) {
-         assert(attempt_impl == NULL);
-         attempt_impl = candidate;
-      }
-   }
-   assert(attempt_impl != NULL);
-   const struct agx_shader_info saved_info = *out;
-   const struct agx_shader_key saved_key = *key;
-   const size_t saved_size = binary->size;
-   bool retry = false;
-   bool success = agx_compile_function_nir_attempt(
-      attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry,
-      agx3_reg_float_consts);
-   ralloc_free(attempt);
-   if (!retry)
-      return success;
-
-   assert(!success && binary->size == saved_size);
-   *out = saved_info;
-   *key = saved_key;
-   binary->size = saved_size;
-   /* Exactly one retry. Real full-budget spills retain the old refusal. */
-   return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                          offset_out, 0, true, NULL,
-                                          agx3_reg_float_consts);
-}
-
 /*
  * The hardware frcp instruction is sometimes off by 1 ULP. For correctly
  * rounded frcp, a refinement step is required. This routine has been
@@ -13983,10 +14549,10 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
                nir_metadata_control_flow, NULL);
    }
    NIR_PASS(_, nir, nir_lower_frexp);
-   /* Before nir_lower_alu's generic lower_fminmax_signed_zero. Validated on
-    * G17P only (`g17p` above means any native AGX3 chip); other chips keep
-    * the generic lowering. The flush policy is agx_nir_lower_fminmax's. */
-   if (chip_g17p) {
+   /* Before nir_lower_alu's generic lower_fminmax_signed_zero. Enabled for
+    * G17P and M5 (AGX3C); other chips keep the generic lowering. The flush
+    * policy is agx_nir_lower_fminmax's. */
+   if (chip_g17p || m5) {
       /* DXVK and vkd3d-proton mark every float op signed-zero preserving.
        * Drop the flag where no use can tell -0 from +0, before the min/max
        * lowering pays for it. */
@@ -16293,10 +16859,11 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    const mesa_shader_stage stage = nir->info.stage;
    const bool uniform_atomics =
       !is_agx3 ||
-      (is_g17p && (stage == MESA_SHADER_COMPUTE ||
-                   stage == MESA_SHADER_VERTEX ||
-                   stage == MESA_SHADER_TESS_CTRL ||
-                   stage == MESA_SHADER_FRAGMENT));
+      (is_g17p &&
+       (stage == MESA_SHADER_COMPUTE ||
+        stage == MESA_SHADER_VERTEX ||
+        stage == MESA_SHADER_TESS_CTRL ||
+        stage == MESA_SHADER_FRAGMENT));
 
    /* Apple's G17P loops are a
     * guard plus a bottom-tested body (fragment and compute alike: the
@@ -16386,11 +16953,14 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_opt_dce);
       /* The launch's copies, if any, sit above every export. */
       unsigned push_count = info->push_count;
+      const bool place_load_bases_low =
+         is_g17p ||
+         (key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !key->dev.emit_agx3d);
       NIR_PASS(_, nir, agx_nir_place_preamble_handles_low,
                key->reserved_preamble,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
-               &push_count, is_g17p);
+               &push_count, place_load_bases_low);
       info->push_count = push_count;
    }
 
@@ -16412,6 +16982,20 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          regs = MIN2(regs, agx_max_registers_for_occupancy(threads));
       }
 
+      if (key->dev.chip == AGX_CHIP_G17C && nir->info.stage == MESA_SHADER_COMPUTE &&
+          key->has_scratch && !key->is_helper) {
+         unsigned nr_samples = 0;
+         nir_foreach_function_impl(l_impl, nir) {
+            nir_foreach_block(l_blk, l_impl) {
+               nir_foreach_instr(l_ins, l_blk) {
+                  if (l_ins->type == nir_instr_type_tex)
+                     nr_samples++;
+               }
+            }
+         }
+         if (nr_samples >= 4)
+            regs = MIN2(regs, 184);
+      }
       NIR_PASS(_, nir, agx_nir_opt_licm, regs - 8);
    }
 
@@ -16545,7 +17129,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       const struct agx_shader_key saved_key = *key;
       const unsigned saved_size = binary.size;
       bool compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                               &out->info, &offset, false);
+                                               &out->info, &offset, 0, false);
 
       /* The G17G packer refuses shapes it has no grounded encoding for and
        * rolls the binary back. Most refusals in real clients (Skia/ANGLE)
@@ -16558,7 +17142,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
          *key = saved_key;
          binary.size = saved_size;
          compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                             &out->info, &offset, true);
+                                             &out->info, &offset, 0, true);
       }
 
       if (!compiled) {

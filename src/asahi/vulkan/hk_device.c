@@ -530,6 +530,45 @@ hk_init_vm_status_mirror(struct hk_device *dev)
    dev->vm_status_mirror.word = word;
 }
 
+static void
+hk_init_fence_error_count(struct hk_device *dev)
+{
+   if (!agx_chip_g17_m5(dev->dev.chip) || dev->dev.is_virtio ||
+       !(dev->dev.params.features & DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT))
+      return;
+
+   struct agx_bo *bo =
+      agx_bo_create(&dev->dev, 16384, 0, AGX_BO_WRITEBACK | AGX_BO_READONLY,
+                    "VM fence error count");
+   if (!bo)
+      return;
+
+   const uint64_t *word = agx_bo_map(bo);
+   if (!word) {
+      agx_bo_unreference(&dev->dev, bo);
+      return;
+   }
+
+   struct drm_asahi_vm_fence_error_mirror mirror = {
+      .vm_id = dev->dev.vm_id,
+      .handle = bo->uapi_handle,
+      .offset = 0,
+      .flags = 0,
+   };
+   struct drm_asahi_get_params query = {
+      .param_group = DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR,
+      .pointer = (uintptr_t)&mirror,
+      .size = sizeof(mirror),
+   };
+   if (drmIoctl(dev->dev.fd, DRM_IOCTL_ASAHI_GET_PARAMS, &query)) {
+      agx_bo_unreference(&dev->dev, bo);
+      return;
+   }
+
+   dev->fence_error_count_bo = bo;
+   dev->fence_error_count = word;
+}
+
 #define HK_CODE_CHUNK_SIZE (1024 * 1024)
 #define HK_CODE_ALIGNMENT  256
 
@@ -581,6 +620,15 @@ hk_finish_vm_status_mirror(struct hk_device *dev)
       agx_bo_unreference(&dev->dev, dev->vm_status_mirror.bo);
    dev->vm_status_mirror.bo = NULL;
    dev->vm_status_mirror.word = NULL;
+}
+
+static void
+hk_finish_fence_error_count(struct hk_device *dev)
+{
+   if (dev->fence_error_count_bo)
+      agx_bo_unreference(&dev->dev, dev->fence_error_count_bo);
+   dev->fence_error_count_bo = NULL;
+   dev->fence_error_count = NULL;
 }
 
 static VkResult
@@ -1132,6 +1180,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    assert(pdev->mem_heap_count == 1);
    dev->dev.bo_cache.size_counter = pdev->mem_heaps[0].cached;
    bool succ = agx_open_device(NULL, &dev->dev);
+   if (succ && agx_chip_g17_m5(dev->dev.chip)) dev->dev.params.features |= DRM_ASAHI_FEATURE_SOFT_FAULTS;
    drmFreeDevice(&drm_device);
    if (!succ) {
       result = vk_errorf(dev, VK_ERROR_INITIALIZATION_FAILED,
@@ -1145,6 +1194,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.check_status = hk_check_status;
    dev->vk.get_timestamp = hk_get_timestamp;
    hk_init_vm_status_mirror(dev);
+   hk_init_fence_error_count(dev);
    if (dev->dev.async_errors)
       dev->async_errors_base = p_atomic_read(dev->dev.async_errors);
 
@@ -1381,6 +1431,7 @@ fail_samplers:
    hk_destroy_sampler_heap(dev, &dev->samplers);
 fail_dev:
    hk_finish_vm_status_mirror(dev);
+   hk_finish_fence_error_count(dev);
    agx_bo_unreference(&dev->dev, dev->physical_sparse_map);
    agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);
@@ -1473,6 +1524,7 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_g17p_bg_eot_dev_cache_finish(dev);
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_finish_vm_status_mirror(dev);
+   hk_finish_fence_error_count(dev);
    agx_bo_unreference(&dev->dev, dev->physical_sparse_map);
    agx_bo_unreference(&dev->dev, dev->sparse_fill);
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);

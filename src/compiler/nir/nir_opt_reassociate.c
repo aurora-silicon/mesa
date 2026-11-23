@@ -272,7 +272,11 @@ rank(struct reassociate_state *state, nir_loop *loop, nir_scalar s)
     */
    if (state->opts & nir_reassociate_loop_invariant) {
       struct invariant_walk w = { .state = state, .loop = loop };
-      r = 2 * r - (!loop || def_loop_invariant(&w, s.def) ? 1 : 0);
+      const bool invariant = !loop || def_loop_invariant(&w, s.def);
+      if (state->opts & nir_reassociate_loop_invariant_first)
+         r += invariant ? 0 : 2;
+      else
+         r = 2 * r - (invariant ? 1 : 0);
    }
 
    return r;

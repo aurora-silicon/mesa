@@ -92,9 +92,10 @@ enum hk_sync_kind {
     * render's vertex half only after the latest such stream on the render
     * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
+   HK_SYNC_QUERY = 1 << 6,
 };
 
-#define HK_SYNC_NUM_KINDS 6
+#define HK_SYNC_NUM_KINDS 7
 
 /* The destination classes a stream of the given kinds belongs to: graphics
  * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). A
@@ -312,6 +313,7 @@ struct hk_sync_state {
    bool in_pass;
    bool resume_pending;
    bool heap_pass;
+   bool pass_uses_query;
    struct hk_cs *pass_vdm;
 
    /* The open general compute stream must be re-validated against the
@@ -435,6 +437,7 @@ void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
 void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_sync_query_use(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* Every later stream of the given kinds waits on cs. */
 void hk_sync_after_stream(struct hk_cmd_buffer *cmd, struct hk_cs *cs,

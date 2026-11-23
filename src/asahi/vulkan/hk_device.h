@@ -302,6 +302,9 @@ struct hk_device {
       int32_t *word;
    } vm_status_mirror;
 
+   struct agx_bo *fence_error_count_bo;
+   const uint64_t *fence_error_count;
+
    /* virtio: dev->dev.async_errors when the device was created. */
    uint32_t async_errors_base;
 

@@ -552,9 +552,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    /* A placed G17C image may alias another image with the same layout.
     * Apply the format and view compatibility checks below to these images. */
    const bool g17c_storage = dev->chip == AGX_CHIP_G17C &&
-                             info->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
-                             (info->mipLevels == 1 ||
-                              info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+                             info->initialLayout == VK_IMAGE_LAYOUT_UNDEFINED;
    const VkImageCreateFlags allowed_flags =
       VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
       (g17c_storage ? VK_IMAGE_CREATE_ALIAS_BIT : 0);

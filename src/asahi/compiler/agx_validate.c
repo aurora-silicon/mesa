@@ -184,11 +184,13 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
 
    case AGX_OPCODE_IMAGE_LOAD:
    case AGX_OPCODE_TEXTURE_LOAD:
+      return (I->sparse ? 8 : 4) * size;
    case AGX_OPCODE_TEXTURE_SAMPLE:
-      /* Even when masked out, these clobber 4 registers.
-       *
-       * TODO: Figure out the sparse interaction.
-       */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          !ctx->key->dev.emit_agx3d && !I->sparse &&
+          I->gather == AGX_GATHER_NONE && !I->query_lod &&
+          I->dest[d].size == AGX_SIZE_32 && I->mask && !(I->mask & ~0xfu))
+         return util_bitcount(I->mask) * size;
       return (I->sparse ? 8 : 4) * size;
 
    case AGX_OPCODE_LOAD_CPROG_AGX3:

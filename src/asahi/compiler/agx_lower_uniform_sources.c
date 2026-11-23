@@ -436,13 +436,26 @@ agx3_lower_m5_live_scalar_lods(agx_context *ctx)
 
    const unsigned alloc = ctx->alloc;
    unsigned *uses = calloc(alloc, sizeof(*uses));
-   agx_foreach_instr_global(ctx, I) {
-      agx_foreach_ssa_src(I, s)
-         uses[I->src[s].value]++;
+   agx_instr **defs = calloc(alloc, sizeof(*defs));
+   agx_block **def_blocks = calloc(alloc, sizeof(*def_blocks));
+   agx_foreach_block(ctx, blk) {
+      agx_foreach_instr_in_block(blk, I) {
+         agx_foreach_ssa_src(I, s)
+            uses[I->src[s].value]++;
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < alloc) {
+               defs[I->dest[d].value] = I;
+               def_blocks[I->dest[d].value] = blk;
+            }
+         }
+      }
    }
 
    agx_index *packed = NULL;
    agx_block **owner = NULL;
+   agx_index uni_packed[512];
+   bool uni_packed_valid[512] = {false};
+   agx_block *entry = agx_start_block(ctx);
    agx_foreach_instr_global_safe(ctx, I) {
       if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
           I->memory_is_packed ||
@@ -456,6 +469,27 @@ agx3_lower_m5_live_scalar_lods(agx_context *ctx)
           agx_channels(lod) != 1 ||
           (!v_block->cf_divergent && uses[lod.value] == 1))
          continue;
+
+      /* Hoist loop-invariant uniform LOD packing to the entry block. */
+      agx_instr *def = lod.value < alloc ? defs[lod.value] : NULL;
+      if (v_block != entry && def &&
+          def->op == AGX_OPCODE_MOV && def->nr_srcs == 1 &&
+          def->src[0].type == AGX_INDEX_UNIFORM &&
+          def->src[0].size == AGX_SIZE_16 &&
+          !def->src[0].abs && !def->src[0].neg &&
+          def->src[0].value < ARRAY_SIZE(uni_packed)) {
+         unsigned u = def->src[0].value;
+         if (!uni_packed_valid[u]) {
+            agx_builder eb = agx_init_builder(ctx, agx_after_block_logical(entry));
+            agx_index ucopy = agx_mov(&eb, def->src[0]);
+            uni_packed[u] = agx_temp(ctx, AGX_SIZE_32);
+            agx_pack_sampler_lod_agx3_to(&eb, uni_packed[u], ucopy);
+            uni_packed_valid[u] = true;
+         }
+         I->src[1] = uni_packed[u];
+         I->memory_is_packed = true;
+         continue;
+      }
 
       if (!owner) {
          packed = calloc(alloc, sizeof(*packed));
@@ -475,6 +509,8 @@ agx3_lower_m5_live_scalar_lods(agx_context *ctx)
    }
    free(owner);
    free(packed);
+   free(def_blocks);
+   free(defs);
    free(uses);
 }
 

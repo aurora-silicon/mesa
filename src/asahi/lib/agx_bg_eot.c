@@ -471,7 +471,8 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       assert(nr > 0);
 
       if (key->g17p_packed_clear && key->op[rt] == AGX_BG_CLEAR &&
-          agx_chip_native_agx3(cache->dev->chip) && rt == 0 &&
+          (agx_chip_native_agx3(cache->dev->chip) ||
+           agx_chip_g17_m5(cache->dev->chip)) && rt == 0 &&
           agx_g17p_packed_clear_ok(&key->tib)) {
          /* One raw tile word: the driver packed the clear colour exactly as
           * the R8G8B8A8_UNORM FLTNORM pair would, so store its 32 bits. */

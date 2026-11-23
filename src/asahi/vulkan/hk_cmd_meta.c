@@ -89,7 +89,8 @@ hk_device_init_meta(struct hk_device *dev)
     * passes. G17P exports stencil in one draw, which also resolves depth and
     * stencil together: 1.50 to 0.48 ms for a 2x D32S8 at 3456x2234. */
    dev->meta.use_stencil_export = !agx_native_graphics(&dev->dev) ||
-                                  dev->dev.chip == AGX_CHIP_G17P;
+                                  dev->dev.chip == AGX_CHIP_G17P ||
+                                  agx_chip_g17_m5(dev->dev.chip);
    /* A scaled image is read through an exact integer descriptor or a
     * filterable normalized one depending on whether the sampler filters, so
     * a blit source has to arrive together with its sampler for the driver to
@@ -2167,7 +2168,8 @@ hk_g17p_compute_blit_supported(const struct hk_device *dev,
                                const struct hk_image *dst,
                                const VkBlitImageInfo2 *info)
 {
-   if (!agx_native_graphics(&dev->dev) || info->regionCount == 0)
+   if (!(agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) ||
+       info->regionCount == 0)
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
@@ -2993,15 +2995,15 @@ hk_meta_resolve_rendering(struct hk_cmd_buffer *cmd,
 static void
 hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
 {
-   /* Use vectorized copies for as much of the buffer as possible. This requires
-    * that dst, src, and size are all properly aligned. Failing to check for
-    * alignment on the buffers causes subtle and hard-to-debug issues!
-    */
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const enum agx_barrier barrier =
+      agx_chip_g17_m5(dev->dev.chip) ? 0 : AGX_BARRIER_ALL;
+
    if (size >= 16 && (dst & 0xf) == 0 && (src & 0xf) == 0) {
       unsigned uint4s = size / 16;
       unsigned bytes = uint4s * 16;
 
-      libagx_copy_uint4(cmd, agx_1d(uint4s), AGX_BARRIER_ALL, dst, src);
+      libagx_copy_uint4(cmd, agx_1d(uint4s), barrier, dst, src);
 
       dst += bytes;
       src += bytes;
@@ -3009,7 +3011,7 @@ hk_cmd_copy(struct hk_cmd_buffer *cmd, uint64_t dst, uint64_t src, size_t size)
    }
 
    if (size) {
-      libagx_copy_uchar(cmd, agx_1d(size), AGX_BARRIER_ALL, dst, src);
+      libagx_copy_uchar(cmd, agx_1d(size), barrier, dst, src);
    }
 }
 
@@ -3239,8 +3241,21 @@ hk_xfer_copybuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *info
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (agx_native_graphics(&dev->dev) ||
-       agx_chip_g17_m5(dev->dev.chip)) {
+   VK_FROM_HANDLE(hk_buffer, m5_src_buf, info->srcBuffer);
+   bool m5_direct_copy = !agx_native_graphics(&dev->dev) &&
+                         agx_chip_g17_m5(dev->dev.chip) &&
+                         !m5_src_buf->sparse_map;
+   if (m5_direct_copy) {
+      for (unsigned i = 0; i < info->regionCount; i++) {
+         if (info->pRegions[i].size > (1ull << 24)) {
+            m5_direct_copy = false;
+            break;
+         }
+      }
+   }
+
+   if (!m5_direct_copy && (agx_native_graphics(&dev->dev) ||
+       agx_chip_g17_m5(dev->dev.chip))) {
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
       struct hk_copy_batch batch = {0};
@@ -3946,7 +3961,7 @@ hk_g17p_tiled_upload_shape(const struct hk_device *dev, bool dest_tiled,
                            struct hk_g17p_tiled_upload_key *key,
                            uint32_t groups[3])
 {
-   if (dev->dev.chip != AGX_CHIP_G17P || !dest_tiled || !plan->width_el ||
+   if ((dev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(dev->dev.chip)) || !dest_tiled || !plan->width_el ||
        !plan->height_el)
       return false;
 
@@ -5066,7 +5081,8 @@ hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
 {
    const struct hk_physical_device *pdev =
       (const struct hk_physical_device *)dev->vk.physical;
-   if (dev->dev.chip != AGX_CHIP_G17P || buffer->va ||
+   if ((dev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(dev->dev.chip)) ||
+       buffer->va ||
        size < (64u << 20) || ((address | offset | size) & 15) ||
        !address || size > UINT64_MAX - address ||
        size / 16 > pdev->vk.properties.maxTexelBufferElements)
@@ -5133,11 +5149,13 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    uint64_t addr =
       vk_meta_buffer_address(&dev->vk, dstBuffer, dstOffset, dstRange);
 
+   const enum agx_barrier barrier =
+      agx_chip_g17_m5(dev->dev.chip) ? 0 : AGX_BARRIER_ALL;
    if (util_is_aligned(addr, 16) && util_is_aligned(range, 16)) {
-      libagx_fill_uint4(cmd, agx_2d(range / 16, 1), AGX_BARRIER_ALL,
+      libagx_fill_uint4(cmd, agx_2d(range / 16, 1), barrier,
                         addr, 0, data, data, data, data);
    } else {
-      libagx_fill(cmd, agx_1d(range / 4), AGX_BARRIER_ALL, addr, data);
+      libagx_fill(cmd, agx_1d(range / 4), barrier, addr, data);
    }
 }
 
@@ -5159,10 +5177,17 @@ hk_xfer_updatebuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
    }
 
    size_t range = vk_buffer_range(&buffer->vk, dstOffset, dstRange);
+   uint64_t addr =
+      vk_meta_buffer_address(&dev->vk, dstBuffer, dstOffset, dstRange);
 
-   hk_cmd_copy(cmd,
-               vk_meta_buffer_address(&dev->vk, dstBuffer, dstOffset, dstRange),
-               hk_pool_upload(cmd, pData, range, 4), range);
+   if (agx_chip_g17_m5(dev->dev.chip) && range == 4 && util_is_aligned(addr, 4)) {
+      uint32_t val;
+      memcpy(&val, pData, sizeof(val));
+      libagx_fill(cmd, agx_1d(1), 0, addr, val);
+      return;
+   }
+
+   hk_cmd_copy(cmd, addr, hk_pool_upload(cmd, pData, range, 4), range);
 }
 
 VKAPI_ATTR void VKAPI_CALL

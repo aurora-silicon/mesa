@@ -117,9 +117,12 @@ hk_query_command_cs(struct hk_cmd_buffer *cmd)
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
    hk_sync_src_dep(cmd, HK_SYNC_ALL, cmd->current_cs.cs, dep);
    struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
-   if (cs && (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
-              agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)))
-      cs->g17p_timestamp_query = true;
+   if (cs) {
+      hk_sync_query_use(cmd, cs);
+      if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+         cs->g17p_timestamp_query = true;
+   }
    return cs;
 }
 
@@ -787,18 +790,26 @@ hk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    if (!queryCount)
       return;
 
-   cmd->sync.kind_override = HK_SYNC_ALL;
+   hk_sync_flush_pending_timestamp(cmd);
+   hk_sync_end_cs_if_timestamped(cmd);
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   hk_sync_src_dep(cmd, HK_SYNC_QUERY, cmd->current_cs.cs, dep);
+   cmd->sync.kind_override = HK_SYNC_XFER | HK_SYNC_QUERY;
    cmd->state.query_reset_recording = true;
-   struct hk_cs *cs = hk_query_command_cs(cmd);
-   if (cs)
+   struct hk_cs *cs = hk_sync_get_cs_after(cmd, dep);
+   if (cs) {
+      if (agx_native_graphics(&hk_cmd_buffer_device(cmd)->dev) ||
+          agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip))
+         cs->g17p_timestamp_query = true;
       emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
+   }
    cmd->state.query_reset_recording = false;
    cmd->sync.kind_override = 0;
    if (!cs)
       return;
 
    hk_sync_after_stream(cmd, cmd->current_cs.cs ? cmd->current_cs.cs : cs,
-                        HK_SYNC_ALL);
+                        HK_SYNC_QUERY);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1007,6 +1018,15 @@ hk_cmd_begin_end_query(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    default:
       UNREACHABLE("Unsupported query type");
+   }
+
+   if (cmd->sync.in_pass || graphics || pre_gfx) {
+      cmd->sync.pass_uses_query = true;
+      hk_sync_query_use(cmd, cmd->current_cs.gfx);
+      hk_sync_query_use(cmd, cmd->current_cs.pre_gfx);
+      hk_sync_query_use(cmd, cmd->current_cs.post_gfx);
+   } else {
+      hk_sync_query_use(cmd, cmd->current_cs.cs);
    }
 
    /* We need to set available=1 after the graphics work finishes. */

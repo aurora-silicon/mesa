@@ -244,7 +244,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_depth_clip_enable = true,
       /* Qualified on G17P only (the whole binding_model.descriptor_buffer
        * group); other chips share the code but need their own run. */
-      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P,
+      .EXT_descriptor_buffer = dev->chip == AGX_CHIP_G17P || dev->chip == AGX_CHIP_G17C,
       .EXT_descriptor_indexing = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = false,
@@ -734,8 +734,7 @@ hk_get_device_features(
        * layout, and push descriptors keep their own command-buffer storage.
        */
       .descriptorBuffer = supported_extensions->EXT_descriptor_buffer,
-      .descriptorBufferCaptureReplay =
-         supported_extensions->EXT_descriptor_buffer,
+      .descriptorBufferCaptureReplay = dev->chip == AGX_CHIP_G17P,
       .descriptorBufferImageLayoutIgnored =
          supported_extensions->EXT_descriptor_buffer,
       .descriptorBufferPushDescriptors =

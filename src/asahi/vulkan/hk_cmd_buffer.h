@@ -42,6 +42,7 @@
 #include "hk_descriptor_set.h"
 #include "hk_drm_render_core.h"
 #include "hk_ioto_arena_core.h"
+#include "hk_nir_root_size.h"
 #include "hk_pipeline_statistics_core.h"
 
 #include "asahi/lib/agx_nir_lower_vbo.h"
@@ -756,6 +757,7 @@ struct hk_graphics_state {
     * copy (hk_m5_fragment_root()). */
    uint64_t fs_root;
    const struct hk_root_descriptor_table *fs_root_cpu;
+   uint32_t fs_root_size;
 
    /* A successful equality check between the immutable root snapshots at
     * fs_root and this address. Cleared whenever fs_root is replaced. */
@@ -1033,6 +1035,7 @@ hk_m5_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
    gfx->fs_root_checked_root = 0;
    gfx->fs_root = gfx->root;
    gfx->fs_root_cpu = gfx->root_cpu;
+   gfx->fs_root_size = gfx->descriptors.uploaded_root_size;
    return gfx->root;
 }
 
@@ -1746,6 +1749,10 @@ struct hk_cmd_buffer {
       struct {
          uint64_t id, addr;
       } constant_data[MESA_SHADER_STAGES];
+      struct hk_group_count_cache_entry {
+         uint32_t x, y, z, valid;
+         uint64_t addr;
+      } group_count_cache[16];
       /* vkCmdBindDescriptorBuffersEXT() */
       uint64_t descriptor_buffers[HK_MAX_DESCRIPTOR_BUFFERS];
       struct hk_graphics_state gfx;
@@ -2488,6 +2495,40 @@ hk_cs_alloc_for_indirect(struct hk_cs *cs, size_t size_B)
    return addr;
 }
 
+static inline size_t
+hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
+{
+   const size_t full = sizeof(struct hk_root_descriptor_table);
+   const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (gfx->shaders[MESA_SHADER_TESS_CTRL] ||
+       gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY] ||
+       gfx->shaders[MESA_SHADER_TASK] ||
+       gfx->shaders[MESA_SHADER_MESH] ||
+       !gfx->shaders[MESA_SHADER_VERTEX])
+      return full;
+
+   const struct hk_shader *vs =
+      &gfx->shaders[MESA_SHADER_VERTEX]->variants[HK_VS_VARIANT_HW];
+   if (!vs->compiled)
+      return full;
+
+   struct hk_api_shader *fs_obj =
+      gfx->mesh_fs ? gfx->mesh_fs
+      : (gfx->fbl_fs ? gfx->fbl_fs : gfx->shaders[MESA_SHADER_FRAGMENT]);
+   uint32_t fs_size = 0;
+   if (fs_obj) {
+      const struct hk_shader *fs = hk_fs_variant(
+         fs_obj, cmd->vk.dynamic_graphics_state.ms.rasterization_samples);
+      if (!fs || !fs->compiled)
+         return full;
+      fs_size = fs->root_descriptor_size;
+   }
+
+   return hk_gfx_root_size_from_stages(vs->root_descriptor_size, fs_obj != NULL,
+                                       fs_size, full);
+}
+
 static void
 hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
 {
@@ -2775,6 +2816,8 @@ void hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id);
 uint64_t hk_cmd_upload_constants(struct hk_cmd_buffer *cmd,
                                  const struct hk_shader *shader,
                                  mesa_shader_stage stage);
+uint64_t hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
+                                   VkDispatchIndirectCommand group_count);
 void hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd);
 
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,

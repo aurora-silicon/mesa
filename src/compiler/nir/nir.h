@@ -7225,6 +7225,7 @@ typedef enum {
     * example the per-iteration constants of an accumulation.
     */
    nir_reassociate_loop_invariant = (1 << 2),
+   nir_reassociate_loop_invariant_first = (1 << 3),
 } nir_reassociate_options;
 
 bool nir_opt_reassociate(nir_shader *shader, nir_reassociate_options opts);

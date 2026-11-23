@@ -528,6 +528,18 @@ hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
+hk_sync_query_use(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (!cs || (cs->sync.kind & HK_SYNC_QUERY))
+      return;
+   struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
+   req_for_mask(cmd, HK_SYNC_QUERY, dep);
+   hk_sync_stream_wait(cs, dep);
+   cs->sync.kind |= HK_SYNC_QUERY;
+   note_last(cmd, cs);
+}
+
+void
 hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                 uint8_t dst_kinds)
 {
@@ -751,6 +763,8 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    cs->sync.kind = stream_kind(cmd, slot, compute);
+   if (st->pass_uses_query && (!compute || pre_gfx || post_gfx))
+      cs->sync.kind |= HK_SYNC_QUERY;
    /* A transfer render writes its attachments, like any render; the draws
     * it records mark it if they write other memory
     * (hk_m5_note_render_resources). */
@@ -887,6 +901,7 @@ hk_sync_stream_created(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    /* A top-of-pipe timestamp waiting for a command to ride on. */
    if (st->pending_start_ts.handle) {
+      hk_sync_query_use(cmd, cs);
       cs->timestamp.start = st->pending_start_ts;
       st->pending_start_ts = (struct agx_timestamp_req){0};
    }
@@ -991,6 +1006,7 @@ hk_sync_check_cs(struct hk_cmd_buffer *cmd)
         agx_chip_g17_m5(hk_cmd_buffer_device(cmd)->dev.chip)) &&
        cmd->sync.pending_start_ts.handle && !cs->timestamp.start.handle &&
        !cs->timestamp.end.handle) {
+      hk_sync_query_use(cmd, cs);
       cs->timestamp.start = cmd->sync.pending_start_ts;
       cmd->sync.pending_start_ts = (struct agx_timestamp_req){0};
    }
@@ -1231,7 +1247,8 @@ stamp_wait(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    if (cs->type == HK_CS_CDM) {
       const struct hk_device *dev = hk_cmd_buffer_device(cmd);
-      if (agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P &&
+      if (((agx_native_graphics(&dev->dev) && dev->dev.chip == AGX_CHIP_G17P) ||
+           agx_chip_g17_m5(dev->dev.chip)) &&
           (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)) {
          /* The logical compute queue already orders these GPU commands by
           * their mandatory kick parents. Adding the timestamp's same-CDM
@@ -1308,6 +1325,7 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
 
    struct hk_cs *tail = last_stream(cmd);
    if (tail && !tail->timestamp.end.handle) {
+      hk_sync_query_use(cmd, tail);
       tail->timestamp.end = req;
       if (tail == cmd->current_cs.cs) {
          stamp_carrier_launch(cmd);
@@ -1321,6 +1339,7 @@ hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd)
    struct hk_cs *cs = timestamp_only_stream(cmd, none);
    if (!cs)
       return;
+   hk_sync_query_use(cmd, cs);
    cs->timestamp.start = req;
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
@@ -1342,6 +1361,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
        * stamp is copied from the first after the render. */
       if (!src_kinds && !gfx->timestamp.start.handle &&
           start_stamps_ordered(cmd)) {
+         hk_sync_query_use(cmd, gfx);
          gfx->timestamp.start = req;
          return;
       }
@@ -1373,6 +1393,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
                                     req.offset_B, sizeof(uint64_t));
          }
       } else {
+         hk_sync_query_use(cmd, gfx);
          gfx->timestamp.end = req;
       }
       return;
@@ -1397,6 +1418,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    hk_sync_src_dep(cmd, src_kinds, tail, dep);
 
    if (tail && !tail->timestamp.end.handle) {
+      hk_sync_query_use(cmd, tail);
       tail->timestamp.end = req;
       stamp_wait(cmd, tail, dep);
 
@@ -1412,6 +1434,7 @@ hk_sync_write_timestamp(struct hk_cmd_buffer *cmd, VkPipelineStageFlags2 stage,
    struct hk_cs *cs = timestamp_only_stream(cmd, dep);
    if (!cs)
       return;
+   hk_sync_query_use(cmd, cs);
    cs->timestamp.end = req;
    stamp_carrier_launch(cmd);
    hk_cmd_buffer_end_compute(cmd);
@@ -1428,6 +1451,7 @@ hk_sync_begin_rendering(struct hk_cmd_buffer *cmd, bool resuming)
    st->pass_vdm = NULL;
    st->resume_pending = resuming;
    st->heap_pass = false;
+   st->pass_uses_query = false;
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = NULL;
@@ -1463,6 +1487,7 @@ hk_sync_end_rendering(struct hk_cmd_buffer *cmd, bool suspending)
    st->pass_vdm = NULL;
    st->resume_pending = false;
    st->heap_pass = false;
+   st->pass_uses_query = false;
 }
 
 void
@@ -1503,6 +1528,7 @@ hk_sync_merge_rendering(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    st->pass_vdm = cs;
    st->resume_pending = false;
    st->heap_pass = false;
+   st->pass_uses_query = false;
    st->pass_fp_count = 0;
    memset(st->pass_tile_wait, 0, sizeof(st->pass_tile_wait));
    st->pass_tile_first = st->pass_tile_last = cs;

@@ -657,13 +657,12 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES))
       key->m5_position_samples = state->ms->rasterization_samples;
 
-   /* M5 has no read-only early reject to rule out. */
    if ((agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
        state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !state->ms->alpha_to_coverage_enable &&
-       (agx_chip_g17_m5(chip) || hk_g17p_static_no_early_reject(state)))
+       hk_g17p_static_no_early_reject(state))
       key->static_tests = true;
 
    if (chip == AGX_CHIP_G17P && state->ms != NULL &&
@@ -982,20 +981,11 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       _mesa_blake3_update(&blake3_ctx, &is_multiview, sizeof(is_multiview));
    }
 
-   /* G17P removes user varyings from fragmentless pipelines, so the same
-    * pre-rasterization shader compiles differently for a library. */
-   if (agx_native_graphics(&((struct hk_physical_device *)device)->dev) &&
-       !(stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
-      const bool no_fragment_shader = hk_pipeline_has_no_fragment_shader(state);
-      _mesa_blake3_update(&blake3_ctx, &no_fragment_shader,
-                          sizeof(no_fragment_shader));
-   }
-
-   /* M5 removes user varyings from the mesh shader of a fragmentless
-    * pipeline (hk_m5_prune_fragmentless_mesh_outputs), so that mesh shader
-    * compiles differently for a pre-rasterization library. */
-   if (agx_chip_g17_m5(((struct hk_physical_device *)device)->dev.chip) &&
-       (stages & VK_SHADER_STAGE_MESH_BIT_EXT) &&
+   /* AGX3 (native and M5) removes user varyings from fragmentless pipelines,
+    * so the same pre-rasterization shader compiles differently for a
+    * library. */
+   if ((agx_native_graphics(&((struct hk_physical_device *)device)->dev) ||
+        agx_chip_g17_m5(((struct hk_physical_device *)device)->dev.chip)) &&
        !(stages & VK_SHADER_STAGE_FRAGMENT_BIT)) {
       const bool no_fragment_shader = hk_pipeline_has_no_fragment_shader(state);
       _mesa_blake3_update(&blake3_ctx, &no_fragment_shader,
@@ -1478,17 +1468,61 @@ bound_offset(nir_builder *b, nir_def *valid, nir_scalar offset)
    return nir_bcsel(b, valid, def, nir_imm_int(b, 0));
 }
 
+/* Fold the constant field displacement into the bounds check so adjacent
+ * fields can share their base-plus-index address.
+ */
+static nir_def *
+bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_scalar offset = nir_scalar_resolved(intr->src[1].ssa, 0);
+   nir_def *bound = intr->src[2].ssa;
+   unsigned bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   unsigned align_offset = nir_intrinsic_align_offset(intr);
+
+   if (!is_op(offset, nir_op_uadd_sat) || offset.def->bit_size != 32 ||
+       bound->bit_size != 32 || align_offset > AGX_ZERO_PAGE_SIZE - bytes ||
+       nir_intrinsic_align_mul(intr) > AGX_ZERO_PAGE_SIZE)
+      return NULL;
+
+   nir_scalar x = nir_scalar_chase_alu_src(offset, 0);
+   nir_scalar y = nir_scalar_chase_alu_src(offset, 1);
+   if (!nir_scalar_is_const(x) && !nir_scalar_is_const(y))
+      return NULL;
+
+   unsigned field = nir_scalar_as_uint(nir_scalar_is_const(x) ? x : y);
+   if (field > AGX_ZERO_PAGE_SIZE - bytes)
+      return NULL;
+
+   /* index + field + bytes <= bound, including when the offset saturates. */
+   nir_def *index = nir_mov_scalar(b, nir_scalar_is_const(x) ? y : x);
+   nir_def *limit = nir_usub_sat(b, bound, nir_imm_int(b, field + bytes - 1));
+   nir_def *record = nir_iadd(b, intr->src[0].ssa, nir_u2u64(b, index));
+
+   /* Adding the displacement must land at the promised alignment even for
+    * an out-of-bounds access.
+    */
+   nir_def *zero = nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS +
+                                    (uint64_t)align_offset - field);
+   return nir_iadd_imm(b, nir_bcsel(b, nir_ult(b, index, limit), record, zero),
+                       field);
+}
+
 static void
-lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
+lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
+                          bool fold_field)
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *base = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
+   nir_def *address = fold_field ? bounded_field_address(b, intr) : NULL;
 
-   /* Bounds check compatibly with the hardware address mode */
-   nir_def *valid = check_in_bounds(b, intr);
-   base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
-   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
+   if (!address) {
+      /* Bounds check compatibly with the hardware address mode */
+      nir_def *valid = check_in_bounds(b, intr);
+      base = nir_bcsel(b, valid, base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0));
+      address = nir_iadd(b, base, nir_u2u64(b, offset));
+   }
 
    enum gl_access_qualifier access = nir_intrinsic_access(intr);
 
@@ -1498,7 +1532,7 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 
    nir_def *val = nir_load_global(
       b, intr->def.num_components, intr->def.bit_size,
-      nir_iadd(b, base, nir_u2u64(b, offset)),
+      address,
       .align_mul = nir_intrinsic_align_mul(intr),
       .align_offset = nir_intrinsic_align_offset(intr), .access = access);
 
@@ -1506,11 +1540,86 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
 }
 
 struct global_load_lowering {
+   bool fold_field;
    bool soft_fault;
    /* G17P and M5: storage-buffer loads use the soft-fault form as well:
     * load, then zero the value when the access is out of bounds. */
    bool storage_result_select;
 };
+
+/* Keep naturally aligned robust UBO loads together. */
+static bool
+hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref ||
+       intr->def.bit_size != 32 ||
+       intr->num_components > 4 ||
+       (nir_intrinsic_access(intr) & ACCESS_VOLATILE))
+      return false;
+
+   nir_deref_instr *leaf = nir_src_as_deref(intr->src[0]);
+   if (leaf->modes != nir_var_mem_ubo ||
+       (glsl_get_explicit_stride(leaf->type) != 0 &&
+        glsl_get_explicit_stride(leaf->type) != 4))
+      return false;
+
+   uint32_t mul, disp;
+   if (!nir_get_explicit_deref_align(leaf, true, &mul, &disp) ||
+       mul < 4 || (disp % MIN2(mul, 64u)) + intr->num_components * 4 > MIN2(mul, 64u) ||
+       mul > AGX_ZERO_PAGE_SIZE)
+      return false;
+
+   nir_deref_path path;
+   nir_deref_path_init(&path, leaf, NULL);
+   nir_deref_instr *root = path.path[0];
+   if (root->deref_type != nir_deref_type_cast ||
+       root->parent.ssa->num_components != 4 ||
+       root->parent.ssa->bit_size != 32) {
+      nir_deref_path_finish(&path);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *addr = root->parent.ssa;
+   for (unsigned i = 1; path.path[i]; ++i)
+      addr = nir_explicit_io_address_from_deref(
+         b, path.path[i], addr, nir_address_format_64bit_bounded_global);
+   nir_deref_path_finish(&path);
+
+   nir_def *base = nir_pack_64_2x32(b, nir_trim_vector(b, addr, 2));
+   nir_def *off = nir_channel(b, addr, 3);
+   nir_def *bound = nir_channel(b, addr, 2);
+   /* Factor neighboring fields onto the same checked 64-byte record.
+    * The advertised robustness2 size alignment equals the minimum UBO
+    * base alignment. The zero page includes one whole aligned record. */
+   nir_def *record, *field;
+   struct m5_bounded_offset o = m5_bounded_offset(nir_scalar_resolved(off, 0), 12);
+   if (o.valid && (o.scale & 63u) == 0) {
+      if (o.term.def) {
+         nir_def *t = nir_mov_scalar(b, o.term);
+         nir_def *base_off = util_is_power_of_two_nonzero(o.scale)
+            ? nir_ishl_imm(b, t, util_logbase2(o.scale))
+            : nir_imul_imm(b, t, o.scale);
+         uint32_t rec_const = o.constant & ~63u;
+         record = rec_const ? nir_iadd_imm(b, base_off, rec_const) : base_off;
+      } else {
+         record = nir_imm_int(b, o.constant & ~63u);
+      }
+      field = nir_imm_int(b, o.constant & 63u);
+   } else {
+      record = nir_iand_imm(b, off, ~63u);
+      field = nir_ishl_imm(b, nir_iand_imm(b, nir_ushr_imm(b, off, 2), 15u), 2);
+   }
+   nir_def *real = nir_iadd(b, base, nir_u2u64(b, record));
+   nir_def *safe = nir_bcsel(b, nir_ult(b, record, bound), real,
+                             nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   nir_def *address = nir_iadd(b, safe, nir_u2u64(b, field));
+   nir_def *value = nir_load_global(b, intr->num_components, 32, address,
+      .align_mul = MIN2(mul, 64u), .align_offset = disp % MIN2(mul, 64u),
+      .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
+   nir_def_replace(&intr->def, value);
+   return true;
+}
 
 static bool
 lower_physical_sparse_load(nir_builder *b, nir_intrinsic_instr *intr,
@@ -1702,7 +1811,7 @@ lower_load_global_constant_offset_instr(nir_builder *b,
        (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
         !state->soft_fault)) {
 
-      lower_load_global_bounded(b, intrin);
+      lower_load_global_bounded(b, intrin, state->fold_field);
       return true;
    }
 
@@ -3270,6 +3379,10 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                      : nir_var_mem_ubo,
                .callback = agx_mem_vectorize_cb,
             });
+   if (dev->dev.chip == AGX_CHIP_G17C &&
+       rs->uniform_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_lower_aligned_ubo,
+               nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));
 
@@ -3346,6 +3459,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(progress, nir, nir_opt_move, opts);
 
    struct global_load_lowering global_loads = {
+      .fold_field = dev->dev.chip == AGX_CHIP_G17C,
       .soft_fault = agx_has_soft_fault(&dev->dev),
       .storage_result_select = dev->dev.chip == AGX_CHIP_G17P ||
                                agx_chip_g17_m5(dev->dev.chip),
@@ -5045,7 +5159,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          NIR_PASS(_, nir, nir_lower_alpha_to_coverage, false, enable);
       }
 
-      if (agx_native_graphics(&dev->dev))
+      if (agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip))
          shader->info.fs.g17p_colour_unit_range =
             agx_nir_fs_colour_outputs_unit_range(nir);
 
@@ -5365,15 +5479,17 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    /* Measure while root markers are still explicit. Uniform lowering loads
     * the root pointer and set bases separately, so retain that prefix too.
     * Round up for native uniform/global load granularity. */
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip))
       shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
-   if (dev->dev.chip == AGX_CHIP_G17P && sw_stage == MESA_SHADER_COMPUTE) {
-      unsigned bytes = hk_nir_root_size(
-         nir, sizeof(struct hk_root_descriptor_table));
-      bytes = MAX2(bytes, hk_root_descriptor_offset(sets) +
-                            set_count * sizeof(uint64_t));
-      shader->root_descriptor_size = MIN2(
-         ALIGN_POT(bytes, 16), sizeof(struct hk_root_descriptor_table));
+   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+       (sw_stage == MESA_SHADER_COMPUTE ||
+        sw_stage == MESA_SHADER_FRAGMENT ||
+        (sw_stage == MESA_SHADER_VERTEX &&
+         nir->info.stage == MESA_SHADER_VERTEX))) {
+      shader->root_descriptor_size = hk_shader_root_descriptor_size(
+         nir, sw_stage, set_count, hk_root_descriptor_offset(sets),
+         hk_root_descriptor_offset(push),
+         sizeof(struct hk_root_descriptor_table));
    }
 
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
@@ -5436,6 +5552,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
        * offset. Null-descriptor bounds need no exact offset: their size is
        * zero, so every access fails the check. */
       .checked_offsets =
+         !agx_has_soft_fault(&dev->dev) &&
          rs && (rs->storage_buffers !=
                    VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||
                 rs->uniform_buffers !=
@@ -5576,7 +5693,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
     * (agx_nir_lower_workgroup_split, hk dispatch_grid). Measured on T6040
     * only, so A18 Pro keeps the API shape. */
    uint16_t launch_size[3] = {0};
-   if (agx_is_m4_pro(&dev->dev) && sw_stage == MESA_SHADER_COMPUTE &&
+   if (agx_is_m4_pro(&dev->dev) &&
+       sw_stage == MESA_SHADER_COMPUTE &&
        nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
        agx_workgroup_split_size(nir, launch_size))
       NIR_PASS(_, nir, agx_nir_lower_workgroup_split, launch_size);
@@ -8336,8 +8454,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
     *
     * Do not apply this to pipeline libraries: their pre-raster shader can be
     * linked with a fragment library later. */
-   if (agx_native_graphics(&dev->dev) && shader_count > 0 &&
-       hk_pipeline_has_no_fragment_shader(state)) {
+   if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+       shader_count > 0 && hk_pipeline_has_no_fragment_shader(state)) {
       nir_shader *last = shaders[shader_count - 1];
       if (last->info.stage <= MESA_SHADER_GEOMETRY)
          NIR_PASS(_, last, nir_remove_outputs, MESA_SHADER_FRAGMENT,
@@ -8396,8 +8514,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    /* Only a complete pipeline known to have no fragment shader can fix an
     * empty interpolation contract. A pre-raster library or shader object
     * must retain draw-time UVS indices for its eventual fragment consumer. */
-   if (agx_native_graphics(&dev->dev) && shader_count > 0 &&
-       hk_pipeline_has_no_fragment_shader(state)) {
+   if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+       shader_count > 0 && hk_pipeline_has_no_fragment_shader(state)) {
       nir_shader *last = shaders[shader_count - 1];
       if (last->info.stage <= MESA_SHADER_GEOMETRY) {
          last->info.known_interpolation_qualifiers = true;
@@ -8519,7 +8637,8 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
 {
    struct hk_shader_info info;
    blob_copy_bytes(blob, &info, sizeof(info));
-   const uint32_t root_descriptor_size = dev->dev.chip == AGX_CHIP_G17P
+   const uint32_t root_descriptor_size =
+      (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip))
       ? blob_read_uint32(blob) : 0;
    uint8_t mesh_primitive_comps[64] = {0};
    if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
@@ -9138,7 +9257,7 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
-   if (dev->dev.chip == AGX_CHIP_G17P)
+   if (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip))
       blob_write_uint32(blob, shader->root_descriptor_size);
    if (dev->dev.chip == AGX_CHIP_G17P &&
        shader->info.stage == MESA_SHADER_MESH)

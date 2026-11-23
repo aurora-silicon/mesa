@@ -27,11 +27,14 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    struct hk_root_descriptor_table *root = &desc->root;
 
    size_t root_size = sizeof(*root);
-   if (dev->dev.chip == AGX_CHIP_G17P &&
-       bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
-      const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
-      if (s && s->root_descriptor_size)
-         root_size = MIN2(root_size, s->root_descriptor_size);
+   if (dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) {
+      if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
+         const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+         if (s && s->root_descriptor_size)
+            root_size = MIN2(root_size, s->root_descriptor_size);
+      } else if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+         root_size = MIN2(root_size, hk_gfx_root_descriptor_size(cmd));
+      }
    }
 
    root->printf_buffer_address = dev->dev.printf_buffer_address;
@@ -52,8 +55,9 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    const size_t tail_B = hk_root_descriptor_offset(set_dynamic_buffer_start);
    /* CPU-decoded descriptor programs use a new root identity to invalidate
     * their native program caches, even when only set memory changed. */
-   if (agx_native_graphics(&dev->dev) && desc->uploaded_root.gpu &&
-       desc->uploaded_root_size == root_size &&
+   if ((agx_native_graphics(&dev->dev) || agx_chip_g17_m5(dev->dev.chip)) &&
+       desc->uploaded_root.gpu &&
+       desc->uploaded_root_size >= root_size &&
        desc->generation == desc->uploaded_root_generation &&
        desc->dynamic_buffer_end == desc->uploaded_dynamic_buffer_end) {
       root->root_desc_addr = desc->uploaded_root.gpu;
@@ -65,8 +69,12 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
              cmd->state.gfx.root &&
              desc->uploaded_root.gpu != cmd->state.gfx.root)
             cmd->state.gfx.g17p_bind_tail.valid = false;
-         if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+         if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
             cmd->state.gfx.root_cpu = desc->uploaded_root.cpu;
+            if (agx_chip_g17_m5(dev->dev.chip))
+               hk_root_fragment_snapshot_publish(&cmd->state.gfx,
+                                                 desc->uploaded_root.cpu, root);
+         }
          hk_upload_stat(cmd, root_reuses, 1);
          return desc->uploaded_root.gpu;
       }
@@ -187,6 +195,35 @@ hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id)
       return;
    hk_upload_stat(cmd, draw_id_uploads, 1);
    hk_upload_stat(cmd, draw_id_bytes, sizeof(draw_id));
+}
+
+uint64_t
+hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
+                          VkDispatchIndirectCommand group_count)
+{
+   const uint32_t hash =
+      ((group_count.x * 2654435761u) ^ (group_count.y * 2246822519u) ^
+       (group_count.z * 3266489917u)) >>
+      28;
+   struct hk_group_count_cache_entry *entry =
+      &cmd->state.group_count_cache[hash];
+   if (likely(entry->valid && entry->x == group_count.x &&
+              entry->y == group_count.y && entry->z == group_count.z))
+      return entry->addr;
+
+   const uint64_t addr =
+      hk_pool_upload(cmd, &group_count, sizeof(group_count), 8);
+   if (!addr) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return 0;
+   }
+
+   entry->x = group_count.x;
+   entry->y = group_count.y;
+   entry->z = group_count.z;
+   entry->valid = 1;
+   entry->addr = addr;
+   return addr;
 }
 
 void

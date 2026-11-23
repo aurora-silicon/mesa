@@ -539,6 +539,8 @@ struct hk_cmd_pending {
 
    /* The queue timeline point its last ioctl signals. */
    uint64_t point;
+   uint64_t fail_seq;
+   bool chunk_timelines, cumulative_outputs;
 
    unsigned count;
    struct hk_cmd_pin pins[];
@@ -681,9 +683,23 @@ enum hk_cmd_pending_state {
  * running. The status of each signalled fence is then read once and
  * remembered.
  */
-static enum hk_cmd_pending_state
-hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait)
+static bool
+hk_cmd_pending_points_cover(const struct hk_cmd_pending *p)
 {
+   return !p->cumulative_outputs && (p->attempted == 1 || p->chunk_timelines);
+}
+
+static enum hk_cmd_pending_state
+hk_cmd_pending_poll(struct hk_device *dev, struct hk_cmd_pending *p, bool wait,
+                    const uint64_t *errors)
+{
+   if (!wait && errors && hk_cmd_pending_points_cover(p) &&
+       *errors == p->fail_seq) {
+      for (unsigned i = 0; i < p->attempted; ++i)
+         p->succeeded[i] = true;
+      return HK_PENDING_SUCCEEDED;
+   }
+
    unsigned unknown_count = 0;
 
    for (unsigned i = 0; wait && i < p->attempted; ++i) {
@@ -754,6 +770,19 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
    else if (queue->cmd_stalled < HK_CMD_STALL_REAPS)
       queue->cmd_stalled++;
 
+   uint64_t errors_after_wait = 0;
+   const uint64_t *errors = NULL;
+   if (dev->fence_error_count && oldest->point <= reached) {
+      uint64_t point = reached;
+      if (!drmSyncobjTimelineWait(dev->dev.fd, &queue->drm.syncobj, &point, 1,
+                                  0, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL)) {
+         __atomic_thread_fence(__ATOMIC_ACQUIRE);
+         errors_after_wait =
+            __atomic_load_n(dev->fence_error_count, __ATOMIC_ACQUIRE);
+         errors = &errors_after_wait;
+      }
+   }
+
    unsigned polls =
       queue->cmd_stalled >= HK_CMD_STALL_REAPS ? HK_CMD_STALL_POLLS : 0;
 
@@ -763,7 +792,7 @@ hk_cmd_pending_reap_queue(struct hk_device *dev, struct hk_queue *queue,
       if (!signalled && !polls)
          break;
 
-      switch (hk_cmd_pending_poll(dev, p, !signalled)) {
+      switch (hk_cmd_pending_poll(dev, p, !signalled, errors)) {
       case HK_PENDING_BUSY:
          if (!signalled)
             polls--;
@@ -813,7 +842,8 @@ hk_cmd_pending_reap(struct hk_device *dev)
 VkResult
 hk_cmd_pending_begin(struct hk_device *dev,
                      const struct vk_queue_submit *submit, unsigned chunks,
-                     struct agx_bo *extra_bo, struct hk_cmd_pending **out)
+                     struct agx_bo *extra_bo, bool chunk_timelines,
+                     bool cumulative_outputs, struct hk_cmd_pending **out)
 {
    *out = NULL;
    hk_cmd_pending_reap(dev);
@@ -863,6 +893,11 @@ hk_cmd_pending_begin(struct hk_device *dev,
    p->count = used;
    for (unsigned i = 0; i < p->count; ++i)
       hk_cmd_pin_ref(p->pins[i]);
+
+   p->chunk_timelines = chunk_timelines;
+   p->cumulative_outputs = cumulative_outputs;
+   if (dev->fence_error_count)
+      p->fail_seq = __atomic_load_n(dev->fence_error_count, __ATOMIC_ACQUIRE);
 
    *out = p;
    return VK_SUCCESS;

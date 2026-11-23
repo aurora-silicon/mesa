@@ -415,14 +415,17 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
 }
 
 static float
-execution_weight(const nir_block *block, const void *data)
+execution_weight_agx3c(const nir_block *block, const void *data)
 {
    float weight = 1.0f;
    if (!data)
       return weight;
+   const bool is_frag = *(const bool *)data;
    for (nir_cf_node *node = block->cf_node.parent; node; node = node->parent) {
       if (node->type == nir_cf_node_if)
-         weight /= 8.0f;
+         weight /= is_frag ? 8.0f : 2.0f;
+      else if (node->type == nir_cf_node_loop && !is_frag)
+         weight *= 4.0f;
    }
    return weight;
 }
@@ -430,7 +433,7 @@ execution_weight(const nir_block *block, const void *data)
 static float
 instr_cost_agx3c(nir_instr *instr, const void *data)
 {
-   return instr_cost(instr, data) * execution_weight(instr->block, data);
+   return instr_cost(instr, data) * execution_weight_agx3c(instr->block, data);
 }
 
 static float
@@ -526,7 +529,7 @@ rewrite_cost_agx3c(nir_def *def, const void *data)
 {
    if (def->bit_size < 32 && def->num_components > 1)
       return 1e30f;
-   float weight = execution_weight(nir_def_block(def), data);
+   float weight = execution_weight_agx3c(nir_def_block(def), data);
    if (data && nir_def_instr(def)->type == nir_instr_type_phi)
       weight /= 8.0f;
    return rewrite_cost_impl(def, true) * weight;
@@ -1022,8 +1025,11 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
        * generic instruction cost there. */
       options.def_size = agx3c ? def_size_agx3c : def_size_agx3b;
       static const bool weight_fragments = true;
+      static const bool weight_compute = false;
       if (agx3c && nir->info.stage == MESA_SHADER_FRAGMENT)
          options.cb_data = &weight_fragments;
+      else if (agx3c && nir->info.stage == MESA_SHADER_COMPUTE)
+         options.cb_data = &weight_compute;
       options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }

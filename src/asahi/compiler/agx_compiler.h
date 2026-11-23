@@ -708,8 +708,9 @@ typedef struct {
    /* M5 CEM owns halves 8..15, beyond CF/shuffle/parallel-copy scratch. */
    bool agx3_cem_low_scratch;
 
-   /* The remat-only spiller had to spill a value to scratch; register
-    * allocation must finish with real spilling under the full budget. */
+   /* The remat-only spiller spilled a value to scratch. It keeps every value
+    * it cannot rematerialize in a register, so this stays false; register
+    * allocation would finish with real spilling under the full budget. */
    bool remat_fallback_spilled;
    unsigned spill_pcopy_base;
 
@@ -1274,6 +1275,7 @@ void agx_opt_promote_m5_float_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
+int agx_ilp_m5_device_load_cap(int program_peak);
 bool agx3_lower_uniform_program(agx_context *ctx);
 /* Success/refusal, not a progress flag. Call only for AGX3B preambles. */
 bool agx3_lower_cprog_inputs(agx_context *ctx);
@@ -1332,7 +1334,6 @@ bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
-void agx_ra_without_remat(agx_context *ctx);
 bool agx3_is_async(const agx_instr *I);
 unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
@@ -1508,6 +1509,80 @@ bool agx3_sink_vertex_outputs(agx_context *ctx);
 bool agx3_coalesce_uniform_half_stores(agx_context *ctx);
 
 bool agx_lower_agx3_device_atomic_sources(agx_context *ctx);
+
+static inline bool
+agx3_fcmpsel_tied_minmax(const agx_instr *I)
+{
+   return I->nr_srcs == 4 && !I->invert_cond && !I->saturate &&
+          (I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN) &&
+          agx_is_equiv(I->src[0], I->src[2]) &&
+          agx_is_equiv(I->src[1], I->src[3]) &&
+          I->src[0].size == I->src[2].size &&
+          I->src[1].size == I->src[3].size &&
+          I->src[0].abs == I->src[2].abs && I->src[0].neg == I->src[2].neg &&
+          I->src[1].abs == I->src[3].abs && I->src[1].neg == I->src[3].neg &&
+          I->src[0].memory == I->src[2].memory &&
+          I->src[1].memory == I->src[3].memory;
+}
+
+static inline bool
+agx3_fcmpsel_gpu1_reg(agx_index x, bool allow_32, bool allow_16, bool post_ra)
+{
+   const bool is_reg =
+      x.type == AGX_INDEX_REGISTER || (!post_ra && x.type == AGX_INDEX_NORMAL);
+   if (!is_reg || x.memory || agx_channels(x) != 1 || x.abs || x.neg)
+      return false;
+   if (x.size == AGX_SIZE_32)
+      return allow_32 && (!post_ra || ((x.value & 1) == 0 && x.value < 256));
+   if (x.size == AGX_SIZE_16)
+      return allow_16 && (!post_ra || x.value < 256);
+   return false;
+}
+
+static inline bool
+agx3_fcmpsel_gpu1_imm8(agx_index x)
+{
+   return x.type == AGX_INDEX_IMMEDIATE && x.value <= UINT8_MAX && !x.abs &&
+          !x.neg && !x.memory && agx_channels(x) == 1;
+}
+
+/* Shared acceptance test for the AGX3C (non-G18G) native gpu1 compare-select
+ * encoder (agx3_alu_fcmp_select32_gpu1 / agx3_alu_fcmp_select16_gpu1).
+ * Pre-RA (post_ra == false), constant materialization allows any immediate in
+ * select slots 2..3 because non-inlineable ones are materialized into half
+ * registers in the same loop; post-RA (post_ra == true), every select slot
+ * must already be an 8-bit integer immediate or a half register. */
+static inline bool
+agx3_fcmpsel_gpu1_supported(const struct agx_device_key *dev,
+                            const agx_instr *I, bool post_ra)
+{
+   if (dev->encoding != AGX_ISA_ENCODING_AGX3C || dev->emit_agx3d ||
+       I->op != AGX_OPCODE_FCMPSEL || I->nr_dests != 1 || I->nr_srcs != 4 ||
+       I->saturate || I->fcmpsel_minifloat_select)
+      return false;
+
+   if (!agx3_fcmpsel_gpu1_reg(I->dest[0], true, true, post_ra))
+      return false;
+
+   const bool cmp0_reg = agx3_fcmpsel_gpu1_reg(I->src[0], true, true, post_ra);
+   const bool cmp1_reg = agx3_fcmpsel_gpu1_reg(I->src[1], true, true, post_ra);
+   const bool cmp0_imm = agx3_fcmpsel_gpu1_imm8(I->src[0]);
+   const bool cmp1_imm = agx3_fcmpsel_gpu1_imm8(I->src[1]);
+   if (!((cmp0_reg && (cmp1_reg || cmp1_imm)) || (cmp0_imm && cmp1_reg)))
+      return false;
+
+   const bool half_dest = I->dest[0].size == AGX_SIZE_16;
+   for (unsigned s = 2; s < 4; ++s) {
+      const bool imm_ok = post_ra ? agx3_fcmpsel_gpu1_imm8(I->src[s])
+                                  : (half_dest &&
+                                     I->src[s].type == AGX_INDEX_IMMEDIATE);
+      const bool reg_ok =
+         half_dest && agx3_fcmpsel_gpu1_reg(I->src[s], false, true, post_ra);
+      if (!imm_ok && !reg_ok)
+         return false;
+   }
+   return true;
+}
 
 #ifdef __cplusplus
 } /* extern C */

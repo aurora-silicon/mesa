@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "util/dag.h"
+#include "util/u_debug.h"
 #include "agx_debug.h"
 #include "util/sparse_bitset.h"
 #include "agx_builder.h"
@@ -773,7 +774,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool place_exit_compare, bool order_edges_free,
                    signed fwd_cap, unsigned hoist_samples,
                    bool hoist_past_writes, bool hoist_loads,
-                   struct sched_dag_state *dag_state)
+                   bool loads_in_flight, struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
@@ -882,6 +883,30 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       }
    }
 
+   /* With loads_in_flight, the window starts at the number of hoisted loads
+    * whose results something scheduled has already read, so it bounds the
+    * loads in flight. Counting the loads issued instead lets every issued
+    * load extend the window, which hoists all of the block's loads to its
+    * top. */
+   const bool in_flight = hoist_samples && loads_in_flight;
+   unsigned consumed_loads = 0;
+   int *load_node = NULL;
+   bool *consumed = NULL;
+   if (in_flight) {
+      load_node = ralloc_array(memctx, int, MAX2(ctx->alloc, 1));
+      consumed = rzalloc_array(memctx, bool, n);
+      if (!load_node || !consumed)
+         return false;
+      for (unsigned v = 0; v < ctx->alloc; ++v)
+         load_node[v] = -1;
+      for (unsigned i = 0; i < n; ++i) {
+         if (ilp_is_hoisted(ctx, nodes[i]->instr, hoist_loads)) {
+            agx_foreach_ssa_dest(nodes[i]->instr, d)
+               load_node[nodes[i]->instr->dest[d].value] = i;
+         }
+      }
+   }
+
    unsigned cycle = 0;
    bool changed = false;
    for (unsigned step = 0; step < n; ++step) {
@@ -908,7 +933,9 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             better = grow < best_grow;
          else if (hoist_samples) {
             const unsigned window =
-               (hoist_past_writes ? issued_writes : issued_samples) +
+               (hoist_past_writes ? issued_writes
+                : in_flight       ? consumed_loads
+                                  : issued_samples) +
                hoist_samples;
             const bool hoist_i = first_sample[i] < window;
             const bool hoist_b = first_sample[best] < window;
@@ -943,6 +970,15 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       done[best] = true;
       order[step] = nodes[best];
       issued_samples += ilp_is_hoisted(ctx, nodes[best]->instr, hoist_loads);
+      if (in_flight) {
+         agx_foreach_ssa_src(nodes[best]->instr, si) {
+            const int l = load_node[nodes[best]->instr->src[si].value];
+            if (l >= 0 && !consumed[l]) {
+               consumed[l] = true;
+               consumed_loads++;
+            }
+         }
+      }
       issued_writes += nodes[best]->instr->op == AGX_OPCODE_IMAGE_WRITE ||
                        nodes[best]->instr->op == AGX_OPCODE_DEVICE_STORE;
       changed |= (unsigned)best != step;
@@ -1210,6 +1246,34 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
  * occupancy bucket for allocation alignment, and the register file size. */
 #define AGX_ILP_M5_OCCUPANCY_MARGIN 8
 #define AGX_ILP_M5_MAX_HALVES 256
+/* Halves a program needs free below the top of its occupancy step for the
+ * in-flight device-load windows (at least this many). */
+#define AGX_ILP_M5_LOAD_HEADROOM 16
+
+/* Register count up to which an M5 compute block may grow to keep device
+ * loads in flight, for a program whose estimated peak is program_peak halves,
+ * or 0 when such blocks keep the issue-order schedule. The loads stay inside
+ * the occupancy step the program is in, AGX_ILP_M5_OCCUPANCY_MARGIN below its
+ * top, as register allocation lands a few halves above the estimate. A
+ * program with fewer than AGX_ILP_M5_LOAD_HEADROOM halves free below the top
+ * of its step keeps the issue-order schedule, since allocation can then cross
+ * into the next step even when the estimate does not grow; so does a program
+ * in the last step, where crossing the top spills.
+ */
+int
+agx_ilp_m5_device_load_cap(int program_peak)
+{
+   if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > AGX_ILP_M5_MAX_HALVES)
+      return 0;
+
+   const int step_top =
+      agx_occupancy_for_register_count(program_peak).max_registers;
+   if (program_peak + AGX_ILP_M5_LOAD_HEADROOM > step_top ||
+       step_top >= AGX_ILP_M5_MAX_HALVES)
+      return 0;
+
+   return step_top - AGX_ILP_M5_OCCUPANCY_MARGIN;
+}
 
 /* Absolute peak register pressure of a block in source order, in halves:
  * its live-out values plus the relative peak walking back from them. */
@@ -1272,17 +1336,24 @@ agx_ilp_schedule(agx_context *ctx)
    const bool m5 = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
    const bool m5_compute =
       m5 && ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble;
-   /* M5 compute uses only the sample-issue schedule below, as Apple's
-    * compute kernels issue independent samples back to back (svgfVariance:
-    * nine SMP in a row, then the accumulation).
-    *
-    * Other M5 geometry-side stages (vertex and its lowered relatives) take
+   const bool m5_sample_probe = m5_compute &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP_PROBE", false);
+   /* ASAHI_M5_ILP_PROBE keeps its whole-policy experiment. Otherwise M5
+    * compute uses only the sample-issue schedule below, as Apple's compute
+    * kernels issue independent samples back to back (svgfVariance: nine SMP
+    * in a row, then the accumulation); ASAHI_M5_SAMPLE_ILP=0 disables it. */
+   const bool m5_full = m5_compute &&
+      debug_get_bool_option("ASAHI_M5_ILP_PROBE", false);
+   const bool m5_samples = m5_compute &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
+   /* Other M5 geometry-side stages (vertex and its lowered relatives) take
     * the same occupancy-capped sample-issue schedule, but only for blocks
     * that also write memory (copy loops); everything else keeps the shared
     * AGX3 policy below. */
    const bool m5_copy = m5 && !ctx->is_preamble &&
       ctx->stage != MESA_SHADER_COMPUTE &&
-      ctx->stage != MESA_SHADER_FRAGMENT;
+      ctx->stage != MESA_SHADER_FRAGMENT &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
    /* Copy blocks the M5 sample-issue schedule newly covers: every such block
     * of those other stages, and compute loop bodies. */
    bool *copy_mode = rzalloc_array(memctx, bool, MAX2(nr_blocks, 1));
@@ -1291,7 +1362,7 @@ agx_ilp_schedule(agx_context *ctx)
       return;
    }
    bool any_copy = false;
-   if (m5_copy || m5_compute) {
+   if (m5_copy || (m5_samples && !m5_full)) {
       agx_foreach_block(ctx, block) {
          if (block->index < nr_blocks &&
              (m5_copy || in_loop[block->index]) &&
@@ -1350,11 +1421,12 @@ agx_ilp_schedule(agx_context *ctx)
    /* M5 fragments: the same occupancy-capped growth as M5 compute where it
     * exceeds the G17P fragment slack below. */
    const bool m5_fragment = m5 && !ctx->is_preamble &&
-      ctx->stage == MESA_SHADER_FRAGMENT;
+      ctx->stage == MESA_SHADER_FRAGMENT &&
+      debug_get_bool_option("ASAHI_M5_SAMPLE_ILP", true);
 
    uint8_t *size16 = NULL;
-   signed m5_occupancy_cap = 0;
-   if (m5_compute || m5_copy || m5_fragment) {
+   signed m5_occupancy_cap = 0, m5_load_cap = 0;
+   if ((m5_samples && !m5_full) || m5_copy || m5_fragment) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
          ralloc_free(memctx);
@@ -1373,15 +1445,16 @@ agx_ilp_schedule(agx_context *ctx)
          m5_occupancy_cap = agx_occupancy_for_register_count(
             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
             AGX_ILP_M5_OCCUPANCY_MARGIN;
+         m5_load_cap = agx_ilp_m5_device_load_cap(program_peak);
       }
    }
 
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
          continue;
-      /* M5 compute: only the occupancy-capped sample-issue schedule. Other
-       * M5 stages take the shared AGX3 policy below, as agx_isa_is_agx3()
-       * gates it. */
+      /* M5 compute: only the occupancy-capped sample-issue schedule (the
+       * whole policy under ASAHI_M5_ILP_PROBE). Other M5 stages take the
+       * shared AGX3 policy below, as agx_isa_is_agx3() gates it. */
       const bool copy = copy_mode[block->index];
       const bool loop_samples = loop_sample_mode[block->index];
       /* Device loads too, in and outside loops: the pressure order places
@@ -1389,11 +1462,13 @@ agx_ilp_schedule(agx_context *ctx)
        * a time, as it would for samples. A copy block keeps its own
        * schedule. M5 only: not G18G, which compiles as AGX3C with
        * emit_agx3d. */
-      const bool compute_loads = m5_compute && !ctx->key->dev.emit_agx3d &&
-                                 !copy;
+      const bool compute_loads = (m5_compute || m5_fragment) && !ctx->key->dev.emit_agx3d &&
+                                 !m5_full && (m5_samples || m5_fragment) && !copy;
       const unsigned loads = compute_loads ? ilp_block_device_loads(block) : 0;
-      if (m5_compute || copy || loop_samples) {
-         if ((!in_loop[block->index] || copy || loop_samples || loads) &&
+      if ((m5_compute && !m5_full) || (m5_fragment && loads) || copy || loop_samples) {
+         if ((m5_samples || m5_fragment || copy || loop_samples) &&
+             (!in_loop[block->index] || m5_sample_probe || copy ||
+              loop_samples || loads) &&
              ilp_block_samples(ctx, block) + loads >=
                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
                               : AGX_ILP_FS_MIN_SAMPLES)) {
@@ -1414,12 +1489,31 @@ agx_ilp_schedule(agx_context *ctx)
                growth = MAX2(growth, ilp_block_sample_halves(ctx, block) +
                                         AGX_ILP_FS_SAMPLE_SLACK);
             }
-            ilp_schedule_block(ctx, block, memctx, native_uniforms,
-                               alu_latency, 16 * alu_latency, growth, 0,
-                               false, true, AGX_ILP_FS_SAMPLE_HALVES,
-                               copy ? AGX_ILP_M5_COPY_SAMPLES
-                                    : AGX_ILP_FS_HOIST_SAMPLES,
-                               copy, loads > 0, &dag_state);
+            if (loads && m5_load_cap > 0) {
+               /* Prefer to hoist only a few device loads ahead of the oldest
+                * one no instruction has read yet: four, else two, else one,
+                * whichever first fits the program's occupancy step. This
+                * ranks candidates; register pressure and scoreboard waits
+                * remain what keeps the schedule safe. */
+               static const unsigned windows[] = {4, 2, 1};
+               const signed load_growth =
+                  m5_load_cap > peak ? m5_load_cap - peak : 0;
+               for (unsigned w = 0; w < ARRAY_SIZE(windows); ++w) {
+                  if (ilp_schedule_block(ctx, block, memctx, native_uniforms,
+                                         alu_latency, 16 * alu_latency,
+                                         load_growth, 0, false, true,
+                                         AGX_ILP_FS_SAMPLE_HALVES, windows[w],
+                                         false, true, true, &dag_state))
+                     break;
+               }
+            } else {
+               ilp_schedule_block(ctx, block, memctx, native_uniforms,
+                                  alu_latency, 16 * alu_latency, growth, 0,
+                                  false, true, AGX_ILP_FS_SAMPLE_HALVES,
+                                  copy ? AGX_ILP_M5_COPY_SAMPLES
+                                       : AGX_ILP_FS_HOIST_SAMPLES,
+                                  copy, loads > 0, false, &dag_state);
+            }
          }
          continue;
       }
@@ -1441,14 +1535,15 @@ agx_ilp_schedule(agx_context *ctx)
           !m5_ordered_memory) {
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, true, false, 0, 0, false,
-                            false, &dag_state);
+                            false, false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, true, false, 0, 0, false,
-                            false, &dag_state);
-      } else if (!in_loop[block->index] && !ctx->is_preamble &&
-                 ctx->stage == MESA_SHADER_FRAGMENT &&
+                            false, false, &dag_state);
+      } else if ((!in_loop[block->index] || m5_sample_probe) &&
+                 !ctx->is_preamble &&
+                 (ctx->stage == MESA_SHADER_FRAGMENT || m5_sample_probe) &&
                  ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.
@@ -1463,7 +1558,8 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, slack, 0, false,
                             true, AGX_ILP_FS_SAMPLE_HALVES,
-                            AGX_ILP_FS_HOIST_SAMPLES, false, false, &dag_state);
+                            AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
+                            &dag_state);
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -1476,7 +1572,8 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             16 * alu_latency, AGX_ILP_SLACK,
                             AGX_ILP_CPROG_HALVES, false, true,
-                            AGX_ILP_CPROG_HALVES - 16, 0, false, false, &dag_state);
+                            AGX_ILP_CPROG_HALVES - 16, 0, false, false, false,
+                            &dag_state);
       }
    }
 

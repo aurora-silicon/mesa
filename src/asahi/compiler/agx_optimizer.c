@@ -227,6 +227,15 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
       if (ins->op == AGX_OPCODE_FCMPSEL && s >= 2)
          continue;
 
+      /* AGX3C compare-select has no grounded abs/neg modifier on comparands;
+       * folding a preheader fneg/fabs into a loop compare forces
+       * agx_lower_m5_alu_operands() to re-materialize it inside the loop. */
+      if (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+          (ins->op == AGX_OPCODE_FCMP || ins->op == AGX_OPCODE_FCMPSEL ||
+           ins->op == AGX_OPCODE_BREAK_IF_FCMP) &&
+          s < 2 && (def->src[0].abs || def->src[0].neg || src.abs || src.neg))
+         continue;
+
       /* We can fold f2f32 into 32-bit instructions, but we can't fold f2f16
        * into 16-bit instructions, since the latter would implicitly promote to
        * a 32-bit instruction which is not exact.
@@ -1212,7 +1221,7 @@ bool
 agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond, agx_index x,
                          agx_index y, bool *result)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        x.type != AGX_INDEX_IMMEDIATE || y.type != AGX_INDEX_IMMEDIATE ||
        x.neg || y.neg)
       return false;
@@ -1408,7 +1417,7 @@ agx_select_compare_cut(const void *a, const void *b)
 static void
 agx_optimizer_select_guard(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding) ||
        I->op != AGX_OPCODE_ICMPSEL || I->saturate || I->invert_cond ||
        agx_channels(I->dest[0]) != 1)
       return;

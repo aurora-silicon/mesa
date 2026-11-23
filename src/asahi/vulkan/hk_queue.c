@@ -117,6 +117,9 @@ queue_submit_empty(struct hk_device *dev, struct hk_queue *queue,
                           "DRM_IOCTL_SYNCOBJ_TRANSFER failed: %m");
    }
 
+   if (submit->wait_count)
+      queue->drm.empty_wait_point = queue->drm.timeline_value;
+
    return queue_signal_timeline(dev, queue, submit);
 }
 
@@ -186,7 +189,7 @@ static bool
 hk_g17p_attachmentless_render(const struct hk_device *dev,
                                     const struct hk_cs *cs)
 {
-   if (dev->dev.chip != AGX_CHIP_G17P ||
+   if ((dev->dev.chip != AGX_CHIP_G17P && !agx_chip_g17_m5(dev->dev.chip)) ||
        cs->tib.sample_size_B != 0 || cs->cr.process_empty_tiles ||
        cs->cr.depth.buffer || cs->cr.depth.meta ||
        cs->cr.stencil.buffer || cs->cr.stencil.meta)
@@ -1635,6 +1638,17 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * it out again without waiting for the GPU. Pin before anything below
     * changes queue or synchronization state, so that a failed allocation
     * leaves nothing to roll back. */
+   const bool pending_chunk_timelines =
+      queue->sync.exact_prior &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS) &&
+      agx_chip_g17_m5(dev->dev.chip) &&
+      command_count > max_commands_per_submit(dev);
+   const bool pending_kernel_cumulative =
+      (dev->dev.chip == AGX_CHIP_G17P ||
+       (agx_chip_g17_m5(dev->dev.chip) &&
+        command_count <= max_commands_per_submit(dev))) &&
+      submit->signal_count > 0 &&
+      (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS);
    struct hk_cmd_pending *pending = NULL;
    const bool pin_recordings = agx_chip_g17_m5(dev->dev.chip);
    if ((pin_recordings || packed_bo) && !dev->dev.is_virtio) {
@@ -1642,7 +1656,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       unsigned chunks = 1 + (command_count - 1) / max_commands_per_submit(dev);
       VkResult pin_result = hk_cmd_pending_begin(
          dev, pin_recordings ? original : &no_recordings, chunks, packed_bo,
-         &pending);
+         pending_chunk_timelines, pending_kernel_cumulative, &pending);
       if (pin_result != VK_SUCCESS) {
          *untouched = !bound;
          return vk_error(queue, pin_result);
@@ -1677,7 +1691,10 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       dev->dev.chip == AGX_CHIP_G17P ||
       (agx_chip_g17_m5(dev->dev.chip) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES));
-   const bool kernel_cumulative = dev->dev.chip == AGX_CHIP_G17P &&
+   const bool kernel_cumulative =
+      (dev->dev.chip == AGX_CHIP_G17P ||
+       (agx_chip_g17_m5(dev->dev.chip) &&
+        command_count <= max_commands_per_submit(dev))) &&
       submit->signal_count > 0 &&
       (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS);
    const unsigned kernel_signal_count =
@@ -1699,12 +1716,32 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
       alloca((submit->wait_count + kernel_signal_count + 3) *
              sizeof(struct drm_asahi_sync));
 
+   int own_wait = -1;
    if (replaced) {
+      own_wait = wait_count;
       syncs[wait_count++] = (struct drm_asahi_sync){
          .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
          .handle = queue->drm.syncobj,
          .timeline_value = replaced_point,
       };
+   }
+
+   if (queue->drm.empty_wait_point) {
+      uint64_t done = 0;
+      if (drmSyncobjQuery(dev->dev.fd, &queue->drm.syncobj, &done, 1) == 0 &&
+          done >= queue->drm.empty_wait_point) {
+         queue->drm.empty_wait_point = 0;
+      } else if (own_wait >= 0) {
+         syncs[own_wait].timeline_value =
+            MAX2(syncs[own_wait].timeline_value, queue->drm.empty_wait_point);
+      } else {
+         own_wait = wait_count;
+         syncs[wait_count++] = (struct drm_asahi_sync){
+            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+            .handle = queue->drm.syncobj,
+            .timeline_value = queue->drm.empty_wait_point,
+         };
+      }
    }
 
    for (unsigned i = 0; i < submit->wait_count; ++i) {
@@ -2132,7 +2169,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * fragment half waits for. Every other render keeps the forms
              * below, which the kernel can publish directly. */
             const bool g17p_staged =
-               dev->dev.chip == AGX_CHIP_G17P && !queue->sync.serialize &&
+               (dev->dev.chip == AGX_CHIP_G17P ||
+                agx_chip_g17_m5(dev->dev.chip)) && !queue->sync.serialize &&
                queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2) &&
@@ -2180,7 +2218,8 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
              * already covers what it names. A staged render takes neither
              * the flag nor part in ta_cover: its tiling waits only for its
              * narrower tiling prefix. */
-            if (dev->dev.chip == AGX_CHIP_G17P && !g17p_staged &&
+            if ((dev->dev.chip == AGX_CHIP_G17P ||
+                 agx_chip_g17_m5(dev->dev.chip)) && !g17p_staged &&
                 !queue->sync.serialize && queue->sync.exact_prior &&
                 (dev->dev.params.features &
                  DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)) {
@@ -2205,7 +2244,7 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
             STATIC_ASSERT(sizeof(struct drm_asahi_cmd_render_with_stage_prior) ==
                           sizeof(struct drm_asahi_cmd_render_with_prior) + 16);
             const bool stage_cdm =
-               !stage_prefixes &&
+               !stage_prefixes && !g17p_staged &&
                agx_chip_g17_m5(dev->dev.chip) && queue->sync.exact_prior &&
                (dev->dev.params.features &
                 DRM_ASAHI_FEATURE_COMPUTE_STAGE_BARRIERS) &&
@@ -2238,7 +2277,9 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
                      .ta_prior_vdm = cs->sync.prior_ta[HK_SYNC_VDM],
                   },
                };
-               hk_gen1_render_ray_query_stages(dev, cs, staged.render.ray_query);
+               if (!agx_chip_g17_m5(dev->dev.chip))
+                  hk_gen1_render_ray_query_stages(dev, cs,
+                                                  staged.render.ray_query);
                header.size = sizeof(staged);
                util_dynarray_append(&payload, header);
                util_dynarray_append_array(&payload, uint8_t, &staged, header.size);
@@ -2292,13 +2333,18 @@ queue_submit_recordings(struct hk_device *dev, struct hk_queue *queue,
     * first submission already waits for every earlier point. */
    if (sib_remap && sib_earlier && !replaced) {
       assert(sib_target == 0);
-      memmove(&syncs[wait_count + 1], &syncs[wait_count],
-              (kernel_signal_count + 1) * sizeof(*syncs));
-      syncs[wait_count++] = (struct drm_asahi_sync){
-         .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
-         .handle = queue->drm.syncobj,
-         .timeline_value = queue->sib.last_point,
-      };
+      if (own_wait >= 0) {
+         syncs[own_wait].timeline_value =
+            MAX2(syncs[own_wait].timeline_value, queue->sib.last_point);
+      } else {
+         memmove(&syncs[wait_count + 1], &syncs[wait_count],
+                 (kernel_signal_count + 1) * sizeof(*syncs));
+         syncs[wait_count++] = (struct drm_asahi_sync){
+            .sync_type = DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ,
+            .handle = queue->drm.syncobj,
+            .timeline_value = queue->sib.last_point,
+         };
+      }
    }
 
    struct drm_asahi_submit submit_ioctl = {
@@ -2967,12 +3013,19 @@ hk_queue_share(struct hk_device *dev, struct hk_queue *queue)
    if (!agx_chip_g17_m5(dev->dev.chip))
       return;
 
+   static int async_compute_env = -1;
+   if (async_compute_env < 0)
+      async_compute_env = debug_get_bool_option("HK_G17C_ASYNC_COMPUTE", false) ? 1 : 0;
+
    vk_foreach_queue(iter, &dev->vk) {
       if (iter == &queue->vk)
          break;
       if (vk_queue_is_emulated(iter))
          continue;
       struct hk_queue *real = container_of(iter, struct hk_queue, vk);
+      if (async_compute_env &&
+          real->vk.queue_family_index != queue->vk.queue_family_index)
+         continue;
       if (real->drm.virt_ring_idx != queue->drm.virt_ring_idx ||
           real->vk.flags != queue->vk.flags)
          continue;
@@ -3064,7 +3117,8 @@ hk_queue_create(struct hk_device *dev,
    for (unsigned i = 0; i < HK_QUEUE_SIBLINGS_MAX; ++i)
       queue->sib.id[i] = UINT32_MAX;
    queue->sib.count = 1;
-   if (dev->dev.chip == AGX_CHIP_G17P && !dev->dev.is_virtio &&
+   if ((dev->dev.chip == AGX_CHIP_G17P || agx_chip_g17_m5(dev->dev.chip)) &&
+       !dev->dev.is_virtio &&
        queue->sync.exact_prior &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS) &&
        (dev->dev.params.features & DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)) {
