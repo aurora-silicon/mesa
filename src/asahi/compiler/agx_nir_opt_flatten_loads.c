@@ -5,11 +5,12 @@
 
 #include "asahi/lib/agx_abi.h"
 #include "compiler/nir/nir_builder.h"
-#include "util/set.h"
 #include "agx_nir.h"
 #include "nir.h"
 #include "nir_intrinsics.h"
 #include "nir_intrinsics_indices.h"
+#include "util/hash_table.h"
+#include "util/set.h"
 
 /*
  * Flatten small uniform ifs whose arms load from memory.
@@ -48,10 +49,15 @@
  * condition), so the result is unchanged; what the untaken arm's loads return
  * is discarded by the selects.
  *
- * Only ifs with a uniform condition whose arms are single blocks of at most
- * `limit` counted instructions and `max_loads` memory reads, both arms
- * together, are flattened: the untaken arm's work is executed too, and a
- * large arm costs more than the branch saves.
+ * Flattening handles two cases:
+ *  - Uniform ifs whose arms are single blocks of at most `limit` counted
+ *    instructions and `max_loads` memory reads, both arms together: the
+ *    untaken arm's work is executed too, so a large arm costs more than the
+ *    branch saves.
+ *  - Bursts of at least 4 sibling single-load divergent ifs in the same CF
+ *    list (each with one empty arm, one non-constant-buffer data load, and at
+ *    most MIN2(limit, 24) counted ops), where flattening replaces >= 4 serial
+ *    control-flow load-wait barriers with back-to-back overlapping loads.
  */
 
 struct flatten_options {
@@ -313,7 +319,8 @@ reads_memory(nir_intrinsic_instr *intr)
 }
 
 struct arm_cost {
-   unsigned count, loads, redirects;
+   unsigned count, loads, redirects, data_loads;
+   bool has_const_global;
 };
 
 /* Whether every instruction of `block` may run with its if's condition false
@@ -338,8 +345,14 @@ arm_is_flattenable(nir_shader *shader, nir_block *block, struct arm_cost *cost)
              (nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_ATOMIC)))
             return false;
 
+         if (is_redirectable_load(intr) &&
+             intr->intrinsic != nir_intrinsic_load_global_constant)
+            cost->data_loads++;
+
          if (load_needs_redirect(shader, intr)) {
             cost->redirects++;
+            if (intr->intrinsic == nir_intrinsic_load_global_constant)
+               cost->has_const_global = true;
          } else if (!(is_redirectable_load(intr) &&
                       (nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE)) &&
                     !nir_instr_can_speculate(instr)) {
@@ -393,6 +406,351 @@ redirect_loads(nir_builder *b, nir_block *block, nir_def *taken)
       }
       nir_src_rewrite(&intr->src[0], addr);
    }
+}
+
+static bool
+def_outside_if_arms(nir_def *def, nir_block *then_block, nir_block *else_block)
+{
+   nir_block *blk = nir_def_instr(def)->block;
+   return blk != then_block && blk != else_block;
+}
+
+static bool
+alu_op_is_commutative_int(nir_op op)
+{
+   switch (op) {
+   case nir_op_iadd:
+   case nir_op_imul:
+   case nir_op_amul:
+   case nir_op_iand:
+   case nir_op_ior:
+   case nir_op_ixor:
+   case nir_op_imin:
+   case nir_op_imax:
+   case nir_op_umin:
+   case nir_op_umax:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+same_pure_expr(nir_def *a, nir_def *b, nir_block *then_block,
+               nir_block *else_block, unsigned depth, unsigned *budget)
+{
+   if (*budget == 0)
+      return false;
+   (*budget)--;
+
+   if (a == b)
+      return def_outside_if_arms(a, then_block, else_block);
+
+   if (depth == 0 || a->bit_size != b->bit_size ||
+       a->num_components != b->num_components)
+      return false;
+
+   nir_instr *ia = nir_def_instr(a);
+   nir_instr *ib = nir_def_instr(b);
+   if (ia->type != ib->type)
+      return false;
+
+   if (ia->type == nir_instr_type_load_const) {
+      nir_load_const_instr *ca = nir_instr_as_load_const(ia);
+      nir_load_const_instr *cb = nir_instr_as_load_const(ib);
+      for (unsigned i = 0; i < a->num_components; ++i) {
+         if (nir_const_value_as_uint(ca->value[i], a->bit_size) !=
+             nir_const_value_as_uint(cb->value[i], b->bit_size))
+            return false;
+      }
+      return true;
+   }
+
+   if (ia->type != nir_instr_type_alu)
+      return false;
+
+   nir_alu_instr *aa = nir_instr_as_alu(ia);
+   nir_alu_instr *ab = nir_instr_as_alu(ib);
+   if (aa->op != ab->op || aa->fp_math_ctrl != ab->fp_math_ctrl ||
+       aa->no_signed_wrap != ab->no_signed_wrap ||
+       aa->no_unsigned_wrap != ab->no_unsigned_wrap)
+      return false;
+
+   const unsigned n = nir_op_infos[aa->op].num_inputs;
+   bool direct = true;
+   for (unsigned i = 0; i < n; ++i) {
+      unsigned comps = nir_ssa_alu_instr_src_components(aa, i);
+      if (memcmp(aa->src[i].swizzle, ab->src[i].swizzle, comps) != 0 ||
+          !same_pure_expr(aa->src[i].src.ssa, ab->src[i].src.ssa, then_block,
+                          else_block, depth - 1, budget)) {
+         direct = false;
+         break;
+      }
+   }
+   if (direct)
+      return true;
+
+   if (n == 2 && alu_op_is_commutative_int(aa->op)) {
+      unsigned c0 = nir_ssa_alu_instr_src_components(aa, 0);
+      unsigned c1 = nir_ssa_alu_instr_src_components(aa, 1);
+      if (c0 == c1 &&
+          memcmp(aa->src[0].swizzle, ab->src[1].swizzle, c0) == 0 &&
+          memcmp(aa->src[1].swizzle, ab->src[0].swizzle, c1) == 0 &&
+          same_pure_expr(aa->src[0].src.ssa, ab->src[1].src.ssa, then_block,
+                         else_block, depth - 1, budget) &&
+          same_pure_expr(aa->src[1].src.ssa, ab->src[0].src.ssa, then_block,
+                         else_block, depth - 1, budget))
+         return true;
+   }
+
+   return false;
+}
+
+static nir_def *
+clone_pure_expr(nir_builder *b, nir_def *def, nir_block *then_block,
+                nir_block *else_block, struct hash_table *remap)
+{
+   if (def_outside_if_arms(def, then_block, else_block))
+      return def;
+
+   struct hash_entry *he = _mesa_hash_table_search(remap, def);
+   if (he)
+      return he->data;
+
+   nir_instr *instr = nir_def_instr(def);
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+         clone_pure_expr(b, alu->src[i].src.ssa, then_block, else_block, remap);
+   }
+
+   nir_instr *clone = nir_instr_clone_deep(b->shader, instr, remap);
+   nir_builder_instr_insert(b, clone);
+   nir_def *res = nir_instr_def(clone);
+   _mesa_hash_table_insert(remap, def, res);
+   return res;
+}
+
+static void
+dce_pure_arm(nir_block *block)
+{
+   nir_foreach_instr_reverse_safe(instr, block) {
+      if (instr->type != nir_instr_type_alu &&
+          instr->type != nir_instr_type_load_const &&
+          instr->type != nir_instr_type_undef)
+         continue;
+      nir_def *def = nir_instr_def(instr);
+      if (def && list_is_empty(&def->uses))
+         nir_instr_remove(instr);
+   }
+}
+
+/* Sink matching terminal store_shared instructions out of a single-block
+ * if/else diamond into one store_shared(phi(v_then, v_else), saddr) after the
+ * if. This removes duplicate shared-address ALU and leaves the if with only
+ * its load arm, allowing burst flattening or peephole-select to remove the CF.
+ */
+static bool
+sink_common_store_shared(nir_builder *b, nir_block *block)
+{
+   if (nir_cf_node_is_first(&block->cf_node))
+      return false;
+
+   nir_cf_node *prev_node = nir_cf_node_prev(&block->cf_node);
+   if (prev_node->type != nir_cf_node_if)
+      return false;
+
+   nir_block *prev_block = nir_cf_node_as_block(nir_cf_node_prev(prev_node));
+   if (nir_block_ends_in_jump(prev_block))
+      return false;
+
+   nir_if *nif = nir_cf_node_as_if(prev_node);
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   if (nir_if_last_then_block(nif) != then_block ||
+       nir_if_last_else_block(nif) != else_block ||
+       nir_block_ends_in_jump(then_block) ||
+       nir_block_ends_in_jump(else_block))
+      return false;
+
+   nir_instr *then_last = nir_block_last_instr(then_block);
+   nir_instr *else_last = nir_block_last_instr(else_block);
+   if (!then_last || !else_last ||
+       then_last->type != nir_instr_type_intrinsic ||
+       else_last->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *ts = nir_instr_as_intrinsic(then_last);
+   nir_intrinsic_instr *es = nir_instr_as_intrinsic(else_last);
+   if (ts->intrinsic != nir_intrinsic_store_shared ||
+       es->intrinsic != nir_intrinsic_store_shared)
+      return false;
+
+   if ((nir_intrinsic_access(ts) | nir_intrinsic_access(es)) &
+       (ACCESS_VOLATILE | ACCESS_ATOMIC))
+      return false;
+
+   if (nir_intrinsic_base(ts) != nir_intrinsic_base(es) ||
+       nir_intrinsic_write_mask(ts) != nir_intrinsic_write_mask(es) ||
+       nir_intrinsic_align_mul(ts) != nir_intrinsic_align_mul(es) ||
+       nir_intrinsic_align_offset(ts) != nir_intrinsic_align_offset(es) ||
+       ts->src[0].ssa->bit_size != es->src[0].ssa->bit_size ||
+       ts->src[0].ssa->num_components != es->src[0].ssa->num_components ||
+       ts->src[1].ssa->bit_size != es->src[1].ssa->bit_size ||
+       ts->src[1].ssa->num_components != es->src[1].ssa->num_components)
+      return false;
+
+   unsigned expr_budget = 64;
+   if (!same_pure_expr(ts->src[1].ssa, es->src[1].ssa, then_block, else_block,
+                       8, &expr_budget))
+      return false;
+
+   b->cursor = nir_before_cf_node(&nif->cf_node);
+   struct hash_table *remap = _mesa_pointer_hash_table_create(NULL);
+   nir_def *hoisted_addr =
+      clone_pure_expr(b, ts->src[1].ssa, then_block, else_block, remap);
+   _mesa_hash_table_destroy(remap, NULL);
+
+   nir_phi_instr *phi = nir_phi_instr_create(b->shader);
+   nir_def_init(&phi->instr, &phi->def, ts->src[0].ssa->num_components,
+                ts->src[0].ssa->bit_size);
+   nir_phi_instr_add_src(phi, then_block, ts->src[0].ssa);
+   nir_phi_instr_add_src(phi, else_block, es->src[0].ssa);
+   b->cursor = nir_before_block(block);
+   nir_builder_instr_insert(b, &phi->instr);
+
+   b->cursor = nir_after_phis(block);
+   nir_store_shared(b, &phi->def, hoisted_addr,
+                    .base = nir_intrinsic_base(ts),
+                    .write_mask = nir_intrinsic_write_mask(ts),
+                    .align_mul = nir_intrinsic_align_mul(ts),
+                    .align_offset = nir_intrinsic_align_offset(ts),
+                    .access = nir_intrinsic_access(ts) &
+                              nir_intrinsic_access(es));
+
+   nir_instr_remove(&ts->instr);
+   nir_instr_remove(&es->instr);
+   dce_pure_arm(then_block);
+   dce_pure_arm(else_block);
+   return true;
+}
+
+/* Divergent small single-load guarded if eligible as part of a sibling
+ * tile-load burst (>= 4 in one CF list). Excludes load_global_constant so UBO
+ * reads remain intact for agx3_nir_lower_uniform_dma. */
+static bool
+is_divergent_burst_if(nir_shader *shader, nir_if *nif,
+                      const struct flatten_options *options)
+{
+   if (nif->control == nir_selection_control_dont_flatten ||
+       !nir_src_is_divergent(&nif->condition))
+      return false;
+
+   nir_block *prev_block = nir_cf_node_as_block(nir_cf_node_prev(&nif->cf_node));
+   if (nir_block_ends_in_jump(prev_block))
+      return false;
+
+   nir_block *then_block = nir_if_first_then_block(nif);
+   nir_block *else_block = nir_if_first_else_block(nif);
+   if (nir_if_last_then_block(nif) != then_block ||
+       nir_if_last_else_block(nif) != else_block)
+      return false;
+
+   struct arm_cost tcost = {0}, ecost = {0};
+   if (!arm_is_flattenable(shader, then_block, &tcost) ||
+       !arm_is_flattenable(shader, else_block, &ecost))
+      return false;
+
+   unsigned total_loads = tcost.loads + ecost.loads;
+   unsigned total_data_loads = tcost.data_loads + ecost.data_loads;
+   unsigned total_count = tcost.count + ecost.count;
+   bool has_const_global = tcost.has_const_global || ecost.has_const_global;
+
+   /* One data load (plus at most one speculatable descriptor load). Cap the
+    * arm at 24 counted ops (3/8 of the 64-op uniform limit): enough for a
+    * 2D/3D index + byte offset + bounds/descriptor setup (~8-16 ops) while
+    * bounding speculative untaken ALU across a multi-if burst. */
+   return total_data_loads == 1 && total_loads <= 2 &&
+          total_loads <= options->max_loads &&
+          total_count <= MIN2(options->limit, 24u) && !has_const_global &&
+          (tcost.count == 0 || ecost.count == 0);
+}
+
+static bool
+block_breaks_burst_run(nir_block *block)
+{
+   nir_foreach_instr(instr, block) {
+      switch (instr->type) {
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+      case nir_instr_type_phi:
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_store_shared) {
+            if (nir_intrinsic_access(intr) & ACCESS_VOLATILE)
+               return true;
+            break;
+         }
+         if (nir_intrinsic_can_reorder(intr))
+            break;
+         return true;
+      }
+      default:
+         return true;
+      }
+   }
+   return false;
+}
+
+static void
+flush_burst_run(struct set *burst_ifs, nir_if **run, unsigned *run_len)
+{
+   /* Require a contiguous run of >= 4 guarded loads (separated only by pure
+    * ALU or non-volatile store_shared, with no barriers or other CF nodes)
+    * before speculatively flattening divergent ifs: isolated 1-3 loads rarely
+    * amortize zero-page redirection on cold lanes, whereas >= 4 consecutive
+    * tile loads remove >= 4 serial load-wait barriers so global latencies
+    * overlap back-to-back and common tile-address ALU can hoist. */
+   if (*run_len >= 4) {
+      for (unsigned i = 0; i < *run_len; ++i)
+         _mesa_set_add(burst_ifs, run[i]);
+   }
+   *run_len = 0;
+}
+
+static void
+collect_burst_ifs(nir_shader *shader, struct exec_list *cf_list,
+                  const struct flatten_options *options, struct set *burst_ifs)
+{
+   nir_if *run[64];
+   unsigned run_len = 0;
+
+   foreach_list_typed(nir_cf_node, node, node, cf_list) {
+      if (node->type == nir_cf_node_block) {
+         if (block_breaks_burst_run(nir_cf_node_as_block(node)))
+            flush_burst_run(burst_ifs, run, &run_len);
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         if (is_divergent_burst_if(shader, nif, options)) {
+            if (run_len < ARRAY_SIZE(run)) {
+               run[run_len++] = nif;
+            } else {
+               _mesa_set_add(burst_ifs, nif);
+            }
+         } else {
+            flush_burst_run(burst_ifs, run, &run_len);
+         }
+         collect_burst_ifs(shader, &nif->then_list, options, burst_ifs);
+         collect_burst_ifs(shader, &nif->else_list, options, burst_ifs);
+      } else if (node->type == nir_cf_node_loop) {
+         flush_burst_run(burst_ifs, run, &run_len);
+         collect_burst_ifs(shader, &nir_cf_node_as_loop(node)->body, options,
+                           burst_ifs);
+      }
+   }
+   flush_burst_run(burst_ifs, run, &run_len);
 }
 
 /* Match val == base + delta via 1..4 chained constant-offset iadd ops. */
@@ -582,7 +940,7 @@ collect_binary_tail_ifs(struct exec_list *cf_list, struct set *skip_ifs)
 static bool
 flatten_block(nir_builder *b, nir_block *block,
               const struct flatten_options *options,
-              const struct set *skip_ifs)
+              const struct set *burst_ifs, const struct set *skip_ifs)
 {
    if (nir_cf_node_is_first(&block->cf_node))
       return false;
@@ -595,13 +953,16 @@ flatten_block(nir_builder *b, nir_block *block,
    if (nir_block_ends_in_jump(prev_block))
       return false;
 
-   /* Only branches every lane takes the same way: a divergent if may run
-    * neither arm or one arm for a whole subgroup, and flattening it would run
-    * both every time. */
+   /* Flatten branches every lane takes the same way, plus bursts of >= 4
+    * sibling small single-load guarded ifs (such as tile-loading loops) where
+    * per-load control-flow barriers serialize memory latency. */
    nir_if *nif = nir_cf_node_as_if(prev_node);
    if (nif->control == nir_selection_control_dont_flatten ||
-       _mesa_set_search(skip_ifs, nif) != NULL ||
-       nir_src_is_divergent(&nif->condition))
+       _mesa_set_search(skip_ifs, nif) != NULL)
+      return false;
+
+   const bool in_burst = _mesa_set_search(burst_ifs, nif) != NULL;
+   if (nir_src_is_divergent(&nif->condition) && !in_burst)
       return false;
 
    nir_block *then_block = nir_if_first_then_block(nif);
@@ -615,8 +976,10 @@ flatten_block(nir_builder *b, nir_block *block,
        !arm_is_flattenable(b->shader, else_block, &cost))
       return false;
 
-   /* Ifs without loads to redirect are peephole select's. */
-   if (cost.redirects == 0 || cost.loads > options->max_loads ||
+   /* Uniform ifs without loads to redirect are peephole select's; burst ifs
+    * may hold speculatable data loads that peephole select skips when
+    * indirect_load_ok is false. */
+   if ((!in_burst && cost.redirects == 0) || cost.loads > options->max_loads ||
        cost.count > options->limit)
       return false;
 
@@ -663,18 +1026,26 @@ agx_nir_opt_flatten_loads(nir_shader *shader, unsigned limit,
    bool progress = false;
 
    nir_foreach_function_impl(impl, shader) {
+      nir_builder b = nir_builder_create(impl);
+      bool sunk = false;
+      nir_foreach_block_safe(block, impl)
+         sunk |= sink_common_store_shared(&b, block);
+      if (sunk)
+         nir_progress(true, impl, nir_metadata_control_flow);
+
       nir_metadata_require(impl, nir_metadata_divergence);
+      struct set *burst_ifs = _mesa_pointer_set_create(NULL);
       struct set *skip_ifs = _mesa_pointer_set_create(NULL);
+      collect_burst_ifs(shader, &impl->body, &options, burst_ifs);
       collect_binary_tail_ifs(&impl->body, skip_ifs);
 
-      nir_builder b = nir_builder_create(impl);
-      bool impl_progress = false;
-
+      bool flattened = false;
       nir_foreach_block_safe(block, impl)
-         impl_progress |= flatten_block(&b, block, &options, skip_ifs);
+         flattened |= flatten_block(&b, block, &options, burst_ifs, skip_ifs);
 
       _mesa_set_destroy(skip_ifs, NULL);
-      progress |= nir_progress(impl_progress, impl, nir_metadata_none);
+      _mesa_set_destroy(burst_ifs, NULL);
+      progress |= nir_progress(sunk || flattened, impl, nir_metadata_none);
    }
 
    return progress;
