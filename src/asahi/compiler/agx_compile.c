@@ -10509,6 +10509,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (jammed)
          agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
 
+      bool interior_unswitched = false;
+      NIR_PASS(interior_unswitched, nir, agx_nir_opt_unswitch_interior_bounds);
+      if (interior_unswitched)
+         agx_optimize_loop_nir(nir, m5, g17p, agx3_unroll);
+
       bool unrolled = false;
       NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
                320, m5_unroll_widest);

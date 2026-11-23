@@ -2719,6 +2719,7 @@ struct NirExecResult {
    uint32_t out_sum = 0;
    uint32_t iters = 0;
    bool hit_step_limit = false;
+   bool faulted = false;
 };
 
 /* Minimal structured-CF NIR interpreter for testing runtime loop unrolling
@@ -2742,7 +2743,7 @@ exec_loop_nir(nir_shader *shader, uint32_t start_val, uint32_t bound_val,
    std::function<bool(struct exec_list *)> run_list =
       [&](struct exec_list *list) -> bool {
       foreach_list_typed(nir_cf_node, node, node, list) {
-         if (res.hit_step_limit)
+         if (res.hit_step_limit || res.faulted)
             return true;
          switch (node->type) {
          case nir_cf_node_block: {
@@ -2834,7 +2835,8 @@ exec_loop_nir(nir_shader *shader, uint32_t start_val, uint32_t bound_val,
                         res.hit_step_limit = true;
                         return true;
                      }
-                     vals[&intr->def] = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     uint32_t v = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     vals[&intr->def] = intr->def.bit_size == 8 ? (v & 0xffu) : v;
                      break;
                   }
                   case nir_intrinsic_store_agx: {
@@ -3517,4 +3519,1146 @@ TEST(AGX3VisionOpts, BinaryTailChunksSkippedLocallyWithoutDontFlatten)
    EXPECT_FALSE(agx_nir_opt_flatten_loads(b.shader, 48, 4));
 
    ralloc_free(b.shader);
+}
+
+/* Generalized NIR interpreter for interior bounds unswitching tests:
+ * reads 32-bit inputs from push_constant[0, 4, 8, 12, ...]. */
+static NirExecResult
+exec_stencil_nir(nir_shader *shader, const std::vector<uint32_t> &pc,
+                 unsigned max_iters = 512,
+                 const std::unordered_map<uint64_t, uint32_t> *const_mem = nullptr)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(shader);
+   std::unordered_map<nir_def *, uint64_t> vals;
+   std::unordered_map<nir_def *, uint64_t> regs;
+   NirExecResult res;
+   nir_block *prev_block = NULL;
+
+   auto get_val = [&](nir_def *d) -> uint64_t {
+      auto it = vals.find(d);
+      EXPECT_NE(it, vals.end()) << "missing SSA value";
+      return it != vals.end() ? it->second : 0;
+   };
+
+   std::function<bool(struct exec_list *)> run_list =
+      [&](struct exec_list *list) -> bool {
+      foreach_list_typed(nir_cf_node, node, node, list) {
+         if (res.hit_step_limit)
+            return true;
+         switch (node->type) {
+         case nir_cf_node_block: {
+            nir_block *blk = nir_cf_node_as_block(node);
+            std::vector<std::pair<nir_def *, uint64_t>> phi_updates;
+            nir_foreach_instr(instr, blk) {
+               if (instr->type == nir_instr_type_phi) {
+                  nir_phi_instr *phi = nir_instr_as_phi(instr);
+                  nir_phi_src *ps = nir_phi_get_src_from_block(phi, prev_block);
+                  EXPECT_NE(ps, nullptr);
+                  if (ps)
+                     phi_updates.push_back({&phi->def, get_val(ps->src.ssa)});
+                  continue;
+               }
+               if (!phi_updates.empty()) {
+                  for (auto &kv : phi_updates)
+                     vals[kv.first] = kv.second;
+                  phi_updates.clear();
+               }
+               switch (instr->type) {
+               case nir_instr_type_load_const: {
+                  nir_load_const_instr *lc = nir_instr_as_load_const(instr);
+                  vals[&lc->def] = nir_const_value_as_uint(lc->value[0], lc->def.bit_size);
+                  break;
+               }
+               case nir_instr_type_undef: {
+                  nir_undef_instr *u = nir_instr_as_undef(instr);
+                  vals[&u->def] = 0;
+                  break;
+               }
+               case nir_instr_type_alu: {
+                  nir_alu_instr *alu = nir_instr_as_alu(instr);
+                  if (alu->op == nir_op_imadshl_agx) {
+                     uint32_t a = (uint32_t)get_val(alu->src[0].src.ssa);
+                     uint32_t b = (uint32_t)get_val(alu->src[1].src.ssa);
+                     uint32_t c = (uint32_t)get_val(alu->src[2].src.ssa);
+                     uint32_t sh = (uint32_t)get_val(alu->src[3].src.ssa);
+                     vals[&alu->def] = (uint32_t)((uint32_t)(a * b) + (c << sh));
+                     break;
+                  }
+                  const nir_op_info *info = &nir_op_infos[alu->op];
+                  nir_const_value src_arr[4][NIR_MAX_VEC_COMPONENTS] = {};
+                  nir_const_value *srcs[4];
+                  for (unsigned i = 0; i < info->num_inputs; ++i) {
+                     unsigned bs = alu->src[i].src.ssa->bit_size;
+                     src_arr[i][0] = nir_const_value_for_uint(get_val(alu->src[i].src.ssa), bs);
+                     srcs[i] = src_arr[i];
+                  }
+                  unsigned eval_bs = 0;
+                  if (!nir_alu_type_get_type_size(info->output_type)) {
+                     eval_bs = alu->def.bit_size;
+                  } else {
+                     for (unsigned i = 0; i < info->num_inputs; ++i) {
+                        if (!nir_alu_type_get_type_size(info->input_types[i])) {
+                           eval_bs = alu->src[i].src.ssa->bit_size;
+                           break;
+                        }
+                     }
+                     if (!eval_bs)
+                        eval_bs = alu->def.bit_size;
+                  }
+                  nir_const_value dest[NIR_MAX_VEC_COMPONENTS] = {};
+                  uint16_t poison = 0;
+                  nir_eval_const_opcode(alu->op, dest, &poison, 1, eval_bs, srcs, 0);
+                  vals[&alu->def] = nir_const_value_as_uint(dest[0], alu->def.bit_size);
+                  break;
+               }
+               case nir_instr_type_intrinsic: {
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+                  switch (intr->intrinsic) {
+                  case nir_intrinsic_load_push_constant: {
+                     uint32_t off = (uint32_t)get_val(intr->src[0].ssa) + nir_intrinsic_base(intr);
+                     uint32_t idx = off / 4;
+                     vals[&intr->def] = idx < pc.size() ? pc[idx] : 0;
+                     break;
+                  }
+                  case nir_intrinsic_load_preamble:
+                     vals[&intr->def] = 0;
+                     break;
+                  case nir_intrinsic_load_global_constant: {
+                     uint64_t addr = get_val(intr->src[0].ssa);
+                     if (!const_mem || const_mem->find(addr) == const_mem->end()) {
+                        res.faulted = true;
+                        return true;
+                     }
+                     vals[&intr->def] = const_mem->at(addr);
+                     break;
+                  }
+                  case nir_intrinsic_decl_reg:
+                     regs[&intr->def] = 0;
+                     break;
+                  case nir_intrinsic_load_reg:
+                     vals[&intr->def] = regs[intr->src[0].ssa];
+                     break;
+                  case nir_intrinsic_store_reg:
+                     regs[intr->src[1].ssa] = get_val(intr->src[0].ssa);
+                     break;
+                  case nir_intrinsic_load_agx: {
+                     uint32_t idx = (uint32_t)get_val(intr->src[1].ssa);
+                     res.iters++;
+                     if (res.iters > max_iters) {
+                        res.hit_step_limit = true;
+                        return true;
+                     }
+                     uint32_t v = (idx * 2654435761u) ^ 0x5a5a5a5au;
+                     vals[&intr->def] = intr->def.bit_size == 8 ? (v & 0xffu) : v;
+                     break;
+                  }
+                  case nir_intrinsic_store_agx:
+                     res.out_sum = (uint32_t)get_val(intr->src[0].ssa);
+                     break;
+                  default:
+                     ADD_FAILURE() << "unexpected intrinsic " << nir_intrinsic_infos[intr->intrinsic].name;
+                     break;
+                  }
+                  break;
+               }
+               case nir_instr_type_jump: {
+                  nir_jump_instr *j = nir_instr_as_jump(instr);
+                  EXPECT_EQ(j->type, nir_jump_break);
+                  prev_block = blk;
+                  return true;
+               }
+               default:
+                  ADD_FAILURE() << "unexpected instr type";
+                  break;
+               }
+            }
+            for (auto &kv : phi_updates)
+               vals[kv.first] = kv.second;
+            prev_block = blk;
+            break;
+         }
+         case nir_cf_node_if: {
+            nir_if *nif = nir_cf_node_as_if(node);
+            bool c = (get_val(nif->condition.ssa) & 1) != 0;
+            if (run_list(c ? &nif->then_list : &nif->else_list))
+               return true;
+            break;
+         }
+         case nir_cf_node_loop: {
+            nir_loop *loop = nir_cf_node_as_loop(node);
+            unsigned guard = 0;
+            while (!run_list(&loop->body)) {
+               if (++guard > max_iters) {
+                  res.hit_step_limit = true;
+                  return true;
+               }
+            }
+            if (res.hit_step_limit)
+               return true;
+            break;
+         }
+         default:
+            break;
+         }
+      }
+      return false;
+   };
+
+   run_list(&impl->body);
+   return res;
+}
+
+static nir_shader *
+make_1d_interior_bounds_shader(int form)
+{
+   nir_builder b = make_compute_shader("interior_1d");
+   nir_def *bound = push_u32(&b, 0);
+   nir_def *base = push_u32(&b, 4);
+   nir_def *stride = push_u32(&b, 8);
+   nir_def *limit = push_u32(&b, 12);
+   nir_def *src = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *dst = nir_load_preamble(&b, 1, 64, .base = 4);
+
+   nir_variable *i_var = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+   nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_store_var(&b, i_var, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   nir_def *i = nir_load_var(&b, i_var);
+   nir_if *ex = nir_push_if(&b, nir_ige(&b, i, bound));
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, ex);
+
+   nir_def *coord = nir_iadd(&b, base, nir_imul(&b, i, stride));
+   nir_def *in_bounds = NULL;
+   if (form == 1) {
+      nir_if *sc = nir_push_if(&b, nir_ige_imm(&b, coord, 0));
+      nir_def *t = nir_ilt(&b, coord, limit);
+      nir_push_else(&b, sc);
+      nir_def *f = nir_imm_false(&b);
+      nir_pop_if(&b, sc);
+      in_bounds = nir_if_phi(&b, t, f);
+   } else if (form == 2) {
+      in_bounds = nir_bcsel(&b, nir_ige_imm(&b, coord, 0),
+                            nir_ilt(&b, coord, limit), nir_imm_false(&b));
+   } else if (form == 3) {
+      in_bounds = nir_iand(&b, nir_ige_imm(&b, coord, 0),
+                           nir_ilt(&b, coord, limit));
+   } else {
+      in_bounds = nir_ult(&b, coord, limit);
+   }
+
+   nir_if *guard = nir_push_if(&b, in_bounds);
+   {
+      nir_def *v = nir_load_agx(
+         &b, 1, 32, src, coord,
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .format = PIPE_FORMAT_R32_UINT);
+      nir_def *w = nir_iadd(&b, nir_imul_imm(&b, v, 3), i);
+      nir_def *s = nir_iadd(&b, nir_load_var(&b, acc_var), nir_ixor(&b, w, coord));
+      nir_store_var(&b, acc_var, s, 1);
+   }
+   nir_pop_if(&b, guard);
+
+   nir_store_var(&b, i_var, nir_iadd_imm(&b, i, 1), 1);
+   nir_pop_loop(&b, loop);
+
+   nir_store_agx(&b, nir_load_var(&b, acc_var), dst, nir_imm_int(&b, 0),
+                 .access = ACCESS_NON_READABLE, .format = PIPE_FORMAT_R32_UINT);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+   return b.shader;
+}
+
+static nir_shader *
+make_2d_interior_bounds_shader(bool inner_entry_guard = false)
+{
+   nir_builder b = make_compute_shader("interior_2d");
+   nir_def *kh = push_u32(&b, 0);
+   nir_def *kw = push_u32(&b, 4);
+   nir_def *oy = push_u32(&b, 8);
+   nir_def *sy = push_u32(&b, 12);
+   nir_def *py = push_u32(&b, 16);
+   nir_def *dy = push_u32(&b, 20);
+   nir_def *ih = push_u32(&b, 24);
+   nir_def *bx = push_u32(&b, 28);
+   nir_def *dx = push_u32(&b, 32);
+   nir_def *iw = push_u32(&b, 36);
+   nir_def *src = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *dst = nir_load_preamble(&b, 1, 64, .base = 4);
+
+   nir_variable *acc_var = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+   nir_store_var(&b, acc_var, nir_imm_int(&b, 0), 1);
+
+   nir_def *entry_cond = inner_entry_guard
+                            ? nir_igt_imm(&b, kh, 0)
+                            : nir_iand(&b, nir_igt_imm(&b, kh, 0),
+                                       nir_igt_imm(&b, kw, 0));
+   nir_if *pos = nir_push_if(&b, entry_cond);
+   {
+      nir_variable *ky_var = nir_local_variable_create(b.impl, glsl_uint_type(), "ky");
+      nir_store_var(&b, ky_var, nir_imm_int(&b, 0), 1);
+
+      nir_loop *yloop = nir_push_loop(&b);
+      nir_def *ky = nir_load_var(&b, ky_var);
+      nir_def *iy_part = nir_imadshl_agx(&b, dy, ky, py, nir_imm_int(&b, 0));
+      nir_def *iy = nir_imadshl_agx(&b, oy, sy, iy_part, nir_imm_int(&b, 0));
+
+      nir_if *ysc = nir_push_if(&b, nir_ige_imm(&b, iy, 0));
+      nir_def *yoob = nir_ige(&b, iy, ih);
+      nir_push_else(&b, ysc);
+      nir_def *yt = nir_imm_true(&b);
+      nir_pop_if(&b, ysc);
+      nir_def *yin = nir_inot(&b, nir_if_phi(&b, yoob, yt));
+
+      nir_if *yguard = nir_push_if(&b, yin);
+      {
+         nir_if *kw_guard = inner_entry_guard
+                               ? nir_push_if(&b, nir_igt_imm(&b, kw, 0))
+                               : NULL;
+         nir_variable *kx_var = nir_local_variable_create(b.impl, glsl_uint_type(), "kx");
+         nir_store_var(&b, kx_var, nir_imm_int(&b, 0), 1);
+
+         nir_loop *xloop = nir_push_loop(&b);
+         nir_def *kx = nir_load_var(&b, kx_var);
+         nir_def *ix = nir_imadshl_agx(&b, dx, kx, bx, nir_imm_int(&b, 0));
+
+         nir_if *xsc = nir_push_if(&b, nir_ige_imm(&b, ix, 0));
+         nir_def *xoob = nir_ige(&b, ix, iw);
+         nir_push_else(&b, xsc);
+         nir_def *xt = nir_imm_true(&b);
+         nir_pop_if(&b, xsc);
+         nir_def *xin = nir_inot(&b, nir_if_phi(&b, xoob, xt));
+
+         nir_if *xguard = nir_push_if(&b, xin);
+         {
+            nir_def *idx = nir_iadd(&b, nir_imul(&b, iy, iw), ix);
+            nir_def *v = nir_load_agx(
+               &b, 1, 32, src, idx,
+               .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+               .format = PIPE_FORMAT_R32_UINT);
+            nir_def *mix = nir_ixor(&b, nir_imul_imm(&b, v, 5), nir_iadd(&b, ky, kx));
+            nir_store_var(&b, acc_var, nir_iadd(&b, nir_load_var(&b, acc_var), mix), 1);
+         }
+         nir_pop_if(&b, xguard);
+
+         nir_def *kx_next = nir_iadd_imm(&b, kx, 1);
+         nir_store_var(&b, kx_var, kx_next, 1);
+         nir_if *xex = nir_push_if(&b, nir_ige(&b, kx_next, kw));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, xex);
+         nir_pop_loop(&b, xloop);
+         if (kw_guard)
+            nir_pop_if(&b, kw_guard);
+      }
+      nir_pop_if(&b, yguard);
+
+      nir_def *ky_next = nir_iadd_imm(&b, ky, 1);
+      nir_store_var(&b, ky_var, ky_next, 1);
+      nir_if *yex = nir_push_if(&b, nir_ige(&b, ky_next, kh));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, yex);
+      nir_pop_loop(&b, yloop);
+   }
+   nir_pop_if(&b, pos);
+
+   nir_store_agx(&b, nir_load_var(&b, acc_var), dst, nir_imm_int(&b, 0),
+                 .access = ACCESS_NON_READABLE, .format = PIPE_FORMAT_R32_UINT);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+   return b.shader;
+}
+
+TEST(AGX3VisionOpts, InteriorBoundsUnswitch1DAnd2DForms)
+{
+   for (int form = 1; form <= 4; ++form) {
+      nir_shader *s = make_1d_interior_bounds_shader(form);
+      EXPECT_TRUE(agx_nir_opt_unswitch_interior_bounds(s)) << "form=" << form;
+      nir_validate_shader(s, "after interior 1d");
+      EXPECT_EQ(count_loops(s), 2u) << "form=" << form;
+
+      unsigned branchless = 0, marked_fallback = 0;
+      nir_function_impl *impl = nir_shader_get_entrypoint(s);
+      std::function<void(struct exec_list *)> walk = [&](struct exec_list *list) {
+         foreach_list_typed(nir_cf_node, n, node, list) {
+            if (n->type == nir_cf_node_loop) {
+               nir_loop *lp = nir_cf_node_as_loop(n);
+               unsigned nifs = 0;
+               foreach_list_typed(nir_cf_node, cn, node, &lp->body) {
+                  if (cn->type == nir_cf_node_if)
+                     nifs++;
+               }
+               if (nifs == 1 && !lp->partially_unrolled)
+                  branchless++;
+               if (lp->partially_unrolled)
+                  marked_fallback++;
+            } else if (n->type == nir_cf_node_if) {
+               walk(&nir_cf_node_as_if(n)->then_list);
+               walk(&nir_cf_node_as_if(n)->else_list);
+            }
+         }
+      };
+      walk(&impl->body);
+      EXPECT_EQ(branchless, 1u) << "form=" << form;
+      EXPECT_EQ(marked_fallback, 1u) << "form=" << form;
+      ralloc_free(s);
+   }
+
+   nir_shader *s2 = make_2d_interior_bounds_shader();
+   EXPECT_TRUE(agx_nir_opt_unswitch_interior_bounds(s2));
+   nir_validate_shader(s2, "after interior 2d");
+   EXPECT_EQ(count_loops(s2), 4u);
+
+   unsigned fast_2d_loops = 0, fallback_loops = 0;
+   nir_function_impl *impl2 = nir_shader_get_entrypoint(s2);
+   std::function<void(struct exec_list *)> walk2 = [&](struct exec_list *list) {
+      foreach_list_typed(nir_cf_node, n, node, list) {
+         if (n->type == nir_cf_node_loop) {
+            nir_loop *lp = nir_cf_node_as_loop(n);
+            unsigned nifs = 0;
+            foreach_list_typed(nir_cf_node, cn, node, &lp->body) {
+               if (cn->type == nir_cf_node_if)
+                  nifs++;
+            }
+            if (lp->partially_unrolled)
+               fallback_loops++;
+            else if (nifs == 1)
+               fast_2d_loops++;
+            walk2(&lp->body);
+         } else if (n->type == nir_cf_node_if) {
+            walk2(&nir_cf_node_as_if(n)->then_list);
+            walk2(&nir_cf_node_as_if(n)->else_list);
+         }
+      }
+   };
+   walk2(&impl2->body);
+   EXPECT_EQ(fast_2d_loops, 2u);
+   EXPECT_EQ(fallback_loops, 2u);
+   ralloc_free(s2);
+}
+
+TEST(AGX3VisionOpts, InteriorBoundsUnswitchExecution)
+{
+   struct Case1D {
+      int32_t bound, base, stride, limit;
+   };
+   const Case1D cases1d[] = {
+      {3, 2, 1, 10},
+      {5, 1, 2, 10},
+      {5, 0, 2, 9},
+      {5, 0, 2, 8},
+      {3, -1, 1, 10},
+      {3, 8, 1, 10},
+      {0, 2, 1, 10},
+      {-2, 2, 1, 10},
+      {4, 2, 0, 10},
+      {4, 5, -1, 10},
+      {4, 2, 1, 0},
+      {4, 2, 1, -5},
+      {5, 0, 0x40000000, 10},
+      {2, 0x7fffffff, 1, 0x7fffffff},
+      {1, 0, 1, 1},
+   };
+
+   for (int form = 1; form <= 4; ++form) {
+      nir_shader *ref = make_1d_interior_bounds_shader(form);
+      nir_shader *opt = nir_shader_clone(NULL, ref);
+      ASSERT_TRUE(agx_nir_opt_unswitch_interior_bounds(opt));
+      nir_validate_shader(opt, "1d exec opt");
+
+      for (const auto &c : cases1d) {
+         std::vector<uint32_t> pc = {(uint32_t)c.bound, (uint32_t)c.base,
+                                     (uint32_t)c.stride, (uint32_t)c.limit};
+         NirExecResult r_ref = exec_stencil_nir(ref, pc);
+         NirExecResult r_opt = exec_stencil_nir(opt, pc);
+         EXPECT_FALSE(r_ref.hit_step_limit);
+         EXPECT_FALSE(r_opt.hit_step_limit);
+         EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+            << "form=" << form << " N=" << c.bound << " base=" << c.base
+            << " stride=" << c.stride << " limit=" << c.limit;
+         EXPECT_EQ(r_opt.iters, r_ref.iters)
+            << "form=" << form << " N=" << c.bound << " base=" << c.base
+            << " stride=" << c.stride << " limit=" << c.limit;
+      }
+      ralloc_free(ref);
+      ralloc_free(opt);
+   }
+
+   for (bool inner_guard : {false, true}) {
+   nir_shader *ref2 = make_2d_interior_bounds_shader(inner_guard);
+   nir_shader *opt2 = nir_shader_clone(NULL, ref2);
+   ASSERT_TRUE(agx_nir_opt_unswitch_interior_bounds(opt2));
+   nir_validate_shader(opt2, "2d exec opt");
+
+   struct Case2D {
+      int32_t kh, kw, oy, sy, py, dy, ih, bx, dx, iw;
+   };
+   const Case2D cases2d[] = {
+      {3, 3, 2, 1, -1, 1, 8, 2, 1, 8},
+      {5, 5, 3, 1, -2, 1, 10, 2, 1, 10},
+      {3, 3, 0, 1, -1, 1, 8, 2, 1, 8},
+      {3, 3, 2, 1, -1, 1, 8, -1, 1, 8},
+      {3, 3, 7, 1, -1, 1, 8, 6, 1, 8},
+      {5, 5, 1, 2, -1, 2, 12, 1, 2, 12},
+      {0, 3, 2, 1, -1, 1, 8, 2, 1, 8},
+      {3, 0, 2, 1, -1, 1, 8, 2, 1, 8},
+      {5, 3, 1, 1, 0, 0x40000000, 10, 1, 1, 10},
+      {3, 5, 1, 1, 0, 1, 10, 0, 0x40000000, 10},
+   };
+   for (const auto &c : cases2d) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)c.kh, (uint32_t)c.kw, (uint32_t)c.oy, (uint32_t)c.sy,
+         (uint32_t)c.py, (uint32_t)c.dy, (uint32_t)c.ih, (uint32_t)c.bx,
+         (uint32_t)c.dx, (uint32_t)c.iw,
+      };
+      NirExecResult r_ref = exec_stencil_nir(ref2, pc);
+      NirExecResult r_opt = exec_stencil_nir(opt2, pc);
+      EXPECT_FALSE(r_ref.hit_step_limit);
+      EXPECT_FALSE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+         << "kh=" << c.kh << " kw=" << c.kw << " oy=" << c.oy << " bx=" << c.bx;
+      EXPECT_EQ(r_opt.iters, r_ref.iters)
+         << "kh=" << c.kh << " kw=" << c.kw << " oy=" << c.oy << " bx=" << c.bx;
+   }
+   ralloc_free(ref2);
+   ralloc_free(opt2);
+   }
+}
+
+
+/* Bug 1 regression: 2D interior-bounds check where both outer (y) and inner (x)
+ * limits come from the SAME in-loop load_global_constant (shared def inside the
+ * outer loop). Clones emitted inside y's chk_if must not leak into x's remap. */
+TEST(AGX3VisionOpts, InteriorBounds2DSharedInLoopConstLimit)
+{
+   auto build_2d_shared_limit = [&]() -> nir_shader * {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "stencil_2d_shared_lim");
+      auto pc = [&](unsigned idx) {
+         return nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                       .base = (int)(idx * 4), .range = 4);
+      };
+      /* pc[0]=kh, pc[1]=kw, pc[2]=base_y, pc[3]=base_x, pc[4]=addr_lo, pc[5]=addr_hi */
+      nir_def *kh = pc(0);
+      nir_def *kw = pc(1);
+      nir_def *base_y = pc(2);
+      nir_def *base_x = pc(3);
+      nir_def *addr = nir_pack_64_2x32_split(&b, pc(4), pc(5));
+      nir_def *ptr = nir_imm_int64(&b, 0x1000);
+
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_variable *ky = nir_local_variable_create(b.impl, glsl_int_type(), "ky");
+      nir_variable *kx = nir_local_variable_create(b.impl, glsl_int_type(), "kx");
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, ky, nir_imm_int(&b, 0), 1);
+
+      nir_loop *yloop = nir_push_loop(&b);
+      {
+         nir_def *yv = nir_load_var(&b, ky);
+         nir_push_if(&b, nir_ige(&b, yv, kh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         /* Shared in-loop constant load used as BOTH ih and iw! */
+         nir_def *shared_dim =
+            nir_load_global_constant(&b, 1, 32, addr, .align_mul = 4);
+         nir_def *iy = nir_iadd(&b, base_y, yv);
+         nir_def *y_in = nir_iand(&b, nir_ige_imm(&b, iy, 0),
+                                  nir_ilt(&b, iy, shared_dim));
+         nir_push_if(&b, y_in);
+         {
+            nir_store_var(&b, kx, nir_imm_int(&b, 0), 1);
+            nir_loop *xloop = nir_push_loop(&b);
+            {
+               nir_def *xv = nir_load_var(&b, kx);
+               nir_push_if(&b, nir_ige(&b, xv, kw));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, NULL);
+
+               nir_def *ix = nir_iadd(&b, base_x, xv);
+               nir_def *x_in = nir_iand(&b, nir_ige_imm(&b, ix, 0),
+                                        nir_ilt(&b, ix, shared_dim));
+               nir_push_if(&b, x_in);
+               {
+                  nir_def *idx = nir_iadd(&b, nir_imul(&b, iy, shared_dim), ix);
+                  nir_def *ld = nir_load_agx(&b, 1, 32, ptr, idx,
+                                             .format = PIPE_FORMAT_R32_UINT);
+                  nir_def *sum = nir_iadd(&b, nir_load_var(&b, acc), ld);
+                  nir_def *mix = nir_ixor(&b, sum, nir_iadd_imm(&b, idx, 7));
+                  nir_store_var(&b, acc, mix, 1);
+               }
+               nir_pop_if(&b, NULL);
+               nir_store_var(&b, kx, nir_iadd_imm(&b, xv, 1), 1);
+            }
+            nir_pop_loop(&b, xloop);
+         }
+         nir_pop_if(&b, NULL);
+         nir_store_var(&b, ky, nir_iadd_imm(&b, yv, 1), 1);
+      }
+      nir_pop_loop(&b, yloop);
+
+      nir_store_agx(&b, nir_load_var(&b, acc), ptr, nir_imm_int(&b, 0),
+                    .format = PIPE_FORMAT_R32_UINT);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "build_2d_shared_limit");
+      return b.shader;
+   };
+
+   nir_shader *ref = build_2d_shared_limit();
+   nir_shader *opt = build_2d_shared_limit();
+   ASSERT_TRUE(agx_nir_opt_unswitch_interior_bounds(opt));
+   nir_validate_shader(opt, "after 2d shared limit interior unswitch");
+
+   const uint64_t valid_addr = 0x2000;
+   std::unordered_map<uint64_t, uint32_t> mem = {{valid_addr, 16u}};
+   struct { int32_t kh, kw, by, bx; uint64_t addr; } cases[] = {
+      {3, 3, 2, 2, valid_addr},   /* interior */
+      {3, 3, 0, 14, valid_addr},  /* x border */
+      {3, 3, -1, 2, valid_addr},  /* y < 0 */
+      {0, 3, 2, 2, 0},            /* kh == 0: poison addr, must not fault */
+      {3, 0, 2, 2, valid_addr},   /* kw == 0 */
+   };
+   for (auto &tc : cases) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)tc.kh, (uint32_t)tc.kw,
+         (uint32_t)tc.by, (uint32_t)tc.bx,
+         (uint32_t)(tc.addr & 0xffffffffu), (uint32_t)(tc.addr >> 32),
+      };
+      auto r_ref = exec_stencil_nir(ref, pc, 512, &mem);
+      auto r_opt = exec_stencil_nir(opt, pc, 512, &mem);
+      EXPECT_FALSE(r_ref.faulted);
+      EXPECT_FALSE(r_opt.faulted);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum);
+      EXPECT_EQ(r_opt.iters, r_ref.iters);
+   }
+   ralloc_free(ref);
+   ralloc_free(opt);
+}
+
+/* Bug 2 regression: 2D top-tested inner loop whose base and limit come from
+ * non-speculatable load_global_constant inside the inner loop body. When kw == 0
+ * (inner trip 0) while kh > 0 and y is interior, the original loop never runs
+ * those inner-body loads, so the guard must NOT fault on a poison inner addr. */
+TEST(AGX3VisionOpts, InteriorBounds2DInLoopConstLoadsTripZero)
+{
+   auto build_2d_inner_const = [&]() -> nir_shader * {
+      nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                     &agx_nir_options,
+                                                     "stencil_2d_inner_const");
+      auto pc = [&](unsigned idx) {
+         return nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0),
+                                       .base = (int)(idx * 4), .range = 4);
+      };
+      /* pc[0]=kh, pc[1]=kw, pc[2]=base_y, pc[3]=ih, pc[4..5]=inner_base_addr,
+       * pc[6..7]=inner_lim_addr */
+      nir_def *kh = pc(0);
+      nir_def *kw = pc(1);
+      nir_def *base_y = pc(2);
+      nir_def *ih = pc(3);
+      nir_def *inner_base_addr = nir_pack_64_2x32_split(&b, pc(4), pc(5));
+      nir_def *inner_lim_addr = nir_pack_64_2x32_split(&b, pc(6), pc(7));
+      nir_def *ptr = nir_imm_int64(&b, 0x1000);
+
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_variable *ky = nir_local_variable_create(b.impl, glsl_int_type(), "ky");
+      nir_variable *kx = nir_local_variable_create(b.impl, glsl_int_type(), "kx");
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, ky, nir_imm_int(&b, 0), 1);
+
+      nir_loop *yloop = nir_push_loop(&b);
+      {
+         nir_def *yv = nir_load_var(&b, ky);
+         nir_push_if(&b, nir_ige(&b, yv, kh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_def *iy = nir_iadd(&b, base_y, yv);
+         nir_def *y_in = nir_iand(&b, nir_ige_imm(&b, iy, 0),
+                                  nir_ilt(&b, iy, ih));
+         nir_push_if(&b, y_in);
+         {
+            nir_store_var(&b, kx, nir_imm_int(&b, 0), 1);
+            nir_loop *xloop = nir_push_loop(&b);
+            {
+               nir_def *xv = nir_load_var(&b, kx);
+               nir_push_if(&b, nir_ige(&b, xv, kw));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, NULL);
+
+               /* Non-speculatable loads INSIDE top-tested inner body! */
+               nir_def *bx = nir_load_global_constant(&b, 1, 32,
+                                                      inner_base_addr,
+                                                      .align_mul = 4);
+               nir_def *ix = nir_iadd(&b, bx, xv);
+               nir_def *x_ge0 = nir_ige_imm(&b, ix, 0);
+               nir_variable *x_in_v =
+                  nir_local_variable_create(b.impl, glsl_bool_type(), "xin");
+               nir_store_var(&b, x_in_v, nir_imm_false(&b), 1);
+               nir_push_if(&b, x_ge0);
+               {
+                  nir_def *iw = nir_load_global_constant(&b, 1, 32,
+                                                         inner_lim_addr,
+                                                         .align_mul = 4);
+                  nir_store_var(&b, x_in_v, nir_ilt(&b, ix, iw), 1);
+               }
+               nir_pop_if(&b, NULL);
+
+               nir_push_if(&b, nir_load_var(&b, x_in_v));
+               {
+                  nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, iy, 32), ix);
+                  nir_def *ld = nir_load_agx(&b, 1, 32, ptr, idx,
+                                             .format = PIPE_FORMAT_R32_UINT);
+                  nir_def *sum = nir_iadd(&b, nir_load_var(&b, acc), ld);
+                  nir_def *mix = nir_ixor(&b, sum, nir_iadd_imm(&b, idx, 11));
+                  nir_store_var(&b, acc, mix, 1);
+               }
+               nir_pop_if(&b, NULL);
+               nir_store_var(&b, kx, nir_iadd_imm(&b, xv, 1), 1);
+            }
+            nir_pop_loop(&b, xloop);
+         }
+         nir_pop_if(&b, NULL);
+         nir_store_var(&b, ky, nir_iadd_imm(&b, yv, 1), 1);
+      }
+      nir_pop_loop(&b, yloop);
+
+      nir_store_agx(&b, nir_load_var(&b, acc), ptr, nir_imm_int(&b, 0),
+                    .format = PIPE_FORMAT_R32_UINT);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "build_2d_inner_const");
+      return b.shader;
+   };
+
+   nir_shader *ref = build_2d_inner_const();
+   nir_shader *opt = build_2d_inner_const();
+   ASSERT_TRUE(agx_nir_opt_unswitch_interior_bounds(opt));
+   nir_validate_shader(opt, "after 2d inner const interior unswitch");
+
+   const uint64_t addr_bx_pos = 0x3000;
+   const uint64_t addr_bx_neg = 0x3004;
+   const uint64_t addr_iw = 0x3008;
+   std::unordered_map<uint64_t, uint32_t> mem = {
+      {addr_bx_pos, 4u},
+      {addr_bx_neg, (uint32_t)-10},
+      {addr_iw, 16u},
+   };
+   struct {
+      int32_t kh, kw, by, ih;
+      uint64_t bx_addr, iw_addr;
+   } cases[] = {
+      /* Critical Bug 2 case: kh=3, y interior, kw=0 with POISON addresses 0! */
+      {3, 0, 2, 16, 0, 0},
+      /* Negative kw with poison addresses: must not fault! */
+      {3, -5, 2, 16, 0, 0},
+      /* bx < 0 with poison iw_addr: short-circuit must prevent reading iw! */
+      {3, 3, 2, 16, addr_bx_neg, 0},
+      /* Valid interior */
+      {3, 3, 2, 16, addr_bx_pos, addr_iw},
+      /* Valid border */
+      {3, 15, 2, 16, addr_bx_pos, addr_iw},
+      /* Outer trip 0 with poison addresses */
+      {0, 3, 2, 16, 0, 0},
+   };
+   for (auto &tc : cases) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)tc.kh, (uint32_t)tc.kw,
+         (uint32_t)tc.by, (uint32_t)tc.ih,
+         (uint32_t)(tc.bx_addr & 0xffffffffu), (uint32_t)(tc.bx_addr >> 32),
+         (uint32_t)(tc.iw_addr & 0xffffffffu), (uint32_t)(tc.iw_addr >> 32),
+      };
+      auto r_ref = exec_stencil_nir(ref, pc, 512, &mem);
+      auto r_opt = exec_stencil_nir(opt, pc, 512, &mem);
+      EXPECT_FALSE(r_ref.faulted) << "ref faulted for kw=" << tc.kw;
+      EXPECT_FALSE(r_opt.faulted) << "opt faulted for kw=" << tc.kw;
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum);
+      EXPECT_EQ(r_opt.iters, r_ref.iters);
+   }
+   ralloc_free(ref);
+   ralloc_free(opt);
+}
+
+
+TEST(AGX3VisionOpts, InteriorBounds2DEarlyOuterBreakTripZero)
+{
+   /* Fault-safety regression: a 2D outer loop with an early break before the
+    * outer bounds guard must NOT be unswitched, because non-speculatable outer
+    * limit and inner bound/base/limit load_global_constant instructions would
+    * otherwise be hoisted before the loop and fault when iteration 0 breaks
+    * early. */
+   auto build_early_break = [&]() {
+      nir_builder b = make_compute_shader("interior_2d_early_break");
+      nir_def *kh = push_u32(&b, 0);
+      nir_def *early_brk = push_u32(&b, 4);
+      nir_def *by = push_u32(&b, 8);
+      nir_def *ih_addr = nir_pack_64_2x32_split(&b, push_u32(&b, 12), push_u32(&b, 16));
+      nir_def *kw_addr = nir_pack_64_2x32_split(&b, push_u32(&b, 20), push_u32(&b, 24));
+      nir_def *bx_addr = nir_pack_64_2x32_split(&b, push_u32(&b, 28), push_u32(&b, 32));
+      nir_def *iw_addr = nir_pack_64_2x32_split(&b, push_u32(&b, 36), push_u32(&b, 40));
+      nir_def *ptr = nir_load_preamble(&b, 1, 64, .base = 0);
+
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_variable *ky = nir_local_variable_create(b.impl, glsl_uint_type(), "ky");
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, ky, nir_imm_int(&b, 0), 1);
+
+      nir_loop *yloop = nir_push_loop(&b);
+      {
+         nir_def *yv = nir_load_var(&b, ky);
+         nir_if *yex = nir_push_if(&b, nir_ige(&b, yv, kh));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, yex);
+
+         /* Early outer break before outer guard and inner loop. */
+         nir_if *ebrk = nir_push_if(&b, nir_ine_imm(&b, early_brk, 0));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, ebrk);
+
+         nir_def *ih = nir_load_global_constant(&b, 1, 32, ih_addr, .align_mul = 4);
+         nir_def *iy = nir_iadd(&b, by, yv);
+         nir_if *ysc = nir_push_if(&b, nir_ige_imm(&b, iy, 0));
+         nir_def *yoob = nir_ige(&b, iy, ih);
+         nir_push_else(&b, ysc);
+         nir_def *yt = nir_imm_true(&b);
+         nir_pop_if(&b, ysc);
+         nir_def *yin = nir_inot(&b, nir_if_phi(&b, yoob, yt));
+
+         nir_if *yg = nir_push_if(&b, yin);
+         {
+            nir_def *kw = nir_load_global_constant(&b, 1, 32, kw_addr, .align_mul = 4);
+            nir_variable *kx = nir_local_variable_create(b.impl, glsl_uint_type(), "kx");
+            nir_store_var(&b, kx, nir_imm_int(&b, 0), 1);
+            nir_loop *xloop = nir_push_loop(&b);
+            {
+               nir_def *xv = nir_load_var(&b, kx);
+               nir_if *xex = nir_push_if(&b, nir_ige(&b, xv, kw));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, xex);
+
+               nir_def *bx = nir_load_global_constant(&b, 1, 32, bx_addr, .align_mul = 4);
+               nir_def *iw = nir_load_global_constant(&b, 1, 32, iw_addr, .align_mul = 4);
+               nir_def *ix = nir_iadd(&b, bx, xv);
+               nir_if *xsc = nir_push_if(&b, nir_ige_imm(&b, ix, 0));
+               nir_def *xoob = nir_ige(&b, ix, iw);
+               nir_push_else(&b, xsc);
+               nir_def *xt = nir_imm_true(&b);
+               nir_pop_if(&b, xsc);
+               nir_def *xin = nir_inot(&b, nir_if_phi(&b, xoob, xt));
+
+               nir_if *xg = nir_push_if(&b, xin);
+               {
+                  nir_def *idx = nir_iadd(&b, nir_imul(&b, iy, iw), ix);
+                  nir_def *v = nir_load_agx(
+                     &b, 1, 32, ptr, idx,
+                     .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                                     ACCESS_CAN_REORDER),
+                     .format = PIPE_FORMAT_R32_UINT);
+                  nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+               }
+               nir_pop_if(&b, xg);
+               nir_store_var(&b, kx, nir_iadd_imm(&b, xv, 1), 1);
+            }
+            nir_pop_loop(&b, xloop);
+         }
+         nir_pop_if(&b, yg);
+         nir_store_var(&b, ky, nir_iadd_imm(&b, yv, 1), 1);
+      }
+      nir_pop_loop(&b, yloop);
+
+      nir_store_agx(&b, nir_load_var(&b, acc), ptr, nir_imm_int(&b, 0),
+                    .format = PIPE_FORMAT_R32_UINT);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "build_early_break");
+      return b.shader;
+   };
+
+   nir_shader *ref = build_early_break();
+   nir_shader *opt = build_early_break();
+   EXPECT_FALSE(agx_nir_opt_unswitch_interior_bounds(opt));
+   nir_validate_shader(opt, "after early outer break rejection");
+
+   const uint64_t addr_ih = 0x4000, addr_kw = 0x4004, addr_bx = 0x4008, addr_iw = 0x400c;
+   std::unordered_map<uint64_t, uint32_t> mem = {
+      {addr_ih, 16u}, {addr_kw, 3u}, {addr_bx, 2u}, {addr_iw, 16u},
+   };
+   /* Early outer break with poison addresses 0 must not fault. */
+   std::vector<uint32_t> pc_poison = {3, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0};
+   auto r_ref_p = exec_stencil_nir(ref, pc_poison, 512, &mem);
+   auto r_opt_p = exec_stencil_nir(opt, pc_poison, 512, &mem);
+   EXPECT_FALSE(r_ref_p.faulted);
+   EXPECT_FALSE(r_opt_p.faulted);
+   EXPECT_EQ(r_opt_p.out_sum, r_ref_p.out_sum);
+   EXPECT_EQ(r_opt_p.iters, 0u);
+
+   /* Normal execution without early break matches reference. */
+   std::vector<uint32_t> pc_valid = {
+      3, 0, 2,
+      (uint32_t)addr_ih, 0, (uint32_t)addr_kw, 0,
+      (uint32_t)addr_bx, 0, (uint32_t)addr_iw, 0,
+   };
+   auto r_ref_v = exec_stencil_nir(ref, pc_valid, 512, &mem);
+   auto r_opt_v = exec_stencil_nir(opt, pc_valid, 512, &mem);
+   EXPECT_FALSE(r_ref_v.faulted);
+   EXPECT_FALSE(r_opt_v.faulted);
+   EXPECT_EQ(r_opt_v.out_sum, r_ref_v.out_sum);
+   EXPECT_EQ(r_opt_v.iters, 9u);
+
+   ralloc_free(ref);
+   ralloc_free(opt);
+}
+
+TEST(AGX3VisionOpts, RotatedSmallWindow3x3And4xPeelExecution)
+{
+   /* Run interior bounds unswitch + runtime loop unrolling on a rotated 2D
+    * stencil (32-bit loads), verifying exact execution across 3x3 (fully
+    * straight-line), 4x4 (exact 4-peel skipping tail), 5x5 (4-peel + 1 tail),
+    * 6..7, 8..11 (8x main), 1..2 (scalar), rectangular, border, and wrap cases. */
+   for (unsigned factor : {8u, 4u}) {
+   nir_shader *ref = make_2d_interior_bounds_shader(factor == 4u);
+   nir_shader *opt = nir_shader_clone(NULL, ref);
+   ASSERT_TRUE(agx_nir_opt_unswitch_interior_bounds(opt));
+   unsigned widest = 0;
+   ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, factor, 320, &widest));
+   nir_opt_dead_cf(opt);
+   nir_opt_copy_prop(opt);
+   nir_opt_constant_folding(opt);
+   nir_opt_dce(opt);
+   nir_validate_shader(opt, "after rotated small-window peel");
+   EXPECT_EQ(widest, factor);
+
+   /* Verify a loop-free 3x3 straight-line branch exists (a then_list containing
+    * >= 9 load_agx instructions and 0 nested loops). */
+   bool found_3x3_straight = false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(opt);
+   std::function<unsigned(struct exec_list *, bool *)> scan =
+      [&](struct exec_list *list, bool *has_loop) -> unsigned {
+      unsigned loads = 0;
+      foreach_list_typed(nir_cf_node, n, node, list) {
+         if (n->type == nir_cf_node_block) {
+            nir_foreach_instr(instr, nir_cf_node_as_block(n)) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_agx)
+                  loads++;
+            }
+         } else if (n->type == nir_cf_node_loop) {
+            *has_loop = true;
+         } else if (n->type == nir_cf_node_if) {
+            nir_if *nif = nir_cf_node_as_if(n);
+            bool tl = false, el = false;
+            unsigned tloads = scan(&nif->then_list, &tl);
+            unsigned eloads = scan(&nif->else_list, &el);
+            if (!tl && tloads >= 9)
+               found_3x3_straight = true;
+            if (tl || el)
+               *has_loop = true;
+            loads += tloads + eloads;
+         }
+      }
+      return loads;
+   };
+   bool top_loop = false;
+   scan(&impl->body, &top_loop);
+   EXPECT_TRUE(found_3x3_straight);
+
+   struct Case2D {
+      int32_t kh, kw, oy, sy, py, dy, ih, bx, dx, iw;
+   };
+   const Case2D cases[] = {
+      {1, 1, 2, 1, 0, 1, 16, 2, 1, 16},
+      {2, 2, 2, 1, 0, 1, 16, 2, 1, 16},
+      {3, 3, 2, 1, -1, 1, 16, 2, 1, 16},        /* 3x3 straight-line */
+      {3, 4, 2, 1, -1, 1, 16, 2, 1, 16},        /* 3x4 exact 4-peel */
+      {4, 3, 2, 1, -1, 1, 16, 2, 1, 16},        /* 4x3 inner 3-peel */
+      {4, 4, 2, 1, -1, 1, 16, 2, 1, 16},        /* 4x4 exact 4-peel */
+      {5, 5, 3, 1, -2, 1, 16, 2, 1, 16},        /* 5x5 4-peel + 1 tail */
+      {3, 5, 2, 1, -1, 1, 16, 2, 1, 16},        /* 3x5 */
+      {5, 3, 3, 1, -2, 1, 16, 2, 1, 16},        /* 5x3 */
+      {6, 6, 3, 1, -2, 1, 20, 2, 1, 20},        /* 6x6 */
+      {7, 7, 3, 1, -2, 1, 20, 2, 1, 20},        /* 7x7 */
+      {8, 8, 3, 1, -2, 1, 20, 2, 1, 20},        /* 8x8 */
+      {9, 9, 3, 1, -2, 1, 20, 2, 1, 20},        /* 9x9 */
+      {3, 11, 2, 1, -1, 1, 24, 2, 1, 24},       /* 3x11 */
+      {3, 3, 0, 1, -1, 1, 16, 2, 1, 16},        /* border y */
+      {5, 5, 3, 1, -2, 1, 16, -1, 1, 16},       /* border x */
+      {0, 3, 2, 1, -1, 1, 16, 2, 1, 16},        /* kh = 0 */
+      {3, 0, 2, 1, -1, 1, 16, 2, 1, 16},        /* kw = 0 */
+      {5, 5, 1, 2, -1, 2, 24, 1, 2, 24},        /* strided + dilated 5x5 */
+   };
+   for (const auto &c : cases) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)c.kh, (uint32_t)c.kw, (uint32_t)c.oy, (uint32_t)c.sy,
+         (uint32_t)c.py, (uint32_t)c.dy, (uint32_t)c.ih, (uint32_t)c.bx,
+         (uint32_t)c.dx, (uint32_t)c.iw,
+      };
+      NirExecResult r_ref = exec_stencil_nir(ref, pc, 2048);
+      NirExecResult r_opt = exec_stencil_nir(opt, pc, 2048);
+      EXPECT_FALSE(r_ref.hit_step_limit);
+      EXPECT_FALSE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+         << "kh=" << c.kh << " kw=" << c.kw << " oy=" << c.oy << " bx=" << c.bx;
+      EXPECT_EQ(r_opt.iters, r_ref.iters)
+         << "kh=" << c.kh << " kw=" << c.kw << " oy=" << c.oy << " bx=" << c.bx;
+   }
+   ralloc_free(ref);
+   ralloc_free(opt);
+   }
+}
+
+
+TEST(AGX3VisionOpts, Rotated8BitInnerNonZeroStart)
+{
+   /* Exercise the f >= 8 && loop_has_8bit_load(inner) small-window split on a
+    * rotated 8-bit inner loop with a runtime non-zero start iv0 (both positive
+    * and negative starts, iv0 >= bound single-iteration rotated edge cases, and
+    * near-INT32_MIN/MAX boundaries) across trip counts 1..10. */
+   auto build_rot8_nonzero = [&]() {
+      nir_builder b = make_compute_shader("rot8_nonzero_start");
+      nir_def *kh = push_u32(&b, 0);
+      nir_def *kx0 = push_u32(&b, 4);
+      nir_def *kx_end = push_u32(&b, 8);
+      nir_def *src = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *dst = nir_load_preamble(&b, 1, 64, .base = 4);
+
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+
+      nir_if *pos = nir_push_if(&b, nir_igt_imm(&b, kh, 0));
+      {
+         nir_variable *ky = nir_local_variable_create(b.impl, glsl_uint_type(), "ky");
+         nir_store_var(&b, ky, nir_imm_int(&b, 0), 1);
+         nir_loop *yloop = nir_push_loop(&b);
+         {
+            nir_def *yv = nir_load_var(&b, ky);
+            nir_variable *kx = nir_local_variable_create(b.impl, glsl_uint_type(), "kx");
+            nir_store_var(&b, kx, kx0, 1);
+            nir_loop *xloop = nir_push_loop(&b);
+            {
+               nir_def *xv = nir_load_var(&b, kx);
+               nir_def *idx = nir_iadd(&b, nir_imul_imm(&b, yv, 32), xv);
+               nir_def *b8 = nir_load_agx(
+                  &b, 1, 8, src, idx,
+                  .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE |
+                                                  ACCESS_CAN_REORDER),
+                  .format = PIPE_FORMAT_R8_UINT);
+               nir_def *v = nir_u2u32(&b, b8);
+               nir_def *mix = nir_ixor(&b, nir_imul_imm(&b, v, 7), nir_iadd(&b, yv, xv));
+               nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), mix), 1);
+
+               nir_def *xnext = nir_iadd_imm(&b, xv, 1);
+               nir_store_var(&b, kx, xnext, 1);
+               nir_if *xex = nir_push_if(&b, nir_ige(&b, xnext, kx_end));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, xex);
+            }
+            nir_pop_loop(&b, xloop);
+
+            nir_def *ynext = nir_iadd_imm(&b, yv, 1);
+            nir_store_var(&b, ky, ynext, 1);
+            nir_if *yex = nir_push_if(&b, nir_ige(&b, ynext, kh));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, yex);
+         }
+         nir_pop_loop(&b, yloop);
+      }
+      nir_pop_if(&b, pos);
+
+      nir_store_agx(&b, nir_load_var(&b, acc), dst, nir_imm_int(&b, 0),
+                    .access = ACCESS_NON_READABLE, .format = PIPE_FORMAT_R32_UINT);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "build_rot8_nonzero");
+      return b.shader;
+   };
+
+   nir_shader *ref = build_rot8_nonzero();
+   nir_shader *opt = nir_shader_clone(NULL, ref);
+   unsigned widest = 0;
+   ASSERT_TRUE(agx_nir_unroll_runtime_loops(opt, 8, 320, &widest));
+   nir_opt_dead_cf(opt);
+   nir_opt_copy_prop(opt);
+   nir_opt_constant_folding(opt);
+   nir_opt_dce(opt);
+   nir_validate_shader(opt, "after rotated 8-bit non-zero start peel");
+   EXPECT_EQ(widest, 8u);
+
+   /* Verify a straight-line 3x3 8-bit branch was emitted (9+ 8-bit loads, no loop). */
+   bool found_3x3 = false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(opt);
+   std::function<unsigned(struct exec_list *, bool *)> scan =
+      [&](struct exec_list *list, bool *has_loop) -> unsigned {
+      unsigned loads = 0;
+      foreach_list_typed(nir_cf_node, n, node, list) {
+         if (n->type == nir_cf_node_block) {
+            nir_foreach_instr(instr, nir_cf_node_as_block(n)) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_agx &&
+                   nir_instr_as_intrinsic(instr)->def.bit_size == 8)
+                  loads++;
+            }
+         } else if (n->type == nir_cf_node_loop) {
+            *has_loop = true;
+         } else if (n->type == nir_cf_node_if) {
+            nir_if *nif = nir_cf_node_as_if(n);
+            bool tl = false, el = false;
+            unsigned tloads = scan(&nif->then_list, &tl);
+            unsigned eloads = scan(&nif->else_list, &el);
+            if (!tl && tloads >= 9)
+               found_3x3 = true;
+            if (tl || el)
+               *has_loop = true;
+            loads += tloads + eloads;
+         }
+      }
+      return loads;
+   };
+   bool top_loop = false;
+   scan(&impl->body, &top_loop);
+   EXPECT_TRUE(found_3x3);
+
+   struct Case {
+      int32_t kh, kx0, kx_end;
+   };
+   std::vector<Case> cases;
+   for (int32_t kh : {1, 3, 4}) {
+      for (int32_t trip = 1; trip <= 10; ++trip) {
+         cases.push_back({kh, 2, 2 + trip});
+         cases.push_back({kh, -3, -3 + trip});
+      }
+   }
+   cases.push_back({3, 5, 5});
+   cases.push_back({3, 5, 2});
+   cases.push_back({3, -1, -4});
+   cases.push_back({3, INT32_MIN, INT32_MIN + 3});
+   cases.push_back({3, INT32_MIN, INT32_MIN + 5});
+   cases.push_back({3, INT32_MAX - 3, INT32_MAX});
+   cases.push_back({3, INT32_MAX - 5, INT32_MAX});
+   cases.push_back({3, INT32_MAX - 1, INT32_MAX});
+
+   for (const auto &c : cases) {
+      std::vector<uint32_t> pc = {
+         (uint32_t)c.kh, (uint32_t)c.kx0, (uint32_t)c.kx_end,
+      };
+      auto r_ref = exec_stencil_nir(ref, pc, 2048);
+      auto r_opt = exec_stencil_nir(opt, pc, 2048);
+      EXPECT_FALSE(r_ref.hit_step_limit);
+      EXPECT_FALSE(r_opt.hit_step_limit);
+      EXPECT_EQ(r_opt.out_sum, r_ref.out_sum)
+         << "kh=" << c.kh << " kx0=" << c.kx0 << " kx_end=" << c.kx_end;
+      EXPECT_EQ(r_opt.iters, r_ref.iters)
+         << "kh=" << c.kh << " kx0=" << c.kx0 << " kx_end=" << c.kx_end;
+   }
+   ralloc_free(ref);
+   ralloc_free(opt);
 }
