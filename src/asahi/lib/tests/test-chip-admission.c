@@ -111,6 +111,14 @@ main(void)
    bad.usc_generation = 2;
    assert(!agx_params_driver_supported(&bad));
 
+   /* T6031 is held to the same ten-slot layout as T6034. */
+   bad = g15c; bad.num_cores_per_cluster = 8;
+   assert(!agx_params_driver_supported(&bad));
+   bad = g15c; bad.core_masks[1] |= UINT64_C(1) << 10;
+   assert(!agx_params_driver_supported(&bad));
+   bad = g15c; bad.core_masks[2] = 0;
+   assert(!agx_params_driver_supported(&bad));
+
    bad = g15s;
    bad.chip_id = 0x6031;
    assert(!agx_params_driver_supported(&bad));
