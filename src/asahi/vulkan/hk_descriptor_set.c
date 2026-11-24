@@ -1219,10 +1219,12 @@ static VkResult
 hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
                          struct hk_descriptor_set_layout *layout,
                          uint32_t variable_count,
-                         struct hk_descriptor_set **out_set)
+                         struct hk_descriptor_set **out_set,
+                         bool *wrote_cached)
 {
    struct hk_descriptor_set *set;
    VkResult result;
+   *wrote_cached = false;
 
    uint32_t mem_size =
       sizeof(struct hk_descriptor_set) +
@@ -1268,6 +1270,7 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
       if (agx_chip_native_agx3(dev->dev.chip)) {
          memset(set->mapped_ptr, 0, set->size);
          hk_descriptor_set_publish(set, set->mapped_ptr, set->size);
+         *wrote_cached |= set->cpu_cached;
       }
    }
 
@@ -1303,6 +1306,8 @@ hk_descriptor_set_create(struct hk_device *dev, struct hk_descriptor_pool *pool,
          write_sampled_image_view_desc(set, NULL, b, j,
                                        layout->binding[b].type);
       }
+      if (array_size > 0)
+         *wrote_cached |= set->cpu_cached;
    }
 
    list_addtail(&set->link, &pool->sets);
@@ -1320,6 +1325,7 @@ hk_AllocateDescriptorSets(VkDevice device,
    VK_FROM_HANDLE(hk_descriptor_pool, pool, pAllocateInfo->descriptorPool);
 
    VkResult result = VK_SUCCESS;
+   bool needs_fence = false;
    uint32_t i;
 
    struct hk_descriptor_set *set = NULL;
@@ -1341,11 +1347,14 @@ hk_AllocateDescriptorSets(VkDevice device,
             ? var_desc_count->pDescriptorCounts[i]
             : 0;
 
+      bool wrote_cached = false;
       result =
-         hk_descriptor_set_create(dev, pool, layout, variable_count, &set);
+         hk_descriptor_set_create(dev, pool, layout, variable_count, &set,
+                                  &wrote_cached);
       if (result != VK_SUCCESS)
          break;
 
+      needs_fence |= wrote_cached;
       pDescriptorSets[i] = hk_descriptor_set_to_handle(set);
    }
 
@@ -1355,7 +1364,7 @@ hk_AllocateDescriptorSets(VkDevice device,
       for (i = 0; i < pAllocateInfo->descriptorSetCount; i++) {
          pDescriptorSets[i] = VK_NULL_HANDLE;
       }
-   } else if (pool->cpu_cached && pAllocateInfo->descriptorSetCount > 0) {
+   } else if (needs_fence) {
       util_post_flush_fence();
    }
    return result;
