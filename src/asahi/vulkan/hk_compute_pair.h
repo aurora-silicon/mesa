@@ -86,6 +86,7 @@ struct hk_compute_pair_dispatch {
    uint32_t exec_threads[3]; /* Effective global thread counts (for CDM emit) */
    uint16_t exec_local[3];   /* Effective logical workgroup size */
    uint64_t root_va;
+   uint32_t root_size;
    uint64_t root_sets[HK_MAX_SETS];
    uint8_t push[HK_MAX_PUSH_SIZE];
    bool is_depthwise_vec4;

@@ -3178,6 +3178,7 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    memcpy(record.exec_local, selected->b.info.workgroup_size,
           sizeof(record.exec_local));
    record.root_va = desc->uploaded_root.gpu;
+   record.root_size = desc->uploaded_root.gpu ? desc->uploaded_root_size : 0;
    memcpy(record.root_sets, desc->root.sets, sizeof(record.root_sets));
    memcpy(record.push, desc->root.push, sizeof(record.push));
    record.is_depthwise_vec4 = (selected == api->depthwise_vec4);
@@ -3281,6 +3282,11 @@ hk_fused_compute_shader_eligible(const struct hk_device *dev,
    if (!hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, max_spill_B))
       return false;
    if (memcmp(s->b.info.workgroup_size, p->exec_local, sizeof(p->exec_local)))
+      return false;
+   const size_t required_root =
+      s->root_descriptor_size ? s->root_descriptor_size
+                              : sizeof(struct hk_root_descriptor_table);
+   if (p->root_size < required_root)
       return false;
    if (!p->exec_threads[0] || !p->exec_threads[1] || !p->exec_threads[2])
       return false;

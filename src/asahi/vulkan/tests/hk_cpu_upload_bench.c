@@ -10,9 +10,11 @@
 #include <time.h>
 
 #include "hk_cmd_buffer.h"
+#include "hk_compute_pair.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
+#include "hk_physical_device.h"
 #include "vk_pipeline_layout.h"
 
 #define CHECK(c) do { if (!(c)) { \
@@ -206,14 +208,56 @@ reuse_correctness(struct fixture *f)
    cs->variants[0].root_descriptor_size = small_B;
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
    CHECK(cd->uploaded_root_size == small_B);
-   /* Alternate compute variants (identity_copy4, im2col_vec4, byte_stencil)
-    * upload their own measured prefix rather than the bound API shader's. */
+   /* Alternate compute variants (identity_copy4, im2col_vec4, depthwise_vec4,
+    * byte_stencil) upload their own measured prefix rather than the bound API
+    * shader's. */
    struct hk_shader alt_cs = {.root_descriptor_size = small_B * 2};
-   CHECK(hk_cmd_buffer_upload_compute_root(cmd, &alt_cs) != small);
-   CHECK(cd->uploaded_root_size == small_B * 2);
+   cs->depthwise_vec4 = &alt_cs;
+   const uint64_t alt_large = hk_cmd_buffer_upload_compute_root(cmd, cs->depthwise_vec4);
+   CHECK(alt_large != small && cd->uploaded_root_size == small_B * 2);
+   CHECK(hk_cmd_buffer_upload_compute_root(cmd, cs->depthwise_vec4) == alt_large);
+   alt_cs.root_descriptor_size = small_B / 2;
+   const uint64_t alt_small = hk_cmd_buffer_upload_compute_root(cmd, cs->depthwise_vec4);
+   CHECK(alt_small != alt_large && cd->uploaded_root_size == small_B / 2);
    alt_cs.root_descriptor_size = 0;
-   CHECK(hk_cmd_buffer_upload_compute_root(cmd, &alt_cs) != small);
+   CHECK(hk_cmd_buffer_upload_compute_root(cmd, cs->depthwise_vec4) != alt_small);
    CHECK(cd->uploaded_root_size == sizeof(cd->root));
+   cs->depthwise_vec4 = NULL;
+
+   /* Submit-time compute-pair fusion must reject a fused shader whose root
+    * prefix exceeds what the producer uploaded (including depthwise_vec4). */
+   struct hk_physical_device pdev = {0};
+   pdev.vk.properties.maxComputeWorkGroupInvocations = 1024;
+   struct vk_physical_device *saved_pdev = f->dev.vk.physical;
+   f->dev.vk.physical = &pdev.vk;
+   struct agx_va fused_va = {.addr = 0x100000};
+   struct agx_bo fused_bo = {.va = &fused_va};
+   struct hk_linked_shader fused_linked = {
+      .b = {.bo = &fused_bo, .size = 64, .nr_gprs = 8},
+   };
+   struct hk_shader fused_cs = {
+      .only_linked = &fused_linked,
+      .root_descriptor_size = small_B,
+      .info = {.stage = MESA_SHADER_COMPUTE, .agx3_uses_root = true, .set_count = 1},
+      .b = {.info = {.stage = MESA_SHADER_COMPUTE,
+                     .workgroup_size = {32, 4, 1},
+                     .agx3_staging_known = true}},
+   };
+   struct hk_compute_pair_dispatch pair = {
+      .exec_threads = {32, 4, 1},
+      .exec_local = {32, 4, 1},
+      .root_va = alt_large,
+      .root_size = small_B,
+      .is_depthwise_vec4 = true,
+   };
+   CHECK(hk_fused_compute_shader_eligible(&f->dev, &fused_cs, &pair));
+   fused_cs.root_descriptor_size = small_B * 2;
+   CHECK(!hk_fused_compute_shader_eligible(&f->dev, &fused_cs, &pair));
+   fused_cs.root_descriptor_size = 0;
+   CHECK(!hk_fused_compute_shader_eligible(&f->dev, &fused_cs, &pair));
+   pair.root_size = sizeof(cd->root);
+   CHECK(hk_fused_compute_shader_eligible(&f->dev, &fused_cs, &pair));
+   f->dev.vk.physical = saved_pdev;
    /* Every chip uploads only the measured compute prefix, including the AGX2
     * and native-encoding M3 paths, and an unmeasured shader the whole table. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
