@@ -428,8 +428,8 @@ KERNEL(32)
 libagx_fill_uint4_blocks(global uint4 *address, uint layer_stride_uint4,
                          uint a, uint b, uint c, uint d)
 {
-   ulong base = (ulong)cl_global_id.y * layer_stride_uint4 +
-                (ulong)cl_group_id.x * 256 + cl_local_id.x;
+   uint base = cl_global_id.y * layer_stride_uint4 +
+               cl_group_id.x * 256 + cl_local_id.x;
    for (uint i = 0; i < 8; ++i)
       address[base + 32 * i] = (uint4)(a, b, c, d);
 }

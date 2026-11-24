@@ -21,16 +21,12 @@
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
 
-/* Smallest uncompressed level, in bytes per layer, cleared with
- * libagx_fill_uint4_blocks on AGX3. The block fill launches an eighth of the
- * groups of libagx_fill_uint4, so a small fill has less parallelism: a 4 KiB
- * clear showed no gain with it, 256 KiB to 400 KiB clears came out even on
- * M5 Max and faster on A18 Pro, and larger clears were faster. AGX2 (M2 G14G)
- * slow-mode measured slower across 256 KiB to 16 MiB (+14.8% at 256 KiB,
- * +0.7% at 16 MiB; +14.4% all-round at 256 KiB), so AGX2 keeps
- * libagx_fill_uint4.
+/* Each 32-lane group of libagx_fill_uint4_blocks fills one 4 KiB block,
+ * launching an eighth of the groups of libagx_fill_uint4. Require at least
+ * four 4 KiB blocks per GPU core so small clears keep enough parallelism to
+ * saturate the device.
  */
-#define HK_CLEAR_BLOCK_FILL_MIN_B (256 * 1024)
+#define HK_CLEAR_BLOCK_FILL_GROUPS_PER_CORE 4
 
 void
 hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
@@ -144,6 +140,10 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
          assert((layout->layer_stride_B % 16) == 0 && "aligned");
          uint32_t layer_stride_uint4 = layout->layer_stride_B / 16;
 
+         const uint64_t block_fill_min_groups =
+            (uint64_t)HK_CLEAR_BLOCK_FILL_GROUPS_PER_CORE *
+            MAX2(1u, agx_get_num_cores(&hk_cmd_buffer_device(cmd)->dev));
+
          if (ail_is_level_logically_compressed(layout, level)) {
             assert((layout->compression_layer_stride_B % 16) == 0 && "aligned");
             uint32_t meta_layer_stride_tl =
@@ -170,9 +170,9 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                               util_logbase2(blocksize_B),
                               util_logbase2(layout->sample_count_sa), c[0],
                               c[1], c[2], c[3], word);
-         } else if (hk_cmd_buffer_device(cmd)->dev.params.usc_generation ==
-                       AGX_ISA_AGX3 &&
-                    size >= HK_CLEAR_BLOCK_FILL_MIN_B && size % 4096 == 0) {
+         } else if (size % 4096 == 0 &&
+                    (uint64_t)(size / 4096) * layer_count >=
+                       block_fill_min_groups) {
             libagx_fill_uint4_blocks(cmd, agx_2d(size / 128, layer_count),
                                      AGX_BARRIER_ALL, address, layer_stride_uint4,
                                      c[0], c[1], c[2], c[3]);
