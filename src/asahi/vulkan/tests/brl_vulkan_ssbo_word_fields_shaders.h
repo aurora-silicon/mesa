@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  * Generated with glslangValidator -V --vn ssbo_word_fields_comp from
- * hk_vulkan_ssbo_word_fields.comp.
+ * brl_vulkan_ssbo_word_fields.comp.
  */
 #pragma once
 #include <stdint.h>

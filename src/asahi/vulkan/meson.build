@@ -1318,9 +1318,9 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
-  hk_vulkan_ssbo_word_fields = executable(
-    'hk-vulkan-ssbo-word-fields',
-    files('tests/hk_vulkan_ssbo_word_fields.c'),
+  brl_vulkan_ssbo_word_fields = executable(
+    'brl-vulkan-ssbo-word-fields',
+    files('tests/brl_vulkan_ssbo_word_fields.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],

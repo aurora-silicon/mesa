@@ -482,12 +482,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # storage-buffer bindings.
   foreach chip : ['g13g', 'g14g']
     test(
-      'hk-' + chip + '-ssbo-word-fields',
+      'brl-' + chip + '-ssbo-word-fields',
       prog_python,
       args : [
         files('../gallium/drivers/asahi/tests/run-shim.py'),
         libasahi_noop_drm_shim,
-        hk_vulkan_ssbo_word_fields,
+        brl_vulkan_ssbo_word_fields,
         '--shim',
       ],
       env : [

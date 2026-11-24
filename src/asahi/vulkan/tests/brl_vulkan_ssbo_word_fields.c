@@ -10,7 +10,7 @@
  *   - records >= 2^30 whose scaled byte offset (rec << 2) wraps mod 2^32,
  *   - a nonzero binding offset across every byte tail 1..80 and VK_WHOLE_SIZE.
  *
- * usage: hk-vulkan-ssbo-word-fields [--shim]
+ * usage: brl-vulkan-ssbo-word-fields [--shim]
  *   --shim   no-op DRM shim: compile, bind, record and submit without
  *            checking GPU readback
  */
@@ -21,7 +21,7 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
-#include "hk_vulkan_ssbo_word_fields_shaders.h"
+#include "brl_vulkan_ssbo_word_fields_shaders.h"
 
 #define CHECK(call)                                                            \
    do {                                                                        \
