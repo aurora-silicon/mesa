@@ -268,8 +268,6 @@ struct hk_device {
    struct util_dynarray m5_pending_as_ids;
    uint32_t m5_pending_as_count;
    struct agx_bg_eot_cache bg_eot;
-   /* frg-codegen v4 BG/EOT device cache (hk_cmd_draw.c). */
-   struct hk_g17p_bg_eot_dev_cache *g17p_bg_eot_dev_cache;
 
    /* VK_KHR_ray_tracing_pipeline shader group handles.  A handle is one
     * device-unique index, so a handle captured from a pipeline library keeps
@@ -642,11 +640,6 @@ hk_device_alloc_scratch(struct hk_device *dev, mesa_shader_stage stage,
    agx_scratch_alloc(hk_device_scratch_locked(dev, stage), size, 0);
    simple_mtx_unlock(&dev->scratch.lock);
 }
-
-/* frg-codegen v4: device-lifetime cache of single-attachment G17P BG/EOT
- * launch programs (hk_cmd_draw.c). */
-void hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev);
-void hk_g17p_bg_eot_dev_cache_finish(struct hk_device *dev);
 
 /* Allocate size bytes of executable memory. Returns a reference to the chunk
  * BO holding it, with the allocation at *offset; release it with

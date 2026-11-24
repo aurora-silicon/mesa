@@ -1061,7 +1061,6 @@ struct agx_context {
    struct util_dynarray global_buffers;
 
    struct hash_table *generic_meta;
-   struct agx_bg_eot_cache bg_eot;
 
    bool any_faults;
    bool submit_quarantined;
@@ -1298,6 +1297,7 @@ struct agx_screen {
    struct pipe_screen pscreen;
    struct agx_device dev;
    struct disk_cache *disk_cache;
+   struct agx_bg_eot_cache bg_eot;
 
    /* Atomic: a context with unknown completion keeps the device alive. */
    bool submit_quarantined;

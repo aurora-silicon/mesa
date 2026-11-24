@@ -4,6 +4,7 @@
  */
 
 #include "agx_bg_eot.h"
+#include "agx_bg_eot_ioto.h"
 #include "agx_g17p_wide_mrt_eot.h"
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
@@ -903,11 +904,14 @@ agx_bg_eot_init(struct agx_bg_eot_cache *cache, struct agx_device *dev)
    simple_mtx_init(&cache->lock, mtx_plain);
    cache->ht = agx_bg_eot_key_table_create(NULL);
    cache->dev = dev;
+   cache->ioto_cache = agx_bg_eot_ioto_cache_create(dev);
 }
 
 void
 agx_bg_eot_cleanup(struct agx_bg_eot_cache *cache)
 {
+   agx_bg_eot_ioto_cache_destroy(cache->dev, cache->ioto_cache);
+   cache->ioto_cache = NULL;
    agx_pool_cleanup(&cache->pool);
    _mesa_hash_table_destroy(cache->ht, NULL);
    simple_mtx_destroy(&cache->lock);

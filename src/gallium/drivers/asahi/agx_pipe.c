@@ -1849,12 +1849,14 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
       c->flags |= DRM_ASAHI_RENDER_VERTEX_SCRATCH;
       c->vertex_helper.data = batch->ctx->scratch_vs.buf->va->addr;
       c->vertex_helper.cfg = batch->vs_preamble_scratch << 16;
-      c->vertex_helper.binary = agx_helper_program(&batch->ctx->bg_eot);
+      c->vertex_helper.binary =
+         agx_helper_program(&agx_screen(batch->ctx->base.screen)->bg_eot);
    }
    if (batch->fs_scratch) {
       c->fragment_helper.data = batch->ctx->scratch_fs.buf->va->addr;
       c->fragment_helper.cfg = batch->fs_preamble_scratch << 16;
-      c->fragment_helper.binary = agx_helper_program(&batch->ctx->bg_eot);
+      c->fragment_helper.binary =
+         agx_helper_program(&agx_screen(batch->ctx->base.screen)->bg_eot);
    }
 
    /* ASAHI_MESA_DEBUG=stats times every render (agx_batch_print_stats()). */
@@ -2006,7 +2008,8 @@ agx_flush_compute(struct agx_context *ctx, struct agx_batch *batch,
       cmdbuf->helper.data = ctx->scratch_cs.buf->va->addr;
       cmdbuf->helper.cfg = batch->cs_preamble_scratch << 16;
       // cmdbuf->helper.cfg |= 0x40;
-      cmdbuf->helper.binary = agx_helper_program(&batch->ctx->bg_eot);
+      cmdbuf->helper.binary =
+         agx_helper_program(&agx_screen(batch->ctx->base.screen)->bg_eot);
    }
 
    const bool stats = (agx_device(ctx->base.screen)->debug & AGX_DBG_STATS) &&
@@ -2160,7 +2163,6 @@ agx_destroy_context(struct pipe_context *pctx)
    util_unreference_framebuffer_state(&ctx->framebuffer);
    util_unreference_framebuffer_state(&ctx->zs_merge_real);
 
-   agx_bg_eot_cleanup(&ctx->bg_eot);
    agx_destroy_meta_shaders(ctx);
 
    /* Lock around the syncobj destruction, to avoid racing
@@ -2367,7 +2369,6 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    agx_init_query_functions(pctx);
    agx_init_streamout_functions(pctx);
 
-   agx_bg_eot_init(&ctx->bg_eot, agx_device(screen));
    agx_init_meta_shaders(ctx);
 
    ctx->blitter = util_blitter_create(pctx);
@@ -3004,6 +3005,7 @@ agx_destroy_screen(struct pipe_screen *pscreen)
 
    agx_bo_unreference(&screen->dev, screen->rodata);
    u_transfer_helper_destroy(pscreen->transfer_helper);
+   agx_bg_eot_cleanup(&screen->bg_eot);
    agx_close_device(&screen->dev);
    disk_cache_destroy(screen->disk_cache);
    ralloc_free(screen);
@@ -3125,6 +3127,8 @@ agx_screen_create(int fd, struct renderonly *ro,
     * is a precision floor: evaluate it at full precision on G18G. */
    if (agx_screen->dev.chip == AGX_CHIP_G18G)
       agx_screen->dev.debug |= AGX_DBG_NO16;
+
+   agx_bg_eot_init(&agx_screen->bg_eot, &agx_screen->dev);
 
    int ret =
       drmSyncobjCreate(agx_device(screen)->fd, 0, &agx_screen->flush_syncobj);

@@ -36,8 +36,11 @@ libasahi_lib_files = files(
   'agx_bytes.h',
   'agx_linker.c',
   'agx_bg_eot.c',
+  'agx_bg_eot_ioto.c',
+  'agx_bg_eot_ioto.h',
   'agx_bg_eot_key.c',
   'agx_tile_mip.h',
+  'agx_ioto_patch.h',
   'agx_tilebuffer.c',
   'agx_nir_lower_msaa.c',
   'agx_nir_lower_sample_intrinsics.c',
@@ -759,4 +762,13 @@ if with_tests
     ['tests/test-scs-layout.c', 'agx_scs_layout.c'],
     c_args: ['-UNDEBUG'],
     include_directories: include_directories('.')), suite: ['asahi'])
+  test('agx_bg_eot_ioto_cache', executable('agx_bg_eot_ioto_cache',
+    files('tests/test-agx-bg-eot-ioto-cache.c'),
+    include_directories: [inc_include, inc_src] + libasahi_lib_includes,
+    dependencies: [idep_mesautil, idep_nir, idep_agx_pack, idep_libagx, idep_libagx_shaders_h],
+    link_with: [libasahi_lib, libasahi_compiler, libasahi_layout],
+    link_args: [
+      '-Wl,--wrap=agx_bo_create',
+      '-Wl,--wrap=agx_bo_unreference',
+    ]), suite: ['asahi'])
 endif
