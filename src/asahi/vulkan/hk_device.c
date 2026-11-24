@@ -1128,6 +1128,20 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       debug_get_bool_option("HK_CDM_DEFER_FLUSH",
                             pdev->dev.chip == AGX_CHIP_G13G);
 
+   /* G14X of generation 14 launches with the reduced CDM_BARRIER word 0x1FF
+    * unless HK_CDM_BARRIER_MASK is set in any form (=0 keeps the full word).
+    * M2 Max Qwen3-4B decode at 2048 tokens saves 0.54 ms per token with
+    * identical tokens and logprobs. hk_cdm_cache_flush applies it only after
+    * the perftest overrides and the sparse guard.
+    */
+   dev->cdm_barrier_default_mask =
+      pdev->dev.chip == AGX_CHIP_G14X &&
+            pdev->dev.params.gpu_generation == 14 &&
+            !HK_PERF(dev, ALWAYSCDMBARRIER) &&
+            !debug_get_option("HK_CDM_BARRIER_MASK", NULL)
+         ? 0x1FF
+         : 0;
+
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps
     * its correct borders there. */

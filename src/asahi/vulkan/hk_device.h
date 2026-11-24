@@ -416,6 +416,10 @@ struct hk_device {
       simple_mtx_t lock;
    } scratch;
 
+   /* Set once the device creates a sparse buffer or image; the CDM barrier
+    * then keeps the full word (hk_cdm_cache_flush). */
+   uint32_t sparse_used;
+
    uint32_t perftest;
    /* drirc hk_submit_batch_size: at most this many commands per kernel
     * submission (0: the kernel and batching limits alone). */
@@ -423,6 +427,9 @@ struct hk_device {
    /* HK_CDM_BARRIER_MASK=<hex>: perftest-only override of the AGX2
     * CDM_BARRIER flag word (bits 0..26). 0 = unset. */
    uint32_t cdm_barrier_mask;
+   /* Reduced CDM_BARRIER word used by default on G14X generation 14 (see
+    * hk_device.c). 0 = the full barrier. */
+   uint32_t cdm_barrier_default_mask;
    /* HK_CDM_DEFER_FLUSH (hk_device.c): emit the CDM barrier at the end of
     * each compute batch, not after every launch. */
    bool cdm_defer_flush;
