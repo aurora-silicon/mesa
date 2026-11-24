@@ -70,6 +70,11 @@ agx_fs_epilog_apply_device_policy(enum agx_chip chip,
    }
    key->m5_coverage = agx_chip_g17_m5(chip);
    key->g17p_tile_formats = g17p || agx_chip_g17_m5(chip);
+   /* Without a constant program the source products are computed per pixel;
+    * writing the destination term first keeps them off the dependency chain
+    * of the tile load (agx3_hoist_pixel_independent()). */
+   key->blend_dst_first =
+      agx_chip_native_agx3(chip) && !agx_chip_native_preamble(chip);
 }
 
 bool

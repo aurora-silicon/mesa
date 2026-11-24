@@ -1433,18 +1433,18 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
  * in-flight device-load windows (at least this many). */
 #define AGX_ILP_M5_LOAD_HEADROOM 16
 
-/* Register count up to which an M5 compute block may grow to keep device
- * loads in flight, for a program whose estimated peak is program_peak halves,
- * or 0 when such blocks keep the issue-order schedule. The loads stay inside
- * the occupancy step the program is in, AGX_ILP_M5_OCCUPANCY_MARGIN below its
- * top, as register allocation lands a few halves above the estimate. A
- * program with fewer than AGX_ILP_M5_LOAD_HEADROOM halves free below the top
- * of its step keeps the issue-order schedule, since allocation can then cross
- * into the next step even when the estimate does not grow; so does a program
- * in the last step, where crossing the top spills.
+/* Register count up to which a pre-RA pass may raise the estimated pressure
+ * of a program whose estimated peak is program_peak halves, or 0 when it must
+ * not raise it. Growth stays inside the occupancy step the program is in,
+ * AGX_ILP_M5_OCCUPANCY_MARGIN below its top, as register allocation lands a
+ * few halves above the estimate. A program with fewer than
+ * AGX_ILP_M5_LOAD_HEADROOM halves free below the top of its step gets 0,
+ * since allocation can then cross into the next step even when the estimate
+ * does not grow; so does a program in the last step, where crossing the top
+ * spills.
  */
 int
-agx_ilp_m5_device_load_cap(int program_peak)
+agx_occupancy_growth_cap(int program_peak)
 {
    if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > AGX_ILP_M5_MAX_HALVES)
       return 0;
@@ -1456,6 +1456,14 @@ agx_ilp_m5_device_load_cap(int program_peak)
       return 0;
 
    return step_top - AGX_ILP_M5_OCCUPANCY_MARGIN;
+}
+
+/* Register count up to which an M5 compute block may grow to keep device
+ * loads in flight, or 0 when such blocks keep the issue-order schedule. */
+int
+agx_ilp_m5_device_load_cap(int program_peak)
+{
+   return agx_occupancy_growth_cap(program_peak);
 }
 
 /* Absolute peak register pressure of a block in source order, in halves:
@@ -1477,6 +1485,20 @@ ilp_block_peak(agx_context *ctx, agx_block *block, const uint8_t *size16,
       agx_liveness_ins_update(&live, I);
    }
    return out + peak;
+}
+
+/* ilp_block_peak() for passes that reorder inside a block after scheduling.
+ * The block's live-out set must be current (agx_compute_liveness()); moving
+ * instructions inside one block does not change it. size16 holds every SSA
+ * destination's agx_index_size_16(). */
+signed
+agx_block_peak_pressure(agx_context *ctx, agx_block *block,
+                        const uint8_t *size16)
+{
+   void *memctx = ralloc_context(NULL);
+   const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+   ralloc_free(memctx);
+   return peak;
 }
 
 void

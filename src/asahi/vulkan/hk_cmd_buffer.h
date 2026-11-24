@@ -287,6 +287,11 @@ struct hk_root_descriptor_table {
     * and fits one launch as it is (hk_mesh_launch_whole()), so the mesh
     * workgroup IDs are the API's without reading the grid. */
    uint32_t mesh_whole;
+
+   /* Host-evaluated fragment uniforms (hk_linked_shader::g16_host),
+    * published to uniform halves [0, 2 * n_out). Must stay the last field
+    * (asserted below), so no earlier offset depends on it. */
+   uint32_t g16_host_unif[HK_G16_HOST_MAX_OUT];
 };
 
 /* The graphics arm is the larger of the two, so everything after the union --
@@ -300,6 +305,18 @@ static_assert(sizeof(((struct hk_root_descriptor_table *)0)->cs) <=
 /* helper macro for computing root descriptor byte offsets */
 #define hk_root_descriptor_offset(member)                                      \
    offsetof(struct hk_root_descriptor_table, member)
+
+/* g16_host_unif follows every other field, so the push constants, dynamic
+ * buffers, printf address and the rest of the shared tail keep the offsets
+ * they have without it, on every chip; only the size of the table grows. */
+static_assert(hk_root_descriptor_offset(g16_host_unif) ==
+                 hk_root_descriptor_offset(mesh_whole) + sizeof(uint32_t),
+              "g16_host_unif must directly follow the last shared root field");
+static_assert(sizeof(struct hk_root_descriptor_table) <
+                 hk_root_descriptor_offset(g16_host_unif) +
+                    sizeof(((struct hk_root_descriptor_table *)0)->g16_host_unif) +
+                    8,
+              "g16_host_unif must be the last root field");
 
 /* Counts only these CPU upload paths, enabled by ASAHI_MESA_DEBUG=perf. */
 struct hk_upload_stats {
@@ -2549,6 +2566,13 @@ hk_gfx_root_descriptor_size(const struct hk_cmd_buffer *cmd)
 {
    const size_t full = sizeof(struct hk_root_descriptor_table);
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
+
+   /* A G16G fragment program with host-evaluated uniforms reads them from
+    * g16_host_unif, the last root field, through a uniform range that the
+    * NIR root-size scan does not see. */
+   const struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
+   if (linked_fs && linked_fs->g16_host.n_out)
+      return full;
    if (gfx->shaders[MESA_SHADER_TESS_CTRL] ||
        gfx->shaders[MESA_SHADER_TESS_EVAL] ||
        gfx->shaders[MESA_SHADER_GEOMETRY] ||
