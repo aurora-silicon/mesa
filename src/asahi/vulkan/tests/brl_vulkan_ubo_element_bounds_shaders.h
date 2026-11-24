@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  * Generated with glslangValidator -V --vn ubo_element_bounds_comp from
- * hk_vulkan_ubo_element_bounds.comp.
+ * brl_vulkan_ubo_element_bounds.comp.
  */
 #pragma once
 #include <stdint.h>

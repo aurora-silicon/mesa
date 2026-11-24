@@ -1324,9 +1324,9 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
-  hk_vulkan_ubo_element_bounds = executable(
-    'hk-vulkan-ubo-element-bounds',
-    files('tests/hk_vulkan_ubo_element_bounds.c'),
+  brl_vulkan_ubo_element_bounds = executable(
+    'brl-vulkan-ubo-element-bounds',
+    files('tests/brl_vulkan_ubo_element_bounds.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],

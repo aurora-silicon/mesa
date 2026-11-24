@@ -10,7 +10,7 @@
  *   - non-64-byte-aligned bounds up to the maximum 64 KiB UBO range,
  *   - dynamic indices both in bounds and >= 4096 within the declared array.
  *
- * usage: hk-vulkan-ubo-element-bounds [--shim]
+ * usage: brl-vulkan-ubo-element-bounds [--shim]
  *   --shim   no-op DRM shim: compile, bind, record and submit without
  *            checking GPU readback
  */
@@ -21,7 +21,7 @@
 #include <string.h>
 #include <vulkan/vulkan.h>
 
-#include "hk_vulkan_ubo_element_bounds_shaders.h"
+#include "brl_vulkan_ubo_element_bounds_shaders.h"
 
 #define CHECK(call)                                                            \
    do {                                                                        \

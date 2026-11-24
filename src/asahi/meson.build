@@ -481,12 +481,12 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # null, non-64-byte-aligned, nonzero-offset and 64 KiB UBO bindings.
   foreach chip : ['g14g', 'g17s']
     test(
-      'hk-' + chip + '-ubo-element-bounds',
+      'brl-' + chip + '-ubo-element-bounds',
       prog_python,
       args : [
         files('../gallium/drivers/asahi/tests/run-shim.py'),
         libasahi_noop_drm_shim,
-        hk_vulkan_ubo_element_bounds,
+        brl_vulkan_ubo_element_bounds,
         '--shim',
       ],
       env : [
