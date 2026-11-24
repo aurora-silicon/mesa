@@ -865,6 +865,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_)
             .alpha.dst_factor = blend.alpha_dst_factor,
             .alpha.func = blend.alpha_func,
 
+            .dst_term_first = key->blend_dst_first,
             .colormask = key->blend.rt[i].colormask,
          };
       }

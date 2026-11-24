@@ -11507,6 +11507,136 @@ agx3_coalesce_uniform_half_stores(agx_context *ctx)
  * adjacent run of non-coherent loads with identical operation and base; SSA
  * keeps their consumers attached to the correct result and no serialization
  * is introduced. */
+/* Native AGX3 chips without a constant program (G15G/S/C, G16G; see
+ * agx_chip_native_preamble()): after scheduling, move
+ * float arithmetic computed only from uniforms ahead of the first
+ * pixel-ordering wait of its block, so it executes outside the ordered colour
+ * transaction instead of between WAIT_PIX and the tile store. Only fadd, fmul,
+ * ffma and mov_imm move, and only when every source is a uniform, an
+ * immediate, or the result of another such instruction. Moved instructions
+ * keep their relative order and their exact operations, modifiers and
+ * operands, so results are bit-identical.
+ *
+ * A moved instruction reads its uniforms earlier than scheduled, so it must not
+ * cross a write to the uniform file. The scan of a block stops at the first
+ * such write after the wait; nothing after it moves. */
+static bool
+agx_writes_uniform(const agx_instr *I)
+{
+   if (I->op == AGX_OPCODE_UNIFORM_STORE)
+      return true;
+   agx_foreach_dest(I, d) {
+      if (I->dest[d].type == AGX_INDEX_UNIFORM)
+         return true;
+   }
+   return false;
+}
+
+bool
+agx3_hoist_pixel_independent(agx_context *ctx)
+{
+   /* A chip with a constant program takes the uniform-only work there. The
+    * hoist has been run on G16G hardware only. */
+   const enum agx_chip chip = ctx->key->dev.chip;
+   if (!agx_chip_native_agx3(chip) || agx_chip_native_preamble(chip) ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+      return false;
+
+   /* Values computed only from uniforms and immediates by the movable ops,
+    * wherever they are in the block, that are available above the wait.
+    * Texture, varying and tile results never qualify, so per-pixel work keeps
+    * its scheduled place. */
+   BITSET_WORD *uniform = BITSET_CALLOC(ctx->alloc);
+   uint8_t *size16 = calloc(MAX2(ctx->alloc, 1), sizeof(uint8_t));
+   if (!uniform || !size16) {
+      free(uniform);
+      free(size16);
+      return false;
+   }
+
+   /* A moved value is live from the wait to its first use, so the move can
+    * raise register pressure. The pass runs before register allocation, so it
+    * takes the scheduler's estimate and the scheduler's growth rule
+    * (agx_occupancy_growth_cap): a block may grow up to the cap, inside the
+    * occupancy step the shader is in now. Where the rule allows no growth (too
+    * little headroom below the top of the step, or the last step, where
+    * crossing the top spills), a move may not raise its block's peak at all.
+    * A move past the limit is undone. A shader whose estimate is already past
+    * the register file is left alone. */
+   agx_compute_liveness(ctx);
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         size16[I->dest[d].value] = agx_index_size_16(I->dest[d]);
+   }
+   signed program_peak = 0;
+   agx_foreach_block(ctx, block)
+      program_peak =
+         MAX2(program_peak, agx_block_peak_pressure(ctx, block, size16));
+   const signed reserved = agx_reserved_registers(ctx);
+   if (program_peak + reserved > (signed)agx_max_registers_for_occupancy(1)) {
+      free(uniform);
+      free(size16);
+      return false;
+   }
+   const signed cap = agx_occupancy_growth_cap(program_peak + reserved);
+
+   bool progress = false;
+   agx_foreach_block(ctx, block) {
+      const signed limit =
+         cap ? cap - reserved : agx_block_peak_pressure(ctx, block, size16);
+      agx_instr *wait = NULL;
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (!wait && I->op == AGX_OPCODE_WAIT_PIX) {
+            wait = I;
+            continue;
+         }
+
+         if (wait && agx_writes_uniform(I))
+            break;
+
+         bool uniform_only = (I->op == AGX_OPCODE_FADD ||
+                              I->op == AGX_OPCODE_FMUL ||
+                              I->op == AGX_OPCODE_FFMA ||
+                              I->op == AGX_OPCODE_MOV_IMM) &&
+                             I->nr_dests == 1 &&
+                             I->dest[0].type == AGX_INDEX_NORMAL;
+         agx_foreach_src(I, s) {
+            const agx_index src = I->src[s];
+            if (src.type == AGX_INDEX_NORMAL) {
+               if (!BITSET_TEST(uniform, src.value))
+                  uniform_only = false;
+            } else if (src.type != AGX_INDEX_UNIFORM &&
+                       src.type != AGX_INDEX_IMMEDIATE &&
+                       src.type != AGX_INDEX_NULL) {
+               uniform_only = false;
+            }
+         }
+
+         if (!uniform_only)
+            continue;
+
+         if (wait) {
+            struct list_head *was_after = I->link.prev;
+            list_del(&I->link);
+            list_addtail(&I->link, &wait->link);
+            if (agx_block_peak_pressure(ctx, block, size16) > limit) {
+               /* Back to its place. Its value is not available above the
+                * wait, so nothing that reads it moves either. */
+               list_del(&I->link);
+               list_add(&I->link, was_after);
+               continue;
+            }
+            progress = true;
+         }
+         BITSET_SET(uniform, I->dest[0].value);
+      }
+   }
+
+   free(uniform);
+   free(size16);
+   return progress;
+}
+
 static bool
 agx3_order_fragment_device_loads(agx_context *ctx)
 {
@@ -13582,6 +13712,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    }
 
    AGX_PASS(ctx, agx3_order_fragment_device_loads);
+   AGX_PASS(ctx, agx3_hoist_pixel_independent);
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
       agx_print_shader(ctx, stdout);
