@@ -738,6 +738,7 @@ if with_tests
       files(
          'test/test-compact-constants.cpp',
          'test/test-agx3-pack-binary.cpp',
+         'test/test-hoist-loads.cpp',
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',

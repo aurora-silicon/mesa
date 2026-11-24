@@ -14616,6 +14616,10 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       AGX_PASS(ctx, agx_ilp_schedule);
    }
 
+   if (nir->info.stage == MESA_SHADER_COMPUTE && ctx->key->dev.hoist_loads) {
+      AGX_PASS(ctx, agx_hoist_loads);
+   }
+
    AGX_PASS(ctx, agx3_order_fragment_device_loads);
 
    if (agx_should_dump(nir, AGX_DBG_SHADERS))
