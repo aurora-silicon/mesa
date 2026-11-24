@@ -1185,6 +1185,18 @@ agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
    agx_valid_buffer_range_add(rsrc, offset, offset + size);
 }
 
+/* DRM_ASAHI_RENDER_FRAGMENT_BARRIERS moves a render's wait for earlier renders
+ * to its fragment half. Kernels that accept the flag without
+ * DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS may drop that wait instead, so
+ * the flag is only set when both are reported. */
+static bool
+agx_ordered_fragment_barriers(const struct agx_device *dev)
+{
+   const uint64_t needed = DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS |
+                           DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS;
+   return (dev->params.features & needed) == needed;
+}
+
 /* Compute inter-submission VDM/CDM barriers for @batch on native AGX3 queues.
  * Disjoint in-flight batches need not serialize across subqueues (for example,
  * an independent CDM dispatch overlapping an in-flight VDM render). Any
@@ -2451,7 +2463,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
       struct drm_asahi_cmd_header header = agx_cmd_header(
          false, compute_here ? DRM_ASAHI_BARRIER_NONE : vdm_barrier,
          compute_here ? compute_commands : cdm_barrier);
-      if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+      if (agx_ordered_fragment_barriers(dev) &&
           (header.vdm_barrier != DRM_ASAHI_BARRIER_NONE ||
            header.cdm_barrier != DRM_ASAHI_BARRIER_NONE) &&
           !compute_here && !batch->vs_needs_render_barrier)
@@ -3047,7 +3059,7 @@ agx_submit_pending(struct agx_context *ctx)
          const uint16_t render_cdm = nr_cdm ? nr_cdm : prior_cdm;
          struct drm_asahi_cmd_header header =
             agx_cmd_header(false, render_vdm, render_cdm);
-         if ((dev->params.features & DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS) &&
+         if (agx_ordered_fragment_barriers(dev) &&
              !batch_compute_cmds && !batch->vs_needs_render_barrier &&
              (render_vdm != DRM_ASAHI_BARRIER_NONE ||
               render_cdm != DRM_ASAHI_BARRIER_NONE))

@@ -222,6 +222,7 @@ static const struct drm_asahi_params_global params_g17p = {
                   DRM_ASAHI_FEATURE_VM_STATUS_MIRROR |                        \
                   DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |                    \
                   DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS |                       \
+                  DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS |               \
                   DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD |                        \
                   DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS,                       \
       .gpu_generation = 16, .gpu_variant = (variant), .gpu_revision = 0x11,   \
@@ -399,6 +400,7 @@ static const struct drm_asahi_params_global params_g17s_kernel = {
    .features = DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
                DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS |
                DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS |
+               DRM_ASAHI_FEATURE_ORDERED_FRAGMENT_BARRIERS |
                DRM_ASAHI_FEATURE_FEW_PRIMITIVES |
                DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                DRM_ASAHI_FEATURE_RENDER_RESOURCES |
