@@ -2086,5 +2086,6 @@ agx_gather_device_key(struct agx_device *dev)
       .soft_fault = agx_has_soft_fault(dev),
       .emit_agx3d = g18g,
       .shader_quad_control = dev->chip == AGX_CHIP_G17P,
+      .g13 = dev->params.gpu_generation == 13,
    };
 }

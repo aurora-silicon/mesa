@@ -216,7 +216,9 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
    /* This could be optimized but it doesn't matter. */
    return pdev->dev.debug |
-          hk_fs_structure_key_bits();
+          hk_fs_structure_key_bits() |
+          ((uint64_t)(getenv("AGX_LOCAL_FOLD_OFF") != NULL) << 35) |
+          ((uint64_t)(getenv("AGX_SCHED_COMPUTE") != NULL) << 36);
 }
 
 const nir_shader_compiler_options *
