@@ -812,6 +812,12 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_agx2_cdm_barrier', executable('hk_agx2_cdm_barrier_test',
+    files('tests/test-hk-agx2-cdm-barrier.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_memory_oom', executable('hk_memory_oom_test',
     files('tests/test-hk-memory-oom.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,

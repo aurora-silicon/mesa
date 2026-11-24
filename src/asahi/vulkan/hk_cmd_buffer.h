@@ -1196,6 +1196,13 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
+
+   /* AGX2: set by hk_CmdPipelineBarrier2, consumed by the next CDM launch on
+    * the general compute stream (dependency-tracked per-launch barrier). Lives
+    * on the command buffer rather than hk_cs so it survives CS splits and
+    * stream merging.
+    */
+   bool cdm_barrier_pending;
 };
 
 /*

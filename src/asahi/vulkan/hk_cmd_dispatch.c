@@ -758,6 +758,18 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   if (agx_chip_command_stream_generation(dev->dev.chip) ==
+       AGX_CS_GENERATION_AGX2) {
+      if (cs == cmd->current_cs.cs && cmd->state.cs.cdm_barrier_pending) {
+         cmd->state.cs.cdm_barrier_pending = false;
+         if (cs->stats.cmds > 0) {
+            hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH + 4);
+            hk_cdm_cache_flush(dev, cs);
+         }
+      }
+      return;
+   }
+
    /* A dependency recorded while no compute stream holding work is open
     * records no flush: the first barrier of a command buffer, or one after a
     * timestamp closed the stream. The writes of this stream may then be read
@@ -816,10 +828,26 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
+
+   /* Only the general compute stream participates in application dependency
+    * tracking; pre-graphics and post-graphics helper streams keep the
+    * unconditional post-launch flush and do not consume pending app barriers.
+    */
+   if (HK_PERF(dev, ALWAYSCDMBARRIER) || cs != cs->cmd->current_cs.cs) {
+      cs->current =
+         agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
+      hk_cdm_cache_flush(dev, cs);
+      return;
+   }
+
+   if (cs->cmd->state.cs.cdm_barrier_pending) {
+      assert(cs->type == HK_CS_CDM);
+      hk_cdm_cache_flush(dev, cs);
+      cs->cmd->state.cs.cdm_barrier_pending = false;
+   }
+
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
-
-   hk_cdm_cache_flush(dev, cs);
 }
 
 void

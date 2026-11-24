@@ -446,9 +446,22 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
+   /* AGX2: restore the unconditional per-launch CDM barrier and the batch
+    * split at every vkCmdPipelineBarrier2. */
+   HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(6),
+   /* AGX2: use the dependency-tracked per-launch CDM barrier on chips that
+    * do not default to it. */
+   HK_PERF_TRACKCDMBARRIER = BITFIELD_BIT(7),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
+
+static inline bool
+hk_agx2_tracked_cdm_barrier_default(enum agx_chip chip, uint32_t gpu_generation)
+{
+   return chip == AGX_CHIP_G13G || chip == AGX_CHIP_G13X ||
+          (chip == AGX_CHIP_G14X && gpu_generation == 14);
+}
 
 /* G17P and M5 GPU caches are tagged by virtual address, so when memory may be
  * mapped at more than one GPU VA an application compute/transfer barrier needs

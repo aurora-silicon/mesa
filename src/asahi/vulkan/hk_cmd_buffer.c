@@ -1084,6 +1084,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_sync_flush_stamp_copies(cmd);
    hk_sync_flush_pending_timestamp(cmd);
    hk_cmd_buffer_end_compute(cmd);
+   cmd->state.cs.cdm_barrier_pending = false;
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
    hk_resolve_deferred_oq_available(cmd);
 
@@ -1404,13 +1405,22 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* M5 records its barriers with the native dependency tracker. */
    if (!agx_chip_native_or_m5(dev->dev.chip)) {
-      hk_cmd_buffer_end_compute(cmd);
-      hk_cmd_buffer_end_graphics(cmd);
-      /* Preserve the same conservative ordering in the shared submit graph,
-       * including kernels that advertise exact prior barriers on AGX2. */
       uint8_t init_dst;
       const bool init =
          brl_discard_init_prepare(cmd, pDependencyInfo, &init_dst);
+
+      if (!HK_PERF(dev, ALWAYSCDMBARRIER))
+         cmd->state.cs.cdm_barrier_pending = true;
+
+      if (HK_PERF(dev, ALWAYSCDMBARRIER) || init || cmd->current_cs.gfx ||
+          cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
+          hk_sync_dependency_has_host_access(pDependencyInfo)) {
+         hk_cmd_buffer_end_compute(cmd);
+         hk_cmd_buffer_end_graphics(cmd);
+      }
+
+      /* Preserve the same conservative ordering in the shared submit graph,
+       * including kernels that advertise exact prior barriers on AGX2. */
       hk_sync_barrier(cmd, HK_SYNC_ALL, HK_SYNC_ALL);
       if (init)
          brl_discard_init_record(cmd, pDependencyInfo, init_dst);
@@ -4777,6 +4787,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    hk_dispatch_with_usc_launch(dev, cs, prog->b.launch,
                                agx_usc_addr(&dev->dev, t.gpu), grid,
                                prog->b.workgroup);
+   if (barrier & AGX_BARRIER_ALL)
+      hk_cdm_cache_flush(dev, cs);
 }
 
 uint64_t
