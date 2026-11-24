@@ -539,6 +539,15 @@ agx_has_soft_fault(const struct agx_device *dev)
           !(dev->debug & AGX_DBG_NOSOFT);
 }
 
+/* The kernel refuses render commands on this device (for example G14 on GPU
+ * firmware 27.2). It must not be offered for graphics, only for compute.
+ */
+static inline bool
+agx_compute_only(const struct agx_device *dev)
+{
+   return dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_ONLY;
+}
+
 /* Base of the G17P USC exec window.  MEASURED RULE: bit 40 of the program VA
  * must be set.  Do not lower this.  See the note in agx_open_device(). */
 #define AGX_G17P_USC_WINDOW_BASE UINT64_C(0x10000000000)

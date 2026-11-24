@@ -2882,6 +2882,11 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    u_init_pipe_screen_caps(pscreen, 1);
 
+   /* kmsro and EGL surfaceless skip a screen without graphics and fall back to
+    * another driver (in the end software rendering).
+    */
+   caps->graphics = !agx_compute_only(agx_device(pscreen));
+
    /* G17G generates mipmaps on the CPU (agx_generate_mipmap_g17g); native
     * AGX3 generates uncompressed UNORM8x4 mipchains in one compute batch
     * (agx_generate_mipmap_agx3). Either falls back to util_gen_mipmap inside
