@@ -60,9 +60,13 @@ m5_native_opaque_eligible(nir_builder *b, nir_def *flags)
    /* Native RT-pipeline shaders arrive here after lowering to COMPUTE.
     * Graphics query resources and callback layouts require their own
     * hardware qualification before using this optimization. */
+   const uint32_t reject_mask =
+      debug_get_bool_option("ASAHI_M5_RQ_NATIVE_FIRST_HIT", true)
+         ? (2u | 0x40u | 0x100u)
+         : (2u | 4u | 0x40u | 0x100u);
    return m5_native_opaque() && b->shader->info.stage == MESA_SHADER_COMPUTE &&
           b->shader->info.ray_queries == 1
-      ? nir_ieq_imm(b, nir_iand_imm(b, flags, 2 | 4 | 0x40 | 0x100), 0)
+      ? nir_ieq_imm(b, nir_iand_imm(b, flags, reject_mask), 0)
       : nir_imm_false(b);
 }
 
@@ -240,11 +244,18 @@ m5_candidate_packet(nir_builder *b, nir_def *driver, nir_def *id,
    nir_def *marker = nir_load_global(b, 1, 32,
       nir_iadd_imm(b, c.compressed_address, -4), .align_mul = 4);
    nir_def *is_aabb = nir_ieq_imm(b, nir_iand_imm(b, marker, 0xff), 0x18);
-   nir_def *id_offset = nir_bcsel(b, is_aabb,
+   nir_def *geo_offset = nir_bcsel(b, is_aabb,
       nir_imm_int(b, 28 - 4), nir_imm_int(b, 48));
-   nir_def *ids = nir_load_global(b, 2, 32,
-      nir_iadd(b, c.compressed_address, nir_i2i64(b, id_offset)),
+   nir_def *prim_offset = nir_bcsel(b, is_aabb,
+      nir_imm_int(b, 28),
+      nir_iadd_imm(b, nir_ishl_imm(b, nir_iand_imm(b, nir_ushr_imm(b, c.flags, 10), 1), 2), 52));
+   nir_def *geo_id = nir_load_global(b, 1, 32,
+      nir_iadd(b, c.compressed_address, nir_i2i64(b, geo_offset)),
       .align_mul = 4);
+   nir_def *prim_id = nir_load_global(b, 1, 32,
+      nir_iadd(b, c.compressed_address, nir_i2i64(b, prim_offset)),
+      .align_mul = 4);
+   nir_def *ids = nir_vec2(b, geo_id, prim_id);
    nir_def *level_address = nir_iadd(b, m5_query_level_base(b),
                                     nir_ishl_imm(b, id, 3));
    nir_def *halves[3];
@@ -788,7 +799,8 @@ agx_nir_m5_should_import_triangle(nir_builder *b, nir_def *native_type,
 static void
 m5_import_native_opaque(nir_builder *b, nir_def *id, nir_def *driver,
                         nir_def *lane, nir_deref_instr *result[5],
-                        nir_deref_instr *minimum, nir_deref_instr *flags)
+                        nir_deref_instr *minimum, nir_deref_instr *flags,
+                        nir_deref_instr *active)
 {
    nir_push_if(b, m5_native_opaque_eligible(b, nir_load_deref(b, flags)));
    /* Canonical native decoder byte-reencodes REGISTER_INDEXED selector3:
@@ -832,6 +844,11 @@ m5_import_native_opaque(nir_builder *b, nir_def *id, nir_def *driver,
    };
    for (unsigned i = 0; i < 5; ++i)
       nir_store_deref(b, result[i], packet[i], 15);
+   if (active) {
+      nir_push_if(b, nir_test_mask(b, nir_load_deref(b, flags), 4));
+      nir_store_deref(b, active, nir_imm_false(b), 1);
+      nir_pop_if(b, NULL);
+   }
    nir_pop_if(b, NULL);
    nir_pop_if(b, NULL);
 }
@@ -943,13 +960,18 @@ m5_candidate_next(nir_builder *b, nir_deref_instr *active,
     * are not readable until it completes, even when the candidate count is
     * zero and no application candidate will be produced. */
    if (initial_completion)
-      m5_import_native_opaque(b, id, driver, lane, result, minimum, flags);
+      m5_import_native_opaque(b, id, driver, lane, result, minimum, flags, active);
    if (batch_completed) {
       /* Gen2 next consumes a completed queue before reading completion
        * again. Import its immutable opaque result once, before exposing
        * this batch's first application candidate. No traversal runs while
        * the singleton query consumes the rest of that completed batch. */
       nir_store_deref(b, batch_completed, nir_imm_true(b), 1);
+      nir_pop_if(b, NULL);
+   }
+   if (initial_completion) {
+      nir_push_if(b, nir_inot(b, nir_load_deref(b, active)));
+      nir_jump(b, nir_jump_break);
       nir_pop_if(b, NULL);
    }
    nir_def *index = m5_cursor_index(b, cursor);
@@ -1265,6 +1287,238 @@ m5_rq_alias_copies(nir_function_impl *impl)
    return progress;
 }
 
+/* Coalesce scalar function-local ray_query variables whose live ranges do not
+ * overlap (e.g. sequential primary/reflection and shadow ray helpers inlined
+ * into one shader). A query becomes live at rq_initialize (which overwrites all
+ * query state) and stays live through any subsequent rq_* use. Standard backward
+ * dataflow liveness detects interference across branches and loops; non-interfering
+ * queries share one variable so single-query optimizations (native opaque commit,
+ * deferred completion, no owner-replay state) apply without changing semantics. */
+static bool
+m5_rq_coalesce_disjoint(nir_shader *shader, nir_function_impl *impl)
+{
+   if (!debug_get_bool_option("ASAHI_M5_RQ_COALESCE_DISJOINT", true))
+      return false;
+
+   nir_variable *vars[64];
+   unsigned n = 0;
+   nir_foreach_function_temp_variable(var, impl) {
+      if (!var->data.ray_query || glsl_type_is_array(var->type))
+         continue;
+      if (n == ARRAY_SIZE(vars))
+         break;
+      vars[n++] = var;
+   }
+   if (n <= 1)
+      return false;
+
+   uint64_t eligible = (n == 64) ? ~UINT64_C(0) : ((UINT64_C(1) << n) - 1);
+
+   /* Disqualify any candidate variable used outside impl or by non-RQ ops. */
+   nir_foreach_function(f, shader) {
+      if (!f->impl)
+         continue;
+      nir_foreach_block(block, f->impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *d = nir_instr_as_deref(instr);
+            if (d->deref_type != nir_deref_type_var)
+               continue;
+            int idx = -1;
+            for (unsigned i = 0; i < n; ++i) {
+               if (vars[i] == d->var) {
+                  idx = (int)i;
+                  break;
+               }
+            }
+            if (idx < 0)
+               continue;
+            if (f->impl != impl) {
+               eligible &= ~(UINT64_C(1) << idx);
+               continue;
+            }
+            nir_foreach_use(use_src, &d->def) {
+               nir_instr *u = nir_src_use_instr(use_src);
+               if (u->type != nir_instr_type_intrinsic) {
+                  eligible &= ~(UINT64_C(1) << idx);
+                  break;
+               }
+               nir_intrinsic_instr *ui = nir_instr_as_intrinsic(u);
+               if (!nir_intrinsic_is_ray_query(ui->intrinsic) ||
+                   use_src != &ui->src[0]) {
+                  eligible &= ~(UINT64_C(1) << idx);
+                  break;
+               }
+            }
+         }
+      }
+   }
+
+   if (util_bitcount64(eligible) <= 1)
+      return false;
+
+   nir_metadata_require(impl, nir_metadata_block_index);
+   const unsigned num_blocks = impl->num_blocks;
+   uint64_t *use = calloc(num_blocks, sizeof(uint64_t));
+   uint64_t *def = calloc(num_blocks, sizeof(uint64_t));
+   uint64_t *live_in = calloc(num_blocks, sizeof(uint64_t));
+   uint64_t *live_out = calloc(num_blocks, sizeof(uint64_t));
+   if (!use || !def || !live_in || !live_out) {
+      free(use);
+      free(def);
+      free(live_in);
+      free(live_out);
+      return false;
+   }
+
+   nir_foreach_block(block, impl) {
+      const unsigned bi = block->index;
+      nir_foreach_instr_reverse(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (!nir_intrinsic_is_ray_query(intr->intrinsic))
+            continue;
+         nir_deref_instr *d = nir_src_as_deref(intr->src[0]);
+         if (!d || d->deref_type != nir_deref_type_var)
+            continue;
+         int idx = -1;
+         for (unsigned i = 0; i < n; ++i) {
+            if (vars[i] == d->var) {
+               idx = (int)i;
+               break;
+            }
+         }
+         if (idx < 0 || !(eligible & (UINT64_C(1) << idx)))
+            continue;
+         const uint64_t bit = UINT64_C(1) << idx;
+         if (intr->intrinsic == nir_intrinsic_rq_initialize) {
+            def[bi] |= bit;
+            use[bi] &= ~bit;
+         } else {
+            use[bi] |= bit;
+            def[bi] &= ~bit;
+         }
+      }
+   }
+
+   bool changed = true;
+   while (changed) {
+      changed = false;
+      nir_foreach_block_reverse(block, impl) {
+         const unsigned bi = block->index;
+         uint64_t out = 0;
+         for (unsigned s = 0; s < 2; ++s) {
+            if (block->successors[s] && block->successors[s] != impl->end_block)
+               out |= live_in[block->successors[s]->index];
+         }
+         const uint64_t in = use[bi] | (out & ~def[bi]);
+         if (out != live_out[bi] || in != live_in[bi]) {
+            live_out[bi] = out;
+            live_in[bi] = in;
+            changed = true;
+         }
+      }
+   }
+
+   uint64_t interfere[64] = {0};
+   nir_foreach_block(block, impl) {
+      uint64_t live = live_out[block->index];
+      nir_foreach_instr_reverse(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (!nir_intrinsic_is_ray_query(intr->intrinsic))
+            continue;
+         nir_deref_instr *d = nir_src_as_deref(intr->src[0]);
+         if (!d || d->deref_type != nir_deref_type_var)
+            continue;
+         int idx = -1;
+         for (unsigned i = 0; i < n; ++i) {
+            if (vars[i] == d->var) {
+               idx = (int)i;
+               break;
+            }
+         }
+         if (idx < 0 || !(eligible & (UINT64_C(1) << idx)))
+            continue;
+         const uint64_t bit = UINT64_C(1) << idx;
+         if (intr->intrinsic == nir_intrinsic_rq_initialize) {
+            live &= ~bit;
+            interfere[idx] |= live;
+         } else {
+            live |= bit;
+            interfere[idx] |= live;
+         }
+      }
+   }
+
+   free(use);
+   free(def);
+   free(live_in);
+   free(live_out);
+
+   for (unsigned i = 0; i < n; ++i) {
+      interfere[i] &= ~(UINT64_C(1) << i);
+      for (unsigned j = 0; j < n; ++j) {
+         if (interfere[i] & (UINT64_C(1) << j))
+            interfere[j] |= UINT64_C(1) << i;
+      }
+   }
+
+   nir_variable *rep[64];
+   bool merged[64] = {false};
+   for (unsigned i = 0; i < n; ++i)
+      rep[i] = vars[i];
+
+   bool progress = false;
+   unsigned merged_count = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      if (!(eligible & (UINT64_C(1) << i)) || merged[i])
+         continue;
+      for (unsigned j = i + 1; j < n; ++j) {
+         if (!(eligible & (UINT64_C(1) << j)) || merged[j])
+            continue;
+         if (interfere[i] & (UINT64_C(1) << j))
+            continue;
+         rep[j] = vars[i];
+         merged[j] = true;
+         interfere[i] |= interfere[j];
+         for (unsigned k = 0; k < n; ++k) {
+            if (interfere[j] & (UINT64_C(1) << k))
+               interfere[k] |= UINT64_C(1) << i;
+         }
+         progress = true;
+         merged_count++;
+      }
+   }
+
+   if (!progress)
+      return false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *d = nir_instr_as_deref(instr);
+         if (d->deref_type != nir_deref_type_var)
+            continue;
+         for (unsigned j = 0; j < n; ++j) {
+            if (merged[j] && d->var == vars[j]) {
+               d->var = rep[j];
+               break;
+            }
+         }
+      }
+   }
+
+   if (shader->info.ray_queries > merged_count)
+      shader->info.ray_queries -= merged_count;
+   nir_progress(true, impl, nir_metadata_control_flow);
+   return true;
+}
+
 /* A dynamically selected element's state is staged through per-operation
  * scalar shadows: each field is copied in once before the operation and the
  * fields the operation writes are copied back once after it, so the element
@@ -1382,7 +1636,9 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
       return false;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
-   if (m5_rq_alias_copies(impl))
+   bool cleaned = m5_rq_alias_copies(impl);
+   cleaned |= m5_rq_coalesce_disjoint(shader, impl);
+   if (cleaned)
       nir_remove_dead_variables(shader, nir_var_function_temp, NULL);
    struct util_dynarray queries = UTIL_DYNARRAY_INIT;
    struct util_dynarray ops = UTIL_DYNARRAY_INIT;
@@ -1509,8 +1765,12 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
             if (intr->intrinsic != nir_intrinsic_rq_initialize ||
                 nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0])) != state->query)
                continue;
+            const uint32_t reject_mask =
+               debug_get_bool_option("ASAHI_M5_RQ_NATIVE_FIRST_HIT", true)
+                  ? (2u | 0x40u | 0x100u)
+                  : (2u | 4u | 0x40u | 0x100u);
             state->native_opaque_possible |= !nir_src_is_const(intr->src[2]) ||
-               !(nir_src_as_uint(intr->src[2]) & (2 | 4 | 0x40 | 0x100));
+               !(nir_src_as_uint(intr->src[2]) & reject_mask);
          }
       }
    }
@@ -1792,7 +2052,12 @@ agx_nir_lower_m5_ray_query(nir_shader *shader,
                                : nir_load_deref(&b, tmax),
             lo, hi, nir_load_deref(&b, mask),
             layout->instance_traversal ? nir_imm_int(&b, 0) : query_control,
-            opaque, m5_candidate_api() ? nir_imm_false(&b) : first_hit,
+            opaque,
+            m5_candidate_api()
+               ? (debug_get_bool_option("ASAHI_M5_RQ_NATIVE_FIRST_HIT", true)
+                     ? nir_iand(&b, native_opaque_eligible, first_hit)
+                     : nir_imm_false(&b))
+               : first_hit,
             nir_ishl_imm(&b, nir_iand_imm(&b, ray_flags, 0x30), 4),
             native_opaque_eligible);
          nir_def *instance_type = NULL, *instance_bary = NULL, *instance_metadata = NULL, *instance_face = NULL;

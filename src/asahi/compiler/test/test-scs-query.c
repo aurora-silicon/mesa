@@ -546,12 +546,19 @@ batch_completion_latch(unsigned count)
    for (unsigned q = 0; q < count; ++q) {
       queries[q] = nir_local_variable_create(b.impl, glsl_uint64_t_type(), "query");
       queries[q]->data.ray_query = true;
-      for (unsigned epoch = 0; epoch < 2; ++epoch) {
+   }
+   /* Interleave epochs across queries when count > 1 so their live ranges
+    * genuinely overlap and cannot be coalesced into a single slot. */
+   for (unsigned epoch = 0; epoch < 2; ++epoch) {
+      for (unsigned q = 0; q < count; ++q) {
          nir_def *rq = &nir_build_deref_var(&b, queries[q])->def;
          nir_rq_initialize(&b, rq, nir_imm_int64(&b, 0x10002000000ull),
             nir_imm_int(&b, epoch ? 2 : 1), nir_imm_int(&b, 255),
             nir_imm_vec3(&b, 0, 0, -1), nir_imm_float(&b, 0.001),
             nir_imm_vec3(&b, 0, 0, 1), nir_imm_float(&b, 10));
+      }
+      for (unsigned q = 0; q < count; ++q) {
+         nir_def *rq = &nir_build_deref_var(&b, queries[q])->def;
          nir_push_loop(&b);
          nir_break_if(&b, nir_inot(&b, nir_rq_proceed(&b, 1, rq)));
          nir_rq_confirm_intersection(&b, rq);
@@ -598,6 +605,76 @@ batch_completion_latch(unsigned count)
    printf("M5_BATCH_COMPLETION_LATCH_PASS count=%u\n", count);
 }
 
+static void
+disjoint_query_coalesce(void)
+{
+   const char *option = getenv("ASAHI_M5_RQ_CANDIDATE_API");
+   char *saved = option ? strdup(option) : NULL;
+   setenv("ASAHI_M5_RQ_CANDIDATE_API", "1", 1);
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+      &agx_nir_options, "M5 disjoint ray query coalesce");
+   b.shader->info.ray_queries = 2;
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = b.shader->info.workgroup_size[2] = 1;
+
+   /* Two sequential queries (closest-hit followed by TerminateOnFirstHit shadow)
+    * with non-overlapping lifetimes should coalesce into one physical slot. */
+   const uint32_t flags[2] = { 0, 4 };
+   for (unsigned q = 0; q < 2; ++q) {
+      nir_variable *var = nir_local_variable_create(b.impl, glsl_uint64_t_type(), "query");
+      var->data.ray_query = true;
+      nir_def *rq = &nir_build_deref_var(&b, var)->def;
+      nir_rq_initialize(&b, rq, nir_imm_int64(&b, 0x10002000000ull),
+         nir_imm_int(&b, flags[q]), nir_imm_int(&b, 255),
+         nir_imm_vec3(&b, 0, 0, -1), nir_imm_float(&b, 0.001),
+         nir_imm_vec3(&b, 0, 0, 1), nir_imm_float(&b, 10));
+      nir_push_loop(&b);
+      nir_break_if(&b, nir_inot(&b, nir_rq_proceed(&b, 1, rq)));
+      nir_rq_confirm_intersection(&b, rq);
+      nir_pop_loop(&b, NULL);
+   }
+
+   const struct agx_m5_ray_query_layout layout = {
+      .payload_uniform = 152, .bvh_uniform = 96, .status_uniform = 134,
+      .launch_header = 0x10000000, .instance_traversal = true,
+   };
+   assert(agx_nir_lower_m5_ray_query(b.shader, &layout));
+
+   unsigned waited = 0, guarded_waits = 0, raw_status = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_scs_base_agx &&
+             nir_intrinsic_base(intr) == 7) {
+            if (nir_intrinsic_flags(intr) == 8) {
+               guarded_waits += inside_batch_completion_guard(instr);
+               waited++;
+            } else if (nir_intrinsic_flags(intr) == 0) {
+               raw_status++;
+            }
+         }
+      }
+   }
+   assert(waited == 2 && guarded_waits == 2 && raw_status == 2);
+
+   agx_preprocess_nir(b.shader);
+   struct agx_shader_key key = {
+      .dev = {.chip = AGX_CHIP_G17S, .encoding = AGX_ISA_ENCODING_AGX3C},
+      .no_preamble = true,
+      .has_scratch = true,
+   };
+   struct agx_shader_part part = {0};
+   assert(agx_compile_shader_nir(b.shader, &key, &part));
+   assert(part.info.uses_ray_traversal && part.info.main_size);
+   free(part.binary);
+   ralloc_free(b.shader);
+   if (saved) { setenv("ASAHI_M5_RQ_CANDIDATE_API", saved, 1); free(saved); }
+   else unsetenv("ASAHI_M5_RQ_CANDIDATE_API");
+   printf("M5_DISJOINT_QUERY_COALESCE_PASS\n");
+}
+
 int main(int argc,char **argv)
 {
  setbuf(stdout,NULL);glsl_type_singleton_init_or_ref();const char *out=argc>1?argv[1]:NULL;
@@ -606,6 +683,7 @@ int main(int argc,char **argv)
  instance_completion_byte();
  batch_completion_latch(1);
  batch_completion_latch(2);
+ disjoint_query_coalesce();
  standard_ray_query(1, false, MESA_SHADER_COMPUTE);
  standard_ray_query(1, false, MESA_SHADER_TESS_CTRL);
  dead_ray_query(false);
