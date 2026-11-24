@@ -488,6 +488,14 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    abort();
 }
 
+void
+hk_cs_finish_pending_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
 /* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
  * open a graphics or pre-graphics stream through it. */
 void

@@ -803,6 +803,18 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 }
 
 void
+hk_cs_finish_pending_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   if (cs->type == HK_CS_CDM && cs->cdm_flush_pending) {
+      hk_ensure_cs_has_space(cmd, cs, 0x2000);
+      cs->current = agx_cdm_barrier_deferred(
+         cs->current, hk_cmd_buffer_device(cmd)->dev.chip);
+      cs->stats.flushes++;
+      cs->cdm_flush_pending = false;
+   }
+}
+
+void
 hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                             struct agx_cdm_launch_word_0_packed launch,
                             uint32_t usc, struct agx_grid grid,
@@ -839,7 +851,15 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   hk_cdm_cache_flush(dev, cs);
+   /* Deferred CDM flush: no barrier between the launches of one batch. The
+    * batch ends at every vkCmdPipelineBarrier2 (hk_cmd_buffer.c), and
+    * hk_cs_finish_pending_flush emits the barrier there.
+    */
+   if (dev->cdm_defer_flush) {
+      cs->cdm_flush_pending = true;
+   } else {
+      hk_cdm_cache_flush(dev, cs);
+   }
 }
 
 void

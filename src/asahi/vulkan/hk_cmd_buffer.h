@@ -1311,6 +1311,11 @@ struct hk_cs {
 
    /* Whether there is more than just the root chunk */
    bool stream_linked;
+   /* Deferred CDM flush (hk_device.cdm_defer_flush): a launch was recorded
+    * without the trailing CDM barrier. It is emitted when the batch ends
+    * (Vulkan barrier, query, event, end of command buffer).
+    */
+   bool cdm_flush_pending;
 
    /* Active-context selector consumed by AGX3 VertexProgramVariant. */
    bool agx3_active_context_selector_valid;
@@ -2958,6 +2963,7 @@ hk_cs_destroy(struct hk_cs *cs)
 }
 
 void hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_cs_finish_pending_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 bool hk_defer_oq_available(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 void hk_resolve_deferred_oq_available(struct hk_cmd_buffer *cmd);
 
@@ -2978,6 +2984,8 @@ hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
 {
    if (*ptr) {
       struct hk_cs *cs = *ptr;
+      hk_cs_finish_pending_flush(cmd, cs);
+
       if (unlikely(cs->query_reset_pending))
          hk_flush_query_resets(cmd, cs);
 

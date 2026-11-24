@@ -1118,6 +1118,16 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->cdm_barrier_mask =
       debug_get_num_option("HK_CDM_BARRIER_MASK", 0) & 0x07ffffff;
 
+   /* Deferred CDM flush: one barrier at the end of each compute batch
+    * instead of after every launch. It holds token-digest parity on M1
+    * (G13G) and is faster there; M1 Max (G13X) lost digest parity with it.
+    * On by default on G13G only; HK_CDM_DEFER_FLUSH=0 disables it,
+    * HK_CDM_DEFER_FLUSH=1 enables it elsewhere for a gate run.
+    */
+   dev->cdm_defer_flush =
+      debug_get_bool_option("HK_CDM_DEFER_FLUSH",
+                            pdev->dev.chip == AGX_CHIP_G13G);
+
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps
     * its correct borders there. */
