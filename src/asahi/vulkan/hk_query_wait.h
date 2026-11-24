@@ -17,8 +17,10 @@
  * This is a tuning candidate, not a hardware latency/CPU guarantee. */
 #define HK_QUERY_WAIT_PRODUCER_NS UINT64_C(1000000)
 
-/* Diagnostic grace after observing completion of the current ordered-reset
- * generation's last registered writer, with no live writer left. */
+/* Error-path-only grace after the current ordered-reset generation's latest
+ * registered writer has completed without availability, with no live writer
+ * left. Correct applications never wait on this bound; pending work and
+ * future writers have no application deadline. */
 #define HK_QUERY_WAIT_RETIRED_NS UINT64_C(2000000000)
 
 struct hk_query_wait_pool;

@@ -30,6 +30,9 @@ __typeof__(hk_cmd_invalidate_compute_state)
 static unsigned stamps, submissions, resets;
 static bool reset_only;
 static unsigned expected_live;
+static uint64_t registration_serial;
+static bool check_registration_serial;
+static bool mixed_first;
 static bool fail_submission;
 static bool tracking_expected = true;
 static bool legacy_clock;
@@ -142,6 +145,8 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct hk_device *dev = (void *)vk_queue->base.device;
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    uint64_t serial;
+   if (check_registration_serial)
+      assert(dev->query_wait.serial == registration_serial + 1);
    if (!tracking_expected || reset_only) {
       assert(hk_query_wait_quiescent(&dev->query_wait, &serial));
       assert(list_length(&dev->query_wait.producers) == expected_live);
@@ -235,6 +240,96 @@ init_cmd(struct hk_cmd_buffer *cmd, struct hk_device *dev)
    vk_object_base_init(&dev->vk, &cmd->vk.base, VK_OBJECT_TYPE_COMMAND_BUFFER);
    cmd->vk.state = MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE;
    list_inithead(&cmd->control_streams);
+}
+
+/* Mixed calls must register in submission order across command buffers,
+ * including reset-only recordings on either side of a writer. */
+static VkResult
+mixed_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+{
+   struct hk_device *dev = (void *)vk_queue->base.device;
+   struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
+   uint64_t serial;
+   if (mixed_first) {
+      assert(!hk_query_wait_quiescent(&dev->query_wait, &serial));
+      mixed_first = false;
+   }
+   assert(submit->api_queue == vk_queue);
+   for (unsigned i = 0; i < submit->command_buffer_count; i++) {
+      struct hk_cmd_buffer *cmd = (void *)submit->command_buffers[i];
+      struct hk_query_wait_producer *producer;
+      assert(hk_query_wait_claim(&dev->query_wait, queue, cmd,
+                                 &cmd->query_wait_ops, &producer,
+                                 submit->api_queue));
+      assert(!!producer == hk_query_wait_has_writers(&cmd->query_wait_ops));
+      hk_query_wait_publish(&dev->query_wait, producer, 100, true);
+   }
+   return VK_SUCCESS;
+}
+
+static void
+test_mixed_submits(struct hk_device *dev, struct hk_queue *queue,
+                   struct hk_query_pool *pool, struct vk_command_pool *cp)
+{
+   struct hk_cmd_buffer *cmds = calloc(2, sizeof(*cmds));
+   assert(cmds);
+   VkCommandBufferSubmitInfo ci[2];
+   for (unsigned i = 0; i < 2; i++) {
+      init_cmd(&cmds[i], dev);
+      cmds[i].vk.pool = cp;
+      ci[i] = (VkCommandBufferSubmitInfo){
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+         .commandBuffer = hk_cmd_buffer_to_handle(&cmds[i]),
+      };
+   }
+   hk_CmdResetQueryPool(ci[0].commandBuffer, hk_query_pool_to_handle(pool),
+                         0, 1);
+   hk_CmdWriteTimestamp2(ci[1].commandBuffer,
+                          VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                          hk_query_pool_to_handle(pool), 0);
+   const struct hk_query_wait_ops ops = {
+      .available = fault_available, .status = fault_status,
+      .now = fault_clock, .changed = fault_changed, .error = fault_error,
+   };
+   queue->vk.driver_submit = mixed_submit;
+   dev->dev.chip = AGX_CHIP_G17P;
+   for (unsigned split = 0; split < 2; split++) {
+      for (unsigned reset_last = 0; reset_last < 2; reset_last++) {
+         hk_ResetQueryPool(hk_device_to_handle(dev),
+                            hk_query_pool_to_handle(pool), 0, 2);
+         VkCommandBufferSubmitInfo ordered[] = {ci[reset_last], ci[!reset_last]};
+         VkSubmitInfo2 si[2] = {{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .commandBufferInfoCount = split ? 1 : 2,
+            .pCommandBufferInfos = ordered,
+         }, {
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .commandBufferInfoCount = 1,
+            .pCommandBufferInfos = &ordered[1],
+         }};
+         mixed_first = true;
+         assert(hk_QueueSubmit2(vk_queue_to_handle(&queue->vk), 1 + split,
+                                si, VK_NULL_HANDLE) == VK_SUCCESS);
+         assert(list_length(&dev->query_wait.producers) == 1);
+         hk_query_wait_prune(&dev->query_wait, queue, 100);
+         fault_now = 0;
+         bool never;
+         VkResult result = hk_query_wait_available(pool->wait, 0, false,
+                                                   &never, &ops, NULL);
+         assert(!never);
+         assert(result == (reset_last ? VK_ERROR_UNKNOWN : VK_ERROR_DEVICE_LOST));
+         assert(fault_now == (reset_last ? UINT64_C(3000000000)
+                                         : HK_QUERY_WAIT_RETIRED_NS));
+      }
+   }
+   dev->dev.chip = AGX_CHIP_G13G;
+   queue->vk.driver_submit = submit;
+   for (unsigned i = 0; i < 2; i++) {
+      hk_query_wait_recording_finish(&cmds[i].query_wait_ops);
+      vk_object_base_finish(&cmds[i].vk.base);
+   }
+   free(cmds);
+   puts("mixed API submits: reset/writer order across command buffers and submit infos; admitted native queue retains registration (CPU model)");
 }
 
 static void
@@ -357,9 +452,17 @@ main(int argc, char **argv)
 
    for (unsigned i = 0; i < 2; i++) {
       expected_live = i + 1;
+      /* Exactly one ordered registration, including all reset ranges. A
+       * preliminary reset walk would mutate the generation a second time. */
+      registration_serial = dev->query_wait.serial;
+      check_registration_serial = true;
+      /* Exercise both legacy admission and the admitted native fast path. */
+      dev->dev.chip = i ? AGX_CHIP_G17P : AGX_CHIP_G13G;
       assert(hk_QueueSubmit2(vk_queue_to_handle(&queue.vk), 1, &si,
                              VK_NULL_HANDLE) == VK_SUCCESS);
    }
+   check_registration_serial = false;
+   dev->dev.chip = AGX_CHIP_G13G;
    assert(submissions == 2);
    if (probe) {
       hk_query_wait_prune(&dev->query_wait, &queue, 37);
@@ -428,6 +531,8 @@ main(int argc, char **argv)
              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
           VK_NOT_READY);
    assert(output[1] == 0);
+
+   test_mixed_submits(dev, &queue, &pool, &command_pool);
 
    fail_submission = true;
    expected_live = 1;

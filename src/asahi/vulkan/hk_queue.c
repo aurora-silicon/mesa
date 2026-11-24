@@ -1494,13 +1494,22 @@ hk_QueueSubmit2(VkQueue _queue, uint32_t submitCount,
       for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
          VK_FROM_HANDLE(hk_cmd_buffer, cmd,
                         pSubmits[i].pCommandBufferInfos[j].commandBuffer);
-         hk_query_wait_invalidate_resets(&dev->query_wait, &cmd->query_wait_ops,
-                                         vk_queue);
          queries |= hk_query_wait_has_writers(&cmd->query_wait_ops);
       }
    }
-   if (!queries)
+   if (!queries) {
+      /* Reset-only calls allocate no producer. Mixed calls instead apply
+       * resets once, in command-buffer order, through enqueue below. */
+      for (uint32_t i = 0; i < submitCount; i++) {
+         for (uint32_t j = 0; j < pSubmits[i].commandBufferInfoCount; j++) {
+            VK_FROM_HANDLE(hk_cmd_buffer, cmd,
+                           pSubmits[i].pCommandBufferInfos[j].commandBuffer);
+            hk_query_wait_invalidate_resets(&dev->query_wait,
+                                            &cmd->query_wait_ops, vk_queue);
+         }
+      }
       return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+   }
 
    struct hk_query_wait_batch *batch = hk_query_wait_batch_create();
    if (!batch)

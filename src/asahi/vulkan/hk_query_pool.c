@@ -741,7 +741,6 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       if (!hk_pipeline_statistics_layout_init(
              pool->vk.query_count, pool->vk.pipeline_statistics, &layout) ||
           layout.size_B > SIZE_MAX) {
-         hk_query_wait_pool_destroy(pool->wait);
          vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       }
