@@ -18,9 +18,10 @@ hk_pool_root_alloc(struct hk_cmd_buffer *cmd, uint32_t size,
                              HK_CMD_BO_ROOT);
 }
 
-__attribute__((hot)) uint64_t
-hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
-                          VkPipelineBindPoint bind_point)
+static uint64_t
+hk_cmd_buffer_upload_root_for_shader(struct hk_cmd_buffer *cmd,
+                                     VkPipelineBindPoint bind_point,
+                                     const struct hk_shader *cs_shader)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_descriptor_state *desc = hk_get_descriptors_state(cmd, bind_point);
@@ -31,9 +32,8 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
     * shader, which takes the whole table. */
    size_t root_size = sizeof(*root);
    if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
-      const struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
-      if (s && s->root_descriptor_size)
-         root_size = MIN2(root_size, s->root_descriptor_size);
+      if (cs_shader && cs_shader->root_descriptor_size)
+         root_size = MIN2(root_size, cs_shader->root_descriptor_size);
    } else if (agx_chip_native_hal200(dev->dev.chip) &&
               bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       root_size = MIN2(root_size, hk_gfx_root_descriptor_size(cmd));
@@ -133,6 +133,25 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    hk_upload_stat(cmd, root_uploads, 1);
    hk_upload_stat(cmd, root_bytes, head_B + (tail_B < root_size ? root_size - tail_B : 0));
    return root_ptr.gpu;
+}
+
+__attribute__((hot)) uint64_t
+hk_cmd_buffer_upload_compute_root(struct hk_cmd_buffer *cmd,
+                                  const struct hk_shader *s)
+{
+   return hk_cmd_buffer_upload_root_for_shader(
+      cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s);
+}
+
+__attribute__((hot)) uint64_t
+hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
+                          VkPipelineBindPoint bind_point)
+{
+   const struct hk_shader *cs_shader =
+      bind_point == VK_PIPELINE_BIND_POINT_COMPUTE
+         ? hk_only_variant(cmd->state.cs.shader)
+         : NULL;
+   return hk_cmd_buffer_upload_root_for_shader(cmd, bind_point, cs_shader);
 }
 
 uint64_t

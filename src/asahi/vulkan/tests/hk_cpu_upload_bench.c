@@ -206,6 +206,14 @@ reuse_correctness(struct fixture *f)
    cs->variants[0].root_descriptor_size = small_B;
    CHECK(hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE) != full);
    CHECK(cd->uploaded_root_size == small_B);
+   /* Alternate compute variants (identity_copy4, im2col_vec4, byte_stencil)
+    * upload their own measured prefix rather than the bound API shader's. */
+   struct hk_shader alt_cs = {.root_descriptor_size = small_B * 2};
+   CHECK(hk_cmd_buffer_upload_compute_root(cmd, &alt_cs) != small);
+   CHECK(cd->uploaded_root_size == small_B * 2);
+   alt_cs.root_descriptor_size = 0;
+   CHECK(hk_cmd_buffer_upload_compute_root(cmd, &alt_cs) != small);
+   CHECK(cd->uploaded_root_size == sizeof(cd->root));
    /* Every chip uploads only the measured compute prefix, including the AGX2
     * and native-encoding M3 paths, and an unmeasured shader the whole table. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {

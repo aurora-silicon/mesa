@@ -2041,7 +2041,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          return;
    }
    const uint64_t root = internal ? cmd->state.gfx.root :
-      hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+      hk_cmd_buffer_upload_compute_root(cmd, s);
    if (!root)
       return;
    const uint64_t texture_pointers = s->info.agx3_indexed_sampler_valid
@@ -2328,7 +2328,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    const uint64_t root_ptr = internal_graphics
       ? cmd->state.gfx.root
-      : hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+      : hk_cmd_buffer_upload_compute_root(cmd, s);
    if (!root_ptr) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
@@ -2806,7 +2806,7 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
    }
-   const uint64_t root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+   const uint64_t root = hk_cmd_buffer_upload_compute_root(cmd, s);
    uint64_t texture_pointers = 0;
    if (s->info.agx3_indexed_sampler_valid) {
       /* The sampled-image heap may be a chunked table (no single BO): its

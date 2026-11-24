@@ -3216,6 +3216,8 @@ void hk_cmd_print_upload_stats(struct hk_cmd_buffer *cmd);
 
 uint64_t hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
                                    VkPipelineBindPoint bind_point);
+uint64_t hk_cmd_buffer_upload_compute_root(struct hk_cmd_buffer *cmd,
+                                           const struct hk_shader *s);
 
 void hk_reserve_scratch_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                              struct hk_shader *s);
