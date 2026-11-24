@@ -732,9 +732,68 @@ m5_canonicalize_isel_uniform_cmp(const agx_context *ctx, agx_instr *I)
    I->icond = rev;
 }
 
+/* fadd.sat of an aligned low-half f32 uniform and -0.0: an f32 clamp of a
+ * uniform, which needs either a copy of the uniform or a register -0.0.
+ */
+static bool
+agx3b_uniform_negzero_clamp(const agx_instr *I)
+{
+   return I->op == AGX_OPCODE_FADD && I->saturate && I->nr_dests == 1 &&
+          I->nr_srcs == 2 && I->dest[0].size == AGX_SIZE_32 &&
+          I->src[0].type == AGX_INDEX_UNIFORM &&
+          I->src[0].size == AGX_SIZE_32 && I->src[0].value < 256 &&
+          !(I->src[0].value & 1) && !I->src[0].abs && !I->src[0].neg &&
+          agx_is_equiv(I->src[1], agx_negzero()) && !I->src[1].abs &&
+          !I->src[1].neg;
+}
+
 void
 agx_lower_uniform_sources(agx_context *ctx)
 {
+   /* Preserve the exact f32 add and saturation. Only change which operand
+    * satisfies the existing mixed uniform/GPR encoding contract.
+    *
+    * The uniform source limits:
+    * - (value & 1): uniform indices count 16-bit halves, and an f32 uniform
+    *   operand must start on an even half. This is an encoding limit, the
+    *   one agx_instr_accepts_uniform() applies to FADD on AGX3B and
+    *   agx3_uniform_float_encode() applies to an AGX3_FLOAT_UNIFORM source.
+    * - (value >= 256): not an encoding limit. agx3_uniform_float_encode()
+    *   takes uniform sources up to half 511. The pass keeps the bound it was
+    *   measured with, the low half of the uniform file (the `high` split in
+    *   agx_instr_accepts_uniform()); a high-half uniform keeps the existing
+    *   copy.
+    *
+    * The limit belongs to the AGX3B encoding, and the copy below that this
+    * avoids is keyed on that encoding, so the pass is too. It has been run
+    * on G16G hardware only.
+    */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && !ctx->is_preamble) {
+      agx_foreach_block(ctx, block) {
+         /* The shared -0.0 is one extra mov_imm per block, and each clamp
+          * it serves drops its own uniform copy. For one clamp that is the
+          * same instruction count in more bytes, so only share it between
+          * two or more clamps in the block.
+          */
+         unsigned clamps = 0;
+         agx_foreach_instr_in_block(block, I)
+            clamps += agx3b_uniform_negzero_clamp(I);
+         if (clamps < 2)
+            continue;
+
+         agx_index zero = agx_null();
+         agx_foreach_instr_in_block_safe(block, I) {
+            if (!agx3b_uniform_negzero_clamp(I))
+               continue;
+            if (agx_is_null(zero)) {
+               agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+               zero = agx_mov_imm(&b, 32, 0x80000000);
+            }
+            I->src[1] = zero;
+         }
+      }
+   }
+
    agx_foreach_instr_global_safe(ctx, I) {
       agx3_lower_m5_modified_fma_immediates(ctx, I);
 
