@@ -22,7 +22,7 @@ hk_ioto_arena_finish(struct hk_cmd_buffer *cmd)
 {
    struct hk_ioto_arena *arena = &cmd->ioto;
 
-   hk_device_free_span(hk_cmd_buffer_device(cmd), arena->span);
+   hk_cmd_pool_free_ioto_span(hk_cmd_buffer_pool(cmd), arena->span);
    memset(arena, 0, sizeof(*arena));
 }
 
@@ -34,13 +34,16 @@ hk_ioto_arena_finish(struct hk_cmd_buffer *cmd)
 /* With cached command memory, programs are cleaned per chunk rather than per
  * program: everything below the cursor, which also covers reservations that
  * were never published. */
-void
+bool
 hk_ioto_arena_clean(struct hk_cmd_buffer *cmd)
 {
    struct hk_ioto_arena *arena = &cmd->ioto;
 
-   if (arena->map && arena->cursor && hk_cached_cmd_memory())
+   if (arena->map && arena->cursor && hk_cached_cmd_memory()) {
       util_flush_range_no_fence(arena->map, arena->cursor);
+      return true;
+   }
+   return false;
 }
 
 static bool
@@ -55,9 +58,8 @@ hk_ioto_arena_grow(struct hk_cmd_buffer *cmd, size_t size, const char *label)
    /* See HK_CMD_SPAN_SIZE: one upload writes about 500 bytes of programs. */
    if (!arena->map && size <= HK_CMD_SPAN_SIZE && hk_cached_cmd_memory()) {
       struct agx_ptr ptr;
-      if (hk_cmd_pool_alloc_span(hk_cmd_buffer_pool(cmd), HK_CMD_SLAB_IOTO,
-                                 HK_CMD_SPAN_SIZE, HK_CMD_SPAN_SIZE, &ptr,
-                                 &arena->span) != VK_SUCCESS)
+      if (hk_cmd_pool_alloc_ioto_span(hk_cmd_buffer_pool(cmd), &ptr,
+                                      &arena->span) != VK_SUCCESS)
          return false;
 
       arena->map = ptr.cpu;
