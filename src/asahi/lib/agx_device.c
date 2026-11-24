@@ -154,9 +154,25 @@ agx_bo_free(struct agx_device *dev, struct agx_bo *bo)
     * vdrm_bo_create() flushes this ahead of any blob that reuses the VA. Keep
     * (leak) the VA if the unbind cannot be queued.
     */
-   if (!dev->is_virtio || !bo->va ||
-       !agx_bo_bind(dev, NULL, bo->va->addr, bo->size, 0,
-                    DRM_ASAHI_BIND_UNBIND))
+   bool free_va = true;
+   if (dev->is_virtio && bo->va) {
+      struct drm_asahi_gem_bind_op ops[2] = {
+         {
+            .flags = DRM_ASAHI_BIND_UNBIND,
+            .range = bo->size,
+            .addr = bo->va->addr,
+         },
+         {
+            .flags = DRM_ASAHI_BIND_UNBIND,
+            .range = bo->size,
+            .addr = bo->ro_shadow_bound
+                       ? agx_rw_addr_to_ro(dev, bo->va->addr)
+                       : 0,
+         },
+      };
+      free_va = !dev->ops.bo_bind(dev, ops, bo->ro_shadow_bound ? 2 : 1);
+   }
+   if (free_va)
       agx_va_free(dev, bo->va, false);
 
    if (bo->prime_fd != -1)
@@ -592,27 +608,36 @@ agx_bo_mmap(struct agx_device *dev, struct agx_bo *bo, void *fixed_addr,
 {
    assert(bo->_map == NULL && "not double mapped");
 
-   struct drm_asahi_gem_mmap_offset gem_mmap_offset = {.handle =
-                                                          bo->uapi_handle};
-   int ret, flags;
+   uint64_t offset;
+   if (likely(bo->has_mmap_offset)) {
+      offset = bo->mmap_offset;
+   } else {
+      struct drm_asahi_gem_mmap_offset gem_mmap_offset = {
+         .handle = bo->uapi_handle,
+      };
+      int ret =
+         drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &gem_mmap_offset);
+      if (ret) {
+         fprintf(stderr, "DRM_IOCTL_ASAHI_MMAP_BO failed: %m\n");
+         assert(0);
+         return;
+      }
 
-   ret = drmIoctl(dev->fd, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &gem_mmap_offset);
-   if (ret) {
-      fprintf(stderr, "DRM_IOCTL_ASAHI_MMAP_BO failed: %m\n");
-      assert(0);
+      offset = gem_mmap_offset.offset;
+      bo->mmap_offset = offset;
+      bo->has_mmap_offset = true;
    }
 
-   flags = MAP_SHARED | (fixed_addr ? MAP_FIXED : 0);
+   int flags = MAP_SHARED | (fixed_addr ? MAP_FIXED : 0);
    bo->_map_size = length ?: bo->size;
    bo->_map = os_mmap(fixed_addr, bo->_map_size, PROT_READ | PROT_WRITE,
-                      flags, dev->fd, gem_mmap_offset.offset);
+                      flags, dev->fd, offset);
    if (bo->_map == MAP_FAILED) {
       bo->_map = NULL;
       bo->_map_size = 0;
       fprintf(stderr,
               "mmap failed: result=%p size=0x%llx fd=%i offset=0x%llx %m\n",
-              bo->_map, (long long)bo->size, dev->fd,
-              (long long)gem_mmap_offset.offset);
+              bo->_map, (long long)bo->size, dev->fd, (long long)offset);
    }
 }
 
@@ -1252,7 +1277,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * a practical limit. */
    if (agx_chip_native_agx3(dev->chip))
       dev->shader_base = AGX_G17P_USC_WINDOW_BASE;
-   else if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G)
+   else if (agx_chip_hal300_path(dev->chip))
       dev->shader_base = AGX_M5_SHADER_BASE;
 
    if (dev->shader_base < reservation) {
@@ -1290,9 +1315,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * robustness carveout untouched while making every ordinary VDM payload
     * directly representable, with no per-run alias option.
     */
-   const bool heap_below_usc = agx_chip_native_agx3(dev->chip) ||
-                               agx_chip_g17_m5(dev->chip) ||
-                               dev->chip == AGX_CHIP_G18G;
+   const bool heap_below_usc = agx_chip_agx3_path(dev->chip);
 
    /*
     * Start the low heap as high as it can go rather than at the reservation.
@@ -1346,7 +1369,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    /* G17P is bounded by the narrower of the compact VDM aperture and the
     * absolute USC texture/sampler table pointer, both of which sit below the
     * USC window. Other chips retain the kernel-reported user limit. */
-   if (agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G) {
+   if (agx_chip_hal300_path(dev->chip)) {
       struct agx_m5_va_layout layout;
       if (!agx_m5_va_layout(dev->params.vm_start, dev->params.vm_end,
                             dev->params.vm_kernel_min_size, dev->shader_base,
@@ -1359,7 +1382,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       user_start = layout.data_start;
    }
    const uint64_t user_limit =
-      agx_chip_g17_m5(dev->chip) || dev->chip == AGX_CHIP_G18G
+      agx_chip_hal300_path(dev->chip)
          ? AGX_M5_DATA_END
          : agx_va_user_limit(dev->chip, heap_below_usc,
                              vm_create.kernel_start);
@@ -1582,9 +1605,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       initialized |= AGX_INIT_CONTEXT_SLOTS;
    }
 
-   const bool dynamic_printf = agx_chip_native_agx3(dev->chip) ||
-                               agx_chip_g17_m5(dev->chip) ||
-                               dev->chip == AGX_CHIP_G18G;
+   const bool dynamic_printf = agx_chip_agx3_path(dev->chip);
    struct agx_bo *bo =
       dynamic_printf
          ? agx_bo_create(dev, LIBAGX_PRINTF_BUFFER_SIZE, 0, AGX_BO_WRITEBACK,
@@ -1620,8 +1641,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    initialized |= AGX_INIT_PRINTF;
 
    /* Map the stage helper tables at the USC execution-window base. */
-   if (agx_chip_native_agx3(dev->chip) || agx_chip_g17_m5(dev->chip) ||
-       dev->chip == AGX_CHIP_G18G) {
+   if (agx_chip_agx3_path(dev->chip)) {
       const size_t usc_base_size = AIL_PAGESIZE;
 
       simple_mtx_lock(&dev->vma_lock);
@@ -1734,9 +1754,10 @@ agx_create_command_queue(struct agx_device *dev,
    return agx_create_command_queue_with_render_scs(dev, priority, layouts);
 }
 
-uint32_t
-agx_create_command_queue_with_render_scs(struct agx_device *dev,
-   enum drm_asahi_priority priority, const uint64_t layouts[2])
+static uint32_t
+agx_create_queue(struct agx_device *dev, enum drm_asahi_priority priority,
+                 const uint64_t layouts[2], uint32_t flags,
+                 uint32_t *created_flags)
 {
    if (dev->debug & AGX_DBG_1QUEUE) {
       // Abuse this lock for this, it's debug only anyway
@@ -1744,15 +1765,21 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
       if (dev->queue_id) {
          /* The shared queue serves a later caller only if it was created with
           * every render SCS layout that caller needs (Vulkan's first queue
-          * brings the ray-query layout; GL needs none). */
+          * brings the ray-query layout; GL needs none) and with no flag the
+          * caller did not ask for (an async queue for a caller that reads
+          * results right after a submission). */
          const bool covered =
             (!layouts[0] || layouts[0] == dev->queue_layouts[0]) &&
-            (!layouts[1] || layouts[1] == dev->queue_layouts[1]);
+            (!layouts[1] || layouts[1] == dev->queue_layouts[1]) &&
+            !(dev->queue_flags & ~flags);
+         const uint32_t shared_flags = dev->queue_flags;
          simple_mtx_unlock(&dev->vma_lock);
          if (!covered) {
             errno = EINVAL;
             return UINT32_MAX;
          }
+         if (created_flags)
+            *created_flags = shared_flags;
          return dev->queue_id;
       }
    }
@@ -1760,6 +1787,7 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
    const bool timeout = dev->compute_timeout_ms &&
                         (dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT);
    struct drm_asahi_queue_create queue_create = {
+      .flags = flags,
       .vm_id = dev->vm_id,
       .priority = priority,
       .usc_exec_base = dev->shader_base,
@@ -1789,10 +1817,34 @@ agx_create_command_queue_with_render_scs(struct agx_device *dev,
       dev->queue_priority = priority;
       dev->queue_layouts[0] = layouts[0];
       dev->queue_layouts[1] = layouts[1];
+      dev->queue_flags = flags;
       simple_mtx_unlock(&dev->vma_lock);
    }
 
+   if (created_flags)
+      *created_flags = flags;
    return queue_create.queue_id;
+}
+
+uint32_t
+agx_create_command_queue_with_render_scs(struct agx_device *dev,
+   enum drm_asahi_priority priority, const uint64_t layouts[2])
+{
+   return agx_create_queue(dev, priority, layouts, 0, NULL);
+}
+
+uint32_t
+agx_create_async_command_queue(struct agx_device *dev,
+                               enum drm_asahi_priority priority, bool *async)
+{
+   const uint64_t layouts[2] = {0};
+   const bool offered = dev->params.features & DRM_ASAHI_FEATURE_ASYNC_SUBMIT;
+   uint32_t flags = 0;
+   const uint32_t id =
+      agx_create_queue(dev, priority, layouts,
+                       offered ? DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT : 0, &flags);
+   *async = id != UINT32_MAX && (flags & DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT);
+   return id;
 }
 
 int

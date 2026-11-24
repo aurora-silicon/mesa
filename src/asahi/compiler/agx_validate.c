@@ -6,6 +6,7 @@
 
 #include "util/compiler.h"
 #include "agx_compiler.h"
+#include "agx3_matrix_core.h"
 #include "agx_debug.h"
 #include "agx_opcodes.h"
 
@@ -120,6 +121,12 @@ agx_validate_sources(agx_instr *I)
       } else if (I->op == AGX_OPCODE_PHI) {
          agx_validate_assert(src.size == I->dest[0].size);
          agx_validate_assert(!agx_is_null(src));
+      } else if ((I->op == AGX_OPCODE_FCMPSEL ||
+                  I->op == AGX_OPCODE_ICMPSEL) &&
+                 s >= 2 && I->nr_dests == 1) {
+         /* A selected register or uniform is a bit pattern of the
+          * destination's width: no encoding extends or narrows it. */
+         agx_validate_assert(src.size == I->dest[0].size);
       }
 
       agx_validate_assert(!src.memory || is_stack_valid(I));
@@ -171,7 +178,7 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
    case AGX_OPCODE_MATMAD16_AGX3:
       return 16;
    case AGX_OPCODE_MATMAD8_AGX3:
-      return 4;
+      return (I->matrix_type & AGX3_MATRIX_ACCUM_F16) ? 2 : 4;
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_PHI:
       /* Tautological */
@@ -341,6 +348,8 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
    case AGX_OPCODE_MATMAD16_AGX3:
       return s == 2 ? 16 : 8;
    case AGX_OPCODE_MATMAD8_AGX3:
+      if (I->matrix_type & AGX3_MATRIX_ACCUM_F16)
+         return 2;
       return s == 2 || (I->matrix_type & 15) == 2 ? 4 : 2;
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_EXPORT:

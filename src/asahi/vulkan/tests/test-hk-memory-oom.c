@@ -25,7 +25,7 @@
 #define MIB (UINT64_C(1024) * 1024)
 static const uint64_t limit = 2048 * MIB, host = 384 * MIB;
 static uint64_t pinned, cached, peak, sibling_snapshot;
-static unsigned bo_calls, kernel_oom_attempts, trims, budget_queries;
+static unsigned bo_calls, bind_calls, kernel_oom_attempts, trims, budget_queries;
 static unsigned passing, host_live;
 static bool bind_fails, bo_fails, image_bind_fails, export_fails, limited = true;
 static unsigned images_live, successes, exported_count;
@@ -48,10 +48,14 @@ __typeof__(os_get_total_physical_memory) __wrap_os_get_total_physical_memory;
 static uint64_t fake_available = UINT64_C(64) * 1024 * MIB;
 static uint64_t fake_total = UINT64_C(32) * 1024 * MIB;
 static bool meminfo_readable = true;
+/* hk_AllocateMemory() reads /proc/meminfo only when the BO cache misses, and
+ * never below 1 MiB. Count the reads to check that. */
+static unsigned meminfo_reads;
 
 bool
 __wrap_os_get_available_system_memory(uint64_t *size)
 {
+   ++meminfo_reads;
    *size = fake_available;
    return meminfo_readable;
 }
@@ -112,6 +116,7 @@ int
 __wrap_agx_bo_bind(struct agx_device *dev, struct agx_bo *bo, uint64_t address,
                    size_t size, uint64_t offset, uint32_t flags)
 {
+   ++bind_calls;
    return bind_fails ? -1 : 0;
 }
 
@@ -310,14 +315,21 @@ init_wsi(struct hk_device *dev)
 }
 
 static VkResult
-alloc(struct hk_device *dev, uint64_t size, VkDeviceMemory *memory)
+alloc_type(struct hk_device *dev, uint64_t size, uint32_t memory_type_index,
+           VkDeviceMemory *memory)
 {
    const VkMemoryAllocateInfo info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .allocationSize = size,
-      .memoryTypeIndex = 0,
+      .memoryTypeIndex = memory_type_index,
    };
    return hk_AllocateMemory(hk_device_to_handle(dev), &info, &allocator, memory);
+}
+
+static VkResult
+alloc(struct hk_device *dev, uint64_t size, VkDeviceMemory *memory)
+{
+   return alloc_type(dev, size, 0, memory);
 }
 
 static void
@@ -510,11 +522,15 @@ main(void)
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    fake_total = UINT64_C(32) * 1024 * MIB;
 
-   /* Allocations below 1 MiB are never refused, 1 MiB is. */
+   /* Allocations below 1 MiB are never refused, 1 MiB is. Below 1 MiB
+    * /proc/meminfo is not read. */
    fake_available = 0;
+   meminfo_reads = 0;
    assert(alloc(dev, MIB / 2, &memory) == VK_SUCCESS);
+   assert(!meminfo_reads);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(alloc(dev, MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   assert(meminfo_reads == 1);
 
    /* An unreadable /proc/meminfo leaves only the heap limit. */
    meminfo_readable = false;
@@ -522,19 +538,88 @@ main(void)
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    meminfo_readable = true;
 
-   /* A BO served from the BO cache allocates nothing, so it passes at the
-    * reserve. A different size that misses the cache is refused. */
+   /* A BO served from the BO cache allocates nothing and reuses its read-only
+    * shadow mapping with zero VM_BIND calls, so it passes at the reserve. A
+    * different size that misses the cache is refused. */
    fake_available = 64 * 1024 * MIB;
+   unsigned binds_before = bind_calls;
    assert(alloc(dev, 128 * MIB, &memory) == VK_SUCCESS);
+   assert(bind_calls == binds_before + 1);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    fake_available = 1024 * MIB;
    before = bo_calls;
+   /* A cache hit does not read /proc/meminfo; a miss reads it once. */
+   meminfo_reads = 0;
+   binds_before = bind_calls;
    assert(alloc(dev, 128 * MIB, &memory) == VK_SUCCESS);
-   assert(bo_calls == before);
+   assert(bo_calls == before && bind_calls == binds_before);
+   assert(!meminfo_reads);
    hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
    assert(alloc(dev, 512 * MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
-   assert(bo_calls == before);
+   assert(bo_calls == before && bind_calls == binds_before);
+   assert(meminfo_reads == 1);
    agx_bo_cache_evict_all(&dev->dev);
+
+   /* Warm BO-cache reuse across 4 KiB..64 MiB must issue zero VM_BINDs,
+    * isolate memory types by BO flags, retry after a bind failure, and reset
+    * cleanly on cache eviction. */
+   fake_available = 64 * 1024 * MIB;
+   pdev->mem_types[1].heapIndex = 0;
+   pdev->mem_types[1].propertyFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+   static const uint64_t reuse_sizes[] = {
+      4096, 65536, MIB, 16 * MIB, 64 * MIB,
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(reuse_sizes); ++i) {
+      before = bo_calls;
+      binds_before = bind_calls;
+      assert(alloc(dev, reuse_sizes[i], &memory) == VK_SUCCESS);
+      assert(bo_calls == before + 1 && bind_calls == binds_before + 1);
+      struct agx_bo *first_bo = hk_device_memory_from_handle(memory)->bo;
+      assert(first_bo->ro_shadow_bound);
+      hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+
+      for (unsigned iter = 0; iter < 3; ++iter) {
+         assert(alloc(dev, reuse_sizes[i], &memory) == VK_SUCCESS);
+         assert(hk_device_memory_from_handle(memory)->bo == first_bo);
+         assert(bo_calls == before + 1 && bind_calls == binds_before + 1);
+         hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+      }
+   }
+
+   /* HOST_CACHED (AGX_BO_WRITEBACK) must not reuse an uncached BO. */
+   before = bo_calls;
+   binds_before = bind_calls;
+   assert(alloc_type(dev, 16 * MIB, 1, &memory) == VK_SUCCESS);
+   assert(bo_calls == before + 1 && bind_calls == binds_before + 1);
+   struct agx_bo *wb_bo = hk_device_memory_from_handle(memory)->bo;
+   assert(wb_bo->flags & AGX_BO_WRITEBACK);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   assert(alloc_type(dev, 16 * MIB, 1, &memory) == VK_SUCCESS);
+   assert(hk_device_memory_from_handle(memory)->bo == wb_bo);
+   assert(bo_calls == before + 1 && bind_calls == binds_before + 1);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+
+   /* A failed RO shadow bind must not mark the BO bound; the next allocation
+    * retries and succeeds. */
+   bind_fails = true;
+   binds_before = bind_calls;
+   assert(alloc(dev, 2 * MIB, &memory) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   assert(bind_calls == binds_before + 1);
+   bind_fails = false;
+   assert(alloc(dev, 2 * MIB, &memory) == VK_SUCCESS);
+   assert(bind_calls == binds_before + 2);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+
+   /* Evicting the cache closes every handle; a fresh allocation binds again. */
+   agx_bo_cache_evict_all(&dev->dev);
+   assert(!pinned && !dev->dev.bo_cache.size);
+   before = bo_calls;
+   binds_before = bind_calls;
+   assert(alloc(dev, 64 * MIB, &memory) == VK_SUCCESS);
+   assert(bo_calls == before + 1 && bind_calls == binds_before + 1);
+   hk_FreeMemory(hk_device_to_handle(dev), memory, &allocator);
+   agx_bo_cache_evict_all(&dev->dev);
+   assert(!pinned && !dev->dev.bo_cache.size);
 
    /* An fd import whose object is smaller than allocationSize is refused,
     * releases the object and leaves the fd with the caller. One at least as

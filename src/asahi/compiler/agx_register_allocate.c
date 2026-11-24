@@ -16,6 +16,7 @@
 #include "util/u_qsort.h"
 #include "util/u_debug.h"
 
+#include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
@@ -266,9 +267,18 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
       agx_print_shader(ctx, stdout);
    }
 
-   uint8_t *widths = calloc(ctx->alloc, sizeof(uint8_t));
-   enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
-   BITSET_WORD *dest_read = agx_values_read(ctx);
+   static_assert(RA_CLASSES <= UINT8_MAX, "ra_class fits in uint8_t");
+   uint8_t stack_widths[1024];
+   uint8_t stack_classes[1024];
+   uint8_t *widths =
+      ctx->alloc <= 1024 ? stack_widths : calloc(ctx->alloc, sizeof(uint8_t));
+   uint8_t *classes =
+      ctx->alloc <= 1024 ? stack_classes : calloc(ctx->alloc, sizeof(uint8_t));
+   if (ctx->alloc <= 1024) {
+      memset(widths, 0, ctx->alloc * sizeof(uint8_t));
+      memset(classes, 0, ctx->alloc * sizeof(uint8_t));
+   }
+   BITSET_WORD *dest_read = NULL;
 
    agx_foreach_instr_global(ctx, I) {
       if (remat && (I->op == AGX_OPCODE_MOV_IMM ||
@@ -375,8 +385,12 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
             late_kill_count += (pot_width - real_width);
 
             /* An unread M5 query-entry result dies right after its write. */
-            if (I->op == AGX_OPCODE_ENTER_QUERY_M5 && !BITSET_TEST(dest_read, I->dest[d].value))
-               late_kill_count += real_width;
+            if (I->op == AGX_OPCODE_ENTER_QUERY_M5) {
+               if (!dest_read)
+                  dest_read = agx_values_read(ctx);
+               if (!BITSET_TEST(dest_read, I->dest[d].value))
+                  late_kill_count += real_width;
+            }
          }
 
          max_demand = MAX2(demand, max_demand);
@@ -386,9 +400,95 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
    }
 
    free(dest_read);
-   free(widths);
-   free(classes);
+   if (widths != stack_widths)
+      free(widths);
+   if (classes != stack_classes)
+      free(classes);
    return max_demand;
+}
+
+bool
+agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
+                        unsigned align, unsigned minimum, unsigned limit,
+                        unsigned *out)
+{
+   const unsigned start = ALIGN_POT(minimum, align);
+   if (start + count > limit)
+      return false;
+
+   bool found = false;
+   unsigned result = 0;
+
+   if (BITSET_WORDBITS == 32 && count == align &&
+       (align == 1 || align == 2 || align == 4 || align == 8 || align == 16)) {
+      const unsigned last_reg = limit - count;
+      const unsigned first_word = start >> 5;
+      const unsigned last_word = last_reg >> 5;
+
+      for (unsigned wi = first_word; wi <= last_word; ++wi) {
+         const uint32_t w = used[wi];
+         if (w == ~0u)
+            continue;
+
+         uint32_t free_slots;
+         if (align == 1) {
+            free_slots = ~w;
+         } else if (align == 2) {
+            free_slots = (~(w | (w >> 1))) & 0x55555555u;
+         } else if (align == 4) {
+            uint32_t b = w | (w >> 1);
+            free_slots = (~(b | (b >> 2))) & 0x11111111u;
+         } else if (align == 8) {
+            uint32_t b = w | (w >> 1);
+            b |= b >> 2;
+            free_slots = (~(b | (b >> 4))) & 0x01010101u;
+         } else {
+            free_slots = ((w & 0xffffu) ? 0u : 1u) |
+                         ((w >> 16) ? 0u : (1u << 16));
+         }
+
+         if (wi == first_word && (start & 31))
+            free_slots &= ~0u << (start & 31);
+         if (wi == last_word && (last_reg & 31) != 31)
+            free_slots &= (2u << (last_reg & 31)) - 1u;
+
+         if (free_slots) {
+            result = (wi << 5) + (unsigned)(ffs(free_slots) - 1);
+            found = true;
+            break;
+         }
+      }
+   } else {
+      for (unsigned reg = start; reg + count <= limit;) {
+         if (BITSET_WORDBITS == 32 && used[reg >> 5] == ~0u) {
+            reg = ALIGN_POT((reg | 31u) + 1u, align);
+            continue;
+         }
+         if (!BITSET_TEST_COUNT(used, reg, count)) {
+            result = reg;
+            found = true;
+            break;
+         }
+         reg += align;
+      }
+   }
+
+#ifndef NDEBUG
+   bool ref_found = false;
+   unsigned ref_reg = 0;
+   for (unsigned reg = start; reg + count <= limit; reg += align) {
+      if (!BITSET_TEST_COUNT(used, reg, count)) {
+         ref_reg = reg;
+         ref_found = true;
+         break;
+      }
+   }
+   assert(found == ref_found && (!found || result == ref_reg));
+#endif
+
+   if (found)
+      *out = result;
+   return found;
 }
 
 static bool
@@ -396,14 +496,19 @@ find_regs_simple(struct ra_ctx *rctx, enum ra_class cls, unsigned count,
                  unsigned align, unsigned minimum, unsigned limit,
                  unsigned *out)
 {
-   for (unsigned reg = ALIGN_POT(minimum, align); reg + count <= limit;
-        reg += align) {
-      if (!BITSET_TEST_COUNT(rctx->used_regs[cls], reg, count)) {
-         *out = reg;
-         return true;
-      }
-   }
+   return agx_ra_find_regs_simple(rctx->used_regs[cls], count, align, minimum,
+                                  limit, out);
+}
 
+/* A phi reading the uniform file becomes a move from it on that incoming edge
+ * (agx_insert_parallel_copies()), which writes the phi's register. */
+static bool
+phi_reads_uniform(const agx_instr *I)
+{
+   agx_foreach_src(I, s) {
+      if (I->src[s].type == AGX_INDEX_UNIFORM)
+         return true;
+   }
    return false;
 }
 
@@ -429,6 +534,14 @@ dest_limit(const struct ra_ctx *rctx, const agx_instr *I, unsigned d)
    if ((rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
         agx_is_g18g(&rctx->shader->key->dev)) &&
        I->op == AGX_OPCODE_MOV && I->src[0].type == AGX_INDEX_UNIFORM)
+      limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
+   /* So does the move a phi reading the uniform file becomes on that edge.
+    * G17P's 32-bit uniform copy also names the upper registers; its 16-bit
+    * one, like G18G's at both widths, does not. */
+   if (I->op == AGX_OPCODE_PHI && phi_reads_uniform(I) &&
+       (agx_is_g18g(&rctx->shader->key->dev) ||
+        (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->dest[d].size == AGX_SIZE_16)))
       limit = MIN2(limit, AGX3_COPY_REG16_DEST_HALVES);
    if (rctx->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
        BITSET_TEST(rctx->low_gpr, I->dest[d].value))
@@ -1144,19 +1257,12 @@ pick_transient_texture_region(struct ra_ctx *rctx, agx_instr *I, unsigned d,
  */
 #define G17P_LOW_BANK_HALVES 128
 
-/* Register budget, in halves, of M5 compute kernels that use native ray
- * traversal. Value from 7c91dddf53f (the M5 userspace snapshot), measured on
- * M5 hardware with the full-resolution RT workload: 160 halves was faster
- * than 128 and 192. Not derived; the snapshot records no numbers.
- */
-#define AGX_M5_RT_REGISTER_BUDGET 160u
-
 static bool
 prefer_high_bank(const struct ra_ctx *rctx, const agx_instr *I, unsigned d,
                  enum ra_class cls, unsigned minimum, unsigned limit)
 {
    const enum agx_chip chip = rctx->shader->key->dev.chip;
-   if ((chip != AGX_CHIP_G17P && !agx_chip_g17_m5(chip)) ||
+   if (!agx_chip_g17p_or_m5(chip) ||
        !rctx->shader->has_spill_pcopy_reserved || cls != RA_GPR ||
        minimum != 0 || limit != rctx->bound[cls] ||
        limit <= G17P_LOW_BANK_HALVES ||
@@ -1194,6 +1300,15 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
    }
    if (simple) {
       return reg;
+   } else if (cls != RA_GPR) {
+      /* Spill slots cannot live-range split: fail closed instead of falling
+       * through into GPR eviction (which corrupts used_regs[RA_GPR] in
+       * NDEBUG builds). */
+      rctx->shader->ra_failed = true;
+      rctx->shader->ra_mem_exhausted = true;
+      if (rctx->shader->ra_abort)
+         longjmp(*(jmp_buf *)rctx->shader->ra_abort, 1);
+      return 0;
    } else {
       assert(!rctx->early_killed && "no live range splits with early kill");
       assert(cls == RA_GPR && "no memory live range splits");
@@ -1621,8 +1736,7 @@ static bool
 pick_phi_source_agreement(struct ra_ctx *rctx, agx_instr *I, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
-        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
+       !agx_chip_g17p_or_m5(rctx->shader->key->dev.chip))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[0]);
@@ -1659,12 +1773,15 @@ pick_phi_unclaimed(struct ra_ctx *rctx, agx_instr *I, unsigned d,
                    unsigned count, unsigned align, unsigned *out)
 {
    if (I->op != AGX_OPCODE_PHI ||
-       (rctx->shader->key->dev.chip != AGX_CHIP_G17P &&
-        !agx_chip_g17_m5(rctx->shader->key->dev.chip)))
+       !agx_chip_g17p_or_m5(rctx->shader->key->dev.chip))
       return false;
 
    enum ra_class cls = ra_class_for_index(I->dest[d]);
-   BITSET_DECLARE(claimed, AGX_NUM_MODELED_REGS) = {0};
+   if (rctx->bound[cls] == 0)
+      return false;
+
+   BITSET_DECLARE(claimed, AGX_NUM_MODELED_REGS);
+   memset(claimed, 0, BITSET_WORDS(rctx->bound[cls]) * sizeof(BITSET_WORD));
    bool any = false;
 
    agx_foreach_phi_in_block(rctx->block, other) {
@@ -1876,6 +1993,14 @@ kill_source(struct ra_ctx *rctx, const agx_instr *I, unsigned s)
    assert(count >= 1);
 
    BITSET_CLEAR_COUNT(rctx->used_regs[cls], reg, count);
+
+   if (cls == RA_GPR) {
+      unsigned reserved = reserved_size(rctx->shader);
+      if (reg < reserved) {
+         BITSET_SET_COUNT(rctx->used_regs[RA_GPR], reg,
+                          MIN2(count, reserved - reg));
+      }
+   }
 }
 
 static void
@@ -1895,7 +2020,7 @@ try_kill_early_sources(struct ra_ctx *rctx, const agx_instr *I,
        dest_end > dest_limit(rctx, I, 0) ||
        (rctx->ssa_to_reg[I->src[first_source].value] & (dest_size - 1)) ||
        ((region_end < dest_end) &&
-        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end)))
+        BITSET_TEST_RANGE(rctx->used_regs[RA_GPR], region_end, dest_end - 1)))
       return;
 
    for (unsigned s = first_source; s <= last_source; ++s) {
@@ -2284,7 +2409,11 @@ static void
 agx_ra_assign_local(struct ra_ctx *rctx)
 {
    BITSET_DECLARE(used_regs_gpr, AGX_NUM_REGS) = {0};
-   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS) = {0};
+   BITSET_DECLARE(used_regs_mem, AGX_NUM_MODELED_REGS);
+   if (rctx->bound[RA_MEM] > 0) {
+      memset(used_regs_mem, 0,
+             BITSET_WORDS(rctx->bound[RA_MEM]) * sizeof(BITSET_WORD));
+   }
    uint16_t *ssa_to_reg = calloc(rctx->shader->alloc, sizeof(uint16_t));
 
    agx_block *block = rctx->block;
@@ -2383,13 +2512,17 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          assert(I->dest[0].size == I->src[0].size);
          assert(I->src[0].type == AGX_INDEX_REGISTER);
 
-         /* r1l specifically is a preloaded register. It is reserved during
-          * demand calculations to ensure we don't need live range shuffling of
-          * spilling temporaries. But we can still preload to it. So if it's
-          * reserved, just free it. It'll be fine.
+         /* Preloaded registers may fall inside the shader-wide reserved prefix
+          * (such as r1l during spilling or r4..r7 before CEM eviction moves
+          * them out of the low scratch bank). Clear the reserved bits so the
+          * preload can occupy its fixed ABI register until killed.
           */
-         if (I->src[0].value == 2) {
-            BITSET_CLEAR(rctx->used_regs[RA_GPR], 2);
+         unsigned preload_reg = I->src[0].value;
+         unsigned preload_nr = agx_index_size_16(I->src[0]);
+         unsigned reserved = reserved_size(rctx->shader);
+         if (preload_reg < reserved) {
+            BITSET_CLEAR_COUNT(rctx->used_regs[RA_GPR], preload_reg,
+                               MIN2(preload_nr, reserved - preload_reg));
          }
 
          assign_regs(rctx, I->dest[0], I->src[0].value);
@@ -2536,7 +2669,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
          I->src[0].type == AGX_INDEX_NORMAL &&
          I->src[1].type == AGX_INDEX_NORMAL;
 
-      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) &&
+      if (I->nr_dests == 1 && !agx_is_null(I->dest[0]) && !I->dest[0].memory &&
           !g17p_ft1 && !g17p_srl_boundary &&
           !g17p_reg_isub && !g17p_reg_and) {
          unsigned first_src = 0;
@@ -2873,8 +3006,9 @@ agx3_tile_store_bank(agx_context *ctx)
     * So size the bank by what the stores actually need, prefix included, and
     * widen to the same halves 0..63 the plain MRT bank below already uses past
     * four targets rather than inventing a third bank. */
-   if (ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
-       list_length(&ctx->blocks) > 1) {
+   if ((ctx->key->g17p_emrt && ctx->agx3_mrt_tile_ops_ordered &&
+        list_length(&ctx->blocks) > 1) ||
+       ctx->agx3_local_read_tile_ops) {
       const unsigned prefix = ALIGN_POT(reserved_size(ctx), payload_align);
       return prefix + payload_halves > 32 ? 64 : 32;
    }
@@ -3017,6 +3151,78 @@ ra_file_alignment(agx_context *ctx)
    return alignment;
 }
 
+/* The registers assignment uses for a program with the given demand: as many
+ * as it can without affecting occupancy, which reduces live range splitting.
+ */
+static unsigned
+assignment_file(const agx_context *ctx, unsigned demand, unsigned alignment,
+                unsigned max_possible_regs, bool force_spilling)
+{
+   unsigned regs =
+      agx_occupancy_for_register_count(ALIGN_POT(demand, alignment))
+         .max_registers;
+   if (ctx->key->is_helper || force_spilling)
+      regs = max_possible_regs;
+
+   /* Occupancy rounding must not reach past a smaller register file. */
+   return ROUND_DOWN_TO(MIN2(regs, max_possible_regs), alignment);
+}
+
+/* AGX2 declares a register count with every program, and the hardware splits
+ * its register file statically: how many threads fit follows from that count
+ * (agx_occupancy_for_register_count). The AGX3B and AGX3C encodings declare no
+ * register count, in the program or its launch; their on-chip storage is
+ * allocated as threads use it. Spending registers there costs no fixed
+ * occupancy step, so the budget is the register file alone. AGX3D programs
+ * declare their register count per dispatch again (registers_16 in the G18
+ * dispatch and render resources) and keep the split.
+ */
+static bool
+agx_has_static_register_split(const agx_context *ctx)
+{
+   return !agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->key->dev.emit_agx3d;
+}
+
+static unsigned
+agx_ra_mem_bound(agx_context *ctx)
+{
+   /* AGX2 keeps the original 2048-half (4 KiB) spill-slot bound so
+    * agx_scratch memory sizing stays unchanged. */
+   if (!ctx->key || !agx_isa_is_agx3(ctx->key->dev.encoding))
+      return AGX2_MAX_SPILL_SLOTS;
+
+   unsigned avail_B = ctx->key->max_scratch_B ? ctx->key->max_scratch_B
+                                              : AGX3_G17P_MAX_SPILL_B;
+
+   /* Reserve the 16-byte AGX3B atomic-return scratch word placed directly
+    * above align(scratch_size_B, 4) in agx_compile_function_nir_attempt(). */
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+      bool has_atomic_return = false;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_ATOMIC && I->nr_dests == 1 &&
+             !agx_is_null(I->dest[0])) {
+            has_atomic_return = true;
+            break;
+         }
+      }
+      if (has_atomic_return)
+         avail_B = avail_B > 16 ? ((avail_B - 16) & ~3u) : 0;
+   }
+
+   /* Account for post-RA TPS frame alignment so RA cannot allocate a spill
+    * frame whose aligned published size exceeds the target limit. */
+   if (agx_is_g18g(&ctx->key->dev))
+      avail_B &= ~15u;
+   else
+      avail_B &= ~3u;
+
+   if (ctx->spill_base_B >= avail_B)
+      return 0;
+
+   return MIN2((avail_B - ctx->spill_base_B) / 2,
+               (unsigned)AGX_NUM_MODELED_REGS);
+}
+
 static void
 agx_ra_impl(agx_context *ctx, bool disable_remat)
 {
@@ -3033,8 +3239,54 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) {
       agx_foreach_instr_global(ctx, I) {
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
-             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY))
+             (I->dim == AGX_DIM_CUBE || I->dim == AGX_DIM_CUBE_ARRAY)) {
             ctx->agx3_cem_low_scratch = true;
+            break;
+         }
+      }
+   }
+
+   /* Linked shaders may preload ABI inputs into the AGX3C low CEM scratch
+    * bank. Evict those preloads out of the bank at shader entry so cube
+    * sampling cannot clobber live ABI values. */
+   if (ctx->agx3_cem_low_scratch) {
+      agx_block *entry = agx_start_block(ctx);
+      agx_instr *last_preload = NULL;
+      bool saw_non_preload = false;
+      agx_foreach_instr_in_block(entry, I) {
+         if (I->op == AGX_OPCODE_PRELOAD) {
+            assert(!saw_non_preload && "PRELOAD must precede non-PRELOAD ops");
+            last_preload = I;
+         } else {
+            saw_non_preload = true;
+         }
+      }
+      if (last_preload) {
+         agx_builder b = agx_init_builder(ctx, agx_after_instr(last_preload));
+         agx_foreach_instr_in_block(entry, I) {
+            if (I->op != AGX_OPCODE_PRELOAD)
+               break;
+            unsigned reg = I->src[0].value;
+            unsigned nr = agx_index_size_16(I->src[0]);
+            if (reg >= AGX3C_CEM_LOW_SCRATCH_END ||
+                reg + nr <= AGX3C_CEM_LOW_SCRATCH_BASE)
+               continue;
+            agx_index orig = I->dest[0];
+            agx_index tmp = agx_vec_temp(ctx, orig.size, agx_channels(orig));
+            I->dest[0] = tmp;
+            if (agx_channels(orig) == 1) {
+               agx_mov_to(&b, orig, tmp);
+            } else {
+               unsigned comps = agx_channels(orig);
+               agx_instr *split = agx_split(&b, comps, tmp);
+               agx_instr *collect = agx_collect_to(&b, orig, comps);
+               for (unsigned c = 0; c < comps; ++c) {
+                  agx_index elem = agx_temp(ctx, orig.size);
+                  split->dest[c] = elem;
+                  collect->src[c] = elem;
+               }
+            }
+         }
       }
    }
 
@@ -3044,10 +3296,14 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    /* Determine maximum possible registers. We won't exceed this! */
    unsigned max_possible_regs = AGX_NUM_REGS;
 
-   /* Compute shaders need to have their entire workgroup together, so our
-    * register usage is bounded by the workgroup size.
+   /* Compute shaders need to have their entire workgroup together, so with a
+    * static register split our register usage is bounded by the workgroup
+    * size. Without one, a 1024-thread workgroup using the whole file runs
+    * correctly, with its barriers, and faster than one spilling to fit an
+    * occupancy step.
     */
-   if (mesa_shader_stage_is_compute(ctx->stage)) {
+   if (mesa_shader_stage_is_compute(ctx->stage) &&
+       agx_has_static_register_split(ctx)) {
       unsigned threads_per_workgroup;
 
       /* If we don't know the workgroup size, worst case it. TODO: Optimize
@@ -3197,13 +3453,26 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    agx_compute_liveness(ctx);
    unsigned effective_demand = agx_calc_register_demand(ctx, false);
    bool spilling = (effective_demand > max_possible_regs);
+
+   /* A program that fits can keep loop-invariant operands out of its loops,
+    * as long as its demand, and so every decision below, stays the same and
+    * the registers assignment will use keep room for each loop's values. */
+   if (!spilling && !(agx_compiler_debug & AGX_DBG_NOOPT) &&
+       agx_opt_licm(ctx, effective_demand,
+                    assignment_file(ctx, effective_demand,
+                                    ra_file_alignment(ctx), max_possible_regs,
+                                    force_spilling)))
+      effective_demand = agx_calc_register_demand(ctx, false);
+
    bool remat = false;
    const unsigned full_budget = max_possible_regs;
 
    /* If we need multiple waves, see if we can rematerialize constants to save
     * waves. If we only have a single wave regardless, this is pointless.
+    * Without a static register split there is no wave to save.
     */
-   if (!disable_remat && effective_demand > agx_round_registers(1) && !spilling) {
+   if (!disable_remat && agx_has_static_register_split(ctx) &&
+       effective_demand > agx_round_registers(1) && !spilling) {
       unsigned effective_demand_remat = agx_calc_register_demand(ctx, true);
 
       /* Worst-case assume we need 6 16-bit registers for constants, for a
@@ -3699,17 +3968,9 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    unsigned demand = ALIGN_POT(effective_demand, reg_file_alignment);
    assert(demand <= max_possible_regs && "Invariant");
 
-   /* Round up the demand to the maximum number of registers we can use without
-    * affecting occupancy. This reduces live range splitting.
-    */
-   unsigned max_regs = agx_occupancy_for_register_count(demand).max_registers;
-   if (ctx->key->is_helper || force_spilling)
-      max_regs = max_possible_regs;
-
-   /* Occupancy rounding must not reach past a smaller register file. */
-   max_regs = MIN2(max_regs, max_possible_regs);
-
-   max_regs = ROUND_DOWN_TO(max_regs, reg_file_alignment);
+   unsigned max_regs =
+      assignment_file(ctx, effective_demand, reg_file_alignment,
+                      max_possible_regs, force_spilling);
 
    /* Or, we can bound tightly for debugging */
    if (agx_compiler_debug & AGX_DBG_DEMAND)
@@ -3737,6 +3998,8 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
    }
    ctx->ra_abort = &ra_abort;
 
+   const unsigned mem_bound = agx_ra_mem_bound(ctx);
+
    agx_foreach_block(ctx, block) {
       agx_ra_assign_local(&(struct ra_ctx){
          .shader = ctx,
@@ -3759,7 +4022,7 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          .high_gpr = high_gpr,
          .tex_low128 = tex_low128,
          .bound[RA_GPR] = max_regs,
-         .bound[RA_MEM] = AGX_NUM_MODELED_REGS,
+         .bound[RA_MEM] = mem_bound,
          .count[RA_GPR] = &reg_count,
          .count[RA_MEM] = &mem_slot_count,
       });
