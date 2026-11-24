@@ -45,6 +45,35 @@ hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    ndispatched++;
 }
 
+/* hk_cmd_buffer_get_cs_general() serves every stream slot; fixtures never
+ * open a graphics or pre-graphics stream through it. */
+void
+hk_tess_batch_flush(struct hk_cmd_buffer *cmd)
+{
+   (void)cmd;
+   abort();
+}
+
+bool
+hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+   abort();
+}
+
+/* Fixtures never copy timestamps. Emitting a copy is a bug. */
+void
+hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                       const struct hk_stamp_copy *copies, unsigned count)
+{
+   (void)cmd;
+   (void)cs;
+   (void)copies;
+   (void)count;
+   abort();
+}
+
 /* These devices never map memory at a second address, so the real
  * function adds no flush either.
  */
@@ -536,7 +565,7 @@ test_order(void)
 static void
 test_order_forward(void)
 {
-   test_chip = AGX_CHIP_G16G;
+   test_chip = AGX_CHIP_G15G;
    struct hk_cmd_buffer *c = new_cmd();
    struct hk_cs *r[3], *p[3];
    for (unsigned i = 0; i < 3; ++i) {
@@ -553,23 +582,80 @@ test_order_forward(void)
    test_chip = AGX_CHIP_G17P;
 }
 
-/* Only the G17 runtime (G17P and M5) publishes render timestamps at
- * retirement. G15 firmware writes the vertex-end slot when tiling finishes,
- * before the fragment work writes the counts: such a stamp is not
- * availability. */
+/* Native HAL200 (G16G/G17P) and M5 (G17G/G17S/G17C) runtimes publish render
+ * timestamps at full retirement. G15 firmware writes the vertex-end slot when
+ * tiling finishes, before the fragment work writes the counts: such a stamp is
+ * not availability. */
 static void
 test_stamp_chips(void)
 {
-   T("chips: G17P and M5 renders carry availability",
-     hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
+   T("chips: native HAL200 and M5 renders carry availability",
+     hk_oq_render_stamps_supported(AGX_CHIP_G16G) &&
+        hk_oq_render_stamps_supported(AGX_CHIP_G17P) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17G) &&
         hk_oq_render_stamps_supported(AGX_CHIP_G17S));
    T("chips: G15 renders keep the queued store",
      !hk_oq_render_stamps_supported(AGX_CHIP_G15G) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15S) &&
         !hk_oq_render_stamps_supported(AGX_CHIP_G15C));
-   T("chips: other native chips keep the queued store",
-     !hk_oq_render_stamps_supported(AGX_CHIP_G16G));
+}
+
+static void
+test_join_moves_query_access_ranges(void)
+{
+   /* Reverse join (hk_oq_joins path): earlier free render's store joins into
+    * later full render's movable stream, preserving moved imm_write_query_ranges. */
+   test_chip = AGX_CHIP_G17P;
+   struct hk_cmd_buffer *c = new_cmd();
+   struct hk_cs *r0 = add(c, false);
+   struct hk_cs *p0 = add_post(c, r0, 1, 1);
+   hk_cs_note_imm_write_query_range(p0, 42, 64, 8);
+   struct hk_cs *r1 = add(c, false);
+   fill_slots(r1, 200);
+   struct hk_cs *p1 = add_post(c, r1, 1, 2);
+   hk_cs_note_imm_write_query_range(p1, 42, 128, 8);
+   T("join-rev-free: fixtures defer", deferred(c, p0) && deferred(c, p1));
+   hk_resolve_deferred_oq_available(c);
+   bool found_moved = false, found_local = false;
+   if (ndispatched == 1 && dispatched[0].cs == p1) {
+      util_dynarray_foreach(&p1->imm_write_query_ranges,
+                            struct hk_query_access_range, r) {
+         if (r->handle == 42 && r->start_B == 64 && r->end_B == 72)
+            found_moved = true;
+         if (r->handle == 42 && r->start_B == 128 && r->end_B == 136)
+            found_local = true;
+      }
+   }
+   T("join-rev-free: moved store query range survives on destination stream",
+     ndispatched == 1 && dispatched[0].cs == p1 && found_moved && found_local);
+
+   /* Reverse join (both full renders): earlier stream joins later movable one
+    * and propagates imm_write_query_untracked. */
+   c = new_cmd();
+   r0 = add(c, false);
+   fill_slots(r0, 100);
+   p0 = add_post(c, r0, 1, 1);
+   hk_cs_note_imm_write_query_range(p0, 55, 256, 8);
+   p0->imm_write_query_untracked = true;
+   r1 = add(c, false);
+   fill_slots(r1, 200);
+   p1 = add_post(c, r1, 1, 2);
+   hk_cs_note_imm_write_query_range(p1, 55, 512, 8);
+   T("join-rev-full: fixtures defer", deferred(c, p0) && deferred(c, p1));
+   hk_resolve_deferred_oq_available(c);
+   found_moved = found_local = false;
+   if (ndispatched == 1 && dispatched[0].cs == p1) {
+      util_dynarray_foreach(&p1->imm_write_query_ranges,
+                            struct hk_query_access_range, r) {
+         if (r->handle == 55 && r->start_B == 256 && r->end_B == 264)
+            found_moved = true;
+         if (r->handle == 55 && r->start_B == 512 && r->end_B == 520)
+            found_local = true;
+      }
+   }
+   T("join-rev-full: moved store query range and untracked flag survive",
+     ndispatched == 1 && dispatched[0].cs == p1 && found_moved && found_local &&
+        p1->imm_write_query_untracked);
 }
 
 int
@@ -583,6 +669,7 @@ main(void)
    test_order();
    test_order_forward();
    test_stamp_chips();
+   test_join_moves_query_access_ranges();
    ralloc_free(test_context);
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

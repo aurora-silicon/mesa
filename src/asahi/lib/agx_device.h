@@ -85,15 +85,19 @@ enum agx_dbg {
 };
 
 /* How many power-of-two levels in the BO cache do we want? 2^14 minimum chosen
- * as it is the page size that all allocations are rounded to
+ * as it is the page size that all allocations are rounded to, up to 2^28
+ * (256 MiB, matching AGX_BO_CACHE_MAX_SIZE) so large allocations do not collide
+ * in a single bucket.
  */
 #define MIN_BO_CACHE_BUCKET (14) /* 2^14 = 16KB */
-#define MAX_BO_CACHE_BUCKET (22) /* 2^22 = 4MB */
+#define MAX_BO_CACHE_BUCKET (28) /* 2^28 = 256MB */
 
 /* Fencepost problem, hence the off-by-one */
+#define NR_BO_CACHE_SIZE_BUCKETS \
+   (MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1)
 #define NR_BO_CACHE_FLAG_BUCKETS 16
 #define NR_BO_CACHE_BUCKETS \
-   ((MAX_BO_CACHE_BUCKET - MIN_BO_CACHE_BUCKET + 1) * NR_BO_CACHE_FLAG_BUCKETS)
+   (NR_BO_CACHE_SIZE_BUCKETS * NR_BO_CACHE_FLAG_BUCKETS)
 
 /* Forward decl only, do not pull in all of NIR */
 struct nir_shader;
@@ -178,6 +182,13 @@ struct agx_device {
    /* Native DRM 0.2 added the four render resource-specifier high dwords.
     * Stock 0.0 kernels do not consume an oversized render packet's tail. */
    bool render_rsrc_spec_hi;
+   /* True when a native kernel populated the optional memory_limit /
+    * client_memory_limit tail of drm_asahi_params_global (where 0 means no
+    * driver limit, as opposed to a legacy 600-byte reply or virtio). */
+   bool has_memory_limits;
+   /* GEM_USERPTR imports ranges of any size the GPU memory limits admit in
+    * this process (agx_userptr_imports_any_size()), checked at open. */
+   bool userptr_any_size;
    agx_device_ops_t ops;
 
    /* vdrm device */
@@ -199,8 +210,10 @@ struct agx_device {
     * creates, in ms; 0 keeps the kernel's default. Sent only to a kernel with
     * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT. */
    uint32_t compute_timeout_ms;
-   /* AGX_DBG_1QUEUE: render SCS layouts the shared queue was created with. */
+   /* AGX_DBG_1QUEUE: render SCS layouts and creation flags the shared queue
+    * was created with. */
    uint64_t queue_layouts[2];
+   uint32_t queue_flags;
    enum drm_asahi_priority queue_priority;
 
    /* VMA heaps */
@@ -242,6 +255,8 @@ struct agx_device {
 
    simple_mtx_t bo_map_lock;
    struct util_sparse_array bo_map;
+   /* Held while agx_bo_map_placed() maps a BO or moves its mapping. */
+   simple_mtx_t bo_mmap_lock;
    /* Exclusive upper bound for every loop over bo_map. */
    uint32_t max_handle;
 
@@ -255,7 +270,8 @@ struct agx_device {
 
       /* Power-of-two size classes, subdivided by allocation-flag hash.
        * Exact flags are still checked when fetching; collisions only affect
-       * lookup cost. Each bucket is a list of free agx_bo objects.
+       * lookup cost. Each bucket is a LIFO list of free agx_bo objects so
+       * recently freed, non-purgeable BOs are reused first.
        */
       struct list_head buckets[NR_BO_CACHE_BUCKETS];
 
@@ -274,7 +290,9 @@ struct agx_device {
       int madvise;
 
       /* DRM shmem pages remain pinned while a BO is cached. Wake only while
-       * the cache has entries, so an idle client can release stale BOs. */
+       * the cache has entries, so an idle client can release stale BOs.
+       * idle_pending is written atomically under idle_lock and read atomically
+       * under bo_cache.lock to skip idle_lock on active-cache puts. */
       mtx_t idle_lock;
       struct u_cnd_monotonic idle_cond;
       thrd_t idle_thread;
@@ -387,24 +405,64 @@ agx_bo_map_placed(struct agx_bo *bo, void *fixed_addr, size_t length)
    if (bo->flags & AGX_BO_HOST_PTR)
       return fixed_addr && fixed_addr != bo->_map ? NULL : bo->_map;
 
-   /* The BO cache deliberately preserves CPU mappings.  A Vulkan allocation
-    * may therefore inherit a mapping from an earlier allocation even though
-    * the new VkDeviceMemory object has never been mapped.  A placed map must
-    * move that stale process mapping to the application's reserved address;
-    * returning it would violate VK_EXT_map_memory_placed.
-    *
-    * Keep ordinary mapping reuse unchanged.  Only the explicit placed-map
-    * contract is allowed to relocate an existing BO mapping. */
-   if (fixed_addr && bo->_map && bo->_map != fixed_addr) {
-      bo->dev->ops.bo_munmap(bo->dev, bo);
-      bo->_map = NULL;
-      bo->_map_size = 0;
+   void *map = p_atomic_read(&bo->_map);
+   if (map && (!fixed_addr || map == fixed_addr))
+      return map;
+
+   /* Threads that share a BO can map it for the first time at once (two
+    * contexts mapping one resource), and each would install its own mapping
+    * over the other's and leak it. So the mapping is made, or moved, under
+    * the device's lock and checked again there. On a backend with
+    * bo_mmap_independent it is made into a copy of the BO and published
+    * after its size, so a thread that finds it without the lock above finds
+    * it whole, never a failed mapping. A backend without it is only allowed
+    * to map the BO itself, so it maps the BO in place under the lock. */
+   simple_mtx_lock(&bo->dev->bo_mmap_lock);
+   map = bo->_map;
+   if (!map || (fixed_addr && map != fixed_addr)) {
+      /* The BO cache deliberately preserves CPU mappings.  A Vulkan
+       * allocation may therefore inherit a mapping from an earlier allocation
+       * even though the new VkDeviceMemory object has never been mapped.  A
+       * placed map must move that stale process mapping to the application's
+       * reserved address; returning it would violate
+       * VK_EXT_map_memory_placed.
+       *
+       * Keep ordinary mapping reuse unchanged.  Only the explicit placed-map
+       * contract is allowed to relocate an existing BO mapping. */
+      if (map) {
+         bo->dev->ops.bo_munmap(bo->dev, bo);
+         p_atomic_set(&bo->_map, NULL);
+         bo->_map_size = 0;
+      }
+
+      if (bo->dev->ops.bo_mmap_independent) {
+         struct agx_bo copy = {
+            .dev = bo->dev,
+            .flags = bo->flags,
+            .size = bo->size,
+            .handle = bo->handle,
+            .uapi_handle = bo->uapi_handle,
+            .has_mmap_offset = bo->has_mmap_offset,
+            .mmap_offset = bo->mmap_offset,
+         };
+         bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr,
+                              fixed_addr ? length : 0);
+         if (!bo->has_mmap_offset && copy.has_mmap_offset) {
+            bo->mmap_offset = copy.mmap_offset;
+            p_atomic_set(&bo->has_mmap_offset, true);
+         }
+         map = copy._map;
+         bo->_map_size = copy._map_size;
+         p_atomic_set(&bo->_map, map);
+      } else {
+         bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr,
+                              fixed_addr ? length : 0);
+         map = bo->_map;
+      }
    }
+   simple_mtx_unlock(&bo->dev->bo_mmap_lock);
 
-   if (!bo->_map)
-      bo->dev->ops.bo_mmap(bo->dev, bo, fixed_addr, fixed_addr ? length : 0);
-
-   return bo->_map;
+   return map;
 }
 
 static inline void *
@@ -428,10 +486,26 @@ agx_bo_map_owned(struct agx_bo *bo, void *fixed_addr, size_t length,
    if (!bo->dev->ops.bo_mmap_independent || (bo->flags & AGX_BO_HOST_PTR))
       return NULL;
 
-   struct agx_bo copy = *bo;
-   copy._map = NULL;
-   copy._map_size = 0;
+   struct agx_bo copy = {
+      .dev = bo->dev,
+      .flags = bo->flags,
+      .size = bo->size,
+      .handle = bo->handle,
+      .uapi_handle = bo->uapi_handle,
+   };
+   if (p_atomic_read(&bo->has_mmap_offset)) {
+      copy.has_mmap_offset = true;
+      copy.mmap_offset = bo->mmap_offset;
+   }
    bo->dev->ops.bo_mmap(bo->dev, &copy, fixed_addr, fixed_addr ? length : 0);
+   if (copy.has_mmap_offset && !p_atomic_read(&bo->has_mmap_offset)) {
+      simple_mtx_lock(&bo->dev->bo_mmap_lock);
+      if (!bo->has_mmap_offset) {
+         bo->mmap_offset = copy.mmap_offset;
+         p_atomic_set(&bo->has_mmap_offset, true);
+      }
+      simple_mtx_unlock(&bo->dev->bo_mmap_lock);
+   }
    *size = agx_bo_map_size(&copy);
    return copy._map;
 }
@@ -451,6 +525,25 @@ agx_has_userptr(const struct agx_device *dev)
 {
    return !dev->is_virtio &&
           (dev->params.features & DRM_ASAHI_FEATURE_USERPTR);
+}
+
+/*
+ * Host memory imports of any size can succeed: GEM_USERPTR is available and
+ * the caller's RLIMIT_MEMLOCK does not bound it below the GPU memory limits.
+ * APIs whose imports have no size bound of their own offer them only then.
+ */
+static inline bool
+agx_has_host_import(const struct agx_device *dev)
+{
+   return agx_has_userptr(dev) && dev->userptr_any_size;
+}
+
+/* The kernel charges GEM_USERPTR pins to RLIMIT_MEMLOCK as well as to the GPU
+ * memory limits (agx_userptr_limits.h). */
+static inline bool
+agx_userptr_charges_memlock(const struct agx_device *dev)
+{
+   return !(dev->params.features & DRM_ASAHI_FEATURE_USERPTR_NO_MEMLOCK);
 }
 
 /* The kernel can keep a BO resident under memory pressure (GEM_RESIDENCY). */
@@ -537,6 +630,14 @@ uint32_t agx_create_command_queue(struct agx_device *dev,
                                   enum drm_asahi_priority priority);
 uint32_t agx_create_command_queue_with_render_scs(struct agx_device *dev,
    enum drm_asahi_priority priority, const uint64_t layouts[2]);
+/* As agx_create_command_queue(), but submissions with output syncs may return
+ * before they retire where the kernel offers that
+ * (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT); *async says whether the queue does.
+ * The caller waits for those outputs before it reads anything the
+ * submissions write. */
+uint32_t agx_create_async_command_queue(struct agx_device *dev,
+                                        enum drm_asahi_priority priority,
+                                        bool *async);
 int agx_destroy_command_queue(struct agx_device *dev, uint32_t queue_id);
 bool agx_probe_high_priority(struct agx_device *dev);
 bool agx_device_vm_failed(struct agx_device *dev);
@@ -561,13 +662,6 @@ unsigned agx_get_num_cores(const struct agx_device *dev);
 
 struct agx_device_key agx_gather_device_key(struct agx_device *dev);
 
-/* Native AGX3 recording: Ioto programs and HAL200-format records. */
-static inline bool
-agx_native_graphics(const struct agx_device *dev)
-{
-   return agx_chip_native_agx3(dev->chip);
-}
-
 /* This interface carries native sampler state in GPU records, not in the
  * firmware command's optional sampler-heap fields. */
 static inline bool
@@ -575,15 +669,6 @@ agx_stream_sampler_state(const struct agx_device *dev)
 {
    return dev->chip == AGX_CHIP_G15G &&
           dev->params.gpu_hal_generation == DRM_ASAHI_GPU_HAL_200;
-}
-
-/* T6040 uses the G17P architecture profile, while capability rollout may
- * still be product-specific. Device admission has already checked USC/HAL. */
-static inline bool
-agx_is_m4_pro(const struct agx_device *dev)
-{
-   return dev->chip == AGX_CHIP_G17P && dev->params.chip_id == 0x6040 &&
-          dev->params.gpu_generation == 16 && dev->params.gpu_variant == 'S';
 }
 
 struct agx_va *agx_va_alloc(struct agx_device *dev, uint64_t size_B,
