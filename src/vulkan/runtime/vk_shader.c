@@ -830,7 +830,6 @@ vk_common_CmdBindShadersEXT(VkCommandBuffer commandBuffer,
          BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_RP_ATTACHMENTS);
          BITSET_SET(dyn->changed_since_pipeline_bind,
                     MESA_VK_DYNAMIC_RP_ATTACHMENTS);
-         dyn->generation++;
       }
    }
 

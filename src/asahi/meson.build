@@ -58,7 +58,8 @@ endif
 
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # HAL200 bind-tail elision / incremental 28B FS PPP update vs non-FS PPP
-  # state changes (scissor, viewport, cull mode, depth op, color blend).
+  # state changes (scissor, viewport, cull mode, depth op, color blend), and
+  # after a change to dynamic state the tail is not built from.
   test(
     'hk-g17p-bind-tail-state-change',
     prog_python,
@@ -71,12 +72,34 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       'ASAHI_SHIM_CHIP=g17p',
       'ASAHI_SHIM_VALIDATE_G17P_STREAM=1',
       'ASAHI_SHIM_G17P_EXPECT_VALID_STREAM=1',
-      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,2',
+      'ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,3',
       'VK_DRIVER_FILES=' + _dev_icd.full_path(),
     ],
     depends : [_dev_icd, libvulkan_asahi],
     suite : ['asahi'],
   )
+
+  if meson.can_run_host_binaries()
+    # What becomes of the prepared bind tail when one state changes between two
+    # draws, on every native chip profile; recorded, nothing submitted.
+    foreach chip : ['g15g', 'g15s', 'g15c', 'g16g', 'g17p']
+      test(
+        'brl-draw-state-reuse-' + chip,
+        prog_python,
+        args : [
+          files('vulkan/tests/run-draw-state-reuse.py'),
+          libasahi_noop_drm_shim,
+          hk_draw_state_bench,
+        ],
+        env : [
+          'ASAHI_SHIM_CHIP=' + chip,
+          'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+        ],
+        depends : [_dev_icd, libvulkan_asahi],
+        suite : ['asahi'],
+      )
+    endforeach
+  endif
 
   # Graphics-path copies from one layer of a block-compressed image into a
   # compressed G17P image; encoded and stream-validated, not executed.

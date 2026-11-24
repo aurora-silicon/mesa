@@ -483,7 +483,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
        dev->dev.params.gpu_generation == 14) {
       /* These native graphics caches are zero-initialized at allocation and
        * never used on AGX2. Reset the common state on either side without
-       * clearing their 8.5 KiB again for every recording. */
+       * clearing them again for every recording. */
       const size_t first =
          offsetof(struct hk_cmd_buffer, state.gfx.g17p_ioto) -
          offsetof(struct hk_cmd_buffer, state);

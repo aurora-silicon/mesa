@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: MIT
  *
  * Verify HAL200 incremental FS PPP updates and bind-tail elision across
- * push-constant-only draws and non-FS PPP state changes (scissor, viewport,
- * cull mode, depth compare op, and color blend).
+ * push-constant-only draws, non-FS PPP state changes (scissor, viewport,
+ * cull mode, depth compare op, and color blend), and a change to dynamic
+ * state the bind tail is not built from (the blend constants).
  *
  * Driven under asahi_noop_drm_shim with ASAHI_SHIM_VALIDATE_G17P_STREAM=1 and
- * ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,2,2:
+ * ASAHI_SHIM_G17P_EXPECT_BIND_TAIL_COUNTS=6,3,3:
  *   Draw 0: initial draw                    -> full bind tail (#1)
  *   Draw 1: push-constant-only change       -> elided tail (#1) + 28B FS PPP (#1)
  *   Draw 2: dynamic scissor + push const    -> full bind tail (#2)
@@ -16,6 +17,7 @@
  *   Draw 5: dynamic depth op + push const   -> full bind tail (#5)
  *   Draw 6: blend-enabled pipe + push const -> full bind tail (#6)
  *   Draw 7: push-constant-only change       -> elided tail (#2) + 28B FS PPP (#2)
+ *   Draw 8: blend constants only            -> elided tail (#3) + 28B FS PPP (#3)
  */
 
 #include <stdint.h>
@@ -325,7 +327,8 @@ make_pipeline(VkDevice dev, VkRenderPass rp, VkPipelineLayout pl,
       .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
       .colorBlendOp = VK_BLEND_OP_ADD,
       .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-      .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+      /* A constant factor: the blend constants reach the fragment program. */
+      .dstAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA,
       .alphaBlendOp = VK_BLEND_OP_ADD,
       .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
@@ -340,6 +343,7 @@ make_pipeline(VkDevice dev, VkRenderPass rp, VkPipelineLayout pl,
       VK_DYNAMIC_STATE_SCISSOR,
       VK_DYNAMIC_STATE_CULL_MODE,
       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
+      VK_DYNAMIC_STATE_BLEND_CONSTANTS,
    };
    VkPipelineDynamicStateCreateInfo dyn = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -645,6 +649,7 @@ main(void)
    vkCmdSetScissor(cmd, 0, 1, &sc0);
    vkCmdSetCullMode(cmd, VK_CULL_MODE_BACK_BIT);
    vkCmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
+   vkCmdSetBlendConstants(cmd, (const float[4]){0.0f, 0.0f, 0.0f, 0.25f});
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
@@ -709,6 +714,12 @@ main(void)
    vkCmdPushConstants(cmd, pl,
                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                       0, sizeof(pc), &pc);
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   /* Draw 8: only the blend constants change, dynamic state that reaches the
+    * draw through the root and not through the bind tail -> elided (#3) +
+    * 28B FS PPP (#3). */
+   vkCmdSetBlendConstants(cmd, (const float[4]){0.0f, 0.0f, 0.0f, 0.75f});
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
    vkCmdEndRenderPass(cmd);

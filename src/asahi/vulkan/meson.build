@@ -928,6 +928,16 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  # Host-only: times draw recording, submits nothing. See the file header.
+  hk_draw_state_bench = executable(
+    'brl-draw-state-bench',
+    files('tests/hk_draw_state_bench.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   executable(
     'vulkan-xfb-resume',
     files('tests/vulkan_xfb_resume.c'),

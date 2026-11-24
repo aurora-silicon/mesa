@@ -7,6 +7,7 @@
 #pragma once
 
 #include <xf86drm.h>
+#include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
@@ -17,6 +18,7 @@
 #include "asahi/lib/agx_scratch.h"
 #include "asahi/lib/agx_tilebuffer.h"
 #include "asahi/lib/agx_uvs.h"
+#include "asahi/lib/agx_vdm_hal200_bind_tail_core.h"
 #include "asahi/lib/pool.h"
 #include "compiler/shader_enums.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -546,6 +548,23 @@ struct agx_encoder {
  * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
+/* Everything a native Ioto graphics program is built from
+ * (agx_build_g17p_graphics_program()), and the program built from it. */
+struct agx_g17p_program_inputs {
+   const struct agx_compiled_shader *shader;
+   const struct agx_linked_shader *linked;
+   /* The linked code the program enters. The batch holds its buffer, so
+    * unlike the two pointers above this address cannot come back as another
+    * shader's while the batch lives. */
+   uint64_t shader_va;
+   /* The texture and sampler tables, or zero. The pair of them is uploaded
+    * for the program, so its range below has no address. */
+   uint64_t resources[2];
+   struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint8_t range_count;
+   uint64_t program;
+};
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -563,6 +582,19 @@ struct agx_batch {
    uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
+   /* The last program of the hardware vertex stage and of the fragment
+    * stage. The same inputs give the same program, so it is kept. */
+   struct agx_g17p_program_inputs g17p_program[2];
+   /* The bind state of the last native draw: its tail, its draw-state
+    * selector, and the vertex shader and fragment program it was built for
+    * (no program: none). agx_g17p_emit_bind_state() publishes it again
+    * while nothing it was built from has changed. */
+   struct {
+      const struct agx_compiled_shader *vs;
+      uint64_t fragment_program;
+      uint32_t draw_state_offset;
+      struct agx_vdm_hal200_bind_tail tail;
+   } g17p_bind_state;
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
@@ -1260,6 +1292,18 @@ struct agx_query {
    struct agx_ptr ptr;
 };
 
+enum agx_native_sampler_entry {
+   /* The sampler itself; with a custom border colour it clamps to one. */
+   AGX_NATIVE_SAMPLER_API,
+   /* Custom border colour: the companion that clamps to zero, and where the
+    * chip takes it, the probe without a comparison. */
+   AGX_NATIVE_SAMPLER_CLAMP,
+   AGX_NATIVE_SAMPLER_PROBE,
+   /* The entry a LOD query reads: the sampler with its LOD bias. */
+   AGX_NATIVE_SAMPLER_QUERY_LOD,
+   AGX_NATIVE_SAMPLER_ENTRIES,
+};
+
 struct agx_sampler_state {
    struct pipe_sampler_state base;
 
@@ -1281,6 +1325,12 @@ struct agx_sampler_state {
 
    /* LOD bias packed as fp16, the form we'll pass to the shader */
    uint16_t lod_bias_as_fp16;
+
+   /* The entries a native per-stage sampler table can hold for this sampler
+    * (agx_upload_samplers()), packed once here. native_packed has a bit for
+    * each entry the chip's sampler layout could express. */
+   struct agx_gallium_sampler_descriptor native[AGX_NATIVE_SAMPLER_ENTRIES];
+   uint8_t native_packed;
 };
 
 struct agx_sampler_view {

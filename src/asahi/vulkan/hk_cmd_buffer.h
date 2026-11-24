@@ -72,6 +72,51 @@ struct hk_linked_shader;
 struct agx_usc_builder;
 struct vk_shader;
 
+/* The dynamic graphics state a HAL200 bind tail is built from: every member
+ * of vk_dynamic_graphics_state that hk_g17p_draw_state() reads,
+ * as X(name, member), with those that change most often first. The viewports
+ * and scissors, of which only viewport_count and scissor_count are used, and
+ * the blend factors, which decide whether the fragment program the tail
+ * launches gets the blend constants, are handled next to this list.
+ * hk_g17p_bind_tail_dyn_dirty() names the same state as dirty bits. */
+#define HK_G17P_BIND_TAIL_DYN(X)                                               \
+   X(viewport_count, vp.viewport_count)                                        \
+   X(scissor_count, vp.scissor_count)                                          \
+   X(stencil_front, ds.stencil.front)                                          \
+   X(stencil_back, ds.stencil.back)                                            \
+   X(cull_mode, rs.cull_mode)                                                  \
+   X(front_face, rs.front_face)                                                \
+   X(depth_bias_enable, rs.depth_bias.enable)                                  \
+   X(depth_bias_constant_factor, rs.depth_bias.constant_factor)                \
+   X(depth_bias_clamp, rs.depth_bias.clamp)                                    \
+   X(depth_bias_slope_factor, rs.depth_bias.slope_factor)                      \
+   X(depth_bias_representation, rs.depth_bias.representation)                  \
+   X(depth_bias_exact, rs.depth_bias.exact)                                    \
+   X(depth_test_enable, ds.depth.test_enable)                                  \
+   X(depth_write_enable, ds.depth.write_enable)                                \
+   X(depth_compare_op, ds.depth.compare_op)                                    \
+   X(depth_bounds_test_enable, ds.depth.bounds_test.enable)                    \
+   X(stencil_test_enable, ds.stencil.test_enable)                              \
+   X(polygon_mode, rs.polygon_mode)                                            \
+   X(line_width, rs.line.width)                                                \
+   X(line_mode, rs.line.mode)                                                  \
+   X(rasterizer_discard_enable, rs.rasterizer_discard_enable)                  \
+   X(rasterization_stream, rs.rasterization_stream)                            \
+   X(depth_clip_enable, rs.depth_clip_enable)                                  \
+   X(depth_clamp_enable, rs.depth_clamp_enable)                                \
+   X(depth_clip_negative_one_to_one, vp.depth_clip_negative_one_to_one)        \
+   X(domain_origin, ts.domain_origin)
+
+struct hk_g17p_bind_tail_dyn {
+#define X(name, member)                                                        \
+   __typeof__(((struct vk_dynamic_graphics_state *)0)->member) name;
+   HK_G17P_BIND_TAIL_DYN(X)
+#undef X
+   bool uses_blend_constant;
+   VkViewport viewports[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
+   VkRect2D scissors[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS];
+};
+
 /* A complete but unpublished HAL200 state update.  The referenced VDM state
  * is command-buffer-owned.  The scissor/depth records stay inline until the
  * draw chooses its live stream, so preparation cannot perturb stream-local
@@ -82,7 +127,15 @@ struct hk_g17p_prepared_bind_tail {
                    [AGX_SCISSOR_LENGTH];
    uint8_t depth_bias[AGX_PPP_VIEWPORT_PAYLOAD_MAX_VIEWPORTS]
                     [AGX_DEPTH_BIAS_LENGTH];
-   uint64_t dynamic_generation;
+   /* The tail was built from the dynamic state that was live when the
+    * dirty bits were last cleared, and only the application has set one
+    * since: a dirty bit of that state then means a change, and none means
+    * no change. hk_g17p_bind_tail_unverify() ends that. */
+   bool dyn_verified;
+   /* Not verified: dyn is the state the tail was built from, to compare
+    * with. If not even that is known, the tail matches nothing. */
+   bool dyn_saved;
+   struct hk_g17p_bind_tail_dyn dyn;
    uint64_t descriptor_generation;
    uint64_t vertex_buffer_generation;
    uint64_t root;
@@ -308,6 +361,10 @@ struct hk_upload_stats {
    uint64_t draw_param_uploads, draw_param_bytes, draw_param_reuses;
    uint64_t draw_id_uploads, draw_id_bytes, draw_id_reuses;
    uint64_t constant_uploads, constant_bytes, constant_reuses;
+   /* Native bind tails: built in full, given a new fragment program only,
+    * and kept. The last two count a HAL200 stream that takes the fragment
+    * record alone, or nothing, as well. */
+   uint64_t bind_tail_builds, bind_tail_program_rebuilds, bind_tail_reuses;
 };
 
 #define hk_upload_stat(cmd, field, value)                                      \
@@ -778,25 +835,6 @@ struct hk_graphics_state {
    bool g17p_draw_params_host_valid;
    bool g17p_draw_id_host_valid;
 
-   struct hk_g17p_prepared_bind_tail g17p_bind_tail;
-   /* The last complete build of g17p_bind_tail, whose other fields still
-    * describe its inputs. A rebuild whose only changed inputs are the root,
-    * descriptor or vertex-buffer identity (a descriptor push or vertex-buffer
-    * bind) reads exactly the same state for every record except the fragment
-    * record's stage program, which is recomputed from fs_fields; see
-    * hk_g17p_build_native_bind_tail(). */
-   struct {
-      struct agx_ppp_hal200_fragment_fields fs_fields;
-      /* The state block of the last build or memo rebuild: CPU copy, its
-       * compact address and size. */
-      const uint8_t *state_cpu;
-      uint32_t state_compact;
-      uint32_t state_size;
-      const struct hk_shader *fs;
-      const struct hk_shader *hw_vs;
-      bool valid;
-   } g17p_bind_tail_memo;
-
    /* Per vertex-attribute slot: the last API format seen and the pipe format
     * and interchange block size hk_flush_dynamic_state_slow() derives from
     * it, which are pure functions of the format. */
@@ -927,14 +965,33 @@ struct hk_graphics_state {
       bool reads_tib;
    } fast_link_fs;
 
-   /* Keep these four native graphics caches contiguous: AGX2 resets leave
-    * their zero-initialized storage untouched.
+   /* Keep these native graphics caches contiguous: AGX2 resets leave their
+    * zero-initialized storage untouched. g17p_ioto is the first of them and
+    * g17p_spilled_rt_descs the last.
     *
     * Exact last VS/FS loader identities. These are recording-only selectors;
     * the published programs and every referenced BO remain command-buffer-
     * owned. Submission never mutates or consults this cache. */
    struct hk_g17p_graphics_ioto_cache_entry g17p_ioto[2];
    struct hk_g17p_launch g17p_launch[2][HK_G17P_LAUNCH_SLOTS];
+   struct hk_g17p_prepared_bind_tail g17p_bind_tail;
+   /* The last complete build of g17p_bind_tail, whose other fields still
+    * describe its inputs. A rebuild whose only changed inputs are the root,
+    * descriptor or vertex-buffer identity (a descriptor push or vertex-buffer
+    * bind) reads exactly the same state for every record except the fragment
+    * record's stage program, which is recomputed from fs_fields; see
+    * hk_g17p_build_native_bind_tail(). */
+   struct {
+      struct agx_ppp_hal200_fragment_fields fs_fields;
+      /* The state block of the last build or memo rebuild: CPU copy, its
+       * compact address and size. */
+      const uint8_t *state_cpu;
+      uint32_t state_compact;
+      uint32_t state_size;
+      const struct hk_shader *fs;
+      const struct hk_shader *hw_vs;
+      bool valid;
+   } g17p_bind_tail_memo;
    /* Exact command-buffer-owned uploads for combined texture/sampler pointer
     * pairs.  Shader/material switches may revisit the same pair thousands of
     * times; a fresh upload address would otherwise force a fresh Ioto program
@@ -2125,8 +2182,8 @@ hk_cmd_buffer_pool(struct hk_cmd_buffer *cmd)
  * runs before the draw-time dirty-state flush. A cached copy refreshed only
  * by that flush was stale there, so the first draw after a blend-equation
  * change published a fragment program without the blend-constant range and
- * the epilog read unwritten uniforms. Prepared programs are keyed by
- * dynamic_graphics_state.generation, which covers every input here. */
+ * the epilog read unwritten uniforms. A prepared bind tail keeps the answer
+ * its fragment program was built with (hk_g17p_bind_tail_dyn). */
 static inline bool
 hk_uses_blend_constant(const struct vk_color_blend_state *cb)
 {
@@ -2528,12 +2585,18 @@ hk_cs_alloc_for_indirect(struct hk_cs *cs, size_t size_B)
    return addr;
 }
 
+/* The dynamic dirty bits are about to be set without a state change, or
+ * the state replaced without them: the prepared HAL200 bind tail can no
+ * longer take a dirty bit for a change (hk_g17p_prepared_bind_tail). */
+void hk_g17p_bind_tail_unverify(struct hk_cmd_buffer *cmd);
+
 static void
 hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
 {
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
+   hk_g17p_bind_tail_unverify(cmd);
    vk_dynamic_graphics_state_dirty_all(dyn);
    gfx->dirty = ~0;
    gfx->shaders_dirty = ~0;
