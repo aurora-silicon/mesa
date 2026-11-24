@@ -13259,7 +13259,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
                          unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat,
-                         bool agx3_reg_float_consts)
+                         bool agx3_reg_float_consts, bool disable_sampled_cap)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
@@ -13280,6 +13280,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
    agx_context *ctx = rzalloc(NULL, agx_context);
    ctx->nir = nir;
    ctx->ra_budget_cut = ra_budget_cut;
+   ctx->disable_sampled_cap = disable_sampled_cap;
    ctx->is_preamble = impl->function->is_preamble;
    ctx->agx3_reg_float_consts = agx3_reg_float_consts;
    if (ctx->is_preamble)
@@ -13630,6 +13631,19 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       return false;
    }
    if (ctx->ra_failed) {
+      /* If the optional sampled-compute occupancy cap tightened the file,
+       * drop it first and retry from the whole register file before giving
+       * up (including on RA_MEM exhaustion) or cutting the GPR budget. */
+      if (ctx->sampled_cap_applied) {
+         assert(!disable_sampled_cap && !ra_budget_cut);
+         ralloc_free(ctx);
+         binary->size = initial_binary_size;
+         *out = initial_out;
+         return agx_compile_function_nir_attempt(
+            nir, impl, key, binary, out, offset_out, 0, disable_remat,
+            retry_without_remat, agx3_reg_float_consts, true);
+      }
+
       /* Spilling only targets total demand; pinned values can still leave the
        * shuffle no room. Recompile with an ever smaller spill budget unless
        * RA_MEM itself was exhausted, where cutting the GPR budget only forces
@@ -13643,7 +13657,7 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          return agx_compile_function_nir_attempt(
             nir, impl, key, binary, out, offset_out,
             ra_budget_cut ? ra_budget_cut * 2 : 16, disable_remat,
-            retry_without_remat, agx3_reg_float_consts);
+            retry_without_remat, agx3_reg_float_consts, disable_sampled_cap);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -13738,6 +13752,15 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
                                   : AGX3_G17P_MAX_SPILL_B;
 
       if (frame_B > limit_B) {
+         if (ctx->sampled_cap_applied) {
+            assert(!disable_sampled_cap && !ra_budget_cut);
+            ralloc_free(ctx);
+            binary->size = initial_binary_size;
+            *out = initial_out;
+            return agx_compile_function_nir_attempt(
+               nir, impl, key, binary, out, offset_out, 0, disable_remat,
+               retry_without_remat, agx3_reg_float_consts, true);
+         }
          agx_set_refusal(ctx, "AGX3 scratch frame exceeds target limit",
                          __LINE__);
          binary->size = initial_binary_size;
@@ -14016,7 +14039,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    if (!eligible)
       return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
                                              offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
+                                             agx3_reg_float_consts, false);
 
    /* Preserve all compiler-owned state, including earlier main code/rodata.
     * The first attempt owns a deep NIR clone and a fresh AIR context. */
@@ -14024,7 +14047,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    if (!attempt)
       return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
                                              offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts);
+                                             agx3_reg_float_consts, false);
 
    nir_function_impl *attempt_impl = NULL;
    nir_foreach_function_with_impl(func, candidate, attempt) {
@@ -14040,7 +14063,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    bool retry = false;
    bool success = agx_compile_function_nir_attempt(
       attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry,
-      agx3_reg_float_consts);
+      agx3_reg_float_consts, false);
    ralloc_free(attempt);
    if (!retry)
       return success;
@@ -14052,7 +14075,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    /* Exactly one retry. Real full-budget spills retain the old refusal. */
    return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
                                           offset_out, 0, true, NULL,
-                                          agx3_reg_float_consts);
+                                          agx3_reg_float_consts, false);
 }
 
 /*

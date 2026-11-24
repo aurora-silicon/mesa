@@ -759,6 +759,12 @@ typedef struct {
     * Retrying with a smaller GPR budget cannot help and only increases spill
     * pressure. */
    bool ra_mem_exhausted;
+   /* Disable the optional sampled-compute occupancy cap on a retry after a
+    * capped allocation failed (including on RA_MEM exhaustion). */
+   bool disable_sampled_cap;
+   /* Set by agx_ra_impl() when agx_sampled_compute_register_cap() actually
+    * lowered max_possible_regs on this attempt. */
+   bool sampled_cap_applied;
    /* Halves taken off the spill budget after a failed allocation, so the
     * live-range shuffle gets free room (agx_compile_function_nir retries). */
    unsigned ra_budget_cut;

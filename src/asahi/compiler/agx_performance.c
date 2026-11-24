@@ -84,23 +84,17 @@ agx_register_file_halves(const struct agx_device_key *dev)
  * above what its whole file allows, or when its register file is unknown
  * (agx_register_file_halves() returns 0).
  *
- * AGX2 and AGX3C currently resolve to 160: their files (256 and 252 halves)
- * reach 384 threads uncapped, so the cap raises that to 640. AGX3B (192
- * halves) already reaches 512, too small a step, so it gets no cap. G18G gets
- * no cap, as it takes no scratch for compute. All encodings share one
+ * AGX2, AGX3C, and AGX3D currently resolve to 160: their files (256 and
+ * 252 halves) reach 384 threads uncapped, so the cap raises that to 640.
+ * AGX3B (192 halves) already reaches 512, too small a step, so it gets no
+ * cap. Launches that take no scratch (such as G18G) leave optional_spills
+ * false instead of overriding the derivation here. All encodings share one
  * occupancy table; a part whose steps differ needs its own table before this
  * derivation is right for it.
  */
 unsigned
 agx_sampled_compute_register_cap(const struct agx_device_key *dev)
 {
-   /* G18G launches compute without scratch (hk_dispatch_g17g_native()
-    * refuses it), so the spills the cap trades for threads would refuse the
-    * launch there.
-    */
-   if (dev->emit_agx3d || dev->encoding == AGX_ISA_ENCODING_AGX3D)
-      return 0;
-
    const unsigned file = agx_register_file_halves(dev);
    if (!file)
       return 0;

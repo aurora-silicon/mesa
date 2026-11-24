@@ -3342,12 +3342,12 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
     * texture reads (agx_sampled_compute_register_cap() derives the budget).
     * Helpers and unspillable programs keep their hardware budget. The cap
     * only trades spills for occupancy, so a retry after a failed allocation
-    * (ra_budget_cut) drops it and spills down from the whole file, as it
-    * would without the cap, rather than refusing a program that fits there.
+    * (including RA_MEM exhaustion) drops it and compiles from the whole
+    * file rather than refusing a program that fits there.
     */
    const unsigned sampled_cap =
       agx_sampled_compute_register_cap(&ctx->key->dev);
-   if (sampled_cap && !ctx->ra_budget_cut &&
+   if (sampled_cap && !ctx->ra_budget_cut && !ctx->disable_sampled_cap &&
        ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
        !ctx->key->is_helper && ctx->key->has_scratch &&
        ctx->key->optional_spills &&
@@ -3357,8 +3357,10 @@ agx_ra_impl(agx_context *ctx, bool disable_remat)
          if (I->op == AGX_OPCODE_TEXTURE_SAMPLE || I->op == AGX_OPCODE_TEXTURE_LOAD)
             samples++;
       }
-      if (samples >= 4)
-         max_possible_regs = MIN2(max_possible_regs, sampled_cap);
+      if (samples >= 4 && sampled_cap < max_possible_regs) {
+         max_possible_regs = sampled_cap;
+         ctx->sampled_cap_applied = true;
+      }
    }
 
    /* Match the CEM scratch extent reserved by agx3_pack_binary. */
