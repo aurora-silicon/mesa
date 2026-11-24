@@ -2882,8 +2882,9 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
 
    u_init_pipe_screen_caps(pscreen, 1);
 
-   /* kmsro and EGL surfaceless skip a screen without graphics and fall back to
-    * another driver (in the end software rendering).
+   /* kmsro and the shared DRI screen constructor (EGL, GLX, GBM) reject a
+    * screen without graphics and fall back to another driver (in the end
+    * software rendering).
     */
    caps->graphics = !agx_compute_only(agx_device(pscreen));
 
