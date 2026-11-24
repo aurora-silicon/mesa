@@ -2087,6 +2087,115 @@ collect_loops(struct exec_list *list, struct util_dynarray *loops)
    }
 }
 
+/* The number of iterations a counted loop with a constant bound runs when
+ * its induction variable starts at `start`, or false if that is more than
+ * `limit` or the tested value or the induction variable would wrap on the
+ * way. */
+static bool
+trips_from(const struct counted_loop *cl, int64_t start, unsigned limit,
+           unsigned *trips)
+{
+   const int64_t lo = cl->is_unsigned ? 0 : INT32_MIN;
+   const int64_t hi = cl->is_unsigned ? (int64_t)UINT32_MAX : INT32_MAX;
+   const int64_t bound = cl->is_unsigned
+                            ? (int64_t)(uint32_t)nir_scalar_as_uint(cl->bound)
+                            : (int64_t)(int32_t)nir_scalar_as_uint(cl->bound);
+   int64_t iv = start;
+   for (unsigned k = 0; k <= limit; ++k) {
+      const int64_t v = iv + cl->offset;
+      if (v < lo || v > hi)
+         return false;
+      bool cont;
+      switch (cl->rel) {
+      case REL_LT: cont = v < bound; break;
+      case REL_LE: cont = v <= bound; break;
+      case REL_GT: cont = v > bound; break;
+      default:     cont = v >= bound; break;
+      }
+      if (!cont) {
+         *trips = k;
+         return true;
+      }
+      iv += cl->step;
+      if (iv < lo || iv > hi)
+         return false;
+   }
+   return false;
+}
+
+/*
+ * A top-tested counted loop with a constant bound whose induction variable
+ * starts at a value range analysis bounds, and which runs the same number of
+ * iterations from every start in that range: the cooperative loads of a
+ * workgroup tile,
+ *
+ *    for (i = local_invocation_id.x; i < 32; i += 16)
+ *       tile[i] = src[base + i];
+ *
+ * run exactly twice in every invocation of a 16-wide workgroup. Its trip
+ * count is only known at run time to the counted-loop analysis, which would
+ * build a main loop that can never run and leave both iterations to the
+ * original loop, with a loop test and branch for each and no way to issue
+ * the second iteration's load before the first iteration's store.
+ *
+ * The start is the induction variable's value on entry. Its unsigned upper
+ * bound U (an invocation index is bounded by the workgroup size) puts it in
+ * [0, U], read as signed only when U fits in 31 bits. The trip count is
+ * monotonic in the start for a fixed step and bound (analyze_loop admits
+ * only steps that move towards the bound), so it is the same for the whole
+ * range when it is the same at both ends, and the induction variable stays
+ * between its values from the two ends. Such loops are replaced by that many
+ * straight copies of the body.
+ */
+static bool
+peel_exact_range_loops(nir_function_impl *impl, unsigned max_instrs)
+{
+   struct util_dynarray loops;
+   util_dynarray_init(&loops, NULL);
+   collect_loops(&impl->body, &loops);
+
+   struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+   nir_loop *peel[32];
+   unsigned counts[32];
+   unsigned n = 0;
+   util_dynarray_foreach(&loops, nir_loop *, lp) {
+      struct counted_loop cl;
+      if (n == ARRAY_SIZE(peel) || !analyze_loop(*lp, &cl) || cl.bottom ||
+          !nir_scalar_is_const(cl.bound))
+         continue;
+
+      nir_block *pre = nir_cf_node_as_block(nir_cf_node_prev(&(*lp)->cf_node));
+      nir_phi_src *init = nir_phi_get_src_from_block(cl.iv, pre);
+      if (!init || init->src.ssa->num_components != 1)
+         continue;
+
+      const uint32_t ub = nir_unsigned_upper_bound(
+         impl->function->shader, range_ht, nir_get_scalar(init->src.ssa, 0));
+      if (!cl.is_unsigned && ub > (uint32_t)INT32_MAX)
+         continue;
+
+      unsigned lo_trips, hi_trips;
+      if (!trips_from(&cl, 0, 4, &lo_trips) ||
+          !trips_from(&cl, ub, 4, &hi_trips) || lo_trips != hi_trips ||
+          lo_trips == 0)
+         continue;
+
+      const int size = count_unrollable(*lp, cl.nif);
+      if (size < 0 || (unsigned)size * lo_trips > max_instrs)
+         continue;
+
+      peel[n] = *lp;
+      counts[n++] = lo_trips;
+   }
+   _mesa_hash_table_destroy(range_ht, NULL);
+   util_dynarray_fini(&loops);
+
+   bool progress = false;
+   for (unsigned i = 0; i < n; ++i)
+      progress |= peel_straight_prefix(impl, peel[i], counts[i], false);
+   return progress;
+}
+
 bool
 agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
                              unsigned max_instrs, unsigned *widest)
@@ -2099,6 +2208,15 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       nir_index_ssa_defs(impl);
 
       bool unswitched = false;
+      if (peel_exact_range_loops(impl, max_instrs)) {
+         nir_progress(true, impl, nir_metadata_none);
+         nir_lower_reg_intrinsics_to_ssa_impl(impl);
+         nir_metadata_require(impl, nir_metadata_block_index);
+         nir_index_ssa_defs(impl);
+         unswitched = true;
+         any = true;
+      }
+
       struct util_dynarray small_peels, outer3_peels;
       util_dynarray_init(&small_peels, NULL);
       util_dynarray_init(&outer3_peels, NULL);

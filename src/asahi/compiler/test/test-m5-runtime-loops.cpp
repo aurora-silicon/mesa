@@ -1278,3 +1278,109 @@ TEST(M5RuntimeLoops, NestedWindowUnswitches)
       ralloc_free(s);
    }
 }
+
+enum tile_start { TILE_LOCAL_ID, TILE_PUSH_CONSTANT };
+
+/* for (int i = start; i < bound; i += step) dst[i] = src[i], the
+ * cooperative load of a workgroup tile when start is the local invocation
+ * index of a `wg`-wide workgroup. */
+static nir_shader *
+tile_loop(unsigned wg, int bound, int step, tile_start start, bool variable_wg)
+{
+   nir_builder b = compute_shader("tile-loop");
+   b.shader->info.workgroup_size[0] = wg;
+   b.shader->info.workgroup_size_variable = variable_wg;
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_def *init =
+      start == TILE_LOCAL_ID
+         ? nir_channel(&b, nir_load_local_invocation_id(&b), 0)
+         : nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 32);
+   nir_store_var(&b, iv, init, 1);
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_break_if(&b, nir_ige_imm(&b, i, bound));
+      nir_def *v = nir_load_global(
+         &b, 1, 32, buffer_address(&b, nir_amul_imm(&b, i, 4)),
+         .access = (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER),
+         .align_mul = 4);
+      nir_store_global(&b, v,
+                       buffer_address(&b, nir_iadd_imm(&b, nir_amul_imm(&b, i, 4), 4096)),
+                       .align_mul = 4);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, step), 1);
+   }
+   nir_pop_loop(&b, loop);
+   NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+   NIR_PASS(_, b.shader, nir_opt_copy_prop);
+   NIR_PASS(_, b.shader, nir_opt_cse);
+   NIR_PASS(_, b.shader, nir_opt_dce);
+   return b.shader;
+}
+
+static unsigned
+count_intrinsics(nir_shader *shader, nir_intrinsic_op op)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == op)
+               n++;
+         }
+      }
+   }
+   return n;
+}
+
+/* Every invocation of a 16-wide workgroup runs the 32-element tile loop
+ * exactly twice (local index 0..15): it becomes two straight copies. */
+TEST(AGX3RuntimeLoops, CooperativeTileLoopPeelsExactly)
+{
+   nir_shader *s = tile_loop(16, 32, 16, TILE_LOCAL_ID, false);
+   ASSERT_EQ(count_loops(s), 1u);
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL));
+   nir_validate_shader(s, "tile loop peel");
+   NIR_PASS(_, s, nir_opt_dce);
+   EXPECT_EQ(count_loops(s), 0u);
+   EXPECT_EQ(count_intrinsics(s, nir_intrinsic_load_global), 2u);
+   EXPECT_EQ(count_intrinsics(s, nir_intrinsic_store_global), 2u);
+   ralloc_free(s);
+
+   /* A 64-wide workgroup over a 256-element tile: four copies. */
+   s = tile_loop(64, 256, 64, TILE_LOCAL_ID, false);
+   EXPECT_TRUE(agx_nir_unroll_runtime_loops(s, 8, 320, NULL));
+   nir_validate_shader(s, "tile loop peel x4");
+   NIR_PASS(_, s, nir_opt_dce);
+   EXPECT_EQ(count_loops(s), 0u);
+   EXPECT_EQ(count_intrinsics(s, nir_intrinsic_store_global), 4u);
+   ralloc_free(s);
+}
+
+/* Where the trip count depends on the start, or the start is not bounded,
+ * the loop stays a loop (the guarded runtime unroll may still apply). */
+TEST(AGX3RuntimeLoops, CooperativeTileLoopRefusals)
+{
+   struct {
+      unsigned wg;
+      int bound, step;
+      tile_start start;
+      bool variable_wg;
+   } cases[] = {
+      /* 40 elements over 16 invocations: 3 trips below index 8, 2 above. */
+      {16, 40, 16, TILE_LOCAL_ID, false},
+      /* An unbounded start may be negative as a signed value. */
+      {16, 32, 16, TILE_PUSH_CONSTANT, false},
+      /* A variable workgroup size bounds the index by the device maximum. */
+      {16, 32, 16, TILE_LOCAL_ID, true},
+      /* Eight trips: more than the straight copies this peels. */
+      {16, 128, 16, TILE_LOCAL_ID, false},
+   };
+   for (const auto &c : cases) {
+      nir_shader *s = tile_loop(c.wg, c.bound, c.step, c.start, c.variable_wg);
+      agx_nir_unroll_runtime_loops(s, 8, 320, NULL);
+      nir_validate_shader(s, "tile loop refusal");
+      EXPECT_GE(count_loops(s), 1u) << c.bound << " " << c.start;
+      ralloc_free(s);
+   }
+}
