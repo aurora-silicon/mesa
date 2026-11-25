@@ -1,0 +1,7 @@
+# Upstream Mesa (https://gitlab.freedesktop.org/mesa/mesa) that the Aurora trees derive from.
+# src/asahi in this tree is that commit's src/asahi, unchanged and not built.
+# ci/aurora-divergence.py compares each 'map' pair (ours, upstream's).
+commit ab0ab2209c4ea834168ec0d23da4d5edfc386015
+map src/aurora src/asahi
+map src/gallium/drivers/aurora src/gallium/drivers/asahi
+map src/gallium/winsys/aurora src/gallium/winsys/asahi
