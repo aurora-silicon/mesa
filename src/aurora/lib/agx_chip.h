@@ -487,7 +487,7 @@ agx_chip_vdm_stream_link_supported(enum agx_chip chip)
 #define AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE (8)
 
 /*
- * Whether Honeykrisp drives a chip through its native AGX3 path: AGX3b shaders
+ * Whether Borealis drives a chip through its native AGX3 path: AGX3b shaders
  * loaded by Ioto programs, VDM/PPP/CDM records in the HAL200 layout, Gen9
  * descriptors with heap-indexed textures and samplers, firmware-owned USC
  * private memory and no helper programs.
@@ -724,7 +724,7 @@ extern "C" {
 #endif
 
 /* Return the exact command-stream architecture, or UNKNOWN.  Recognition does
- * not imply a complete Honeykrisp upload-to-submit path.  Callers opening a
+ * not imply a complete Borealis upload-to-submit path.  Callers opening a
  * device must check agx_chip_driver_supported, not only UNKNOWN. */
 enum agx_chip
 agx_chip_from_params(const struct drm_asahi_params_global *params);
@@ -759,15 +759,15 @@ agx_chip_command_stream_generation(enum agx_chip chip)
 #define AGX_CDM_BARRIER_FULL_WORD 0xfffffu
 
 /* The default flag word of the AGX2 CDM barrier record Borealis emits at a
- * tracked compute dependency (hk_cdm_flush()). The reduced word 0x1ff
+ * tracked compute dependency (brl_cdm_flush()). The reduced word 0x1ff
  * (unk_0..8, PBE/texture-cache maintenance included) is the set measured on
  * the two AGX2 X dies; every other chip keeps the full word. The gate is a
  * chip property rather than a measured property because the reduced set is a
  * die-level drain characteristic: the two chips it was proven on are the
  * only AGX2 parts the lab holds. The word alone does not decide when a
  * barrier is emitted, and a device that created a sparse resource upgrades
- * to the full word at emit or submit (hk_cdm_flush(),
- * hk_submit_patch_sparse_sites()). */
+ * to the full word at emit or submit (brl_cdm_flush(),
+ * brl_submit_patch_sparse_sites()). */
 static inline uint32_t
 agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
 {
@@ -777,7 +777,7 @@ agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
    return AGX_CDM_BARRIER_FULL_WORD;
 }
 
-/* The word emitted at a tracked compute dependency (hk_cdm_flush()): the
+/* The word emitted at a tracked compute dependency (brl_cdm_flush()): the
  * full word once the device holds a sparse resource or under
  * fullcdmbarrier, the chip's default word otherwise. */
 static inline uint32_t
@@ -1027,8 +1027,8 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
 }
 
 /* Whether the Borealis graphics path supplies the depth/stencil feedback-loop
- * shader twin (hk_fbl_twin()) and draw-time dynamic transition
- * (hk_select_fbl_fs()) required for VK_EXT_attachment_feedback_loop_dynamic_state.
+ * shader twin (brl_fbl_twin()) and draw-time dynamic transition
+ * (brl_select_fbl_fs()) required for VK_EXT_attachment_feedback_loop_dynamic_state.
  * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C). */
 static inline bool
 agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
@@ -1083,7 +1083,7 @@ agx_chip_usc_base_page_fill_returns_for(enum agx_chip chip,
 
 /*
  * Whether the texture descriptor's last word (bytes 28-31) is ignored by the
- * texture unit and so free for the driver: Honeykrisp keeps a 2D view's
+ * texture unit and so free for the driver: Borealis keeps a 2D view's
  * level-zero extent there (AGX_GEN10_IMAGE_EXTENT_OFFSET), so a constant
  * level-zero textureSize() is one load.
  *
@@ -1259,7 +1259,7 @@ agx_chip_has_shader_quad_control(enum agx_chip chip)
 }
 
 /* Whether an image load misses a store made earlier in the same invocation,
- * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
+ * so Borealis forwards the stored value to the load. A18 Pro's loads
  * behave this way; G15 loads observe the invocation's own stores. */
 static inline bool
 agx_chip_image_load_misses_own_store(enum agx_chip chip)

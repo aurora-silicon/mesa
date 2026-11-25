@@ -5,7 +5,7 @@
  * user interfaces record them, including areas on the right and bottom edges:
  * every pixel outside the areas must keep its contents, every pixel inside
  * must take the pass's clear or draw. The driver does not walk the tiles past
- * an area's bottom-right corner (hk_queue.c), so those tiles must survive
+ * an area's bottom-right corner (brl_queue.c), so those tiles must survive
  * untouched.
  *
  * It then times 1000 passes of a 128x64 area on an 8192x8192 attachment. A

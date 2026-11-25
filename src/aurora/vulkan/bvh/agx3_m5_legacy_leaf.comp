@@ -20,12 +20,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 
-#include "hk_build_interface.h"
+#include "brl_build_interface.h"
 
 layout(local_size_x = 8) in;
 layout(push_constant) uniform CONSTS
 {
-   hk_agx3_leaf_args args;
+   brl_agx3_leaf_args args;
 };
 
 shared vec3 vertices[24];
@@ -164,7 +164,7 @@ store64(uint64_t address, uint64_t value)
 }
 
 void
-encode_instance(hk_agx3_leaf_job job, uint lane)
+encode_instance(brl_agx3_leaf_job job, uint lane)
 {
    REF(vk_ir_instance_node) src = REF(vk_ir_instance_node)(
       OFFSET(job.intermediate_bvh, job.triangle_offsets[lane]));
@@ -212,17 +212,17 @@ main()
    uint id = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
    if (id >= args.job_count)
       return;
-   hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
+   brl_agx3_leaf_job job = DEREF(INDEX(brl_agx3_leaf_job, args.jobs, id));
    uint count = job.child_count;
-   bool leaf = job.node_kind == HK_AGX3_NODE_LEAF;
-   bool instances = job.node_kind == HK_AGX3_NODE_INSTANCES;
-   bool aabbs = job.node_kind == HK_AGX3_NODE_AABBS;
+   bool leaf = job.node_kind == BRL_AGX3_NODE_LEAF;
+   bool instances = job.node_kind == BRL_AGX3_NODE_INSTANCES;
+   bool aabbs = job.node_kind == BRL_AGX3_NODE_AABBS;
    /* Bounding-box record stride: the 48-byte native record (class 4). */
-   uint aabb_stride = HK_AGX3_M5_AABB_RECORD_B;
+   uint aabb_stride = BRL_AGX3_M5_AABB_RECORD_B;
    if (count < 1u || count > 8 ||
-       job.node_kind > HK_AGX3_NODE_AABBS) {
+       job.node_kind > BRL_AGX3_NODE_AABBS) {
       if (lane == 0)
-         DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_INVALID_COUNT;
+         DEREF(INDEX(uint32_t, args.status, id)) = BRL_AGX3_LEAF_INVALID_COUNT;
       return;
    }
    uint capacity = min(count, 4u), blocks = (count + capacity - 1u) / capacity;
@@ -243,9 +243,9 @@ main()
          upper[lane] = DEREF(src).aabb.max;
          for (uint a = 0; a < 3; ++a) {
             if (!finite(lower[lane][a]) || !finite(upper[lane][a]))
-               atomicOr(bad, HK_AGX3_LEAF_NONFINITE);
+               atomicOr(bad, BRL_AGX3_LEAF_NONFINITE);
             if (lower[lane][a] > upper[lane][a])
-               atomicOr(bad, HK_AGX3_LEAF_RANGE);
+               atomicOr(bad, BRL_AGX3_LEAF_RANGE);
          }
          if (aabbs) {
             REF(vk_ir_aabb_node) box = REF(vk_ir_aabb_node)(
@@ -271,7 +271,7 @@ main()
             for (uint a = 0; a < 3; ++a) {
                p[a] = DEREF(src).coords[v][a];
                if (!finite(p[a]))
-                  atomicOr(bad, HK_AGX3_LEAF_NONFINITE);
+                  atomicOr(bad, BRL_AGX3_LEAF_NONFINITE);
             }
             vertices[lane * 3u + v] = p;
          }
@@ -293,7 +293,7 @@ main()
    if (leaf && lane < blocks &&
        !fit_qtb(lane * capacity, min(capacity, count - lane * capacity), qbase,
                 qexp))
-      atomicOr(bad, HK_AGX3_LEAF_RANGE);
+      atomicOr(bad, BRL_AGX3_LEAF_RANGE);
    if (lane == 0) {
       vec3 lo = lower[0], hi = upper[0], base;
       uvec3 exponent;
@@ -302,7 +302,7 @@ main()
          hi = max(hi, upper[t]);
       }
       if (!fit_root(lo, hi, base, exponent)) {
-         atomicOr(bad, HK_AGX3_LEAF_RANGE);
+         atomicOr(bad, BRL_AGX3_LEAF_RANGE);
       } else {
          for (uint t = 0; t < 8; ++t)
             root[t] = uint64_t(0);
@@ -351,7 +351,7 @@ main()
                   rhi = base[a] + float(qhi) * s;
                }
                if (rlo > lower[t][a] || rhi < upper[t][a])
-                  atomicOr(bad, HK_AGX3_LEAF_RANGE);
+                  atomicOr(bad, BRL_AGX3_LEAF_RANGE);
                root[t] |= uint64_t(qlo) << shifts[a];
                root[t] |= uint64_t(qhi) << shifts[a + 3];
             }
@@ -370,7 +370,7 @@ main()
    if (instances && lane < count)
       encode_instance(job, lane);
    if (aabbs && lane < count) {
-      /* 48-byte native bounding-box record (HK_AGX3_M5_AABB_RECORD_B). */
+      /* 48-byte native bounding-box record (BRL_AGX3_M5_AABB_RECORD_B). */
       uint64_t record = children + uint64_t(lane) * uint64_t(aabb_stride);
       store32(record, 0x18u);
       for (uint a = 0; a < 3; ++a) {
@@ -426,6 +426,6 @@ main()
          store32(address, uint(root[w]));
          store32(address + 4ul, uint(root[w] >> 32));
       }
-      DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
+      DEREF(INDEX(uint32_t, args.status, id)) = BRL_AGX3_LEAF_SUCCESS;
    }
 }

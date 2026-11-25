@@ -832,7 +832,7 @@ main(int argc, char **argv)
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
    /* Draw 5: pure bare-CULL-only change (no push-constant update) ->
-    * hk_g17p_flush_dynamic_state_fast() early return emitting ONLY an 8B CULL
+    * brl_g17p_flush_dynamic_state_fast() early return emitting ONLY an 8B CULL
     * PPP update (#2) directly between INDEX_LIST draws with no VDM state
     * update. */
    vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);

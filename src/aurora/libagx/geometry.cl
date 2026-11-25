@@ -114,7 +114,7 @@ libagx_increment_ia_restart(global uint32_t *ia_vertices,
                         false, &scratch);
 }
 
-/* Honeykrisp's native G17P path passes the scratch page for every disabled
+/* Borealis's native G17P path passes the scratch page for every disabled
  * counter and does not expose geometry or tessellation.  All five addresses
  * are therefore valid and non-null, allowing this specialization to avoid
  * pointer-presence reductions while preserving the exact restart accounting. */

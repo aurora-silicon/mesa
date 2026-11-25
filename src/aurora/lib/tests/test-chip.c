@@ -10,7 +10,7 @@
 #include <string.h>
 
 #include "aurora/genxml/agx3_cmdstream.h"
-#include "aurora/vulkan/hk_agx3_vdm_decode.h"
+#include "aurora/vulkan/brl_agx3_vdm_decode.h"
 #include "agx3_cdm_direct_launch_semantic_core.h"
 #include "agx3_compute_program_core.h"
 #include "agx_ioto_core.h"
@@ -281,12 +281,12 @@ static unsigned decoder_chip(enum agx_chip chip);
 static unsigned
 shader_binary_version_class(enum agx_chip chip)
 {
-   switch (hk_shader_binary_version(chip)) {
-   case HK_CLASSIC_SHADER_BINARY_VERSION:
+   switch (brl_shader_binary_version(chip)) {
+   case BRL_CLASSIC_SHADER_BINARY_VERSION:
       return 1;
-   case HK_AGX2_SHADER_BINARY_VERSION:
+   case BRL_AGX2_SHADER_BINARY_VERSION:
       return 2;
-   case HK_AGX3_SHADER_BINARY_VERSION:
+   case BRL_AGX3_SHADER_BINARY_VERSION:
       return 3;
    default:
       return 9;

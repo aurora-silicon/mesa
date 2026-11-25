@@ -145,7 +145,7 @@ agx_va_user_limit(enum agx_chip chip, bool heap_below_usc, uint64_t kernel_start
  * sparse buffer's read-only alias apart from its primary mapping.
  *
  * A sparse buffer is bound a second time at `addr + sparse_ro_offset`
- * (hk_buffer.c:95, d12_resource.c:1118).  For that to be a pure bit-set with
+ * (brl_buffer.c:95, d12_resource.c:1118).  For that to be a pure bit-set with
  * no carry -- and for the alias window to stay disjoint from the primary one
  * -- every address in [*out_start, *out_start + *out_size) must have the
  * sparse bit clear.  Since both are powers of two once rounded, that reduces

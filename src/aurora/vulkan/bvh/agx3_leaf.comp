@@ -3,7 +3,7 @@
  *
  * Native M5 Gen3 nodes, derived from the saved 2/4/8/64-triangle AGX
  * captures and agx_rt_blas_gen3.h. Eight lanes encode one independent node,
- * and a workgroup, one 32-lane subgroup, encodes HK_AGX3_NODE_JOBS_PER_GROUP
+ * and a workgroup, one 32-lane subgroup, encodes BRL_AGX3_NODE_JOBS_PER_GROUP
  * of them: one lane per child for its bounds, its root word, its record and
  * its QTB vertex bytes. The eight lanes of a node share its bounds, each QTB
  * block's bounds and their checks through clustered subgroup operations, so
@@ -11,8 +11,8 @@
  * from the same common build IR. No CPU readback, cross-workgroup
  * synchronization, or global allocator.
  *
- * Built with HK_AGX3_REFIT for updates: jobs come from the retained jobs
- * (see hk_agx3_retained_job). Each leaf job encodes as above and leaves its
+ * Built with BRL_AGX3_REFIT for updates: jobs come from the retained jobs
+ * (see brl_agx3_retained_job). Each leaf job encodes as above and leaves its
  * bounds for its parent, or NaN bounds when it fails, so that its
  * ancestors fail too; agx3_refit.comp then encodes the inner jobs. After a
  * triangle update's leaf pass (agx3_refit_leaf.comp), leaf jobs read their
@@ -30,15 +30,15 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
 
-#include "hk_build_interface.h"
+#include "brl_build_interface.h"
 #include "agx3_node.h"
 
 /* Variants for one geometry kind: their jobs are inner nodes or that
  * kind's leaves only, so the other kinds' encoders, and their registers,
  * drop out. A job of another kind fails as an invalid job. */
-#ifdef HK_AGX3_REFIT_DIRECT
-#define HK_AGX3_REFIT 1
-#define HK_AGX3_LEAF_ONLY HK_AGX3_NODE_LEAF
+#ifdef BRL_AGX3_REFIT_DIRECT
+#define BRL_AGX3_REFIT 1
+#define BRL_AGX3_LEAF_ONLY BRL_AGX3_NODE_LEAF
 /* Inactive triangles have NaN vertices, as for leaf generation. */
 #define SpvCapabilitySignedZeroInfNanPreserve 4466
 #define SpvExecutionModeSignedZeroInfNanPreserve 4461
@@ -46,20 +46,20 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"],
                      capabilities = [SpvCapabilitySignedZeroInfNanPreserve],
                      SpvExecutionModeSignedZeroInfNanPreserve, 32);
 #endif
-#ifdef HK_AGX3_REFIT_TRIANGLES
-#define HK_AGX3_REFIT 1
-#define HK_AGX3_LEAF_ONLY HK_AGX3_NODE_LEAF
+#ifdef BRL_AGX3_REFIT_TRIANGLES
+#define BRL_AGX3_REFIT 1
+#define BRL_AGX3_LEAF_ONLY BRL_AGX3_NODE_LEAF
 #endif
 /* Only triangle structures pair triangles. */
-#if defined(HK_AGX3_LEAF_PAIRS) && !defined(HK_AGX3_LEAF_ONLY)
-#define HK_AGX3_LEAF_ONLY HK_AGX3_NODE_LEAF
+#if defined(BRL_AGX3_LEAF_PAIRS) && !defined(BRL_AGX3_LEAF_ONLY)
+#define BRL_AGX3_LEAF_ONLY BRL_AGX3_NODE_LEAF
 #endif
 
-#define JOBS HK_AGX3_NODE_JOBS_PER_GROUP
-/* Built twice: HK_AGX3_LEAF_PAIRS encodes jobs whose children may be
- * triangle pairs (see hk_agx3_plan_args.pairs) and keeps four vertices per
+#define JOBS BRL_AGX3_NODE_JOBS_PER_GROUP
+/* Built twice: BRL_AGX3_LEAF_PAIRS encodes jobs whose children may be
+ * triangle pairs (see brl_agx3_plan_args.pairs) and keeps four vertices per
  * child; the other build serves every other job with three. */
-#ifdef HK_AGX3_LEAF_PAIRS
+#ifdef BRL_AGX3_LEAF_PAIRS
 #define VERTICES 4u
 #else
 #define VERTICES 3u
@@ -67,12 +67,12 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"],
 layout(local_size_x = 8 * JOBS) in;
 layout(push_constant) uniform CONSTS
 {
-#ifdef HK_AGX3_REFIT_DIRECT
-   hk_agx3_refit_direct_args args;
-#elif defined(HK_AGX3_REFIT)
-   hk_agx3_refit_encode_args args;
+#ifdef BRL_AGX3_REFIT_DIRECT
+   brl_agx3_refit_direct_args args;
+#elif defined(BRL_AGX3_REFIT)
+   brl_agx3_refit_encode_args args;
 #else
-   hk_agx3_leaf_args args;
+   brl_agx3_leaf_args args;
 #endif
 };
 
@@ -100,9 +100,9 @@ fit_qtb(vec3 lo, vec3 hi, out vec3 base, out uvec3 exponent)
  * the third. An unpaired record repeats v2 as v3, so B is never hit.
  *
  * Store the pair (a, b) sharing edge ea of a and edge eb of b (see
- * hk_agx3_shared_edge): rotate a so its shared edge becomes v1-v2, then b
+ * brl_agx3_shared_edge): rotate a so its shared edge becomes v1-v2, then b
  * is (v2, v1, v3) rotated to start at its own vertex eb. */
-#ifdef HK_AGX3_LEAF_PAIRS
+#ifdef BRL_AGX3_LEAF_PAIRS
 void
 arrange_pair(inout vec3 p[4], inout uint prim0, out uint prim1, vec3 b[3],
              uint edges, uint b_id)
@@ -177,7 +177,7 @@ store64(uint64_t address, uint64_t value)
 }
 
 void
-encode_instance(hk_agx3_leaf_job job, uint lane, uint64_t transforms,
+encode_instance(brl_agx3_leaf_job job, uint lane, uint64_t transforms,
                 uint64_t pointers)
 {
    REF(vk_ir_instance_node) src = REF(vk_ir_instance_node)(
@@ -223,29 +223,29 @@ main()
    uint id = gl_WorkGroupID.x * JOBS + slot;
    /* Every lane reaches every subgroup operation; a job that has no node to
     * encode, or fails a check, only stops doing work. */
-#ifdef HK_AGX3_REFIT_DIRECT
+#ifdef BRL_AGX3_REFIT_DIRECT
    libagx_gen1_as_metadata live_meta =
       DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
    if (live_meta.retained_bytes == 0ul)
       return;
    uint64_t retained = live_meta.native_base + live_meta.retained_offset;
-   hk_agx3_retained_state saved = DEREF(REF(hk_agx3_retained_state)(retained));
+   brl_agx3_retained_state saved = DEREF(REF(brl_agx3_retained_state)(retained));
    uint jobs = saved.job_count;
    uint leaf_jobs = saved.leaf_jobs;
    if (leaf_jobs > jobs || leaf_jobs + saved.inner_jobs != jobs)
       leaf_jobs = jobs;
    if (gl_WorkGroupID.x * JOBS >= leaf_jobs)
       return;
-   uint64_t records = retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
-   uint64_t offsets = records + uint64_t(jobs) * uint64_t(HK_AGX3_RETAINED_JOB_BYTES);
+   uint64_t records = retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
+   uint64_t offsets = records + uint64_t(jobs) * uint64_t(BRL_AGX3_RETAINED_JOB_BYTES);
    bool live = id < jobs;
-   hk_agx3_leaf_job job;
-   hk_agx3_retained_job record;
+   brl_agx3_leaf_job job;
+   brl_agx3_retained_job record;
    uint count = 0;
    if (live) {
-      record = DEREF(INDEX(hk_agx3_retained_job, records, id));
+      record = DEREF(INDEX(brl_agx3_retained_job, records, id));
       job.node_kind = (record.kind_count >> 4) & 15u;
-      live = job.node_kind != HK_AGX3_NODE_INNER;
+      live = job.node_kind != BRL_AGX3_NODE_INNER;
    }
    if (live) {
       job.output_bvh = args.output_bvh;
@@ -253,26 +253,26 @@ main()
       job.child_slot = record.child_slot;
       job.child_count = record.kind_count & 15u;
       count = job.child_count;
-#elif defined(HK_AGX3_REFIT)
-   hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
+#elif defined(BRL_AGX3_REFIT)
+   brl_agx3_refit_state refit = DEREF(REF(brl_agx3_refit_state)(args.refit));
    if (gl_WorkGroupID.x >= refit.dispatch[0])
       return;
    uint jobs = refit.job_count;
    if (gl_WorkGroupID.x * JOBS >= jobs)
       return;
-   uint64_t records = refit.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   uint64_t records = refit.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
    bool live = id < jobs;
-   hk_agx3_leaf_job job;
-   hk_agx3_retained_job record;
+   brl_agx3_leaf_job job;
+   brl_agx3_retained_job record;
    uint count = 0;
    if (live) {
       /* Inner jobs are encoded from their children's bounds. */
-      record = DEREF(INDEX(hk_agx3_retained_job, records, id));
+      record = DEREF(INDEX(brl_agx3_retained_job, records, id));
       job.node_kind = (record.kind_count >> 4) & 15u;
-      live = job.node_kind != HK_AGX3_NODE_INNER;
+      live = job.node_kind != BRL_AGX3_NODE_INNER;
    }
    if (live) {
-      uint64_t offsets = records + uint64_t(jobs) * uint64_t(HK_AGX3_RETAINED_JOB_BYTES);
+      uint64_t offsets = records + uint64_t(jobs) * uint64_t(BRL_AGX3_RETAINED_JOB_BYTES);
       job.intermediate_bvh = args.intermediate_bvh;
       job.output_bvh = args.output_bvh;
       job.root_slot = record.root_slot;
@@ -290,36 +290,36 @@ main()
    if (gl_WorkGroupID.x * JOBS >= jobs)
       return;
    bool live = id < jobs;
-   hk_agx3_leaf_job job;
+   brl_agx3_leaf_job job;
    uint count = 0;
    if (live) {
-      job = DEREF(INDEX(hk_agx3_leaf_job, args.jobs, id));
+      job = DEREF(INDEX(brl_agx3_leaf_job, args.jobs, id));
       count = job.child_count;
 #endif
-#ifdef HK_AGX3_LEAF_ONLY
-      const bool kind_ok = job.node_kind == HK_AGX3_NODE_INNER ||
-                           job.node_kind == HK_AGX3_LEAF_ONLY;
+#ifdef BRL_AGX3_LEAF_ONLY
+      const bool kind_ok = job.node_kind == BRL_AGX3_NODE_INNER ||
+                           job.node_kind == BRL_AGX3_LEAF_ONLY;
 #else
-      const bool kind_ok = job.node_kind <= HK_AGX3_NODE_AABBS;
+      const bool kind_ok = job.node_kind <= BRL_AGX3_NODE_AABBS;
 #endif
       if (count < 1u || count > 8 || !kind_ok) {
          if (lane == 0)
-            DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_INVALID_COUNT;
+            DEREF(INDEX(uint32_t, args.status, id)) = BRL_AGX3_LEAF_INVALID_COUNT;
          live = false;
       }
    }
    const bool valid = live;
-#ifdef HK_AGX3_LEAF_ONLY
-   const bool leaf = HK_AGX3_LEAF_ONLY == HK_AGX3_NODE_LEAF &&
-                     live && job.node_kind == HK_AGX3_NODE_LEAF;
-   const bool instances = HK_AGX3_LEAF_ONLY == HK_AGX3_NODE_INSTANCES &&
-                          live && job.node_kind == HK_AGX3_NODE_INSTANCES;
-   const bool aabbs = HK_AGX3_LEAF_ONLY == HK_AGX3_NODE_AABBS &&
-                      live && job.node_kind == HK_AGX3_NODE_AABBS;
+#ifdef BRL_AGX3_LEAF_ONLY
+   const bool leaf = BRL_AGX3_LEAF_ONLY == BRL_AGX3_NODE_LEAF &&
+                     live && job.node_kind == BRL_AGX3_NODE_LEAF;
+   const bool instances = BRL_AGX3_LEAF_ONLY == BRL_AGX3_NODE_INSTANCES &&
+                          live && job.node_kind == BRL_AGX3_NODE_INSTANCES;
+   const bool aabbs = BRL_AGX3_LEAF_ONLY == BRL_AGX3_NODE_AABBS &&
+                      live && job.node_kind == BRL_AGX3_NODE_AABBS;
 #else
-   bool leaf = live && job.node_kind == HK_AGX3_NODE_LEAF;
-   bool instances = live && job.node_kind == HK_AGX3_NODE_INSTANCES;
-   bool aabbs = live && job.node_kind == HK_AGX3_NODE_AABBS;
+   bool leaf = live && job.node_kind == BRL_AGX3_NODE_LEAF;
+   bool instances = live && job.node_kind == BRL_AGX3_NODE_INSTANCES;
+   bool aabbs = live && job.node_kind == BRL_AGX3_NODE_AABBS;
 #endif
    uint capacity = max(min(count, 4u), 1u), blocks = (count + capacity - 1u) / capacity;
    /* This lane's child: its bounds, record vertices and words. Lanes past
@@ -343,22 +343,22 @@ main()
          my_hi = DEREF(src).aabb.max;
          for (uint a = 0; a < 3; ++a) {
             if (!finite(my_lo[a]) || !finite(my_hi[a]))
-               my_bad |= HK_AGX3_LEAF_NONFINITE;
+               my_bad |= BRL_AGX3_LEAF_NONFINITE;
             if (my_lo[a] > my_hi[a])
-               my_bad |= HK_AGX3_LEAF_RANGE;
+               my_bad |= BRL_AGX3_LEAF_RANGE;
          }
       } else {
-#ifndef HK_AGX3_LEAF_PAIRS
+#ifndef BRL_AGX3_LEAF_PAIRS
          vec3 tri[3];
          uint geometry_flags;
-#ifdef HK_AGX3_REFIT_DIRECT
+#ifdef BRL_AGX3_REFIT_DIRECT
          uint prim_id = DEREF(INDEX(uint32_t, offsets, record.first + lane)) /
                         SIZEOF(vk_ir_triangle_node);
          vk_bvh_geometry_data geom = args.geometry;
          geometry_flags = geom.geometry_id;
          my_primitive = prim_id;
          if (prim_id >= args.leaf_bound) {
-            my_bad |= HK_AGX3_LEAF_RANGE;
+            my_bad |= BRL_AGX3_LEAF_RANGE;
             tri[0] = vec3(0.0);
             tri[1] = vec3(0.0);
             tri[2] = vec3(0.0);
@@ -383,10 +383,10 @@ main()
             for (uint v = 0; v < 3; ++v)
                tri[v] = inactive ? vec3(0.0) : vertices.vertex[v].xyz;
          }
-#elif defined(HK_AGX3_REFIT)
+#elif defined(BRL_AGX3_REFIT)
          if (args.triangles != 0ul) {
-            REF(hk_agx3_refit_triangle) src =
-               INDEX(hk_agx3_refit_triangle, args.triangles, record.first + lane);
+            REF(brl_agx3_refit_triangle) src =
+               INDEX(brl_agx3_refit_triangle, args.triangles, record.first + lane);
             geometry_flags = DEREF(src).geometry_id_and_flags;
             my_primitive = DEREF(src).triangle_id;
             for (uint v = 0; v < 3; ++v)
@@ -421,14 +421,14 @@ main()
          for (uint v = 0; v < 3; ++v) {
             for (uint a = 0; a < 3; ++a)
                if (!finite(tri[v][a]))
-                  my_bad |= HK_AGX3_LEAF_NONFINITE;
+                  my_bad |= BRL_AGX3_LEAF_NONFINITE;
             my_vertices[v] = tri[v];
          }
          my_vertices[3] = my_vertices[2];
 #else
          /* A pair names the internal node over its two triangles. */
          uint offset = job.triangle_offsets[lane];
-         bool paired = (offset & HK_AGX3_LEAF_PAIR_OFFSET) != 0u;
+         bool paired = (offset & BRL_AGX3_LEAF_PAIR_OFFSET) != 0u;
          offset &= ~3u;
          REF(vk_ir_triangle_node)
          src = REF(vk_ir_triangle_node)(OFFSET(job.intermediate_bvh, offset));
@@ -457,9 +457,9 @@ main()
             for (uint v = 0; v < 3; ++v)
                for (uint k = 0; k < 3; ++k)
                   b[v][k] = DEREF(second).coords[v][k];
-            uint edges = hk_agx3_shared_edge(a, b);
+            uint edges = brl_agx3_shared_edge(a, b);
             if (edges == ~0u)
-               my_bad |= HK_AGX3_LEAF_RANGE;
+               my_bad |= BRL_AGX3_LEAF_RANGE;
             else
                arrange_pair(p, my_primitive, my_primitive1, b, edges,
                             DEREF(second).triangle_id);
@@ -467,7 +467,7 @@ main()
          for (uint v = 0; v < 4; ++v) {
             for (uint a = 0; a < 3; ++a)
                if (!finite(p[v][a]))
-                  my_bad |= HK_AGX3_LEAF_NONFINITE;
+                  my_bad |= BRL_AGX3_LEAF_NONFINITE;
             my_vertices[v] = p[v];
          }
 #endif
@@ -505,7 +505,7 @@ main()
          ok = fit_qtb(block_lo, block_hi, qbase, qexp);
          /* The QTB holds the record's vertices in reverse order; an
           * unpaired record repeats v2 as v3. */
-#ifdef HK_AGX3_LEAF_PAIRS
+#ifdef BRL_AGX3_LEAF_PAIRS
          const uint order[4] = uint[4](3, 2, 1, 0);
 #else
          const uint order[4] = uint[4](2, 2, 1, 0);
@@ -522,7 +522,7 @@ main()
             }
       }
       if (!ok)
-         my_bad |= HK_AGX3_LEAF_RANGE;
+         my_bad |= BRL_AGX3_LEAF_RANGE;
    }
    uint quad_node_bad = subgroupClusteredOr(my_bad, 4u);
    uint node_bad = quad_node_bad | subgroupShuffleXor(quad_node_bad, 4u);
@@ -531,9 +531,9 @@ main()
    if (node_bad != 0u) {
       if (lane == 0) {
          DEREF(INDEX(uint32_t, args.status, id)) = node_bad;
-#ifdef HK_AGX3_REFIT
+#ifdef BRL_AGX3_REFIT
          store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, record.position)),
-                    HK_AGX3_FAILED_BOUNDS, HK_AGX3_FAILED_BOUNDS);
+                    BRL_AGX3_FAILED_BOUNDS, BRL_AGX3_FAILED_BOUNDS);
 #endif
       }
       return;
@@ -552,19 +552,19 @@ main()
       store128(geometry + 32ul, uvec4(my_primitive, 0u, 0u, 0u));
       store128(geometry + 48ul, uvec4(0u));
    }
-#if defined(HK_AGX3_REFIT) && !defined(HK_AGX3_REFIT_DIRECT)
+#if defined(BRL_AGX3_REFIT) && !defined(BRL_AGX3_REFIT_DIRECT)
    if (instances && lane < count) {
       /* As the envelope lays them out after the nodes. */
       uint64_t transforms = uint64_t(refit.end_slot) * 64ul;
       encode_instance(job, lane, transforms,
                       transforms + 64ul * uint64_t(args.leaf_bound));
    }
-#elif !defined(HK_AGX3_REFIT)
+#elif !defined(BRL_AGX3_REFIT)
    if (instances && lane < count) {
       uint64_t transforms, pointers;
       if (args.counts != 0ul && args.leaf_bound != 0u) {
          transforms =
-            uint64_t(DEREF(REF(hk_agx3_plan_state)(args.counts)).next_slot) * 64ul;
+            uint64_t(DEREF(REF(brl_agx3_plan_state)(args.counts)).next_slot) * 64ul;
          pointers = transforms + 64ul * uint64_t(args.leaf_bound);
       } else {
          transforms = DEREF(REF(uint64_t)(job.output_bvh + 104ul));
@@ -581,7 +581,7 @@ main()
       uvec3 p1 = floatBitsToUint(my_vertices[1]);
       uvec3 p2 = floatBitsToUint(my_vertices[2]);
       uvec3 p3 = floatBitsToUint(my_vertices[VERTICES - 1u]);
-#ifdef HK_AGX3_LEAF_PAIRS
+#ifdef BRL_AGX3_LEAF_PAIRS
       uint second = my_primitive1;
 #else
       uint second = my_primitive;
@@ -612,8 +612,8 @@ main()
    store_word64(uint64_t(job.output_bvh) + uint64_t(job.root_slot) * 64ul +
                    uint64_t(lane) * 8ul, my_root);
    if (lane == 0) {
-      DEREF(INDEX(uint32_t, args.status, id)) = HK_AGX3_LEAF_SUCCESS;
-#ifdef HK_AGX3_REFIT
+      DEREF(INDEX(uint32_t, args.status, id)) = BRL_AGX3_LEAF_SUCCESS;
+#ifdef BRL_AGX3_REFIT
       /* Its parent's encoding reads these (agx3_refit.comp). */
       store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, record.position)), node_lo, node_hi);
 #endif

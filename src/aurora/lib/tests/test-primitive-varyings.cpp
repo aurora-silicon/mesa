@@ -2,7 +2,7 @@
 #include "aurora/compiler/agx_compile.h"
 #include "compiler/nir/nir_builder.h"
 extern "C" {
-#include "aurora/vulkan/hk_nir_widen_16bit_varyings.h"
+#include "aurora/vulkan/brl_nir_widen_16bit_varyings.h"
 }
 
 class PrimitiveVaryings : public ::testing::Test {
@@ -20,7 +20,7 @@ TEST_F(PrimitiveVaryings, MeshStoresWidenBeforeInterstageOptimization)
       nir_store_per_primitive_output(&b, value, nir_imm_int(&b, 0),
          nir_imm_int(&b, 0), .write_mask = 1, .src_type = type,
          .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
-      ASSERT_TRUE(hk_nir_widen_16bit_varyings(b.shader, HK_NIR_WIDEN_16BIT_OUTPUTS));
+      ASSERT_TRUE(brl_nir_widen_16bit_varyings(b.shader, BRL_NIR_WIDEN_16BIT_OUTPUTS));
       nir_intrinsic_instr *store = nir_instr_as_intrinsic(nir_block_last_instr(nir_cursor_current_block(b.cursor)));
       EXPECT_EQ(store->src[0].ssa->bit_size, 32u);
       EXPECT_EQ(nir_intrinsic_src_type(store), nir_alu_type_get_base_type(type) | 32);
@@ -54,8 +54,8 @@ TEST_F(PrimitiveVaryings, PrimitiveLoadsWidenAndNarrowNumerically)
                  .dest_type = type,
                  .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
          nir_def *use = nir_iadd_imm(&b, value, 1);
-         auto mode = output ? HK_NIR_WIDEN_16BIT_OUTPUTS : HK_NIR_WIDEN_16BIT_INPUTS;
-         ASSERT_TRUE(hk_nir_widen_16bit_varyings(b.shader, mode));
+         auto mode = output ? BRL_NIR_WIDEN_16BIT_OUTPUTS : BRL_NIR_WIDEN_16BIT_INPUTS;
+         ASSERT_TRUE(brl_nir_widen_16bit_varyings(b.shader, mode));
          EXPECT_EQ(value->bit_size, 32u);
          auto *load = nir_instr_as_intrinsic(nir_def_instr(value));
          EXPECT_EQ(nir_intrinsic_dest_type(load), nir_alu_type_get_base_type(type) | 32);

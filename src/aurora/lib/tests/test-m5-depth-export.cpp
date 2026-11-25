@@ -76,7 +76,7 @@ build_epilog(const epilog_shape &shape)
 
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "M5 depth export epilog");
-   /* As hk selects the builder for M5. */
+   /* As Borealis selects the builder for M5. */
    if (shape.sample_shading)
       agx_nir_fs_epilog_g17p(&b, &fs);
    else

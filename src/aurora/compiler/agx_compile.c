@@ -4351,10 +4351,10 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        *    compute grid-Z input there made every layered eMRT store address
        *    layer zero.
        *
-       * Both are driver-internal, and hk sets g17p_emrt only for the eMRT
-       * epilog (hk_cmd_draw.c). An API gl_Layer read never reaches here from
-       * hk -- nir_lower_sysvals_to_varyings rewrites it as a flat coefficient
-       * first (hk_shader.c) -- but it does from gallium, which lowers
+       * Both are driver-internal, and Borealis sets g17p_emrt only for the eMRT
+       * epilog (brl_cmd_draw.c). An API gl_Layer read never reaches here from
+       * Borealis -- nir_lower_sysvals_to_varyings rewrites it as a flat coefficient
+       * first (brl_shader.c) -- but it does from gallium, which lowers
        * VARYING_SLOT_LAYER back to this intrinsic with layer_as_varying
        * false and sets neither key bit. Leave that path alone. */
       if (b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
@@ -6801,7 +6801,7 @@ agx_lower_agx3_half_iadd_constants(agx_context *ctx)
 }
 
 /* Lower 32-bit integer adds or multiply-adds of half sources -- 16-bit
- * integer arithmetic the optimizer widened, as hk's int16 shaders and
+ * integer arithmetic the optimizer widened, as Borealis's int16 shaders and
  * dynamically indexed uniform arrays produce -- that have no native
  * mixed-width AGX3 encoding (all IMADs, immediate/uniform or saturated
  * IADDs, double-negated IADDs, shifted IADDs outside AGX3C's shift 1..4
@@ -11526,7 +11526,7 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
 }
 
 /* Whether a compile with a preamble size forms its preamble. Internal shaders
- * always do: hk's meta copies depend on it for correctness with imgwblk
+ * always do: Borealis's meta copies depend on it for correctness with imgwblk
  * intrinsics.
  */
 static bool
@@ -11692,7 +11692,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
    /* Do not run agx_nir_uniform_unit_global_id here: Borealis workgroup
-    * coalescing (hk_coalesce_workgroup_size_ex) checks eligibility before
+    * coalescing (brl_coalesce_workgroup_size_ex) checks eligibility before
     * backend compile and widens size-1 axes at dispatch, so rewriting
     * global_invocation_id[c] to workgroup_id[c] corrupts coalesced dispatches.
     */
@@ -16472,7 +16472,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
     * (agx_nir_lower_integer_division), which decides whether a preamble forms.
     * The first preprocessing of a Vulkan compute shader may defer these passes
     * so compute-kernel matchers see the raw idiv/udiv/irem/imod/umod by a
-    * constant; hk_lower_nir() preprocesses it again before backend compilation.
+    * constant; brl_lower_nir() preprocesses it again before backend compilation.
     */
    if (!defer_idiv) {
       NIR_PASS(_, nir, agx_nir_opt_iv_divmod);
@@ -16534,7 +16534,7 @@ agx_preprocess_nir_internal(nir_shader *nir, bool g17p, bool native_fragment_dep
 
       /* A frontend that reaches this helper with `g17p` set owns the
        * element-index conversion for the whole shader, including shared
-       * accesses that do not exist yet: hk_shader.c lowers `shared` variables
+       * accesses that do not exist yet: brl_shader.c lowers `shared` variables
        * to load_shared and store_shared between its two calls here, so the
        * first call legitimately finds nothing and the second does the work.
        * Record the ownership rather than the work -- a flag set by the pass

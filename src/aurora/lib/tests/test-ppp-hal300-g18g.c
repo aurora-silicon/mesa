@@ -558,7 +558,7 @@ test_compute(void)
    /* The flag-free barrier and the flags=5 strong flush are captured:
     * every other flag value is refused on G18G in both directions,
     * although G17G admits all of them.  flags=5 is grounded from rel24b+
-    * chained launches (hk_cmd_dispatch.c). */
+    * chained launches (brl_cmd_dispatch.c). */
    for (unsigned flags = 1; flags <= 0xf; ++flags) {
       if (flags == 5)
          continue;

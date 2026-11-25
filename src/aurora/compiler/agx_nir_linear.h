@@ -23,7 +23,7 @@ struct lin {
 
 /* The base address of a buffer binding: the 64-bit address packed from the
  * first two components of a buffer binding descriptor load
- * (ACCESS_BUFFER_BINDING_AGX, attached by hk_nir_lower_descriptors for storage
+ * (ACCESS_BUFFER_BINDING_AGX, attached by brl_nir_lower_descriptors for storage
  * and uniform buffer descriptors: address low, high, size, ...). Such a
  * binding spans at most INT32_MAX bytes on M5 (maxStorageBufferRange), so a
  * 32-bit offset into it that wraps 2^32 is past its end. A physical storage

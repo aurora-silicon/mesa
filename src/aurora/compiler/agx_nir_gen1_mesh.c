@@ -251,7 +251,7 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
             if (slot == VARYING_SLOT_POS)
                continue;
             if (slot == VARYING_SLOT_LAYER) {
-               /* Only hk's workgroup-uniform form (see vertex_layer). */
+               /* Only Borealis's workgroup-uniform form (see vertex_layer). */
                if (nir_intrinsic_component(i) != 0 ||
                    nir_intrinsic_write_mask(i) != 1)
                   M5_REFUSE();
@@ -302,7 +302,7 @@ agx_gen1_mesh_gather_varyings(const nir_shader *s,
       slots++;
    }
    /* Points always carry a point size. A points shader writing none gets 1.0
-    * next to each position (hk_mesh_default_point_size); one writing no
+    * next to each position (brl_mesh_default_point_size); one writing no
     * position either has no defined vertex to size. */
    if (s->info.mesh.primitive_type == MESA_PRIM_POINTS) {
       varyings->components[VARYING_SLOT_PSIZ] = 1;

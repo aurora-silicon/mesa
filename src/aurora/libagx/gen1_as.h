@@ -18,7 +18,7 @@
  * that base. Nothing else in the image is read by traversal. The image itself
  * therefore has no alignment beyond its slots: it lives at the Vulkan address,
  * and a structure that is not 16 KiB-aligned gets a driver-owned base whose
- * first slot forwards to its root (hk_gen1_as_window_*). The child references
+ * first slot forwards to its root (brl_gen1_as_window_*). The child references
  * of every node then carry the slot distance from that base to the image.
  */
 #define LIBAGX_GEN1_AS_BASE_ALIGNMENT 16384u

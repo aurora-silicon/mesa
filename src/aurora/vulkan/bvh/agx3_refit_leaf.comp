@@ -4,7 +4,7 @@
  * An update's leaf pass for triangles, in place of generating IR leaves: a
  * thread per primitive of one geometry reads its triangle as leaf
  * generation does and leaves it at its leaf's slot (see
- * hk_agx3_retained_state), so that refit encoding reads each leaf job's
+ * brl_agx3_retained_state), so that refit encoding reads each leaf job's
  * children together rather than gathering IR leaves. Reads follow the
  * application's index order; only the stores scatter.
  */
@@ -18,7 +18,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
-#include "hk_build_interface.h"
+#include "brl_build_interface.h"
 #include "agx3_node.h"
 
 /* Inactive triangles have NaN vertices, as for leaf generation. */
@@ -29,7 +29,7 @@ spirv_execution_mode(extensions = ["SPV_KHR_float_controls"],
                      SpvExecutionModeSignedZeroInfNanPreserve, 32);
 
 layout(local_size_x = 64) in;
-layout(push_constant) uniform CONSTS { hk_agx3_refit_leaf_args args; };
+layout(push_constant) uniform CONSTS { brl_agx3_refit_leaf_args args; };
 
 void
 main()
@@ -42,11 +42,11 @@ main()
    if (live.retained_bytes == 0ul)
       return;
    uint64_t source = live.native_base + live.retained_offset;
-   uint jobs = DEREF(REF(hk_agx3_retained_state)(source)).job_count;
+   uint jobs = DEREF(REF(brl_agx3_retained_state)(source)).job_count;
    if (jobs == 0u)
       return;
    uint64_t slots = source +
-                    uint64_t(HK_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
+                    uint64_t(BRL_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
    uint slot = DEREF(INDEX(uint32_t, slots, args.geometry.first_id + id));
    if (slot == ~0u)
       return;
@@ -72,7 +72,7 @@ main()
    for (uint i = 0; i < 3; i++)
       v[i] = inactive ? uvec3(0u) : floatBitsToUint(vertices.vertex[i].xyz);
 
-   uint64_t triangle = uint64_t(INDEX(hk_agx3_refit_triangle, args.triangles, slot));
+   uint64_t triangle = uint64_t(INDEX(brl_agx3_refit_triangle, args.triangles, slot));
    store128(triangle, uvec4(v[0], v[1].x));
    store128(triangle + 16ul, uvec4(v[1].yz, v[2].xy));
    store128(triangle + 32ul, uvec4(v[2].z, geom.geometry_id, id, 0u));

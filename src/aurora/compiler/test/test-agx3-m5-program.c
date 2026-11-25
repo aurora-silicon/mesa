@@ -357,7 +357,7 @@ select_launch_model(const uint32_t tmpl[11], bool run, uint32_t groups_x,
 }
 
 /* The GPU-written single-kick launch must be byte-identical to the record the
- * host encodes for the same kernel and grid (hk_dispatch_m5_native). */
+ * host encodes for the same kernel and grid (brl_dispatch_m5_native). */
 static int
 test_m5_single_kick_launch(enum agx_chip chip)
 {
@@ -371,7 +371,7 @@ test_m5_single_kick_launch(enum agx_chip chip)
       struct agx3_compute_program program;
       CHECK(agx3_m5_native_compute_program_bind(chip, &desc, &program));
 
-      /* The template hk captures: a 3D grid of the kernel's local size. */
+      /* The template Borealis captures: a 3D grid of the kernel's local size. */
       const struct agx3_compute_direct_grid tmpl_grid = {
          .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
          .size = {32, 2, 2}, .local_size = {32, 1, 1}, .dimensions = 3,
@@ -409,7 +409,7 @@ test_m5_single_kick_launch(enum agx_chip chip)
          CHECK(model[5] == groups_y);
          CHECK(model[6] == d);
 
-         /* hk_dispatch_m5_native's direct record for the same launch. */
+         /* brl_dispatch_m5_native's direct record for the same launch. */
          const struct agx3_compute_direct_grid grid = {
             .source = AGX3_CDM_DIRECT_GRID_GLOBAL_THREADS,
             .size = {groups_x * 32, groups_y, d}, .local_size = {32, 1, 1},

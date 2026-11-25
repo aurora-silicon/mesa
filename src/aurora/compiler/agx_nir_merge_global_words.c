@@ -134,7 +134,7 @@ block_in_any_loop(nir_block *block)
    return false;
 }
 
-/* Soft-fault robust buffer loads (hk_shader.c:lower_load_global_constant_offset_instr)
+/* Soft-fault robust buffer loads (brl_shader.c:lower_load_global_constant_offset_instr)
  * lower load_global[_constant]_bounded to a plain load_global at base + u2u64(off)
  * followed by a per-load bounds check (bounds_agx for 32-bit, bcsel(..., val, 0) for
  * 8/16-bit) with nir_uadd_sat(off, size) on non-constant offsets. Such loads may

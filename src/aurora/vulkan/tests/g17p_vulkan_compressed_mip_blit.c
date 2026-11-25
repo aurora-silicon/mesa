@@ -13,8 +13,8 @@
  * usage: g17p-vulkan-compressed-mip-blit [--shim] [--expect-compute]
  *   --shim            no-op DRM shim: nothing executes, skip readback
  *   --expect-compute  require that recording the blit chains logs a render
- *                     pass only for the levels hk stores through the PBE
- *                     (HK_G17P_MIP_PBE_MIN_TEXELS) and that the images are
+ *                     pass only for the levels Borealis stores through the PBE
+ *                     (BRL_G17P_MIP_PBE_MIN_TEXELS) and that the images are
  *                     compressed (needs ASAHI_MESA_DEBUG=perf)
  */
 #include <stdbool.h>
@@ -409,7 +409,7 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
                      VK_IMAGE_LAYOUT_GENERAL, 1, &to_plain, VK_FILTER_LINEAR);
       barrier(cmd);
    }
-   /* Levels of HK_G17P_MIP_PBE_MIN_TEXELS (1 << 17) texels and more take
+   /* Levels of BRL_G17P_MIP_PBE_MIN_TEXELS (1 << 17) texels and more take
     * a render pass, the rest compute */
    unsigned passes = 0;
    for (uint32_t l = 1; l < levels; ++l)

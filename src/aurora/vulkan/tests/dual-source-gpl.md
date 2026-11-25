@@ -12,7 +12,7 @@ Supported cases should pass. Four framebuffer attachments do not make the
 dual-source draw exceed `maxFragmentDualSrcAttachments`. Unsupported formats
 or features can cause ordinary CTS support skips.
 
-`hk-dual-source-gpl` compiles the CTS shaders and fixed-function state above,
+`brl-dual-source-gpl` compiles the CTS shaders and fixed-function state above,
 using each of the 41 formats and four representative secondary-source factors
 (two for formats without alpha). It checks the actual fragment link key
 against the Vulkan blend state and compares linked executable bytes, register
@@ -33,7 +33,7 @@ Configure a native Linux build with `-Dvulkan-drivers=asahi -Dbuild-tests=true
 normally, then run:
 
 ```
-meson test -C build --no-rebuild hk_dual_source_gpl --print-errorlogs
+meson test -C build --no-rebuild brl_dual_source_gpl --print-errorlogs
 ```
 
 The Meson runner explicitly selects the built no-op shim and the built Asahi

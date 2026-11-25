@@ -15,11 +15,11 @@
  * produced them. So this only has to cover every range the driver's collector
  * can emit, and a value below that refuses a legal program fail-closed.
  *
- * Honeykrisp's collector is fixed-shape and needs at most seven for a vertex
+ * Borealis's collector is fixed-shape and needs at most seven for a vertex
  * program: VBO bases, VBO clamps, draw parameters, draw ID, indexed
  * texture/sampler heaps, descriptor root, and promoted constants
- * (hk_cmd_buffer.c static-asserts that against
- * HK_AGX3_G17P_GRAPHICS_MAX_RANGES, which aliases this value).
+ * (brl_cmd_buffer.c static-asserts that against
+ * BRL_AGX3_G17P_GRAPHICS_MAX_RANGES, which aliases this value).
  *
  * The GL driver's collector is not fixed-shape: agx_nir_layout_uniforms()
  * pushes one range per contiguous run of system values of one element size,

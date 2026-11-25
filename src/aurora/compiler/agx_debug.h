@@ -44,7 +44,7 @@ const char *agx_last_compile_refusal(void);
 /* Fragment-structure code generation choices that remain selectable. */
 enum agx_fs_structure_flag {
    /* Compile the colour epilog into the fragment shader at link time, as
-    * Apple's compiler blends inline. Honeykrisp keeps the main shader's NIR
+    * Apple's compiler blends inline. Borealis keeps the main shader's NIR
     * and backend key; at fast-link it appends the draw's epilog, turns every
     * export / load_exported pair into SSA values and compiles one fragment
     * program. It falls back to the split main + epilog whenever the

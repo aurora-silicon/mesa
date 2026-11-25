@@ -15,13 +15,13 @@
 /* Colour formats whose G17P images Gallium may allocate losslessly
  * compressed.
  *
- * These are the pipe formats of Honeykrisp's G17P colour policy
- * (hk_g17p_compression_color_format()) plus the X variants GL renders to.
+ * These are the pipe formats of Borealis's G17P colour policy
+ * (brl_g17p_compression_color_format()) plus the X variants GL renders to.
  * An X variant has the same AIL channel class, type and tilebuffer format as
  * its A variant, so its PBE and texture descriptors differ only in swizzle,
  * and compression is a property of the channel class. The compressed packets
  * themselves are the shared Gen9 ones (agx_pbe_agx3_core.c), pinned against
- * native bytes by test-hk-native-descriptor.c.
+ * native bytes by test-brl-native-descriptor.c.
  *
  * Every format here has a tilebuffer footprint of at most 8 bytes per
  * sample, and none has a different store class (R11G11B10 and RGB9E5 are

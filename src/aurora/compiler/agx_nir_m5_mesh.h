@@ -51,7 +51,7 @@ struct agx_m5_mesh_varyings {
     * (0: none), see agx_nir_lower_gen1_mesh and m5_mesh_line_bias. */
    uint16_t line_bias_root_B;
    /* G17P: the layer is a per-vertex VARYING_SLOT_LAYER output that every
-    * vertex of a workgroup writes with the same value (hk's multiview
+    * vertex of a workgroup writes with the same value (Borealis's multiview
     * lowering writes the view index). It goes straight to each vertex's
     * layer word, so primitives keep their shared vertices and no primitive
     * record is written. lv is set; no per-primitive layer or viewport. */

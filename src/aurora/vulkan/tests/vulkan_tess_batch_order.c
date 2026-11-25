@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: MIT
  *
  * Ordering of the software tessellation stages that G17P batches across the
- * draws of a render (hk_tess_batch.h): each stage's launches run back to back
+ * draws of a render (brl_tess_batch.h): each stage's launches run back to back
  * with no barrier between them, and one cache flush follows the stage. That
  * flush must wait for every launch of the stage, not only the last one.
  *
@@ -18,7 +18,7 @@
  * values (the buffer is cleared before every pass) or a wrong level behind.
  *
  * The shaders' storage writes and reads across draws have no API barrier
- * between them: the expected values are what Honeykrisp's in-order stages
+ * between them: the expected values are what Borealis's in-order stages
  * give, batched or not, and are not a Vulkan guarantee.
  *
  * Usage: vulkan-tess-batch-order [passes] [--shim [--indirect]]

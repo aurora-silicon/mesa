@@ -1,0 +1,119 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* Classify imported host memory via /proc/self/maps to determine whether an M5
+ * GPU-writable import can alias another GPU virtual address
+ * (brl_cdm_alias_scope()). A range takes the worst class across its mappings.
+ *
+ * Limitation: /proc/self/maps cannot detect an imported range moved via mremap
+ * and re-imported (both ranges appear private-anonymous, so intra-submit
+ * barriers could read stale data; cross-submit vkEndCommandBuffer flushes still
+ * cover it). Detecting that requires kernel-side folio_maybe_dma_pinned().
+ */
+enum brl_host_map_class {
+   /* Private anonymous memory: no pathname, "[heap]", or an anonymous
+    * region named with PR_SET_VMA_ANON_NAME ("[anon:...]"). Unless moved
+    * by mremap after an import (see above), its pages are mapped at this
+    * one virtual address of this process: fork gives the child copies of
+    * pinned anonymous pages instead of sharing them, and pinning for
+    * writing breaks the copy-on-write sharing of the others first. */
+   BRL_HOST_MAP_PRIVATE_ANON,
+   /* A private mapping of a file outside /dev: until written, its pages are
+    * the file's page cache, which any shared mapping of the file maps too. */
+   BRL_HOST_MAP_PRIVATE,
+   /* Anything else: a shared mapping (System V or POSIX shm, memfd, a shared
+    * file, a mapped Vulkan or DRM buffer, a dma-buf), a mapping of a device
+    * or anonymous inode, [stack] and other special regions, a gap in the
+    * range, or a line that does not parse. */
+   BRL_HOST_MAP_OTHER,
+};
+
+/* Parses one line of /proc/<pid>/maps, without its newline. */
+bool brl_host_maps_parse_line(const char *line, size_t len, uintptr_t *start,
+                             uintptr_t *end, enum brl_host_map_class *cls);
+
+/* Folds the lines of a maps file, in its (ascending) order, over the range
+ * [start, end). Lines below the range are skipped, and the walk stops once
+ * the range is covered, a gap shows, or a line is BRL_HOST_MAP_OTHER. */
+struct brl_host_maps_cover {
+   uintptr_t next, end;
+   enum brl_host_map_class cls;
+   bool done;
+};
+
+void brl_host_maps_cover_init(struct brl_host_maps_cover *c, uintptr_t start,
+                             uintptr_t end);
+
+/* Feeds one line; returns true once the class of the range is decided. */
+bool brl_host_maps_cover_line(struct brl_host_maps_cover *c, const char *line,
+                             size_t len);
+
+/* The class of the range: BRL_HOST_MAP_OTHER unless the lines fed covered
+ * all of it. */
+enum brl_host_map_class
+brl_host_maps_cover_result(const struct brl_host_maps_cover *c);
+
+/* The class of [start, end) in maps text, or read from an open maps file
+ * (only up to the line that decides it). */
+enum brl_host_map_class brl_host_maps_classify_text(const char *text,
+                                                  size_t len, uintptr_t start,
+                                                  uintptr_t end);
+enum brl_host_map_class brl_host_maps_classify_fd(int fd, uintptr_t start,
+                                                uintptr_t end);
+
+/* A live host import of a device. It aliases (brl_host_import_aliases()) when
+ * its own mappings allow another address of its pages, or while it overlaps
+ * another live import of the same device of which at least one of the two
+ * is GPU-writable: the same pages then have two GPU addresses, one of which
+ * the GPU writes. Two read-only imports of the same pages never miss a
+ * write, since the GPU writes neither. */
+struct brl_host_import {
+   uintptr_t start, end;
+   const void *owner;
+   /* Bound read-write for the GPU. */
+   bool gpu_writes;
+   /* Its mappings allow another virtual address of its pages: for a
+    * GPU-writable import anything but BRL_HOST_MAP_PRIVATE_ANON, for a
+    * read-only one BRL_HOST_MAP_OTHER. */
+   bool maps_alias;
+   /* Live imports it overlaps, at least one of each pair GPU-writable. */
+   uint32_t overlaps;
+};
+
+static inline bool
+brl_host_import_aliases(const struct brl_host_import *import)
+{
+   return import->maps_alias || import->overlaps != 0;
+}
+
+/* Whether an import with these properties has mappings that allow another
+ * virtual address of its pages. */
+static inline bool
+brl_host_import_maps_alias(bool gpu_writes, enum brl_host_map_class cls)
+{
+   return gpu_writes ? cls != BRL_HOST_MAP_PRIVATE_ANON
+                     : cls == BRL_HOST_MAP_OTHER;
+}
+
+struct brl_host_imports {
+   struct brl_host_import *items;
+   unsigned count, capacity;
+};
+
+/* Adds an import (owner unique). Returns how many imports, it included,
+ * began to alias, or -1 when out of memory (nothing changed). */
+int brl_host_imports_add(struct brl_host_imports *set,
+                        const struct brl_host_import *import);
+
+/* Removes the import of owner. Returns how many imports, it included,
+ * stopped aliasing; 0 when owner has no import in the set. */
+unsigned brl_host_imports_remove(struct brl_host_imports *set,
+                                const void *owner);
+
+void brl_host_imports_fini(struct brl_host_imports *set);

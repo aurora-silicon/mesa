@@ -358,7 +358,7 @@ static bool near(uint32_t px, float r, float g, float b) {
 }
 
 int main(void) {
-  char dir[] = "/tmp/hk-border-emulation-cache-XXXXXX";
+  char dir[] = "/tmp/brl-border-emulation-cache-XXXXXX";
   if (!mkdtemp(dir)) {
     perror("mkdtemp");
     return 2;

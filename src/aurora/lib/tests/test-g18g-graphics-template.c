@@ -21,7 +21,7 @@
 #include "aurora/compiler/agx3_graphics_program.h"
 #include "aurora/compiler/agx3_reencode_cache.h"
 #include "aurora/lib/agx_ioto_state_core.h"
-#include "aurora/vulkan/hk_g17p_patch.h"
+#include "aurora/vulkan/brl_g17p_patch.h"
 #include "util/ralloc.h"
 
 #define CHECK(x)                                                               \
@@ -135,17 +135,17 @@ main(void)
 
          /* The template, from the first draw's addresses */
          struct agx3_g17p_graphics_program_template composed;
-         struct hk_g17p_patch_plan plan;
-         unsigned offsets[2 * HK_G17P_PATCH_MAX_RELOCS];
+         struct brl_g17p_patch_plan plan;
+         unsigned offsets[2 * BRL_G17P_PATCH_MAX_RELOCS];
          const char *why = NULL;
          unsigned at = 0;
          CHECK(agx3_g18g_graphics_program_template_generate(&desc, &composed));
-         CHECK(hk_g17p_patch_plan_init(&plan, ranges, range_count,
+         CHECK(brl_g17p_patch_plan_init(&plan, ranges, range_count,
                                        composed.relocations,
                                        composed.relocation_count,
                                        composed.program.length, true));
          const unsigned count =
-            hk_g17p_patch_plan_ldimms(&plan, NULL, offsets, NULL);
+            brl_g17p_patch_plan_ldimms(&plan, NULL, offsets, NULL);
          struct agx3_reencode_template *t = agx3_reencode_template_create(
             mem, &composed.program, &ioto, offsets, count, &why, &at);
          CHECK(t);
@@ -158,16 +158,16 @@ main(void)
             const unsigned class = k / 100;
             for (unsigned i = 0; i < range_count; ++i)
                ranges[i].address = address(class, k % 100, i, range_count);
-            if (!hk_g17p_patch_plan_fits(&plan, ranges)) {
+            if (!brl_g17p_patch_plan_fits(&plan, ranges)) {
                ++unfit;
                continue;
             }
 
             struct agx3_g17p_graphics_program full, patched;
-            uint32_t immediates[2 * HK_G17P_PATCH_MAX_RELOCS];
+            uint32_t immediates[2 * BRL_G17P_PATCH_MAX_RELOCS];
             CHECK(generate_full(&desc, &full));
             CHECK(agx3_reencode_program(&full, &ioto, &why, &at));
-            hk_g17p_patch_plan_ldimms(&plan, ranges, NULL, immediates);
+            brl_g17p_patch_plan_ldimms(&plan, ranges, NULL, immediates);
             if (!agx3_reencode_template_emit(t, immediates, &patched)) {
                /* Only for addresses whose LDIMMs take another size */
                ++refused[class];
@@ -204,25 +204,25 @@ main(void)
                                                .shader_gprs = 16};
       struct agx3_g17p_graphics_program_template composed;
       struct agx3_g17p_graphics_program patched, full;
-      struct hk_g17p_patch_plan plan;
-      unsigned offsets[2 * HK_G17P_PATCH_MAX_RELOCS];
-      uint32_t immediates[2 * HK_G17P_PATCH_MAX_RELOCS];
+      struct brl_g17p_patch_plan plan;
+      unsigned offsets[2 * BRL_G17P_PATCH_MAX_RELOCS];
+      uint32_t immediates[2 * BRL_G17P_PATCH_MAX_RELOCS];
       const char *why = NULL;
       unsigned at = 0;
       CHECK(agx3_g18g_graphics_program_template_generate(&desc, &composed));
-      CHECK(hk_g17p_patch_plan_init(&plan, ranges, 3, composed.relocations,
+      CHECK(brl_g17p_patch_plan_init(&plan, ranges, 3, composed.relocations,
                                     composed.relocation_count,
                                     composed.program.length, true));
       const unsigned count =
-         hk_g17p_patch_plan_ldimms(&plan, NULL, offsets, NULL);
+         brl_g17p_patch_plan_ldimms(&plan, NULL, offsets, NULL);
       struct agx3_reencode_template *t = agx3_reencode_template_create(
          mem, &composed.program, &ioto, offsets, count, &why, &at);
       CHECK(t);
       CHECK(agx3_reencode_template_fast_ldimms(t) == count);
       ldimms += count;
       ranges[1].address = UINT64_C(0x20000000400);
-      CHECK(hk_g17p_patch_plan_fits(&plan, ranges));
-      hk_g17p_patch_plan_ldimms(&plan, ranges, NULL, immediates);
+      CHECK(brl_g17p_patch_plan_fits(&plan, ranges));
+      brl_g17p_patch_plan_ldimms(&plan, ranges, NULL, immediates);
       CHECK(agx3_reencode_template_emit(t, immediates, &patched));
       CHECK(generate_full(&desc, &full));
       CHECK(agx3_reencode_program(&full, &ioto, &why, &at));

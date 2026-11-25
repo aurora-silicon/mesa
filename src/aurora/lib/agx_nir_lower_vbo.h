@@ -22,7 +22,7 @@ extern "C" {
  *
  * The number of attributes a device actually advertises is smaller when the
  * vertex prolog register ABI cannot hold them all; see
- * agx_max_vertex_attribs() in agx_compile.h, which hk uses for
+ * agx_max_vertex_attribs() in agx_compile.h, which Borealis uses for
  * maxVertexInputAttributes. DXVK's D3D9 fixed-function vertex shader reads 18
  * attributes (dxvk d3d9 BindInputLayout maps every fixed-function input
  * signature entry to an attribute, binding the unused ones to a null stream),

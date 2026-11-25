@@ -24,7 +24,7 @@
 #define AGX_GALLIUM_SAMPLER_AGX3_SIZE    32u
 #define AGX_GALLIUM_G17P_API_SAMPLERS    32u
 
-/* Custom borders are implemented like Honeykrisp: the ordinary API sampler
+/* Custom borders are implemented like Borealis: the ordinary API sampler
  * bank clamps to one and a second bank clamps to zero.  The shader combines
  * those samples with the exact API border colour. */
 #define AGX_GALLIUM_G17P_CUSTOM_BORDER_BASE \

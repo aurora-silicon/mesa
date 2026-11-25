@@ -325,7 +325,7 @@ API_PREFIX = r'''
 #define DRM_ASAHI_FEATURE_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_IOCTL_ASAHI_GET_PARAMS 1
-#define HK_QUERY_TIMEOUT 2000000000ull
+#define BRL_QUERY_TIMEOUT 2000000000ull
 #define VK_SYNC_FEATURE_CPU_WAIT 1
 #define vk_foreach_queue(q,d) for(struct vk_queue *q=(d)->queue;q;q=NULL)
 typedef int VkResult;typedef void *VkDevice,*VkFence,*VkSemaphore,*VkQueryPool,*VkQueue;
@@ -339,13 +339,13 @@ struct vk_device_dispatch_table {VkResult (*QueueWaitIdle)(VkQueue);};
 struct vk_device {bool lost;FILE *debug_output;VkResult (*check_status)(struct vk_device*);
  void *physical;struct vk_queue *queue;struct vk_device_dispatch_table dispatch_table;};
 struct u_printf_ctx {int lock;void *bo;uint32_t *map;};
-struct hk_device {struct vk_device vk;struct {int32_t *word;} vm_status_mirror;
+struct brl_device {struct vk_device vk;struct {int32_t *word;} vm_status_mirror;
  struct {uint vm_id;int fd;struct {uint features;} params;struct u_printf_ctx printf;} dev;};
 struct drm_asahi_vm_status {uint vm_id;int error;};
 struct drm_asahi_get_params {uint param_group;uintptr_t pointer;uint size;};
 struct vk_fence {int unused;};struct vk_semaphore {uint type;};
 struct vk_queue {struct {struct vk_device *device;} base;};
-struct hk_query_report {uint64_t value;};struct hk_query_pool {struct hk_query_report report;bool available;};
+struct brl_query_report {uint64_t value;};struct brl_query_pool {struct brl_query_report report;bool available;};
 typedef struct {uint32_t flags,semaphoreCount;const VkSemaphore *pSemaphores;
  const uint64_t *pValues;} VkSemaphoreWaitInfo;
 static bool vk_device_is_lost(struct vk_device *d) {return d->lost;}
@@ -382,17 +382,17 @@ static VkResult vk_sync_wait(struct vk_device*d,struct vk_sync*s,uint64_t v,enum
 }
 static void vk_sync_destroy(struct vk_device*d,struct vk_sync*s) {(void)d;(void)s;}
 static VkQueue vk_queue_to_handle(struct vk_queue*q) {return q;}
-static bool hk_query_is_available(struct hk_device*d,struct hk_query_pool*p,uint q) {(void)d;(void)q;complete();return p->available;}
-static const struct hk_query_report *hk_query_report_map(struct hk_device*d,struct hk_query_pool*p,uint q) {(void)d;(void)q;return &p->report;}
-static uint hk_reports_per_query(struct hk_query_pool*p) {(void)p;return 1;}
-static bool hk_query_write_cpu_result(void*dst,const uint64_t*src,uint n,bool avail,VkQueryResultFlags flags) {
+static bool brl_query_is_available(struct brl_device*d,struct brl_query_pool*p,uint q) {(void)d;(void)q;complete();return p->available;}
+static const struct brl_query_report *brl_query_report_map(struct brl_device*d,struct brl_query_pool*p,uint q) {(void)d;(void)q;return &p->report;}
+static uint brl_reports_per_query(struct brl_query_pool*p) {(void)p;return 1;}
+static bool brl_query_write_cpu_result(void*dst,const uint64_t*src,uint n,bool avail,VkQueryResultFlags flags) {
  (void)n;(void)flags;*(uint64_t*)dst=*src;return avail;
 }
 '''
 API_TESTS = r'''
 int main(void) {
  uint32_t words[4]={8,0,0xaabbccdd,0x11223344};
- struct hk_device d={0};d.vk.debug_output=stderr;d.vk.check_status=hk_check_status;
+ struct brl_device d={0};d.vk.debug_output=stderr;d.vk.check_status=brl_check_status;
  u_printf_init(&d.dev.printf,NULL,words);completion_abort=&words[1];
  struct vk_queue queue={.base={.device=&d.vk}};d.vk.queue=&queue;
  d.vk.dispatch_table.QueueWaitIdle=vk_common_QueueWaitIdle;
@@ -400,18 +400,18 @@ int main(void) {
  struct vk_semaphore semaphore={.type=VK_SEMAPHORE_TYPE_TIMELINE};VkSemaphore s=&semaphore;
  uint64_t counter=0,value=1,result_value=0;
  VkSemaphoreWaitInfo wait={.semaphoreCount=1,.pSemaphores=&s,.pValues=&value};
- struct hk_query_pool pool={.report={123},.available=true};
+ struct brl_query_pool pool={.report={123},.available=true};
  for(uint api=0;api<7;api++) for(uint failure=0;failure<2;failure++) {
   words[1]=0;d.vk.lost=false;fail_on_complete=failure;transport_result=VK_SUCCESS;
   VkResult got;
   switch(api) {
-  case 0: got=hk_GetFenceStatus(&d,&fence);break;
-  case 1: got=hk_GetSemaphoreCounterValue(&d,&semaphore,&counter);break;
+  case 0: got=brl_GetFenceStatus(&d,&fence);break;
+  case 1: got=brl_GetSemaphoreCounterValue(&d,&semaphore,&counter);break;
   case 2: got=vk_common_WaitForFences(&d,1,&f,1,UINT64_MAX);break;
   case 3: got=vk_common_WaitSemaphores(&d,&wait,UINT64_MAX);break;
   case 4: got=vk_common_QueueWaitIdle(&queue);break;
   case 5: got=vk_common_DeviceWaitIdle(&d);break;
-  default: got=hk_GetQueryPoolResults(&d,&pool,0,1,sizeof(result_value),&result_value,8,0);break;
+  default: got=brl_GetQueryPoolResults(&d,&pool,0,1,sizeof(result_value),&result_value,8,0);break;
   }
   printf("api=%u failure=%u result=%d sticky=%u\n",api,failure,got,d.vk.lost);fflush(stdout);
   assert(got==(failure?VK_ERROR_DEVICE_LOST:VK_SUCCESS));assert(d.vk.lost==failure);
@@ -420,15 +420,15 @@ int main(void) {
  }
  // A not-ready poll preserves VK_NOT_READY if healthy and surfaces abort if set.
  d.vk.lost=false;words[1]=0;transport_result=VK_NOT_READY;fail_on_complete=false;
- assert(hk_GetFenceStatus(&d,&fence)==VK_NOT_READY);
- fail_on_complete=true;assert(hk_GetFenceStatus(&d,&fence)==VK_ERROR_DEVICE_LOST);
+ assert(brl_GetFenceStatus(&d,&fence)==VK_NOT_READY);
+ fail_on_complete=true;assert(brl_GetFenceStatus(&d,&fence)==VK_ERROR_DEVICE_LOST);
  // Both available+WAIT and unavailable query routes must propagate failure.
  for(uint available=0;available<2;available++) {
   d.vk.lost=false;words[1]=0;fail_on_complete=true;pool.available=available;
-  assert(hk_GetQueryPoolResults(&d,&pool,0,1,sizeof(result_value),&result_value,8,VK_QUERY_RESULT_WAIT_BIT)==VK_ERROR_DEVICE_LOST);
+  assert(brl_GetQueryPoolResults(&d,&pool,0,1,sizeof(result_value),&result_value,8,VK_QUERY_RESULT_WAIT_BIT)==VK_ERROR_DEVICE_LOST);
  }
  d.vk.lost=false;words[1]=0;fail_on_complete=false;pool.available=false;
- assert(hk_GetQueryPoolResults(&d,&pool,0,1,sizeof(result_value),&result_value,8,0)==VK_NOT_READY);
+ assert(brl_GetQueryPoolResults(&d,&pool,0,1,sizeof(result_value),&result_value,8,0)==VK_NOT_READY);
  puts("PASS actual abort/status callbacks and 7 completion APIs, sticky repeat and not-ready polling");
  return 0;
 }
@@ -445,17 +445,17 @@ def api_code(old_query=False):
                   "VkResult\nvk_check_printf_status(") + "\n"
     code += block(source("src/vulkan/runtime/vk_device.h"),
                   "static inline VkResult\nvk_device_check_status(") + "\n"
-    device = source("src/aurora/vulkan/hk_device.c")
-    code += block(device, "static VkResult\nhk_check_status(") + "\n"
-    for name in ["hk_GetFenceStatus", "hk_GetSemaphoreCounterValue"]:
+    device = source("src/aurora/vulkan/brl_device.c")
+    code += block(device, "static VkResult\nbrl_check_status(") + "\n"
+    for name in ["brl_GetFenceStatus", "brl_GetSemaphoreCounterValue"]:
         code += block(device, "VKAPI_ATTR VkResult VKAPI_CALL\n" + name + "(") + "\n"
     for path, name in [("vk_fence.c", "WaitForFences"), ("vk_semaphore.c", "WaitSemaphores"),
                        ("vk_queue.c", "QueueWaitIdle"), ("vk_device.c", "DeviceWaitIdle")]:
         code += block(source("src/vulkan/runtime/" + path),
                       "VKAPI_ATTR VkResult VKAPI_CALL\nvk_common_" + name + "(") + "\n"
-    query = source("src/aurora/vulkan/hk_query_pool.c", BASE if old_query else None)
-    code += block(query, "static VkResult\nhk_query_wait_for_available(") + "\n"
-    code += block(query, "VKAPI_ATTR VkResult VKAPI_CALL\nhk_GetQueryPoolResults(") + "\n"
+    query = source("src/aurora/vulkan/brl_query_pool.c", BASE if old_query else None)
+    code += block(query, "static VkResult\nbrl_query_wait_for_available(") + "\n"
+    code += block(query, "VKAPI_ATTR VkResult VKAPI_CALL\nbrl_GetQueryPoolResults(") + "\n"
     return code + API_TESTS
 
 
@@ -464,7 +464,7 @@ def end_to_end_code(revision=None):
     api = api_code().replace("int main(", "int api_probe_main(")
     return repair + api + r'''
 int main(void) {
- struct hk_device d={0};d.vk.debug_output=stderr;d.vk.check_status=hk_check_status;
+ struct brl_device d={0};d.vk.debug_output=stderr;d.vk.check_status=brl_check_status;
  u_printf_init(&d.dev.printf,NULL,status_words);
  fail_on_complete=false;transport_result=VK_SUCCESS;completion_abort=&status_words[1];
  for(uint batch=0;batch<2;batch++) for(uint chip=0;chip<3;chip++) for(uint size=0;size<3;size++) {
@@ -472,7 +472,7 @@ int main(void) {
   struct poly_heap h={storage,16,32};VkDrawIndexedIndirectCommand cmd={64,1,1,0,0};
   reset_status();d.vk.lost=false;
   repair(&h,&cmd,in,2*(1u<<size),size,AGX_PRIMITIVE_POINTS,chip,batch);
-  VkResult result=hk_GetFenceStatus(&d,NULL);
+  VkResult result=brl_GetFenceStatus(&d,NULL);
   printf("composed batch=%u chip=%u width=%u output=%u abort=%u VkResult=%d\n",
    batch,chip,1u<<size,captured.b.count[0],status_words[1],result);fflush(stdout);
   assert(result==VK_ERROR_DEVICE_LOST && d.vk.lost && h.bottom==16);
@@ -501,17 +501,17 @@ def run(output, label, code, expected, args=()):
 
 
 def source_contracts():
-    draw = source("src/aurora/vulkan/hk_cmd_draw.c")
-    single = "".join(block(draw, "static void\nhk_emit_robust_index(").split())
-    batch = "".join(block(draw, "static void\nhk_flush_robust_index_batch(").split())
-    assert "target,hk_heap(cmd),dev->dev.printf_buffer_address,draw.b.ptr" in single
-    assert "batch->jobs.gpu,hk_heap(cmd),dev->dev.printf_buffer_address,draw->index_buffer" in batch
+    draw = source("src/aurora/vulkan/brl_cmd_draw.c")
+    single = "".join(block(draw, "static void\nbrl_emit_robust_index(").split())
+    batch = "".join(block(draw, "static void\nbrl_flush_robust_index_batch(").split())
+    assert "target,brl_heap(cmd),dev->dev.printf_buffer_address,draw.b.ptr" in single
+    assert "batch->jobs.gpu,brl_heap(cmd),dev->dev.printf_buffer_address,draw->index_buffer" in batch
     assert "AGX_BARRIER_ALL|AGX_PREGFX" in single
     assert "AGX_BARRIER_ALL|AGX_PREGFX" in batch
     # Heap reclamation cannot clear the sticky device abort word.
-    assert "printf" not in block(draw, "static uint64_t\nhk_heap(")
-    paths = ["src/aurora/libagx/draws.cl", "src/aurora/vulkan/hk_cmd_draw.c",
-             "src/aurora/vulkan/hk_device.c", "src/aurora/vulkan/hk_query_pool.c",
+    assert "printf" not in block(draw, "static uint64_t\nbrl_heap(")
+    paths = ["src/aurora/libagx/draws.cl", "src/aurora/vulkan/brl_cmd_draw.c",
+             "src/aurora/vulkan/brl_device.c", "src/aurora/vulkan/brl_query_pool.c",
              "src/aurora/lib/agx_device.c", "src/compiler/nir/nir_lower_printf.c",
              "src/util/u_printf.h", "src/vulkan/runtime/vk_debug_utils.c",
              "src/vulkan/runtime/vk_device.h", "src/vulkan/runtime/vk_device.c",

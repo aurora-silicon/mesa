@@ -340,7 +340,7 @@ agx_bo_bind(struct agx_device *dev, struct agx_bo *bo, uint64_t addr,
  *
  *   0x1000018000 -> 0x18000, ..., 0x1000068000 -> 0x68000
  *
- * Honeykrisp intentionally combines those resources into one fixed BO at
+ * Borealis intentionally combines those resources into one fixed BO at
  * 0x1000000000, preserving the exact high addresses as BO offsets.  Bind the
  * corresponding ranges a second time so hardware-side direct-context reads
  * see the same low aperture as Metal.  The resource sizes and gaps are
@@ -1269,7 +1269,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
    /* G17P: the USC exec window must sit at 2^40.
     *
     * HARDWARE FACT, not a preference.  With the window at the address this
-    * formula derives from vm_start (0x1100000000), every Honeykrisp kick --
+    * formula derives from vm_start (0x1100000000), every Borealis kick --
     * including one whose shader and preamble touch no memory at all -- ended
     * in a GMMU page fault (reason=3) with zero elapsed time, i.e. before the
     * first instruction.  With the window at 0x10000000000 the identical
@@ -1465,7 +1465,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
    /* Every vkAllocateMemory() binds a read-only shadow of the allocation at
     * +sparse_ro_offset, unconditionally, "in case this is used for a sparse
-    * resident buffer" (hk_device_memory.c).  So the ALIAS window
+    * resident buffer" (brl_device_memory.c).  So the ALIAS window
     * [user_start + user_size, user_start + 2 * user_size) is live for every
     * app allocation, not just sparse ones, and the kernel rejects a bind that
     * leaves the user range or touches the kernel range (file.rs gem_bind:
@@ -1604,7 +1604,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
 
       /* The contents of the scratch page are undefined, but making them nonzero
        * helps fuzz for bugs where we incorrectly read from the write section.
-       * Unbound sparse pages map hk's own zeroed fill page instead.
+       * Unbound sparse pages map Borealis's own zeroed fill page instead.
        */
       void *map = agx_bo_map(dev->scratch_bo);
       if (!map)

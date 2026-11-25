@@ -1,0 +1,71 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#ifndef BRL_AGX3_AS_FORMAT_H
+#define BRL_AGX3_AS_FORMAT_H
+
+#include "aurora/lib/agx_chip.h"
+
+/*
+ * Native acceleration-structure formats. The device's chip selects one, and
+ * that format's encoder writes the records that its own refit, traversal,
+ * serialization, relocation and copies read:
+ *
+ *  - GEN1: G17P and the other native AGX3 chips. bvh/agx3_gen1_*.comp encode
+ *    four node jobs per 32-lane workgroup through an indirect dispatch
+ *    written after the plan state, and may pair triangles sharing an edge in
+ *    one record; every child has a 64-byte record slot; images are aligned
+ *    to 16 KiB (brl_acceleration_structure.c, libagx/gen1_as.h,
+ *    compiler/agx3_rt_gen1_*).
+ *  - M5: G17G and G17S. bvh/agx3_*.comp encode one node per 8-lane
+ *    workgroup, batched through a dense job map, with 48-byte bounding-box
+ *    records; images are aligned to 1 KiB (brl_m5_acceleration_structure.c).
+ */
+enum brl_agx3_as_format {
+   BRL_AGX3_AS_FORMAT_GEN1,
+   BRL_AGX3_AS_FORMAT_M5,
+};
+
+static inline enum brl_agx3_as_format
+brl_agx3_as_format_for_chip(enum agx_chip chip)
+{
+   return agx_chip_g17_m5(chip) ? BRL_AGX3_AS_FORMAT_M5 : BRL_AGX3_AS_FORMAT_GEN1;
+}
+
+/* Bytes of a native child record slot, common to both formats. */
+#define BRL_AGX3_AS_SLOT_B 64u
+
+/* Image alignment. */
+#define BRL_AGX3_GEN1_IMAGE_ALIGN 16384u
+#define BRL_AGX3_M5_IMAGE_ALIGN   1024u
+
+/* Encoding scratch after brl_agx3_plan_state's offset: GEN1 keeps the node
+ * encoding dispatch arguments (BRL_AGX3_PLAN_ENCODE_DISPATCH) there, M5 only
+ * the plan state. */
+#define BRL_AGX3_GEN1_PLAN_TAIL_B 48u
+#define BRL_AGX3_M5_PLAN_TAIL_B   32u
+
+/* Bounding-box leaf record size. The M5 record size,
+ * BRL_AGX3_M5_AABB_RECORD_B, is defined with its layout in
+ * bvh/brl_build_interface.h, which the encoder programs share. */
+#define BRL_AGX3_GEN1_AABB_RECORD_B 64u
+
+/* Lanes of one node-encoding workgroup. */
+#define BRL_AGX3_GEN1_NODE_GROUP_LANES 32u
+#define BRL_AGX3_M5_NODE_GROUP_LANES   8u
+
+static inline unsigned
+brl_agx3_as_image_align(enum brl_agx3_as_format format)
+{
+   return format == BRL_AGX3_AS_FORMAT_M5 ? BRL_AGX3_M5_IMAGE_ALIGN
+                                         : BRL_AGX3_GEN1_IMAGE_ALIGN;
+}
+
+static inline unsigned
+brl_agx3_as_plan_tail(enum brl_agx3_as_format format)
+{
+   return format == BRL_AGX3_AS_FORMAT_M5 ? BRL_AGX3_M5_PLAN_TAIL_B
+                                         : BRL_AGX3_GEN1_PLAN_TAIL_B;
+}
+
+#endif

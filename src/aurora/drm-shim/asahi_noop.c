@@ -27,7 +27,7 @@
 static simple_mtx_t shim_mapping_lock = SIMPLE_MTX_INITIALIZER;
 
 /*
- * T8103 / M1, the AGX2 identity Honeykrisp is already conformant on.  This is
+ * T8103 / M1, the AGX2 identity Borealis is already conformant on.  This is
  * the control arm for G17P work: run the same client twice, changing only
  * ASAHI_SHIM_CHIP, and any difference is attributable to the AGX3 paths.
  *
@@ -185,7 +185,7 @@ static const struct drm_asahi_params_global params_g16s_as = {
  * (drivers/gpu/drm/asahi/g17_drm.rs:24-27,118-140 and file.rs:295-324): a
  * 42-bit user root two pages below the top, one die, one cluster, USC
  * generation 3, HAL 200, and soft faults on because fault_control defaults to
- * 0xb.  Select with ASAHI_SHIM_CHIP=g17p.  This exists so the Honeykrisp G17P
+ * 0xb.  Select with ASAHI_SHIM_CHIP=g17p.  This exists so the Borealis G17P
  * shader and command-stream paths can be exercised without hardware.
  */
 static const struct drm_asahi_params_global params_g17p = {
@@ -584,7 +584,7 @@ shim_g15_kernel(void)
 }
 
 /* The queue's USC window, as QUEUE_CREATE set it. One queue base per run is
- * enough here: Honeykrisp gives every queue of a device the same base. */
+ * enough here: Borealis gives every queue of a device the same base. */
 static uint64_t shim_usc_exec_base;
 
 /* Identity is unconditional: flags and chip selection never turn a registered
@@ -1828,7 +1828,7 @@ asahi_ioctl_vm_bind_unlocked(int fd, unsigned long request, void *arg)
 /* A submission's ordering is carried entirely by the barrier fields in each
  * command header and by which ioctl the in/out syncobjs ride on. Both are
  * write-only from userspace: the kernel is the only thing that has ever read
- * them, so a mistake in what Honeykrisp asks for and a kernel that does not
+ * them, so a mistake in what Borealis asks for and a kernel that does not
  * honour the request look identical from a readback that comes back stale.
  * Set ASAHI_SHIM_SUBMIT_LOG to a path and every submit ioctl is appended to
  * it, one line per command, exactly as the kernel would parse it. */

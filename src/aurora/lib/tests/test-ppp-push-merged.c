@@ -39,7 +39,7 @@ main(void)
    };
 
    /* FRAGMENT_CONTROL: the precomputed word sets the pass type, the push
-    * adds tag_write_disable (hk_cmd_draw.c, agx_state.c). */
+    * adds tag_write_disable (brl_cmd_draw.c, agx_state.c). */
    struct agx_fragment_control_packed control, control_all;
    agx_pack(&control, FRAGMENT_CONTROL, cfg) {
       cfg.pass_type = AGX_PASS_TYPE_PUNCH_THROUGH;

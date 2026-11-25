@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 /* aurora-packtest: correctness of multi-command-buffer submissions with
- * submit packing (hk_queue.c, hk_pack.c) on and off.
+ * submit packing (brl_queue.c, brl_pack.c) on and off.
  *
  * Each case is a list of command buffers holding compute dispatches over a
  * storage buffer of slots, barriers, transfers and work that keeps a command
@@ -840,9 +840,9 @@ trace_line(const char *line, size_t n)
       /* The pass-through is best effort. */
    }
    unsigned runs, members;
-   if (n > 13 && !memcmp(line, "HK_PACK runs=", 13)) {
+   if (n > 13 && !memcmp(line, "BRL_PACK runs=", 13)) {
       const bool counted =
-         sscanf(line, "HK_PACK runs=%u members=%u", &runs, &members) == 2;
+         sscanf(line, "BRL_PACK runs=%u members=%u", &runs, &members) == 2;
       const char *st = memmem(line, n, "strong_tails=", 13);
       pthread_mutex_lock(&tr.lock);
       if (counted)
@@ -959,7 +959,7 @@ listed(const char *name, const char *const *list, unsigned count)
  * ending with a dispatch pack wherever packing is on. Those ending with a
  * barrier end with a strong flush without memory scope, which packs only
  * where the driver admits such tails (the trace's strong_tails=, see
- * hk_pack_admits_strong_tail()). A driver older than that field (#558) never
+ * brl_pack_admits_strong_tail()). A driver older than that field (#558) never
  * relaxes them: on M5 without mesa#506 those cases then FAIL as must-pack.
  * Every command buffer of chain-all ends with
  * an ALL -> ALL barrier, whose tail is a render wait once the queue ran a

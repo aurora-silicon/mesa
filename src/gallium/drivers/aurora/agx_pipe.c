@@ -623,7 +623,7 @@ agx_gen10_private_compression_allowed(const struct agx_device *dev,
  * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION, and refuses the submission
  * with EOPNOTSUPP otherwise, so without that bit a multisample depth buffer
  * stays plain. Borealis checks the same bit
- * (hk_m5_depth_msaa_compression_eligible()).
+ * (brl_m5_depth_msaa_compression_eligible()).
  */
 static bool
 agx_gen10_private_depth_compression_allowed(const struct agx_device *dev,
@@ -1760,7 +1760,7 @@ agx_clear(struct pipe_context *pctx, unsigned buffers,
       agx_batch_init_state(batch);
       const struct agx_tilebuffer_layout *tib = &batch->tilebuffer_layout;
       /* A spilling multisample tilebuffer clears every target with the
-       * draw, as Honeykrisp does: a background clear of the resident targets
+       * draw, as Borealis does: a background clear of the resident targets
        * would leave the draw's epilog to preserve them by reading the tile
        * back, a multisample eMRT shape the packer refuses. On G17P such a
        * tilebuffer is always wider than the uncovered-tile limit, which
@@ -2107,8 +2107,8 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    /* G17P treats an absent ZLS allocation as an inactive depth surface.  Its
     * native render command keeps the clear register at 1.0 in that state;
     * zero is only a real clear value when depth or stencil storage exists.
-    * Honeykrisp submits M5 renders on the G17 runtime the same way
-    * (hk_drm_g17p_depth_clear). */
+    * Borealis submits M5 renders on the G17 runtime the same way
+    * (brl_drm_g17p_depth_clear). */
    if ((agx_chip_native_or_g18g(dev->chip) ||
         agx_m5_render_resources(dev)) && !zres &&
        !sres)
@@ -2623,7 +2623,7 @@ agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch)
    /* On G17P stencil is never compressed, so a batch that includes a stencil
     * clear falls back to VDM. On AGX2 (M1/M2), S8_UINT (including separate
     * stencil on Z32F_S8) can be compressed and packs as R8_UINT, matching
-    * hk_clear_image(). */
+    * brl_clear_image(). */
    if (batch->clear & PIPE_CLEAR_STENCIL) {
       const struct pipe_surface *surf = &batch->key.zsbuf;
       if (!surf->texture)

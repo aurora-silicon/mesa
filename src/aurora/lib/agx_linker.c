@@ -152,7 +152,7 @@ static const uint8_t sample_loop_footer[] = {
  * 1 KiB closure the witness proved on hardware.  So this rule reproduces the
  * witness byte for byte rather than merely resembling it.
  *
- * Honeykrisp's compute path guarantees no preamble, so the constant program
+ * Borealis's compute path guarantees no preamble, so the constant program
  * is the witness's minimal terminating one.
  */
 #define AGX3_CONTAINER_LEAD        0x340u
@@ -335,7 +335,7 @@ agx3_relocate_main_uvs(const struct agx_device *dev,
  * The packer emits the AGX3b pixel transaction protocol only for fragment
  * shapes it has proven. It returns any other shape without the protocol
  * instead of failing, so a program that blends inline is checked by its bytes,
- * as Borealis checks its own (hk_g17p_mono_part_refusal()). The program must
+ * as Borealis checks its own (brl_g17p_mono_part_refusal()). The program must
  * contain the colour entry gate (agx3_pixel_colour_entry()) and end with a
  * final release: a pixrel whose descriptor carries the 0x200 end-of-sequence
  * bit (agx3_pixel_release() with last set) directly ahead of the 4-byte END.

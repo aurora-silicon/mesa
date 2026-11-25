@@ -152,7 +152,7 @@ bool agx_nir_lower_texture(struct nir_shader *s);
 #define AGX_NIR_TEXTURE_GENERATION_G18G (1u << 8)
 /* A caller whose Gen10 storage descriptors keep the image-atomic addressing
  * word after the texture/PBE pair (AGX_G17P_IMAGE_ATOMIC_SW_OFFSET, as
- * Honeykrisp's 96-byte storage record does) without the buffer-metadata
+ * Borealis's 96-byte storage record does) without the buffer-metadata
  * record ORs this into the generation it passes to
  * agx_nir_lower_texture_for_generation(). Without it, Gen10 image atomics
  * read the word from the PBE's last eight bytes, where Gallium keeps it.
@@ -173,7 +173,7 @@ bool agx_nir_lower_texture_for_generation(struct nir_shader *s, unsigned generat
  * view-bounds robustness and require it. */
 /* sparse_buffer_residency: ordinary texel-buffer reads must consult the
  * software sparse residency map, because the descriptor names the primary
- * mapping rather than the read-only shadow (hk_buffer_view.c). */
+ * mapping rather than the read-only shadow (brl_buffer_view.c). */
 bool agx_nir_lower_texture_with_buffer_metadata(struct nir_shader *s,
                                                unsigned generation,
                                                bool robust_formatless_images,
@@ -212,8 +212,8 @@ bool agx_nir_needs_texture_crawl(struct nir_instr *instr);
 /* Pack that word: level offset [0:26] and layer stride [35:61] in 128-byte
  * units, log2 tile width [27:30] and height [31:34] in pixels, log2 sample
  * count [62:63]. libagx_image_texel_address_gen9() decodes it. Returns false
- * when the addressing does not fit. Honeykrisp packs the same word with
- * hk_pack_g17p_image_atomic_sw(), which stays in its dependency-free header. */
+ * when the addressing does not fit. Borealis packs the same word with
+ * brl_pack_g17p_image_atomic_sw(), which stays in its dependency-free header. */
 static inline bool
 agx_g17p_pack_image_atomic_sw(uint64_t level_offset_B, unsigned tile_width_px,
                               unsigned tile_height_px, uint64_t layer_stride_B,
@@ -268,7 +268,7 @@ struct agx_g17p_combined_sampler_binding {
  * PBE and a sampler-shaped state record (native run112 kick 19 launch 1
  * loads exactly these 16 bytes into u0..u3). */
 #define AGX_G18G_STORAGE_ROOT_HALFS 8u
-/* Initializer of that 32-byte state record, shared by Gallium and hk. It is
+/* Initializer of that 32-byte state record, shared by Gallium and Borealis. It is
  * also entry 0 of the sampler table on the G18G image-write routes. Moved
  * unchanged from Gallium's agx_g18g_native_write_state1 (agx_state.c), whose
  * comment records where the value comes from and how it decodes. */

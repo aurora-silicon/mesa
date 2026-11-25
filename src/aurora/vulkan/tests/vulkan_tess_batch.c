@@ -3,7 +3,7 @@
  *
  * Many small tessellated draws in one render pass, as terrain renderers
  * record them. Software tessellation runs five compute stages per draw before
- * the render (hk_launch_tess()); each draw has its own rectangle, colour and
+ * the render (brl_launch_tess()); each draw has its own rectangle, colour and
  * tessellation level in push constants, the draws alternate between a
  * triangle and a quad domain pipeline, and their rectangles overlap so that
  * the image depends on the draws being rasterised in API order.

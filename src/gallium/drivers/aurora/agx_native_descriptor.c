@@ -123,7 +123,7 @@ agx_gallium_pack_g17p_txf_sampler(
 
    if (agx_chip_hal300_path(chip)) {
       /* The same texel-fetch state in G17G's Gen5 record, as
-       * hk_pack_native_txf_sampler() and the G17G tile reload use it: the
+       * brl_pack_native_txf_sampler() and the G17G tile reload use it: the
        * compare-mode selector is set even without a comparison. */
       agx_pack(out->opaque, SAMPLER_GEN5, cfg) {
          cfg.minimum_lod = 0.0f;
@@ -138,7 +138,7 @@ agx_gallium_pack_g17p_txf_sampler(
       return true;
    }
 
-   /* Honeykrisp's passing G17P texture.read() path reserves sampler zero with
+   /* Borealis's passing G17P texture.read() path reserves sampler zero with
     * these exact HAL200 semantics. In particular, texel fetch does not use
     * the legacy background path's pixel-coordinate/linear/edge-clamp state.
     * Keep the remaining 24 bytes in the 32-byte heap slot zero. */
@@ -440,7 +440,7 @@ agx_gallium_pack_native_pbe_impl(
    if (!agx3_generation)
       return false;
 
-   /* The same gate hk_pack_native_pbe() applies field for field -- the one
+   /* The same gate brl_pack_native_pbe() applies field for field -- the one
     * that already runs on this hardware through Borealis -- so a shape is
     * admitted here exactly when Borealis admits it: 2D, and on Gen9 2D
     * arrays and 3D with mips, one- and multi-layer multisample, and the
@@ -511,7 +511,7 @@ agx_gallium_pack_native_pbe_impl(
         * On G18G it is also the J873 bgra8/gears/colour end-of-tile PBE
         * (ffc60a02 00007f80 00005800 0003f010 for BGRA8 256x256, pitch 1024),
         * which the codec reproduces; on G18G the PBE holds pitch/16-1 at
-        * word1[59:44]. hk already admits it (8295c0d67c5). */
+        * word1[59:44]. Borealis already admits it (8295c0d67c5). */
        (strided &&
         (legacy->level != 0 || legacy->levels != 1 ||
          legacy->unk_mipmapped)) ||
@@ -646,7 +646,7 @@ agx_gallium_set_null_native_pbe(
    };
 
    /* AGX3's recovered PBE geometry is 2D only, and the null descriptor
-    * Honeykrisp already runs on this hardware is 2D. The AGX2 null
+    * Borealis already runs on this hardware is 2D. The AGX2 null
     * descriptor keeps the dimension it has always had.
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation))

@@ -82,7 +82,7 @@ libagx_draw_indirect_byte_count(global VkDrawIndirectCommand *out,
 
 /*
  * VK_EXT_conditional_rendering predicates both graphics and compute commands
- * with one 32-bit value.  Honeykrisp lowers each affected command to an
+ * with one 32-bit value.  Borealis lowers each affected command to an
  * indirect argument record and runs this kernel immediately before the
  * consumer.  This is deliberately separate from predicate_indirect: Vulkan
  * requires a 32-bit load (D3D12 uses 64-bit predication), permits inversion,
@@ -460,14 +460,14 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
  * then records one indirect dispatch per kernel.
  *
  * `record` is the VkTraceRaysIndirectCommand2KHR every trace form publishes
- * (hk_cmd_trace_rays.c); its first quadword is raygenShaderRecordAddress and
+ * (brl_cmd_trace_rays.c); its first quadword is raygenShaderRecordAddress and
  * the group handle's index is the first dword of that record
- * (hk_ray_tracing_core.h: hk_ray_tracing_group_handle).  `in_dims` is where the
+ * (brl_ray_tracing_core.h: brl_ray_tracing_group_handle).  `in_dims` is where the
  * three launch dimensions live right now; `out_record_dims` is where they must
  * be copied to for the kernels to read, or zero when the record already holds
  * them.  `handles` lists each kernel's raygen handle index.
  */
-/* Same non-wrapping round-up as hk_rt_launch_group_count: 8x4 tiles for 2D/3D
+/* Same non-wrapping round-up as brl_rt_launch_group_count: 8x4 tiles for 2D/3D
  * launches (height > 1) with 32-lane workgroups, 32x1 strips for 1D launches. */
 static inline uint2
 libagx_trace_rays_group_count(uint32_t width, uint32_t height,
@@ -622,8 +622,8 @@ libagx_trace_rays_indirect_setup(global uint32_t *out_record_dims,
     * Count is 2^30, so a conforming application cannot reach it -- but the
     * width comes out of a device buffer nothing validates, and a wrap here is
     * a whole trace that quietly does not happen.  The host side computes the
-    * same thing the same way (hk_rt_launch_group_count), and
-    * test-hk-ray-tracing-core pins the two together at the top of the range;
+    * same thing the same way (brl_rt_launch_group_count), and
+    * test-brl-ray-tracing-core pins the two together at the top of the range;
     * the first version of this kernel used the wrapping form and that test is
     * what caught it. */
    const uint2 groups_xy =

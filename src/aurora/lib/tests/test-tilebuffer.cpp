@@ -979,7 +979,7 @@ TEST(Tilebuffer, G17PCompressedColourNeverSpills)
       }
    }
 
-   /* Honeykrisp's 46 Vulkan formats are 41 pipe formats (the five
+   /* Borealis's 46 Vulkan formats are 41 pipe formats (the five
     * A8B8G8R8 PACK32 formats are R8G8B8A8); Gallium adds 12 X variants. */
    EXPECT_EQ(admitted, 53u);
 

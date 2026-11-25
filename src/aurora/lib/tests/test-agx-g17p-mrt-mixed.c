@@ -782,7 +782,7 @@ compile_epilog_samples_shared(unsigned count, const enum pipe_format *formats,
                                 .secondary = true};
    u_foreach_bit64(offset, partitions)
       BITSET_SET(key.g17p_tile_partitions, offset);
-   /* Match Honeykrisp's keyed physical partitions even when every target
+   /* Match Borealis's keyed physical partitions even when every target
     * is written. Unkeyed GL shaders now carry logical attachment IDs, which
     * differ from physical order for the reordered mixed-format witnesses. */
    if (!partitions && count > 1) {

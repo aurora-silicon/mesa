@@ -77,7 +77,7 @@ sample_id(int4 c, uint samples)
  * AGX2-only in-place decompression kernel. For multisampled attachments it
  * calls libagx_image_texel_address() directly, which unpacks the AGX2 PBE
  * descriptor and its software sideband layout. Callers must guard dispatch
- * with hk_descriptor_generation_is_agx2().
+ * with brl_descriptor_generation_is_agx2().
  */
 KERNEL(32)
 libagx_decompress(constant struct libagx_decompress_images *images,

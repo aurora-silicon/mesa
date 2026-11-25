@@ -1226,7 +1226,7 @@ TEST(NativeForms, ImageStoreUsesDataTypeAcrossChipsAndFormats)
 }
 
 /* A G17P state-0 storage image that the shader also reads names its
- * texture/PBE descriptor pair through state 0 (hk's read/write ABI): record 0
+ * texture/PBE descriptor pair through state 0 (Borealis's read/write ABI): record 0
  * is the texture, which read as a PBE describes a far larger surface, so the
  * store must take record 1. A write-only image's state 0 is the PBE itself and
  * keeps record 0. Only the immediate descriptor index may differ. */
@@ -5166,7 +5166,7 @@ TEST(NativeForms, Gen1MeshClipCullPointSizeFollowHardwareUVSOrder)
 
 TEST(NativeForms, Gen1MeshLayerExportsFromThreadgroupMemory)
 {
-   /* A per-primitive layer (hk's multiview lowering writes one) reaches the
+   /* A per-primitive layer (Borealis's multiview lowering writes one) reaches the
     * exported layer/viewport vertex word from threadgroup memory: the export
     * must not read it back from the primitive's record in device memory. The
     * record keeps its copy for a fragment shader reading gl_Layer.
@@ -7864,7 +7864,7 @@ TEST(NativeForms, Agx3bPreservesNativeI32ToF16AndMixedFadd)
  * texelFetch(sampler2DRect, ...) with no LOD operand. Before Poly lowers
  * TCS/TES/GS to CDM kernels (or HW VS), agx_nir_lower_g17g_indexed_reads()
  * sees their API stages; declining them left unlowered bindless handles and
- * agx3_indexed_sampler_valid = false, causing hk_dispatch_m5_native() to
+ * agx3_indexed_sampler_valid = false, causing brl_dispatch_m5_native() to
  * refuse the launch with VK_ERROR_FEATURE_NOT_PRESENT. */
 TEST(NativeForms, M5PreRasterMultisampleAndImplicitLod0FetchLowerAndCompile)
 {
@@ -7908,12 +7908,12 @@ TEST(NativeForms, M5PreRasterMultisampleAndImplicitLod0FetchLowerAndCompile)
 
          /* Compile the CDM-dispatched stages (TCS, GS, and TES lowered to
           * compute) on G17S to confirm the lowered fetch packs with known
-          * staging and satisfies hk_g17p_compute_shader_supported(). */
+          * staging and satisfies brl_g17p_compute_shader_supported(). */
          if (stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_GEOMETRY ||
              stage == MESA_SHADER_TESS_EVAL) {
             if (stage == MESA_SHADER_TESS_EVAL)
                b.shader->info.stage = MESA_SHADER_COMPUTE;
-            /* Lower load_descriptor_set_agx(0) to load_preamble(12) as hk does
+            /* Lower load_descriptor_set_agx(0) to load_preamble(12) as Borealis does
              * with root = AGX_G17P_TXF_ROOT_HALFS (8). */
             nir_foreach_block(block, b.impl) {
                nir_foreach_instr_safe(instr, block) {
@@ -8015,7 +8015,7 @@ TEST(NativeForms, M5PreRasterMultisampleAndImplicitLod0FetchLowerAndCompile)
    }
 }
 
-/* Replace load_descriptor_set_agx(0) with load_preamble(12), as hk does with
+/* Replace load_descriptor_set_agx(0) with load_preamble(12), as Borealis does with
  * root = AGX_G17P_TXF_ROOT_HALFS (8). */
 static void
 m5_lower_descriptor_set_to_preamble(nir_shader *s)

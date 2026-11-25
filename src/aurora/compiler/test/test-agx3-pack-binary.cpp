@@ -13540,7 +13540,7 @@ TEST_F(AGX3PackBinary, ReciprocalWidthsRefuseUngroundedModes)
 /* The gap the old gate left: a reciprocal whose destination is a register the
  * form can address but the packer refused.  Three of the ten distinct programs
  * three.js compiles for webgl_geometry_cube, webgl_animation_keyframes and
- * webgl_materials_physical_clearcoat died on this shape, and hk_shader.c turns
+ * webgl_materials_physical_clearcoat died on this shape, and brl_shader.c turns
  * a packer refusal into VK_ERROR_FEATURE_NOT_PRESENT for the whole pipeline. */
 TEST_F(AGX3PackBinary, ReciprocalEncodesAboveTheOldRegisterGate)
 {
@@ -17800,7 +17800,7 @@ TEST_F(AGX3PackBinary, G18GVertexOutputRetryKeepsTheRegisterBound)
    }
 }
 
-/* G18G: the saturated register+minifloat add that hk's image-to-buffer copy
+/* G18G: the saturated register+minifloat add that Borealis's image-to-buffer copy
  * uses to repack a UNORM texel, sat(x + -0.0), has wait fields for slots 1..6
  * only. With seven or eight loads in flight its source comes back on slot 7
  * or 8; that wait is retired through the band carrier on the destination and

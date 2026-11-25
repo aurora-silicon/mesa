@@ -94,8 +94,8 @@ agx3_texture_descriptor_surface(const uint8_t bytes[32])
 
 /*
  * A descriptor that is entirely zero is the reserved null texture, not a bug:
- * hk_device.c pins heap entry zero to it and every null descriptor path in
- * hk_descriptor_set.c writes it deliberately.  Its surface address is zero,
+ * brl_device.c pins heap entry zero to it and every null descriptor path in
+ * brl_descriptor_set.c writes it deliberately.  Its surface address is zero,
  * which is never dereferenced.
  */
 static bool
@@ -121,7 +121,7 @@ fail_at(uint64_t address, const char *reason)
  * A record the decoder understands but this oracle does not model.
  *
  * This validator's accept-set was grown from streams the Gallium driver was
- * observed to emit.  Honeykrisp legitimately emits records outside that set --
+ * observed to emit.  Borealis legitimately emits records outside that set --
  * tessellation and geometry lower through TESSELLATE_DIRECT, and the compute
  * side uses the substream/secondary barriers and link padding.  Refusing them
  * would report a gap in the ORACLE as a bug in the DRIVER, which is the one
@@ -293,7 +293,7 @@ validate_ioto_program(const struct asahi_g17p_stream_memory *memory,
                                            &record, &consumed) ||
           !consumed || consumed > readable) {
          /* Once the state tail is complete, the program may continue into
-          * its constant program instead of terminating: hk's
+          * its constant program instead of terminating: Borealis's
           * graphics_constant_suffix_replace swaps exactly this program's
           * terminator for the shader's preamble, inline when it fits
           * (AGX_IOTO_PRESHADER_INLINE_LIMIT). That is ordinary compiled
@@ -511,7 +511,7 @@ validate_ioto_program(const struct asahi_g17p_stream_memory *memory,
          case AGX_IOTO_KIND_B_EP0: {
             /* An unconditional branch ends this linear run: the bytes after
              * it are padding or another program, so a straight walk past it
-             * reads garbage. hk emits two:
+             * reads garbage. Borealis emits two:
              *
              *  - relative: the external-setup graphics launcher
              *    (agx_ioto_g17p_external_setup_launcher_compose_trusted) jumps to
@@ -520,7 +520,7 @@ validate_ioto_program(const struct asahi_g17p_stream_memory *memory,
              *    the state-tail and immediate tracking across.
              *
              *  - absolute: the constant program (agx_ioto_constant_program_
-             *    emit, hk_agx3_g17p_constant_program_from_binary) replaces
+             *    emit, brl_agx3_g17p_constant_program_from_binary) replaces
              *    the program's terminator with a jump to the shader's
              *    preamble. That is ordinary compiled code ending in its own
              *    stop, not Ioto; the program is complete at the jump.
@@ -609,8 +609,8 @@ asahi_g17p_compute_validate(
 {
    struct asahi_g17p_compute_stats local = {0};
    bool need_barrier = false;
-   /* need_barrier was set by a direct launch. Honeykrisp's batched
-    * tessellation stages (hk_tess_batch.h) put the direct launches of one
+   /* need_barrier was set by a direct launch. Borealis's batched
+    * tessellation stages (brl_tess_batch.h) put the direct launches of one
     * stage back to back; anything else after a launch still needs a barrier
     * first. */
    bool direct_tail = false;
@@ -748,7 +748,7 @@ asahi_g17p_compute_validate(
 
       case AGX3_CDM_RECORD_STREAM_TERMINATE:
          /* A stream whose only record is the opening strong flush is a real
-          * shape, not an empty stream: hk_CmdPipelineBarrier2() emits exactly
+          * shape, not an empty stream: brl_CmdPipelineBarrier2() emits exactly
           * that for an API-declared HOST_READ dependency when the command
           * buffer records no other compute work, and it is what makes a
           * preceding fragment store visible to the CPU (Mesa 6aae441547b,
@@ -1179,7 +1179,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
    uint8_t latched_cull_slot[AGX_PPP_HAL200_CULL_LENGTH] = {0};
    bool tessellation_state_seen = false;
    bool restart_seen = false;
-   /* Honeykrisp re-emits the restart State Update only when the restart
+   /* Borealis re-emits the restart State Update only when the restart
     * index changes, and forgets it where the driver does: after an indirect
     * packet (indexed ones write their own) and at a stream link, which also
     * covers an empty robust-index draw's jump. A non-empty robust-index draw
@@ -1211,7 +1211,7 @@ asahi_g17p_stream_validate(const struct asahi_g17p_stream_memory *memory,
          /* Zero is not a selector. Every CPU-side packer refuses it outright
           * (agx_vdm_hal200_{direct,indexed,indirect}_draw_pack all reject
           * draw_state_context_offset == 0), but a GPU-side record builder can
-          * still be handed 0 -- hk_cmd_draw.c's robust-index path initialises
+          * still be handed 0 -- brl_cmd_draw.c's robust-index path initialises
           * draw_state_offset to 0 and only fills it when the native bind tail
           * was emitted. Say that plainly: compact_address(0) resolves to the
           * render context base, which is mapped, so the walk would otherwise

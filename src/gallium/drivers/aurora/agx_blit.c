@@ -14,7 +14,7 @@
 #include "aurora/lib/agx3_compute_program_core.h"
 #include "aurora/lib/agx_bg_eot_key.h"
 #include "aurora/lib/agx_tile_mip.h"
-#include "aurora/vulkan/hk_g17p_meta_copy_core.h"
+#include "aurora/vulkan/brl_g17p_meta_copy_core.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "gallium/auxiliary/util/u_blitter.h"
@@ -234,7 +234,7 @@ asahi_compute_blit_supported(enum agx_chip chip,
    /* Gallium's compute blitter reaches agx_launch_grid() and therefore
     * agx_cdm_launch(), whose packet is the AGX2 compute command format, and
     * agx_upload_textures()'s legacy storage PBE descriptor. AGX3-encoding
-    * parts need the native Ioto program/launch path Honeykrisp already uses;
+    * parts need the native Ioto program/launch path Borealis already uses;
     * on HAL200 the internal block-image kernel aborts in
     * agx_native_descriptor_rejected("storage PBE") before it is ever
     * submitted. Take the fully supported render blitter until native Gallium
@@ -546,7 +546,7 @@ agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
  */
 /* AGX3 end-of-tile IMGWBLK averages samples in hardware for every native
  * normalized and 16-bit floating-point colour selector (0x75, 0x95, 0x15),
- * matching Borealis's hk_agx3_format_needs_shader_resolve(). Keep integer
+ * matching Borealis's brl_agx3_format_needs_shader_resolve(). Keep integer
  * formats (sample-zero semantics), sRGB (linear averaging), 32-bit floats and
  * packed R11G11B10F/R9G9B9E5F words (raw-bit IMGWBLK) on the shader resolve
  * path. */
@@ -1277,12 +1277,12 @@ agx_agx3_mipmap_ensure_cdm_space(struct agx_context *ctx,
 
 /*
  * Compressed UNORM8x4 mip chains on HAL200 (G16G, G17P), the scheme Borealis
- * uses (hk_g17p_compressed_blit(), build_g17p_mip_shader()).
+ * uses (brl_g17p_compressed_blit(), build_g17p_mip_shader()).
  *
  * util_gen_mipmap() would store every level of a compressed chain in its own
  * render pass. On classic-submission G16G a mip render pass in a chain costs
  * 0.13-0.24 ms, against compute at 0.13-0.24 ns per texel
- * (HK_CLASSIC_MIP_PBE_MIN_TEXELS), so a 2560x1440 chain would take about ten
+ * (BRL_CLASSIC_MIP_PBE_MIN_TEXELS), so a 2560x1440 chain would take about ten
  * times as long as it does uncompressed. Instead, one compute dispatch per
  * level reads the source level through the texture unit, which decodes
  * compressed tiles, writes the level's texels raw at their GPU-tiled
@@ -1576,7 +1576,7 @@ agx_g17p_mip_compute_shader(struct pipe_context *pctx, unsigned key)
 /* Private 2D UNORM8x4 mip chains that the compute path below generates. Like
  * Borealis on images that are not attachments, keep chains whose top level
  * is below the size where a compressed level pays for its render-pass upload
- * plain (hk_mip_level_through_pbe()); GL cannot tell which textures will be
+ * plain (brl_mip_level_through_pbe()); GL cannot tell which textures will be
  * rendered to. */
 bool
 agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
@@ -1589,7 +1589,7 @@ agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
           agx_agx3_mipmap_format_supported(templ->format) &&
           templ->width0 <= UINT16_MAX + 1u &&
           templ->height0 <= UINT16_MAX + 1u &&
-          hk_mip_level_through_pbe(dev->chip, templ->width0, templ->height0);
+          brl_mip_level_through_pbe(dev->chip, templ->width0, templ->height0);
 }
 
 struct agx_g17p_mip_level_plan {
@@ -2077,7 +2077,7 @@ agx_generate_mipmap_agx3_levels(struct agx_context *ctx,
 /* Native AGX3 compute mipchain generation for uncompressed GPU-tiled UNORM8x4
  * 2D / 2D_ARRAY / CUBE textures. Runs all levels in one CDM compute batch via
  * libagx_mipmap_unorm8x4 / libagx_mipmap_unorm8x4_2level /
- * libagx_mipmap_unorm8x4_odd (matching Borealis's hk_g17p_compute_blit()),
+ * libagx_mipmap_unorm8x4_odd (matching Borealis's brl_g17p_compute_blit()),
  * avoiding one 3D render pass per mip level. Unsupported formats or layouts
  * return false and fall back to util_gen_mipmap(). */
 static bool

@@ -1,7 +1,7 @@
 /* Copyright 2026 Aurora Silicon
  * SPDX-License-Identifier: MIT
  *
- * Retained-job BVH refit passes (see hk_agx3_retained_job):
+ * Retained-job BVH refit passes (see brl_agx3_retained_job):
  * - SAVE/NUMBER/COUNT_LEVELS/LIST_LEVELS: persist full-build jobs after the AS
  *   image, numbered leaf-first (preserving child order and encoded bytes) with
  *   top inner levels indexed by depth.
@@ -22,24 +22,24 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
-#include "hk_build_interface.h"
+#include "brl_build_interface.h"
 #include "agx3_node.h"
-#ifdef HK_AGX3_REFIT_TOP
-layout(local_size_x = HK_AGX3_REFIT_TOP_GROUP_SIZE) in;
-layout(push_constant) uniform CONSTS { hk_agx3_refit_top_args args; };
+#ifdef BRL_AGX3_REFIT_TOP
+layout(local_size_x = BRL_AGX3_REFIT_TOP_GROUP_SIZE) in;
+layout(push_constant) uniform CONSTS { brl_agx3_refit_top_args args; };
 #else
-layout(local_size_x = HK_AGX3_REFIT_GROUP_SIZE) in;
-layout(push_constant) uniform CONSTS { hk_agx3_refit_args args; };
+layout(local_size_x = BRL_AGX3_REFIT_GROUP_SIZE) in;
+layout(push_constant) uniform CONSTS { brl_agx3_refit_args args; };
 #endif
 
 /* The retained level table: counts, then fill cursors. */
 uint64_t
 level_table(uint64_t retained, uint jobs)
 {
-   return retained + uint64_t(HK_AGX3_RETAINED_LEVELS(jobs, args.leaf_bound));
+   return retained + uint64_t(BRL_AGX3_RETAINED_LEVELS(jobs, args.leaf_bound));
 }
 
-#ifndef HK_AGX3_REFIT_TOP
+#ifndef BRL_AGX3_REFIT_TOP
 uint
 leaf_size()
 {
@@ -54,7 +54,7 @@ uint
 level_start(uint64_t table, uint level)
 {
    uint start = 0;
-   for (uint l = 0; l < level && l < HK_AGX3_REFIT_LEVELS; ++l)
+   for (uint l = 0; l < level && l < BRL_AGX3_REFIT_LEVELS; ++l)
       start += DEREF(INDEX(uint32_t, table, l));
    return start;
 }
@@ -71,17 +71,17 @@ node_index(uint offset)
 void
 save(uint id)
 {
-   hk_agx3_plan_state plan = DEREF(REF(hk_agx3_plan_state)(args.plan_state));
+   brl_agx3_plan_state plan = DEREF(REF(brl_agx3_plan_state)(args.plan_state));
    uint jobs = plan.job_count;
-   REF(hk_agx3_retained_state) state = REF(hk_agx3_retained_state)(args.retained);
-   uint64_t records = args.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
-   uint64_t offsets = records + uint64_t(jobs) * uint64_t(HK_AGX3_RETAINED_JOB_BYTES);
+   REF(brl_agx3_retained_state) state = REF(brl_agx3_retained_state)(args.retained);
+   uint64_t records = args.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
+   uint64_t offsets = records + uint64_t(jobs) * uint64_t(BRL_AGX3_RETAINED_JOB_BYTES);
    if (id == 0) {
       uint root = args.leaf_bound + DEREF(args.header).ir_internal_node_count - 1u;
-      hk_agx3_retained_state saved;
+      brl_agx3_retained_state saved;
       saved.job_count = jobs;
       saved.root_job = jobs != 0u && root < args.node_bound
-         ? DEREF(INDEX(hk_agx3_plan_node, args.plan_nodes, root)).job : 0xffffffffu;
+         ? DEREF(INDEX(brl_agx3_plan_node, args.plan_nodes, root)).job : 0xffffffffu;
       saved.end_slot = plan.next_slot;
       saved.depth = plan.depth;
       saved.deepest_level = 0;
@@ -90,21 +90,21 @@ save(uint id)
       saved.inner_jobs = 0;
       DEREF(state) = saved;
       uint64_t table = level_table(args.retained, jobs);
-      for (uint i = 0; i < HK_AGX3_REFIT_LEVELS * 2u; ++i)
+      for (uint i = 0; i < BRL_AGX3_REFIT_LEVELS * 2u; ++i)
          DEREF(INDEX(uint32_t, table, i)) = 0u;
    }
    if (id < args.leaf_bound)
-      DEREF(INDEX(uint32_t, args.retained + uint64_t(HK_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound)),
+      DEREF(INDEX(uint32_t, args.retained + uint64_t(BRL_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound)),
                   id)) = ~0u;
    if (id >= jobs)
       return;
-   hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.plan_jobs, id));
+   brl_agx3_leaf_job job = DEREF(INDEX(brl_agx3_leaf_job, args.plan_jobs, id));
    uint count = min(job.child_count, 8u);
    /* Hand out the job's child offsets or positions only, and keep the
     * first in its status: number() writes its record under its new id. */
-   REF(hk_agx3_plan_state) cursors = REF(hk_agx3_plan_state)(args.plan_state);
+   REF(brl_agx3_plan_state) cursors = REF(brl_agx3_plan_state)(args.plan_state);
    uint first;
-   if (job.node_kind == HK_AGX3_NODE_INNER) {
+   if (job.node_kind == BRL_AGX3_NODE_INNER) {
       first = atomicAdd(DEREF(cursors).saved_positions, count);
    } else {
       first = atomicAdd(DEREF(cursors).saved_offsets, count);
@@ -122,17 +122,17 @@ save(uint id)
 void
 number(uint id)
 {
-   REF(hk_agx3_retained_state) state = REF(hk_agx3_retained_state)(args.retained);
+   REF(brl_agx3_retained_state) state = REF(brl_agx3_retained_state)(args.retained);
    uint jobs = DEREF(state).job_count;
    if (id >= jobs)
       return;
-   hk_agx3_leaf_job job = DEREF(INDEX(hk_agx3_leaf_job, args.plan_jobs, id));
+   brl_agx3_leaf_job job = DEREF(INDEX(brl_agx3_leaf_job, args.plan_jobs, id));
    uint first = DEREF(INDEX(uint32_t, args.status, id));
-   uint retained = job.node_kind == HK_AGX3_NODE_INNER
+   uint retained = job.node_kind == BRL_AGX3_NODE_INNER
       ? jobs - 1u - atomicAdd(DEREF(state).inner_jobs, 1u)
       : atomicAdd(DEREF(state).leaf_jobs, 1u);
-   uint64_t records = args.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
-   REF(hk_agx3_retained_job) record = INDEX(hk_agx3_retained_job, records, retained);
+   uint64_t records = args.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
+   REF(brl_agx3_retained_job) record = INDEX(brl_agx3_retained_job, records, retained);
    DEREF(record).root_slot = job.root_slot;
    DEREF(record).child_slot = job.child_slot;
    DEREF(record).kind_count = job.child_count | (job.node_kind << 4);
@@ -142,8 +142,8 @@ number(uint id)
       DEREF(record).position = jobs - 1u;
       DEREF(state).root_job = retained;
    }
-   if (job.node_kind == HK_AGX3_NODE_LEAF) {
-      uint64_t slots = args.retained + uint64_t(HK_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
+   if (job.node_kind == BRL_AGX3_NODE_LEAF) {
+      uint64_t slots = args.retained + uint64_t(BRL_AGX3_RETAINED_SLOTS(jobs, args.leaf_bound));
       for (uint c = 0; c < min(job.child_count, 8u); ++c) {
          uint leaf = job.triangle_offsets[c] / leaf_size();
          if (leaf < args.leaf_bound)
@@ -160,39 +160,39 @@ number(uint id)
 void
 count_levels(uint id)
 {
-   REF(hk_agx3_retained_state) state = REF(hk_agx3_retained_state)(args.retained);
+   REF(brl_agx3_retained_state) state = REF(brl_agx3_retained_state)(args.retained);
    uint jobs = DEREF(state).job_count;
-   uint64_t records = args.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   uint64_t records = args.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
    uint64_t table = level_table(args.retained, jobs);
    uint deepest = 0;
-   hk_agx3_leaf_job job;
+   brl_agx3_leaf_job job;
    bool inner = false;
    if (id < jobs) {
-      job = DEREF(INDEX(hk_agx3_leaf_job, args.plan_jobs, id));
-      inner = job.node_kind == HK_AGX3_NODE_INNER;
+      job = DEREF(INDEX(brl_agx3_leaf_job, args.plan_jobs, id));
+      inner = job.node_kind == BRL_AGX3_NODE_INNER;
    }
    if (inner) {
       /* The root is the inner job of level 0. */
       if (job.root_slot == 0u)
          atomicAdd(DEREF(INDEX(uint32_t, table, 0u)), 1u);
       uint retained = DEREF(INDEX(uint32_t, args.status, id));
-      uint first = DEREF(INDEX(hk_agx3_retained_job, records, retained)).first;
+      uint first = DEREF(INDEX(brl_agx3_retained_job, records, retained)).first;
       for (uint c = 0; c < min(job.child_count, 8u); ++c) {
-         hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.plan_nodes,
+         brl_agx3_plan_node node = DEREF(INDEX(brl_agx3_plan_node, args.plan_nodes,
                                               node_index(job.triangle_offsets[c])));
          if (node.job >= jobs)
             continue;
          uint child = DEREF(INDEX(uint32_t, args.status, node.job));
-         REF(hk_agx3_retained_job) child_record = INDEX(hk_agx3_retained_job, records, child);
+         REF(brl_agx3_retained_job) child_record = INDEX(brl_agx3_retained_job, records, child);
          DEREF(child_record).parent = retained;
          DEREF(child_record).position = first + c;
          uint kind_count = DEREF(child_record).kind_count;
-         if (((kind_count >> 4) & 15u) != HK_AGX3_NODE_INNER)
+         if (((kind_count >> 4) & 15u) != BRL_AGX3_NODE_INNER)
             continue;
          /* Inner jobs sit at depths of whole levels. */
-         uint level = (node.depth & ~(HK_AGX3_PLAN_PAIR | HK_AGX3_PLAN_PAIR_OPAQUE)) / 3u;
+         uint level = (node.depth & ~(BRL_AGX3_PLAN_PAIR | BRL_AGX3_PLAN_PAIR_OPAQUE)) / 3u;
          DEREF(child_record).kind_count = kind_count | (level << 8);
-         if (level < HK_AGX3_REFIT_LEVELS)
+         if (level < BRL_AGX3_REFIT_LEVELS)
             atomicAdd(DEREF(INDEX(uint32_t, table, level)), 1u);
          deepest = max(deepest, level);
       }
@@ -202,22 +202,22 @@ count_levels(uint id)
       atomicMax(DEREF(state).deepest_level, deepest);
 }
 
-/* List the inner jobs of the first HK_AGX3_REFIT_LEVELS levels by level. */
+/* List the inner jobs of the first BRL_AGX3_REFIT_LEVELS levels by level. */
 void
 list_levels(uint id)
 {
-   uint jobs = DEREF(REF(hk_agx3_retained_state)(args.retained)).job_count;
+   uint jobs = DEREF(REF(brl_agx3_retained_state)(args.retained)).job_count;
    if (id >= jobs)
       return;
-   uint64_t records = args.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
-   uint kind_count = DEREF(INDEX(hk_agx3_retained_job, records, id)).kind_count;
+   uint64_t records = args.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
+   uint kind_count = DEREF(INDEX(brl_agx3_retained_job, records, id)).kind_count;
    uint level = kind_count >> 8;
-   if (((kind_count >> 4) & 15u) != HK_AGX3_NODE_INNER || level >= HK_AGX3_REFIT_LEVELS)
+   if (((kind_count >> 4) & 15u) != BRL_AGX3_NODE_INNER || level >= BRL_AGX3_REFIT_LEVELS)
       return;
    uint64_t table = level_table(args.retained, jobs);
    uint index = level_start(table, level) +
-      atomicAdd(DEREF(INDEX(uint32_t, table, HK_AGX3_REFIT_LEVELS + level)), 1u);
-   uint64_t list = table + uint64_t(HK_AGX3_RETAINED_LEVEL_BYTES);
+      atomicAdd(DEREF(INDEX(uint32_t, table, BRL_AGX3_REFIT_LEVELS + level)), 1u);
+   uint64_t list = table + uint64_t(BRL_AGX3_RETAINED_LEVEL_BYTES);
    DEREF(INDEX(uint32_t, list, index)) = id;
 }
 
@@ -229,13 +229,13 @@ prepare(uint id)
       libagx_gen1_as_metadata live = DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
       source = live.native_base + live.retained_offset;
    }
-   hk_agx3_retained_state saved = DEREF(REF(hk_agx3_retained_state)(source));
+   brl_agx3_retained_state saved = DEREF(REF(brl_agx3_retained_state)(source));
    uint jobs = saved.job_count;
    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
    if (args.copy != 0u) {
       /* An update into another structure keeps it updatable: copy the state,
        * the records and every child offset the leaf jobs may use. */
-      uint words = HK_AGX3_RETAINED_BYTES(jobs, args.leaf_bound) / 4u;
+      uint words = BRL_AGX3_RETAINED_BYTES(jobs, args.leaf_bound) / 4u;
       for (uint i = id; i < words; i += stride)
          DEREF(INDEX(uint32_t, args.retained, i)) = DEREF(INDEX(uint32_t, source, i));
    }
@@ -263,27 +263,27 @@ prepare(uint id)
    uint leaves = saved.leaf_jobs;
    if (leaves > jobs || leaves + saved.inner_jobs != jobs)
       leaves = jobs;
-   hk_agx3_refit_state refit;
-   refit.dispatch[0] = (leaves + HK_AGX3_NODE_JOBS_PER_GROUP - 1u) / HK_AGX3_NODE_JOBS_PER_GROUP;
+   brl_agx3_refit_state refit;
+   refit.dispatch[0] = (leaves + BRL_AGX3_NODE_JOBS_PER_GROUP - 1u) / BRL_AGX3_NODE_JOBS_PER_GROUP;
    refit.dispatch[1] = 1u;
    refit.dispatch[2] = 1u;
    refit.job_count = jobs;
    refit.retained = args.copy != 0u ? args.retained : source;
    /* Propagation only for inner jobs past the levels. */
    refit.propagate[0] = saved.deepest_level >= args.level
-      ? (leaves + HK_AGX3_REFIT_GROUP_SIZE - 1u) / HK_AGX3_REFIT_GROUP_SIZE : 0u;
+      ? (leaves + BRL_AGX3_REFIT_GROUP_SIZE - 1u) / BRL_AGX3_REFIT_GROUP_SIZE : 0u;
    refit.propagate[1] = 1u;
    refit.propagate[2] = 1u;
    refit.end_slot = saved.end_slot;
-   DEREF(REF(hk_agx3_refit_state)(args.refit)) = refit;
-   /* Workgroups of HK_AGX3_REFIT_GROUP_SIZE / 8 jobs for each level the
+   DEREF(REF(brl_agx3_refit_state)(args.refit)) = refit;
+   /* Workgroups of BRL_AGX3_REFIT_GROUP_SIZE / 8 jobs for each level the
     * update encodes by level, all from this thread: a small structure runs
     * fewer threads than there are levels, and a level left unwritten would
     * dispatch whatever the scratch held. */
    if (args.levels != 0ul) {
       uint64_t table = level_table(source, jobs);
-      const uint per_group = HK_AGX3_REFIT_GROUP_SIZE / 8u;
-      for (uint l = 0; l < args.level && l < HK_AGX3_REFIT_LEVELS; ++l) {
+      const uint per_group = BRL_AGX3_REFIT_GROUP_SIZE / 8u;
+      for (uint l = 0; l < args.level && l < BRL_AGX3_REFIT_LEVELS; ++l) {
          uint count = min(DEREF(INDEX(uint32_t, table, l)), jobs);
          uint64_t dispatch = args.levels + uint64_t(l) * 12ul;
          store32(dispatch, (count + per_group - 1u) / per_group);
@@ -296,7 +296,7 @@ prepare(uint id)
       uint active_leaves = args.no_leaves != 0u ? saved.active_leaves
                                                 : DEREF(args.header).active_leaf_count;
       bool empty = jobs == 0u || active_leaves == 0u;
-      hk_agx3_envelope_job job;
+      brl_agx3_envelope_job job;
       job.bounds = REF(vk_ir_node)(args.bounds + uint64_t(jobs != 0u ? jobs - 1u : 0u) *
                                    uint64_t(SIZEOF(vk_aabb)));
       job.output_bvh = args.output_bvh;
@@ -304,11 +304,11 @@ prepare(uint id)
       job.primitive_count = empty ? 0u : active_leaves;
       job.node_count = jobs;
       job.depth = saved.depth;
-      job.opaque_build_word = empty ? HK_AGX3_PLAN_EMPTY : 0u;
+      job.opaque_build_word = empty ? BRL_AGX3_PLAN_EMPTY : 0u;
       job.resource_id = args.resource_id;
       job.geometry_type = args.geometry_type;
       job.leaf_bound = args.leaf_bound;
-      DEREF(REF(hk_agx3_envelope_job)(args.envelope)) = job;
+      DEREF(REF(brl_agx3_envelope_job)(args.envelope)) = job;
    }
 }
 
@@ -321,16 +321,16 @@ prepare(uint id)
 void
 propagate(uint id)
 {
-   hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
+   brl_agx3_refit_state refit = DEREF(REF(brl_agx3_refit_state)(args.refit));
    if (id >= refit.job_count)
       return;
-   uint64_t records = refit.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
-   hk_agx3_retained_job leaf = DEREF(INDEX(hk_agx3_retained_job, records, id));
-   if (((leaf.kind_count >> 4) & 15u) == HK_AGX3_NODE_INNER)
+   uint64_t records = refit.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
+   brl_agx3_retained_job leaf = DEREF(INDEX(brl_agx3_retained_job, records, id));
+   if (((leaf.kind_count >> 4) & 15u) == BRL_AGX3_NODE_INNER)
       return;
    uint parent = leaf.parent;
    for (uint steps = 0; parent != 0xffffffffu && steps < 64u; ++steps) {
-      hk_agx3_retained_job job = DEREF(INDEX(hk_agx3_retained_job, records, parent));
+      brl_agx3_retained_job job = DEREF(INDEX(brl_agx3_retained_job, records, parent));
       if ((job.kind_count >> 8) < args.level)
          return;
       uint count = job.kind_count & 15u;
@@ -352,17 +352,17 @@ propagate(uint id)
       bool ok = count >= 1u && count <= 8u && fit_root(lo, hi, base, exponent);
       uint64_t words[8];
       for (uint t = 0; t < 8u && ok; ++t)
-         words[t] = root_word(t, count, HK_AGX3_NODE_INNER, 0u, job.child_slot,
+         words[t] = root_word(t, count, BRL_AGX3_NODE_INNER, 0u, job.child_slot,
                               args.slot_bias, base, exponent, child_lo[t], child_hi[t], ok);
       if (ok) {
          uint64_t node = args.output_bvh + uint64_t(job.root_slot) * 64ul;
          for (uint t = 0; t < 8u; ++t)
             store_word64(node + uint64_t(t) * 8ul, words[t]);
       } else {
-         lo = hi = HK_AGX3_FAILED_BOUNDS;
+         lo = hi = BRL_AGX3_FAILED_BOUNDS;
       }
       store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)), lo, hi);
-      DEREF(INDEX(uint32_t, args.status, parent)) = ok ? HK_AGX3_LEAF_SUCCESS : HK_AGX3_LEAF_RANGE;
+      DEREF(INDEX(uint32_t, args.status, parent)) = ok ? BRL_AGX3_LEAF_SUCCESS : BRL_AGX3_LEAF_RANGE;
       parent = job.parent;
    }
 }
@@ -375,17 +375,17 @@ void
 inner(uint id)
 {
    uint slot = id / 8u, lane = id % 8u;
-   hk_agx3_refit_state refit = DEREF(REF(hk_agx3_refit_state)(args.refit));
-   uint64_t records = refit.retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+   brl_agx3_refit_state refit = DEREF(REF(brl_agx3_refit_state)(args.refit));
+   uint64_t records = refit.retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
    uint64_t table = level_table(refit.retained, refit.job_count);
    bool live = slot < min(DEREF(INDEX(uint32_t, table, args.level)), refit.job_count);
    uint index = 0, count = 0;
-   hk_agx3_retained_job job;
+   brl_agx3_retained_job job;
    vec3 my_lo = vec3(INFINITY), my_hi = vec3(-INFINITY);
    if (live) {
-      uint64_t list = table + uint64_t(HK_AGX3_RETAINED_LEVEL_BYTES);
+      uint64_t list = table + uint64_t(BRL_AGX3_RETAINED_LEVEL_BYTES);
       index = DEREF(INDEX(uint32_t, list, level_start(table, args.level) + slot));
-      job = DEREF(INDEX(hk_agx3_retained_job, records, index));
+      job = DEREF(INDEX(brl_agx3_retained_job, records, index));
       count = job.kind_count & 15u;
       if (lane < count) {
          my_lo = DEREF(INDEX(vk_aabb, args.bounds, job.first + lane)).min;
@@ -399,23 +399,23 @@ inner(uint id)
    bool ok = live && count >= 1u && count <= 8u && fit_root(lo, hi, base, exponent);
    uint64_t word = 0ul;
    if (ok)
-      word = root_word(lane, count, HK_AGX3_NODE_INNER, 0u, job.child_slot, args.slot_bias,
+      word = root_word(lane, count, BRL_AGX3_NODE_INNER, 0u, job.child_slot, args.slot_bias,
                        base, exponent, my_lo, my_hi, ok);
    bool bad = subgroupClusteredOr(ok ? 0u : 1u, 8u) != 0u;
    if (!live)
       return;
    if (bad) {
       if (lane == 0u) {
-         DEREF(INDEX(uint32_t, args.status, index)) = HK_AGX3_LEAF_RANGE;
+         DEREF(INDEX(uint32_t, args.status, index)) = BRL_AGX3_LEAF_RANGE;
          store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)),
-                    HK_AGX3_FAILED_BOUNDS, HK_AGX3_FAILED_BOUNDS);
+                    BRL_AGX3_FAILED_BOUNDS, BRL_AGX3_FAILED_BOUNDS);
       }
       return;
    }
    store_word64(args.output_bvh + uint64_t(job.root_slot) * 64ul + uint64_t(lane) * 8ul, word);
    if (lane == 0u) {
       store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)), lo, hi);
-      DEREF(INDEX(uint32_t, args.status, index)) = HK_AGX3_LEAF_SUCCESS;
+      DEREF(INDEX(uint32_t, args.status, index)) = BRL_AGX3_LEAF_SUCCESS;
    }
 }
 
@@ -424,32 +424,32 @@ main()
 {
    uint id = gl_GlobalInvocationID.x;
    /* Built once per update phase that runs per level or per job
-    * (HK_AGX3_REFIT_ONLY_PHASE), so those carry only their own registers,
+    * (BRL_AGX3_REFIT_ONLY_PHASE), so those carry only their own registers,
     * and once for the other phases. */
-#ifdef HK_AGX3_REFIT_ONLY_PHASE
-   const uint phase = HK_AGX3_REFIT_ONLY_PHASE;
+#ifdef BRL_AGX3_REFIT_ONLY_PHASE
+   const uint phase = BRL_AGX3_REFIT_ONLY_PHASE;
 #else
    const uint phase = args.phase;
 #endif
-   if (phase == HK_AGX3_REFIT_SAVE)
+   if (phase == BRL_AGX3_REFIT_SAVE)
       save(id);
-   else if (phase == HK_AGX3_REFIT_PREPARE)
+   else if (phase == BRL_AGX3_REFIT_PREPARE)
       prepare(id);
-   else if (phase == HK_AGX3_REFIT_PROPAGATE)
+   else if (phase == BRL_AGX3_REFIT_PROPAGATE)
       propagate(id);
-   else if (phase == HK_AGX3_REFIT_COUNT_LEVELS)
+   else if (phase == BRL_AGX3_REFIT_COUNT_LEVELS)
       count_levels(id);
-   else if (phase == HK_AGX3_REFIT_LIST_LEVELS)
+   else if (phase == BRL_AGX3_REFIT_LIST_LEVELS)
       list_levels(id);
-   else if (phase == HK_AGX3_REFIT_NUMBER)
+   else if (phase == BRL_AGX3_REFIT_NUMBER)
       number(id);
    else
       inner(id);
 }
-#else /* HK_AGX3_REFIT_TOP */
+#else /* BRL_AGX3_REFIT_TOP */
 
-shared uint s_level_count[HK_AGX3_REFIT_LEVELS];
-shared uint s_level_start[HK_AGX3_REFIT_LEVELS];
+shared uint s_level_count[BRL_AGX3_REFIT_LEVELS];
+shared uint s_level_start[BRL_AGX3_REFIT_LEVELS];
 
 /* Exact round-to-nearest-even reciprocal matching agx3_envelope.comp. */
 uint
@@ -512,7 +512,7 @@ publish_refit_metadata(uint jobs, uint64_t image_bytes)
    live.image_bytes = image_bytes;
    live.retained_offset = 0ul;
    live.retained_bytes = 0ul;
-   if ((args.flags & HK_AGX3_REFIT_TOP_KEEP_RETAINED) != 0u) {
+   if ((args.flags & BRL_AGX3_REFIT_TOP_KEEP_RETAINED) != 0u) {
       libagx_gen1_as_metadata previous =
          DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
       live.retained_offset = previous.retained_offset;
@@ -520,7 +520,7 @@ publish_refit_metadata(uint jobs, uint64_t image_bytes)
    } else if ((args.build_flags & 1u) != 0u) { /* Vulkan ALLOW_UPDATE */
       live.retained_offset = args.retained_offset;
       live.retained_bytes =
-         uint64_t(HK_AGX3_RETAINED_BYTES(jobs, args.leaf_bound));
+         uint64_t(BRL_AGX3_RETAINED_BYTES(jobs, args.leaf_bound));
    }
    live.storage_bytes = max(image_bytes, live.retained_offset + live.retained_bytes);
    live.build_flags = args.build_flags;
@@ -541,9 +541,9 @@ envelope_half_area(vec3 lo, inout vec3 hi, inout uint status)
    precise vec3 extent = hi - lo;
    for (uint a = 0u; a < 3u; ++a) {
       if (isnan(lo[a]) || isinf(lo[a]) || isnan(hi[a]) || isinf(hi[a]))
-         status |= HK_AGX3_LEAF_NONFINITE;
+         status |= BRL_AGX3_LEAF_NONFINITE;
       if (lo[a] > hi[a])
-         status |= HK_AGX3_LEAF_RANGE;
+         status |= BRL_AGX3_LEAF_RANGE;
       if (extent[a] == 0.0) {
          hi[a] = lo[a] + max(abs(lo[a]), 1.0) * 1.52587890625e-05;
          extent[a] = hi[a] - lo[a];
@@ -557,16 +557,16 @@ envelope_half_area(vec3 lo, inout vec3 hi, inout uint status)
 }
 
 void
-finish_refit_envelope(hk_agx3_retained_state saved, uint jobs)
+finish_refit_envelope(brl_agx3_retained_state saved, uint jobs)
 {
-   uint active_leaves = (args.flags & HK_AGX3_REFIT_TOP_NO_LEAVES) != 0u
+   uint active_leaves = (args.flags & BRL_AGX3_REFIT_TOP_NO_LEAVES) != 0u
                            ? saved.active_leaves
                            : DEREF(args.header).active_leaf_count;
    bool empty = jobs == 0u || active_leaves == 0u;
    if (empty) {
       if (args.output_bvh == 0ul || (args.output_bvh & 63ul) != 0ul ||
           args.output_bvh >= (1ul << 48) - 192ul) {
-         DEREF(args.envelope_status) = HK_AGX3_LEAF_RANGE;
+         DEREF(args.envelope_status) = BRL_AGX3_LEAF_RANGE;
          return;
       }
       for (uint i = 0u; i < 48u; ++i)
@@ -576,7 +576,7 @@ finish_refit_envelope(hk_agx3_retained_state saved, uint jobs)
       store32(args.output_bvh + 176ul,
               args.resource_id != 0u ? args.resource_id : 1u);
       publish_refit_metadata(jobs, 192ul);
-      DEREF(args.envelope_status) = HK_AGX3_LEAF_SUCCESS;
+      DEREF(args.envelope_status) = BRL_AGX3_LEAF_SUCCESS;
       return;
    }
 
@@ -590,10 +590,10 @@ finish_refit_envelope(hk_agx3_retained_state saved, uint jobs)
    uint status = 0u;
    if (saved.end_slot < 3u || active_leaves == 0u || jobs == 0u ||
        saved.depth == 0u)
-      status |= HK_AGX3_LEAF_INVALID_COUNT;
+      status |= BRL_AGX3_LEAF_INVALID_COUNT;
    if (args.output_bvh == 0ul || (args.output_bvh & 63ul) != 0ul ||
        args.output_bvh >= (1ul << 48) || size > (1ul << 48) - args.output_bvh)
-      status |= HK_AGX3_LEAF_RANGE;
+      status |= BRL_AGX3_LEAF_RANGE;
 
    vk_aabb root_bounds = DEREF(INDEX(vk_aabb, args.bounds, jobs - 1u));
    vec3 lo = root_bounds.min, hi = root_bounds.max;
@@ -601,7 +601,7 @@ finish_refit_envelope(hk_agx3_retained_state saved, uint jobs)
    uint inverse_bits = reciprocal_rte(area);
    float inverse = uintBitsToFloat(inverse_bits);
    if (!(area > 0.0) || isinf(area) || isinf(inverse))
-      status |= HK_AGX3_LEAF_RANGE;
+      status |= BRL_AGX3_LEAF_RANGE;
    if (status != 0u) {
       DEREF(args.envelope_status) = status;
       return;
@@ -654,28 +654,28 @@ finish_refit_envelope(hk_agx3_retained_state saved, uint jobs)
    store32(d + 180ul, 0u);
 
    publish_refit_metadata(jobs, size);
-   DEREF(args.envelope_status) = HK_AGX3_LEAF_SUCCESS;
+   DEREF(args.envelope_status) = BRL_AGX3_LEAF_SUCCESS;
 }
 
-/* Fallback for degenerate trees deeper than HK_AGX3_REFIT_LEVELS when
+/* Fallback for degenerate trees deeper than BRL_AGX3_REFIT_LEVELS when
  * running all inner levels in one workgroup. */
 void
 propagate_top(uint tid, uint64_t records, uint jobs, uint leaves)
 {
-   for (uint i = tid; i < jobs; i += HK_AGX3_REFIT_TOP_GROUP_SIZE)
+   for (uint i = tid; i < jobs; i += BRL_AGX3_REFIT_TOP_GROUP_SIZE)
       DEREF(INDEX(uint32_t, args.counters, i)) = 0u;
    controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,
                   gl_StorageSemanticsBuffer,
                   gl_SemanticsAcquireRelease | gl_SemanticsMakeAvailable |
                      gl_SemanticsMakeVisible);
-   for (uint i = tid; i < leaves; i += HK_AGX3_REFIT_TOP_GROUP_SIZE) {
-      hk_agx3_retained_job leaf = DEREF(INDEX(hk_agx3_retained_job, records, i));
-      if (((leaf.kind_count >> 4) & 15u) == HK_AGX3_NODE_INNER)
+   for (uint i = tid; i < leaves; i += BRL_AGX3_REFIT_TOP_GROUP_SIZE) {
+      brl_agx3_retained_job leaf = DEREF(INDEX(brl_agx3_retained_job, records, i));
+      if (((leaf.kind_count >> 4) & 15u) == BRL_AGX3_NODE_INNER)
          continue;
       uint parent = leaf.parent;
       for (uint steps = 0u; parent != 0xffffffffu && steps < 64u; ++steps) {
-         hk_agx3_retained_job job = DEREF(INDEX(hk_agx3_retained_job, records, parent));
-         if ((job.kind_count >> 8) < HK_AGX3_REFIT_LEVELS)
+         brl_agx3_retained_job job = DEREF(INDEX(brl_agx3_retained_job, records, parent));
+         if ((job.kind_count >> 8) < BRL_AGX3_REFIT_LEVELS)
             break;
          uint count = job.kind_count & 15u;
          uint arrived = atomicAdd(DEREF(INDEX(uint32_t, args.counters, parent)), 1u,
@@ -697,7 +697,7 @@ propagate_top(uint tid, uint64_t records, uint jobs, uint leaves)
                c_lo = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).min;
                c_hi = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).max;
             }
-            root_word(t, count, HK_AGX3_NODE_INNER, 0u, job.child_slot,
+            root_word(t, count, BRL_AGX3_NODE_INNER, 0u, job.child_slot,
                       args.slot_bias, base, exponent, c_lo, c_hi, ok);
          }
          if (ok) {
@@ -709,17 +709,17 @@ propagate_top(uint tid, uint64_t records, uint jobs, uint leaves)
                   c_hi = DEREF(INDEX(vk_aabb, args.bounds, job.first + t)).max;
                }
                bool word_ok = true;
-               uint64_t word = root_word(t, count, HK_AGX3_NODE_INNER, 0u,
+               uint64_t word = root_word(t, count, BRL_AGX3_NODE_INNER, 0u,
                                          job.child_slot, args.slot_bias,
                                          base, exponent, c_lo, c_hi, word_ok);
                store_word64(node + uint64_t(t) * 8ul, word);
             }
          } else {
-            lo = hi = HK_AGX3_FAILED_BOUNDS;
+            lo = hi = BRL_AGX3_FAILED_BOUNDS;
          }
          store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)), lo, hi);
          DEREF(INDEX(uint32_t, args.status, parent)) =
-            ok ? HK_AGX3_LEAF_SUCCESS : HK_AGX3_LEAF_RANGE;
+            ok ? BRL_AGX3_LEAF_SUCCESS : BRL_AGX3_LEAF_RANGE;
          parent = job.parent;
       }
    }
@@ -740,10 +740,10 @@ main()
    uint tid = gl_LocalInvocationID.x;
    uint local_slot = tid / 8u;
    uint lane = tid % 8u;
-   const uint jobs_per_iter = HK_AGX3_REFIT_TOP_GROUP_SIZE / 8u;
+   const uint jobs_per_iter = BRL_AGX3_REFIT_TOP_GROUP_SIZE / 8u;
 
    uint64_t retained = 0ul;
-   hk_agx3_retained_state saved;
+   brl_agx3_retained_state saved;
    saved.job_count = 0u;
    saved.root_job = 0xffffffffu;
    saved.end_slot = 0u;
@@ -753,26 +753,26 @@ main()
    saved.leaf_jobs = 0u;
    saved.inner_jobs = 0u;
    if (args.refit != 0ul) {
-      retained = DEREF(REF(hk_agx3_refit_state)(args.refit)).retained;
-      saved = DEREF(REF(hk_agx3_retained_state)(retained));
+      retained = DEREF(REF(brl_agx3_refit_state)(args.refit)).retained;
+      saved = DEREF(REF(brl_agx3_retained_state)(retained));
    } else if (args.metadata != 0ul) {
       libagx_gen1_as_metadata live =
          DEREF(REF(libagx_gen1_as_metadata)(args.metadata));
       if (live.retained_bytes != 0ul) {
          retained = live.native_base + live.retained_offset;
-         saved = DEREF(REF(hk_agx3_retained_state)(retained));
+         saved = DEREF(REF(brl_agx3_retained_state)(retained));
       }
    }
    uint jobs = saved.job_count;
 
    if (jobs != 0u && args.top_levels != 0u) {
-      uint64_t records = retained + uint64_t(HK_AGX3_RETAINED_STATE_BYTES);
+      uint64_t records = retained + uint64_t(BRL_AGX3_RETAINED_STATE_BYTES);
       uint64_t table = level_table(retained, jobs);
-      uint64_t list = table + uint64_t(HK_AGX3_RETAINED_LEVEL_BYTES);
+      uint64_t list = table + uint64_t(BRL_AGX3_RETAINED_LEVEL_BYTES);
 
       if (tid == 0u) {
          uint sum = 0u;
-         for (uint l = 0u; l < HK_AGX3_REFIT_LEVELS; ++l) {
+         for (uint l = 0u; l < BRL_AGX3_REFIT_LEVELS; ++l) {
             uint c = min(DEREF(INDEX(uint32_t, table, l)), jobs);
             s_level_count[l] = c;
             s_level_start[l] = sum;
@@ -782,8 +782,8 @@ main()
       controlBarrier(gl_ScopeWorkgroup, gl_ScopeWorkgroup,
                      gl_StorageSemanticsShared, gl_SemanticsAcquireRelease);
 
-      if (args.top_levels >= HK_AGX3_REFIT_LEVELS &&
-          saved.deepest_level >= HK_AGX3_REFIT_LEVELS) {
+      if (args.top_levels >= BRL_AGX3_REFIT_LEVELS &&
+          saved.deepest_level >= BRL_AGX3_REFIT_LEVELS) {
          uint leaves = saved.leaf_jobs;
          if (leaves > jobs || leaves + saved.inner_jobs != jobs)
             leaves = jobs;
@@ -800,11 +800,11 @@ main()
             uint slot = batch + local_slot;
             bool live = slot < level_count;
             uint index = 0u, count = 0u;
-            hk_agx3_retained_job job;
+            brl_agx3_retained_job job;
             vec3 my_lo = vec3(INFINITY), my_hi = vec3(-INFINITY);
             if (live) {
                index = DEREF(INDEX(uint32_t, list, base_idx + slot));
-               job = DEREF(INDEX(hk_agx3_retained_job, records, index));
+               job = DEREF(INDEX(brl_agx3_retained_job, records, index));
                count = job.kind_count & 15u;
                if (lane < count) {
                   my_lo = DEREF(INDEX(vk_aabb, args.bounds, job.first + lane)).min;
@@ -818,22 +818,22 @@ main()
             bool ok = live && count >= 1u && count <= 8u && fit_root(lo, hi, base, exponent);
             uint64_t word = 0ul;
             if (ok)
-               word = root_word(lane, count, HK_AGX3_NODE_INNER, 0u, job.child_slot,
+               word = root_word(lane, count, BRL_AGX3_NODE_INNER, 0u, job.child_slot,
                                 args.slot_bias, base, exponent, my_lo, my_hi, ok);
             bool bad = subgroupClusteredOr(ok ? 0u : 1u, 8u) != 0u;
             if (live) {
                if (bad) {
                   if (lane == 0u) {
-                     DEREF(INDEX(uint32_t, args.status, index)) = HK_AGX3_LEAF_RANGE;
+                     DEREF(INDEX(uint32_t, args.status, index)) = BRL_AGX3_LEAF_RANGE;
                      store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)),
-                                HK_AGX3_FAILED_BOUNDS, HK_AGX3_FAILED_BOUNDS);
+                                BRL_AGX3_FAILED_BOUNDS, BRL_AGX3_FAILED_BOUNDS);
                   }
                } else {
                   store_word64(args.output_bvh + uint64_t(job.root_slot) * 64ul +
                                uint64_t(lane) * 8ul, word);
                   if (lane == 0u) {
                      store_aabb(uint64_t(INDEX(vk_aabb, args.bounds, job.position)), lo, hi);
-                     DEREF(INDEX(uint32_t, args.status, index)) = HK_AGX3_LEAF_SUCCESS;
+                     DEREF(INDEX(uint32_t, args.status, index)) = BRL_AGX3_LEAF_SUCCESS;
                   }
                }
             }
@@ -848,4 +848,4 @@ main()
    if (tid == 0u)
       finish_refit_envelope(saved, jobs);
 }
-#endif /* HK_AGX3_REFIT_TOP */
+#endif /* BRL_AGX3_REFIT_TOP */

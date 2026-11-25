@@ -47,7 +47,7 @@ struct agx_texture_lower_options {
     * alias; see agx_device::sparse_ro_offset.  The residency map is indexed
     * from the primary mapping, so a descriptor that addresses the alias has
     * to have it taken back off.  Masking is a no-op for a descriptor that
-    * already names the primary mapping, which is what hk_buffer_view.c emits
+    * already names the primary mapping, which is what brl_buffer_view.c emits
     * on G17P, so the same code covers both. */
    uint64_t sparse_ro_offset;
 
@@ -427,9 +427,9 @@ buffer_texel_resident(nir_builder *b, nir_def *desc, nir_def *element,
  * Sparse residency for a texel buffer.
  *
  * A sparse texel fetch on an IMAGE gets its residency code from the hardware,
- * because hk_image_view.c puts the texture descriptor in AGX_IMAGE_MODE_SPARSE
+ * because brl_image_view.c puts the texture descriptor in AGX_IMAGE_MODE_SPARSE
  * and points it at a page table.  A texel BUFFER never gets that treatment:
- * hk_buffer_view.c builds a plain linear 2D texture over the buffer's
+ * brl_buffer_view.c builds a plain linear 2D texture over the buffer's
  * read-only alias, so the texture unit has nothing to report residency from
  * and answers "resident" for every page, bound or not.  Measured on Neo (G17P,
  * A18 Pro): with the hardware sparse fetch emitted,
@@ -439,7 +439,7 @@ buffer_texel_resident(nir_builder *b, nir_def *desc, nir_def *element,
  * fully resident; every case with an unbound page failed.
  *
  * So take the residency from the same per-page bitmap the sparse SSBO path
- * reads (lower_sparse_buffer_deref() in hk_nir_lower_descriptors.c) and drop
+ * reads (lower_sparse_buffer_deref() in brl_nir_lower_descriptors.c) and drop
  * the hardware residency request.  That also keeps this shape away from the
  * AGX3 sparse fetch encoder, which refuses it.
  */
@@ -2580,7 +2580,7 @@ agx_nir_lower_texture_with_buffer_metadata(nir_shader *s, unsigned generation,
                                            uint64_t sparse_ro_offset,
                                            bool sparse_buffer_residency)
 {
-   /* hk's image robustness covers both formatless loads and texel fetches. */
+   /* Borealis's image robustness covers both formatless loads and texel fetches. */
    return lower_texture(s, generation, true, robust_formatless_images,
                         robust_formatless_images, sparse_ro_offset,
                         sparse_buffer_residency, NULL);

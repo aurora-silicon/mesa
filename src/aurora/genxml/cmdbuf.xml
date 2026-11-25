@@ -319,7 +319,7 @@
          descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
-         Nothing hk builds reaches it today (the widest stride any path
+         Nothing Borealis builds reaches it today (the widest stride any path
          produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
          which is 16383 after the shift), so this is a latent overrun; the
          declared width is what makes the guard real. -->
@@ -374,7 +374,7 @@
          descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
-         Nothing hk builds reaches it today (the widest stride any path
+         Nothing Borealis builds reaches it today (the widest stride any path
          produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
          which is 16383 after the shift), so this is a latent overrun; the
          declared width is what makes the guard real. -->
@@ -421,7 +421,7 @@
          descriptor. Declaring 18 let a stride needing 17 bits
          run past the field and clobber "Page-aligned layers" (126) and
          "Extended" (127) instead of tripping util_bitpack_uint's range assert.
-         Nothing hk builds reaches it today (the widest stride any path
+         Nothing Borealis builds reaches it today (the widest stride any path
          produces is a buffer texture's AGX_TEXTURE_BUFFER_WIDTH * 16 minus 16,
          which is 16383 after the shift), so this is a latent overrun; the
          declared width is what makes the guard real. -->
@@ -442,7 +442,7 @@
     <field name="Unk word 3 bits 8-10" size="3" start="200" type="hex"/>
     <!-- No hardware field: the M5 texture unit ignores this word, and the
          drivers keep software data in it (Gallium's buffer element count,
-         Honeykrisp's level-zero extent of a 2D view; see
+         Borealis's level-zero extent of a 2D view; see
          agx_chip_texture_descriptor_spare_word). -->
     <field name="Software word" size="32" start="224" type="hex"/>
   </struct>

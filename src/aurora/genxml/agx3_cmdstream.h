@@ -529,7 +529,7 @@ agx3_cdm_barrier_flags_grounded(enum agx_chip chip, uint8_t flags)
     * word and flags=5. On G18G the flag-free word is captured (compute-add),
     * and flags=5 is grounded on hardware from rel24b+ chained launches: the
     * weak flag-free tail does not give write visibility and flag-free chains
-    * hung the CDM (hk_cmd_dispatch.c). */
+    * hung the CDM (brl_cmd_dispatch.c). */
    return agx_chip_g17_m5(chip) || flags == 0 || flags == 5;
 }
 

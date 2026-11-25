@@ -89,14 +89,14 @@
 
 #define AGX_SCRATCH_PAGE_ADDRESS (AGX_ZERO_PAGE_ADDRESS + AGX_ZERO_PAGE_SIZE)
 
-/* Honeykrisp G17P texel-buffer metadata follows the native texture/PBE and
+/* Borealis G17P texel-buffer metadata follows the native texture/PBE and
  * heap-index records. These are software ABI fields, not Gen9 hardware bits.
  */
 #define AGX_G17P_BUFFER_TEXTURE_PBE_OFFSET 32
 /* Gallium's Gen10 (G17G) buffer texture keeps its element count in the
  * descriptor's last word, which no Gen10 field occupies. */
 #define AGX_GEN10_BUFFER_TEXTURE_SIZE_OFFSET 28
-/* Honeykrisp's Gen10 image views keep their level-zero extent (width in the
+/* Borealis's Gen10 image views keep their level-zero extent (width in the
  * low half, height in the high half) in the same word; see
  * agx_chip_texture_descriptor_spare_word(). */
 #define AGX_GEN10_IMAGE_EXTENT_OFFSET 28
@@ -116,7 +116,7 @@
 #define AGX_G17P_BUFFER_TEXTURE_ADDRESS_OFFSET 80
 #define AGX_G17P_BUFFER_TEXTURE_RGB32_OFFSET 88
 /* Sparse residency for a texel buffer.  G17P's buffer texture descriptor is
- * never put in AGX_IMAGE_MODE_SPARSE (hk_buffer_view.c builds a plain linear
+ * never put in AGX_IMAGE_MODE_SPARSE (brl_buffer_view.c builds a plain linear
  * 2D texture), so the hardware has no residency to report for one.  A sparse
  * texel fetch therefore reads its residency from the same per-page bitmap the
  * sparse SSBO path uses, and this word carries the two things the shader needs
@@ -133,7 +133,7 @@
 #define AGX_G17P_BUFFER_TEXTURE_SPARSE_MAP_SHIFT 4
 #define AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE 96
 
-/* Layout of struct hk_sparse_buffer_map_header (hk_buffer.h), which both the
+/* Layout of struct brl_sparse_buffer_map_header (brl_buffer.h), which both the
  * sparse SSBO lowering and the sparse texel fetch read from the shader.
  * Static-asserted against the struct there. */
 #define AGX_SPARSE_BUFFER_MAP_RESOURCE_BASE_OFFSET 0

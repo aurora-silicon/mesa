@@ -151,7 +151,7 @@ check_g17p_task_kernel_shared(void)
    }
 
    /* Lower task payload into shared memory and turn the shader into a compute
-    * kernel, matching hk_g17p_lower_task_kernel(). */
+    * kernel, matching brl_g17p_lower_task_kernel(). */
    nir_shader_intrinsics_pass(b.shader, rewrite_task_payload_to_shared,
                               nir_metadata_control_flow, NULL);
 

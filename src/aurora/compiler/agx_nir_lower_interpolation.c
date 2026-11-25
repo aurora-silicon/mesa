@@ -82,7 +82,7 @@ interpolate_at_offset(nir_builder *b, nir_def *cf, nir_def *offset,
     * a power-of-two scale.  Until it is understood, take the coordinate from
     * the position varying, which is the value the hardware interpolator
     * itself agrees with.  Gated on the same flag the native constant-plane
-    * marker uses, which hk sets for AGX_CHIP_G17P; AGX2 is conformant on the
+    * marker uses, which Borealis sets for AGX_CHIP_G17P; AGX2 is conformant on the
     * register path and keeps it, as do the host-test callers.
     */
    nir_def *tile_offs;

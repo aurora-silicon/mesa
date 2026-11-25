@@ -537,7 +537,7 @@ agx_m5_mesh_gather_varyings(const nir_shader *s,
          return false;
       varyings->components[slot] = varyings->primitive_comps[slot];
    }
-   /* Like the M5 vertex stage (hk_lower_hw_vs with layer_as_varying), the
+   /* Like the M5 vertex stage (brl_lower_hw_vs with layer_as_varying), the
     * layer is also a flat user word for fragment reads, zero when only the
     * viewport is written, and a written viewport is one as well. */
    if (varyings->lv) {
@@ -742,7 +742,7 @@ m5_mesh_line_bias(nir_builder *b, const nir_shader *s,
  *
  * A native M5 mesh draw takes flat inputs from the vertex its PPP
  * flat-shading selector names, the draw's provoking vertex (see the native
- * mesh note at fields.flat_shading_vertex in hk_cmd_draw.c), and the draw
+ * mesh note at fields.flat_shading_vertex in brl_cmd_draw.c), and the draw
  * root carries the same selector (load_provoking_last). Per-primitive words
  * are flat inputs (agx_nir_lower_m5_mesh_fragment), so only the provoking
  * vertex of a primitive needs them; its other corners keep naming API
@@ -1514,7 +1514,7 @@ agx_nir_lower_m5_task_payload(nir_shader *s, unsigned max_payload_B,
  * other mesh the object writes no record and both stages put the payload at
  * +0. With the record, a full 1 KiB payload measured as lost workgroups of
  * the last children (those reading its last words), consistent with the
- * next task's record landing on them. Shared with hk_shader.c and
+ * next task's record landing on them. Shared with brl_shader.c and
  * agx_vdm_mesh_core.h via AGX_M5_TASK_RECORD_PAYLOAD_BYTES. */
 
 static bool

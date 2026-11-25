@@ -13,12 +13,12 @@ import tempfile
 def main():
     binary, driver, shim, glslang = (Path(arg).resolve() for arg in sys.argv[1:])
     source = Path(__file__).resolve().parent
-    with tempfile.TemporaryDirectory(prefix="hk-dual-source-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="brl-dual-source-") as tmp:
         work = Path(tmp)
         for name in ("common.vert", "generic.frag", "dual.frag"):
             subprocess.run([
                 str(glslang), "-V", "--target-env", "vulkan1.0",
-                str(source / ("hk_dual_source_" + name)),
+                str(source / ("brl_dual_source_" + name)),
                 "-o", str(work / (name + ".spv")),
             ], check=True)
         icd = work / "icd.json"

@@ -18,7 +18,7 @@
  *
  * On the M4 Pro (2026-11-05), dyn costs ~195 ns/draw of GPU time against
  * ~158 for fixed, and ~80 ns/draw more recording time. Keeping the fragment
- * program across roots it cannot read (M5's hk_m5_fragment_root()) changed
+ * program across roots it cannot read (M5's brl_m5_fragment_root()) changed
  * neither there: the HAL200 bind-tail memo already rebuilds only the fragment
  * record, and the comparison cost what the rebuild saved. The recording cost
  * is led by cleaning each write-back root to the point of coherency.

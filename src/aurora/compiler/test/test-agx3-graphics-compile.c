@@ -692,7 +692,7 @@ build_vs_vkcube_vbo_ubo(void)
 
 /*
  * The FS lowering passes introduce driver-owned system values that every
- * driver resolves itself (d12_dxil_lower_root_mask / hk_lower_uvs_index and
+ * driver resolves itself (d12_dxil_lower_root_mask / brl_lower_uvs_index and
  * friends). Resolve them to the monolithic-draw constants so the test
  * exercises the backend rather than a driver ABI.
  */
@@ -1524,7 +1524,7 @@ build_fs_discard_then_tests(void)
    return fs_finish(&b);
 }
 
-/* Minecraft's `if (colour.a == 0.0) discard;` as Honeykrisp's deferred
+/* Minecraft's `if (colour.a == 0.0) discard;` as Borealis's deferred
  * lowering hands it to the backend: the dynamic tests_zs mask ORed into the
  * killed set, and its complement as the live set. AGX_G17P_DISCARD_WORD
  * reduces both to bit 0 at one sample; the single testing update must keep
@@ -2309,7 +2309,7 @@ test_g17p_fragment_io_matrix(void)
 }
 
 /* Fragment shader matching vkcube's statically indexed set-0 combined image
- * sampler after Honeykrisp descriptor lowering. The Gen9 texture starts at
+ * sampler after Borealis descriptor lowering. The Gen9 texture starts at
  * byte 64, followed by the native sampler word at byte 96.
  */
 static nir_shader *
@@ -2329,7 +2329,7 @@ build_fs_texture_bias_offset_root(uint32_t bias_offset_B, bool use_root)
    nir_def *tsampler = nir_bindless_sampler_agx(
       &b, nir_imm_int(&b, 96), nir_imm_intN_t(&b, 45, 16), .desc_set = 0);
 
-   /* Honeykrisp lowers the API sampler bias to a descriptor load. HAL200
+   /* Borealis lowers the API sampler bias to a descriptor load. HAL200
     * carries that bias in the native sampler word, while the software field is
     * always zero, so the bounded lowering removes this source again.
     */
@@ -9446,7 +9446,7 @@ test_agx3_vertex_without_preamble_has_none(void)
 }
 
 /* The driver keeps a vertex shader's descriptor-set pointers only when its
- * uniform-half record names one (hk_agx3_g17p_graphics_live_set_count()).
+ * uniform-half record names one (brl_agx3_g17p_graphics_live_set_count()).
  * Firefox's vertex texel fetch through set 3 reads that set's pointer, halves
  * 12..15 under lower_test_descriptor_set(), and not set 1's, halves 4..7.
  */

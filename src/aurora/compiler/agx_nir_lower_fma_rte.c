@@ -159,7 +159,7 @@ fma_tininess_before_rounding(enum agx_chip chip)
  * this repair keeps. nir_opt_algebraic rewrites ffma_weak into ffma, after
  * which the two cannot be told apart, so the driver runs this once, where a
  * shader enters it and before any algebraic optimization
- * (hk_preprocess_nir_internal(), agx_shader_initialize()). The repair guards
+ * (brl_preprocess_nir_internal(), agx_shader_initialize()). The repair guards
  * the native ffma it keeps, so a second run would repair it again.
  */
 bool

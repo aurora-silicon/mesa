@@ -3,7 +3,7 @@
  *
  * A pipeline with a dynamic sample count and an alpha-tested fragment shader,
  * as games build them: the driver compiles the shader's multisample variant
- * at the first multisampled draw (hk_fs_build_sample_variant), in the middle
+ * at the first multisampled draw (brl_fs_build_sample_variant), in the middle
  * of recording a frame. That variant must go to the disk cache, so that the
  * next process that draws with the shader loads it instead of compiling it
  * again.
@@ -306,7 +306,7 @@ static void run(double *record_ms, unsigned *compiles, uint64_t *hash) {
 }
 
 int main(void) {
-  char dir[] = "/tmp/hk-sample-variant-cache-XXXXXX";
+  char dir[] = "/tmp/brl-sample-variant-cache-XXXXXX";
   if (!mkdtemp(dir)) {
     perror("mkdtemp");
     return 2;

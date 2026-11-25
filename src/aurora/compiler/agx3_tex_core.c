@@ -832,7 +832,7 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
     * produce -- a zero residency code reads as resident -- but that reading is
     * an inference; only the CTS outcomes above are measured.)  Apple's own
     * `sparse_sample`/`sparse_read` bytes do carry bit 3 rather than bit 2; why
-    * their argument-buffer descriptors tolerate it and Honeykrisp's register
+    * their argument-buffer descriptors tolerate it and Borealis's register
     * and uniform descriptors do not is not yet understood.  Hardware decides,
     * so the profile stays where the dense form puts it. */
    base[nb++] = (struct agx3_field_kv)KV(
@@ -882,7 +882,7 @@ agx3_tex_encode_sample(enum agx_isa_encoding enc,
       ov[n++] = (struct agx3_field_kv)KV(156, 1);
    if (d->array && !(enc == AGX_ISA_ENCODING_AGX3C &&
                      d->query_lod && !d->cube)) {
-      /* Honeykrisp's driver descriptor ABI pairs arrays with the
+      /* Borealis's driver descriptor ABI pairs arrays with the
        * sampler-private layer staged by PACK_SMPIR.  Native Apple fragment
        * witnesses use the direct f31/f37 path as part of their complete 4/8
        * ABI, where f31 is a uniform half.

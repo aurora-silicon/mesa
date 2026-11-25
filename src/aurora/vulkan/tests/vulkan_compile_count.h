@@ -14,7 +14,7 @@
  * program. Loading any of those from the disk cache compiles nothing, so it
  * prints nothing.
  *
- * The flag is part of the driver's cache identity (hk_codegen_env_hash()), so
+ * The flag is part of the driver's cache identity (brl_codegen_env_hash()), so
  * call compile_count_enable() before the first Vulkan instance and keep it set
  * for every instance that shares the cache.
  */

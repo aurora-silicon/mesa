@@ -1,13 +1,13 @@
 # Borealis CPU upload benchmark
 
 Build Mesa with `-Dvulkan-drivers=asahi -Dbuild-tests=true`. The `asahi` test
-suite includes `hk_cpu_upload`, a host-only correctness test that also runs a
+suite includes `brl_cpu_upload`, a host-only correctness test that also runs a
 small upload benchmark. It links the production descriptor-binding and upload
 code. No Vulkan or DRM device is created and nothing is submitted.
 
 ```
 meson test -C build --suite asahi --print-errorlogs
-ASAHI_MESA_DEBUG=perf build/src/aurora/vulkan/hk-cpu-upload-bench 1000
+ASAHI_MESA_DEBUG=perf build/src/aurora/vulkan/brl-cpu-upload-bench 1000
 ```
 
 The numeric argument is the number of simulated command buffers, each with

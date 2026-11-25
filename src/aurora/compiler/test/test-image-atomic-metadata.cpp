@@ -61,7 +61,7 @@ TEST(ImageAtomicMetadata, AddressLoadsFollowDescriptorABI)
                      intr->def.bit_size * intr->def.num_components;
             }
          }
-         /* A caller that declares the storage sideband (hk on G18G) reads
+         /* A caller that declares the storage sideband (Borealis on G18G) reads
           * the word after the texture/PBE pair, as the metadata ABI does. */
          const unsigned offset = generation == 10 && !metadata
             ? AGX_GEN10_IMAGE_ATOMIC_SW_OFFSET : AGX_G17P_IMAGE_ATOMIC_SW_FROM_PBE;

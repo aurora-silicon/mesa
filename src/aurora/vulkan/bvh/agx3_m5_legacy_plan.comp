@@ -18,12 +18,12 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float32 : require
-#include "hk_build_interface.h"
+#include "brl_build_interface.h"
 
 layout(local_size_x = 64) in;
 layout(push_constant) uniform CONSTS
 {
-   hk_agx3_plan_args args;
+   brl_agx3_plan_args args;
 };
 
 void
@@ -70,7 +70,7 @@ source_index(uint ir_id)
           i < args.node_bound - args.leaf_bound)
          return args.leaf_bound + i;
    }
-   fail(HK_AGX3_PLAN_INDEX);
+   fail(BRL_AGX3_PLAN_INDEX);
    return 0xffffffffu;
 }
 
@@ -109,7 +109,7 @@ count_leaves(uint start)
    stack[0] = start;
    while (sp != 0) {
       if (++steps > args.node_bound * 2u) {
-         fail(HK_AGX3_PLAN_CYCLE);
+         fail(BRL_AGX3_PLAN_CYCLE);
          return 0;
       }
       uint index = stack[--sp];
@@ -150,15 +150,15 @@ void
 initialize(uint id)
 {
    if (id < args.node_bound) {
-      hk_agx3_plan_node node;
+      brl_agx3_plan_node node;
       node.parent = 0xffffffffu;
       node.leaf_count = id < args.leaf_bound ? 1u : 0u;
       node.depth = 0;
       node.job = 0xffffffffu;
-      DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)) = node;
+      DEREF(INDEX(brl_agx3_plan_node, args.nodes, id)) = node;
    }
    if (id == 0) {
-      hk_agx3_plan_state state;
+      brl_agx3_plan_state state;
       state.job_count = 0;
       state.groups_y = 1;
       state.groups_z = 1;
@@ -168,7 +168,7 @@ initialize(uint id)
       state.saved_offsets = 0;
       state.saved_positions = 0;
       if (DEREF(args.header).active_leaf_count == 0)
-         state.error = HK_AGX3_PLAN_EMPTY;
+         state.error = BRL_AGX3_PLAN_EMPTY;
       if (args.leaf_bound > args.node_bound || args.node_bound > 0xffffffffu / 64u ||
           (DEREF(args.header).active_leaf_count != 0 &&
            (DEREF(args.header).ir_internal_node_count == 0 ||
@@ -180,7 +180,7 @@ initialize(uint id)
           args.output_bvh >= (1ul << 48) ||
           uint64_t(args.slot_bound) * 64ul + 184ul > (1ul << 48) - args.output_bvh ||
           args.slot_bound < 5)
-         state.error |= HK_AGX3_PLAN_INDEX;
+         state.error |= BRL_AGX3_PLAN_INDEX;
       DEREF(args.state) = state;
    }
 }
@@ -198,12 +198,12 @@ link_and_count(uint id)
          if (child == 0xffffffffu)
             return;
          uint old = atomicCompSwap(
-            DEREF(INDEX(hk_agx3_plan_node, args.nodes, child)).parent,
+            DEREF(INDEX(brl_agx3_plan_node, args.nodes, child)).parent,
             0xffffffffu, id);
          if (old != 0xffffffffu)
-            fail(HK_AGX3_PLAN_SHAPE);
+            fail(BRL_AGX3_PLAN_SHAPE);
       }
-   DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).leaf_count =
+   DEREF(INDEX(brl_agx3_plan_node, args.nodes, id)).leaf_count =
       count_leaves(id);
 }
 
@@ -212,38 +212,38 @@ classify(uint id)
 {
    if (id >= args.node_bound)
       return;
-   hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.nodes, id));
+   brl_agx3_plan_node node = DEREF(INDEX(brl_agx3_plan_node, args.nodes, id));
    uint root = root_index();
    if (id != root && node.parent == 0xffffffffu)
       return; /* inactive IR leaf */
    uint cursor = id, depth = 0;
    while (cursor != root) {
       if (depth++ >= args.node_bound) {
-         fail(HK_AGX3_PLAN_CYCLE);
+         fail(BRL_AGX3_PLAN_CYCLE);
          return;
       }
-      cursor = DEREF(INDEX(hk_agx3_plan_node, args.nodes, cursor)).parent;
+      cursor = DEREF(INDEX(brl_agx3_plan_node, args.nodes, cursor)).parent;
       if (cursor >= args.node_bound) {
-         fail(HK_AGX3_PLAN_INDEX);
+         fail(BRL_AGX3_PLAN_INDEX);
          return;
       }
    }
-   DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).depth = depth;
+   DEREF(INDEX(brl_agx3_plan_node, args.nodes, id)).depth = depth;
    bool selected = id == root;
    if (!selected)
       selected = node.leaf_count <= 8
-                    ? DEREF(INDEX(hk_agx3_plan_node, args.nodes, node.parent))
+                    ? DEREF(INDEX(brl_agx3_plan_node, args.nodes, node.parent))
                             .leaf_count > 8
                     : depth % 3 == 0;
    if (!selected)
       return;
    uint job = atomicAdd(DEREF(args.state).job_count, 1);
    if (job >= args.node_bound) {
-      fail(HK_AGX3_PLAN_ALLOCATION);
+      fail(BRL_AGX3_PLAN_ALLOCATION);
       return;
    }
-   DEREF(INDEX(hk_agx3_plan_node, args.nodes, id)).job = job;
-   hk_agx3_leaf_job output_job;
+   DEREF(INDEX(brl_agx3_plan_node, args.nodes, id)).job = job;
+   brl_agx3_leaf_job output_job;
    output_job.intermediate_bvh = args.intermediate_bvh;
    output_job.output_bvh = args.output_bvh;
    output_job.root_slot = id == root ? 0u : 0xffffffffu;
@@ -252,13 +252,13 @@ classify(uint id)
    output_job.node_kind =
       node.leaf_count <= 8
          ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
-               ? HK_AGX3_NODE_INSTANCES
+               ? BRL_AGX3_NODE_INSTANCES
                : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                    ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF)
-         : HK_AGX3_NODE_INNER;
+                    ? BRL_AGX3_NODE_AABBS : BRL_AGX3_NODE_LEAF)
+         : BRL_AGX3_NODE_INNER;
    for (uint i = 0; i < 8; i++)
       output_job.triangle_offsets[i] = 0;
-   DEREF(INDEX(hk_agx3_leaf_job, args.jobs, job)) = output_job;
+   DEREF(INDEX(brl_agx3_leaf_job, args.jobs, job)) = output_job;
    atomicMax(DEREF(args.state).depth, (depth + 2u) / 3u + 1u);
 }
 
@@ -267,7 +267,7 @@ emit(uint id)
 {
    if (id >= args.node_bound)
       return;
-   hk_agx3_plan_node node = DEREF(INDEX(hk_agx3_plan_node, args.nodes, id));
+   brl_agx3_plan_node node = DEREF(INDEX(brl_agx3_plan_node, args.nodes, id));
    if (node.job == 0xffffffffu)
       return;
    bool leaf = node.leaf_count <= 8;
@@ -276,18 +276,18 @@ emit(uint id)
    level[0] = 0;
    while (sp != 0) {
       if (++steps > args.node_bound * 2u) {
-         fail(HK_AGX3_PLAN_CYCLE);
+         fail(BRL_AGX3_PLAN_CYCLE);
          return;
       }
       uint current = stack[--sp], d = level[sp];
       bool end = leaf ? current < args.leaf_bound
                       : current != id &&
-                           (DEREF(INDEX(hk_agx3_plan_node, args.nodes, current))
+                           (DEREF(INDEX(brl_agx3_plan_node, args.nodes, current))
                                   .leaf_count <= 8 ||
                             d == 3);
       if (end) {
          if (count == 8) {
-            fail(HK_AGX3_PLAN_SHAPE);
+            fail(BRL_AGX3_PLAN_SHAPE);
             return;
          }
          selected[count++] = current;
@@ -298,7 +298,7 @@ emit(uint id)
             if (pair[c] != VK_BVH_INVALID_NODE) {
                uint child = source_index(pair[c]);
                if (child == 0xffffffffu || sp == 9) {
-                  fail(HK_AGX3_PLAN_SHAPE);
+                  fail(BRL_AGX3_PLAN_SHAPE);
                   return;
                }
                stack[sp] = child;
@@ -307,7 +307,7 @@ emit(uint id)
       }
    }
    if (count == 0 || (leaf && count != node.leaf_count)) {
-      fail(HK_AGX3_PLAN_SHAPE);
+      fail(BRL_AGX3_PLAN_SHAPE);
       return;
    }
    /* Instances take two slots each; triangles one record slot each plus one
@@ -316,26 +316,26 @@ emit(uint id)
    uint slots = leaf ? (args.geometry_type == VK_GEOMETRY_TYPE_INSTANCES_KHR
                            ? 2u * count
                            : args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                                ? (count * HK_AGX3_M5_AABB_RECORD_B + 63u) / 64u
+                                ? (count * BRL_AGX3_M5_AABB_RECORD_B + 63u) / 64u
                                 : count + (count + 3u) / 4u) : count;
    uint first = atomicAdd(DEREF(args.state).next_slot, slots);
    if (slots > args.slot_bound || first > args.slot_bound - slots) {
-      fail(HK_AGX3_PLAN_ALLOCATION);
+      fail(BRL_AGX3_PLAN_ALLOCATION);
       return;
    }
-   REF(hk_agx3_leaf_job) job = INDEX(hk_agx3_leaf_job, args.jobs, node.job);
+   REF(brl_agx3_leaf_job) job = INDEX(brl_agx3_leaf_job, args.jobs, node.job);
    DEREF(job).child_slot = first;
    DEREF(job).child_count = count;
    for (uint c = 0; c < count; c++) {
       DEREF(job).triangle_offsets[c] = source_offset(selected[c]);
       if (!leaf) {
          uint child_job =
-            DEREF(INDEX(hk_agx3_plan_node, args.nodes, selected[c])).job;
+            DEREF(INDEX(brl_agx3_plan_node, args.nodes, selected[c])).job;
          if (child_job >= DEREF(args.state).job_count) {
-            fail(HK_AGX3_PLAN_SHAPE);
+            fail(BRL_AGX3_PLAN_SHAPE);
             return;
          }
-         DEREF(INDEX(hk_agx3_leaf_job, args.jobs, child_job)).root_slot =
+         DEREF(INDEX(brl_agx3_leaf_job, args.jobs, child_job)).root_slot =
             first + c;
       }
    }
@@ -346,7 +346,7 @@ finish(uint id)
 {
    if (id != 0)
       return;
-   hk_agx3_envelope_job job;
+   brl_agx3_envelope_job job;
    uint root = DEREF(args.state).error == 0 ? root_index() : 0;
    job.bounds =
       REF(vk_ir_node)(OFFSET(args.intermediate_bvh, source_offset(root)));
@@ -358,8 +358,8 @@ finish(uint id)
    job.depth = DEREF(args.state).depth;
    /* Internal job sentinel only: an all-inactive tree has no native nodes.
     * Other planner errors remain errors; do not publish them as empty. */
-   job.opaque_build_word = DEREF(args.state).error == HK_AGX3_PLAN_EMPTY
-                             ? HK_AGX3_PLAN_EMPTY : 0;
+   job.opaque_build_word = DEREF(args.state).error == BRL_AGX3_PLAN_EMPTY
+                             ? BRL_AGX3_PLAN_EMPTY : 0;
    job.resource_id = args.resource_id;
    job.geometry_type = args.geometry_type;
    job.leaf_bound = args.leaf_bound;
@@ -374,7 +374,7 @@ finish(uint id)
 void
 plan_single_leaf()
 {
-   hk_agx3_plan_state state;
+   brl_agx3_plan_state state;
    state.job_count = 0;
    state.groups_y = 1;
    state.groups_z = 1;
@@ -385,7 +385,7 @@ plan_single_leaf()
    state.saved_positions = 0;
    uint active_count = DEREF(args.header).active_leaf_count;
    if (active_count == 0)
-      state.error = HK_AGX3_PLAN_EMPTY;
+      state.error = BRL_AGX3_PLAN_EMPTY;
    if (args.leaf_bound != 1 || args.node_bound < 2 || active_count > 1 ||
        args.root_offset != leaf_size() ||
        (args.geometry_type != VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
@@ -394,33 +394,33 @@ plan_single_leaf()
        args.output_bvh >= (1ul << 48) ||
        uint64_t(args.slot_bound) * 64ul + 184ul > (1ul << 48) - args.output_bvh ||
        args.slot_bound < 5)
-      state.error |= HK_AGX3_PLAN_INDEX;
+      state.error |= BRL_AGX3_PLAN_INDEX;
    if (state.error == 0) {
-      hk_agx3_leaf_job job;
+      brl_agx3_leaf_job job;
       job.intermediate_bvh = args.intermediate_bvh;
       job.output_bvh = args.output_bvh;
       job.root_slot = 0;
       job.child_slot = 3;
       job.child_count = 1;
       job.node_kind = args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
-                        ? HK_AGX3_NODE_AABBS : HK_AGX3_NODE_LEAF;
+                        ? BRL_AGX3_NODE_AABBS : BRL_AGX3_NODE_LEAF;
       for (uint i = 0; i < 8; ++i)
          job.triangle_offsets[i] = 0;
-      DEREF(INDEX(hk_agx3_leaf_job, args.jobs, 0)) = job;
+      DEREF(INDEX(brl_agx3_leaf_job, args.jobs, 0)) = job;
       state.job_count = 1;
       state.depth = 1;
       state.next_slot = args.geometry_type == VK_GEOMETRY_TYPE_AABBS_KHR
                            ? 4 : 5;
    }
-   hk_agx3_envelope_job envelope;
+   brl_agx3_envelope_job envelope;
    envelope.bounds = REF(vk_ir_node)(args.intermediate_bvh);
    envelope.output_bvh = args.output_bvh;
    envelope.end_slot = state.next_slot;
    envelope.primitive_count = state.error == 0 ? 1 : 0;
    envelope.node_count = state.job_count;
    envelope.depth = state.depth;
-   envelope.opaque_build_word = state.error == HK_AGX3_PLAN_EMPTY
-                                 ? HK_AGX3_PLAN_EMPTY : 0;
+   envelope.opaque_build_word = state.error == BRL_AGX3_PLAN_EMPTY
+                                 ? BRL_AGX3_PLAN_EMPTY : 0;
    envelope.resource_id = args.resource_id;
    envelope.geometry_type = args.geometry_type;
    envelope.leaf_bound = 1;

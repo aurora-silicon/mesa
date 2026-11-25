@@ -1025,7 +1025,7 @@ agx_nir_fs_epilog_native(nir_builder *b, const void *key_,
     * depth/stencil tests, so the epilog must not trigger them again.  It does
     * not say the main shader's coverage has been applied: a forced-early
     * shader runs the tests at its start with only the API mask
-    * (hk_g17p_apply_api_mask_to_force_early) and exports the coverage its
+    * (brl_g17p_apply_api_mask_to_force_early) and exports the coverage its
     * discards and SampleMask writes produced in FOUT_WRITE_SAMPLES for us.
     * Gating this block on the flag dropped that mask on the floor and stored
     * colour for killed samples -- query_pool.discard.early.*.{discard,
@@ -1317,7 +1317,7 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
  *
  * Apple's inline blend for the throughput fragment shader has no source
  * clamp: its compiler knows float(v & 63) / 255 lies in [0, 1]
- * (native fragment 0x106..0x1b4). Honeykrisp's split epilog cannot see the
+ * (native fragment 0x106..0x1b4). Borealis's split epilog cannot see the
  * main shader's values, so nir_lower_blend clamps every UNORM blend source
  * (four f32add.sat per RGBA8 pixel). The main shader proves the bound here;
  * the epilog key carries it; the epilog then drops fsat of the exported

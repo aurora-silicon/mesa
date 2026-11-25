@@ -915,7 +915,7 @@ agx_get_bg_eot_shader_locked(struct agx_bg_eot_cache *cache,
    return ret;
 }
 
-/* Honeykrisp shares one cache between every command buffer of a device, and
+/* Borealis shares one cache between every command buffer of a device, and
  * command buffers record on any thread: the lookup, the build (which
  * allocates from cache->ht and uploads to cache->pool) and the insert all run
  * under the lock that agx_get_precompiled() takes for the same pool.
