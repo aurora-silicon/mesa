@@ -1,0 +1,18 @@
+# Aurora Gallium driver (OpenGL ES / OpenGL) expectations, G15G (M3)
+# Machine: J615 MacBook Air M3, Apple M3 (G15G C0); kernel 7.3.0-aurora-fleet85; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the aurora arm 88314f80 (libEGL_mesa, libgallium, libgbm overlay)
+# CTS: glcts 1.4.7.0, EGL surfaceless pbuffer 256x256 rgba8888d24s8ms0, release build, 2026-11-26
+# Cases: dEQP-GLES3 44,778 (all) + 28,220 of the 80,187 GL rest cases (stopped to free the Mac)
+# Evidence: aurora traces/gpu/20261126-borealis-split/j615 (lane BOREALIS-SPLIT)
+# 72998 cases run; 9 expected non-pass (3 passed with the installed package)
+
+KHR-GLES31.core.constant_expressions.basic_dot_float_tess_eval,Fail
+KHR-GLES31.core.constant_expressions.basic_length_float_tess_eval,Fail
+KHR-GLES31.core.constant_expressions.basic_normalize_float_tess_eval,Fail
+KHR-GLES32.core.constant_expressions.basic_dot_float_tess_eval,Fail
+KHR-GLES32.core.constant_expressions.basic_length_float_tess_eval,Fail
+KHR-GLES32.core.constant_expressions.basic_normalize_float_tess_eval,Fail
+
+# Regressions on this tip: passed with the installed package on the same Mac (see the header).
+KHR-GL46.constant_expressions.basic_dot_float_tess_eval,Fail
+KHR-GL46.constant_expressions.basic_length_float_tess_eval,Fail
+KHR-GL46.constant_expressions.basic_normalize_float_tess_eval,Fail

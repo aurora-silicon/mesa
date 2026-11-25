@@ -1,0 +1,7 @@
+# Borealis expectations, G15G (M3)
+# Machine: J615 MacBook Air M3, Apple M3 (G15G C0); kernel 7.3.0-aurora-fleet85; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the split arm 4fc09a3e (same code: .text identical)
+# CTS: VK-GL-CTS 1.4.7.1 (+ driver ID 35, teardown fix), release build b_ndebug=true, user-space overlay, 2026-11-26
+# Cases: vk-a sample (635,999 of 3,215,124; one GPU-fault repro case excluded by the kit)
+# Evidence: aurora traces/gpu/20261126-borealis-split/j615 (lane BOREALIS-SPLIT)
+# Results that changed between repeated rounds of the same build.
+

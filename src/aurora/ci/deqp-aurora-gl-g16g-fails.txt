@@ -1,0 +1,7 @@
+# Aurora Gallium driver (OpenGL ES / OpenGL) expectations, G16G (M4)
+# Machine: J713 MacBook Air M4, Apple M4 (G16G B0); kernel 7.3.0-aurora-fleet85; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the aurora arm 88314f80 (libEGL_mesa, libgallium, libgbm overlay)
+# CTS: glcts 1.4.7.0, EGL surfaceless pbuffer 256x256 rgba8888d24s8ms0, release build, 2026-11-26
+# Cases: dEQP-GLES3 aosp 44,778 (all); the GL rest list was not run on this Mac
+# Evidence: aurora traces/gpu/20261126-borealis-split/j713 (lane BOREALIS-SPLIT)
+# 44778 cases run; 0 expected non-pass (0 passed with the installed package)
+

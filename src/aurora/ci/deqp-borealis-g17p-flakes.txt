@@ -1,0 +1,7 @@
+# Borealis expectations, G17P (A18 Pro)
+# Machine: J700 MacBook Neo, Apple A18 Pro (G17P B1); kernel 7.3.0-aurora-fleet89; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the aurora arm 88314f80 at J=1 (same code: .text identical)
+# CTS: VK-GL-CTS 1.4.7.1 (+ driver ID 35, teardown fix), release build b_ndebug=true, user-space overlay, 2026-11-26
+# Cases: smoke only: every 100th vk-default case (16,541); larger runs thrash this 8 GB Mac at this tip
+# Evidence: aurora traces/gpu/20261126-borealis-split/neo (lane BOREALIS-SPLIT)
+# Results that changed between repeated rounds of the same build.
+

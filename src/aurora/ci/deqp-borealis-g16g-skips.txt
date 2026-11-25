@@ -1,0 +1,14 @@
+# Borealis expectations, G16G (M4)
+# Machine: J713 MacBook Air M4, Apple M4 (G16G B0); kernel 7.3.0-aurora-fleet85; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the split arm 4fc09a3e (same code: .text identical)
+# CTS: VK-GL-CTS 1.4.7.1 (+ driver ID 35, teardown fix), release build b_ndebug=true, user-space overlay, 2026-11-26
+# Cases: partial vk-a sample: 190,114 cases run; two chunks partial and the rest without tess|geom cases because those, fast_linked_library stencil d32_sfloat_s8_uint and multisample std_sample_locations abort per case on this tip (kernel submit EINVAL); see the skips file
+# Evidence: aurora traces/gpu/20261126-borealis-split/j713 (lane BOREALIS-SPLIT)
+#
+# Temporary: on this tip every case in these groups aborted its dEQP process (kernel 'submit failed! (err: EINVAL)'
+# then DeviceLost), about 5 s per case, so a run never finishes. They passed with the installed package (fleet80c,
+# mesa-aurora 26.3.0-30) on 2026-11-23. Remove each line once the cause is fixed.
+dEQP-VK\.draw\.dynamic_rendering\.primary_cmd_buff\.multi_draw\..*
+dEQP-VK\.pipeline\.fast_linked_library\.cache\..*
+dEQP-VK\.pipeline\.fast_linked_library\.stencil\.format\.d32_sfloat_s8_uint\..*
+dEQP-VK\.pipeline\.fast_linked_library\.multisample\.std_sample_locations\..*
+dEQP-VK\.api\.command_buffers\.record_many_draws_.*

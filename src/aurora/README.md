@@ -72,6 +72,22 @@ since then that touch the asahi driver: the candidates to cross-port. It runs as
 
 ## Conformance baselines
 
-`ci/deqp-borealis-{fails,flakes,skips}.txt` (Vulkan) and `ci/deqp-aurora-gl-*.txt` (OpenGL ES and
-OpenGL) list the expected non-passing cases per GPU generation, from runs on real machines; each
-section names the machine, kernel, Mesa commit and CTS version it came from.
+`ci/deqp-borealis-<gen>-{fails,flakes,skips}.txt` (Vulkan) and `ci/deqp-aurora-gl-<gen>-{fails,flakes}.txt`
+(OpenGL ES and OpenGL) are deqp-runner expectation files per GPU generation, from runs on real machines.
+Each file's header names the machine, kernel, Mesa commit, CTS version and which cases ran. Entries
+that passed with the installed package on the same Mac are listed last, under a comment: they are
+regressions to fix, not accepted results.
+
+| Generation | Mac | Vulkan | OpenGL ES / OpenGL |
+|------------|-----|--------|--------------------|
+| G13S (M1 Pro) | J316s | 636,000-case sample | all 124,965 |
+| G14 (M2) | J413, J473 | not run yet (Macs held) | not run yet |
+| G15G (M3) | J615 | 636,000-case sample | GLES3 + 28,220 GL |
+| G16G (M4) | J713 | 190,114 cases, plus skips | GLES3 |
+| G16S (M4 Pro) | J616s | 564,000 cases | not run yet |
+| G17P (A18 Pro) | J700 | 16,541-case smoke | not run yet |
+| G17 (M5) | none in our lab | asked of other boards' owners | not run yet |
+| G18 (M6) | none (no hardware yet) | not run | not run |
+
+The samples are every 5th 6,000-case chunk of the VK-CTS 1.4.7.1 vk-default mustpass (3,215,124
+cases), so cases outside them have no expectation yet.

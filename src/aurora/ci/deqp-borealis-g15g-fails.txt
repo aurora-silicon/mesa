@@ -1,0 +1,51 @@
+# Borealis expectations, G15G (M3)
+# Machine: J615 MacBook Air M3, Apple M3 (G15G C0); kernel 7.3.0-aurora-fleet85; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the split arm 4fc09a3e (same code: .text identical)
+# CTS: VK-GL-CTS 1.4.7.1 (+ driver ID 35, teardown fix), release build b_ndebug=true, user-space overlay, 2026-11-26
+# Cases: vk-a sample (635,999 of 3,215,124; one GPU-fault repro case excluded by the kit)
+# Evidence: aurora traces/gpu/20261126-borealis-split/j615 (lane BOREALIS-SPLIT)
+# 635999 cases run; 42 expected non-pass (42 passed with the installed package)
+
+
+# Regressions on this tip: passed with the installed package on the same Mac (see the header).
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.base_level.level_1,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.base_level.level_2,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.filter_mode.min_linear_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.filter_mode.min_linear_mipmap_linear_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.filter_mode.min_linear_mipmap_nearest_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.filter_mode.min_nearest_mipmap_linear_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.filter_mode.min_nearest_mipmap_nearest_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_npot.compare_greater.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_npot.compare_greater.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_npot.compare_greater.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_npot.compare_less.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_npot.compare_less.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_npot.compare_less.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_pot.compare_greater.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_pot.compare_greater.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_pot.compare_greater.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_pot.compare_less.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_pot.compare_less.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d.depth32f.size_pot.compare_less.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.base_level.level_1,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.base_level.level_2,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.filter_mode.min_linear_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.filter_mode.min_linear_mipmap_linear_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.filter_mode.min_linear_mipmap_nearest_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.filter_mode.min_nearest_mipmap_linear_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.filter_mode.min_nearest_mipmap_nearest_mag_linear,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_npot.compare_greater.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_npot.compare_greater.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_npot.compare_greater.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_npot.compare_less.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_npot.compare_less.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_npot.compare_less.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_pot.compare_greater.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_pot.compare_greater.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_pot.compare_greater.repeat_mirrored_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_pot.compare_less.clamp_to_edge_repeat,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_pot.compare_less.mirrored_repeat_clamp_to_edge,Fail
+dEQP-VK.glsl.texture_gather.graphics.offsets.min_required_offset.2d_array.depth32f.size_pot.compare_less.repeat_mirrored_repeat,Fail
+dEQP-VK.pipeline.shader_object_unlinked_spirv.multisample.misc.dynamic_rendering.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r16g16b16a16_sint_d32_sfloat_s8_uint.random_111,Fail
+dEQP-VK.pipeline.shader_object_unlinked_spirv.multisample.misc.dynamic_rendering.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r16g16b16a16_sint_d32_sfloat_s8_uint.random_59,Fail
+dEQP-VK.pipeline.shader_object_unlinked_spirv.multisample.misc.dynamic_rendering.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r32g32b32a32_uint_d16_unorm.random_112,Fail
+dEQP-VK.pipeline.shader_object_unlinked_spirv.multisample.misc.dynamic_rendering.multi_renderpass.r8g8b8a8_unorm_r16g16b16a16_sfloat_r32g32b32a32_uint_d16_unorm.random_168,Fail
