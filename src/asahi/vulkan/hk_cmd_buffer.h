@@ -3789,9 +3789,9 @@ void hk_cmd_dispatch_indirect_addr(VkCommandBuffer command_buffer,
 /* Whether a compute launch on this device can take the scratch frame its
  * shader's register spills need. hk_dispatch_g17g_native() carries G18G
  * scratch through g18_compute_resources, while hk_dispatch_m5_native()
- * takes it only with the kernel's compute resources. The compiler only
- * spills to an occupancy cap (optional_spills) where this holds, so the
- * dispatch paths refuse scratch by this same rule. */
+ * takes it only with the kernel's compute resources (and refuses scratch
+ * by this same rule). The compiler only spills to an occupancy cap
+ * (optional_spills) where this holds. */
 static inline bool
 hk_compute_launch_takes_scratch(const struct agx_device *dev)
 {

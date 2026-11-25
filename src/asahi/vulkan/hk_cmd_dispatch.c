@@ -2851,7 +2851,6 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        (internal && s->info.stage != MESA_SHADER_VERTEX && s->data_size) ||
        (!g18 && agx_is_indirect(grid)) ||
        (g18_indirect && (!grid.ptr || sparse_indirect)) ||
-       (!hk_compute_launch_takes_scratch(&dev->dev) && scratch_bytes) ||
        s->b.info.uses_ray_traversal ||
        (g18 && (s->b.info.nr_preamble_gprs ||
                 scratch_bytes > max_spill ||

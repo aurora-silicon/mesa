@@ -214,12 +214,9 @@ hk_fs_structure_key_bits(void)
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
 {
-   /* This could be optimized but it doesn't matter. Whether compute
-    * launches take scratch decides optional_spills, so it names the cache
-    * too. */
-   const bool launch_scratch = hk_compute_launch_takes_scratch(&pdev->dev);
-   return pdev->dev.debug | hk_fs_structure_key_bits() |
-          ((uint64_t)launch_scratch << 31);
+   /* This could be optimized but it doesn't matter. */
+   return pdev->dev.debug |
+          hk_fs_structure_key_bits();
 }
 
 uint32_t
