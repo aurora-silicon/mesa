@@ -87,10 +87,10 @@ agx_register_file_halves(const struct agx_device_key *dev)
  * AGX2, AGX3C, and AGX3D currently resolve to 160: their files (256 and
  * 252 halves) reach 384 threads uncapped, so the cap raises that to 640.
  * AGX3B (192 halves) already reaches 512, too small a step, so it gets no
- * cap. Launches that take no scratch (such as G18G) leave optional_spills
- * false instead of overriding the derivation here. All encodings share one
- * occupancy table; a part whose steps differ needs its own table before this
- * derivation is right for it.
+ * cap. Launches that take no scratch (such as M5 without compute resources)
+ * leave optional_spills false instead of overriding the derivation here. All
+ * encodings share one occupancy table; a part whose steps differ needs its own
+ * table before this derivation is right for it.
  */
 unsigned
 agx_sampled_compute_register_cap(const struct agx_device_key *dev)
@@ -142,6 +142,8 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_ST_VARY_FMA_AGX3] = { F32, 2, 1 },
    [AGX_OPCODE_MATMAD8_AGX3]     = { F32, 4, 2 },
    [AGX_OPCODE_MATMAD16_AGX3]    = { F32, 8, 4 },
+   [AGX_OPCODE_SIMD_MATRIX_FMADD32] = { F32, 4, 2 },
+   [AGX_OPCODE_SIMD_MATRIX_FMADD16] = { F16, 4, 2 },
 
    [AGX_OPCODE_HFMA]          = { F16, 2, 1 },
    [AGX_OPCODE_HADD]          = { F16, 2, 1 },
@@ -179,7 +181,13 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_QUAD_PREFIX]      = { SCIB, 18, 18 },
    [AGX_OPCODE_QUAD_REDUCE]      = { SCIB, 24, 24 },
    [AGX_OPCODE_SHUFFLE]          = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_XOR]      = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_UP]       = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_DOWN]     = { SCIB, 5, 2   },
    [AGX_OPCODE_QUAD_SHUFFLE]     = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_XOR] = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_UP]  = { SCIB, 5, 2   },
+   [AGX_OPCODE_QUAD_SHUFFLE_DOWN] = { SCIB, 5, 2  },
 
    [AGX_OPCODE_ICMP_BALLOT]      = { SCIB, 5, 2   },
    [AGX_OPCODE_FCMP_BALLOT]      = { SCIB, 5, 2   },

@@ -68,8 +68,18 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
              cmd->state.gfx.root &&
              desc->uploaded_root.gpu != cmd->state.gfx.root)
             cmd->state.gfx.g17p_bind_tail.valid = false;
-         if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+         if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
             cmd->state.gfx.root_cpu = desc->uploaded_root.cpu;
+            cmd->state.gfx.root_size = root_size;
+            if ((agx_chip_native_hal200(dev->dev.chip) ||
+                 agx_chip_g17_m5(dev->dev.chip)) &&
+                cmd->state.gfx.root_fragment_snapshot_cpu !=
+                   desc->uploaded_root.cpu) {
+               hk_root_fragment_snapshot_publish(&cmd->state.gfx,
+                                                 desc->uploaded_root.cpu, root,
+                                                 root_size);
+            }
+         }
          hk_upload_stat(cmd, root_reuses, 1);
          return desc->uploaded_root.gpu;
       }
@@ -79,8 +89,10 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    if (!root_ptr.gpu)
       return 0;
 
-   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+   if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
       cmd->state.gfx.root_cpu = root_ptr.cpu;
+      cmd->state.gfx.root_size = root_size;
+   }
 
    /* A HAL200 tail built for the old root names it and must be rebuilt
     * before publication. Byte-identical roots keep that identity. */
@@ -91,9 +103,10 @@ hk_cmd_buffer_upload_root(struct hk_cmd_buffer *cmd,
    /* Capture from the CPU source after every publication-time augmentation.
     * Reading the GPU-mapped root back here would pay uncached load latency. */
    if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
-       agx_chip_g17_m5(dev->dev.chip)) {
+       (agx_chip_native_hal200(dev->dev.chip) ||
+        agx_chip_g17_m5(dev->dev.chip))) {
       struct hk_graphics_state *gfx = &cmd->state.gfx;
-      hk_root_fragment_snapshot_publish(gfx, root_ptr.cpu, root);
+      hk_root_fragment_snapshot_publish(gfx, root_ptr.cpu, root, root_size);
    }
 
    memcpy(root_ptr.cpu, root, head_B);
@@ -128,10 +141,9 @@ hk_cmd_upload_constants(struct hk_cmd_buffer *cmd, const struct hk_shader *s,
       return 0;
 
    assert(stage < MESA_SHADER_STAGES);
-   const bool native =
-      agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip);
-   if (native && s->constant_data_id &&
-       cmd->state.constant_data[stage].id == s->constant_data_id) {
+   if (s->constant_data_id &&
+       cmd->state.constant_data[stage].id == s->constant_data_id &&
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
       hk_upload_stat(cmd, constant_reuses, 1);
       return cmd->state.constant_data[stage].addr;
    }
@@ -155,7 +167,7 @@ hk_cmd_upload_draw_params(struct hk_cmd_buffer *cmd, uint32_t first,
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    uint32_t params[] = {first, first_instance};
-   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
+   if (agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip) &&
        gfx->g17p_draw_params_host_valid && gfx->draw_params &&
        memcmp(gfx->g17p_draw_params_value, params, sizeof(params)) == 0) {
       hk_upload_stat(cmd, draw_param_reuses, 1);
@@ -176,9 +188,9 @@ void
 hk_cmd_upload_draw_id(struct hk_cmd_buffer *cmd, uint32_t draw_id)
 {
    struct hk_graphics_state *gfx = &cmd->state.gfx;
-   if (agx_chip_native_agx3(hk_cmd_buffer_device(cmd)->dev.chip) &&
+   if (gfx->g17p_draw_id_value == draw_id &&
        gfx->g17p_draw_id_host_valid && gfx->draw_id_ptr &&
-       gfx->g17p_draw_id_value == draw_id) {
+       agx_chip_native_or_m5(hk_cmd_buffer_device(cmd)->dev.chip)) {
       hk_upload_stat(cmd, draw_id_reuses, 1);
       return;
    }
@@ -201,10 +213,10 @@ hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
       ((group_count.x * 2654435761u) ^ (group_count.y * 2246822519u) ^
        (group_count.z * 3266489917u)) >>
       28;
-   struct hk_group_count_cache_entry *entry =
-      &cmd->state.group_count_cache[hash];
-   if (likely(entry->valid && entry->x == group_count.x &&
-              entry->y == group_count.y && entry->z == group_count.z))
+   struct hk_group_count_cache_entry *entry = &cmd->group_count_cache[hash];
+   if (likely(cmd->used_group_count_cache && entry->valid &&
+              entry->x == group_count.x && entry->y == group_count.y &&
+              entry->z == group_count.z))
       return entry->addr;
 
    const uint64_t addr =
@@ -219,6 +231,7 @@ hk_cmd_upload_group_count(struct hk_cmd_buffer *cmd,
    entry->z = group_count.z;
    entry->valid = 1;
    entry->addr = addr;
+   cmd->used_group_count_cache = true;
    return addr;
 }
 

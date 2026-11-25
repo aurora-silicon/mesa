@@ -37,8 +37,8 @@ TEST(SampledComputeRegisterCap, DerivedFromFileAndOccupancy)
    /* AGX3B reaches 512 threads uncapped: too small a step for the spills. */
    EXPECT_EQ(cap_for(AGX_ISA_ENCODING_AGX3B), 0u);
 
-   /* AGX3D also has a 252-half file; launches that take no scratch (G18G)
-    * keep the cap off via optional_spills = false. */
+   /* AGX3D also has a 252-half file; launches without optional_spills keep
+    * the cap off. */
    EXPECT_EQ(cap_for(AGX_ISA_ENCODING_AGX3C, true), 160u);
    EXPECT_EQ(cap_for(AGX_ISA_ENCODING_AGX3D), 160u);
 
