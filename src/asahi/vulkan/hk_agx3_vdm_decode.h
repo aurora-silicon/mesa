@@ -36,12 +36,14 @@ extern "C" {
  * when agx_shader_info gains AGX3 vertex preamble hoist metadata and
  * vertex binaries may carry extracted preamble NIR, to 48 when
  * hk_shader_info.vs records per-pipeline vertex input robustness, to 49
- * when compute shaders carry packed vec4 alternates, to 50 when they
- * carry compute-pair state in a third variant byte, and to 51 when AGX3
- * payloads carry the compute root prefix. Classic payloads move to 38 and
- * AGX2 to 39 when they carry it too. */
-#define HK_AGX3_SHADER_BINARY_VERSION 51u
-#define HK_CLASSIC_SHADER_BINARY_VERSION 38u
+ * when compute shaders carry packed vec4 alternates, and to 50 when they
+ * carry compute-pair state in a third variant byte. AGX3 moves to 51 and
+ * classic to 39 when compute-pair binaries also carry the producer state
+ * needed to compile fused variants, to 52 / 40 when compute shaders carry
+ * their proven submit-pack loop bounds, and to 53 / 41 when AGX3 payloads
+ * carry the compute root prefix (AGX2 moves to 39). */
+#define HK_AGX3_SHADER_BINARY_VERSION 53u
+#define HK_CLASSIC_SHADER_BINARY_VERSION 41u
 /* AGX2 binaries include attachmentless layer-zero root lowering, fs.reads_layer,
  * per-pipeline vertex input robustness in hk_shader_info.vs, and the compute
  * root prefix. */
