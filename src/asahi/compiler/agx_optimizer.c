@@ -393,6 +393,11 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * narrow `U16_TO_F(and(h, 0xff))` (f32) to `U8_TO_F(h)` so unpacked byte
  * lanes from merged u8x2..u8x4 loads convert directly without masking.
  *
+ * On AGX3B (excluding G18G), preserve the existing exact-0xff fold from #657
+ * (`U8_TO_F` / `U16_TO_F` -> `U8_TO_F` for f32) untouched, while scoping
+ * `S8_TO_F` and wider low-byte-preserving masks (`(mask & 0xff) == 0xff`) to
+ * AGX3C.
+ *
  * U8_TO_F with an f16 destination is intentionally excluded: AGX3C has no
  * native unsigned-byte-to-f16 int2flt form, so agx_lower_agx3_half_converts
  * lowers it to `and(src, 0xff)` + U16_TO_F (which reads all 16 bits of the
@@ -401,16 +406,20 @@ static void
 agx_optimizer_convert_u8_mask(const agx_context *ctx, agx_instr **defs,
                               agx_instr *I)
 {
-   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       ctx->key->dev.emit_agx3d || I->op != AGX_OPCODE_CONVERT ||
+   if (!ctx->key || ctx->key->dev.emit_agx3d || I->op != AGX_OPCODE_CONVERT ||
        I->nr_dests != 1 || I->nr_srcs != 2 || I->saturate ||
        I->round != AGX_ROUND_RTE || I->src[0].type != AGX_INDEX_IMMEDIATE)
+      return;
+
+   const bool is_agx3b = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   const bool is_agx3c = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C;
+   if (!is_agx3b && !is_agx3c)
       return;
 
    const enum agx_convert mode = I->src[0].value;
    const bool native_byte_cvt =
       (mode == AGX_CONVERT_U8_TO_F && I->dest[0].size == AGX_SIZE_32) ||
-      (mode == AGX_CONVERT_S8_TO_F &&
+      (is_agx3c && mode == AGX_CONVERT_S8_TO_F &&
        (I->dest[0].size == AGX_SIZE_16 || I->dest[0].size == AGX_SIZE_32));
    const bool narrow_u16_cvt =
       mode == AGX_CONVERT_U16_TO_F && I->dest[0].size == AGX_SIZE_32;
@@ -436,7 +445,9 @@ agx_optimizer_convert_u8_mask(const agx_context *ctx, agx_instr **defs,
           agx_channels(val) != 1 || val.abs || val.neg || val.memory)
          continue;
 
-      if (native_byte_cvt && (mask.value & 0xff) == 0xff) {
+      const bool mask_ok =
+         is_agx3c ? (mask.value & 0xff) == 0xff : mask.value == 0xff;
+      if (native_byte_cvt && mask_ok) {
          I->src[1] = val;
          return;
       }

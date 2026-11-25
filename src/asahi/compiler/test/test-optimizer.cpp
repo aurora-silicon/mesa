@@ -2717,7 +2717,8 @@ TEST_F(Optimizer, ConvertU8MaskFoldAGX3C)
       bool expect_fold;
    } cases[] = {
       /* Positive cases: AGX3C (non-AGX3D) U8_TO_F f32, S8_TO_F f16/f32, and
-       * U16_TO_F f32 with exact 0xff mask */
+       * U16_TO_F f32 with exact 0xff mask; AGX3B preserves exact-0xff #657
+       * U8_TO_F/U16_TO_F f32 folds */
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
        AGX_SIZE_32, 0xff, false, AGX_ROUND_RTE, true},
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_S8_TO_F, AGX_CONVERT_S8_TO_F,
@@ -2726,11 +2727,16 @@ TEST_F(Optimizer, ConvertU8MaskFoldAGX3C)
        AGX_SIZE_16, 0xff, false, AGX_ROUND_RTE, true},
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U16_TO_F, AGX_CONVERT_U8_TO_F,
        AGX_SIZE_32, 0xff, false, AGX_ROUND_RTE, true},
-      /* Wider mask still preserves low 8 bits for native byte converts */
+      {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
+       AGX_SIZE_32, 0xff, false, AGX_ROUND_RTE, true},
+      {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_U16_TO_F, AGX_CONVERT_U8_TO_F,
+       AGX_SIZE_32, 0xff, false, AGX_ROUND_RTE, true},
+      /* Wider mask still preserves low 8 bits for native byte converts on AGX3C */
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
        AGX_SIZE_32, 0x3ff, false, AGX_ROUND_RTE, true},
-      /* Negative cases: U8_TO_F f16, U16_TO_F with >8-bit mask, AGX3D, AGX3B,
-       * narrow mask, sat/round */
+      /* Negative cases: U8_TO_F f16, U16_TO_F with >8-bit mask, AGX3D, new
+       * S8_TO_F / wider-mask cases scoped out of AGX3B, narrow mask,
+       * sat/round */
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
        AGX_SIZE_16, 0xff, false, AGX_ROUND_RTE, false},
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U16_TO_F, AGX_CONVERT_U16_TO_F,
@@ -2738,7 +2744,13 @@ TEST_F(Optimizer, ConvertU8MaskFoldAGX3C)
       {AGX_ISA_ENCODING_AGX3C, true, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
        AGX_SIZE_32, 0xff, false, AGX_ROUND_RTE, false},
       {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
+       AGX_SIZE_32, 0x3ff, false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_S8_TO_F, AGX_CONVERT_S8_TO_F,
        AGX_SIZE_32, 0xff, false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_S8_TO_F, AGX_CONVERT_S8_TO_F,
+       AGX_SIZE_16, 0xff, false, AGX_ROUND_RTE, false},
+      {AGX_ISA_ENCODING_AGX3B, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
+       AGX_SIZE_16, 0xff, false, AGX_ROUND_RTE, false},
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
        AGX_SIZE_32, 0x7f, false, AGX_ROUND_RTE, false},
       {AGX_ISA_ENCODING_AGX3C, false, AGX_CONVERT_U8_TO_F, AGX_CONVERT_U8_TO_F,
@@ -2767,6 +2779,33 @@ TEST_F(Optimizer, ConvertU8MaskFoldAGX3C)
          agx_instr *I =
             agx_convert_to(b, out, agx_immediate(mode), src, c.round);
          I->saturate = c.saturate;
+         agx_unit_test(b, out);
+      }
+
+      agx_optimize_and_dce(actual->shader);
+      agx_dce(expected->shader, true);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}
+
+TEST_F(Optimizer, ConvertU8MaskFoldAGX3BSharedMaskParity)
+{
+   for (enum agx_convert mode : {AGX_CONVERT_U8_TO_F, AGX_CONVERT_U16_TO_F}) {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+
+      for (agx_builder *b : {actual, expected}) {
+         b->shader->key = &key;
+         agx_index v = agx_preload(b, hx);
+         agx_index masked =
+            agx_bitop(b, v, agx_immediate(0xff), UTIL_LUT2(a & b));
+         agx_unit_test(b, masked);
+         agx_index out = agx_temp(b->shader, AGX_SIZE_32);
+         agx_convert_to(b, out,
+                        agx_immediate(b == actual ? mode : AGX_CONVERT_U8_TO_F),
+                        b == actual ? masked : v, AGX_ROUND_RTE);
          agx_unit_test(b, out);
       }
 
