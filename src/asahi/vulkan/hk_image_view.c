@@ -342,7 +342,7 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
           * (copied_layers_src_view).
           */
          if (unlikely(layers > 1) && agx_chip_native_agx3(dev->dev.chip))
-            mesa_loge_once("hk: uncompressed view of %u layers of a "
+            mesa_loge_once("borealis: uncompressed view of %u layers of a "
                            "block-compressed image addresses only the first",
                            layers);
 

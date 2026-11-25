@@ -612,7 +612,7 @@ check_g17p_subgroup_quad_compute(bool valid_lane)
  *
  *   agx3_pack_binary.c: no grounded AGX3 encoding for quad_shuffle
  *     [d16:reg13 s0=16:reg13 s1=32:reg2 ...]
- *   hk: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
+ *   borealis: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
  *
  * measured on Neo (G17P, A18 Pro).  The backend widens that shape to the
  * 32-bit register-lane form, which is the same one nir_lower_subgroups

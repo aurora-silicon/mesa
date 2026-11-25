@@ -13288,7 +13288,7 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
                                  uint32_t index, uint32_t count,
                                  VkResult result)
 {
-   mesa_loge("hk: vkCreateGraphicsPipelines refused pipeline %u of %u: %s",
+   mesa_loge("borealis: vkCreateGraphicsPipelines refused pipeline %u of %u: %s",
              index, count, vk_Result_to_str(result));
 
    const VkPipelineCreateFlags2KHR flags =
@@ -13298,14 +13298,14 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
    const VkPipelineLibraryCreateInfoKHR *libs =
       vk_find_struct_const(info->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR);
 
-   mesa_loge("hk:   flags=0x%" PRIx64 " gpl_subset=0x%x linked_libraries=%u",
+   mesa_loge("borealis:   flags=0x%" PRIx64 " gpl_subset=0x%x linked_libraries=%u",
              (uint64_t)flags, gpl ? gpl->flags : 0u,
              libs ? libs->libraryCount : 0u);
 
    for (uint32_t s = 0; s < info->stageCount; s++) {
       const VkPipelineShaderStageCreateInfo *stage = &info->pStages[s];
 
-      mesa_loge("hk:   stage %-4s entry \"%s\" spirv=%zu bytes flags=0x%x",
+      mesa_loge("borealis:   stage %-4s entry \"%s\" spirv=%zu bytes flags=0x%x",
                 hk_shader_stage_bit_name(stage->stage),
                 stage->pName ? stage->pName : "(null)",
                 hk_pipeline_stage_spirv_size(stage), stage->flags);
@@ -13320,31 +13320,31 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
             vk_DynamicState_to_str(info->pDynamicState->pDynamicStates[d]));
       }
 
-      mesa_loge("hk:   dynamic(%u): %s",
+      mesa_loge("borealis:   dynamic(%u): %s",
                 info->pDynamicState->dynamicStateCount, dyn.data);
    } else {
-      mesa_loge("hk:   dynamic(0): all state static");
+      mesa_loge("borealis:   dynamic(0): all state static");
    }
 
    if (info->pInputAssemblyState) {
-      mesa_loge("hk:   ia: topology=%u restart=%u",
+      mesa_loge("borealis:   ia: topology=%u restart=%u",
                 info->pInputAssemblyState->topology,
                 info->pInputAssemblyState->primitiveRestartEnable);
    }
 
    if (info->pVertexInputState) {
-      mesa_loge("hk:   vi: bindings=%u attributes=%u",
+      mesa_loge("borealis:   vi: bindings=%u attributes=%u",
                 info->pVertexInputState->vertexBindingDescriptionCount,
                 info->pVertexInputState->vertexAttributeDescriptionCount);
    }
 
    if (info->pTessellationState) {
-      mesa_loge("hk:   tess: patch_control_points=%u",
+      mesa_loge("borealis:   tess: patch_control_points=%u",
                 info->pTessellationState->patchControlPoints);
    }
 
    if (info->pViewportState) {
-      mesa_loge("hk:   vp: viewports=%u scissors=%u",
+      mesa_loge("borealis:   vp: viewports=%u scissors=%u",
                 info->pViewportState->viewportCount,
                 info->pViewportState->scissorCount);
    }
@@ -13353,7 +13353,7 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
       const VkPipelineRasterizationStateCreateInfo *rs =
          info->pRasterizationState;
 
-      mesa_loge("hk:   rs: discard=%u polygon=%u cull=0x%x front=%u "
+      mesa_loge("borealis:   rs: discard=%u polygon=%u cull=0x%x front=%u "
                 "depth_clamp=%u depth_bias=%u line_width=%f",
                 rs->rasterizerDiscardEnable, rs->polygonMode, rs->cullMode,
                 rs->frontFace, rs->depthClampEnable, rs->depthBiasEnable,
@@ -13363,7 +13363,7 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
    if (info->pMultisampleState) {
       const VkPipelineMultisampleStateCreateInfo *ms = info->pMultisampleState;
 
-      mesa_loge("hk:   ms: samples=%u sample_shading=%u min=%f "
+      mesa_loge("borealis:   ms: samples=%u sample_shading=%u min=%f "
                 "sample_mask=0x%x alpha_to_coverage=%u alpha_to_one=%u",
                 ms->rasterizationSamples, ms->sampleShadingEnable,
                 ms->minSampleShading,
@@ -13375,7 +13375,7 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
       const VkPipelineDepthStencilStateCreateInfo *ds =
          info->pDepthStencilState;
 
-      mesa_loge("hk:   ds: test=%u write=%u op=%u bounds=%u stencil=%u",
+      mesa_loge("borealis:   ds: test=%u write=%u op=%u bounds=%u stencil=%u",
                 ds->depthTestEnable, ds->depthWriteEnable, ds->depthCompareOp,
                 ds->depthBoundsTestEnable, ds->stencilTestEnable);
    }
@@ -13391,7 +13391,7 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
                                     cb->pAttachments[a].colorWriteMask);
       }
 
-      mesa_loge("hk:   cb: logic_op=%u/%u attachments=%u %s",
+      mesa_loge("borealis:   cb: logic_op=%u/%u attachments=%u %s",
                 cb->logicOpEnable, cb->logicOp, cb->attachmentCount, att.data);
    }
 
@@ -13410,13 +13410,13 @@ hk_log_refused_graphics_pipeline(const VkGraphicsPipelineCreateInfo *info,
             vk_Format_to_str(rendering->pColorAttachmentFormats[a]));
       }
 
-      mesa_loge("hk:   rendering: view_mask=0x%x color=%u [%s] depth=%s "
+      mesa_loge("borealis:   rendering: view_mask=0x%x color=%u [%s] depth=%s "
                 "stencil=%s",
                 rendering->viewMask, rendering->colorAttachmentCount,
                 colors.data, vk_Format_to_str(rendering->depthAttachmentFormat),
                 vk_Format_to_str(rendering->stencilAttachmentFormat));
    } else {
-      mesa_loge("hk:   render_pass=%s subpass=%u",
+      mesa_loge("borealis:   render_pass=%s subpass=%u",
                 info->renderPass != VK_NULL_HANDLE ? "yes" : "none",
                 info->subpass);
    }
@@ -13478,9 +13478,9 @@ hk_CreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
       failed++;
 
    const VkComputePipelineCreateInfo *info = &pCreateInfos[failed];
-   mesa_loge("hk: vkCreateComputePipelines refused pipeline %u of %u: %s",
+   mesa_loge("borealis: vkCreateComputePipelines refused pipeline %u of %u: %s",
              failed, createInfoCount, vk_Result_to_str(result));
-   mesa_loge("hk:   flags=0x%x stage entry \"%s\" spirv=%zu bytes "
+   mesa_loge("borealis:   flags=0x%x stage entry \"%s\" spirv=%zu bytes "
              "stage_flags=0x%x",
              info->flags, info->stage.pName ? info->stage.pName : "(null)",
              hk_pipeline_stage_spirv_size(&info->stage), info->stage.flags);

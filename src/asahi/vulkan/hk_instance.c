@@ -83,7 +83,10 @@ hk_init_dri_options(struct hk_instance *instance)
 {
    hk_parse_dri_options(&instance->drirc,
                         &(driConfigFileParseParams) {
-                           .driverName = "hk",
+                           /* drirc files written before the rename use
+                            * driver="hk"; keep matching them. */
+                           .driverName = "borealis",
+                           .driverNameAlias = "hk",
                            .applicationName = instance->vk.app_info.app_name,
                            .applicationVersion = instance->vk.app_info.app_version,
                            .engineName = instance->vk.app_info.engine_name,

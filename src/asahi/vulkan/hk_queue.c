@@ -6841,7 +6841,7 @@ hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns)
                                       1, abs_timeout, 0, NULL);
       } while (ret == -EINTR);
       if (ret == -ETIME && !warned) {
-         mesa_logw("hk: device destroyed while its GPU work was still running");
+         mesa_logw("borealis: device destroyed while its GPU work was still running");
          warned = true;
       }
    }

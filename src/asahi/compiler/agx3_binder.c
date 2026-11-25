@@ -55,7 +55,7 @@ agx3d_table_or_null(void)
  * a 1.5 KiB memset on every composed instruction.
  *
  * Thread-specific storage rather than a _Thread_local array: libgallium and
- * libvulkan_asahi build with the initial-exec TLS model, and a dlopen() of
+ * libvulkan_aurora build with the initial-exec TLS model, and a dlopen() of
  * either only gets glibc's small static TLS surplus, which a 1280-byte
  * static TLS array exhausts (EGL then fails to load with "cannot allocate
  * memory in static TLS block"). */

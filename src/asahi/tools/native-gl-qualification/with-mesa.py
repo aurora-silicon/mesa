@@ -20,7 +20,7 @@ if len(libs) != 1:
     p.error("overlay must have exactly one Mesa library directory")
 lib = libs[0]
 for name in ("libEGL_mesa.so.0", "libGLX_mesa.so.0", "libgbm.so.1",
-             "libvulkan_asahi.so", "gbm/dri_gbm.so", "dri/asahi_dri.so", "dri/zink_dri.so"):
+             "libvulkan_aurora.so", "gbm/dri_gbm.so", "dri/asahi_dri.so", "dri/zink_dri.so"):
     path = lib / name
     if not path.is_file() or not path.resolve().is_relative_to(root):
         p.error(f"missing library or symlink escaping overlay: {path}")
@@ -41,7 +41,7 @@ def loader_json(path, content):
 loader_json(egl, {"file_format_version": "1.0.0", "ICD": {
     "library_path": str(lib / "libEGL_mesa.so.0")}})
 loader_json(vk, {"file_format_version": "1.0.0", "ICD": {
-    "library_path": str(lib / "libvulkan_asahi.so"), "api_version": "1.4.0"}})
+    "library_path": str(lib / "libvulkan_aurora.so"), "api_version": "1.4.0"}})
 env = dict(os.environ)
 # Exclude selectors, injected layers and debugging paths from the comparison.
 for name in ("MESA_LOADER_DRIVER_OVERRIDE", "GALLIUM_DRIVER", "LD_PRELOAD",

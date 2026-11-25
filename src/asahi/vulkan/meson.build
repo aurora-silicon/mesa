@@ -140,7 +140,7 @@ hk_files = files(
 
 hk_drirc = custom_target(
   'hk_drirc',
-  input  : [files('hk_drirc_gen.py'), drirc_gen, '00-hk-defaults.conf'],
+  input  : [files('hk_drirc_gen.py'), drirc_gen, '00-borealis-defaults.conf'],
   output : ['hk_drirc.c', 'hk_drirc.h'],
   command : [
     prog_python, '@INPUT0@',
@@ -974,19 +974,29 @@ if with_tests
   )
 endif
 
-libvulkan_asahi = shared_library(
-  'vulkan_asahi',
+libvulkan_aurora = shared_library(
+  'vulkan_aurora',
   link_whole : [libhk],
   link_args: [ld_args_build_id],
   gnu_symbol_visibility : 'hidden',
   install : true,
 )
 
-icd_file_name = libname_prefix + 'vulkan_asahi.' + libname_suffix
+# Kept for one release so tools that look for the library under its old
+# name still find it. Only the library is aliased: a second ICD manifest
+# would make the loader list every GPU twice.
+install_symlink(
+  libname_prefix + 'vulkan_asahi.' + libname_suffix,
+  pointing_to : libname_prefix + 'vulkan_aurora.' + libname_suffix,
+  install_dir : get_option('libdir'),
+  install_tag : 'runtime',
+)
 
-asahi_icd = custom_target(
+icd_file_name = libname_prefix + 'vulkan_aurora.' + libname_suffix
+
+aurora_icd = custom_target(
   input : [vk_icd_gen, vk_api_xml],
-  output : 'asahi_icd.' + vulkan_manifest_suffix,
+  output : 'aurora_icd.' + vulkan_manifest_suffix,
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
@@ -1001,7 +1011,7 @@ asahi_icd = custom_target(
   install : true,
 )
 
-_dev_icdname = 'asahi_devenv_icd.@0@.json'.format(host_machine.cpu())
+_dev_icdname = 'aurora_devenv_icd.@0@.json'.format(host_machine.cpu())
 _dev_icd = custom_target(
   input : [vk_icd_gen, vk_api_xml],
   output : _dev_icdname,

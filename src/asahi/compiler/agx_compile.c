@@ -95,7 +95,7 @@ agx_get_compiler_debug(void)
 }
 
 /* The last compile refusal of this thread. It lives in thread-specific storage
- * rather than a __thread array: libgallium and libvulkan_asahi use the
+ * rather than a __thread array: libgallium and libvulkan_aurora use the
  * initial-exec TLS model, and a dlopen() of either only gets glibc's small
  * static TLS surplus, which an 896-byte array exhausts (EGL then fails to load
  * with "cannot allocate memory in static TLS block"). */
@@ -4764,7 +4764,7 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
        *   agx3_pack_binary.c:10028: no grounded AGX3 encoding for quad_shuffle
        *     [d16:reg13 s0=16:reg13 s1=32:reg2 ...]
        *   AGX3 refused shader during binary packing
-       *   hk: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
+       *   borealis: vkCreateComputePipelines refused pipeline 0 of 1: VK_ERROR_UNKNOWN
        *
        * Any quad broadcast whose lane is not a compile-time constant lands
        * here; s1 above is r1, the register agx_lower_divergent_shuffle()

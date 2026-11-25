@@ -183,7 +183,7 @@ temporarily; Mesa libraries stay entirely in the overlay.
 Confirm the **greeter** gnome-shell PID (not the user's compositor) maps the
 candidate `libgallium` path. Zink symlinks also resolve to libgallium, so absence
 of `zink_dri.so` in maps is not proof of native GL; inspect the filtered driver
-selectors in its environment and absence of `libvulkan_asahi.so` too. Repeat
+selectors in its environment and absence of `libvulkan_aurora.so` too. Repeat
 the avatar test on the real greeter, with a fresh launch. Preserve capture,
 journal interval, loaded library identity and result.
 

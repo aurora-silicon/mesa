@@ -174,7 +174,7 @@ if gallium_drivers.contains('auto')
       gallium_drivers = [
         'v3d', 'vc4', 'freedreno', 'etnaviv', 'nouveau', 'svga',
         'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
-        'zink', 'asahi'
+        'zink', 'aurora'
       ]
     elif ['arm'].contains(host_machine.cpu_family())
       gallium_drivers = [
@@ -206,9 +206,23 @@ elif gallium_drivers.contains('all')
    gallium_drivers = [
      'r300', 'r600', 'radeonsi', 'crocus', 'v3d', 'vc4', 'freedreno', 'etnaviv', 'i915',
      'nouveau', 'svga', 'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
-     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu'
+     'zink', 'd3d12', 'aurora', 'rocket', 'ethosu'
    ]
 endif
+
+# The Apple GPU drivers were selected as 'asahi' before they moved to src/aurora.
+# Keep accepting the old name for the Gallium driver so existing build scripts and packaging keep working.
+if gallium_drivers.contains('asahi')
+  warning('-Dgallium-drivers=asahi is deprecated, use -Dgallium-drivers=aurora')
+endif
+_gallium_drivers = []
+foreach _d : gallium_drivers
+  _d = _d == 'aurora' ? 'asahi' : _d
+  if not _gallium_drivers.contains(_d)
+    _gallium_drivers += _d
+  endif
+endforeach
+gallium_drivers = _gallium_drivers
 
 with_amdgpu_virtio = get_option('amdgpu-virtio')
 
@@ -273,7 +287,7 @@ if _vulkan_drivers.contains('auto')
     if host_machine.cpu_family().startswith('x86')
       _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'nouveau', 'swrast']
     elif ['aarch64'].contains(host_machine.cpu_family())
-      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'asahi']
+      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'aurora']
     elif ['arm'].contains(host_machine.cpu_family())
       _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno']
     elif ['mips', 'mips64', 'ppc', 'ppc64', 'riscv32', 'riscv64'].contains(host_machine.cpu_family())
@@ -296,8 +310,22 @@ elif _vulkan_drivers.contains('all')
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
                       'imagination', 'microsoft-experimental',
-                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp']
+                      'nouveau', 'aurora', 'gfxstream', 'kosmickrisp']
 endif
+
+# The Apple GPU drivers were selected as 'asahi' before they moved to src/aurora.
+# Keep accepting the old name for Borealis so existing build scripts and packaging keep working.
+if _vulkan_drivers.contains('asahi')
+  warning('-Dvulkan-drivers=asahi is deprecated, use -Dvulkan-drivers=aurora')
+endif
+_vk_renamed = []
+foreach _d : _vulkan_drivers
+  _d = _d == 'asahi' ? 'aurora' : _d
+  if not _vk_renamed.contains(_d)
+    _vk_renamed += _d
+  endif
+endforeach
+_vulkan_drivers = _vk_renamed
 
 with_intel_vk = _vulkan_drivers.contains('intel')
 with_intel_hasvk = _vulkan_drivers.contains('intel_hasvk')
@@ -311,7 +339,7 @@ with_imagination_vk = _vulkan_drivers.contains('imagination')
 with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
-with_asahi_vk = _vulkan_drivers.contains('asahi')
+with_asahi_vk = _vulkan_drivers.contains('aurora')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
 with_any_vk = _vulkan_drivers.length() != 0

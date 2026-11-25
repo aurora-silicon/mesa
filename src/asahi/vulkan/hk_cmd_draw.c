@@ -2224,7 +2224,7 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
          memcpy(program->bytes, code.data, code.size);
          program->length = code.size;
       } else {
-         mesa_loge("hk: G18G tile Ioto not re-encoded: %s at +0x%x",
+         mesa_loge("borealis: G18G tile Ioto not re-encoded: %s at +0x%x",
                    why ? why : "longer than program buffer", at);
       }
       util_dynarray_fini(&code);
