@@ -351,3 +351,17 @@ struct hk_cmd_buffer;
 void hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                     enum pipe_format view_format, const uint32_t *clear_value,
                     const VkImageSubresourceRange *range, bool whole_3d);
+
+/* Whether an image's layout matches the uncompressed GPU-tiled Morton address
+ * calculation used by the AGX3 compute mipmap blit path. Compressed images
+ * (including M5 compressed images under AIL_LAYOUT_POLICY_M5) and G18G layouts
+ * stay off this path so they take the compressed-blit or graphics fallback. */
+static inline bool
+hk_compute_blit_uncompressed_layout_supported(enum agx_chip chip,
+                                              const struct ail_layout *layout)
+{
+   return agx_chip_native_or_m5(chip) && layout && !layout->compressed &&
+          !layout->g18g && layout->tiling == AIL_TILING_GPU &&
+          (layout->policy == AIL_LAYOUT_POLICY_LEGACY ||
+           layout->policy == AIL_LAYOUT_POLICY_M5);
+}

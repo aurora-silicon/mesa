@@ -2193,7 +2193,11 @@ hk_g17p_compute_blit_supported(const struct hk_device *dev,
                                const struct hk_image *dst,
                                const VkBlitImageInfo2 *info)
 {
-   if (!agx_chip_native_agx3(dev->dev.chip) || info->regionCount == 0)
+   if (info->regionCount == 0 ||
+       !hk_compute_blit_uncompressed_layout_supported(
+          dev->dev.chip, &src->planes[0].layout) ||
+       !hk_compute_blit_uncompressed_layout_supported(
+          dev->dev.chip, &dst->planes[0].layout))
       return false;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {

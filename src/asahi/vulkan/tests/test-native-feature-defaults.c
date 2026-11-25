@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_private.h"
+#include "hk_image.h"
 #include "hk_queue.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -60,6 +61,36 @@ main(void)
    assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G15P));
    assert(!agx_chip_elide_app_dispatch_barrier(AGX_CHIP_G18G));
 
+   /* Uncompressed GPU-tiled M5 and native AGX3 layouts qualify for the
+    * compute mipmap blit path; compressed M5 images must take their fallback. */
+   struct ail_layout m5_plain = {
+      .tiling = AIL_TILING_GPU,
+      .policy = AIL_LAYOUT_POLICY_M5,
+      .compressed = false,
+      .g18g = false,
+   };
+   struct ail_layout m5_compressed = m5_plain;
+   m5_compressed.compressed = true;
+   struct ail_layout native_plain = {
+      .tiling = AIL_TILING_GPU,
+      .policy = AIL_LAYOUT_POLICY_LEGACY,
+      .compressed = false,
+   };
+   struct ail_layout linear_layout = m5_plain;
+   linear_layout.tiling = AIL_TILING_LINEAR;
+   struct ail_layout g18g_layout = m5_plain;
+   g18g_layout.g18g = true;
+
+   assert(hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17S, &m5_plain));
+   assert(hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17G, &m5_plain));
+   assert(hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17C, &m5_plain));
+   assert(!hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17S, &m5_compressed));
+   assert(!hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17C, &m5_compressed));
+   assert(hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17P, &native_plain));
+   assert(hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G16G, &native_plain));
+   assert(!hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G17S, &linear_layout));
+   assert(!hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G18G, &g18g_layout));
+   assert(!hk_compute_blit_uncompressed_layout_supported(AGX_CHIP_G13G, &native_plain));
 
    /* Kernel-feature-gated cumulative signals and sibling compute queues apply
     * uniformly across G16G, G17P, and M5 (G17G/G17S/G17C) without chip forks. */
