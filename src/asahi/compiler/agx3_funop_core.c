@@ -170,11 +170,10 @@ agx3_funop_encode_impl(enum agx_isa_encoding enc, enum agx3_funop op, uint16_t d
     * AGX3_FUNOP_RINT), f32log2, f32exp2, f32rsqrt and f32sqrtstep -- each
     * of which deposits all of the destination and source index bits
     * identically in the AGX3C and AGX3D (G18G) tables. In production,
-    * agx3_emit_funop() routes only G18G floor/ceil/trunc (keeping
-    * AGX3_FUNOP_RINT off this route so roundeven falls through to
-    * agx3_alu_unary_m5()), f32log2, f32exp2, f32rsqrt and f32sqrtstep here
-    * (with SRSQRT and unsaturated RSQRT caught earlier in
-    * agx3_pack_binary.c by separate ALU helpers). Encodable is not
+    * agx3_emit_funop() routes only G18G f32log2, f32exp2, f32rsqrt and
+    * f32sqrtstep here (all four rounding ops fall through to
+    * agx3_alu_unary_m5(), and SRSQRT and unsaturated RSQRT are caught
+    * earlier in agx3_pack_binary.c by separate ALU helpers). Encodable is not
     * allocatable: RA caps AGX3C and AGX3D at 252 halves (AGX3C_NUM_REGS,
     * AGX3D_NUM_REGS), so h252-h255 only occur in encoder tests.
     *
