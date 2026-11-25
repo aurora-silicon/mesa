@@ -10,8 +10,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[2]
 build = Path(sys.argv[1]).resolve()
-shim = build / 'src/asahi/drm-shim/libasahi_noop_drm_shim.so'
-icds = list((build / 'src/asahi/vulkan').glob('aurora_devenv_icd.*.json'))
+shim = build / 'src/aurora/drm-shim/libasahi_noop_drm_shim.so'
+icds = list((build / 'src/aurora/vulkan').glob('aurora_devenv_icd.*.json'))
 assert shim.is_file() and len(icds) == 1, 'Build the driver, development ICD and drm-shim first'
 with tempfile.TemporaryDirectory(prefix='siliconforest-vulkan-smoke-') as directory:
     binary = str(Path(directory) / 'vulkan-smoke')

@@ -32,7 +32,7 @@
 #include "freedreno/drm/freedreno_drm_public.h"
 #include "panfrost/drm/panfrost_drm_public.h"
 #include "lima/drm/lima_drm_public.h"
-#include "asahi/drm/asahi_drm_public.h"
+#include "aurora/drm/asahi_drm_public.h"
 #include "zink/drm/zink_drm_public.h"
 #include "xf86drm.h"
 

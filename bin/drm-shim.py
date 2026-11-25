@@ -120,7 +120,7 @@ for target in INTEL_TARGETS:
 
 LD_PRELOAD = {
     "amd": "src/amd/drm-shim/libamdgpu_noop_drm_shim.so",
-    "asahi": "src/asahi/drm-shim/libasahi_noop_drm_shim.so",
+    "asahi": "src/aurora/drm-shim/libasahi_noop_drm_shim.so",
     "etnaviv": "src/etnaviv/drm-shim/libetnaviv_noop_drm_shim.so",
     "freedreno": "src/freedreno/drm-shim/libfreedreno_noop_drm_shim.so",
     "intel": "src/intel/tools/libintel_noop_drm_shim.so",

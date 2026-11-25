@@ -338,7 +338,7 @@ DRM_DRIVER_DESCRIPTOR_STUB(panthor)
 #endif
 
 #ifdef GALLIUM_ASAHI
-#include "asahi/drm/asahi_drm_public.h"
+#include "aurora/drm/asahi_drm_public.h"
 
 static struct pipe_screen *
 pipe_asahi_create_screen(int fd, const struct pipe_screen_config *config)
@@ -350,7 +350,7 @@ pipe_asahi_create_screen(int fd, const struct pipe_screen_config *config)
 }
 
 const driOptionDescription asahi_driconf[] = {
-      #include "asahi/driinfo_asahi.h"
+      #include "aurora/driinfo_asahi.h"
 };
 DRM_DRIVER_DESCRIPTOR(asahi, asahi_driconf, ARRAY_SIZE(asahi_driconf))
 /* The kernel driver is "aurora"; "asahi" stays for older kernels and for
@@ -516,7 +516,7 @@ const driOptionDescription kmsro_driconf[] = {
       #include "v3d/driinfo_v3d.h"
 #endif
 #ifdef GALLIUM_ASAHI
-      #include "asahi/driinfo_asahi.h"
+      #include "aurora/driinfo_asahi.h"
 #endif
 #ifdef GALLIUM_FREEDRENO
       #include "freedreno/driinfo_freedreno.h"
