@@ -483,3 +483,15 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     )
   endforeach
 endif
+
+if with_tests
+  # Lists how src/aurora and the Gallium driver differ from upstream Mesa's asahi
+  # driver (see UPSTREAM and ci/aurora-divergence.py). Informational; skipped when
+  # the upstream commit is not in the repository.
+  test(
+    'aurora-divergence',
+    prog_python,
+    args : [files('ci/aurora-divergence.py'), '--root', dir_source_root],
+    suite : ['asahi'],
+  )
+endif
