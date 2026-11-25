@@ -30,6 +30,7 @@ copy_shader_init(copy_shader *s, mesa_shader_stage stage, bool loop)
    s->key.dev.chip = AGX_CHIP_G17S;
    s->b = agx_test_builder(s->mem);
    s->b->shader->key = &s->key;
+   s->b->shader->out = rzalloc(s->mem, agx_shader_info);
    s->b->shader->stage = stage;
    s->b->shader->nir = rzalloc(s->mem, nir_shader);
    s->b->shader->nir->info.stage = stage;
@@ -189,11 +190,11 @@ TEST(M5CopySchedule, LoopConstantsRematerializedInBody)
    ralloc_free(s.mem);
 }
 
-TEST(M5CopySchedule, OtherGenerationsUnchanged)
+TEST(M5CopySchedule, LegacyISAIsUnchanged)
 {
    copy_shader s;
    copy_shader_init(&s, MESA_SHADER_VERTEX, false);
-   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
    s.key.dev.chip = AGX_CHIP_G17P;
    emit_copies(&s, 8, true);
    agx_ilp_schedule(s.b->shader);
@@ -202,6 +203,22 @@ TEST(M5CopySchedule, OtherGenerationsUnchanged)
    EXPECT_EQ(loads_before_first_write(s.body), 1u);
    EXPECT_EQ(max_reads_in_flight(s.body, &first_write), 1u);
    ralloc_free(s.mem);
+}
+
+TEST(M5CopySchedule, AGX3BVertexReadsIssueAheadOfWrites)
+{
+   for (bool reorderable : {false, true}) {
+      SCOPED_TRACE(reorderable);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_VERTEX, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G17P;
+      emit_copies(&s, 8, reorderable);
+      agx_ilp_schedule(s.b->shader);
+
+      EXPECT_EQ(loads_before_first_write(s.body), reorderable ? 4u : 1u);
+      ralloc_free(s.mem);
+   }
 }
 
 /* M5 compute device loads issue ahead of their uses, as samples do. */
@@ -225,6 +242,21 @@ TEST(M5CopySchedule, G18GComputeDeviceLoadsKeepTheirOrder)
    emit_load_uses(&s, 6);
    agx_ilp_schedule(s.b->shader);
    EXPECT_EQ(loads_before_first_add(s.body), 1u);
+   ralloc_free(s.mem);
+}
+
+/* G18G compute blocks taking the sample-hoist path still need size16 allocated
+ * for ilp_block_peak() even when shared_compute_loads is disabled. */
+TEST(M5CopySchedule, G18GComputeCopyLoopMeasuresPeakWithoutCrash)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   s.key.dev.chip = AGX_CHIP_G17G;
+   s.key.dev.emit_agx3d = true;
+   emit_copies(&s, 4, true);
+   agx_ilp_schedule(s.b->shader);
+   unsigned first_write = 0;
+   EXPECT_GT(max_reads_in_flight(s.body, &first_write), 1u);
    ralloc_free(s.mem);
 }
 
@@ -305,14 +337,34 @@ TEST(M5CopySchedule, ComputeDeviceLoadsStayBoundedInFlight)
 
 /* Near the top of an occupancy step there is no room for a vec4 load's
  * result ahead of its use: the loads keep their order. */
-TEST(M5CopySchedule, ComputeDeviceLoadsStayInsideTheOccupancyStep)
+TEST(M5CopySchedule, TraversalDeviceLoadsStayInsideTheOccupancyStep)
 {
    copy_shader s;
    copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.b->shader->out->uses_ray_traversal = true;
    emit_wide_load_uses(&s, 8, 4, 46);
    agx_ilp_schedule(s.b->shader);
    EXPECT_EQ(max_device_loads_in_flight(s.body), 1u);
    ralloc_free(s.mem);
+}
+
+/* These vec4 loads straddle a legacy occupancy boundary. Both files have
+ * room to overlap them under Dynamic Caching. */
+TEST(M5CopySchedule, DynamicCachingDeviceLoadsCrossAnOccupancyBoundary)
+{
+   for (auto encoding : {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      SCOPED_TRACE(encoding);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.key.dev.encoding = encoding;
+      s.key.dev.chip = encoding == AGX_ISA_ENCODING_AGX3B
+                         ? AGX_CHIP_G17P : AGX_CHIP_G17S;
+      emit_wide_load_uses(&s, 8, 4, 46);
+      agx_ilp_schedule(s.b->shader);
+      EXPECT_GE(max_device_loads_in_flight(s.body), 2u);
+      EXPECT_LE(max_device_loads_in_flight(s.body), 4u);
+      ralloc_free(s.mem);
+   }
 }
 
 /* The headroom rule at its edges: at least 16 halves free below the top of
@@ -344,6 +396,7 @@ TEST(M5CopySchedule, ComputeDeviceLoadWindowsFallBack)
       SCOPED_TRACE(live);
       copy_shader s;
       copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.b->shader->out->uses_ray_traversal = true;
       emit_wide_load_uses(&s, 8, 4, live);
       agx_ilp_schedule(s.b->shader);
       const unsigned in_flight = max_device_loads_in_flight(s.body);
@@ -369,6 +422,7 @@ TEST(M5CopySchedule, ComputeDeviceLoadsFollowTheProgramPeak)
       SCOPED_TRACE(heavy);
       copy_shader s;
       copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+      s.b->shader->out->uses_ray_traversal = true;
       agx_builder *b = s.b;
       if (heavy) {
          agx_index held[46];
@@ -774,4 +828,137 @@ TEST(M5CopySchedule, AGX3BFragmentCubeBudgetRespected)
                 FRAG_SAMPLE_TEX, FRAG_DESC_IMM, AGX_LOD_MODE_AUTO_LOD, false,
                 true, 80),
              1u);
+}
+
+/* Helper-kernel protocol ops (doorbell, stack_map, stack_unmap) must carry
+ * AGX_SCHEDULE_CLASS_BARRIER and never be reordered past get_sr_barrier inside
+ * AGX2 loop bodies (libagx_helper deadlock regression). */
+TEST(M5CopySchedule, AGX2HelperDoorbellOrderPreserved)
+{
+   EXPECT_EQ(agx_opcodes_info[AGX_OPCODE_DOORBELL].schedule_class,
+             AGX_SCHEDULE_CLASS_BARRIER);
+   EXPECT_EQ(agx_opcodes_info[AGX_OPCODE_STACK_MAP].schedule_class,
+             AGX_SCHEDULE_CLASS_BARRIER);
+   EXPECT_EQ(agx_opcodes_info[AGX_OPCODE_STACK_UNMAP].schedule_class,
+             AGX_SCHEDULE_CLASS_BARRIER);
+
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   s.key.dev.chip = AGX_CHIP_G13G;
+
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_doorbell(b, 0x20);
+   agx_index op = agx_get_sr_barrier(b, 32, (enum agx_sr)0x90);
+   agx_index arg = agx_get_sr_barrier(b, 32, (enum agx_sr)0x92);
+   agx_index sum = agx_iadd(b, op, arg, 0);
+   agx_if_icmp(b, sum, agx_zero(), 1, AGX_ICOND_UEQ, false, s.body);
+
+   agx_pressure_schedule(b->shader);
+   agx_ilp_schedule(b->shader);
+
+   int doorbell_pos = -1, first_sr_pos = -1, pos = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_DOORBELL)
+         doorbell_pos = pos;
+      else if (I->op == AGX_OPCODE_GET_SR_BARRIER && first_sr_pos < 0)
+         first_sr_pos = pos;
+      ++pos;
+   }
+   EXPECT_GE(doorbell_pos, 0);
+   EXPECT_GT(first_sr_pos, doorbell_pos);
+   ralloc_free(s.mem);
+}
+
+/* stack_adjust must live in SCHED_MEM_STACK so stack_load/stack_store stay
+ * strictly ordered between frame allocation and deallocation. */
+TEST(M5CopySchedule, StackAdjustSerializesStackAccesses)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX2;
+   s.key.dev.chip = AGX_CHIP_G13G;
+
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index val = agx_mov_imm(b, 32, 0x1234);
+   agx_index off = agx_zero();
+   agx_stack_adjust(b, 16);
+   agx_stack_store(b, val, off, AGX_FORMAT_I32, 1);
+   agx_index loaded = agx_stack_load(b, off, AGX_FORMAT_I32, 1);
+   agx_stack_adjust(b, -16);
+   agx_device_store(b, loaded, agx_uniform(0, AGX_SIZE_64), agx_zero(),
+                    AGX_FORMAT_I32, 1, 0, false);
+
+   agx_pressure_schedule(b->shader);
+   agx_ilp_schedule(b->shader);
+
+   int adj_alloc = -1, st_pos = -1, ld_pos = -1, adj_free = -1, pos = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_STACK_ADJUST) {
+         if (adj_alloc < 0)
+            adj_alloc = pos;
+         else
+            adj_free = pos;
+      } else if (I->op == AGX_OPCODE_STACK_STORE) {
+         st_pos = pos;
+      } else if (I->op == AGX_OPCODE_STACK_LOAD) {
+         ld_pos = pos;
+      }
+      ++pos;
+   }
+   EXPECT_GE(adj_alloc, 0);
+   EXPECT_GT(st_pos, adj_alloc);
+   EXPECT_GT(ld_pos, st_pos);
+   EXPECT_GT(adj_free, ld_pos);
+   ralloc_free(s.mem);
+}
+
+/* Multi-channel loads unpacked by SPLIT remain tracked as in-flight loads
+ * until a real consumer reads a split lane, and independent ALU chains
+ * interleave rather than serializing one chain after another. */
+TEST(M5CopySchedule, SplitLoadChainsInterleaveIndependentAlu)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, false);
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index address = agx_preload(b, agx_register(2, AGX_SIZE_64));
+   agx_index w = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index acc[4];
+   for (unsigned c = 0; c < 4; ++c)
+      acc[c] = agx_mov_imm(b, 32, 0);
+
+   for (unsigned i = 0; i < 6; ++i) {
+      agx_index vec = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_device_load_to(b, vec, address, agx_immediate(i * 16),
+                         AGX_FORMAT_I32, 0xf, 0, false);
+      agx_instr *split = agx_split(b, 4, vec);
+      for (unsigned c = 0; c < 4; ++c)
+         split->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+      for (unsigned c = 0; c < 4; ++c) {
+         agx_index scaled = agx_fmul(b, split->dest[c], w);
+         acc[c] = agx_ffma(b, scaled, w, acc[c]);
+      }
+   }
+   agx_index total = agx_fadd(b, agx_fadd(b, acc[0], acc[1]),
+                              agx_fadd(b, acc[2], acc[3]));
+   agx_unit_test(b, total);
+
+   agx_ilp_schedule(b->shader);
+   const unsigned in_flight = max_device_loads_in_flight(s.body);
+   EXPECT_GE(in_flight, 2u);
+   EXPECT_LE(in_flight, 4u);
+
+   /* Verify that the first two FMULs issue before the first FFMA (interleaving
+    * independent chains instead of completing lane 0's FMUL->FFMA before lane 1). */
+   unsigned fmuls_before_first_ffma = 0;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_FFMA)
+         break;
+      fmuls_before_first_ffma += I->op == AGX_OPCODE_FMUL;
+   }
+   EXPECT_GE(fmuls_before_first_ffma, 2u);
+   ralloc_free(s.mem);
 }

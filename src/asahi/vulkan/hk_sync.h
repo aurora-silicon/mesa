@@ -273,8 +273,11 @@ struct hk_sync_xfer_dst {
 struct hk_sync_stream {
    /* Recording order. Equal to list order for every pair the tracking
     * compares: a pre-graphics stream takes the number reserved just below
-    * its render so it sorts before it, where the list places it. */
+    * its render so it sorts before it, where the list places it. Multiple
+    * pre-graphics streams ahead of the same render break ties by pre_seq. */
    uint32_t seq;
+   uint32_t pre_seq;
+   uint32_t pre_count;
 
    /* The latest HK_SYNC_GFX_MEM stream on this stream's subqueue recorded
     * before it. */
@@ -298,9 +301,10 @@ struct hk_sync_stream {
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
 
    /* For a render: what its vertex (tiling) half needs, a subset of dep
-    * without the fragment-only requirements (HK_SYNC_GFX_FRAG) and tile
-    * hazards. Resolved like dep into barrier_ta/prior_ta; ta_split when
-    * they differ from barrier/prior. */
+    * without the fragment-only requirements (HK_SYNC_GFX_FRAG). Tile
+    * hazards stay in it: starting tiling ahead of them corrupts the shared
+    * tile. Resolved like dep into barrier_ta/prior_ta; ta_split when they
+    * differ from barrier/prior. */
    struct hk_sync_dep dep_ta[HK_SYNC_NUM_SQ];
    uint16_t barrier_ta[HK_SYNC_NUM_SQ];
    uint64_t prior_ta[HK_SYNC_NUM_SQ];
@@ -392,13 +396,20 @@ struct hk_sync_state {
    struct hk_cs *xfer_any;
    uint32_t xfer_version;
 
-   /* The draw state the last draw-time check found no noted write in: valid
-    * while xfer_version, the descriptor and vertex buffer generations and the
-    * index buffer are unchanged (hk_cmd_draw.c). */
+   /* Draw-state slices the last draw-time check found no noted write in:
+    * each slice stays valid independently while xfer_version and that
+    * slice's resource identity are unchanged (hk_cmd_draw.c). */
    struct {
-      bool valid;
-      uint32_t version;
-      uint64_t descriptors, vertex_buffers, index;
+      uint32_t desc_version;
+      uint32_t vb_version;
+      uint32_t index_version;
+      bool desc_valid;
+      bool vb_valid;
+      bool index_valid;
+      uint64_t descriptors;
+      uint64_t vertex_buffers;
+      uint64_t index_addr;
+      uint64_t index_range;
    } xfer_clean;
 
    /* A top-of-pipe timestamp waiting for the next stream to carry it as its
@@ -579,6 +590,14 @@ uint8_t hk_sync_host_flush_kinds(const VkDependencyInfo *info);
 void hk_sync_defer_host_flush(struct hk_cmd_buffer *cmd,
                               const VkDependencyInfo *info);
 
+/* The host availability a pipeline barrier asks for: the open compute stream
+ * to record the memory-scoped flush in, when that stream holds work and
+ * already follows the dependency's first scope (it then also waits for what
+ * that scope names), or NULL, with the flush deferred to the submission
+ * (hk_sync_defer_host_flush()) or none needed. */
+struct hk_cs *hk_sync_host_flush(struct hk_cmd_buffer *cmd,
+                                 const VkDependencyInfo *info);
+
 /* Take the deferred host-availability kinds, for an operation the host can
  * observe before the submission completes (an event write). */
 uint8_t hk_sync_take_host_flush(struct hk_cmd_buffer *cmd);
@@ -595,6 +614,9 @@ void hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
  * then every stream before self), or for a stream still to be created. */
 void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
+
+/* A compute stream for a query command, ordered after earlier query work. */
+struct hk_cs *hk_query_command_cs(struct hk_cmd_buffer *cmd);
 
 /* The render stream draws with a pre-rasterization shader that reads images:
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
@@ -722,6 +744,12 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * into its stream (hk_sync_load_resolved()) before emitting it. The streams
  * keep the fields of their last occurrence.
  */
+bool hk_sync_resolve_submit_ex(struct hk_queue *queue,
+                               struct hk_cmd_buffer *const *cmdbufs,
+                               unsigned count, bool first_cdm_is_flush,
+                               bool chain_first, uint64_t completed,
+                               struct hk_sync_resolved *out,
+                               bool *tail_raised_out);
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,
@@ -739,14 +767,16 @@ uint8_t hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq);
  * host flush its command buffers deferred (hk_sync_defer_host_flush()),
  * called after hk_sync_resolve_submit(). With exact priors it follows the
  * latest command of each of `kinds` and every requirement still carried, on
- * both subqueues and earlier submissions included, and with `chain` also the
- * submission's last command on each subqueue; legacy prefixes follow every
- * earlier command. base holds the ordinals before the submission, count its
- * commands on each subqueue. With exact priors it also takes the flush's
- * ordinal; false if that overflows. The flush is no later command's source:
- * no kind names it. */
+ * both subqueues and earlier submissions included, and the submission's last
+ * command on each subqueue it has commands on, as legacy prefixes do; with
+ * none there, legacy prefixes follow every earlier command. A flush that
+ * trails render-dependent compute work then names a render too, so the
+ * kernel takes it behind a render dependency like that work instead of as a
+ * command with no dependency. base holds the
+ * ordinals before the submission, count its commands on each subqueue. With
+ * exact priors it also takes the flush's ordinal; false if that overflows.
+ * The flush is no later command's source: no kind names it. */
 bool hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
-                               bool chain,
                                const uint64_t base[HK_SYNC_NUM_SQ],
                                const uint32_t count[HK_SYNC_NUM_SQ],
                                uint16_t barrier[HK_SYNC_NUM_SQ],
