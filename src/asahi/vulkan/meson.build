@@ -949,6 +949,13 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_gen5_shadow_gather_border',
+    executable('hk_gen5_shadow_gather_border_test',
+    files('tests/test-hk-gen5-shadow-gather-border.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_m5_vs_cprog', executable('hk_m5_vs_cprog_test',
     files('tests/test-hk-m5-vs-cprog.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
