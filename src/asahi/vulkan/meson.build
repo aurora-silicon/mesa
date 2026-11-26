@@ -1071,6 +1071,12 @@ if with_tests and ld_args_gc_sections.length() > 0
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_part_cache', executable('hk_part_cache_test',
+    files('tests/test-hk-part-cache.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_index_robustness', executable('hk_index_robustness_test',
     files('tests/test-hk-index-robustness.c'),
     include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
@@ -1140,6 +1146,21 @@ if with_tests
   hk_dual_source_gpl_test = executable(
     'hk-dual-source-gpl',
     files('tests/hk_dual_source_gpl.c'),
+    include_directories : [
+      inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm, include_directories('.'),
+    ],
+    dependencies : [hk_deps, cc.find_library('vulkan')],
+    # hk_cmd_buffer.h uses GNU void-pointer arithmetic in inline helpers.
+    c_args : [c_msvc_compat_args, '-Wno-pointer-arith'],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  # Shader-object binary import: round trip, and refusal of forged root
+  # metadata. Reads the binary layout from the driver's headers.
+  hk_vulkan_shader_binary_root = executable(
+    'hk-vulkan-shader-binary-root',
+    files('tests/hk_vulkan_shader_binary_root.c'), hk_entrypoints[0],
     include_directories : [
       inc_gallium, inc_gallium_aux, inc_include, inc_src, inc_asahi,
       inc_virtio_gpu, inc_virtio_vdrm, include_directories('.'),

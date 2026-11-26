@@ -36,8 +36,8 @@ hk_cmd_buffer_upload_root_for_shader(struct hk_cmd_buffer *cmd,
     * shader, which takes the whole table. */
    size_t root_size = sizeof(*root);
    if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) {
-      if (cs_shader && cs_shader->root_descriptor_size)
-         root_size = MIN2(root_size, cs_shader->root_descriptor_size);
+      if (cs_shader)
+         root_size = hk_shader_root_size(cs_shader);
    } else if ((agx_chip_native_hal200(dev->dev.chip) ||
                agx_chip_g17_m5(dev->dev.chip)) &&
               bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
