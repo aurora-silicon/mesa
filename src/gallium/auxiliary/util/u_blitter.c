@@ -2769,16 +2769,13 @@ static void *get_custom_vs(struct blitter_context *blitter)
    return ctx->custom_vs;
 }
 
-/**
- * Performs a custom blit to the destination surface, using the VS and FS
- * provided.
- *
- * Used by vc4 for the 8-bit linear-to-tiled blit.
- */
-void util_blitter_custom_shader(struct blitter_context *blitter,
-                                struct pipe_surface *dstsurf,
-                                unsigned width, unsigned height,
-                                void *custom_vs, void *custom_fs)
+static void
+blitter_custom_shader_rect(struct blitter_context *blitter,
+                           struct pipe_surface *dstsurf,
+                           unsigned width, unsigned height,
+                           int x1, int y1, int x2, int y2,
+                           unsigned num_layers,
+                           void *custom_vs, void *custom_fs)
 {
    struct blitter_context_priv *ctx = (struct blitter_context_priv*)blitter;
    struct pipe_context *pipe = ctx->base.pipe;
@@ -2814,15 +2811,55 @@ void util_blitter_custom_shader(struct blitter_context *blitter,
    blitter_set_common_draw_rect_state(ctx, false,
       util_framebuffer_get_num_samples(&fb_state) > 1);
    blitter_set_dst_dimensions(ctx, fb_state.width, fb_state.height);
-   blitter->draw_rectangle(blitter, ctx->velem_state, get_custom_vs,
-                           0, 0, fb_state.width, fb_state.height,
-                           0, 1, UTIL_BLITTER_ATTRIB_NONE, NULL);
+   blitter->draw_rectangle(blitter, ctx->velem_state,
+                           custom_vs ? get_custom_vs :
+                           num_layers > 1 ? get_vs_layered :
+                                            get_vs_passthrough_pos,
+                           x1, y1, x2, y2, 0, num_layers,
+                           UTIL_BLITTER_ATTRIB_NONE, NULL);
 
    util_blitter_restore_vertex_states(blitter);
    util_blitter_restore_fragment_states(blitter);
    util_blitter_restore_fb_state(blitter);
    util_blitter_restore_render_cond(blitter);
    util_blitter_unset_running_flag(blitter);
+}
+
+/**
+ * Performs a custom blit to the destination surface, using the VS and FS
+ * provided.
+ *
+ * Used by vc4 for the 8-bit linear-to-tiled blit.
+ */
+void util_blitter_custom_shader(struct blitter_context *blitter,
+                                struct pipe_surface *dstsurf,
+                                unsigned width, unsigned height,
+                                void *custom_vs, void *custom_fs)
+{
+   blitter_custom_shader_rect(blitter, dstsurf, width, height, 0, 0,
+                              width, height, 1, custom_vs, custom_fs);
+}
+
+/**
+ * Draws the rectangle (x1, y1)-(x2, y2) of every layer of the destination
+ * surface with a custom fragment shader; pixels outside the rectangle keep
+ * their contents. The vertex shader passes the position through and, for
+ * more than one layer, writes the layer (relative to the surface's first
+ * layer), which the fragment shader can read as VARYING_SLOT_LAYER.
+ */
+void util_blitter_custom_shader_rect(struct blitter_context *blitter,
+                                     struct pipe_surface *dstsurf,
+                                     int x1, int y1, int x2, int y2,
+                                     void *custom_fs)
+{
+   struct blitter_context_priv *ctx = (struct blitter_context_priv*)blitter;
+   unsigned width, height;
+   unsigned num_layers = dstsurf->last_layer - dstsurf->first_layer + 1;
+
+   assert(ctx->has_layered || num_layers == 1);
+   pipe_surface_size(dstsurf, &width, &height);
+   blitter_custom_shader_rect(blitter, dstsurf, width, height, x1, y1, x2, y2,
+                              num_layers, NULL, custom_fs);
 }
 
 static void *

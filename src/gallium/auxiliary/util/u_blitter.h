@@ -408,6 +408,13 @@ void util_blitter_custom_shader(struct blitter_context *blitter,
                                 unsigned width, unsigned height,
                                 void *custom_vs, void *custom_fs);
 
+/* Draws a rectangle of every layer of a surface with a custom fragment
+ * shader */
+void util_blitter_custom_shader_rect(struct blitter_context *blitter,
+                                     struct pipe_surface *dstsurf,
+                                     int x1, int y1, int x2, int y2,
+                                     void *custom_fs);
+
 /* Used by D3D12 for non-MSAA -> MSAA stencil blits */
 void util_blitter_stencil_fallback(struct blitter_context *blitter,
                                    struct pipe_resource *dst,
