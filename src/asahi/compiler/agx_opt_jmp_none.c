@@ -26,12 +26,13 @@
  *
  * On AGX3B a group with every lane off still spends a cycle per instruction, so
  * short guarded paths pay for the jump: 5 is 4-6% faster than 19 there, and
- * 10, 5 and 2 are alike. AGX3C fragment shaders share the lower threshold.
- * Other AGX3C stages keep COST_JMP for divergent conditions, so short
- * bounds-checked compute kernels do not emit spurious forward skips, and take
- * the lower threshold for a subgroup-uniform condition: every lane leaves the
- * arm together, so the jump is taken exactly when the arm would otherwise run
- * with no lane active.
+ * 10, 5 and 2 are alike. AGX3C fragment and compute shaders share the lower
+ * threshold. In compute that also puts a forward skip around the outer bounds
+ * check of short kernels, which almost every lane passes; on G17S the skipped
+ * empty arms elsewhere still make it a net win. Other AGX3C stages keep
+ * COST_JMP for divergent conditions and take the lower threshold for a
+ * subgroup-uniform condition: every lane leaves the arm together, so the jump
+ * is taken exactly when the arm would otherwise run with no lane active.
  */
 #define COST_JMP (19)
 #define COST_JMP_AGX3 (5)
@@ -174,7 +175,8 @@ try_insert_jmp(agx_context *ctx, agx_block *from, agx_instr *from_I,
 
    const bool low_cost_jmp =
       ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
-      ((ctx->stage == MESA_SHADER_FRAGMENT || from_I->uniform_cond) &&
+      ((ctx->stage == MESA_SHADER_FRAGMENT ||
+        mesa_shader_stage_is_compute(ctx->stage) || from_I->uniform_cond) &&
        ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
        !ctx->key->dev.emit_agx3d);
    const uint32_t cost_jmp = low_cost_jmp ? COST_JMP_AGX3 : COST_JMP;
