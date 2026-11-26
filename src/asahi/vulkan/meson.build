@@ -1634,7 +1634,7 @@ if with_tests and host_machine.system() == 'linux'
       '-Wl,--wrap=hk_sync_write_timestamp',
       '-Wl,--wrap=hk_sync_flush_pending_timestamp',
       '-Wl,--wrap=hk_sync_end_cs_if_timestamped',
-      '-Wl,--wrap=hk_sync_src_dep', '-Wl,--wrap=hk_sync_get_cs_after',
+      '-Wl,--wrap=hk_query_command_cs',
       '-Wl,--wrap=hk_flush_deferred_clears_why',
       '-Wl,--wrap=hk_cmd_invalidate_graphics_state',
       '-Wl,--wrap=hk_cmd_invalidate_compute_state',

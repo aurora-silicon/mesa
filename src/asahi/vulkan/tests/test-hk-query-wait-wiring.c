@@ -19,8 +19,7 @@ __typeof__(hk_sync_write_timestamp) __wrap_hk_sync_write_timestamp;
 __typeof__(hk_sync_flush_pending_timestamp)
    __wrap_hk_sync_flush_pending_timestamp;
 __typeof__(hk_sync_end_cs_if_timestamped) __wrap_hk_sync_end_cs_if_timestamped;
-__typeof__(hk_sync_src_dep) __wrap_hk_sync_src_dep;
-__typeof__(hk_sync_get_cs_after) __wrap_hk_sync_get_cs_after;
+__typeof__(hk_query_command_cs) __wrap_hk_query_command_cs;
 __typeof__(hk_flush_deferred_clears_why) __wrap_hk_flush_deferred_clears_why;
 __typeof__(hk_cmd_invalidate_graphics_state)
    __wrap_hk_cmd_invalidate_graphics_state;
@@ -98,25 +97,15 @@ __wrap_hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd)
    (void)cmd;
 }
 
-void
-__wrap_hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t kinds,
-                       struct hk_cs *self,
-                       struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
-{
-   (void)cmd;
-   (void)kinds;
-   (void)self;
-   memset(dep, 0, sizeof(*dep) * HK_SYNC_NUM_SQ);
-}
-
 struct hk_cs *
-__wrap_hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
-                            const struct hk_sync_dep dep[HK_SYNC_NUM_SQ])
+__wrap_hk_query_command_cs(struct hk_cmd_buffer *cmd)
 {
+   /* Query stream preparation moved into hk_sync.c. Replace that emission
+    * boundary directly so its same-object calls do not allocate GPU streams
+    * in this CPU-only recording fixture. */
    assert(cmd->state.query_reset_recording);
    assert(cmd->sync.kind_override == HK_SYNC_ALL);
    resets++;
-   (void)dep;
    return NULL;
 }
 
