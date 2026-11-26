@@ -12,7 +12,6 @@
 #include "vulkan/vulkan_core.h"
 #include "agx_pack.h"
 #include "hk_buffer.h"
-#include "hk_buffer_view.h"
 #include "hk_cmd_buffer.h"
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -370,7 +369,7 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_BLOCK_COPY,
    HK_META_OBJECT_KEY_G17P_MIP,
    HK_META_OBJECT_KEY_AGX3_GEN10_MIP,
-   HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
+   HK_META_OBJECT_KEY_BUFFER_FILL_LARGE,
    HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
    HK_META_OBJECT_KEY_AGX3_COMPRESSED_BUF2IMG,
    HK_META_OBJECT_KEY_BUFFER_COPY_BATCH,
@@ -6122,45 +6121,48 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
    hk_meta_end(cmd, &save, bind_point);
 }
 
+#define HK_FILL_LARGE_WG        256u
+#define HK_FILL_LARGE_UNROLL    8u
+#define HK_FILL_LARGE_WG_ELEMS  (HK_FILL_LARGE_WG * HK_FILL_LARGE_UNROLL)
+#define HK_FILL_LARGE_WG_BYTES  ((uint64_t)HK_FILL_LARGE_WG_ELEMS * 16u)
+/* Measured floor where fills are large enough to amortise a 32 KiB workgroup's
+ * partial-wave tail and benefit from the alternating sweep; smaller fills stay
+ * on vk_meta_fill_buffer_addr (1 KiB workgroups). */
+#define HK_FILL_LARGE_MIN_BYTES (8ull << 20)
+
 static void
-hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
-                        VkDeviceSize offset, VkDeviceSize size, uint32_t data,
-                        const struct hk_native_pbe_descriptor *expected)
+hk_fill_buffer_large(struct hk_cmd_buffer *cmd, uint64_t address,
+                     VkDeviceSize size, uint32_t data)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   const uint32_t key = HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE;
-   const VkDescriptorSetLayoutBinding binding = {
-      .binding = 0,
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
-      .descriptorCount = 1,
-      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-   };
-   const VkDescriptorSetLayoutCreateInfo desc_info = {
-      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-      .bindingCount = 1,
-      .pBindings = &binding,
-   };
+   const uint32_t key = HK_META_OBJECT_KEY_BUFFER_FILL_LARGE;
    /* Alternate the sweep direction from one recorded fill to the next. When
     * consecutive fills cover the same lines, such as a buffer cleared or
     * filled again and again, each fill then starts on the lines the previous
-    * one wrote last, which the system-level cache still holds: on the A18 Pro
-    * that takes about 24 % off a repeated 64 MiB fill. Sweeping from the end
-    * costs the same as from the start, so other fills see no difference. The
-    * counter is the device's rather than the command buffer's so that fills
-    * recorded one per command buffer alternate too. */
+    * one wrote last, which the system-level cache still holds. Sweeping from
+    * the end costs the same as from the start, so other fills see no
+    * difference. The counter is the device's rather than the command buffer's
+    * so that fills recorded one per command buffer alternate too. */
    const struct {
+      uint64_t address;
       uint32_t elements;
       uint32_t data;
       uint32_t reverse;
-   } push = {size / 16, data, p_atomic_inc_return(&dev->g17p_fills) & 1};
+      uint32_t pad;
+   } push = {
+      address,
+      size / 16,
+      data,
+      p_atomic_inc_return(&dev->large_fills) & 1,
+      0,
+   };
    const VkPushConstantRange push_range = {
       .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
       .size = sizeof(push),
    };
    VkPipelineLayout layout;
    VkResult result = vk_meta_get_pipeline_layout(
-      &dev->vk, &dev->meta, &desc_info, &push_range,
+      &dev->vk, &dev->meta, NULL, &push_range,
       &key, sizeof(key), &layout);
    if (result != VK_SUCCESS) {
       vk_command_buffer_set_error(&cmd->vk, result);
@@ -6170,31 +6172,54 @@ hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
    VkPipeline pipeline = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
    if (pipeline == VK_NULL_HANDLE) {
       nir_builder b = nir_builder_init_simple_shader(
-         MESA_SHADER_COMPUTE, NULL, "hk-meta-fill-buffer-pbe");
-      b.shader->info.workgroup_size[0] = 64;
+         MESA_SHADER_COMPUTE, NULL, "hk-meta-fill-buffer-large");
+      b.shader->info.workgroup_size[0] = HK_FILL_LARGE_WG;
       b.shader->info.workgroup_size[1] = 1;
       b.shader->info.workgroup_size[2] = 1;
-      nir_variable *image = nir_variable_create(
-         b.shader, nir_var_image,
-         glsl_image_type(GLSL_SAMPLER_DIM_BUF, false, GLSL_TYPE_UINT), "dest");
-      image->data.descriptor_set = 0;
-      image->data.binding = 0;
-      image->data.image.format = PIPE_FORMAT_R32G32B32A32_UINT;
-      image->data.access = ACCESS_NON_READABLE;
-      nir_def *index = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
-      nir_def *elements = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0));
-      nir_def *value = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_def *wg_id = nir_channel(&b, nir_load_workgroup_id(&b), 0);
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *wg_base = nir_imul_imm(&b, wg_id, HK_FILL_LARGE_WG_ELEMS);
+      nir_def *base_index = nir_iadd(&b, wg_base, lid);
+      nir_def *dst_base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 0));
+      nir_def *elements = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8));
+      nir_def *value = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 12));
+      nir_def *val4 = nir_replicate(&b, value, 4);
       nir_def *reverse = nir_ine_imm(
-         &b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8)), 0);
-      nir_push_if(&b, nir_ult(&b, index, elements));
-      nir_def *texel = nir_bcsel(
-         &b, reverse, nir_isub(&b, nir_iadd_imm(&b, elements, -1), index),
-         index);
-      nir_image_deref_store(
-         &b, &nir_build_deref_var(&b, image)->def, nir_pad_vec4(&b, texel),
-         nir_imm_int(&b, 0), nir_replicate(&b, value, 4), nir_imm_int(&b, 0),
-         .image_dim = GLSL_SAMPLER_DIM_BUF, .image_array = false,
-         .format = PIPE_FORMAT_R32G32B32A32_UINT, .src_type = nir_type_uint32);
+         &b, nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 16)), 0);
+      nir_def *last = nir_iadd_imm(&b, elements, -1);
+      nir_def *t0 =
+         nir_bcsel(&b, reverse, nir_isub(&b, last, base_index), base_index);
+      nir_def *step =
+         nir_bcsel(&b, reverse, nir_imm_int(&b, -(int32_t)HK_FILL_LARGE_WG),
+                   nir_imm_int(&b, (int32_t)HK_FILL_LARGE_WG));
+      /* Full workgroups skip per-element bounds checks; only the final
+       * partial workgroup (when elements is not a multiple of
+       * HK_FILL_LARGE_WG_ELEMS) executes the predicated tail. */
+      nir_push_if(&b, nir_ult(&b, nir_iadd_imm(&b, wg_base, HK_FILL_LARGE_WG_ELEMS - 1),
+                              elements));
+      {
+         for (unsigned u = 0; u < HK_FILL_LARGE_UNROLL; ++u) {
+            nir_def *idx =
+               u ? nir_iadd(&b, t0, nir_imul_imm(&b, step, u)) : t0;
+            nir_def *dst =
+               nir_iadd(&b, dst_base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 4));
+            nir_store_global(&b, val4, dst, .align_mul = 16);
+         }
+      }
+      nir_push_else(&b, NULL);
+      {
+         for (unsigned u = 0; u < HK_FILL_LARGE_UNROLL; ++u) {
+            nir_def *index =
+               u ? nir_iadd_imm(&b, base_index, u * HK_FILL_LARGE_WG) : base_index;
+            nir_push_if(&b, nir_ult(&b, index, elements));
+            nir_def *idx =
+               u ? nir_iadd(&b, t0, nir_imul_imm(&b, step, u)) : t0;
+            nir_def *dst =
+               nir_iadd(&b, dst_base, nir_ishl_imm(&b, nir_u2u64(&b, idx), 4));
+            nir_store_global(&b, val4, dst, .align_mul = 16);
+            nir_pop_if(&b, NULL);
+         }
+      }
       nir_pop_if(&b, NULL);
 
       const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
@@ -6220,87 +6245,33 @@ hk_g17p_fill_buffer_pbe(struct hk_cmd_buffer *cmd, VkBuffer buffer,
       }
    }
 
-   /* The view is owned by this recording until its normal reset/destruction.
-    * Its PBE addresses the original buffer; no image or alias is allocated. */
-   const VkBufferViewCreateInfo view_info = {
-      .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO,
-      .buffer = buffer,
-      .format = VK_FORMAT_R32G32B32A32_UINT,
-      .offset = offset,
-      .range = size,
-   };
-   VkBufferView view;
-   result = vk_meta_create_buffer_view(&cmd->vk, &dev->meta, &view_info, &view);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd->vk, result);
-      return;
-   }
-
-   /* CreateBufferView can represent a refused format with a null PBE.
-    * Require the exact descriptor accepted by our existing codec preflight. */
-   VK_FROM_HANDLE(hk_buffer_view, native_view, view);
-   if (memcmp(&native_view->pbe, expected, sizeof(*expected)) != 0) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FORMAT_NOT_SUPPORTED);
-      return;
-   }
-
-   const VkWriteDescriptorSet write = {
-      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-      .dstBinding = 0,
-      .descriptorCount = 1,
-      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
-      .pTexelBufferView = &view,
-   };
    const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
    VkCommandBuffer cb = vk_command_buffer_to_handle(&cmd->vk);
    disp->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-   disp->CmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                layout, 0, 1, &write);
    disp->CmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT,
                           0, sizeof(push), &push);
-   disp->CmdDispatch(cb, DIV_ROUND_UP(push.elements, 64), 1, 1);
+   disp->CmdDispatch(cb, DIV_ROUND_UP(push.elements, HK_FILL_LARGE_WG_ELEMS), 1, 1);
 }
 
 static bool
-hk_g17p_fill_buffer_pbe_supported(const struct hk_device *dev,
-                                  const struct hk_buffer *buffer,
-                                  uint64_t address, uint64_t offset,
-                                  uint64_t size,
-                                  struct hk_native_pbe_descriptor *pbe)
+hk_fill_buffer_large_supported(const struct hk_device *dev, uint64_t address,
+                               uint64_t size)
 {
-   const struct hk_physical_device *pdev =
-      (const struct hk_physical_device *)dev->vk.physical;
-   if (!agx_chip_native_or_m5(dev->dev.chip) || buffer->va ||
-       size < (64u << 20) || ((address | offset | size) & 15) ||
-       !address || size > UINT64_MAX - address ||
-       size / 16 > pdev->vk.properties.maxTexelBufferElements)
-      return false;
-
-   /* Match CreateBufferView's ordinary RGBA32_UINT linear PBE. Let the
-    * existing codec prove address, stride and dimension representability. */
-   struct AGX_PBE semantic = {
-      AGX_PBE_header,
-      .dimension = AGX_TEXTURE_DIMENSION_2D,
-      .layout = AGX_LAYOUT_LINEAR,
-      .channels = AGX_CHANNELS_R32G32B32A32,
-      .type = AGX_TEXTURE_TYPE_UINT,
-      .swizzle_r = 0, .swizzle_g = 1, .swizzle_b = 2, .swizzle_a = 3,
-      .buffer = address,
-      .width = AGX_TEXTURE_BUFFER_WIDTH,
-      .height = DIV_ROUND_UP(size / 16, AGX_TEXTURE_BUFFER_WIDTH),
-      .stride = AGX_TEXTURE_BUFFER_WIDTH * 16 - 4,
-      .layers = 1,
-      .levels = 1,
-   };
-   const unsigned generation = agx_chip_descriptor_generation(dev->dev.chip);
-   if (!hk_pack_native_pbe(generation, pbe, &semantic))
-      return false;
-
-   /* The last stored texel must stay in the codec's supported address domain
-    * too; size and address were already checked for alignment and overflow. */
-   semantic.buffer = address + size - 16;
-   struct hk_native_pbe_descriptor last;
-   return hk_pack_native_pbe(generation, &last, &semantic);
+   /* Each workgroup writes HK_FILL_LARGE_WG_BYTES (256 threads x 8 unrolled
+    * uint4 stores = 32 KiB). Require at least HK_FILL_LARGE_MIN_BYTES (8 MiB)
+    * and at least one full workgroup per GPU core so smaller in-cache fills
+    * keep vk_meta_fill_buffer_addr's 1 KiB workgroups without wave-tail loss,
+    * while staying 16-byte aligned and within 32-bit element indexing without
+    * wg_base + HK_FILL_LARGE_WG_ELEMS overflow. */
+   const uint64_t core_bytes =
+      (uint64_t)agx_get_num_cores(&dev->dev) * HK_FILL_LARGE_WG_BYTES;
+   const uint64_t min_bytes = MAX2(HK_FILL_LARGE_MIN_BYTES, core_bytes);
+   return core_bytes != 0 &&
+          size >= min_bytes &&
+          ((address | size) & 15) == 0 &&
+          address != 0 &&
+          size <= UINT64_MAX - address &&
+          (size / 16) <= UINT32_MAX - HK_FILL_LARGE_WG_ELEMS;
 }
 
 static void
@@ -6319,10 +6290,8 @@ hk_xfer_fillbuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
          vk_meta_buffer_address(&dev->vk, dstBuffer, dstOffset, dstRange);
       struct hk_meta_save save;
       hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
-      struct hk_native_pbe_descriptor pbe;
-      if (hk_g17p_fill_buffer_pbe_supported(dev, buffer, address, dstOffset,
-                                           size, &pbe))
-         hk_g17p_fill_buffer_pbe(cmd, dstBuffer, dstOffset, size, data, &pbe);
+      if (hk_fill_buffer_large_supported(dev, address, size))
+         hk_fill_buffer_large(cmd, address, size, data);
       else
          vk_meta_fill_buffer_addr(&cmd->vk, &dev->meta, address, size, data);
       hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
