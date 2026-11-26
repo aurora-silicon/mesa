@@ -12,6 +12,7 @@
 
 #include "agx_helpers.h"
 #include "agx_bg_eot_key.h"
+#include "agx_chip_caps.h"
 #include "agx_nir_texture.h"
 #include "agx_pack.h"
 #include "hk_device.h"
@@ -402,14 +403,15 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
       cfg.unk_mipmapped = layout->levels > 1;
       cfg.srgb_2_channel = cfg.srgb && util_format_colormask(desc) == 0x3;
 
-      /* On native HAL200 (G16G/G17P), spilled compressed colour attachments are
-       * decompressed in place before the render pass and written through an
-       * uncompressed eMRT PBE. Keeping emrt_texture uncompressed avoids
-       * compressed-read vs uncompressed-write texture-cache hazards during
-       * in-pass blending. */
+      /* With Gen9 compression (AGX_CAP_HAL200_LOSSLESS_COMPRESSION), spilled
+       * compressed colour attachments are decompressed in place before the
+       * render pass and written through an uncompressed eMRT PBE. Keeping
+       * emrt_texture uncompressed avoids compressed-read vs uncompressed-write
+       * texture-cache hazards during in-pass blending. */
       const bool compressed_tex =
          layout->compressed &&
-         !(agx_chip_native_hal200(dev->dev.chip) &&
+         !(agx_chip_has_cap(dev->dev.chip,
+                            AGX_CAP_HAL200_LOSSLESS_COMPRESSION) &&
            usage == HK_DESC_USAGE_EMRT);
       if (compressed_tex) {
          cfg.compressed = true;

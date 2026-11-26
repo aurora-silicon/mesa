@@ -101,13 +101,14 @@ target_is_agx3(const char *target)
 
 /* Whether a target decompresses spilled compressed colour attachments in place
  * (libagx_agx3_decompress, and libagx_reset_compression_metadata for the
- * attachments a pass discards): native HAL200, and the chips with private
+ * attachments a pass discards and for whole-level uploads): the chips with
+ * Gen9 compression (AGX_CAP_HAL200_LOSSLESS_COMPRESSION) and with private
  * Gen10 compression (AGX_CAP_GEN10_2D_COMPRESSION). */
 static bool
 target_has_spill_decompress(const char *target)
 {
    const enum agx_chip chip = target_chip(target);
-   return agx_chip_native_hal200(chip) ||
+   return agx_chip_has_cap(chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
           agx_chip_has_cap(chip, AGX_CAP_GEN10_2D_COMPRESSION);
 }
 

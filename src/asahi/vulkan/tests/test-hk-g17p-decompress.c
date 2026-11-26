@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: MIT
  *
  * Verify the precompiled in-place decompression kernels
- * (libagx_agx3_decompress, libagx_reset_compression_metadata) of HAL200 (G17P
- * and G16G) and of Gen10 private compression (AGX_CAP_GEN10_2D_COMPRESSION,
+ * (libagx_agx3_decompress, libagx_reset_compression_metadata) of Gen9
+ * compression (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G17P, G16G and the G15S
+ * library) and of Gen10 private compression (AGX_CAP_GEN10_2D_COMPRESSION,
  * the M5's g17g library; not g18g), hk_g17p_decompress_pack_mode(),
  * hk_g17p_decompress_image_type_supported(), Gen9 compressed texture
  * descriptor packing across all admitted colour formats and shapes, and the
@@ -68,12 +69,17 @@ main(void)
    assert(agx_chip_has_cap(AGX_CHIP_G17G, AGX_CAP_GEN10_2D_COMPRESSION));
    assert(!agx_chip_has_cap(AGX_CHIP_G18G, AGX_CAP_GEN10_2D_COMPRESSION));
 
-   /* Verify libagx_reset_compression_metadata on HAL200 (G17P, G16G), Gen10
-    * (g17g) and AGX2, and its absence from g18g. */
+   /* Verify libagx_reset_compression_metadata on Gen9 (G17P, G16G, G15S),
+    * Gen10 (g17g) and AGX2, and its absence from g15g and g18g. */
+   assert(agx_chip_has_cap(AGX_CHIP_G15S, AGX_CAP_HAL200_LOSSLESS_COMPRESSION));
+   assert(!agx_chip_has_cap(AGX_CHIP_G15G, AGX_CAP_HAL200_LOSSLESS_COMPRESSION));
    check_kernel(libagx_g17p[LIBAGX_RESET_COMPRESSION_METADATA],
                 "libagx_reset_compression_metadata (g17p)");
    check_kernel(libagx_g16g[LIBAGX_RESET_COMPRESSION_METADATA],
                 "libagx_reset_compression_metadata (g16g)");
+   check_kernel(libagx_g15s[LIBAGX_RESET_COMPRESSION_METADATA],
+                "libagx_reset_compression_metadata (g15s)");
+   assert(libagx_g15g[LIBAGX_RESET_COMPRESSION_METADATA] == NULL);
    check_kernel(libagx_g17g[LIBAGX_RESET_COMPRESSION_METADATA],
                 "libagx_reset_compression_metadata (g17g)");
    assert(libagx_g18g[LIBAGX_RESET_COMPRESSION_METADATA] == NULL);
@@ -81,17 +87,17 @@ main(void)
    assert(libagx_g13x[LIBAGX_RESET_COMPRESSION_METADATA] != NULL);
 
    /* Verify all 6 variants of libagx_agx3_decompress (1x/2x/4x x 2D/array)
-    * on G17P, G16G and g17g, and exclusion from the other targets. */
+    * on G17P, G16G, G15S and g17g, and exclusion from the other targets. */
    for (unsigned s = 0; s < 3; ++s) {
       for (unsigned layered = 0; layered < 2; ++layered) {
          const unsigned prog = LIBAGX_AGX3_DECOMPRESS(s, layered);
          check_kernel(libagx_g17p[prog], "libagx_agx3_decompress (g17p)");
          check_kernel(libagx_g16g[prog], "libagx_agx3_decompress (g16g)");
          check_kernel(libagx_g17g[prog], "libagx_agx3_decompress (g17g)");
+         check_kernel(libagx_g15s[prog], "libagx_agx3_decompress (g15s)");
          assert(libagx_g13g[prog] == NULL);
          assert(libagx_g13x[prog] == NULL);
          assert(libagx_g15g[prog] == NULL);
-         assert(libagx_g15s[prog] == NULL);
          assert(libagx_g18g[prog] == NULL);
       }
    }

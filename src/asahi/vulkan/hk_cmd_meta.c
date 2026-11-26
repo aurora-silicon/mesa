@@ -4668,6 +4668,40 @@ hk_g17p_tiled_upload(struct hk_cmd_buffer *cmd,
    disp->CmdDispatch(cb, groups[0], groups[1], groups[2]);
 }
 
+/*
+ * A HAL200 (Gen9) compressed 2D colour image keeps its body in the plain GPU
+ * tiling, with one metadata word per 16x16 tile beside it (the layout the
+ * in-place decompression writes back). An upload that rewrites a whole mip
+ * level can therefore take the raw tiled upload, which overlaps across
+ * submissions, and then mark that level's tiles uncompressed, instead of a
+ * render pass. The next render into the image compresses the tiles again.
+ * A level too small to be allocated compressed is plain already. Any other
+ * partial upload keeps the graphics path, which merges into compressed tiles.
+ */
+static bool
+hk_hal200_upload_bypasses_compression(const struct hk_device *dev,
+                                      const struct hk_image *image,
+                                      const struct ail_layout *layout,
+                                      const VkBufferImageCopy2 *region)
+{
+   const uint32_t level = region->imageSubresource.mipLevel;
+   if (!agx_chip_has_cap(dev->dev.chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
+       layout->tiling != AIL_TILING_GPU || layout->sample_count_sa != 1 ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT)
+      return false;
+
+   if (!ail_is_level_allocated_compressed(layout, level))
+      return true;
+
+   return region->imageOffset.x == 0 && region->imageOffset.y == 0 &&
+          region->imageOffset.z == 0 &&
+          region->imageExtent.width ==
+             u_minify(image->vk.extent.width, level) &&
+          region->imageExtent.height ==
+             u_minify(image->vk.extent.height, level);
+}
+
 static bool
 hk_g17p_copy_uncompressed_buffer_to_image_supported(
    struct hk_device *dev, const struct hk_buffer *buffer,
@@ -4687,7 +4721,8 @@ hk_g17p_copy_uncompressed_buffer_to_image_supported(
       const struct ail_layout *layout = &image->planes[plane].layout;
       if ((layout->tiling != AIL_TILING_GPU &&
            layout->tiling != AIL_TILING_LINEAR) ||
-          layout->compressed ||
+          (layout->compressed && !hk_hal200_upload_bypasses_compression(
+                                    dev, image, layout, region)) ||
           (layout->tiling == AIL_TILING_LINEAR && image->vk.mip_levels != 1))
          return false;
 
@@ -4798,6 +4833,28 @@ hk_g17p_copy_uncompressed_buffer_to_image(
          libagx_copy_image_struct(
             cmd, agx_2d(plan.width_el, plan.height_el), AGX_BARRIER_NONE,
             args);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return;
+      }
+
+      /* The body now holds plain texels: mark the level's tiles uncompressed
+       * (hk_hal200_upload_bypasses_compression). Like the upload itself this
+       * needs no ordering inside the copy; the consumer's transfer barrier
+       * orders both before any read. */
+      if (layout->compressed &&
+          ail_is_level_allocated_compressed(layout, level)) {
+         struct ail_layout *meta_layout = &image->planes[plane].layout;
+         const uint16_t width_tl = ail_metadata_width_tl(meta_layout, level);
+         const uint16_t height_tl = ail_metadata_height_tl(meta_layout, level);
+         const uint64_t metadata =
+            base_dst + layout->metadata_offset_B +
+            layout->level_offsets_compressed_B[level] +
+            (uint64_t)plan.first_slice * layout->compression_layer_stride_B;
+         libagx_reset_compression_metadata(
+            cmd, agx_3d(width_tl, height_tl, plan.slice_count),
+            AGX_BARRIER_NONE, metadata,
+            ail_tile_mode_uncompressed(layout->format),
+            layout->compression_layer_stride_B / 8, width_tl, height_tl);
          if (vk_command_buffer_has_error(&cmd->vk))
             return;
       }

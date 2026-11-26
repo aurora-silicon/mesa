@@ -3705,15 +3705,15 @@ hk_tilebuffer_layout(const struct hk_device *dev, const VkFormat *vk_formats,
  * Compressed multisample targets are at most eight bytes, so all eight fit
  * the 4x sample budget (64 bytes) and do not spill when allocated first.
  *
- * On native HAL200 (G16G/G17P), spilled compressed colour attachments
- * decompress in place via libagx_agx3_decompress before the render pass.
- * Keeping compressed MSAA targets resident when they fit avoids unnecessary
- * decompression. */
+ * With Gen9 compression (AGX_CAP_HAL200_LOSSLESS_COMPRESSION), spilled
+ * compressed colour attachments decompress in place via
+ * libagx_agx3_decompress before the render pass. Keeping compressed MSAA
+ * targets resident when they fit avoids unnecessary decompression. */
 static uint8_t
 hk_resident_attachments(const struct hk_device *dev,
                         const struct hk_rendering_state *render)
 {
-   if (!(agx_chip_native_hal200(dev->dev.chip) ||
+   if (!(agx_chip_has_cap(dev->dev.chip, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
          agx_chip_g17_m5(dev->dev.chip)) ||
        render->tilebuffer.nr_samples <= 1)
       return 0;
@@ -5461,14 +5461,17 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                unsigned layer = view->vk.base_array_layer;
                uint64_t base = hk_image_base_address(image, image_plane);
 
-               /* Native HAL200 decompresses every spilled compressed colour
-                * attachment with libagx_agx3_decompress. Gen10 private
-                * compression (AGX_CAP_GEN10_2D_COMPRESSION) takes the same
-                * program, at its 16x8 metadata tile (ail_metadata_tile()), for
-                * the single-sample 16-byte targets an eight-target pass
+               /* Gen9 compression (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G15S,
+                * G16G and G17P) decompresses every spilled compressed colour
+                * attachment with libagx_agx3_decompress, which reads Gen9
+                * descriptors whatever the command-stream generation. Gen10
+                * private compression (AGX_CAP_GEN10_2D_COMPRESSION) takes the
+                * same program, at its 16x8 metadata tile (ail_metadata_tile()),
+                * for the single-sample 16-byte targets an eight-target pass
                 * spills; 2x/4x RGBA16F takes libagx_m5_decompress_rgba16f
                 * below. */
-               if (agx_chip_native_hal200(dev->dev.chip) ||
+               if (agx_chip_has_cap(dev->dev.chip,
+                                    AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ||
                    (agx_chip_has_cap(dev->dev.chip,
                                      AGX_CAP_GEN10_2D_COMPRESSION) &&
                     layout->sample_count_sa == 1 &&
