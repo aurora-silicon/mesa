@@ -4947,6 +4947,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          terminate_size + HK_CS_SPACE_PADDING + AGX_CDM_STREAM_LINK_LENGTH,
    };
    const bool trace = hk_pack_trace();
+   const bool prof_dump = debug_get_bool_option("HK_PACK_PROFILE_DUMP", false);
+   const bool prof_split = debug_get_bool_option("HK_PACK_PROFILE_SPLIT", false);
+   static unsigned prof_dumped_242 = 0;
+   const bool do_prof_dump = prof_dump && n >= 200 && prof_dumped_242 == 0;
    const int64_t t0_ns = trace ? os_time_get_nano() : 0;
 
    struct hk_pack_member *members =
@@ -5718,14 +5722,18 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       hk_cmd_pending_reap(dev);
 
    const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
-   out->bo = agx_bo_create(&dev->dev, total, 0,
+   const bool split_active = prof_split && n >= 200;
+   const size_t split_per_pkt = 4096u;
+   const size_t alloc_total = split_active ? (total + (size_t)n * split_per_pkt) : total;
+   out->bo = agx_bo_create(&dev->dev, alloc_total, 0,
                            cached ? AGX_BO_WRITEBACK : 0,
                            "Packed compute submit");
    uint8_t *map = out->bo ? agx_bo_map(out->bo) : NULL;
    struct vk_command_buffer **commands =
       hk_queue_pack_scratch(&queue->pack.commands,
-                            n - packed_members + run_count, sizeof(*commands));
-   if (!map || !commands || !hk_queue_pack_ensure_packets(queue, run_count) ||
+                            split_active ? n : (n - packed_members + run_count),
+                            sizeof(*commands));
+   if (!map || !commands || !hk_queue_pack_ensure_packets(queue, split_active ? n : run_count) ||
        !hk_pack_add_bo(out->extra_bos, out->bo)) {
       hk_packed_runs_free(dev, out);
       memset(out, 0, sizeof(*out));
@@ -5809,20 +5817,28 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       }
 
       const struct hk_pack_run *pr = &runs[r];
-      struct hk_packed_submit *packet = &out->packets[out->packet_count++];
-      struct hk_cmd_buffer *cmd = &packet->cmd;
-      struct hk_cs *cs = &packet->cs;
-      hk_pack_init_packet(cmd, cs, dev, map + pr->offset,
-                          out->bo->va->addr + pr->offset, pr->bytes,
-                          visible_completion);
+      size_t split_off = pr->offset;
+      unsigned prof_ord = 0;
+      struct hk_packed_submit *packet = NULL;
+      struct hk_cmd_buffer *cmd = NULL;
+      struct hk_cs *cs = NULL;
+      if (!split_active) {
+         packet = &out->packets[out->packet_count++];
+         cmd = &packet->cmd;
+         cs = &packet->cs;
+         hk_pack_init_packet(cmd, cs, dev, map + pr->offset,
+                             out->bo->va->addr + pr->offset, pr->bytes,
+                             visible_completion);
+      }
 
       bool has_non_self = false;
       for (unsigned m = 0; m < pr->count; ++m) {
          const unsigned idx = pr->first + m;
          const struct hk_cmd_buffer *source =
             (const void *)submit->command_buffers[idx];
-         cs->sync.kind |= list_first_entry(&source->control_streams,
-                                           struct hk_cs, node)->sync.kind;
+         if (!split_active)
+            cs->sync.kind |= list_first_entry(&source->control_streams,
+                                              struct hk_cs, node)->sync.kind;
          if (!plans[idx].is_self_copy)
             has_non_self = true;
          /* Pre-suppress preceding im2col/dw_a members fused into a later GEMM
@@ -6174,8 +6190,18 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          if (suppressed) {
             if (is_suppressed_self && !suppressed_arr[idx])
                self_elided++;
-            hk_pack_fold_attachments(cs, item);
+            if (!split_active)
+               hk_pack_fold_attachments(cs, item);
          } else {
+            if (split_active) {
+               packet = &out->packets[out->packet_count++];
+               cmd = &packet->cmd;
+               cs = &packet->cs;
+               hk_pack_init_packet(cmd, cs, dev, map + split_off,
+                                   out->bo->va->addr + split_off, split_per_pkt,
+                                   visible_completion);
+               cs->sync.kind |= item->sync.kind;
+            }
             bool fused = false;
             const struct hk_pack_fuse_plan *pl = &plans[idx];
             struct hk_shader *fused_shader =
@@ -6469,6 +6495,26 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   if (needs_root)
                      root_off += root_stride;
                   hk_pack_fold_attachments(cs, item);
+                  if (split_active) {
+                     if (pl->im2col_idx_off) {
+                        const struct hk_cmd_buffer *s0 = (const void *)submit->command_buffers[idx - pl->im2col_idx_off];
+                        hk_pack_fold_attachments(cs, list_first_entry(&s0->control_streams, struct hk_cs, node));
+                     }
+                     if (pl->dw_a_idx_off) {
+                        for (unsigned j = idx - pl->dw_a_idx_off; j < idx; ++j) {
+                           const struct hk_cmd_buffer *s0 = (const void *)submit->command_buffers[j];
+                           hk_pack_fold_attachments(cs, list_first_entry(&s0->control_streams, struct hk_cs, node));
+                        }
+                     }
+                     for (unsigned k = 1; k < pl->span; ++k) {
+                        const struct hk_cmd_buffer *s0 = (const void *)submit->command_buffers[idx + k];
+                        hk_pack_fold_attachments(cs, list_first_entry(&s0->control_streams, struct hk_cs, node));
+                     }
+                     if (pl->dual_write == HK_COMPUTE_PAIR_DUAL_COPY2) {
+                        const struct hk_cmd_buffer *s0 = (const void *)submit->command_buffers[idx + pl->dual2_idx_off];
+                        hk_pack_fold_attachments(cs, list_first_entry(&s0->control_streams, struct hk_cs, node));
+                     }
+                  }
                   hk_pack_dedup_resources(&cs->compute_resources, unique);
                   for (unsigned k = 1; k < pl->span; ++k)
                      suppressed_arr[idx + k] = true;
@@ -6525,7 +6571,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   break;
                }
             }
-            const bool eff_last = next_idx == UINT32_MAX;
+            const bool eff_last = split_active || next_idx == UINT32_MAX;
 
             if (eff_last) {
                if (visible_completion) {
@@ -6647,9 +6693,74 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   }
                }
             }
+
+            if (do_prof_dump) {
+               const struct hk_compute_pair_dispatch *cp =
+                  hk_compute_pair_stream_eligible(item) ? item->compute_pair : NULL;
+               int32_t m_v = 0, n_v = 0, k_v = 0;
+               if (cp && cp->info.role == HK_COMPUTE_PAIR_GEMM) {
+                  memcpy(&n_v, cp->push + cp->info.gemm.n_offset_B, 4);
+                  memcpy(&k_v, cp->push + cp->info.gemm.k_offset_B, 4);
+                  if (cp->info.gemm.is_guarded)
+                     memcpy(&m_v, cp->push + cp->info.gemm.m_offset_B, 4);
+                  else
+                     m_v = (int32_t)(cp->groups[1] * 32u);
+               } else if (cp && cp->info.role == HK_COMPUTE_PAIR_DEPTHWISE) {
+                  memcpy(&m_v, cp->push + cp->info.depthwise.height_offset_B, 4);
+                  memcpy(&n_v, cp->push + cp->info.depthwise.width_offset_B, 4);
+                  memcpy(&k_v, cp->push + cp->info.depthwise.channels_offset_B, 4);
+               }
+               const struct hk_shader *sh = fused ? fused_shader : NULL;
+               const unsigned skip_mask =
+                  (pl->skip_c ? 1u : 0u) | (pl->skip_fadd_dst ? 2u : 0u) |
+                  (pl->skip_pad_dst ? 4u : 0u) | (pl->skip_dw_dst1 ? 8u : 0u) |
+                  (pl->skip_dw_dst2 ? 16u : 0u) | (pl->skip_im2_dst ? 32u : 0u);
+               const char *bact = "elide";
+               if (eff_last) bact = "end";
+               else if (cs->current == cs->strong_flush_end) bact = "strong";
+               else if (cs->current == cs->weak_barrier_end) bact = "weak";
+               fprintf(stderr,
+                       "PROF_DISP ord=%u idx=%u role=%u fused=%d alt=%u eff_alt=%u dual=%u im2=%u dwa=%u span=%u skip=0x%x "
+                       "M=%d N=%d K=%d thr=%ux%ux%u loc=%ux%ux%u sh_gprs=%u sh_ins=%u sh_mem=%u bact=%s\n",
+                       prof_ord, idx, cp ? cp->info.role : 0u, (int)fused,
+                       cp ? cp->alt_kind : 0u,
+                       pl->alt_kind_override ? pl->alt_kind_override : (cp ? cp->alt_kind : 0u),
+                       pl->dual_write, pl->im2col_idx_off, pl->dw_a_idx_off, pl->span, skip_mask,
+                       m_v, n_v, k_v,
+                       cp ? cp->exec_threads[0] : 0u, cp ? cp->exec_threads[1] : 0u, cp ? cp->exec_threads[2] : 0u,
+                       cp ? cp->exec_local[0] : 0u, cp ? cp->exec_local[1] : 0u, cp ? cp->exec_local[2] : 0u,
+                       sh ? sh->b.info.nr_gprs : 0u, sh ? sh->b.info.stats.instrs : 0u,
+                       sh ? sh->b.info.local_size : 0u, bact);
+            }
+            prof_ord++;
+
+            if (split_active) {
+               uint8_t pk = 0;
+               hk_pack_fold_member(cmd, cs, source, item, true, &pk);
+               memcpy(cs->current, terminate, terminate_size);
+               cs->current = (uint8_t *)cs->current + terminate_size;
+               memset(cs->current, 0, HK_CS_SPACE_PADDING);
+               const size_t written =
+                  (uint8_t *)cs->current - (uint8_t *)cs->start + HK_CS_SPACE_PADDING;
+               if (cached)
+                  util_flush_range_no_fence(cs->start, written);
+               hk_pack_finish_sync(cmd, cs);
+               out->commands[out->command_count++] = &cmd->vk;
+               split_off = ALIGN_POT(split_off + written, 64u);
+               continue;
+            }
          }
+         if (split_active)
+            continue;
 
          hk_pack_fold_member(cmd, cs, source, item, last, &preceding_kinds);
+      }
+      if (do_prof_dump)
+         prof_dumped_242 = 1;
+      if (split_active) {
+         i += pr->count;
+         r++;
+         continue;
       }
 
       assert(!cs->stream_linked);
