@@ -91,3 +91,53 @@ regressions to fix, not accepted results.
 
 The samples are every 5th 6,000-case chunk of the VK-CTS 1.4.7.1 vk-default mustpass (3,215,124
 cases), so cases outside them have no expectation yet.
+
+## Borealis compared with upstream asahi
+
+What the data shows today (aurora-wip `3f1c2bc3` against upstream Mesa `ab0ab2209c4e`, the copy in
+`src/asahi`):
+
+- **GPUs.** Upstream knows G13 and G14 (M1, M2: `AGX_CHIP_G13G/G13X/G14G/G14X`). These trees add
+  G15 (M3), G16 (M4), G17 (M5, and the A18 Pro's G17P) and G18 (M6), 23 chip entries in total.
+  Upstream does not run on M3 and later at all.
+- **Vulkan extensions.** Borealis's extension table lists 192 extensions, upstream Honeykrisp's 168;
+  none is upstream-only. The 24 Borealis-only ones (some only on the chips that support them):
+  EXT_attachment_feedback_loop_dynamic_state, EXT_descriptor_buffer, EXT_external_memory_host,
+  EXT_fragment_shader_interlock, EXT_memory_priority, EXT_mesh_shader, EXT_nested_command_buffer,
+  EXT_pageable_device_local_memory, EXT_pipeline_library_group_handles,
+  EXT_ray_tracing_invocation_reorder, EXT_shader_atomic_float, EXT_shader_atomic_float2,
+  EXT_texture_compression_astc_hdr, KHR_acceleration_structure, KHR_compute_shader_derivatives,
+  KHR_cooperative_matrix, KHR_deferred_host_operations, KHR_ray_query, KHR_ray_tracing_maintenance1,
+  KHR_ray_tracing_pipeline, KHR_ray_tracing_position_fetch, KHR_shader_bfloat16,
+  KHR_unified_image_layouts, NV_cooperative_matrix2.
+- **Conformance on our GPUs.** See the baselines table above (Borealis only).
+
+Not measured yet, and needed before an upstream series argues for M1 and M2: upstream Honeykrisp and
+the upstream Gallium driver on the same M1 Pro and M2 Macs, same CTS lists and same kernel, for
+CTS pass deltas, and gpubench/game-trace performance for both drivers. The rows kit in
+`kits/test/20261126-borealis-split` takes any overlay pair, so this is one more overlay built from
+upstream main.
+
+## Sharing code with upstream asahi
+
+`src/aurora` carries its own copy of everything upstream keeps in `src/asahi`. How far each part
+has moved since `ab0ab2209c4e` (commits on aurora-wip touching it, upstream files changed):
+
+| Part | Commits | Lines added | Upstream files changed | Sharing outlook |
+|------|---------|-------------|------------------------|-----------------|
+| `vulkan` | 1,066 | 212k | most | separate driver (Borealis) |
+| `compiler` | 770 | 362k | most | AGX3 backend is new; the AGX2 core could be shared if upstream takes our fixes |
+| `lib` | 310 | 54k | many | device/BO layer shareable, AGX3 command stream ours |
+| Gallium driver + winsys | 234 | | most | separate driver |
+| `libagx` | 47 | 3.6k | few | good candidate to share |
+| `drm-shim` | 39 | 4.9k | few | good candidate to share |
+| `genxml` | 27 | 2.5k | few | AGX2 XML shareable; AGX3 XML added beside it |
+| `clc` | 26 | 0.5k | few | shareable |
+| `layout` | 20 | 1.4k | few | shareable |
+| `isa` | 7 | 18k | few | AGX2 description shareable; AGX3 added beside it |
+
+`ci/aurora-divergence.py` gives the per-file picture. For an upstream series the plan is: send the
+fixes that apply to upstream's AGX2 code to upstream asahi first; once a part (layout, clc, libagx,
+drm-shim, the AGX2 halves of genxml and isa) matches upstream again, build Borealis against the
+upstream copy instead of ours, so that only the AGX3-specific code and the Borealis driver are new.
+A human submits and talks to upstream; no tool interacts with upstream merge requests.
