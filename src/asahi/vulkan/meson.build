@@ -163,6 +163,14 @@ hk_entrypoints = custom_target(
 )
 
 if with_tests
+  # Unit tests of the synchronization regression runner (no Vulkan).
+  test(
+    'borealis-sync-runner',
+    prog_python,
+    args : [files('tests/sync/test_runner.py')],
+    suite : ['asahi'],
+  )
+
   test('hk_execution_allowance',
     executable('hk_execution_allowance_test',
       files('tests/test-hk-execution-allowance.c'),
@@ -1399,6 +1407,15 @@ if with_tests
     files('tests/g17p_vulkan_cross_queue.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  borealis_sync = executable(
+    'borealis-sync',
+    files('tests/borealis_sync.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_thread],
     c_args : [c_msvc_compat_args],
     gnu_symbol_visibility : 'hidden',
   )

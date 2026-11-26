@@ -488,6 +488,32 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     timeout : 120,
   )
 
+  # Synchronization regression cases: recorded, submitted and waited for,
+  # without checking contents (the pixel oracles need the GPU). The t6041
+  # profile has independent queues, so Borealis exposes the two queues the
+  # cases need.
+  foreach sync_case : ['layer-disjoint-queues', 'feedback-loop-outside-area',
+                       'same-image-disjoint-tiles']
+    test(
+      'borealis-sync-' + sync_case,
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        borealis_sync,
+        '--shim',
+        sync_case,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=t6041',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+      timeout : 120,
+    )
+  endforeach
+
   # Background/end-of-tile shader cache shared by command buffers recording
   # on several threads.
   test(
