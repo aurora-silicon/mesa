@@ -9,6 +9,7 @@
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_sparse.h"
+#include "asahi/lib/agx_chip_caps.h"
 
 static void
 check_queries(struct hk_physical_device *pdev)
@@ -135,7 +136,7 @@ check_queries(struct hk_physical_device *pdev)
 }
 
 static void
-check_tiles_and_tails(void)
+check_tiles_and_tails(enum agx_chip chip)
 {
    struct hk_device *dev = calloc(1, sizeof(*dev));
    assert(dev);
@@ -182,7 +183,7 @@ check_tiles_and_tails(void)
              * compressed coordinates used to get divided by the block twice. */
             for (unsigned z = 0; z < u_minify(5, l); ++z) {
                uint64_t actual = hk_sparse_image_tile_offset_B(
-                  AGX_CHIP_G17P, layout, l, tile.width_el, tile.height_el, z);
+                  chip, layout, l, tile.width_el, tile.height_el, z);
                uint64_t expected = z * layout->layer_stride_B +
                                    layout->level_offsets_B[l] +
                                    (w + 1) * AIL_PAGESIZE;
@@ -237,18 +238,23 @@ check_tiles_and_tails(void)
 int
 main(void)
 {
-   struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
-   assert(pdev);
-   pdev->vk.base.type = VK_OBJECT_TYPE_PHYSICAL_DEVICE;
-   pdev->dev.chip = AGX_CHIP_G17P;
-   pdev->vk.supported_features.sparseBinding = true;
-   pdev->vk.supported_features.sparseResidencyImage2D = true;
-   pdev->vk.supported_features.sparseResidencyImage3D = true;
-   pdev->vk.properties.maxImageDimension3D = 2048;
-   pdev->vk.properties.framebufferColorSampleCounts = 1 | 2 | 4;
-   check_queries(pdev);
-   check_tiles_and_tails();
-   free(pdev);
-   puts("G17P sparse query, block addressing and mip-tail checks passed");
+   static const enum agx_chip chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17S};
+   for (unsigned i = 0; i < ARRAY_SIZE(chips); ++i) {
+      struct hk_physical_device *pdev = calloc(1, sizeof(*pdev));
+      assert(pdev);
+      pdev->vk.base.type = VK_OBJECT_TYPE_PHYSICAL_DEVICE;
+      pdev->dev.chip = chips[i];
+      pdev->vk.supported_features.sparseBinding = true;
+      pdev->vk.supported_features.sparseResidencyImage2D = true;
+      pdev->vk.supported_features.sparseResidencyImage3D =
+         agx_chip_has_cap(chips[i], AGX_CAP_SPARSE_RESIDENCY_3D);
+      assert(pdev->vk.supported_features.sparseResidencyImage3D);
+      pdev->vk.properties.maxImageDimension3D = 2048;
+      pdev->vk.properties.framebufferColorSampleCounts = 1 | 2 | 4;
+      check_queries(pdev);
+      check_tiles_and_tails(chips[i]);
+      free(pdev);
+   }
+   puts("G17P and M5 sparse query, block addressing and mip-tail checks passed");
    return 0;
 }
