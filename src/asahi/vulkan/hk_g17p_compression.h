@@ -13,7 +13,8 @@
 #include <string.h>
 
 /* HAL200 lossless compression policy across native HAL200 AGX3B parts
- * (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G16G and G17P).
+ * (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G16G and G17P) and G15S, whose GPU
+ * reads the same metadata on the G15 command-stream generation.
  *
  * The compressed Gen9 PBE (write) packet matches Apple's HAL200 StateFields
  * encoder byte-for-byte for GPU-tiled one-layer 2D images, the read
@@ -29,7 +30,7 @@
  *    (R32G32B32A32_{UINT,SINT,SFLOAT}) for single-sample 2D (single-layer,
  *    arrays, and cubemaps). The 1-8 byte 2x/4x MSAA variants (attachments,
  *    arrays, input attachments, multiview) are gated by
- *    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION (G16G and G17P), sharing the Gen9
+ *    AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION (G16G, G17P and G15S), sharing the Gen9
  *    PBE/texture/AIL metadata encodings and per-layer compressed resolve split.
  *    Any spilled compressed colour attachment is decompressed in-place before
  *    the render pass via libagx_agx3_decompress /
@@ -191,7 +192,7 @@ hk_hal200_compression_eligible(enum agx_chip chip, uint32_t chip_id,
     * this restriction; 2x/4x MSAA colour is gated by
     * AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION further below.
     *
-    * All native HAL200 AGX3B parts (G16G, G17P) share the Gen9 PBE, ZLS,
+    * G16G, G17P and G15S share the Gen9 PBE, ZLS,
     * texture, and AIL compression metadata encodings for layered, cube, and 3D
     * colour, 16-byte single-sample 2D/array/cube colour, and single-level
     * 1x/2x/4x depth (single-layer and arrays). Any spilled compressed colour

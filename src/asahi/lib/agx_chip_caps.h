@@ -126,11 +126,13 @@ enum agx_chip_cap {
     * colour (single-sample 2D, arrays, cubemaps), single-level 1x/2x/4x depth
     * and 1x stencil, shared DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED colour
     * images, in-place spill decompression via libagx_agx3_decompress, and Gen9
-    * compressed compute mip blits. Enabled across native HAL200 AGX3B parts
-    * (G16G and G17P), which share the Gen9 PBE/texture/ZLS/AIL metadata
-    * contract; off on G15* (M3, G15/RTKit 2419 CS generation), M5 HAL300
-    * (Gen10, gated separately), G18G, and AGX2. 2x/4x MSAA colour compression
-    * is gated separately by AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION. */
+    * compressed compute mip blits. Enabled on G16G and G17P, and on G15S
+    * (M3 Pro): its GPU reads and writes the same Gen9 PBE/texture/ZLS/AIL
+    * metadata although it runs the G15 command-stream generation, so this
+    * capability follows the GPU, not agx_chip_native_hal200(). Off on G15G
+    * and G15C until measured on their own hardware, M5 HAL300 (Gen10, gated
+    * separately), G18G, and AGX2. 2x/4x MSAA colour compression is gated
+    * separately by AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION. */
    AGX_CAP_HAL200_LOSSLESS_COMPRESSION = 1u << 18,
 
    /* HAL200/Gen9 lossless 2x/4x MSAA colour compression in Borealis: 1-8B
@@ -211,7 +213,10 @@ enum agx_chip_cap {
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \
    X(G15G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
-   X(G15S, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
+   X(G15S,                                                                     \
+     AGX_CAPS_NATIVE | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |                   \
+        AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION,                                 \
+     __VA_ARGS__)                                                              \
    X(G15C, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15D, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
    X(G16P, AGX_CAP_COOPERATIVE_MATRIX, __VA_ARGS__)                            \
