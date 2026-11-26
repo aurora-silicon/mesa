@@ -725,12 +725,38 @@ test_unused_vertex_outputs(void)
    CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &fields, &state));
    const uint8_t words22[] = {22, 0, 0, 0};
    CHECK(!memcmp(state.bytes + state.offsets[3] + 16, words22, 4));
-   fields.vertex_varying_components = 115;
+   fields.point_size_output = true;
+   fields.vertex_varying_components = 125;
    CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &fields, &state));
-   const uint8_t words128[] = {128, 0, 0, 0};
-   CHECK(!memcmp(state.bytes + state.offsets[3] + 16, words128, 4));
-   fields.vertex_varying_components = 116;
+   const uint8_t words139[] = {139, 0, 0, 0};
+   CHECK(!memcmp(state.bytes + state.offsets[3] + 16, words139, 4));
+   fields.vertex_varying_components = 126;
    CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &fields, &state));
+
+   /* Exercise the same 125/139 acceptance and 126/140 rejection bounds on the
+    * general_varyings path. */
+   struct agx_ppp_hal300_graphics_fields gen = fields;
+   gen.general_varyings = true;
+   gen.point_size_output = true;
+   gen.layer_output = true;
+   gen.clip_distance_words = 8;
+   gen.vertex_varying_components = 125;
+   gen.fragment_varying_components = 125;
+   gen.varying_counts_32 = 125;
+   gen.cf_binding_count = 1;
+   gen.cf_register_count = 127;
+   gen.varying_table = 0x1000;
+   gen.uvs_words = 139;
+   gen.output_select = 0x40000 | 0x180000 | 0x10000 | 0xff;
+   CHECK(agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &gen, &state));
+   CHECK(!memcmp(state.bytes + state.offsets[3] + 16, words139, 4));
+   gen.vertex_varying_components = 126;
+   gen.fragment_varying_components = 126;
+   gen.varying_counts_32 = 126;
+   gen.uvs_words = 140;
+   CHECK(!agx_ppp_hal300_graphics_core_pack(AGX_CHIP_G17S, &gen, &state));
+
+   fields.point_size_output = false;
    fields.vertex_varying_components = 9;
    fields.fragment_varying_components = 1;
    fields.cf_binding_count = 1;

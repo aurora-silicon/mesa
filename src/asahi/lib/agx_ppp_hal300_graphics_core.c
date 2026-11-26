@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "agx_ppp_hal300_graphics_core.h"
+#include "agx_chip_caps.h"
 #include "agx_vdm_state_core.h"
 #include <string.h>
 
@@ -282,9 +283,15 @@ agx_ppp_hal300_graphics_core_pack(
        ((ti_spill_quads || ti_staging_quads) && !agx_chip_g17_m5(chip)))
       return false;
 
+   const unsigned max_user_words = agx_chip_max_uvs_user_words(chip);
+   const unsigned max_uvs_words = agx_chip_max_uvs_words(chip);
+
    if (fields->general_varyings) {
       /* HAL300's native VSStateConfig and VIT producer retain the shared
-       * all-f32 UVS/CF ABI: 128 total UVS words and 127 coefficients. */
+       * all-f32 UVS/CF ABI: up to max_user_words user words (124 API plus
+       * default Layer on M5), max_uvs_words total UVS words (including
+       * position, optional PointSize, packed layer/viewport, and up to 8 clip
+       * distances), and 127 coefficients. */
       const unsigned smooth = fields->varying_counts_32 & 0xff;
       const unsigned flat = (fields->varying_counts_32 >> 8) & 0xff;
       const unsigned linear = (fields->varying_counts_32 >> 16) & 0xff;
@@ -295,12 +302,12 @@ agx_ppp_hal300_graphics_core_pack(
              ? 0x10000 : 0) |
          (fields->fragment_reads_depth ? 0x200000 : 0) |
          ((UINT32_C(1) << fields->clip_distance_words) - 1);
-      if (fields->vertex_varying_components > 124 ||
+      if (fields->vertex_varying_components > max_user_words ||
           fields->fragment_varying_components >
              fields->vertex_varying_components ||
           fields->varying_counts_16 || (fields->varying_counts_32 >> 24) ||
           smooth + flat + linear != fields->vertex_varying_components ||
-          fields->uvs_words > 128 ||
+          fields->uvs_words > max_uvs_words ||
           fields->uvs_words != 4 + fields->vertex_varying_components +
              fields->point_size_output + fields->layer_output +
              fields->clip_distance_words ||
@@ -314,9 +321,10 @@ agx_ppp_hal300_graphics_core_pack(
    } else {
       if (fields->vertex_varying_components >
              ((fields->rasterizer_discard ||
-               !fields->fragment_varying_components) ? 124 : 8) ||
+               !fields->fragment_varying_components) ? max_user_words : 8) ||
           4 + fields->point_size_output + fields->layer_output +
-             fields->clip_distance_words + fields->vertex_varying_components > 128 ||
+             fields->clip_distance_words + fields->vertex_varying_components >
+             max_uvs_words ||
           fields->fragment_varying_components >
              fields->vertex_varying_components || fields->needs_primitive_id)
          return false;
