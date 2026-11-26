@@ -15169,6 +15169,20 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       return false;
    }
 
+   /* The sampled-compute cap trades moderate static TPS spills for extra
+    * resident threads. If it caused a spill storm (too large a spill frame,
+    * too many scalar spills/fills, or loop-weighted spill traffic outpacing
+    * texture reads), drop the optional cap and retry from the whole file. */
+   if (ctx->sampled_cap_applied && agx_sampled_cap_spills_excessive(ctx)) {
+      assert(!disable_sampled_cap && !ra_budget_cut);
+      ralloc_free(ctx);
+      binary->size = initial_binary_size;
+      *out = initial_out;
+      return agx_compile_function_nir_attempt(
+         nir, impl, key, binary, out, offset_out, 0, disable_remat,
+         retry_without_remat, agx3_reg_float_consts, true);
+   }
+
    /* Apple's G17P compiler publishes a 16-byte scratch footprint for compute,
     * vertex and fragment shaders that consume a device atomic's return.
     * The otherwise equivalent return-unused shaders publish zero, and the

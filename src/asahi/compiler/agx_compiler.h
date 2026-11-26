@@ -1428,6 +1428,7 @@ void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
 void agx_ra_without_remat(agx_context *ctx);
+bool agx_sampled_cap_spills_excessive(const agx_context *ctx);
 bool agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
                              unsigned align, unsigned minimum, unsigned limit,
                              unsigned *out);

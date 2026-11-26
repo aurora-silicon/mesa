@@ -66,12 +66,30 @@ agx_register_file_halves(const struct agx_device_key *dev)
    }
 }
 
+/* Encodings whose register spills lower to launch-allocated static
+ * thread-private storage (copy/rld with hardware scoreboarding) rather than
+ * AGX2's helper-backed device-memory stack with explicit 2-slot scoreboard
+ * waits. Optional occupancy-driven spilling only pays on static TPS: measured
+ * on G13G (AGX2), capping sampled compute to 160 halves adds ~55x higher
+ * per-core spill cost than on G17C (AGX3C), slowing ALU-heavy sampled compute
+ * by +16% to +259% while yielding no meaningful gain on texture-bound shaders
+ * (-0.9% to +2.4%, vs -7.0% to -14.5% on G17C for the same shaders).
+ */
+static bool
+agx_isa_has_static_tps(enum agx_isa_encoding encoding)
+{
+   return encoding == AGX_ISA_ENCODING_AGX3B ||
+          encoding == AGX_ISA_ENCODING_AGX3C ||
+          encoding == AGX_ISA_ENCODING_AGX3D;
+}
+
 /*
  * A compute program that issues several texture reads spends much of its
  * time waiting on them, and more resident threads hide that wait. Capping its
- * registers trades scratch spills for those threads. The cap follows from two
- * properties of the device:
+ * registers trades scratch spills for those threads. The cap follows from
+ * three properties of the device:
  *
+ *  - launch-allocated static thread-private storage (agx_isa_has_static_tps()),
  *  - the occupancy steps (occupancies[] above): how many threads a core keeps
  *    resident at each per-thread register budget, and
  *  - the per-thread register file (agx_register_file_halves()).
@@ -80,21 +98,26 @@ agx_register_file_halves(const struct agx_device_key *dev)
  * step): 640 of 1024 threads, 20 of 32 SIMD groups. The cap is the largest
  * budget that still reaches that step, 160 halves with the current steps.
  * Tuned on G17C against the uncapped file and a 192-half cap.
- * A device gets no cap when the cap would not raise its resident threads
- * above what its whole file allows, or when its register file is unknown
+ * A device gets no cap when its ISA lacks static TPS (AGX2), when the cap
+ * would not raise its resident threads by at least 1.5x over what its whole
+ * file allows, or when its register file is unknown
  * (agx_register_file_halves() returns 0).
  *
- * AGX2, AGX3C, and AGX3D currently resolve to 160: their files (256 and
- * 252 halves) reach 384 threads uncapped, so the cap raises that to 640.
+ * AGX3C and AGX3D currently resolve to 160: both use static TPS and their
+ * 252-half files reach 384 threads uncapped, so the cap raises that to 640.
  * AGX3B (192 halves) already reaches 512, too small a step, so it gets no
- * cap. Launches that take no scratch (such as M5 without compute resources)
- * leave optional_spills false instead of overriding the derivation here. All
- * encodings share one occupancy table; a part whose steps differ needs its own
- * table before this derivation is right for it.
+ * cap. AGX2 uses helper-backed device-memory stack spills with explicit waits
+ * and gets no cap. Launches that take no scratch (such as M5 without compute
+ * resources) leave optional_spills false instead of overriding the derivation
+ * here. All encodings share one occupancy table; a part whose steps differ
+ * needs its own table before this derivation is right for it.
  */
 unsigned
 agx_sampled_compute_register_cap(const struct agx_device_key *dev)
 {
+   if (!agx_isa_has_static_tps(dev->encoding))
+      return 0;
+
    const unsigned file = agx_register_file_halves(dev);
    if (!file)
       return 0;
