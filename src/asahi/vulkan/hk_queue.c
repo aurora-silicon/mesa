@@ -6573,6 +6573,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                         dp.pad_flags &= ~(HK_DW_A_FLAG_HAS_DST2 << 16);
                      memcpy(rt->push + dw_off, &dp, sizeof(dp));
                   }
+                  if (fused_shader->probe_wg_reverse) {
+                     const uint32_t grid[2] = {tmp_disp.exec_threads[0], tmp_disp.exec_threads[1]};
+                     memcpy(rt->push + 248, grid, sizeof(grid));
+                  }
                   tmp_disp.root_va = root_va + root_off;
                }
 

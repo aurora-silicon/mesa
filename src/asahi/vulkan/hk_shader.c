@@ -10538,6 +10538,51 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
       }
    }
 
+   /* PROFILING ONLY (HK_PROBE_REV): reverse the workgroup order of selected
+    * fused cmat variant classes so a consumer starts on the rows its producer
+    * wrote last (still in the system level cache). d=dw_a c=plain dcopy
+    * i=im2col_a g=gemm_dw f=fadd (no im2a/dwa). Only classes that always get a
+    * packer root table (where the grid is written) are eligible. */
+   bool probe_rev = false;
+   if (fused_nir && hk_compute_pair_alt_is_gemm_cmat(alt_kind) &&
+       fused_nir->num_uniforms <= 248) {
+      const char *rv = getenv("HK_PROBE_REV");
+      const bool plain_src = !has_dw_a && !has_gemm_dw && !im2col_a;
+      if (rv && *rv &&
+          ((strchr(rv, 'd') && has_dw_a) || (strchr(rv, 'g') && has_gemm_dw) ||
+           (strchr(rv, 'i') && im2col_a) ||
+           (strchr(rv, 'c') && plain_src &&
+            (dual_write == HK_COMPUTE_PAIR_DUAL_COPY || dual_write == HK_COMPUTE_PAIR_DUAL_COPY2)) ||
+           (strchr(rv, 'f') && plain_src && hk_compute_pair_dual_is_fadd(dual_write)))) {
+         nir_function_impl *impl = nir_shader_get_entrypoint(fused_nir);
+         nir_builder pb = nir_builder_at(nir_before_impl(impl));
+         nir_def *tx = nir_load_push_constant(&pb, 1, 32, nir_imm_int(&pb, 248),
+                                              .base = 0, .range = 256, .align_mul = 4);
+         nir_def *ty = nir_load_push_constant(&pb, 1, 32, nir_imm_int(&pb, 252),
+                                              .base = 0, .range = 256, .align_mul = 4);
+         nir_def *gx1 = nir_iadd_imm(&pb, nir_udiv_imm(&pb, tx, fused_nir->info.workgroup_size[0]), -1);
+         nir_def *gy1 = nir_iadd_imm(&pb, nir_udiv_imm(&pb, ty, fused_nir->info.workgroup_size[1]), -1);
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_workgroup_id)
+                  continue;
+               pb.cursor = nir_after_instr(instr);
+               nir_def *id = &intr->def;
+               nir_def *rev = nir_vec3(&pb, nir_isub(&pb, gx1, nir_channel(&pb, id, 0)),
+                                       nir_isub(&pb, gy1, nir_channel(&pb, id, 1)),
+                                       nir_channel(&pb, id, 2));
+               nir_def_rewrite_uses_after(id, rev);
+            }
+         }
+         nir_progress(true, impl, nir_metadata_none);
+         fused_nir->num_uniforms = 256;
+         probe_rev = true;
+      }
+   }
+
    struct hk_shader *shader = NULL;
    if (fused_nir) {
       struct vk_shader_compile_info synth = {
@@ -10553,6 +10598,8 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                           &fused_loop_bound);
    }
 
+   if (shader)
+      shader->probe_wg_reverse = probe_rev;
    struct hk_compute_pair_variant var = {
       .has_epilogue = has_ep,
       .has_fadd = has_fadd,

@@ -318,6 +318,9 @@ struct hk_shader {
    struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
    struct hk_pack_loop_bound pack_loop_bound;
+   /* PROFILING ONLY: fused variant reverses its workgroup order; the packer
+    * writes the dispatch grid (global threads x, y) at push bytes 248..255. */
+   bool probe_wg_reverse;
 
    const void *code_ptr;
    uint32_t code_size;
