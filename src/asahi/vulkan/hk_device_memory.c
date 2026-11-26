@@ -64,11 +64,11 @@ static bool
 hk_allow_bo_alloc(size_t size, void *data)
 {
    bool *mem_rejected = data;
-   if (hk_system_memory_fits(size))
-      return true;
 
-   *mem_rejected = true;
-   return false;
+   /* agx_bo_create_checked() asks again after evicting the BO cache, so
+    * record only the latest answer. */
+   *mem_rejected = !hk_system_memory_fits(size);
+   return !*mem_rejected;
 }
 
 /* Supports opaque fd only */
@@ -259,7 +259,7 @@ hk_GetMemoryHostPointerPropertiesEXT(
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
-       !agx_has_userptr(&dev->dev))
+       !agx_has_host_import(&dev->dev))
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    const uint64_t alignment =
@@ -930,14 +930,16 @@ hk_UnmapMemory2KHR(VkDevice device,
        * PROT_NONE'ing the difference lands on address space the application
        * reserved for itself -- the guard pages dEQP-VK.memory.map_placed.*
        * fills and reads back. */
-      void *err = mmap(mem->bo->_map, agx_bo_map_size(mem->bo), PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-      if (err == MAP_FAILED) {
-         return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
-                          "Failed to map over original mapping");
+      if (mem->bo->_map) {
+         void *err = mmap(mem->bo->_map, agx_bo_map_size(mem->bo), PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+         if (err == MAP_FAILED) {
+            return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                             "Failed to map over original mapping");
+         }
+         mem->bo->_map = NULL;
+         mem->bo->_map_size = 0;
       }
-      mem->bo->_map = NULL;
-      mem->bo->_map_size = 0;
    } else {
       if (mem->bo->_map) {
          munmap(mem->bo->_map, agx_bo_map_size(mem->bo));
@@ -985,7 +987,7 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
       *pFD = agx_bo_export(&dev->dev, memory->bo);
-      if (*pFD < 0 && !dev->dev.is_virtio)
+      if (*pFD < 0)
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       return VK_SUCCESS;
    default:

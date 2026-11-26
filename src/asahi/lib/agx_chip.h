@@ -176,7 +176,11 @@ enum agx_chip_record {
    AGX_RECORD_HAL300_NATIVE_CAPTURE = 1 << 20,
    AGX_RECORD_PPP_VIEWPORT = 1 << 21,
    AGX_RECORD_PPP_W_CLAMP_CULL2 = 1 << 22,
+   AGX_RECORD_VDM_STREAM_LINK_AGX2 = 1 << 23,
 };
+
+/* AGX2 chips that use the genxml 8-byte non-returning VDM_STREAM_LINK. */
+#define AGX_RECORDS_AGX2 (AGX_RECORD_VDM_STREAM_LINK_AGX2)
 
 /* The records of every byte-witnessed G15, G16 and G17 identity. */
 #define AGX_RECORDS_G15_G17                                                    \
@@ -195,14 +199,15 @@ enum agx_chip_record {
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR |                                 \
     AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY | AGX_RECORD_CDM_SECONDARY_BARRIER)
 
-/* G18G has the records its J873 native captures contain. The codecs of the
- * other G15-G17 records refuse it: the VDM stream link and tessellate codecs
- * because no capture contains the record, the rest as their lists stood
- * before this table (see each codec). */
+/* G18G has the records its J873 native captures contain plus the direct 8-byte
+ * HAL300 VDM stream link verified on J873g hardware. The tessellate codec
+ * still refuses it because no capture contains that record, and the rest stay
+ * as their lists stood before this table (see each codec). */
 #define AGX_RECORDS_G18G                                                       \
    (AGX_RECORD_VDM_STATE | AGX_RECORD_VDM_PPP_STATE | AGX_RECORD_VDM_BARRIER | \
-    AGX_RECORD_VDM_STREAM_TERMINATE | AGX_RECORD_PPP_VIEWPORT |                \
-    AGX_RECORD_PPP_W_CLAMP_CULL2 | AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |       \
+    AGX_RECORD_VDM_STREAM_LINK | AGX_RECORD_VDM_STREAM_TERMINATE |             \
+    AGX_RECORD_PPP_VIEWPORT | AGX_RECORD_PPP_W_CLAMP_CULL2 |                   \
+    AGX_RECORD_PPP_HAL300_DEPTH_STENCIL |                                      \
     AGX_RECORD_PPP_HAL300_DEPTH_BIAS_SCISSOR | AGX_RECORD_CDM_LAUNCH |         \
     AGX_RECORD_CDM_INDIRECT_LAUNCH | AGX_RECORD_CDM_INDIRECT_LAUNCH_36 |       \
     AGX_RECORD_CDM_BARRIER | AGX_RECORD_HAL300_NATIVE_CAPTURE)
@@ -295,10 +300,14 @@ enum agx_chip_quirk {
  * submission model is unknown.
  */
 #define AGX_CHIPS(X, ...)                                                      \
-   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
-   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, 0, 0, __VA_ARGS__)  \
+   X(G13G, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G13X, AGX2, AGX2, AGX2, 7, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G14G, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
+   X(G14X, AGX2, AGX2, AGX2, 8, GEN4, NONE, CLASSIC, AGX2, AGX_RECORDS_AGX2,   \
+     0, __VA_ARGS__)                                                           \
    X(G15P, AGX2, AGX2, UNKNOWN, UNKNOWN, UNKNOWN, NONE, UNKNOWN, NONE, 0, 0,   \
      __VA_ARGS__)                                                              \
    X(G15G, AGX3, AGX3B, G15, 9, GEN4, GPU0, CLASSIC, NATIVE_AGX3,              \
@@ -434,6 +443,15 @@ agx_chip_has_record(enum agx_chip chip, unsigned record)
 {
    return false AGX_CHIPS(AGX_CHIP_ROW_TEST, chip, AGX_CHIP_ROW_HAS_RECORD,
                           record);
+}
+
+/* Whether a chip is witnessed to take an 8-byte non-returning VDM stream link
+ * (genxml AGX_VDM_STREAM_LINK on AGX2 or agx_vdm_stream_link_core on AGX3). */
+static inline bool
+agx_chip_vdm_stream_link_supported(enum agx_chip chip)
+{
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_STREAM_LINK |
+                                       AGX_RECORD_VDM_STREAM_LINK_AGX2);
 }
 
 /* G17P keeps every colour target in the imageblock past 64 bytes a sample:
@@ -735,6 +753,41 @@ agx_chip_command_stream_generation(enum agx_chip chip)
    return agx_chip_info(chip)->cs_generation;
 }
 
+/* The flag word the AGX2 CDM barrier record carries when every bit is set:
+ * unk_0..19 plus the USC cache invalidate, the record the shared
+ * agx_cdm_barrier() emitter produces. */
+#define AGX_CDM_BARRIER_FULL_WORD 0xfffffu
+
+/* The default flag word of the AGX2 CDM barrier record Borealis emits at a
+ * tracked compute dependency (hk_cdm_flush()). The reduced word 0x1ff
+ * (unk_0..8, PBE/texture-cache maintenance included) is the set measured on
+ * the two AGX2 X dies; every other chip keeps the full word. The gate is a
+ * chip property rather than a measured property because the reduced set is a
+ * die-level drain characteristic: the two chips it was proven on are the
+ * only AGX2 parts the lab holds. The word alone does not decide when a
+ * barrier is emitted, and a device that created a sparse resource upgrades
+ * to the full word at emit or submit (hk_cdm_flush(),
+ * hk_submit_patch_sparse_sites()). */
+static inline uint32_t
+agx2_cdm_barrier_default_word(enum agx_chip chip, uint32_t gpu_generation)
+{
+   if (chip == AGX_CHIP_G13X ||
+       (chip == AGX_CHIP_G14X && gpu_generation == 14))
+      return 0x1ffu;
+   return AGX_CDM_BARRIER_FULL_WORD;
+}
+
+/* The word emitted at a tracked compute dependency (hk_cdm_flush()): the
+ * full word once the device holds a sparse resource or under
+ * fullcdmbarrier, the chip's default word otherwise. */
+static inline uint32_t
+agx2_cdm_barrier_emit_word(uint32_t default_word, bool sparse_used,
+                           bool force_full)
+{
+   return (sparse_used || force_full) ? AGX_CDM_BARRIER_FULL_WORD
+                                      : default_word;
+}
+
 static inline enum agx_descriptor_generation
 agx_chip_descriptor_generation(enum agx_chip chip)
 {
@@ -770,9 +823,8 @@ agx_chip_sampler_generation(enum agx_chip chip)
  *     equivalence probe and all five Vulkan CTS groups above.
  *
  * Off elsewhere:
- *   - G18G uses HAL300 records too, but has no stream-link continuation for
- *     an empty rewritten draw yet (hk_robust_index_rewrite_admitted) and its
- *     out-of-range index behaviour is unmeasured, so it stays off.
+ *   - G18G uses HAL300 records too, but its out-of-range hardware index
+ *     behaviour is unmeasured, so it keeps the software rewrite.
  *   - G15 and G16G (G15/HAL200 records) keep the software rewrite until
  *     hardware rows (M3, M4) prove zero substitution past the size word.
  *   - AGX2 does not have it: its Index List does not read out-of-range
@@ -974,6 +1026,39 @@ agx_chip_elide_app_dispatch_barrier(enum agx_chip chip)
    return agx_chip_native_or_m5(chip);
 }
 
+/* Whether the Borealis graphics path supplies the depth/stencil feedback-loop
+ * shader twin (hk_fbl_twin()) and draw-time dynamic transition
+ * (hk_select_fbl_fs()) required for VK_EXT_attachment_feedback_loop_dynamic_state.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C). */
+static inline bool
+agx_chip_has_feedback_loop_dynamic_state(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
+/* Whether VK_EXT_depth_clip_control (and
+ * extendedDynamicState3DepthClipNegativeOneToOne) is qualified on this chip.
+ * Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table across
+ * AGX2, native AGX3, and AGX3C/HAL300 (M5: G17G/G17S/G17C). Other HAL300
+ * encodings such as AGX3D (G18G) stay off until qualified on their hardware. */
+static inline bool
+agx_chip_has_depth_clip_control(enum agx_chip chip)
+{
+   return !agx_chip_hal300_path(chip) || agx_chip_g17_m5(chip);
+}
+
+/* Whether Borealis enables shader-reconstructed single-plane packed 4:2:2
+ * YCbCr formats (8/10/12/16-bit views backed by plain RGBA word textures and
+ * reconstructed in NIR) and 10/12-bit YCbCr plane UNORM range restoration.
+ * Shared across native AGX3 (G15/G16/G17P) and M5 (G17G/G17S/G17C); AGX2 keeps
+ * its existing path and other HAL300 encodings such as AGX3D (G18G) stay off
+ * until qualified on their hardware. */
+static inline bool
+agx_chip_has_packed_ycbcr(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
 /* Number of helper-table slots in the USC code-container lead block.  G15
  * and G16 parts have ten; with six their fragment programs of 256x256 and
  * larger walk past the lead into the guard page.  On G17P the state loader's
@@ -1089,6 +1174,41 @@ agx_chip_native_imageblock(enum agx_chip chip)
 }
 
 /*
+ * Whether single-sample 2D colour images are losslessly compressed in the
+ * Gen9 form Borealis implements for G17P. The image is GPU-tiled, and 8 bytes
+ * of metadata per 16x16 tile follow it in the same allocation. The texture
+ * descriptor sets bit 59 (compressed) and bit 127 (extended) and carries the
+ * metadata address >> 4 in its third word. The PBE sets word 0 bit 59 and
+ * word 1 bit 63, with the same third word.
+ *
+ * G16G: macOS 27.2 (26B123) on the M4 allocates a 4096x4096 RGBA8 texture as
+ * 64 MiB of image plus 512 KiB of metadata, and its blit copy into that
+ * texture reads and writes it through these exact descriptors. The capture
+ * shows no compressed depth, multisampled or layered image, so those stay on
+ * agx_chip_gen9_extended_compression().
+ *
+ * The selection is by chip because no device property reports compression.
+ */
+static inline bool
+agx_chip_gen9_color_compression(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G;
+}
+
+/*
+ * The compressed shapes beyond single-sample colour, measured on the G17P
+ * parts (A18 Pro, M4 Pro, M4 Max):
+ *  - depth and stencil through the ZLS unit;
+ *  - 2x and 4x attachments;
+ *  - the M4 Pro's layered, cube and 3D shapes.
+ */
+static inline bool
+agx_chip_gen9_extended_compression(enum agx_chip chip)
+{
+   return chip == AGX_CHIP_G17P;
+}
+
+/*
  * Whether the defect applies that drops the upper bytes of a wide multisample
  * sample on a tile no geometry covered
  * (AGX_G17P_MAX_UNCOVERED_TILE_BYTES_PER_SAMPLE). Measured on A18 Pro, and on
@@ -1130,6 +1250,26 @@ agx_chip_tri_merge_across_side_effects(enum agx_chip chip)
    return agx_chip_info(chip)->quirks & AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS;
 }
 
+/* Whether an AGX3 chip supplies the quad ballot/shuffle encodings and
+ * draw-time triangle-merge control required by VK_KHR_shader_quad_control.
+ * Native AGX3B (G15/G16/G17P) and M5 AGX3C (G17G/G17S/G17C) share both;
+ * AGX2 uses its legacy path and bring-up G18G stays off. */
+static inline bool
+agx_chip_agx3_shader_quad_control(enum agx_chip chip)
+{
+   return agx_chip_native_or_m5(chip);
+}
+
+/* Whether Vulkan VK_KHR_shader_quad_control / shaderQuadControl is supported
+ * on this chip (AGX2 native support, or AGX3 with quad encodings and
+ * draw-time triangle-merge control). */
+static inline bool
+agx_chip_has_shader_quad_control(enum agx_chip chip)
+{
+   return agx_chip_isa(chip) == AGX_ISA_AGX2 ||
+          agx_chip_agx3_shader_quad_control(chip);
+}
+
 /* Whether an image load misses a store made earlier in the same invocation,
  * so Honeykrisp forwards the stored value to the load. A18 Pro's loads
  * behave this way; G15 loads observe the invocation's own stores. */
@@ -1160,13 +1300,14 @@ agx_chip_has_fp32_denorm_preserve(enum agx_chip chip)
           agx_chip_native_or_m5(chip);
 }
 
-/* Whether the sampler state word carries the LOD bias.  The HAL200 sampler
- * layout has a bias field; Gen4 does not, so the shader applies the bias. */
+/* Whether the sampler state word carries the LOD bias.  The HAL200 and Gen5
+ * sampler layouts have a bias field; Gen4 does not, so the shader applies it. */
 static inline bool
 agx_chip_sampler_has_lod_bias(enum agx_chip chip)
 {
-   return agx_chip_sampler_generation(chip) ==
-          AGX_SAMPLER_GENERATION_GEN4_HAL200;
+   const enum agx_sampler_generation gen = agx_chip_sampler_generation(chip);
+   return gen == AGX_SAMPLER_GENERATION_GEN4_HAL200 ||
+          gen == AGX_SAMPLER_GENERATION_GEN5;
 }
 
 /*
@@ -1255,12 +1396,16 @@ bool agx_chip_has_hardware_ray_tracing(enum agx_chip chip);
 
 bool agx_chip_needs_scheduling_stalls(enum agx_chip chip);
 
-/* Every AGX3B part carries the 8x8 f16/f32 matmad backing a subgroup-scope
- * cooperative matrix. M5 has its own AGX3C encoding and matrix16 support. */
+/* AGX2 (G13/G14 via simd_matrix_fmadd and software fallback for partial
+ * subgroups; G15P is an uncharacterized A16 part), every AGX3B part
+ * (8x8 matmad), and M5 (AGX3C matrix16/matmad8) support subgroup-scope
+ * cooperative matrices. */
 static inline bool
 agx_chip_cooperative_matrix_supported(enum agx_chip chip)
 {
-   return agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX3B ||
+   const enum agx_isa_encoding enc = agx_chip_isa_encoding(chip);
+   return (enc == AGX_ISA_ENCODING_AGX2 && chip != AGX_CHIP_G15P) ||
+          enc == AGX_ISA_ENCODING_AGX3B ||
           agx_chip_g17_m5(chip);
 }
 
@@ -1294,6 +1439,20 @@ agx_chip_local_read_tilebuffer(enum agx_chip chip)
 
    return (enc == AGX_ISA_ENCODING_AGX3B && cs == AGX_CS_GENERATION_HAL200) ||
           (enc == AGX_ISA_ENCODING_AGX3C && cs == AGX_CS_GENERATION_HAL300);
+}
+
+/*
+ * Whether the varying coefficient table selects perspective-correct
+ * interpolation with shade model 5 instead of AGX2's 7.
+ *
+ * HAL300 parts (M5 G17G/G17S/G17C and M6 G18G) treat shade model 7 as linear,
+ * so smooth perspective bindings must be rewritten to shade model 5 via
+ * agx_cf_bindings_select_perspective().
+ */
+static inline bool
+agx_chip_uses_shade_model_5(enum agx_chip chip)
+{
+   return agx_chip_hal300_path(chip);
 }
 
 /* Stable name for diagnostics, e.g. "G15G". Never NULL. */

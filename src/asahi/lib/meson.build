@@ -220,6 +220,16 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-userptr-limits',
+    executable(
+      'asahi-userptr-limits',
+      files('tests/test-userptr-limits.c'),
+      include_directories : include_directories('.'),
+      c_args : ['-UNDEBUG'],
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-chip-admission',
     executable(
       'asahi-chip-admission',
@@ -335,6 +345,18 @@ if with_tests
       files('tests/test-chip.c'),
       include_directories : [inc_include, inc_src, inc_asahi],
       dependencies : [idep_agx_pack, idep_mesautil],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'asahi-agx-cdm-barrier-word',
+    executable(
+      'asahi-agx-cdm-barrier-word',
+      files('tests/test-agx-cdm-barrier-word.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
       link_with : [libasahi_lib],
       c_args : [c_msvc_compat_args],
       gnu_symbol_visibility : 'hidden',

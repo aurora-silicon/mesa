@@ -9,10 +9,12 @@
 
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/u_atomic.h"
 #include "vk_queue.h"
 
 struct hk_device;
 struct hk_packed_submit;
+struct hk_render_packet;
 
 /* Queues advertised per family when the kernel reports independent queues
  * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
@@ -54,9 +56,9 @@ struct hk_queue {
        */
       uint64_t timeline_value;
 
-      /* The highest timeline value a host wait has seen signalled, for
-       * occlusion query reads (hk_oq_submission_done()). Every value at or
-       * below it is complete. */
+      /* The highest timeline value a host wait or syncobj query has seen
+       * signalled, updated monotonically via hk_queue_note_signalled(). Every
+       * value at or below it is complete. */
       uint64_t signalled_value;
 
       /* Latest timeline point that received the waits of a submission
@@ -118,9 +120,28 @@ struct hk_queue {
       struct util_dynarray members;
       struct util_dynarray runs;
       struct util_dynarray commands;
+      /* Per member: the fused compute-pair plan and its elision state. */
+      struct util_dynarray fused;
+      struct util_dynarray plans;
+      struct util_dynarray planned_suppressed;
+      struct util_dynarray suppressed_arr;
+      struct util_dynarray run_sup;
+      /* Buffers the packets read until they complete: their streams, the
+       * fused shaders' code, uniform loaders and root tables. */
+      struct util_dynarray extra_bos;
       struct hk_packed_submit *packets;
       unsigned packets_cap;
    } pack;
+
+   /* Reusable scratch and packets for submit-time render packing
+    * (hk_render_pack_runs()). */
+   struct {
+      struct util_dynarray commands;
+      struct util_dynarray runs;
+      struct util_dynarray targets;
+      struct hk_render_packet *packets;
+      unsigned packets_cap;
+   } rpack;
 
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
@@ -160,6 +181,9 @@ struct hk_queue {
       bool used;
       /* Timeline point of the latest submission to a sibling. */
       uint64_t last_point;
+      /* Timeline point of the latest packed submission containing global
+       * atomics; sibling routing stays off until it completes. */
+      uint64_t packed_atomic_point;
    } sib;
 };
 
@@ -167,6 +191,19 @@ static inline struct hk_device *
 hk_queue_device(struct hk_queue *queue)
 {
    return (struct hk_device *)queue->vk.base.device;
+}
+
+static inline void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   while (seen < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
+      if (prev == seen)
+         break;
+      seen = prev;
+   }
 }
 
 
@@ -202,7 +239,7 @@ hk_queue_sibling_compute_supported(const struct agx_device *dev,
 {
    const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
-   return !dev->is_virtio && exact_prior &&
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) && exact_prior &&
           hk_queue_uses_cumulative_signals(dev) &&
           (dev->params.features & required) == required &&
           !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
@@ -219,6 +256,7 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+void hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns);
 
 /* The first command buffer of the submission whose recording failed, or NULL.
  * Such a command buffer is not executable (vkEndCommandBuffer returned its
@@ -230,5 +268,7 @@ VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
 
 uint32_t hk_queue_independent_budget(struct hk_device *dev);
+
+bool hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);
