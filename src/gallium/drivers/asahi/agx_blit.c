@@ -1080,6 +1080,280 @@ agx_resource_copy_region(struct pipe_context *pctx, struct pipe_resource *dst,
                              src_level, src_box);
 }
 
+/* Integer formats whose texels are the raw bits of every colour format with
+ * the same memory layout (ail_pixel_format[].channels): a copy through such a
+ * view moves bytes unchanged, keeps the image compressed and needs no format
+ * conversion. Indexed like asahi_blitter::upload_fs. */
+static const enum pipe_format agx_raw_copy_formats[] = {
+   PIPE_FORMAT_R8_UINT,           PIPE_FORMAT_R8G8_UINT,
+   PIPE_FORMAT_R8G8B8A8_UINT,     PIPE_FORMAT_R16_UINT,
+   PIPE_FORMAT_R16G16_UINT,       PIPE_FORMAT_R16G16B16A16_UINT,
+   PIPE_FORMAT_R32_UINT,          PIPE_FORMAT_R32G32_UINT,
+   PIPE_FORMAT_R32G32B32A32_UINT, PIPE_FORMAT_R10G10B10A2_UINT,
+};
+static_assert(ARRAY_SIZE(agx_raw_copy_formats) ==
+                 ARRAY_SIZE(((struct asahi_blitter *)0)->upload_fs),
+              "one upload shader per raw copy format");
+
+/* The agx_raw_copy_formats[] view a buffer-to-image copy renders through,
+ * or -1 when the copy cannot be rendered: no view has the image's memory
+ * layout, or a layer's end-of-tile store has no encoding (the render would
+ * be dropped, see agx_level_renderable()). */
+static int
+agx_raw_copy_view(struct agx_context *ctx, struct pipe_resource *img,
+                  unsigned level, const struct pipe_box *box)
+{
+   struct pipe_screen *pscreen = ctx->base.screen;
+   const enum pipe_format format = img->format;
+   const unsigned bpp = util_format_get_blocksize(format);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(agx_raw_copy_formats); ++i) {
+      enum pipe_format raw = agx_raw_copy_formats[i];
+
+      if (ail_formats_compatible(format, raw) &&
+          util_format_get_blocksize(raw) == bpp &&
+          pscreen->is_format_supported(pscreen, raw, img->target, 0, 0,
+                                       PIPE_BIND_RENDER_TARGET)) {
+         if (!agx_level_renderable(ctx, img, raw, level, box->z) ||
+             !agx_level_renderable(ctx, img, raw, level,
+                                   box->z + box->depth - 1))
+            return -1;
+
+         return i;
+      }
+   }
+
+   return -1;
+}
+
+/* Fragment shader of a buffer-to-image copy: each pixel loads its texel from
+ * SSBO 0 at y * stride + x * bpp + layer * layer_stride + base (uniforms 0-2,
+ * base already biased by the destination origin; the layer is relative to
+ * the first one copied) and writes the raw channels to a
+ * agx_raw_copy_formats[] view of the image. */
+static void *
+agx_upload_fs(struct pipe_context *pctx, enum pipe_format raw, bool layered)
+{
+   const struct util_format_description *desc = util_format_description(raw);
+   const unsigned bpp = desc->block.bits / 8;
+   const nir_shader_compiler_options *options =
+      pctx->screen->nir_options[MESA_SHADER_FRAGMENT];
+
+   nir_builder b_ = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, options, "asahi buffer-to-image copy");
+   nir_builder *b = &b_;
+   b->shader->info.num_ubos = 1;
+   b->shader->info.num_ssbos = 1;
+
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *params =
+      nir_load_ubo(b, 3, 32, zero, zero, .align_mul = 16, .range = ~0);
+   nir_def *xy =
+      nir_f2u32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_def *offset =
+      nir_iadd(b, nir_imul(b, nir_channel(b, xy, 1), nir_channel(b, params, 0)),
+               nir_iadd(b, nir_imul_imm(b, nir_channel(b, xy, 0), bpp),
+                        nir_channel(b, params, 1)));
+   if (layered) {
+      nir_variable *layer = nir_variable_create(
+         b->shader, nir_var_shader_in, glsl_uint_type(), "layer");
+      layer->data.location = VARYING_SLOT_LAYER;
+      layer->data.interpolation = INTERP_MODE_FLAT;
+      offset = nir_iadd(b, offset,
+                        nir_imul(b, nir_load_var(b, layer),
+                                 nir_channel(b, params, 2)));
+   }
+
+   /* One load of the whole texel: 32-bit words from 4 bytes up (the caller
+    * keeps such texels 4-byte aligned), else one 8- or 16-bit value. */
+   const unsigned word_bits = MIN2(bpp * 8, 32);
+   nir_def *words = nir_load_ssbo(b, MAX2(bpp / 4, 1), word_bits, zero,
+                                  offset, .align_mul = MIN2(bpp, 4),
+                                  .access = ACCESS_NON_WRITEABLE |
+                                            ACCESS_CAN_REORDER);
+
+   nir_def *chans[4];
+   for (unsigned c = 0; c < desc->nr_channels; ++c) {
+      const unsigned shift = desc->channel[c].shift;
+      const unsigned size = desc->channel[c].size;
+      nir_def *word = nir_u2u32(b, nir_channel(b, words, shift / word_bits));
+
+      chans[c] = size == 32 ? word
+                            : nir_iand_imm(b,
+                                           nir_ushr_imm(b, word,
+                                                        shift % word_bits),
+                                           BITFIELD_MASK(size));
+   }
+   for (unsigned c = desc->nr_channels; c < 4; ++c)
+      chans[c] = zero;
+
+   nir_variable *out = nir_variable_create(b->shader, nir_var_shader_out,
+                                           glsl_uvec4_type(), "color");
+   out->data.location = FRAG_RESULT_DATA0;
+   nir_store_var(b, out, nir_vec(b, chans, 4), 0xf);
+
+   return pipe_shader_from_nir(pctx, b->shader);
+}
+
+/* Copies between the CPU maps of a buffer and an image; the maps synchronize
+ * with the GPU. */
+static void
+agx_image_copy_buffer_cpu(struct pipe_context *pctx, struct pipe_resource *img,
+                          struct pipe_resource *buf, bool upload,
+                          unsigned buffer_offset, unsigned stride,
+                          uint64_t layer_stride, unsigned level,
+                          const struct pipe_box *box)
+{
+   const enum pipe_format format = img->format;
+   const uint64_t size =
+      (uint64_t)(box->depth - 1) * layer_stride +
+      (uint64_t)(util_format_get_nblocksy(format, box->height) - 1) * stride +
+      util_format_get_stride(format, box->width);
+   struct pipe_transfer *xfer;
+
+   if (upload) {
+      const uint8_t *data = pipe_buffer_map_range(pctx, buf, buffer_offset,
+                                                  size, PIPE_MAP_READ, &xfer);
+      if (!data)
+         return;
+
+      pctx->texture_subdata(pctx, img, level, PIPE_MAP_WRITE, box, data,
+                            stride, layer_stride);
+      pipe_buffer_unmap(pctx, xfer);
+   } else {
+      uint8_t *data = pipe_buffer_map_range(pctx, buf, buffer_offset, size,
+                                            PIPE_MAP_WRITE, &xfer);
+      if (!data)
+         return;
+
+      struct pipe_transfer *ixfer;
+      const uint8_t *map =
+         pctx->texture_map(pctx, img, level, PIPE_MAP_READ, box, &ixfer);
+      if (map) {
+         util_copy_box(data, format, stride, layer_stride, 0, 0, 0,
+                       box->width, box->height, box->depth, map,
+                       ixfer->stride, ixfer->layer_stride, 0, 0, 0);
+         pctx->texture_unmap(pctx, ixfer);
+      }
+      pipe_buffer_unmap(pctx, xfer);
+   }
+}
+
+/* pipe_context::image_copy_buffer. Where the state tracker would otherwise
+ * render the copy (PIPE_TEXTURE_TRANSFER_BLIT), a buffer-to-image copy
+ * (glTexSubImage from a pixel unpack buffer) renders the destination box
+ * with agx_upload_fs(), which reads each texel straight from the buffer: one
+ * load and a few integer ops per pixel instead of the state tracker's
+ * texel-buffer draw, and the image stays compressed. Everything else goes
+ * through the CPU maps, as the state tracker's fallback does. */
+void
+agx_image_copy_buffer(struct pipe_context *pctx, struct pipe_resource *dst,
+                      struct pipe_resource *src, unsigned buffer_offset,
+                      unsigned buffer_stride, unsigned buffer_layer_stride,
+                      unsigned level, const struct pipe_box *box)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   const bool upload = src->target == PIPE_BUFFER;
+   struct pipe_resource *buf = upload ? src : dst;
+   struct pipe_resource *img = upload ? dst : src;
+   const enum pipe_format format = img->format;
+   const unsigned bpp = util_format_get_blocksize(format);
+   const unsigned stride = buffer_stride
+                              ? buffer_stride
+                              : util_format_get_stride(format, box->width);
+   const uint64_t layer_stride =
+      buffer_layer_stride
+         ? buffer_layer_stride
+         : (uint64_t)stride * util_format_get_nblocksy(format, box->height);
+
+   if (box->width <= 0 || box->height <= 0 || box->depth <= 0)
+      return;
+
+   int raw = -1;
+   if (upload &&
+       (pctx->screen->caps.texture_transfer_modes &
+        PIPE_TEXTURE_TRANSFER_BLIT) &&
+       img->nr_samples <= 1 &&
+       util_format_get_blockwidth(format) == 1 &&
+       util_format_get_blockheight(format) == 1 &&
+       !util_format_is_depth_or_stencil(format) &&
+       (bpp < 4 || ((buffer_offset | stride | layer_stride) % 4) == 0) &&
+       (buffer_offset % bpp) == 0 && (stride % bpp) == 0 &&
+       layer_stride <= UINT32_MAX)
+      raw = agx_raw_copy_view(ctx, img, level, box);
+
+   if (raw < 0) {
+      agx_image_copy_buffer_cpu(pctx, img, buf, upload, buffer_offset, stride,
+                                layer_stride, level, box);
+      return;
+   }
+
+   const bool layered = box->depth > 1;
+   struct asahi_blitter *bl = &ctx->compute_blitter;
+   if (!bl->upload_fs[raw][layered]) {
+      bl->upload_fs[raw][layered] =
+         agx_upload_fs(pctx, agx_raw_copy_formats[raw], layered);
+   }
+
+   /* An upload of every texel of a single-level image need not load the old
+    * contents into the tilebuffer (as st_pbo does for its draw). */
+   if (img->last_level == 0 &&
+       util_texrange_covers_whole_level(img, level, box->x, box->y, box->z,
+                                        box->width, box->height, box->depth))
+      pctx->invalidate_resource(pctx, img);
+
+   struct agx_stage *fs = &ctx->stage[MESA_SHADER_FRAGMENT];
+   struct pipe_shader_buffer saved_ssbo = {0};
+   const bool had_ssbo = fs->ssbo_mask & BITFIELD_BIT(0);
+   const bool ssbo_writable = fs->ssbo_writable_mask & BITFIELD_BIT(0);
+   if (had_ssbo)
+      pipe_resource_reference(&saved_ssbo.buffer, fs->ssbo[0].buffer);
+   saved_ssbo.buffer_offset = fs->ssbo[0].buffer_offset;
+   saved_ssbo.buffer_size = fs->ssbo[0].buffer_size;
+
+   struct pipe_shader_buffer ssbo = {
+      .buffer = buf,
+      .buffer_offset = 0,
+      .buffer_size = buf->width0,
+   };
+   pctx->set_shader_buffers(pctx, MESA_SHADER_FRAGMENT, 0, 1, &ssbo, 0);
+
+   /* Bias the base so the shader indexes by window coordinates; 32-bit
+    * wrap-around keeps every in-bounds offset exact. */
+   const uint32_t params[4] = {
+      stride,
+      buffer_offset - (uint32_t)box->y * stride - (uint32_t)box->x * bpp,
+      (uint32_t)layer_stride,
+   };
+   struct pipe_constant_buffer cb = {
+      .buffer_size = sizeof(params),
+      .user_buffer = params,
+   };
+
+   struct pipe_surface surf = {
+      .texture = img,
+      .format = agx_raw_copy_formats[raw],
+      .level = level,
+      .first_layer = box->z,
+      .last_layer = box->z + box->depth - 1,
+   };
+
+   agx_blitter_save(ctx, ctx->blitter,
+                    ASAHI_SAVE_FRAMEBUFFER | ASAHI_SAVE_FRAGMENT_STATE |
+                       ASAHI_SAVE_FRAGMENT_CONSTANT |
+                       ASAHI_DISABLE_RENDER_COND);
+   pctx->set_constant_buffer(pctx, MESA_SHADER_FRAGMENT, 0, &cb);
+   util_blitter_custom_shader_rect(ctx->blitter, &surf, box->x, box->y,
+                                   box->x + box->width, box->y + box->height,
+                                   bl->upload_fs[raw][layered]);
+   util_blitter_restore_constant_buffer_state(ctx->blitter);
+
+   pctx->set_shader_buffers(pctx, MESA_SHADER_FRAGMENT, 0, 1,
+                            had_ssbo ? &saved_ssbo : NULL,
+                            ssbo_writable ? BITFIELD_BIT(0) : 0);
+   pipe_resource_reference(&saved_ssbo.buffer, NULL);
+}
+
 /* G17G: generate mipmaps on the CPU where the GPU cannot. The blitter
  * renders into the levels above the base, and a render whose target the
  * native PBE profile refuses is dropped while the generation reports

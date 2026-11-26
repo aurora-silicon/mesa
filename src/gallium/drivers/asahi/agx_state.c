@@ -6597,6 +6597,13 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
          ctx->delete_compute_state(ctx, bl->g17p_mip_cs[i]);
    }
 
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->upload_fs); ++i) {
+      for (unsigned layered = 0; layered < 2; ++layered) {
+         if (bl->upload_fs[i][layered])
+            ctx->delete_fs_state(ctx, bl->upload_fs[i][layered]);
+      }
+   }
+
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
 

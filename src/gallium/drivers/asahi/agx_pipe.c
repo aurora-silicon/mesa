@@ -3013,6 +3013,7 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->flush = agx_flush;
    pctx->clear = agx_clear;
    pctx->resource_copy_region = agx_resource_copy_region;
+   pctx->image_copy_buffer = agx_image_copy_buffer;
    pctx->blit = agx_blit;
    if (screen->caps.generate_mipmap)
       pctx->generate_mipmap = agx_generate_mipmap;

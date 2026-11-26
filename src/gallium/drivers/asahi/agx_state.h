@@ -969,6 +969,10 @@ struct asahi_blitter {
    /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
    void *g17p_mip_cs[32];
 
+   /* Buffer-to-image copy fragment shaders, by raw copy view and whether
+    * they copy several layers (agx_image_copy_buffer) */
+   void *upload_fs[10][2];
+
    /* [filter] */
    void *sampler[2];
 
@@ -1915,6 +1919,13 @@ void agx_blitter_save(struct agx_context *ctx, struct blitter_context *blitter,
                       enum asahi_blitter_op op);
 
 void agx_blit(struct pipe_context *pipe, const struct pipe_blit_info *info);
+
+void agx_image_copy_buffer(struct pipe_context *pctx,
+                           struct pipe_resource *dst,
+                           struct pipe_resource *src, unsigned buffer_offset,
+                           unsigned buffer_stride,
+                           unsigned buffer_layer_stride, unsigned level,
+                           const struct pipe_box *box);
 
 bool agx_g18_msaa4_storage(const struct agx_device *dev,
                            const struct agx_resource *rsrc,
