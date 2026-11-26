@@ -1167,13 +1167,14 @@ hk_get_device_properties(const struct agx_device *dev,
     * giving a theoretical limit of 119. We round down to 116 to give a sensible
     * limit in vec4s.
     */
-   /* G17P's 8-bit UVS indices and native vertex-state counts also cover the
-    * fixed-function copies above and the unlinked shader's default Layer and
-    * PointSize. The API's 128 components include position; these defaults and
-    * fixed copies are internal reservations. Fragment coefficients retain
+   /* G17P and M5 8-bit UVS indices and native vertex-state counts also cover
+    * the fixed-function copies above and the unlinked shader's default Layer
+    * and PointSize. The API's 128 components include position; these defaults
+    * and fixed copies are internal reservations. Fragment coefficients retain
     * their independent bound. The 136-word clip boundary is hardware-tested.
     */
-   unsigned max_vgt_output_components = dev->chip == AGX_CHIP_G17P ? 128 : 116;
+   unsigned max_vgt_output_components =
+      agx_chip_max_vgt_output_components(dev->chip);
 
    *properties = (struct vk_properties){
       .cooperativeMatrixSupportedStages = features->cooperativeMatrix

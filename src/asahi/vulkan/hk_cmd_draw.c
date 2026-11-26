@@ -11105,8 +11105,9 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       const bool layer_word = uvs && uvs->group_offs[UVS_CLIP_DIST] ==
                                     uvs->group_offs[UVS_LAYER_VIEWPORT] + 1;
 
-      const bool vertex_layout = uvs && components <= 124 &&
-         uvs->size <= 128 && clip_words <= 8 &&
+      const bool vertex_layout = uvs &&
+         components <= agx_chip_max_uvs_user_words(dev->dev.chip) &&
+         uvs->size <= agx_chip_max_uvs_words(dev->dev.chip) && clip_words <= 8 &&
          uvs->group_offs[UVS_POSITION] == 0 &&
          uvs->group_offs[UVS_VARYINGS] == 4 &&
          uvs->group_offs[UVS_PSIZ] == 4 + components &&

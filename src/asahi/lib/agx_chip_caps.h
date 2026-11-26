@@ -163,6 +163,10 @@ enum agx_chip_cap {
     * reuse, push-descriptor elision, and direct fragment-root comparisons
     * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
    AGX_CAP_CACHED_CMD_MEMORY = 1u << 22,
+
+   /* The vertex state can carry 128 API output components and their
+    * fixed-function UVS words. */
+   AGX_CAP_VARYING_OUTPUT_128 = 1u << 23,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -185,7 +189,7 @@ enum agx_chip_cap {
     AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |           \
     AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |                                    \
     AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |            \
-    AGX_CAP_CACHED_CMD_MEMORY)
+    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_VARYING_OUTPUT_128)
 
 /* What the M5 parts (G17G, G17S, G17C) share. */
 #define AGX_CAPS_M5                                                            \
@@ -195,7 +199,7 @@ enum agx_chip_cap {
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
     AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA |                  \
     AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |            \
-    AGX_CAP_CACHED_CMD_MEMORY)
+    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_VARYING_OUTPUT_128)
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
@@ -242,4 +246,25 @@ static inline bool
 agx_chip_has_cap(enum agx_chip chip, unsigned cap)
 {
    return false AGX_CHIP_CAPS(AGX_CHIP_CAP_ROW_TEST, chip, cap);
+}
+
+/* API counts include position. The expanded UVS layout also reserves space
+ * for the default Layer varying, PointSize, the packed layer/viewport word,
+ * and eight clip distances. Fragment coefficients have their own bound. */
+static inline unsigned
+agx_chip_max_vgt_output_components(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_VARYING_OUTPUT_128) ? 128 : 116;
+}
+
+static inline unsigned
+agx_chip_max_uvs_user_words(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_VARYING_OUTPUT_128) ? 125 : 124;
+}
+
+static inline unsigned
+agx_chip_max_uvs_words(enum agx_chip chip)
+{
+   return agx_chip_has_cap(chip, AGX_CAP_VARYING_OUTPUT_128) ? 139 : 128;
 }
