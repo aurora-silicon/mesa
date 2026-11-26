@@ -1,0 +1,7 @@
+# Borealis expectations, G14G (M2)
+# Machine: J413 MacBook Air M2, Apple M2 (G14G B0); kernel 7.3.0-aurora-fleet89; Mesa: aurora-silicon/mesa aurora-wip 3f1c2bc3 + the src/aurora series (bcf97da04e29); rows ran the split arm 4fc09a3e for the sample and the aurora arm 88314f80 for the A/B (same code: .text identical)
+# CTS: VK-GL-CTS 1.4.7.1 (+ driver ID 35, teardown fix), release build b_ndebug=true, user-space overlay, J=1, 2026-11-26
+# Cases: vk-a sample: every 5th 6,000-case chunk of the vk-default mustpass (636,000 of 3,215,124), not the full mustpass
+# Evidence: aurora traces/gpu/20261126-borealis-split/m2 (lane BOREALIS-SPLIT)
+# Results that changed between repeated rounds of the same build.
+
