@@ -870,7 +870,8 @@ split_if_after_last_demote(nir_builder *b, nir_if *nif)
  */
 static bool
 update_coverage_after_last_demote(nir_builder *b, nir_function_impl *impl,
-                                  nir_variable *killed, nir_def **a2c_slot)
+                                  nir_variable *killed, bool uniform_tests,
+                                  nir_def **a2c_slot)
 {
    nir_cf_node *node = last_demote_node(&impl->body);
    const bool split = worth_splitting(node);
@@ -888,7 +889,7 @@ update_coverage_after_last_demote(nir_builder *b, nir_function_impl *impl,
       nir_demote_samples(b, *a2c_slot);
    }
 
-   final_coverage_update(b, nir_load_var(b, killed), false);
+   final_coverage_update(b, nir_load_var(b, killed), uniform_tests);
    return split;
 }
 
@@ -1160,7 +1161,7 @@ lower_sample_mask_deferred(nir_shader *shader, bool uniform_tests,
    nir_def *a2c_slot = NULL;
    const bool split =
       early_update &&
-      update_coverage_after_last_demote(&b, impl, ctx.killed,
+      update_coverage_after_last_demote(&b, impl, ctx.killed, uniform_tests,
                                         a2c_mask ? &a2c_slot : NULL);
 
    nir_shader_intrinsics_pass(shader, accumulate_demote,
@@ -1285,11 +1286,16 @@ agx_nir_lower_sample_mask(nir_shader *shader)
    return lower_sample_mask(shader, false);
 }
 
-/* M5: one uniformly selected final coverage update (final_coverage_update). */
+/* M5/HAL300: one uniformly selected final coverage update. When `early_update`
+ * is set (M5 parts), place the update right after the last demote (same early
+ * coverage placement as G17P, preserving quad helper lanes for derivatives
+ * while terminating dead and depth-failed quads before heavy shading); G18G
+ * keeps `early_update = false` (late update at end of shader). */
 bool
-agx_nir_lower_sample_mask_deferred_m5(nir_shader *shader)
+agx_nir_lower_sample_mask_deferred_m5(nir_shader *shader, bool early_update)
 {
-   return lower_sample_mask_deferred(shader, true, false, NULL, false, false);
+   return lower_sample_mask_deferred(shader, true, early_update, NULL, false,
+                                     false);
 }
 
 bool
