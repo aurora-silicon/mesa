@@ -2802,7 +2802,8 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
     * clear included, was lost.
     */
    key.single_sample_reload = false;
-
+   if (store && !partial_render)
+      key.resolve_mask = render->agx2_resolve_mask;
 
    bool needs_textures_for_spilled_rts =
       agx_tilebuffer_spills(&render->tilebuffer) && !partial_render && !store;
@@ -3023,6 +3024,8 @@ hk_build_bg_eot_program(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info,
          agx_usc_uniform(&b, 4 + (8 * rt), 8, colour);
          uniforms = MAX2(uniforms, 4 + (8 * rt) + 8);
       } else if (key.op[rt] == AGX_EOT_STORE) {
+         if (key.resolve_mask & BITFIELD_BIT(rt))
+            iview = render->color_att[rt].resolve_iview;
          const bool valid = key.tib.layered
                                ? iview->planes[0].layered_eot_pbe_valid
                                : iview->planes[0].eot_pbe_valid;
@@ -4073,19 +4076,20 @@ hk_m5_pass_merge_candidate(struct hk_cmd_buffer *cmd, const struct hk_cs *cs)
                                            render->tilebuffer.sample_size_B);
 
    /* The instance is one ordinary render stream with draws, with no
-    * pre/post-graphics streams, heap use or timestamps attached. */
+    * pre/post-graphics streams, heap use or start timestamps attached. An end
+    * timestamp stays on the merged stream and latches when the merged pass
+    * finishes, which still satisfies Vulkan's after-all-prior-commands rule. */
    if (!agx_chip_native_or_m5(dev->dev.chip) ||
        cmd->in_meta || cs->stats.cmds == 0 || cmd->sync.pass_vdm != cs ||
        cmd->current_cs.pre_gfx || cmd->current_cs.post_gfx ||
        cmd->state.oq_pending_render ||
-       cmd->uses_heap || cs->timestamp.start.handle ||
-       cs->timestamp.end.handle) {
+       cmd->uses_heap || cs->timestamp.start.handle) {
       if (msaa_enabled)
          hk_frame_anatomy_note(dev,
             "MSAA pass merge refused: pre=%u post=%u heap=%u draws=%u timestamp=%u",
             cmd->current_cs.pre_gfx != NULL, cmd->current_cs.post_gfx != NULL,
             cmd->uses_heap, cs->stats.cmds,
-            cs->timestamp.start.handle != 0 || cs->timestamp.end.handle != 0);
+            cs->timestamp.start.handle != 0);
       return false;
    }
 
@@ -4585,7 +4589,7 @@ hk_m5_pass_merge_begin(struct hk_cmd_buffer *cmd, const VkRenderingInfo *info)
             (m->open_cs && m->open_cs->current != m->open_cs_current))
       why = "compute";
    else if (cs->current != m->after_current || cs->end != m->end ||
-            cs->timestamp.start.handle || cs->timestamp.end.handle)
+            cs->timestamp.start.handle)
       why = "stream";
    else if (info->flags & (VK_RENDERING_SUSPENDING_BIT |
                            VK_RENDERING_RESUMING_BIT |
@@ -4808,6 +4812,38 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
       ail_metadata_tile(layout).height_el, 0, pack_mode,
       util_logbase2(layout->sample_count_sa), layered ? 1 : 0);
    return true;
+}
+
+/* A 2D block store resolves four RGBA8 tile samples through the destination
+ * PBE. A partial render still needs a multisample store to the source for
+ * reload, and a subrect resolve must preserve destination pixels outside it.
+ */
+static uint8_t
+hk_agx2_color_resolve_mask(const struct hk_device *dev,
+                           const struct hk_rendering_state *render)
+{
+   if (agx_chip_isa_encoding(dev->dev.chip) != AGX_ISA_ENCODING_AGX2 ||
+       agx_chip_command_stream_generation(dev->dev.chip) != AGX_CS_GENERATION_AGX2 ||
+       !render->cr.whole_attachments || render->cr.layers != 1 ||
+       render->view_mask || render->tilebuffer.nr_samples != 4 ||
+       (render->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)))
+      return 0;
+
+   uint8_t mask = 0;
+   for (unsigned i = 0; i < render->color_att_count; ++i) {
+      const struct hk_attachment *att = &render->color_att[i];
+      const struct hk_image_view *dst = att->resolve_iview;
+      if (att->iview && dst && !render->tilebuffer.spilled[i] &&
+          att->store_op == VK_ATTACHMENT_STORE_OP_DONT_CARE &&
+          att->resolve_mode == VK_RESOLVE_MODE_AVERAGE_BIT &&
+          att->iview->vk.image->samples == VK_SAMPLE_COUNT_4_BIT &&
+          render->tilebuffer.logical_format[i] == PIPE_FORMAT_R8G8B8A8_UNORM &&
+          dst->vk.view_type == VK_IMAGE_VIEW_TYPE_2D &&
+          dst->vk.format == VK_FORMAT_R8G8B8A8_UNORM &&
+          dst->planes[0].eot_pbe_valid)
+         mask |= BITFIELD_BIT(i);
+   }
+   return mask;
 }
 
 static void
@@ -5054,6 +5090,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
             render->cr.whole_attachments = false;
       }
    }
+
+   render->agx2_resolve_mask = hk_agx2_color_resolve_mask(dev, render);
 
    perf_debug(cmd, "Rendering %ux%ux%u@%u %s%s", render->cr.width,
               render->cr.height, render->cr.layers,
@@ -5666,6 +5704,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
          }
       }
    }
+   u_foreach_bit(i, render->agx2_resolve_mask)
+      loaded_resolve |= render->color_att[i].load_op == VK_ATTACHMENT_LOAD_OP_LOAD;
    const bool process_empty_tiles =
       resolved_clear || resolved_clear_z || resolved_clear_s || loaded_resolve;
    render->process_empty_tiles_without_z =
@@ -5826,8 +5866,9 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
    VkRenderingAttachmentInfo vk_color_att[HK_MAX_RTS];
    VkRenderingAttachmentFlagsInfoKHR vk_color_att_flags[HK_MAX_RTS];
    for (uint32_t i = 0; i < render->color_att_count; i++) {
-      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE &&
-          !render->g17p_direct_color_resolve)
+      const bool resolved = render->g17p_direct_color_resolve ||
+                            (render->agx2_resolve_mask & BITFIELD_BIT(i));
+      if (render->color_att[i].resolve_mode != VK_RESOLVE_MODE_NONE && !resolved)
          need_resolve = true;
 
       vk_color_att_flags[i] = (VkRenderingAttachmentFlagsInfoKHR) {
@@ -5839,7 +5880,7 @@ hk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
          .pNext = &vk_color_att_flags[i],
          .imageView = hk_image_view_to_handle(render->color_att[i].iview),
          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-         .resolveMode = render->g17p_direct_color_resolve
+         .resolveMode = resolved
                            ? VK_RESOLVE_MODE_NONE
                            : render->color_att[i].resolve_mode,
          .resolveImageView =
@@ -7584,6 +7625,7 @@ static bool
 hk_g17p_mono_resolve_exports(nir_shader *nir)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_metadata_require(impl, nir_metadata_dominance);
    nir_scalar slot[256];
    uint8_t slot_bits[256] = {0};
 
@@ -7619,7 +7661,8 @@ hk_g17p_mono_resolve_exports(nir_shader *nir)
                if (!slot_bits[h]) {
                   /* Never exported: the register was undefined too. */
                   comps[c] = nir_undef(&b, 1, d->bit_size);
-               } else if (slot_bits[h] != d->bit_size) {
+               } else if (slot_bits[h] != d->bit_size ||
+                          !nir_block_dominates(nir_def_instr(slot[h].def)->block, block)) {
                   return false;
                } else {
                   comps[c] = nir_mov_scalar(&b, slot[h]);
@@ -7672,7 +7715,7 @@ hk_g17p_mono_part_refusal(const struct hk_shader *shader,
  * the colour epilog key and the tile partitions (the build is part of the
  * cache's own identity). */
 static bool
-hk_m5_uniform_blend_key(const struct agx_fs_epilog_key *key)
+hk_uniform_blend_key(const struct agx_fs_epilog_key *key)
 {
    const unsigned mode = agx_pack_blend_standard(
       PIPE_BLEND_ADD, PIPE_BLENDFACTOR_SRC_ALPHA, PIPE_BLENDFACTOR_INV_SRC_ALPHA,
@@ -7697,9 +7740,14 @@ hk_m5_uniform_blend_key(const struct agx_fs_epilog_key *key)
 }
 
 static bool
-hk_m5_uniform_blend_part(const struct hk_shader *shader,
-                         const struct agx_shader_part *part)
+hk_uniform_blend_part(const struct hk_shader *shader,
+                      const struct agx_shader_part *part)
 {
+   /* The classic stream launches the variant's own preamble and uniforms.
+    * The resources and varyings still come from the API shader. */
+   if (shader->g17p_mono_key.dev.encoding == AGX_ISA_ENCODING_AGX2)
+      return !hk_g17p_mono_layout_mismatch(&shader->b, part, true);
+
    const struct agx_shader_info *info = &part->info;
    return info->stage == MESA_SHADER_FRAGMENT &&
           hk_g17p_native_cprog_qualified(info) &&
@@ -7791,8 +7839,11 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       return NULL;
    const unsigned main_samples = MAX2(shader->g17p_mono_key.fs.nr_samples, 1);
    const bool inline_samples = shader->info.fs.m5_inline_sample_shading;
-   const bool uniform_blend = agx_chip_g17_m5(dev->dev.chip) && !inline_samples;
-   if (uniform_blend && !hk_m5_uniform_blend_key(ekey))
+   const bool agx2 =
+      agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
+   const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
+                              !inline_samples;
+   if (uniform_blend && !hk_uniform_blend_key(ekey))
       HK_MONO_REFUSE("uniform blend shape");
    if ((ekey->native_spills && !inline_samples) ||
        (ekey->link.sample_shading && !inline_samples) ||
@@ -7817,7 +7868,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
                expected.info.push_count = MAX2(expected.info.push_count,
                                                ekey->emrt_heap_base + 4);
             if (uniform_blend
-                   ? !hk_m5_uniform_blend_part(shader, part)
+                   ? !hk_uniform_blend_part(shader, part)
                    : inline_samples
                    ? hk_g17p_mono_layout_mismatch(&expected, part, false) != NULL
                    : hk_g17p_mono_part_refusal(shader, part) != NULL)
@@ -7995,10 +8046,12 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
    key.no_stop = false;
    key.secondary = false;
    if (uniform_blend) {
-      key.m5_uniform_blend = true;
       key.no_preamble = false;
-      key.g17p_native_uniforms = true;
-      key.g17p_uniform_dma = false;
+      if (!agx2) {
+         key.m5_uniform_blend = true;
+         key.g17p_native_uniforms = true;
+         key.g17p_uniform_dma = false;
+      }
    }
    key.g17p_emrt = inline_samples && ekey->native_spills;
    if (shader->b.info.rodata.size_16 && shader->b.binary) {
@@ -8048,7 +8101,7 @@ hk_g17p_inline_epilog_part(struct hk_device *dev, struct hk_shader *shader,
       nir = NULL; /* consumed */
       why = !compiled ? "backend refused the monolithic program"
             : uniform_blend
-               ? (hk_m5_uniform_blend_part(shader, part) ? NULL
+               ? (hk_uniform_blend_part(shader, part) ? NULL
                                                          : "uniform blend launch")
             : inline_samples ? hk_g17p_mono_layout_mismatch(&expected, part, false)
                              : hk_g17p_mono_part_refusal(shader, part);
@@ -8099,12 +8152,17 @@ hk_g17p_local_read_part_refusal(const struct hk_shader *shader,
    const struct agx_shader_info *info = &part->info;
    if (info->stage != MESA_SHADER_FRAGMENT)
       return "wrong stage";
-   if (!info->agx3_colour_link.entry_emitted ||
-       info->agx3_colour_link.colour_classes == 0 ||
-       info->agx3_colour_link.rt_query_write_acquired)
-      return "pixel protocol not proven";
-   if (info->has_preamble && !hk_g17p_native_cprog_qualified(info))
-      return "constant program outside the native protocol";
+   if (shader->local_read_key.dev.encoding == AGX_ISA_ENCODING_AGX2) {
+      if (!info->reads_tib)
+         return "no tilebuffer read";
+   } else {
+      if (!info->agx3_colour_link.entry_emitted ||
+          info->agx3_colour_link.colour_classes == 0 ||
+          info->agx3_colour_link.rt_query_write_acquired)
+         return "pixel protocol not proven";
+      if (info->has_preamble && !hk_g17p_native_cprog_qualified(info))
+         return "constant program outside the native protocol";
+   }
    if (info->early_fragment_tests != shader->local_read_meta.early_fragment_tests ||
        info->uses_draw_id || info->uses_base_param)
       return "launch contract mismatch";
@@ -8185,9 +8243,13 @@ hk_g17p_local_read_inline_epilog_part(
    if (!mem)
       return NULL;
 
-   const unsigned main_samples = MAX2(shader->local_read_key.fs.nr_samples, 1);
+   const unsigned main_samples = shader->local_read_key.fs.nr_samples;
    const unsigned samples = MAX2(ekey->nr_samples, 1);
-   if (ekey->native_spills || samples != main_samples)
+   const bool agx2 = shader->local_read_key.dev.encoding == AGX_ISA_ENCODING_AGX2;
+   const bool dynamic_samples = agx2 && !main_samples;
+   const bool sample_count_supported = dynamic_samples
+      ? (samples == 2 || samples == 4) : samples == MAX2(main_samples, 1);
+   if (ekey->native_spills || !sample_count_supported)
       HK_LR_REFUSE("epilog shape");
 
    disk = hk_g17p_local_read_disk_key(dev, shader, ekey, local_read, partitions,
@@ -8309,7 +8371,8 @@ hk_g17p_local_read_inline_epilog_part(
       pixel.link.sample_shading = false;
       pixel.defer_monolithic_msaa = true;
       agx_nir_fs_epilog(&eb, &pixel);
-      agx_nir_lower_sample_exports_to_end(nir);
+      if (!agx2)
+         agx_nir_lower_sample_exports_to_end(nir);
    } else if (agx_chip_native_agx3(dev->dev.chip)) {
       build_g17p_fs_epilog(&eb, &lr_ekey);
    } else {
@@ -8357,7 +8420,11 @@ hk_g17p_local_read_inline_epilog_part(
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
 
-   if (inline_samples) {
+   if (dynamic_samples) {
+      NIR_PASS(_, nir, agx_nir_specialize_sample_count, samples);
+      NIR_PASS(_, nir, agx_nir_lower_monolithic_msaa_agx2, samples);
+      nir->info.fs.uses_sample_shading = false;
+   } else if (inline_samples) {
       struct agx_g17p_colour_layout layout;
       agx_g17p_colour_layout_init(&layout, lr_ekey.link.loc_written,
                                   lr_ekey.link.size_32,
@@ -8383,7 +8450,7 @@ hk_g17p_local_read_inline_epilog_part(
    struct agx_shader_key key = shader->local_read_key;
    key.no_stop = false;
    key.secondary = false;
-   key.agx3_local_read = true;
+   key.agx3_local_read = key.dev.encoding != AGX_ISA_ENCODING_AGX2;
    key.fs.inside_sample_loop = false;
    key.fs.nr_samples = samples;
    if (partitions)
@@ -8494,8 +8561,7 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
    /* On-chip tile-memory local_read: compile a monolithic fragment program
     * reading eligible color input attachments directly from the tilebuffer.
     * Any refusal falls through to the split DRAM path below. */
-   if (key->local_read.enabled && !prolog && key->nr_samples_shaded == 0 &&
-       shader->local_read_nir) {
+   if (key->local_read.enabled && !prolog && shader->local_read_nir) {
       struct agx_shader_part *mono = hk_g17p_local_read_inline_epilog_part(
          dev, shader, &key->epilog, &key->local_read, g17p_tile_partitions);
       if (mono) {
@@ -8532,9 +8598,11 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
 
    /* Inline blend: try one monolithic fragment program first;
     * any refusal falls through to the split link below, unchanged. */
-   const bool uniform_blend = agx_chip_g17_m5(dev->dev.chip) &&
+   const bool agx2 =
+      agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX2;
+   const bool uniform_blend = (agx2 || agx_chip_g17_m5(dev->dev.chip)) &&
                               !shader->info.fs.m5_inline_sample_shading &&
-                              hk_m5_uniform_blend_key(&key->epilog);
+                              hk_uniform_blend_key(&key->epilog);
    if ((uniform_blend || shader->info.fs.m5_inline_sample_shading ||
         (agx_chip_native_agx3(dev->dev.chip) &&
          (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND))) &&
@@ -8548,19 +8616,21 @@ hk_get_fast_linked_locked_fs(struct hk_device *dev, struct hk_shader *shader,
           * source. Any other program with its own constant program brings
           * its own uniform layout; link it as the main of a shader
           * describing that layout. */
+         const bool m5_blend = uniform_blend && !agx2;
+         const bool own_layout =
+            !m5_blend && (agx2 || hk_g17p_mono_own_layout(shader, mono));
          struct hk_shader *layout =
-            !uniform_blend && mono_key_clone &&
-                  hk_g17p_mono_own_layout(shader, mono)
+            mono_key_clone && own_layout
                ? hk_g17p_layout_shader_create(dev, shader, mono)
                : NULL;
          struct hk_linked_shader *mono_linked = NULL;
-         if (mono_key_clone && uniform_blend)
+         if (mono_key_clone && m5_blend)
             mono_linked = hk_fast_link_fragment_variant(dev, shader, mono,
                                                         &key->epilog);
          else if (layout)
             mono_linked = hk_fast_link_part(dev, true, layout, NULL, NULL,
                                             NULL, 0, NULL);
-         else if (mono_key_clone && !hk_g17p_mono_own_layout(shader, mono))
+         else if (mono_key_clone && !own_layout)
             mono_linked = hk_fast_link_part(dev, true, shader, mono, NULL,
                                             NULL, 0, NULL);
          free(mono->binary);
@@ -11425,20 +11495,42 @@ hk_flush_ppp_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t **out)
       }
 
       if (changed) {
-         struct agx_ptr upload =
-            hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
-         if (!upload.cpu)
-            return;
-         memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
-
+         const unsigned all_records =
+            BITFIELD_MASK(AGX_PPP_HAL300_GRAPHICS_RECORDS);
          uint8_t *start = *out;
-         u_foreach_bit(i, changed) {
-            if (!hk_ppp_emit_state(dev->dev.chip, out,
-                                   upload.gpu + state.offsets[i],
-                                   state.lengths[i])) {
-               vk_command_buffer_set_error(&cmd->vk,
-                                           VK_ERROR_FEATURE_NOT_PRESENT);
+         if (changed == all_records) {
+            struct agx_ptr upload =
+               hk_pool_vdm_alloc(cmd, sizeof(state.bytes), 64);
+            if (!upload.cpu)
                return;
+            memcpy(upload.cpu, state.bytes, sizeof(state.bytes));
+            for (unsigned i = 0; i < AGX_PPP_HAL300_GRAPHICS_RECORDS; ++i) {
+               if (!hk_ppp_emit_state(dev->dev.chip, out,
+                                      upload.gpu + state.offsets[i],
+                                      state.lengths[i])) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+            }
+         } else {
+            uint32_t total = 0;
+            u_foreach_bit(i, changed)
+               total += state.lengths[i];
+            struct agx_ptr upload = hk_pool_vdm_alloc(cmd, total, 64);
+            if (!upload.cpu)
+               return;
+            uint32_t off = 0;
+            u_foreach_bit(i, changed) {
+               memcpy((uint8_t *)upload.cpu + off,
+                      state.bytes + state.offsets[i], state.lengths[i]);
+               if (!hk_ppp_emit_state(dev->dev.chip, out, upload.gpu + off,
+                                      state.lengths[i])) {
+                  vk_command_buffer_set_error(&cmd->vk,
+                                              VK_ERROR_FEATURE_NOT_PRESENT);
+                  return;
+               }
+               off += state.lengths[i];
             }
          }
          if (unlikely(dev->frame_anatomy))
@@ -12079,15 +12171,20 @@ hk_local_read_descriptors_match(const struct hk_cmd_buffer *cmd,
 
       const uint64_t offset = (uint64_t)bl->offset +
                               (uint64_t)b->elem * (uint64_t)bl->stride;
-      if (offset + sizeof(struct hk_sampled_image_descriptor) >
-          desc->set_sizes[b->set])
+      const unsigned generation = set->layout->descriptor_generation;
+      const struct hk_sampled_image_descriptor_layout layout =
+         hk_sampled_image_descriptor_layout(generation);
+      if (!layout.stride || offset + layout.stride > desc->set_sizes[b->set])
          return false;
 
-      const struct hk_sampled_image_descriptor *d =
-         (const struct hk_sampled_image_descriptor *)((const uint8_t *)set->mapped_ptr +
-                                                      offset);
-      if (memcmp(&d->tex, &iview->planes[0].ia, sizeof(d->tex)) != 0 ||
-          d->sw.sampled_heap_index != iview->planes[0].input_heap_index)
+      const uint8_t *record = (const uint8_t *)set->mapped_ptr + offset;
+      const uint8_t *sw = record + layout.sampler;
+      uint32_t index;
+      memcpy(&index, sw + offsetof(struct hk_sampled_image_descriptor_sw,
+                                   sampled_heap_index), sizeof(index));
+      if (index != iview->planes[0].input_heap_index ||
+          memcmp(record + layout.texture, &iview->planes[0].ia,
+                 hk_texture_descriptor_size(generation)) != 0)
          return false;
    }
 
@@ -12314,7 +12411,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
        (has_masked_rt && agx_g18g_word_mrt_mask(in->tib) != 0 &&
         agx_g18g_native_mixed_epilog_mask(in->tib) != 0));
 
-   if (fs && fs->local_read_nir && agx_chip_local_read_tilebuffer(dev->dev.chip) &&
+   if (fs && fs->local_read_nir && hk_local_read_tilebuffer(dev->dev.chip) &&
        !key->epilog.native_spills && !key->epilog.blend.logicop_enable &&
        !key->epilog.blend.alpha_to_coverage &&
        !key->epilog.blend.alpha_to_one && !key->epilog.defer_api_sample_mask &&
@@ -12322,7 +12419,9 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
        !key->prolog.cull_distance_size && key->prolog.api_sample_mask == 0xff &&
        !key->epilog.link.write_z && !key->epilog.link.write_s &&
        !agx_tilebuffer_spills(in->tib) && in->view_mask == 0 &&
-       key->nr_samples_shaded == 0 &&
+       (key->nr_samples_shaded == 0 ||
+        (fs->local_read_key.dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+         (samples == 2 || samples == 4))) &&
        (samples == 1 ||
         ((fs->local_read.ia_mask & ~fs->local_read.ms_mask) == 0 &&
          fs->local_read.uses_sample_shading))) {
@@ -13554,7 +13653,8 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
 
    /* Root must be uploaded after the above, which touch the root. */
-   if (agx_chip_native_hal200(dev->dev.chip) &&
+   if ((agx_chip_native_hal200(dev->dev.chip) ||
+        agx_chip_g17_m5(dev->dev.chip)) &&
        hk_root_upload_needs_growth(gfx->descriptors.uploaded_root_size,
                                    hk_gfx_root_descriptor_size(cmd)))
       hk_root_mark_dirty(&gfx->descriptors);
@@ -13952,7 +14052,9 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       }
    }
 
-   if (!hk_root_dirty(desc) && agx_chip_native_hal200(dev->dev.chip) &&
+   if (!hk_root_dirty(desc) &&
+       (agx_chip_native_hal200(dev->dev.chip) ||
+        agx_chip_g17_m5(dev->dev.chip)) &&
        hk_root_upload_needs_growth(desc->uploaded_root_size,
                                    hk_gfx_root_descriptor_size(cmd)))
       return false;
@@ -14082,12 +14184,81 @@ hk_g17p_flush_dynamic_state_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    return true;
 }
 
+/* Consecutive hardware draws may only change the graphics root. Their linked
+ * shaders and fixed-function state are already published in this stream. */
+static bool
+hk_agx2_flush_root(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                   bool ordinary_draw_path, uint32_t draw_id,
+                   struct agx_draw draw)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!hk_root_dirty(desc) || !ordinary_draw_path || !gfx->root || cmd->in_meta ||
+       agx_is_indirect(draw.b) ||
+       agx_chip_command_stream_generation(dev->dev.chip) !=
+          AGX_CS_GENERATION_AGX2 ||
+       gfx->dirty || gfx->shaders_dirty || gfx->linked_dirty ||
+       vk_dynamic_graphics_state_any_dirty(dyn) || dev->frame_anatomy ||
+       (dyn->ms.rasterization_samples && !gfx->render.tilebuffer.nr_samples))
+      return false;
+
+   if (!gfx->shaders[MESA_SHADER_VERTEX] || gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] || gfx->shaders[MESA_SHADER_TESS_EVAL] ||
+       gfx->shaders[MESA_SHADER_GEOMETRY])
+      return false;
+
+   struct hk_shader *vs = hk_bound_hw_vs(gfx);
+   struct hk_shader *fs = hk_bound_fs(cmd);
+   struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
+   struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
+   if (!fs || !linked_vs || !linked_fs || fs->local_read_nir ||
+       !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
+       !gfx->fast_link_vs.key.prolog.hw || gfx->fast_link_vs.key.prolog.adjacency ||
+       linked_vs->sw_indexing || hk_fast_link_vs_uvs_stale(cmd, vs) ||
+       gfx->fast_link_vs.key.prolog.robustness.level !=
+          hk_vertex_robustness_level(dev, vs, dyn->vertex_input_robustness) ||
+       hk_stat_enabled(hk_pipeline_stat_addr(
+          cmd, VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)) !=
+          gfx->fast_link_fs.key.prolog.statistics ||
+       hk_fs_clear_fill_stale(cmd, cs))
+      return false;
+
+   gfx->render.color_written |= gfx->fast_link_fs.app_color_written;
+   gfx->render.color_read |= gfx->fast_link_fs.reads_tib;
+   hk_flush_draw_params_and_id(cmd, vs, linked_vs, draw_id, draw);
+   gfx->root = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   if (!gfx->root)
+      return true;
+
+   hk_reserve_scratch(cmd, cs, vs);
+   uint64_t program = hk_upload_usc_words(cmd, vs, linked_vs);
+   if (vk_command_buffer_has_error(&cmd->vk))
+      return true;
+
+   uint8_t *out = cs->current;
+   struct hk_agx2_vertex_state state = hk_agx2_pack_vertex_state(cmd, vs);
+   if (!hk_agx2_publish_vertex_state(cmd, &out, &state, program))
+      return true;
+   hk_flush_ppp_state(cmd, cs, &out);
+   cs->current = out;
+   if (!vk_command_buffer_has_error(&cmd->vk))
+      hk_root_mark_clean(desc);
+   return true;
+}
+
 static __attribute__((hot)) void
 hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
                        uint32_t draw_id, struct agx_draw draw,
                        bool ordinary_draw_path,
                        bool *g17p_native_bind_tail_emitted_out)
 {
+   if (hk_agx2_flush_root(cmd, cs, ordinary_draw_path, draw_id, draw)) {
+      *g17p_native_bind_tail_emitted_out = false;
+      return;
+   }
+
    if (hk_g17p_flush_dynamic_state_fast(cmd, cs, draw_id, draw,
                                         ordinary_draw_path,
                                         g17p_native_bind_tail_emitted_out))
@@ -14160,9 +14331,13 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
             *g17p_native_bind_tail_emitted_out =
                hk_vertex_state_bind_tail(dev->dev.chip, tail_emitted);
 
+            const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
+            const bool use_shadow =
+               verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
             const uint64_t fs_root = hk_agx3_fragment_root_select(
-               gfx, fs_src->info.agx3_root_reads, fs_src->root_descriptor_size,
-               true, true);
+               gfx, fs_src->info.agx3_root_reads,
+               fs_src->info.agx3_dynbuf_reads, fs_src->root_descriptor_size,
+               true, use_shadow);
             if (fs_root != prev_fs_root) {
                const uint64_t fragment_program =
                   hk_upload_usc_words(cmd, fs, linked_fs);

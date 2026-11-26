@@ -49,7 +49,8 @@ static const unsigned all_caps =
    AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SPARSE_BINDING |
    AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG |
    AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |
-   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT;
+   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
+   AGX_CAP_CACHED_CMD_MEMORY;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -139,16 +140,17 @@ test_cdm_war_weak_barrier(void)
    }
 }
 
-/* AGX_CAP_MOD3_REG_BANK_RA is enabled only on G17P until per-generation
- * hardware A/B benchmarks and CTS rows qualify other parts. */
+/* AGX_CAP_MOD3_REG_BANK_RA is qualified on G17P and M5 (G17G/G17S/G17C);
+ * G15, G16, G18G, and AGX2 stay off until per-generation hardware A/B
+ * benchmarks and CTS rows qualify them. */
 static void
 test_mod3_reg_bank_ra(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_MOD3_REG_BANK_RA) ==
-                    (c == AGX_CHIP_G17P),
-                 c);
+      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_MOD3_REG_BANK_RA) == expected, c);
    }
 }
 
