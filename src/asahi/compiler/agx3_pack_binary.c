@@ -13699,7 +13699,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    unsigned k = 0;
    unsigned vertex_loads_scheduled = 0;
    const bool batch_device_loads =
-      enc == AGX_ISA_ENCODING_AGX3C && !ctx->is_preamble &&
+      (enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
+      !ctx->is_preamble &&
       ctx->stage == MESA_SHADER_COMPUTE && ctx->nir && !ctx->nir->info.internal;
    agx_foreach_block(ctx, slot_block) {
       agx_foreach_instr_in_block(slot_block, I) {
@@ -13726,13 +13727,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
          e->is_async = agx3_is_async(I) || I->agx3_tex_coord_start;
-         /* Native G17G loads16/loads32 issue several independent 32-bit
+         /* Native G17G/G17P device loads issue several independent non-coherent
           * device loads on each queue before the first consumer wait.
           * Keep coherent operations and other asynchronous engines separate. */
          if (batch_device_loads &&
              I->op == AGX_OPCODE_DEVICE_LOAD &&
-             I->format == AGX_FORMAT_I32 && !I->coherent &&
-             !I->agx3_tex_coord_start) {
+             (I->format == AGX_FORMAT_I8 || I->format == AGX_FORMAT_I16 ||
+              I->format == AGX_FORMAT_F16 || I->format == AGX_FORMAT_I32) &&
+             !I->coherent && !I->agx3_tex_coord_start) {
             e->join_class = 1;
             e->join_limit = 8;
          }

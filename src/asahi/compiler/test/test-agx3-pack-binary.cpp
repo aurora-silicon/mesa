@@ -19297,3 +19297,104 @@ TEST_F(AGX3PackBinary, FragmentTexelFetchUsesReservedSamplerZeroOnAgx3c)
          << "unexpected AGX3c fragment fetch with sampler_value=1";
    }
 }
+
+/* AGX3B compute: 8 independent non-coherent DEVICE_LOADs across I8, I16,
+ * F16, and I32 (scalar, vec2, and vec4) share the 6 scoreboard slots via
+ * join_class=1, join_limit=8 with zero pre-waits, while consumers wait on
+ * their producer's slot; coherent=true refuses joining and forces slot
+ * retirement before reuse. */
+TEST_F(AGX3PackBinary, Agx3bDeviceLoadBatchingMultiFormatAndCoherentControl)
+{
+   const auto enc = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+
+   auto make_load = [&](agx_builder *b, unsigned dst_reg, enum agx_size sz,
+                        unsigned ch, enum agx_format fmt, unsigned mask,
+                        unsigned off, bool coherent) {
+      agx_index dst = agx_register(dst_reg, sz);
+      dst.channels_m1 = ch - 1;
+      agx_device_load_to(b, dst, agx_uniform(16, AGX_SIZE_64),
+                         agx_immediate(off), fmt, mask, 0, coherent);
+   };
+
+   /* Non-coherent multi-format burst of 8 loads -> 0 wait_mask on all 8 */
+   {
+      agx_builder *b = builder(enc);
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(b->shader, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+      make_load(b, 8,  AGX_SIZE_32, 1, AGX_FORMAT_I8,  0x1, 0, false);
+      make_load(b, 10, AGX_SIZE_16, 1, AGX_FORMAT_I16, 0x1, 1, false);
+      make_load(b, 12, AGX_SIZE_16, 4, AGX_FORMAT_F16, 0xf, 2, false);
+      make_load(b, 16, AGX_SIZE_32, 2, AGX_FORMAT_I32, 0x3, 3, false);
+      make_load(b, 20, AGX_SIZE_32, 4, AGX_FORMAT_I32, 0xf, 4, false);
+      make_load(b, 28, AGX_SIZE_32, 1, AGX_FORMAT_I8,  0x1, 5, false);
+      make_load(b, 30, AGX_SIZE_16, 1, AGX_FORMAT_F16, 0x1, 6, false);
+      make_load(b, 32, AGX_SIZE_32, 1, AGX_FORMAT_I32, 0x1, 7, false);
+      /* Consume load 0 (slot 1) and load 6 (slot 1 joined) */
+      agx_iadd_to(b, agx_register(4, AGX_SIZE_32),
+                  agx_register(8, AGX_SIZE_32),
+                  agx_register(30, AGX_SIZE_16), 0);
+      agx_stop(b);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+
+      auto check_zero_wait = [&](uint16_t data, enum agx3_mem_width w,
+                                 uint8_t mask, uint32_t off, uint8_t slot) {
+         struct agx3_mem_desc d = {};
+         d.data = data;
+         d.width = w;
+         d.mask = mask;
+         d.base_is_uniform = true;
+         d.base = 16;
+         d.idx_kind = AGX3_MEM_IDX_IMM;
+         d.idx_scaled = false;
+         d.byte_off = (int32_t)(off << (unsigned)w);
+         d.slot = slot;
+         d.wait_mask = 0;
+         uint8_t bytes[AGX3_MEM_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_mem_encode_load(enc, &d, bytes, &len));
+         EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                   code.end())
+            << "data=" << data << " slot=" << (unsigned)slot;
+      };
+      check_zero_wait(8,  AGX3_MEM_W8,  0x1, 0, 1);
+      check_zero_wait(10, AGX3_MEM_W16, 0x1, 1, 2);
+      check_zero_wait(12, AGX3_MEM_W16, 0xf, 2, 3);
+      check_zero_wait(16, AGX3_MEM_W32, 0x3, 3, 4);
+      check_zero_wait(20, AGX3_MEM_W32, 0xf, 4, 5);
+      check_zero_wait(28, AGX3_MEM_W8,  0x1, 5, 6);
+      check_zero_wait(30, AGX3_MEM_W16, 0x1, 6, 1);
+      check_zero_wait(32, AGX3_MEM_W32, 0x1, 7, 2);
+   }
+
+   /* Negative control: coherent=true must NOT join, 7th load waits on slot 1 */
+   {
+      agx_builder *b = builder(enc);
+      b->shader->stage = MESA_SHADER_COMPUTE;
+      b->shader->nir = rzalloc(b->shader, nir_shader);
+      b->shader->nir->info.stage = MESA_SHADER_COMPUTE;
+      for (unsigned n = 0; n < 7; ++n)
+         make_load(b, 8 + 2 * n, AGX_SIZE_32, 1, AGX_FORMAT_I32, 0x1, n, true);
+      agx_stop(b);
+      const auto code = pack(b);
+      ASSERT_FALSE(code.empty()) << agx3_last_pack_refusal();
+
+      struct agx3_mem_desc d = {};
+      d.data = 8 + 2 * 6;
+      d.width = AGX3_MEM_W32;
+      d.mask = 0x1;
+      d.base_is_uniform = true;
+      d.base = 16;
+      d.idx_kind = AGX3_MEM_IDX_IMM;
+      d.idx_scaled = false;
+      d.byte_off = 6 << 2;
+      d.slot = 1;
+      d.wait_mask = 1; /* must wait slot 1 */
+      d.coherent = true;
+      uint8_t bytes[AGX3_MEM_MAX_LENGTH], len = 0;
+      ASSERT_TRUE(agx3_mem_encode_load(enc, &d, bytes, &len));
+      EXPECT_NE(std::search(code.begin(), code.end(), bytes, bytes + len),
+                code.end());
+   }
+}

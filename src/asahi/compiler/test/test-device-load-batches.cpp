@@ -86,3 +86,38 @@ TEST(DeviceLoadBatches, InvalidContractsFailClosed)
    i.join_limit = 8; i.is_async = false;
    EXPECT_FALSE(agx3_slot_assign(&i, 1, 8, &r));
 }
+
+TEST(DeviceLoadBatches, Agx3bSixSlotsBatchingAndSaturation)
+{
+   /* 12 joined loads across 6 AGX3B slots share queues with 0 waits. */
+   std::array<agx3_slot_instr, 12> loads12;
+   std::array<agx3_slot_result, 12> res12;
+   for (unsigned n = 0; n < loads12.size(); ++n)
+      loads12[n] = load(n);
+   ASSERT_TRUE(agx3_slot_assign(loads12.data(), loads12.size(), 6, res12.data()));
+   for (unsigned n = 0; n < loads12.size(); ++n) {
+      EXPECT_EQ(res12[n].wait_mask, 0u);
+      EXPECT_EQ(res12[n].slot, n % 6 + 1);
+   }
+
+   /* 49 loads across 6 slots: 6 * 8 = 48 join without waits, 49th drains slot 1. */
+   std::array<agx3_slot_instr, 49> loads49;
+   std::array<agx3_slot_result, 49> res49;
+   for (unsigned n = 0; n < loads49.size(); ++n)
+      loads49[n] = load(n);
+   ASSERT_TRUE(agx3_slot_assign(loads49.data(), loads49.size(), 6, res49.data()));
+   for (unsigned n = 0; n < 48; ++n)
+      EXPECT_EQ(res49[n].wait_mask, 0u);
+   EXPECT_EQ(res49[48].slot, 1u);
+   EXPECT_EQ(res49[48].wait_mask, 1u);
+
+   /* Non-joined LOCAL_LOAD (join=false) retires a joined slot before reusing it. */
+   std::array<agx3_slot_instr, 7> mixed;
+   std::array<agx3_slot_result, 7> res_mixed;
+   for (unsigned n = 0; n < 6; ++n)
+      mixed[n] = load(n);
+   mixed[6] = load(10, false);
+   ASSERT_TRUE(agx3_slot_assign(mixed.data(), mixed.size(), 6, res_mixed.data()));
+   EXPECT_EQ(res_mixed[6].slot, 1u);
+   EXPECT_EQ(res_mixed[6].wait_mask, 1u);
+}
