@@ -279,43 +279,33 @@ hk_pack_native_pbe(unsigned generation,
         legacy->levels == 1)) &&
       (legacy->layout == AGX_LAYOUT_GPU || (generation == 9 && interchange)) &&
       !multisample;
-   /* Private destination capability for raw D32 copy views. The independently
-    * witnessed packet combines only Gen10 R32_UINT with compressed 2x/4x.
-    * Image allocation policy remains separate and unchanged. */
-   const bool compressed_msaa_r32_uint =
+   /* Qualified Gen10 compressed 2x/4x MSAA formats: 4-byte (R32F/U32, RG16F,
+    * RGB10A2_UNORM, RGBA8_UNORM/sRGB/SNORM) and 8-byte RGBA16 (UNORM/SNORM/
+    * UINT/FLOAT), sharing the witnessed single-sample compressed PBE packet
+    * plus MSAA dimension/selector. See agx_pbe_agx3_2d_multisample_pack(). */
+   const bool compressed_msaa_gen10 =
       generation == 10 &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
       legacy->layout == AGX_LAYOUT_GPU &&
-      legacy->channels == AGX_CHANNELS_R32 &&
-      legacy->type == AGX_TEXTURE_TYPE_UINT && !legacy->srgb &&
       legacy->layers == 1 && legacy->level == 0 && legacy->levels == 1 &&
       !legacy->unk_mipmapped &&
       (legacy->samples == AGX_SAMPLE_COUNT_2 ||
-       legacy->samples == AGX_SAMPLE_COUNT_4);
-   const bool compressed_msaa_rgba16 =
-      generation == 10 &&
-      legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
-      legacy->layout == AGX_LAYOUT_GPU &&
-      legacy->channels == AGX_CHANNELS_R16G16B16A16 &&
-      (legacy->type == AGX_TEXTURE_TYPE_FLOAT ||
-       legacy->type == AGX_TEXTURE_TYPE_UINT) && !legacy->srgb &&
-      legacy->layers == 1 && legacy->level == 0 && legacy->levels == 1 &&
-      !legacy->unk_mipmapped &&
-      (legacy->samples == AGX_SAMPLE_COUNT_2 ||
-       legacy->samples == AGX_SAMPLE_COUNT_4);
-   /* RGBA8/BGRA8 (UNORM and sRGB) share the R32_UINT texel size and so its
-    * compressed multisample metadata layout; see
-    * agx_pbe_agx3_2d_multisample_pack(). */
-   const bool compressed_msaa_rgba8 =
-      generation == 10 &&
-      legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
-      legacy->layout == AGX_LAYOUT_GPU &&
-      legacy->channels == AGX_CHANNELS_R8G8B8A8 &&
-      legacy->type == AGX_TEXTURE_TYPE_UNORM &&
-      legacy->layers == 1 && legacy->level == 0 && legacy->levels == 1 &&
-      !legacy->unk_mipmapped &&
-      (legacy->samples == AGX_SAMPLE_COUNT_2 ||
-       legacy->samples == AGX_SAMPLE_COUNT_4);
+       legacy->samples == AGX_SAMPLE_COUNT_4) &&
+      ((legacy->channels == AGX_CHANNELS_R32 &&
+        (legacy->type == AGX_TEXTURE_TYPE_UINT ||
+         legacy->type == AGX_TEXTURE_TYPE_FLOAT) && !legacy->srgb) ||
+       (legacy->channels == AGX_CHANNELS_R16G16 &&
+        legacy->type == AGX_TEXTURE_TYPE_FLOAT && !legacy->srgb) ||
+       (legacy->channels == AGX_CHANNELS_R10G10B10A2 &&
+        legacy->type == AGX_TEXTURE_TYPE_UNORM && !legacy->srgb) ||
+       (legacy->channels == AGX_CHANNELS_R8G8B8A8 &&
+        (legacy->type == AGX_TEXTURE_TYPE_UNORM ||
+         (legacy->type == AGX_TEXTURE_TYPE_SNORM && !legacy->srgb))) ||
+       (legacy->channels == AGX_CHANNELS_R16G16B16A16 &&
+        (legacy->type == AGX_TEXTURE_TYPE_UNORM ||
+         legacy->type == AGX_TEXTURE_TYPE_SNORM ||
+         legacy->type == AGX_TEXTURE_TYPE_UINT ||
+         legacy->type == AGX_TEXTURE_TYPE_FLOAT) && !legacy->srgb));
    if ((!layered && !multisample &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
        (legacy->layout == AGX_LAYOUT_LINEAR &&
@@ -332,17 +322,14 @@ hk_pack_native_pbe(unsigned generation,
                        !(generation == 10 && legacy->samples == AGX_SAMPLE_COUNT_8))
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
        (legacy->compressed && !compressed_gen9 && !compressed_2d &&
-                          !compressed_msaa_r32_uint &&
-                          !compressed_msaa_rgba16 && !compressed_msaa_rgba8) ||
+                          !compressed_msaa_gen10) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && legacy->layers != 1) ||
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped ||
                         (legacy->compressed && !compressed_gen9 &&
-                          !compressed_msaa_r32_uint &&
-                          !compressed_msaa_rgba16 &&
-                          !compressed_msaa_rgba8))) ||
+                          !compressed_msaa_gen10))) ||
        (legacy->extended != legacy->compressed) ||
        (legacy->layout == AGX_LAYOUT_LINEAR || interchange
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4

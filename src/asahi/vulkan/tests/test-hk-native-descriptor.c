@@ -541,6 +541,28 @@ check_compressed_msaa_pbe(void)
    semantic.acceleration_buffer = UINT64_C(0x45678000);
    semantic.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY_MULTISAMPLED;
    assert(!hk_pack_native_pbe(10, &packed, &semantic));
+
+   /* Expanded M5 4-byte and 8-byte MSAA colour formats pack on Gen10 2x/4x,
+    * while B10G11R11 remains excluded. */
+   semantic.dimension = AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED;
+   const struct {
+      enum agx_channels channels;
+      enum agx_texture_type type;
+      bool expect;
+   } extra_msaa[] = {
+      {AGX_CHANNELS_R10G10B10A2, AGX_TEXTURE_TYPE_UNORM, true},
+      {AGX_CHANNELS_R16G16, AGX_TEXTURE_TYPE_FLOAT, true},
+      {AGX_CHANNELS_R32, AGX_TEXTURE_TYPE_FLOAT, true},
+      {AGX_CHANNELS_R8G8B8A8, AGX_TEXTURE_TYPE_SNORM, true},
+      {AGX_CHANNELS_R16G16B16A16, AGX_TEXTURE_TYPE_UNORM, true},
+      {AGX_CHANNELS_R16G16B16A16, AGX_TEXTURE_TYPE_SNORM, true},
+      {AGX_CHANNELS_R11G11B10, AGX_TEXTURE_TYPE_FLOAT, false},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(extra_msaa); i++) {
+      semantic.channels = extra_msaa[i].channels;
+      semantic.type = extra_msaa[i].type;
+      assert(hk_pack_native_pbe(10, &packed, &semantic) == extra_msaa[i].expect);
+   }
 }
 
 static void
