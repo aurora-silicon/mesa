@@ -4928,6 +4928,63 @@ compute_pair_emitted_footprint(const struct vk_queue_submit *submit,
 
 static bool
 hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
+             const struct vk_queue_submit *submit, struct hk_packed_runs *out);
+
+/* PROFILING ONLY (HK_PROBE_BAND=<bands>): launch a fused GEMM producer and the
+ * fused depthwise-A consumer that reads its output as interleaved row bands
+ * (P0 P1 C0 P2 C1 ...), strong flush between steps, so the consumer re-reads
+ * rows its producer wrote moments ago. */
+static unsigned
+hk_probe_band_k(void)
+{
+   const char *e = getenv("HK_PROBE_BAND");
+   const int k = e ? atoi(e) : 0;
+   return k > 1 && k <= 64 ? (unsigned)k : 0;
+}
+
+struct hk_probe_band {
+   bool active;
+   unsigned c_idx;
+   struct hk_shader *p_shader;
+   struct hk_compute_pair_dispatch p_disp;
+   size_t p_root_off;
+   uint32_t m;      /* pixels (GEMM rows) of P's output and C's output */
+   uint32_t halo;   /* pixels C reads beyond its own last pixel */
+};
+
+/* One band launch: a copy of @tmpl_off's root table with the band's first
+ * workgroup row at push bytes 248..251. */
+static bool
+hk_probe_band_launch(struct hk_device *dev, struct hk_cs *cs, struct hk_shader *s,
+                     const struct hk_compute_pair_dispatch *d, uint32_t tile_m,
+                     uint32_t px0, uint32_t px1, uint8_t *root_map, uint64_t root_va,
+                     size_t tmpl_off, size_t *root_off, size_t root_stride,
+                     size_t root_total, uint8_t *ioto_map, uint64_t ioto_va,
+                     size_t *ioto_off, size_t ioto_total)
+{
+   if (*root_off + root_stride > root_total || *ioto_off >= ioto_total)
+      return false;
+   struct hk_root_descriptor_table *rt =
+      (struct hk_root_descriptor_table *)(root_map + *root_off);
+   memcpy(rt, root_map + tmpl_off, sizeof(*rt));
+   rt->root_desc_addr = root_va + *root_off;
+   const uint32_t row0 = px0 / tile_m;
+   memcpy(rt->push + 248, &row0, sizeof(row0));
+   struct hk_compute_pair_dispatch band = *d;
+   band.exec_threads[1] = ((px1 - px0) / tile_m) * s->probe_band_wg_y;
+   band.root_va = root_va + *root_off;
+   size_t used = 0;
+   if (!hk_emit_fused_compute_dispatch(dev, cs, s, &band, ioto_map + *ioto_off,
+                                       ioto_va + *ioto_off, ioto_total - *ioto_off,
+                                       &used))
+      return false;
+   *ioto_off += ALIGN_POT(used, 64u);
+   *root_off += root_stride;
+   return true;
+}
+
+static bool
+hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
              const struct vk_queue_submit *submit, struct hk_packed_runs *out)
 {
    memset(out, 0, sizeof(*out));
@@ -4986,6 +5043,16 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;
             }
          }
+      }
+   }
+
+   const unsigned probe_band_k = pair_safe ? hk_probe_band_k() : 0;
+   if (probe_band_k) {
+      for (unsigned i = 0; i < n; ++i) {
+         if (members[i].cs && hk_compute_pair_stream_eligible(members[i].cs) &&
+             members[i].cs->compute_pair->info.role == HK_COMPUTE_PAIR_GEMM)
+            members[i].bytes += (size_t)(probe_band_k + 1) *
+                                (AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE + 256);
       }
    }
 
@@ -5713,6 +5780,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          }
       }
    }
+   if (probe_band_k) {
+      ioto_total_est *= (size_t)(2 * probe_band_k + 2);
+      root_cand_count = (root_cand_count + fused_cand_count) * (2 * probe_band_k + 2);
+   }
    const int64_t t1_ns = trace ? os_time_get_nano() : 0;
 
    /* Reap already-retired submissions before allocating packet BOs so the
@@ -6160,6 +6231,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       }
 
       uint8_t preceding_kinds = 0;
+      struct hk_probe_band band = {0};
       struct hk_pack_hazard_state hazard = {0};
       struct hk_pack_footprint cached_fp;
       unsigned cached_fp_idx = UINT32_MAX;
@@ -6190,7 +6262,9 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   ? pl->shader : NULL;
             const bool needs_root =
                pl->dual_write != HK_COMPUTE_PAIR_DUAL_NONE ||
-               pl->im2col_idx_off != 0 || pl->dw_a_idx_off != 0;
+               pl->im2col_idx_off != 0 || pl->dw_a_idx_off != 0 ||
+               (probe_band_k && fused_shader && fused_shader->probe_band);
+            bool band_deferred_now = false;
             if (fused_shader && ioto_off < ioto_total &&
                 (!needs_root || (root_map && root_off + root_stride <= root_total))) {
                const struct hk_compute_pair_dispatch *p_disp = item->compute_pair;
@@ -6452,22 +6526,148 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                         dp.pad_flags &= ~(HK_DW_A_FLAG_HAS_DST2 << 16);
                      memcpy(rt->push + dw_off, &dp, sizeof(dp));
                   }
+                  if (fused_shader->probe_band) {
+                     const uint32_t zero_row = 0;
+                     memcpy(rt->push + 248, &zero_row, sizeof(zero_row));
+                  }
                   tmp_disp.root_va = root_va + root_off;
                }
 
                const size_t unique = cs->compute_resources.size;
                size_t ioto_used = 0;
-               if (root_ok &&
+               bool emit_ok = root_ok &&
                    hk_pack_add_bo(out->extra_bos, fused_shader->only_linked->b.bo) &&
                    (!(fused_shader->b.info.has_preamble ||
                       fused_shader->b.info.rodata.size_16) ||
-                    hk_pack_add_bo(out->extra_bos, fused_shader->bo)) &&
-                   hk_emit_fused_compute_dispatch(dev, cs, fused_shader,
-                                                  &tmp_disp,
-                                                  ioto_map + ioto_off,
-                                                  ioto_va + ioto_off,
-                                                  ioto_total - ioto_off,
-                                                  &ioto_used)) {
+                    hk_pack_add_bo(out->extra_bos, fused_shader->bo));
+               unsigned band_c_m = UINT32_MAX;
+               if (emit_ok && probe_band_k && needs_root && !band.active &&
+                   fused_shader->probe_band && tmp_disp.exec_threads[2] == 1 &&
+                   pl->dual_write != HK_COMPUTE_PAIR_DUAL_GEMM_DW &&
+                   pl->dual_write != HK_COMPUTE_PAIR_DUAL_COPY2 &&
+                   pl->alt_kind_override == HK_COMPUTE_PAIR_ALT_NONE &&
+                   p_disp->info.role == HK_COMPUTE_PAIR_GEMM) {
+                  /* The consumer: a fused dw_a GEMM whose depthwise group
+                   * directly follows this producer's span. */
+                  const unsigned g = m + pl->span;
+                  for (unsigned mc = g + 1; mc < pr->count && mc <= g + 4; ++mc) {
+                     const struct hk_pack_fuse_plan *pc = &plans[pr->first + mc];
+                     if (pc->shader && pc->shader->probe_band &&
+                         pc->dw_a_idx_off == mc - g &&
+                         mc + pc->span <= pr->count && !pc->im2col_idx_off &&
+                         pc->dual_write != HK_COMPUTE_PAIR_DUAL_GEMM_DW &&
+                         pc->alt_kind_override == HK_COMPUTE_PAIR_ALT_NONE &&
+                         (pc->dual_write != HK_COMPUTE_PAIR_DUAL_COPY2 ||
+                          mc + pc->dual2_idx_off < pr->count)) {
+                        band_c_m = mc;
+                        break;
+                     }
+                  }
+               }
+               if (band_c_m != UINT32_MAX) {
+                  const unsigned c_idx = pr->first + band_c_m;
+                  const struct hk_pack_fuse_plan *pc = &plans[c_idx];
+                  const uint32_t in_w = pc->dw_a_push.in_wh & 0xffffu;
+                  const uint32_t in_h = pc->dw_a_push.in_wh >> 16;
+                  const uint32_t out_w = pc->dw_a_push.out_wh & 0xffffu;
+                  const uint32_t out_h = pc->dw_a_push.out_wh >> 16;
+                  const bool s2 = (pc->dw_a_push.pad_flags >> 16) & HK_DW_A_FLAG_STRIDE2;
+                  const uint32_t mpix = in_w * in_h;
+                  const uint32_t rows_p = tmp_disp.exec_threads[1] / fused_shader->probe_band_wg_y;
+                  int32_t m_p = 0;
+                  memcpy(&m_p, p_disp->push + p_disp->info.gemm.m_offset_B, 4);
+                  struct hk_pack_footprint pfp, dfp;
+                  compute_pair_emitted_footprint(submit, plans, idx, true, false, &pfp);
+                  compute_pair_emitted_footprint(submit, plans, pr->first + m + pl->span,
+                                                 false, false, &dfp);
+                  bool raw = false;
+                  for (unsigned w = 0; w < pfp.num_writes && !raw; ++w)
+                     for (unsigned r = 0; r < dfp.num_reads && !raw; ++r)
+                        raw = pfp.writes[w].handle == dfp.reads[r].handle &&
+                              pfp.writes[w].start < dfp.reads[r].end &&
+                              dfp.reads[r].start < pfp.writes[w].end;
+                  if (!s2 && in_w == out_w && in_h == out_h && mpix && rows_p &&
+                      (uint32_t)m_p == mpix && mpix % rows_p == 0 &&
+                      util_is_power_of_two_nonzero(mpix / rows_p) &&
+                      pfp.known && dfp.known && raw) {
+                     band = (struct hk_probe_band){
+                        .active = true,
+                        .c_idx = c_idx,
+                        .p_shader = fused_shader,
+                        .p_disp = tmp_disp,
+                        .p_root_off = root_off,
+                        .m = mpix,
+                        .halo = 2 * in_w,
+                     };
+                     band_deferred_now = true;
+                  }
+               }
+               if (band_deferred_now) {
+                  /* Launched with the consumer, below. */
+               } else if (emit_ok && band.active && band.c_idx == idx) {
+                  const uint32_t rows_c = tmp_disp.exec_threads[1] / fused_shader->probe_band_wg_y;
+                  const uint32_t rows_p =
+                     band.p_disp.exec_threads[1] / band.p_shader->probe_band_wg_y;
+                  const uint32_t tile_c = rows_c ? band.m / rows_c : 0;
+                  const uint32_t tile_p = rows_p ? band.m / rows_p : 0;
+                  size_t band_root = root_off + root_stride;
+                  if (fused_shader->probe_band && tmp_disp.exec_threads[2] == 1 &&
+                      tile_c && tile_c * rows_c == band.m &&
+                      util_is_power_of_two_nonzero(tile_c)) {
+                     const uint32_t unit = MAX2(tile_c, tile_p);
+                     uint32_t bpx = DIV_ROUND_UP(band.m, probe_band_k);
+                     bpx = MAX2(bpx, band.halo);
+                     bpx = DIV_ROUND_UP(bpx, unit) * unit;
+                     uint32_t pp = 0, cc = 0;
+                     bool first = true;
+                     while (emit_ok && cc < band.m) {
+                        const uint32_t c_end = MIN2(band.m, cc + bpx);
+                        const uint32_t need = MIN2(band.m, c_end + band.halo);
+                        if (!first)
+                           hk_cdm_visibility_flush(dev, cs, false);
+                        first = false;
+                        if (pp < need) {
+                           const uint32_t p_end = MIN2(band.m, pp + bpx);
+                           emit_ok = hk_probe_band_launch(
+                              dev, cs, band.p_shader, &band.p_disp, tile_p, pp, p_end,
+                              root_map, root_va, band.p_root_off, &band_root, root_stride,
+                              root_total, ioto_map, ioto_va, &ioto_off, ioto_total);
+                           pp = p_end;
+                        } else {
+                           emit_ok = hk_probe_band_launch(
+                              dev, cs, fused_shader, &tmp_disp, tile_c, cc, c_end,
+                              root_map, root_va, root_off, &band_root, root_stride,
+                              root_total, ioto_map, ioto_va, &ioto_off, ioto_total);
+                           cc = c_end;
+                        }
+                     }
+                  } else {
+                     /* Not bandable after all: producer whole, then consumer. */
+                     emit_ok = hk_probe_band_launch(
+                        dev, cs, band.p_shader, &band.p_disp, tile_p ? tile_p : 1, 0,
+                        band.m, root_map, root_va, band.p_root_off, &band_root, root_stride,
+                        root_total, ioto_map, ioto_va, &ioto_off, ioto_total);
+                     if (emit_ok) {
+                        hk_cdm_visibility_flush(dev, cs, false);
+                        emit_ok = hk_emit_fused_compute_dispatch(dev, cs, fused_shader,
+                                                                 &tmp_disp,
+                                                                 ioto_map + ioto_off,
+                                                                 ioto_va + ioto_off,
+                                                                 ioto_total - ioto_off,
+                                                                 &ioto_used);
+                     }
+                  }
+                  band.active = false;
+                  root_off = band_root - root_stride;
+               } else if (emit_ok) {
+                  emit_ok = hk_emit_fused_compute_dispatch(dev, cs, fused_shader,
+                                                           &tmp_disp,
+                                                           ioto_map + ioto_off,
+                                                           ioto_va + ioto_off,
+                                                           ioto_total - ioto_off,
+                                                           &ioto_used);
+               }
+               if (emit_ok) {
                   ioto_off += ALIGN_POT(ioto_used, 64u);
                   if (needs_root)
                      root_off += root_stride;
@@ -6530,7 +6730,11 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             }
             const bool eff_last = next_idx == UINT32_MAX;
 
-            if (eff_last) {
+            if (band.active && band_deferred_now) {
+               hk_pack_hazard_reset_all(&hazard);
+               if (hk_cdm_visibility_flush_needed(dev, cs, false))
+                  hk_cdm_visibility_flush(dev, cs, false);
+            } else if (eff_last) {
                if (visible_completion) {
                   hk_cdm_visibility_flush(dev, cs, true);
                } else if (hk_cdm_memory_scope_form(dev) &&

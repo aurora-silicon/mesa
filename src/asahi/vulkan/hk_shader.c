@@ -10599,6 +10599,42 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
       }
    }
 
+   /* PROFILING ONLY (HK_PROBE_BAND): fused cmat GEMMs (not gemm_dw, whose
+    * grid is 8x8 pixel tiles) read a workgroup-row offset from push bytes
+    * 248..251, so the packer can launch them as row bands interleaved with a
+    * depthwise-A consumer. The packer writes 0 when it does not band. */
+   bool probe_band = false;
+   uint32_t probe_band_wg_y = 1;
+   if (fused_nir && hk_compute_pair_alt_is_gemm_cmat(alt_kind) && !has_gemm_dw &&
+       fused_nir->num_uniforms <= 248) {
+      const char *bv = getenv("HK_PROBE_BAND");
+      if (bv && atoi(bv) > 1) {
+         nir_function_impl *impl = nir_shader_get_entrypoint(fused_nir);
+         nir_builder pb = nir_builder_at(nir_before_impl(impl));
+         nir_def *base = nir_load_push_constant(&pb, 1, 32, nir_imm_int(&pb, 248),
+                                                .base = 0, .range = 256, .align_mul = 4);
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_workgroup_id)
+                  continue;
+               pb.cursor = nir_after_instr(instr);
+               nir_def *id = &intr->def;
+               nir_def *band = nir_vec3(&pb, nir_channel(&pb, id, 0),
+                                        nir_iadd(&pb, nir_channel(&pb, id, 1), base),
+                                        nir_channel(&pb, id, 2));
+               nir_def_rewrite_uses_after(id, band);
+            }
+         }
+         nir_progress(true, impl, nir_metadata_none);
+         fused_nir->num_uniforms = 256;
+         probe_band = true;
+         probe_band_wg_y = MAX2(fused_nir->info.workgroup_size[1], 1);
+      }
+   }
+
    struct hk_shader *shader = NULL;
    if (fused_nir) {
       struct vk_shader_compile_info synth = {
@@ -10614,6 +10650,10 @@ hk_compute_pair_get_or_compile_fused(struct hk_device *dev,
                                           &fused_loop_bound);
    }
 
+   if (shader) {
+      shader->probe_band = probe_band;
+      shader->probe_band_wg_y = probe_band_wg_y;
+   }
    struct hk_compute_pair_variant var = {
       .has_epilogue = has_ep,
       .has_fadd = has_fadd,

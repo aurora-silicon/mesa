@@ -322,6 +322,10 @@ struct hk_shader {
    struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
    struct hk_pack_loop_bound pack_loop_bound;
+   /* PROFILING ONLY (HK_PROBE_BAND): workgroup row offset at push bytes
+    * 248..251; workgroup height of the grid's y axis. */
+   bool probe_band;
+   uint32_t probe_band_wg_y;
 
    const void *code_ptr;
    uint32_t code_size;
