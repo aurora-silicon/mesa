@@ -163,12 +163,23 @@ enum agx_chip_cap {
     * reuse, push-descriptor elision, and direct fragment-root comparisons
     * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
    AGX_CAP_CACHED_CMD_MEMORY = 1u << 22,
+
+
+   /* Compute shaders hoist non-coherent device_load instructions up to 64
+    * instructions past pure ALU, threadgroup barriers, workgroup memory
+    * accesses, other non-coherent device loads, and non-overlapping immediate
+    * uniform_store instructions (agx_hoist_loads). Measured and qualified on
+    * G13G and G13X; other chips keep the existing schedule until measured. */
+   AGX_CAP_COMPUTE_HOIST_LOADS = 1u << 23,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
 #define AGX_CAPS_AGX2                                                          \
    (AGX_CAP_SPARSE_BINDING | AGX_CAP_SPARSE_RESIDENCY_3D |                     \
     AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COOPERATIVE_MATRIX)
+
+/* What the measured G13 chips (G13G, G13X) add over the AGX2 set. */
+#define AGX_CAPS_G13 (AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_HOIST_LOADS)
 
 /* What the five native AGX3 chips (G15G, G15S, G15C, G16G, G17P) share. */
 #define AGX_CAPS_NATIVE                                                        \
@@ -205,8 +216,8 @@ enum agx_chip_cap {
  * predicates do.
  */
 #define AGX_CHIP_CAPS(X, ...)                                                  \
-   X(G13G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G13X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G13G, AGX_CAPS_G13, __VA_ARGS__)                                          \
+   X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G15P, 0, __VA_ARGS__)                                                     \

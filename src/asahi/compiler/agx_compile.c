@@ -15405,6 +15405,9 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    if (likely(!(agx_compiler_debug & AGX_DBG_NOSCHED))) {
       AGX_PASS(ctx, agx_pressure_schedule);
       AGX_PASS(ctx, agx_ilp_schedule);
+      if (!ctx->is_preamble && nir->info.stage == MESA_SHADER_COMPUTE &&
+          agx_chip_has_cap(ctx->key->dev.chip, AGX_CAP_COMPUTE_HOIST_LOADS))
+         AGX_PASS(ctx, agx_hoist_loads);
    }
 
    AGX_PASS(ctx, agx3_order_fragment_device_loads);

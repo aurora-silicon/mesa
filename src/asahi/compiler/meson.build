@@ -766,6 +766,7 @@ if with_tests
          'test/test-minifloat.cpp',
          'test/test-optimizer.cpp',
          'test/test-pressure-cse.cpp',
+         'test/test-hoist-loads.cpp',
          'test/test-ilp-cprog-cap.cpp',
          'test/test-rte-fma.cpp',
          'test/test-image-atomic-metadata.cpp',

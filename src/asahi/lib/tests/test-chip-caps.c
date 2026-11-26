@@ -50,7 +50,7 @@ static const unsigned all_caps =
    AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG |
    AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
-   AGX_CAP_CACHED_CMD_MEMORY;
+   AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_HOIST_LOADS;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -266,6 +266,18 @@ test_signed_zero_minmax_select(void)
    }
 }
 
+/* AGX_CAP_COMPUTE_HOIST_LOADS is enabled on the measured G13 rows only. */
+static void
+test_compute_hoist_loads(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COMPUTE_HOIST_LOADS) == expected,
+                 c);
+   }
+}
+
 int
 main(void)
 {
@@ -282,6 +294,7 @@ main(void)
    test_hal200_lossless_compression();
    test_hal200_msaa_color_compression();
    test_signed_zero_minmax_select();
+   test_compute_hoist_loads();
 
    if (failures) {
       fprintf(stderr, "agx_chip_caps: %u of %u checks failed\n", failures,
