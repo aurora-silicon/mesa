@@ -1091,6 +1091,8 @@ agx_pack_integer_8_agx3(agx_builder *b, const agx_index *channels,
    return n;
 }
 
+static agx_index agx_g17p_shift_boundary(agx_builder *b, unsigned shift);
+
 /* A multi-component W8 payload is byte-packed in the register file: two
  * adjacent components occupy the low/high bytes of one 16-bit register. NIR
  * keeps each 8-bit component in its own 16-bit or zero-extended 32-bit lane,
@@ -1101,12 +1103,21 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
 {
    agx_index channels[4] = {agx_null()};
 
-   /* AGX3C: unpack each byte in one 16-bit operation: even bytes mask
-    * the low byte and odd bytes shift right by 8, clearing the upper byte. */
-   if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-       !b->shader->key->dev.emit_agx3d) {
+   /* AGX3B and AGX3C: unpack each byte in one 16-bit operation: even bytes
+    * mask the low byte and odd bytes shift right by 8, clearing the upper
+    * byte. AGX3B's half-register SRL has no immediate count: it takes the
+    * register count a NIR 16-bit ushr gets (agx_g17p_shift_boundary), and
+    * one count serves every odd byte of the payload. This replaces the
+    * widen, 32-bit shift, re-narrow and mask of the form below per byte. */
+   const bool agx3b =
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   if (agx3b || (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+                 !b->shader->key->dev.emit_agx3d)) {
+      const agx_index count = agx3b && nr_channels > 1
+                                 ? agx_g17p_shift_boundary(b, 8)
+                                 : agx_immediate(8);
       for (unsigned i = 0; i < nr_channels; ++i) {
-         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], agx_immediate(8))
+         channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], count)
                                : agx_and(b, halfs[i / 2], agx_immediate(0xff));
          if (dest.size == AGX_SIZE_32) {
             agx_index zext = agx_temp(b->shader, AGX_SIZE_32);
@@ -5867,6 +5878,21 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
          }
          if (native_shape)
             continue;
+      }
+
+      /* A minifloat multiplier takes the other multiplicand's negation in its
+       * sign bit. The exact product's sign is the XOR of the operand signs
+       * and the FMA still rounds once, so fma(-x, #k, c) is fma(x, #-k, c)
+       * for every x, including zeros, infinities and NaNs. Only an absolute
+       * value is left to materialize below. */
+      for (unsigned s = 0; s < 2; ++s) {
+         agx_index *imm = &I->src[1 - s];
+         if (I->src[s].neg && I->src[s].type != AGX_INDEX_IMMEDIATE &&
+             imm->type == AGX_INDEX_IMMEDIATE && imm->value <= 0xff &&
+             !imm->memory) {
+            I->src[s].neg = false;
+            imm->value ^= 0x80;
+         }
       }
 
       agx_foreach_src(I, s) {
@@ -11525,6 +11551,266 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
    return progress;
 }
 
+static bool
+agx_alu_constructs_vector(const nir_alu_instr *alu)
+{
+   if (alu->def.num_components > 1)
+      return true;
+
+   switch (alu->op) {
+   case nir_op_pack_32_2x16_split:
+   case nir_op_pack_64_2x32_split:
+   case nir_op_pack_32_4x8_split:
+   case nir_op_pack_half_2x16_split:
+   case nir_op_pack_half_2x16_rtz_split:
+   case nir_op_pack_32_2x16:
+   case nir_op_pack_64_2x32:
+   case nir_op_pack_32_4x8:
+   case nir_op_pack_64_4x16:
+   case nir_op_pack_half_2x16:
+   case nir_op_pack_unorm_2x16:
+   case nir_op_pack_snorm_2x16:
+   case nir_op_pack_unorm_4x8:
+   case nir_op_pack_snorm_4x8:
+   case nir_op_pack_uint_2x16:
+   case nir_op_pack_sint_2x16:
+   case nir_op_pack_uvec2_to_uint:
+   case nir_op_pack_uvec4_to_uint:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_def_only_scalar_alu_uses(nir_def *def, unsigned depth)
+{
+   if (depth >= 4)
+      return false;
+
+   nir_foreach_use_including_if(use_src, def) {
+      if (nir_src_is_if(use_src))
+         return false;
+
+      nir_instr *use_instr = nir_src_use_instr(use_src);
+      if (use_instr->type != nir_instr_type_alu)
+         return false;
+
+      nir_alu_instr *alu = nir_instr_as_alu(use_instr);
+      if (agx_alu_constructs_vector(alu))
+         return false;
+
+      /* Scalar movs before copy-prop may forward a load channel into a vector
+       * constructor, phi, or intrinsic where register affinity still matters. */
+      if (alu->op == nir_op_mov &&
+          !agx_def_only_scalar_alu_uses(&alu->def, depth + 1))
+         return false;
+   }
+
+   return true;
+}
+
+static bool
+agx_intrinsic_is_memory_load(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+   case nir_intrinsic_load_constant:
+   case nir_intrinsic_load_push_constant:
+   case nir_intrinsic_load_agx:
+   case nir_intrinsic_load_constant_agx:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+agx_memory_load_format_shrinkable(const nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_agx &&
+       intr->intrinsic != nir_intrinsic_load_constant_agx)
+      return true;
+
+   /* Keep packed subword loads and W8-word unpacks at their encoded width. */
+   if (nir_intrinsic_base(intr) &
+       (AGX_NIR_MEMORY_PACKED_COUNT_MASK | AGX_NIR_MEMORY_UNPACK_W8_WORD))
+      return false;
+
+   enum pipe_format fmt = nir_intrinsic_format(intr);
+   return fmt == PIPE_FORMAT_R8_UINT || fmt == PIPE_FORMAT_R16_UINT ||
+          fmt == PIPE_FORMAT_R32_UINT;
+}
+
+static bool
+agx_memory_loads_match(const nir_intrinsic_instr *a,
+                       const nir_intrinsic_instr *b)
+{
+   if (a->intrinsic != b->intrinsic || a->def.bit_size != b->def.bit_size)
+      return false;
+
+   unsigned num_srcs = nir_intrinsic_infos[a->intrinsic].num_srcs;
+   assert(num_srcs == nir_intrinsic_infos[b->intrinsic].num_srcs);
+   for (unsigned i = 0; i < num_srcs; ++i) {
+      if (nir_srcs_equal(a->src[i], b->src[i]))
+         continue;
+      if (!nir_src_is_const(a->src[i]) || !nir_src_is_const(b->src[i]) ||
+          nir_src_bit_size(a->src[i]) != nir_src_bit_size(b->src[i]) ||
+          nir_src_num_components(a->src[i]) != 1 ||
+          nir_src_num_components(b->src[i]) != 1 ||
+          nir_src_as_uint(a->src[i]) != nir_src_as_uint(b->src[i]))
+         return false;
+   }
+
+   if (nir_intrinsic_has_base(a) != nir_intrinsic_has_base(b) ||
+       (nir_intrinsic_has_base(a) &&
+        nir_intrinsic_base(a) != nir_intrinsic_base(b)))
+      return false;
+
+   if (nir_intrinsic_has_format(a) != nir_intrinsic_has_format(b) ||
+       (nir_intrinsic_has_format(a) &&
+        nir_intrinsic_format(a) != nir_intrinsic_format(b)))
+      return false;
+
+   if (nir_intrinsic_has_sign_extend(a) != nir_intrinsic_has_sign_extend(b) ||
+       (nir_intrinsic_has_sign_extend(a) &&
+        nir_intrinsic_sign_extend(a) != nir_intrinsic_sign_extend(b)))
+      return false;
+
+   if (nir_intrinsic_has_range_base(a) != nir_intrinsic_has_range_base(b) ||
+       (nir_intrinsic_has_range_base(a) &&
+        nir_intrinsic_range_base(a) != nir_intrinsic_range_base(b)))
+      return false;
+
+   if (nir_intrinsic_has_range(a) != nir_intrinsic_has_range(b) ||
+       (nir_intrinsic_has_range(a) &&
+        nir_intrinsic_range(a) != nir_intrinsic_range(b)))
+      return false;
+
+   return true;
+}
+
+static unsigned
+agx_shrink_memory_load_target_comps(nir_intrinsic_instr *intr)
+{
+   unsigned orig = intr->def.num_components;
+   if (orig <= 1 || !agx_memory_load_format_shrinkable(intr))
+      return orig;
+
+   /* Keep 4-component buffer descriptors intact for preamble speculation and
+    * never drop volatile memory reads. */
+   if (nir_intrinsic_has_access(intr) &&
+       (nir_intrinsic_access(intr) &
+        (ACCESS_BUFFER_DESCRIPTOR_AGX | ACCESS_VOLATILE)))
+      return orig;
+
+   /* Leave non-ALU uses (intrinsics, phis, texture ops, ifs) and vector
+    * constructors/packers untouched so vector register affinity stays intact. */
+   if (!agx_def_only_scalar_alu_uses(&intr->def, 0))
+      return orig;
+
+   unsigned mask = nir_def_components_read(&intr->def);
+   if (!mask)
+      return orig;
+
+   unsigned comps = util_last_bit(mask);
+   unsigned rounded = comps > 4 ? util_next_power_of_two(comps) : comps;
+   if (rounded >= orig)
+      return orig;
+
+   /* Divergent loads stay in GPRs whose register allocation rounds vector
+    * width up to a power of two. Skip shrinking e.g. vec4 -> vec3 when it
+    * saves no GPRs, while keeping uniform vec4 -> vec3 shrinking for
+    * preamble uniform slots and divergent vec4 -> vec1/vec2 shrinking. */
+   if (intr->def.divergent &&
+       util_next_power_of_two(rounded) >= util_next_power_of_two(orig))
+      return orig;
+
+   return rounded;
+}
+
+struct agx_shrink_load_cand {
+   nir_intrinsic_instr *intr;
+   unsigned candidate_comps;
+};
+
+static bool
+agx_nir_shrink_memory_loads_impl(nir_function_impl *impl)
+{
+   struct util_dynarray cands;
+   util_dynarray_init(&cands, NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (!agx_intrinsic_is_memory_load(intr) ||
+             intr->def.num_components <= 1)
+            continue;
+
+         struct agx_shrink_load_cand cand = {
+            .intr = intr,
+            .candidate_comps = agx_shrink_memory_load_target_comps(intr),
+         };
+         util_dynarray_append(&cands, cand);
+      }
+   }
+
+   bool progress = false;
+   unsigned count =
+      util_dynarray_num_elements(&cands, struct agx_shrink_load_cand);
+   struct agx_shrink_load_cand *items =
+      (struct agx_shrink_load_cand *)cands.data;
+
+   for (unsigned i = 0; i < count; ++i) {
+      unsigned target = items[i].candidate_comps;
+      nir_intrinsic_instr *intr = items[i].intr;
+      if (target >= intr->def.num_components)
+         continue;
+
+      /* Keep matching sibling loads at the same component count so post-LICM
+       * CSE and select_load continue to merge identical loads across blocks. */
+      for (unsigned j = 0; j < count; ++j) {
+         if (i == j)
+            continue;
+         if (items[j].candidate_comps > target &&
+             agx_memory_loads_match(intr, items[j].intr)) {
+            target = items[j].candidate_comps;
+            if (target >= intr->def.num_components)
+               break;
+         }
+      }
+
+      if (target < intr->def.num_components) {
+         intr->def.num_components = target;
+         intr->num_components = target;
+         progress = true;
+      }
+   }
+
+   util_dynarray_fini(&cands);
+
+   return nir_progress(progress, impl, nir_metadata_control_flow);
+}
+
+bool
+agx_nir_shrink_memory_loads(nir_shader *nir)
+{
+   nir_divergence_analysis(nir);
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      progress |= agx_nir_shrink_memory_loads_impl(impl);
+   }
+
+   return progress;
+}
+
 /* Whether a compile with a preamble size forms its preamble. Internal shaders
  * always do: hk's meta copies depend on it for correctness with imgwblk
  * intrinsics.
@@ -11994,10 +12280,14 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
     * varying, which overflowed the AGX3B register file and spilled.
     */
    NIR_PASS(addr_progress, nir, agx_nir_opt_select_load);
-   if (addr_progress || pre_alg_progress) {
-      NIR_PASS(_, nir, nir_opt_cse);
-      NIR_PASS(_, nir, nir_opt_dce);
-   }
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   /* Trim unused trailing vector load channels after address lowering,
+    * select_load, and CSE so identical-address loads merge before trimming and
+    * uniform vec4->vec3 / divergent power-of-two shrinking saves uniform slots
+    * or GPRs without breaking vector register affinity. */
+   NIR_PASS(_, nir, agx_nir_shrink_memory_loads);
 
    NIR_PASS(sub_progress, nir, nir_opt_uniform_subgroup, &subgroups_options);
    if (g18_scans)
@@ -12347,15 +12637,22 @@ pre_preamble:
       if (fused_selects)
          NIR_PASS(_, nir, nir_opt_remove_phis);
       NIR_PASS(_, nir, nir_opt_dce);
+      /* The packed form is emitted final: its byte extract has an in-range
+       * offset, so no shift lowering applies. Running the main
+       * nir_opt_algebraic here, after nir_opt_algebraic_late, would undo the
+       * late forms of the whole shader (every isub splits back into an ineg
+       * plus an iadd). */
       bool packed_lut = false;
       NIR_PASS(packed_lut, nir, agx_nir_opt_pack_byte_lut_select);
       if (packed_lut) {
          late_progress = true;
-         NIR_PASS(_, nir, nir_opt_algebraic);
-         NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
          NIR_PASS(_, nir, nir_opt_copy_prop);
          NIR_PASS(_, nir, nir_opt_dce);
       }
+      /* agx_nir_fuse_selects hoists negations out of select trees for a
+       * downstream add to absorb; nir_opt_algebraic_late, which forms isub,
+       * has already run, so make those adds subtracts here. */
+      NIR_PASS(late_progress, nir, agx_nir_fold_ineg_add);
    } else {
       NIR_PASS(late_progress, nir, agx_nir_fuse_selects);
    }
@@ -14754,12 +15051,12 @@ m5_lower_predicated_load(nir_builder *b, nir_intrinsic_instr *intr,
 
 
 static bool
-agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
+agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
-                         unsigned ra_budget_cut, bool disable_remat, bool *retry_without_remat,
-                         bool agx3_reg_float_consts, bool disable_sampled_cap)
+                         unsigned ra_budget_cut, bool agx3_reg_float_consts,
+                         bool disable_sampled_cap)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
@@ -15116,24 +15413,13 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
 
    /* Record provenance before RA can create stack instructions. */
    const bool imports_only_before_ra = agx3_cprog_spill_provenance(ctx);
-   if (disable_remat)
-      agx_ra_without_remat(ctx);
-   else
-      agx_ra(ctx);
+   agx_ra(ctx);
 
    /* A failed allocation is refused and retried below; its AIR is not a
     * program to validate (agx_validate exits on it). */
    if (!ctx->ra_failed)
-      agx_validate(ctx, disable_remat ? "agx_ra_without_remat" : "agx_ra");
+      agx_validate(ctx, "agx_ra");
 
-   /* The occupancy rematerialization attempt has already modified AIR.
-    * Discard the entire context; changing its budget cannot undo spills. */
-   if (retry_without_remat && ctx->remat_fallback_spilled) {
-      *retry_without_remat = true;
-      binary->size = initial_binary_size;
-      ralloc_free(ctx);
-      return false;
-   }
    if (ctx->ra_failed) {
       /* If the optional sampled-compute occupancy cap tightened the file,
        * drop it first and retry from the whole register file before giving
@@ -15143,9 +15429,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          ralloc_free(ctx);
          binary->size = initial_binary_size;
          *out = initial_out;
-         return agx_compile_function_nir_attempt(
-            nir, impl, key, binary, out, offset_out, 0, disable_remat,
-            retry_without_remat, agx3_reg_float_consts, true);
+         return agx_compile_function_nir(
+            nir, impl, key, binary, out, offset_out, 0,
+            agx3_reg_float_consts, true);
       }
 
       /* Spilling only targets total demand; pinned values can still leave the
@@ -15158,10 +15444,10 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
          binary->size = initial_binary_size;
          /* Constant promotion and others accumulate into out. */
          *out = initial_out;
-         return agx_compile_function_nir_attempt(
+         return agx_compile_function_nir(
             nir, impl, key, binary, out, offset_out,
-            ra_budget_cut ? ra_budget_cut * 2 : 16, disable_remat,
-            retry_without_remat, agx3_reg_float_consts, disable_sampled_cap);
+            ra_budget_cut ? ra_budget_cut * 2 : 16, agx3_reg_float_consts,
+            disable_sampled_cap);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
@@ -15178,9 +15464,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
       ralloc_free(ctx);
       binary->size = initial_binary_size;
       *out = initial_out;
-      return agx_compile_function_nir_attempt(
-         nir, impl, key, binary, out, offset_out, 0, disable_remat,
-         retry_without_remat, agx3_reg_float_consts, true);
+      return agx_compile_function_nir(
+         nir, impl, key, binary, out, offset_out, 0,
+         agx3_reg_float_consts, true);
    }
 
    /* Apple's G17P compiler publishes a 16-byte scratch footprint for compute,
@@ -15275,9 +15561,9 @@ agx_compile_function_nir_attempt(nir_shader *nir, nir_function_impl *impl,
             ralloc_free(ctx);
             binary->size = initial_binary_size;
             *out = initial_out;
-            return agx_compile_function_nir_attempt(
-               nir, impl, key, binary, out, offset_out, 0, disable_remat,
-               retry_without_remat, agx3_reg_float_consts, true);
+            return agx_compile_function_nir(
+               nir, impl, key, binary, out, offset_out, 0,
+               agx3_reg_float_consts, true);
          }
          agx_set_refusal(ctx, "AGX3 scratch frame exceeds target limit",
                          __LINE__);
@@ -16083,61 +16369,6 @@ agx_opt_agx3_normflt_byte_pairs(agx_context *ctx)
    ralloc_free(memctx);
 }
 
-/* Retry eligible preambles without changing scratch admission or launch rules. */
-static bool
-agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
-                         struct agx_shader_key *key,
-                         struct util_dynarray *binary,
-                         struct agx_shader_info *out, unsigned *offset_out,
-                         bool agx3_reg_float_consts)
-{
-   const bool eligible =
-      impl->function->is_preamble && nir->info.stage == MESA_SHADER_FRAGMENT &&
-      key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-      (key->g17p_native_uniforms || key->agx3_native_cprog) &&
-      debug_get_bool_option("ASAHI_M5_CPROG_REMAT_RETRY", true);
-   if (!eligible)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts, false);
-
-   /* Preserve all compiler-owned state, including earlier main code/rodata.
-    * The first attempt owns a deep NIR clone and a fresh AIR context. */
-   nir_shader *attempt = nir_shader_clone(NULL, nir);
-   if (!attempt)
-      return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                             offset_out, 0, false, NULL,
-                                             agx3_reg_float_consts, false);
-
-   nir_function_impl *attempt_impl = NULL;
-   nir_foreach_function_with_impl(func, candidate, attempt) {
-      if (func->is_preamble) {
-         assert(attempt_impl == NULL);
-         attempt_impl = candidate;
-      }
-   }
-   assert(attempt_impl != NULL);
-   const struct agx_shader_info saved_info = *out;
-   const struct agx_shader_key saved_key = *key;
-   const size_t saved_size = binary->size;
-   bool retry = false;
-   bool success = agx_compile_function_nir_attempt(
-      attempt, attempt_impl, key, binary, out, offset_out, 0, false, &retry,
-      agx3_reg_float_consts, false);
-   ralloc_free(attempt);
-   if (!retry)
-      return success;
-
-   assert(!success && binary->size == saved_size);
-   *out = saved_info;
-   *key = saved_key;
-   binary->size = saved_size;
-   /* Exactly one retry. Real full-budget spills retain the old refusal. */
-   return agx_compile_function_nir_attempt(nir, impl, key, binary, out,
-                                          offset_out, 0, true, NULL,
-                                          agx3_reg_float_consts, false);
-}
-
 /*
  * The hardware frcp instruction is sometimes off by 1 ULP. For correctly
  * rounded frcp, a refinement step is required. This routine has been
@@ -16206,10 +16437,10 @@ agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 
 /*
  * Lower 32-bit integer division. When the compile forms a preamble, a division
- * by a uniform value uses magic multipliers (agx_nir_opt_uniform_idiv), whose
- * calculation the preamble then runs once. Without a preamble that calculation
- * would run in every invocation and cost more than nir_lower_idiv's
- * reciprocal, so everything takes nir_lower_idiv.
+ * by a uniform value uses an exact reciprocal (agx_nir_opt_uniform_idiv),
+ * which the preamble then computes once. Without a preamble that calculation
+ * would run in every invocation and save nothing over nir_lower_idiv, so
+ * everything takes nir_lower_idiv.
  */
 bool
 agx_nir_lower_integer_division(nir_shader *nir, bool forms_preamble)
@@ -19045,6 +19276,15 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          NIR_PASS(post_opt_progress, nir,
                   agx_nir_reassociate_loop_invariant_eq);
       NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm, regs, cap_rt_compute);
+   } else if (key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+              nir->info.stage == MESA_SHADER_COMPUTE && !nir->info.internal &&
+              !key->is_helper) {
+      const unsigned threads = nir->info.workgroup_size_variable ? 1024 :
+         nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
+         nir->info.workgroup_size[2];
+      if (threads)
+         NIR_PASS(post_opt_progress, nir, agx_nir_opt_licm_agx2_integer,
+                  agx_max_registers_for_occupancy(threads));
    }
 
    if (is_agx3 && !key->dev.emit_agx3d)
@@ -19389,7 +19629,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       const struct agx_shader_key saved_key = *key;
       const unsigned saved_size = binary.size;
       bool compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                               &out->info, &offset, false);
+                                               &out->info, &offset, 0, false,
+                                               false);
 
       /* The G17G packer refuses shapes it has no grounded encoding for and
        * rolls the binary back. Most refusals in real clients (Skia/ANGLE)
@@ -19402,7 +19643,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          *key = saved_key;
          binary.size = saved_size;
          compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                             &out->info, &offset, true);
+                                             &out->info, &offset, 0, true,
+                                             false);
       }
 
       if (!compiled) {

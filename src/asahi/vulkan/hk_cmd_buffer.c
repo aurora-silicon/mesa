@@ -184,10 +184,9 @@ hk_descriptor_state_fini(struct hk_cmd_buffer *cmd,
    }
 }
 
-/* Writes the stream words of the patch sites. M5 command memory is mapped
- * uncached (hk_g17p_cached_cmd_memory() is G17P-only), so the words need no
- * cache maintenance, only to be stored whole (the GPU may read the stream
- * meanwhile when the alias count leaves 0) and made visible before the
+/* Writes the stream words of the patch sites. Store whole words (the GPU may
+ * read the stream meanwhile when the alias count leaves 0), clean each patched
+ * cache line when command memory is CPU-cached, and fence before the
  * submission or host signal that lets the GPU run them. */
 void
 hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
@@ -195,8 +194,13 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
    if (p_atomic_read(&cmd->alias_patched) || !cmd->alias_sites.size)
       return;
 
-   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site)
+   const bool cached =
+      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
+   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
+      if (cached)
+         util_flush_range_no_fence(site->word, sizeof(*site->word));
+   }
 
    __sync_synchronize();
    if (util_has_cache_ops())
@@ -683,7 +687,7 @@ hk_cmd_buffer_alloc_bo(struct hk_cmd_buffer *cmd,
    return VK_SUCCESS;
 }
 
-static struct agx_ptr
+struct agx_ptr
 hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
                                struct hk_uploader *uploader, uint32_t size,
                                uint32_t alignment, enum hk_cmd_bo_type type,
@@ -1123,9 +1127,7 @@ static void
 hk_cmd_buffer_publish_root_uploads(struct hk_cmd_buffer *cmd,
                                    bool already_fenced)
 {
-   struct hk_device *dev = hk_cmd_buffer_device(cmd);
-   if (!agx_chip_native_agx3(dev->dev.chip) ||
-       list_is_empty(&cmd->uploader.root.bos))
+   if (list_is_empty(&cmd->uploader.root.bos))
       return;
 
    if (util_has_cache_ops()) {
@@ -1236,14 +1238,7 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_flush_deferred_clears(cmd);
    hk_sync_flush_stamp_copies(cmd);
    hk_sync_flush_pending_timestamp(cmd);
-
-   /* A barrier declared with no following launch in this command buffer
-    * still orders this buffer's writes against whatever runs next (the
-    * queue's next submission). The closing compute stream lands it on its
-    * trailing edge (hk_cdm_end_stream_flush); with no open stream there is
-    * no local work to order and the flag is simply cleared. */
    hk_cmd_buffer_end_compute(cmd);
-   cmd->state.cs.cdm_barrier_pending = false;
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
    hk_resolve_pending_oq_available(cmd);
    hk_resolve_deferred_oq_available(cmd);
@@ -1416,7 +1411,7 @@ hk_classify_pass_barrier(struct hk_cmd_buffer *cmd, const VkDependencyInfo *info
    state.depth_stencil_writes =
       state.attachment_count > state.color_attachment_count;
    state.color_input_local_read =
-      agx_chip_local_read_tilebuffer(dev->dev.chip) && render->view_mask == 0 &&
+      hk_local_read_tilebuffer(dev->dev.chip) && render->view_mask == 0 &&
       cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY &&
       !(render->flags & (VK_RENDERING_SUSPENDING_BIT |
                          VK_RENDERING_RESUMING_BIT |
@@ -1566,25 +1561,24 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
 
    /* M5 records its barriers with the native dependency tracker. */
    if (!agx_chip_native_or_m5(dev->dev.chip)) {
-      /* The app declared a memory dependency: the next CDM launch carries
-       * the full barrier set (hk_cmd_dispatch.c). Launches before the
-       * barrier were already flushed by the previous launch's gating. */
-      const bool track = !HK_PERF(dev, ALWAYSCDMBARRIER);
-      if (track)
-         cmd->state.cs.cdm_barrier_pending = true;
+      /* A BY_REGION colour input may stay in this render. The consuming
+       * draw checks the bound descriptors and compiled tile-read program
+       * before emitting geometry. A failed check splits the render. */
+      bool local_read = false;
+      if (cmd->sync.in_pass && cmd->current_cs.gfx &&
+          (pDependencyInfo->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) &&
+          !hk_classify_pass_barrier(cmd, pDependencyInfo, &local_read) &&
+          local_read) {
+         uint8_t src, dst;
+         hk_sync_dependency_kinds(pDependencyInfo, hk_sync_image_class(cmd),
+                                  &src, &dst);
+         cmd->state.gfx.render.kept_local_read_barrier = true;
+         cmd->state.barrier_stats.kept++;
+         hk_sync_pass_barrier(cmd, src, dst);
+         return;
+      }
 
-      /* Outside a render pass only a CDM control stream can be open; the
-       * pending flag orders it against the next launch. Ending the compute
-       * batch here would only produce the stream merge_control_streams
-       * stitches back together at hk_EndCommandBuffer, plus a stream link
-       * and a fresh chunk per barrier; keep it open. The batch must end
-       * when a graphics batch is open: the dependency then spans batch
-       * types and the kernel orders the resulting commands. */
-      const bool gfx_open = cmd->current_cs.gfx ||
-                            cmd->current_cs.pre_gfx ||
-                            cmd->current_cs.post_gfx;
-      if (!track || gfx_open)
-         hk_cmd_buffer_end_compute(cmd);
+      hk_cmd_buffer_end_compute(cmd);
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
        * including kernels that advertise exact prior barriers on AGX2. */
@@ -4219,12 +4213,17 @@ hk_agx3_fragment_root(struct hk_cmd_buffer *cmd, const struct hk_shader *s)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    struct hk_graphics_state *gfx = &cmd->state.gfx;
+   const bool verify = unlikely(dev->dev.debug & AGX_DBG_VERIFY);
 
-   if (unlikely(dev->dev.debug & AGX_DBG_VERIFY))
+   if (verify)
       hk_agx3_verify_fragment_root_shadow(gfx);
 
+   const bool use_shadow =
+      verify || !gfx->root_cpu_cached || !gfx->fs_root_cpu_cached;
    return hk_agx3_fragment_root_select(gfx, s->info.agx3_root_reads,
-                                       s->root_descriptor_size, true, true);
+                                       s->info.agx3_dynbuf_reads,
+                                       s->root_descriptor_size, true,
+                                       use_shadow);
 }
 
 static inline uint64_t
@@ -5397,14 +5396,6 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    hk_dispatch_with_usc_launch(dev, cs, prog->b.launch,
                                agx_usc_addr(&dev->dev, t.gpu), grid,
                                prog->b.workgroup);
-
-   /* Internal helpers communicate through memory with their consumer. Match
-    * the AGX2 flush-after-launch contract when the caller requests the
-    * common all-memory barrier (as hk_dispatch_precomp_g17p does). */
-   if (barrier & AGX_BARRIER_ALL) {
-      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
-      hk_cdm_cache_flush(dev, cs);
-   }
 }
 
 uint64_t
@@ -5920,11 +5911,14 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     */
    const bool native_eot = agx_chip_agx3_path(dev->dev.chip);
    const bool output_only_through_eot =
-      native_eot && render->g17p_direct_color_resolve;
+      (native_eot && render->g17p_direct_color_resolve) ||
+      render->agx2_resolve_mask;
 
-   /* A timestamp rides on this exact command; replacing the render with
-    * image clears would drop it. Keep the render. */
-   if (cs->timestamp.start.handle || cs->timestamp.end.handle)
+   /* A timestamp belongs to this render. A direct AGX2 resolve also needs
+    * the neutral raster state below when there are no draws.
+    */
+   if ((cs->timestamp.start.handle || cs->timestamp.end.handle) &&
+       !(render->agx2_resolve_mask && cs->cr.process_empty_tiles))
       return false;
 
    /* HAL300: a multisample clear-only pass stays a render. As compute it is a
@@ -5932,11 +5926,11 @@ hk_optimize_empty_vdm(struct hk_cmd_buffer *cmd)
     * render that writes only its attachments it is not. */
    const bool m5_ms_clear = agx_chip_hal300_path(dev->dev.chip) &&
                             cs->cr.process_empty_tiles && cs->tib.nr_samples > 1;
-   if (native_eot &&
-       (continuation ||
-        (cs->cr.process_empty_tiles &&
-         (output_only_through_eot || m5_ms_clear ||
-          !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4))))) {
+   if ((cs->cr.process_empty_tiles && output_only_through_eot) ||
+       (native_eot &&
+        (continuation || (cs->cr.process_empty_tiles &&
+                          (m5_ms_clear ||
+                           !agx_get_precompiled(&dev->bg_eot, LIBAGX_FILL_UINT4)))))) {
       /* Normally supplied by the first draw. A clear has no application
        * sample-location state; use the attachment sample count and leave
        * has_sample_locations uncommitted, just like other meta operations.

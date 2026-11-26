@@ -488,6 +488,27 @@ hk_root_matches_push(const struct hk_root_descriptor_table *a, size_t a_size,
                                hk_root_descriptor_offset(dynamic_buffers));
 }
 
+/* Whether two roots agree on every dynamic_buffers[] slot named in mask. */
+static inline bool
+hk_root_matches_dynbuf_mask(const struct hk_root_descriptor_table *a,
+                            size_t a_size,
+                            const struct hk_root_descriptor_table *b,
+                            size_t b_size, uint64_t mask)
+{
+   const uint8_t *ab = (const uint8_t *)a;
+   const uint8_t *bb = (const uint8_t *)b;
+   const size_t a_lim = MIN2(a_size, sizeof(*a));
+   const size_t b_lim = MIN2(b_size, sizeof(*b));
+   const size_t base = hk_root_descriptor_offset(dynamic_buffers);
+   const size_t stride = sizeof(a->dynamic_buffers[0]);
+   u_foreach_bit64(slot, mask) {
+      const size_t start = base + slot * stride;
+      if (!hk_root_span_matches(ab, a_lim, bb, b_lim, start, start + stride))
+         return false;
+   }
+   return true;
+}
+
 /* Build the same visible-byte sequence as hk_root_matches_for_fragment().
  * Keeping this derived from the shared span list includes future root fields
  * and padding without duplicating the root ABI. Push constants sit alongside
@@ -597,6 +618,7 @@ struct hk_descriptor_state {
    uint32_t uploaded_root_size;
    uint64_t uploaded_root_generation;
    uint8_t uploaded_dynamic_buffer_end;
+   bool uploaded_root_cpu_cached;
 
    /* One past the highest root.dynamic_buffers entry any bind wrote. Later
     * entries are unread by every bound layout and stay out of uploads. */
@@ -795,6 +817,7 @@ struct hk_rendering_state {
 
    /* The main G17P EOT writes the single-sample resolve target directly. */
    bool g17p_direct_color_resolve;
+   uint8_t agx2_resolve_mask;
 
    /* Exact admission result for the current physical tilebuffer layout.
     * The layout is immutable after BeginRendering except for the one
@@ -1031,6 +1054,10 @@ struct hk_graphics_state {
    struct hk_root_fragment_snapshot fs_root_fragment_snapshot;
    const struct hk_root_descriptor_table *root_fragment_snapshot_cpu;
    const struct hk_root_descriptor_table *fs_root_fragment_snapshot_cpu;
+   /* Whether root_cpu / fs_root_cpu point into CPU write-back (AGX_BO_WRITEBACK)
+    * command-pool BOs that can be compared directly without shadow snapshots. */
+   bool root_cpu_cached;
+   bool fs_root_cpu_cached;
 
    uint64_t draw_params;
    uint64_t draw_id_ptr;
@@ -1291,11 +1318,19 @@ hk_root_fragment_snapshot_publish(struct hk_graphics_state *gfx,
 
 /* Select the same immutable root as the fresh byte comparison. Hidden reads
  * always use the current root; snapshots and the positive identity memo only
- * accelerate the equality check for shaders that cannot observe those bytes. */
+ * accelerate the equality check for shaders that cannot observe those bytes.
+ *
+ * dynbuf_reads names the dynamic_buffers[] slots the shader reads at constant
+ * offsets (hk_shader_info::agx3_dynbuf_reads). Those slots are compared
+ * directly in the CPU mappings, so that only happens when the caller compares
+ * roots there (!use_shadow, CPU-cached roots): the snapshots leave the
+ * dynamic buffers out, and there such a shader keeps following the current
+ * root. The slots are checked on every call, ahead of the identity memo,
+ * because the memo does not cover them. */
 static inline uint64_t
 hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
-                             uint32_t required_size, bool use_memo,
-                             bool use_shadow)
+                             uint64_t dynbuf_reads, uint32_t required_size,
+                             bool use_memo, bool use_shadow)
 {
    const uint8_t hidden = HK_ROOT_READS_ADDRESS | HK_ROOT_READS_VERTEX_INPUT |
                           HK_ROOT_READS_DYNAMIC_BUFFERS;
@@ -1311,7 +1346,12 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
                        gfx->fs_root_fragment_snapshot_cpu == gfx->fs_root_cpu;
 
    if (gfx->fs_root && gfx->fs_root != gfx->root && gfx->root_cpu &&
-       prev_size >= req && !(root_reads & hidden)) {
+       prev_size >= req && !(root_reads & hidden) &&
+       (!dynbuf_reads ||
+        (!use_shadow &&
+         hk_root_matches_dynbuf_mask(gfx->fs_root_cpu, prev_size,
+                                     gfx->root_cpu, cur_size,
+                                     dynbuf_reads)))) {
       const bool memo_bytes = use_memo && gfx->fs_root_checked_root &&
                               gfx->fs_root_checked_root == gfx->root;
       if (memo_bytes && (!reads_push || gfx->fs_root_checked_push_match))
@@ -1360,16 +1400,13 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
    gfx->fs_root = gfx->root;
    gfx->fs_root_cpu = gfx->root_cpu;
    gfx->fs_root_size = gfx->root_size;
+   gfx->fs_root_cpu_cached = gfx->root_cpu_cached;
    return gfx->root;
 }
 
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
-   /* vkCmdPipelineBarrier2 dependency not yet consumed by a CDM launch.
-    * Lives on the command buffer so it survives CS splits and
-    * merge_control_streams. */
-   bool cdm_barrier_pending;
 };
 
 /*
@@ -2732,6 +2769,12 @@ struct agx_ptr hk_pool_alloc_from_slow(struct hk_cmd_buffer *cmd,
                                        uint32_t size, uint32_t alignment,
                                        enum hk_cmd_bo_type type);
 
+struct agx_ptr hk_pool_alloc_from_slow_cached(struct hk_cmd_buffer *cmd,
+                                              struct hk_uploader *uploader,
+                                              uint32_t size, uint32_t alignment,
+                                              enum hk_cmd_bo_type type,
+                                              bool *cpu_cached_out);
+
 /* Bump allocation from the uploader's current BO; a new BO or a large
  * allocation takes hk_pool_alloc_from_slow(). */
 static inline struct agx_ptr
@@ -2751,6 +2794,28 @@ hk_pool_alloc_from(struct hk_cmd_buffer *cmd, struct hk_uploader *uploader,
    }
 
    return hk_pool_alloc_from_slow(cmd, uploader, size, alignment, type);
+}
+
+static inline struct agx_ptr
+hk_pool_alloc_from_cached(struct hk_cmd_buffer *cmd,
+                          struct hk_uploader *uploader, uint32_t size,
+                          uint32_t alignment, enum hk_cmd_bo_type type,
+                          bool *cpu_cached_out)
+{
+   assert(alignment > 0);
+   const uint32_t offset = align(uploader->offset, alignment);
+   if (likely(uploader->map != NULL && offset <= uploader->capacity &&
+              size <= uploader->capacity - offset)) {
+      uploader->offset = offset + size;
+      *cpu_cached_out = uploader->cpu_cached;
+      return (struct agx_ptr){
+         .gpu = uploader->base + offset,
+         .cpu = uploader->map + offset,
+      };
+   }
+
+   return hk_pool_alloc_from_slow_cached(cmd, uploader, size, alignment, type,
+                                         cpu_cached_out);
 }
 
 struct agx_ptr hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size,

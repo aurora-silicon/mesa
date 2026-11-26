@@ -788,17 +788,6 @@ hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* A dependency declared but not yet emitted on AGX2 lands on the
-    * trailing edge of the closing compute stream. Every stream close
-    * funnels here, so no caller can end the compute stream with a declared
-    * dependency left unemitted. This also keeps the drain out of
-    * hk_cmd_buffer.h: standalone test binaries stub this function. */
-   if (cs == cmd->current_cs.cs && cmd->state.cs.cdm_barrier_pending) {
-      cmd->state.cs.cdm_barrier_pending = false;
-      hk_ensure_cs_has_space(cmd, cs, AGX_CDM_BARRIER_LENGTH);
-      hk_cdm_cache_flush(dev, cs);
-   }
-
    /* A dependency recorded while no compute stream holding work is open
     * records no flush: the first barrier of a command buffer, or one after a
     * timestamp closed the stream. The writes of this stream may then be read
@@ -856,22 +845,10 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
 
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
-
-   if (!HK_PERF(dev, ALWAYSCDMBARRIER) &&
-       cs->cmd->state.cs.cdm_barrier_pending) {
-      /* The app declared a memory dependency since the last launch: carry
-       * the full barrier ahead of this launch and clear it. Launches the
-       * app left unordered have no Vulkan-defined ordering to enforce, so
-       * their drain is skipped. */
-      cs->cmd->state.cs.cdm_barrier_pending = false;
-      hk_cdm_cache_flush(dev, cs);
-   }
-
    cs->current =
       agx_cdm_launch(cs->current, dev->dev.chip, grid, wg, launch, usc);
 
-   if (HK_PERF(dev, ALWAYSCDMBARRIER))
-      hk_cdm_cache_flush(dev, cs);
+   hk_cdm_cache_flush(dev, cs);
 }
 
 void
@@ -889,17 +866,6 @@ hk_dispatch_with_usc(struct hk_device *dev, struct hk_cs *cs,
    }
 
    hk_dispatch_with_usc_launch(dev, cs, launch, usc, grid, local_size);
-
-   /* Software graphics stages communicate through memory: VS outputs,
-    * geometry counts and XFB bases are consumed by the next dispatch, and
-    * the application cannot supply barriers between these internal
-    * stages. Keep the flush-after-launch contract for them (as
-    * hk_dispatch_with_local_size does on AGX3); compute launches stay
-    * dependency-tracked. */
-   if (info->stage != MESA_SHADER_COMPUTE) {
-      hk_ensure_cs_has_space(cs->cmd, cs, AGX_CDM_BARRIER_LENGTH);
-      hk_cdm_cache_flush(dev, cs);
-   }
 }
 
 static bool
@@ -4756,11 +4722,34 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
                              ((a_b.address | a_b.offset) % 16ull) == 0;
       const bool can_64x64 =
          (m_u % 64u) == 0 && (n_u % 64u) == 0 && (k_u % 8u) == 0 &&
-         k_u >= 64u && (m_u / 64u) * (n_u / 64u) >= 25u && a_align16;
+         k_u >= 64u && (m_u / 64u) * (n_u / 64u) >= 48u && a_align16;
       const bool can_64x48 =
          !can_64x64 && (m_u % 64u) == 0 && (n_u % 48u) == 0 &&
          n_u >= 96u && (n_u % 64u) != 0 && (k_u % 8u) == 0 &&
          (m_u / 64u) * (n_u / 48u) >= 25u && a_align16;
+      /* High-K K_step=32 tiles for narrow N (16/32) or non-32-aligned M%16==0:
+       * halve K-loop barriers, double/quadruple workgroup parallelism on wide
+       * GPUs, and enable unguarded specialization when M%16==0 (e.g. M=400).
+       * Keep 32x32 gated to small-grid M (< 48 WGs at 64x32) so wide grids do
+       * not double B reads. */
+      const bool can_16x32 =
+         !can_64x64 && !can_64x48 &&
+         (m_u % 32u) != 0 && (m_u % 16u) == 0 && (n_u % 32u) == 0 &&
+         k_u >= 32u && (k_u % 8u) == 0 && a_align16;
+      const bool can_16x16 =
+         !can_64x64 && !can_64x48 && !can_16x32 &&
+         (m_u % 32u) != 0 && (m_u % 16u) == 0 && (n_u % 16u) == 0 &&
+         k_u >= 32u && (k_u % 8u) == 0 && a_align16;
+      const bool can_32x32 =
+         !can_64x64 && !can_64x48 && !can_16x32 && !can_16x16 &&
+         (m_u % 32u) == 0 && (n_u % 32u) == 0 && (n_u % 64u) != 0 &&
+         k_u >= 64u && (k_u % 32u) == 0 &&
+         (m_u / 64u) * (n_u / 32u) < 48u && a_align16;
+      const bool can_32x16 =
+         !can_64x64 && !can_64x48 && !can_16x32 && !can_16x16 && !can_32x32 &&
+         (m_u % 32u) == 0 && (n_u % 16u) == 0 && (n_u % 32u) != 0 &&
+         k_u >= 32u && (k_u % 16u) == 0 &&
+         ((k_u % 32u) == 0 || (m_u / 32u) <= 200u) && a_align16;
       if (can_64x64) {
          const enum hk_compute_pair_alt_kind k64 =
             gemm->is_guarded ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT64X64_UNGUARDED
@@ -4786,6 +4775,22 @@ hk_select_gemm_cmat(struct hk_cmd_buffer *cmd, struct hk_api_shader *api,
             alt = s48;
             tile_n = 48u;
             chosen_kind = HK_COMPUTE_PAIR_ALT_GEMM_CMAT48_UNGUARDED;
+         }
+      } else if (can_16x32 || can_16x16 || can_32x32 || can_32x16) {
+         const enum hk_compute_pair_alt_kind k_small =
+            can_16x32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16X32_UNGUARDED :
+            can_16x16 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT16X16_UNGUARDED :
+            can_32x32 ? HK_COMPUTE_PAIR_ALT_GEMM_CMAT32X32_UNGUARDED :
+                        HK_COMPUTE_PAIR_ALT_GEMM_CMAT32X16_UNGUARDED;
+         struct hk_shader *s_sm = hk_compute_pair_get_or_compile_fused(
+            dev, api->compute_pair_producer, NULL, k_small,
+            HK_COMPUTE_PAIR_DUAL_NONE, NULL, false, NULL, NULL);
+         if (s_sm &&
+             hk_g17p_compute_shader_supported(dev->dev.chip, s_sm,
+                                              s_sm->only_linked, 1u << 16)) {
+            alt = s_sm;
+            tile_n = hk_compute_pair_alt_gemm_tile_n(k_small);
+            chosen_kind = k_small;
          }
       } else if ((n_u % 24u) == 0 && (n_u % 32u) != 0 && (n_u % 64u) != 0 &&
                  hk_gemm_cmat_can_specialize_unguarded(gemm->is_guarded, m_u, n_u, k_u,
