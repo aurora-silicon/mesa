@@ -41,7 +41,7 @@ extern "C" {
  * classic to 39 when compute-pair binaries also carry the producer state
  * needed to compile fused variants, to 52 / 40 when compute shaders carry
  * their proven submit-pack loop bounds, and to 53 / 41 when AGX3 payloads
- * carry the compute root prefix (AGX2 moves to 39). */
+ * carry the root prefix (AGX2 moves to 39). */
 #define HK_AGX3_SHADER_BINARY_VERSION 53u
 #define HK_CLASSIC_SHADER_BINARY_VERSION 41u
 /* AGX2 binaries include attachmentless layer-zero root lowering, fs.reads_layer,
