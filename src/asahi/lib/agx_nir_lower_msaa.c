@@ -769,6 +769,34 @@ specialize_g17p_equiv_copy(nir_function_impl *impl, nir_cf_list *copy,
    }
 }
 
+/* True in a lane when samples j and k of that lane hold the same bytes in
+ * every probed tilebuffer read. */
+static nir_def *
+g17p_equiv_samples_equal(nir_builder *b, nir_def *const *raw_j,
+                         nir_def *const *raw_k,
+                         const struct g17p_equiv_probe *probes,
+                         unsigned num_probes)
+{
+   nir_def *diff16 = NULL, *diff32 = NULL;
+   for (unsigned p = 0; p < num_probes; ++p) {
+      nir_def *diff = nir_ixor(b, raw_j[p], raw_k[p]);
+      for (unsigned c = 0; c < probes[p].raw_components; ++c) {
+         nir_def *d = nir_channel(b, diff, c);
+         nir_def **acc = &diff16;
+         if (d->bit_size != 16) {
+            d = nir_u2u32(b, d);
+            acc = &diff32;
+         }
+         *acc = *acc ? nir_ior(b, *acc, d) : d;
+      }
+   }
+
+   nir_def *diff = diff16 ? nir_u2u32(b, diff16) : NULL;
+   if (diff32)
+      diff = diff ? nir_ior(b, diff, diff32) : diff32;
+   return nir_ieq_imm(b, diff, 0);
+}
+
 /*
  * Monolithic MSAA local-read shaders often run on interior pixels where every
  * sample in the subgroup has full coverage and identical input tilebuffer
@@ -1005,14 +1033,57 @@ agx_nir_unroll_g17p_samples_equiv(nir_shader *shader, unsigned nr_samples,
    }
    nir_push_else(&b, nif);
    {
+      /* Shade each distinct sample value of a lane once. At a primitive edge
+       * the samples of a pixel usually split into two groups, and the body
+       * is a function of the probed tilebuffer reads alone (sample-dependent
+       * inputs were rejected above), so the first covered sample of each
+       * group shades and stores to every covered sample equal to it. A copy
+       * runs only in the lanes where its sample starts a group. */
+      nir_def *raw[4][G17P_EQUIV_MAX_PROBES];
+      nir_def *covered[4];
+      for (unsigned s = 0; s < nr_samples; ++s) {
+         covered[s] = nir_ine_imm(&b, sample_masks[s], 0);
+         for (unsigned k = 0; k < num_probes; ++k) {
+            raw[s][k] = nir_load_local_pixel_agx(
+               &b, probes[k].raw_components, probes[k].raw_bit_size,
+               sample_masks[s], .base = probes[k].base,
+               .format = probes[k].raw_format, .target = probes[k].target);
+         }
+      }
+
+      nir_def *same[4][4] = {{NULL}};
+      for (unsigned j = 0; j < nr_samples; ++j) {
+         for (unsigned k = j + 1; k < nr_samples; ++k) {
+            same[j][k] = nir_iand(
+               &b, nir_iand(&b, covered[j], covered[k]),
+               g17p_equiv_samples_equal(&b, raw[j], raw[k], probes,
+                                        num_probes));
+         }
+      }
+
       for (unsigned i = 0; i < nr_samples; ++i) {
-         nir_cf_list slow_copy;
-         nir_cf_list_clone(&slow_copy, &body, &impl->cf_node, NULL);
-         specialize_g17p_equiv_copy(impl, &slow_copy, sample_masks[i],
-                                    sample_masks[i], probes,
-                                    (i == 0 && any_reuse) ? reuse : NULL,
-                                    num_probes);
-         b.cursor = nir_cf_reinsert(&slow_copy, b.cursor);
+         nir_def *starts = covered[i];
+         for (unsigned j = 0; j < i; ++j)
+            starts = nir_iand(&b, starts, nir_inot(&b, same[j][i]));
+
+         nir_def *stores = sample_masks[i];
+         for (unsigned k = i + 1; k < nr_samples; ++k) {
+            stores = nir_ior(&b, stores,
+                             nir_bcsel(&b, same[i][k], sample_masks[k],
+                                       nir_imm_intN_t(&b, 0, 16)));
+         }
+
+         nir_push_if(&b, starts);
+         {
+            nir_cf_list slow_copy;
+            nir_cf_list_clone(&slow_copy, &body, &impl->cf_node, NULL);
+            specialize_g17p_equiv_copy(impl, &slow_copy, sample_masks[i],
+                                       stores, probes,
+                                       (i == 0 && any_reuse) ? reuse : NULL,
+                                       num_probes);
+            b.cursor = nir_cf_reinsert(&slow_copy, b.cursor);
+         }
+         nir_pop_if(&b, NULL);
       }
    }
    nir_pop_if(&b, nif);

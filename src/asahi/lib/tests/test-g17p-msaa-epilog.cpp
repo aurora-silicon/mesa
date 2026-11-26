@@ -824,9 +824,10 @@ TEST_F(G17PMSAAEpilog, MonolithicLocalReadSampleEquivFastPathCompiles)
       EXPECT_EQ(ballots, 1u);
       /* The RGBA8 target is probed as one raw 32-bit word per sample, which
        * the body cannot reuse: 4 probe loads + 1 sample-0 load in the fast
-       * path + 4 in the slow path. */
-      EXPECT_EQ(raw_probes, 4u);
-      EXPECT_EQ(loads, 9u);
+       * path, and in the slow path 4 raw reloads to group equal samples plus
+       * 4 body loads. */
+      EXPECT_EQ(raw_probes, 8u);
+      EXPECT_EQ(loads, 13u);
       /* 1 whole-pixel store in fast path + 4 per-sample stores in slow path. */
       EXPECT_EQ(stores, 5u);
 
@@ -943,8 +944,9 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
 
       unsigned ballots = 0, loads = 0, stores = 0, raw32_probes = 0,
                raw32_vec2_probes = 0, raw16_probes = 0, active_reads = 0,
-               sample_mask_reads = 0, ieqs = 0;
+               sample_mask_reads = 0, ieqs = 0, ifs = 0;
       nir_foreach_block(block, b.impl) {
+         ifs += nir_block_get_following_if(block) != NULL;
          nir_foreach_instr(instr, block) {
             if (instr->type == nir_instr_type_alu) {
                const nir_op aop = nir_instr_as_alu(instr)->op;
@@ -981,16 +983,22 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4EquivCompiles)
       /* 16 probe loads: three 8-bit targets as 1x32-bit (12) and the 4x16-bit
        * target as 2x32-bit (4). Sample 0's 2x32-bit probe unpacks directly
        * into the body, eliminating the fast-path and sample-0 slow-path
-       * reloads of target 1: 16 + 3 + 15 = 34 total loads. */
-      EXPECT_EQ(loads, 34u);
-      EXPECT_EQ(raw32_probes, 12u);
-      EXPECT_EQ(raw32_vec2_probes, 4u);
+       * reloads of target 1: 16 + 3 + 15 = 34 body and probe loads. The slow
+       * path reloads the same 16 raw words to group equal samples: 50. */
+      EXPECT_EQ(loads, 50u);
+      EXPECT_EQ(raw32_probes, 24u);
+      EXPECT_EQ(raw32_vec2_probes, 8u);
       EXPECT_EQ(raw16_probes, 0u);
       /* Coverage and probe diffs fold into one 32-bit mismatch word for
-       * ballot(mismatch != 0), leaving only the ballot-zero equality test. */
-      EXPECT_LE(ieqs, 1u);
+       * ballot(mismatch != 0), leaving only the ballot-zero equality test;
+       * the slow path compares each of the 6 sample pairs once. */
+      EXPECT_LE(ieqs, 7u);
       /* 1 whole-pixel store in fast path + 4 per-sample stores in slow path. */
       EXPECT_EQ(stores, 5u);
+      /* The fast/slow branch, and one guard per slow-path sample: a copy runs
+       * only in the lanes where its sample is the first of a group of equal
+       * samples. */
+      EXPECT_EQ(ifs, 1u + samples);
 
       agx_preprocess_nir(b.shader);
 
@@ -1083,9 +1091,10 @@ TEST(G17PMsaaEpilog, MonolithicLocalReadDeferred4MRTMsaa4Half16EquivCompiles)
          }
       }
       /* 4 samples probed as 2x32; fast path & slow sample 0 reuse v0 via
-       * unpack_32_2x16, leaving only slow samples 1..3 as R16_UINT loads. */
-      EXPECT_EQ(loads, 34u);
-      EXPECT_EQ(raw32_vec2_probes, 4u);
+       * unpack_32_2x16, leaving only slow samples 1..3 as R16_UINT loads.
+       * The slow path reloads the 4 samples' raw words to group them. */
+      EXPECT_EQ(loads, 50u);
+      EXPECT_EQ(raw32_vec2_probes, 8u);
       EXPECT_EQ(r16_reloads, 3u);
 
       agx_preprocess_nir(b.shader);
