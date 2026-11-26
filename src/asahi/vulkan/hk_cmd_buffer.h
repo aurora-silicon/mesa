@@ -2523,6 +2523,10 @@ struct hk_cmd_buffer {
    uint32_t alias_registered;
    struct list_head alias_link;
 
+   /* Device-monotonic generation set on hk_EndCommandBuffer, bumped if alias
+    * or sparse patch sites are rewritten, and cleared on begin/reset/destroy. */
+   uint64_t pack_gen;
+
    /* AGX2 reduced-word CDM barrier records emitted while no sparse resource
     * existed (struct hk_sparse_site), upgraded to the full word at submit
     * when dev->sparse_used is set (hk_submit_patch_sparse_sites()). */

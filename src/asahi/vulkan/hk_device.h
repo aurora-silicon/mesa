@@ -175,6 +175,10 @@ struct hk_device {
        * it exclusively (taken after cmd_lock). */
       struct u_rwlock patch_lock;
    } host_alias;
+   /* Monotonic generation counter bumped on vkEndCommandBuffer and when a
+    * command buffer's alias/sparse patch sites are rewritten; validates
+    * per-queue cached packed compute submissions by (pointer, pack_gen). */
+   uint64_t next_pack_gen;
    /* One bit per main-heap page: only unbound sparse buffer pages are set. */
    struct agx_bo *physical_sparse_map;
    /* The buffers with a residency map (hk_buffer::sparse_map), for texel

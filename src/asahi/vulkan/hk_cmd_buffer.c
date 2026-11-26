@@ -195,8 +195,8 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
    if (p_atomic_read(&cmd->alias_patched) || !cmd->alias_sites.size)
       return;
 
-   const bool cached =
-      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool cached = hk_g17p_cached_cmd_memory(&dev->dev);
    util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
       if (cached)
@@ -207,6 +207,8 @@ hk_cmd_buffer_patch_alias_sites(struct hk_cmd_buffer *cmd)
    if (util_has_cache_ops())
       util_post_flush_fence();
    p_atomic_set(&cmd->alias_patched, 1);
+   if (p_atomic_read(&cmd->pack_gen))
+      p_atomic_set(&cmd->pack_gen, p_atomic_inc_return(&dev->next_pack_gen));
 }
 
 void
@@ -373,12 +375,19 @@ hk_cdm_note_sparse_site(struct hk_cs *cs, uint32_t *word)
 static void
 hk_cmd_buffer_patch_sparse_sites(struct hk_cmd_buffer *cmd)
 {
+   if (!cmd->sparse_sites.size)
+      return;
+
    util_dynarray_foreach(&cmd->sparse_sites, struct hk_sparse_site, site)
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
 
    __sync_synchronize();
    if (util_has_cache_ops())
       util_post_flush_fence();
+   if (p_atomic_read(&cmd->pack_gen)) {
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      p_atomic_set(&cmd->pack_gen, p_atomic_inc_return(&dev->next_pack_gen));
+   }
 }
 
 void
@@ -405,6 +414,7 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
 {
    struct hk_cmd_pool *pool = hk_cmd_buffer_pool(cmd);
    struct hk_device *dev = hk_cmd_pool_device(pool);
+   p_atomic_set(&cmd->pack_gen, 0);
    hk_cmd_buffer_reset_alias_sites(cmd);
    util_dynarray_clear(&cmd->sparse_sites);
    hk_cmd_pending_reap(dev);
@@ -1064,6 +1074,7 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
       hk_reset_cmd_buffer(&cmd->vk, 0);
    cmd->g17p_pristine = false;
    cmd->usage_flags = pBeginInfo->flags;
+   p_atomic_set(&cmd->pack_gen, 0);
    vk_command_buffer_begin(&cmd->vk, pBeginInfo);
    cmd->state.compute_pair_simultaneous =
       pBeginInfo->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
@@ -1315,7 +1326,10 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_render_pack_end_cmd(cmd);
 
    hk_cmd_print_upload_stats(cmd);
-   return vk_command_buffer_end(&cmd->vk);
+   VkResult res = vk_command_buffer_end(&cmd->vk);
+   if (res == VK_SUCCESS)
+      p_atomic_set(&cmd->pack_gen, p_atomic_inc_return(&dev->next_pack_gen));
+   return res;
 }
 
 /* Whether any barrier in the dependency requests write availability (source

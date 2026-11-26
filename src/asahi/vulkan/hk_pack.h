@@ -172,6 +172,12 @@ void hk_pack_fold_member(struct hk_cmd_buffer *packet, struct hk_cs *cs,
 /* The packet's stream is its command buffer's latest of every kind. */
 void hk_pack_finish_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs);
 
+/* Updates self-referential sync stream pointers (req[].cut, last[], last_any[],
+ * cs->sync.dep[].cut) from `old_cs` to `cs` after shallow-copying a packed
+ * packet into cache storage. */
+void hk_pack_relocate_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs,
+                           const struct hk_cs *old_cs);
+
 /* Adds `bo` once to `bos`, the buffers a packed submission keeps alive until
  * it completes (hk_cmd_pending_begin()). A NULL `bo` adds nothing. Returns
  * false if the list cannot grow. */

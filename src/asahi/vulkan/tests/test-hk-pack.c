@@ -1983,6 +1983,74 @@ test_loop_work_scaling(void)
    }
 }
 
+/* Shallow-copying a packed packet into persistent cache storage must relocate
+ * every self-referential sync stream pointer (req[].cut, last[], last_any[])
+ * off the scratch packet so subsequent submits neither lose barriers nor
+ * dereference freed scratch packets after array growth. */
+static void
+test_pack_relocate_sync(bool exact)
+{
+   struct hk_device dev = { .dev.chip = AGX_CHIP_G17C };
+   struct hk_cmd_buffer *m0 = plain(1);
+   struct hk_cmd_buffer *m1 = plain(1);
+   /* Give m1 a tail barrier so hk_pack_fold_member() sets req[].cut = cs. */
+   struct hk_cs *m1_cs = first_cs(m1);
+   for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+      m1->sync.req[k][HK_SYNC_CDM].prior = HK_SYNC_COMPUTE;
+      m1->sync.req[k][HK_SYNC_CDM].cut = m1_cs;
+   }
+
+   struct {
+      struct hk_cmd_buffer cmd;
+      struct hk_cs cs;
+   } scratch = {0}, cached = {0};
+
+   uint8_t buf[64] = {0};
+   hk_pack_init_packet(&scratch.cmd, &scratch.cs, &dev, buf, 0x1000,
+                       sizeof(buf), true);
+   scratch.cs.sync.kind = HK_SYNC_COMPUTE;
+   uint8_t preceding = 0;
+   hk_pack_fold_member(&scratch.cmd, &scratch.cs, m0, first_cs(m0), false,
+                       &preceding);
+   hk_pack_fold_member(&scratch.cmd, &scratch.cs, m1, m1_cs, true, &preceding);
+   hk_pack_finish_sync(&scratch.cmd, &scratch.cs);
+
+   cached = scratch;
+   list_inithead(&cached.cmd.control_streams);
+   list_addtail(&cached.cs.node, &cached.cmd.control_streams);
+   cached.cs.cmd = &cached.cmd;
+   hk_pack_relocate_sync(&cached.cmd, &cached.cs, &scratch.cs);
+
+   /* Poison scratch to catch any stale pointer dereference or stale index. */
+   memset(&scratch, 0xa5, sizeof(scratch));
+
+   bool no_stale = cached.cmd.sync.last_any[HK_SYNC_CDM] == &cached.cs;
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      if (cached.cmd.sync.last_any[sq] == &scratch.cs ||
+          cached.cs.sync.dep[sq].cut == &scratch.cs)
+         no_stale = false;
+      for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+         if (cached.cmd.sync.last[k][sq] == &scratch.cs ||
+             cached.cmd.sync.req[k][sq].cut == &scratch.cs)
+            no_stale = false;
+      }
+   }
+   T(exact ? "exact: relocate_sync rewrites all scratch cs pointers"
+           : "legacy: relocate_sync rewrites all scratch cs pointers",
+     no_stale &&
+        cached.cmd.sync.last[ffs(HK_SYNC_COMPUTE) - 1][HK_SYNC_CDM] == &cached.cs &&
+        cached.cmd.sync.req[ffs(HK_SYNC_COMPUTE) - 1][HK_SYNC_CDM].cut ==
+           &cached.cs);
+
+   struct hk_cmd_buffer *consumer = plain(1);
+   struct hk_queue *q = new_queue(exact);
+   struct hk_cmd_buffer *seq[2] = { &cached.cmd, consumer };
+   T(exact ? "exact: relocated packet resolves barrier onto consumer"
+           : "legacy: relocated packet resolves barrier onto consumer",
+     resolve(q, seq, 2) &&
+        wait_of(first_cs(consumer), HK_SYNC_CDM, 0, exact) != 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2115,6 +2183,8 @@ main(int argc, char **argv)
    }
 
    test_packet_reuse(false);
+   test_pack_relocate_sync(false);
+   test_pack_relocate_sync(true);
    test_span_pool_policy();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
