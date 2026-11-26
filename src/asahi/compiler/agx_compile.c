@@ -10400,6 +10400,74 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
 }
 
 static void
+agx_optimize_nir_late_tail(nir_shader *nir, bool g17p, bool g18_scans,
+                           bool agx3_compute_opts)
+{
+   bool progress;
+
+   /* Do remaining lowering late, since this inserts &s for shifts so we want to
+    * do it after fusing constant shifts. Constant folding will clean up.
+    */
+   /* Must precede agx_nir_lower_algebraic_late, which rewrites extract_u16
+    * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
+   NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
+   NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
+   if (g18_scans)
+      NIR_PASS(_, nir, agx_nir_avoid_square_overflow);
+   NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
+   if (agx3_compute_opts) {
+      bool fused_selects = false;
+      for (unsigned iter = 0; iter < 4; ++iter) {
+         bool p = false;
+         NIR_PASS(p, nir, agx_nir_fuse_selects);
+         fused_selects |= p;
+         if (!p)
+            break;
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
+      NIR_PASS(_, nir, agx_nir_fold_const_select_alu);
+      if (fused_selects)
+         NIR_PASS(_, nir, nir_opt_remove_phis);
+   } else {
+      NIR_PASS(_, nir, agx_nir_fuse_selects);
+   }
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_combine_barriers, NULL, NULL);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_opt_cse);
+   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
+   NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+
+   /* Cleanup optimizations */
+   nir_move_options move_all = nir_move_const_undef | nir_move_load_ubo |
+                               nir_move_load_input | nir_move_load_frag_coord |
+                               nir_move_comparisons | nir_move_copies |
+                               nir_move_load_ssbo | nir_move_alu;
+   if (agx_has_derivative_in_control_flow(nir))
+      move_all &= ~(nir_move_load_input | nir_move_load_frag_coord |
+                    nir_move_alu);
+
+   /* Sinking a G17P buffer load into the arm that reads it saves the load when
+    * the arm is skipped. Sink leaves it at the top of that block; moving it on
+    * to its use would make each load wait alone instead of overlapping.
+    */
+   NIR_PASS(_, nir, nir_opt_sink,
+            g17p ? move_all : move_all & ~nir_move_load_ssbo);
+   NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
+   NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
+
+   /* After lowering phis to scalar, we must copy prop/DCE for correctness. RA
+    * can't deal with dead phis.
+    */
+   do {
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      progress = false;
+   } while (progress);
+}
+
+static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool g17p, bool m5,
                  bool g18_scans, bool checked_offsets,
@@ -10518,16 +10586,24 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, nir_opt_peephole_select, &peephole_select_options);
 
    /* Small uniform ifs whose arms load from memory, which peephole select
-    * keeps: on M5 an if costs five control-flow instructions and a wait for
-    * every load in flight. Flattening one can expose another around it.
-    * Not on G18G, which compiles as AGX3C with emit_agx3d (g18_scans). */
-   if (m5 && !g18_scans) {
+    * keeps: on AGX3 (AGX3B and AGX3C) an if costs control-flow instructions
+    * and a wait for every load in flight. Flattening one can expose another
+    * around it. Not on G18G, which compiles as AGX3C with emit_agx3d
+    * (g18_scans). */
+   if (agx3_compute_opts) {
+      /* Use a single encoding-uniform select limit across AGX3B and AGX3C so
+       * G15G/G16G/G17P/G17S flatten identically inside the load-flatten loop. */
+      nir_opt_peephole_select_options flatten_select_options = {
+         .limit = 64,
+         .expensive_alu_ok = true,
+         .expensive_limit = 0,
+      };
       bool flattened;
       do {
          flattened = false;
          NIR_PASS(flattened, nir, agx_nir_opt_flatten_loads, 64, 4);
          NIR_PASS(flattened, nir, nir_opt_peephole_select,
-                  &peephole_select_options);
+                  &flatten_select_options);
       } while (flattened);
       NIR_PASS(_, nir, nir_opt_algebraic);
       NIR_PASS(_, nir, nir_opt_cse);
@@ -10845,66 +10921,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       nir_index_ssa_defs(impl);
    }
 
-   /* Do remaining lowering late, since this inserts &s for shifts so we want to
-    * do it after fusing constant shifts. Constant folding will clean up.
-    */
-   /* Must precede agx_nir_lower_algebraic_late, which rewrites extract_u16
-    * into u2u32(unpack_32_2x16_split_y) (the pass also matches that form). */
-   NIR_PASS(_, nir, agx_nir_fold_extract16_bfe);
-   NIR_PASS(_, nir, agx_nir_lower_algebraic_late);
-   if (g18_scans)
-      NIR_PASS(_, nir, agx_nir_avoid_square_overflow);
-   NIR_PASS(_, nir, agx_nir_fold_pixel_coord);
-   if (agx3_compute_opts) {
-      bool fused_selects = false;
-      for (unsigned iter = 0; iter < 4; ++iter) {
-         bool p = false;
-         NIR_PASS(p, nir, agx_nir_fuse_selects);
-         fused_selects |= p;
-         if (!p)
-            break;
-         NIR_PASS(_, nir, nir_opt_dce);
-      }
-      NIR_PASS(_, nir, agx_nir_fold_const_select_alu);
-      if (fused_selects)
-         NIR_PASS(_, nir, nir_opt_remove_phis);
-   } else {
-      NIR_PASS(_, nir, agx_nir_fuse_selects);
-   }
-   NIR_PASS(_, nir, nir_opt_constant_folding);
-   NIR_PASS(_, nir, nir_opt_combine_barriers, NULL, NULL);
-   NIR_PASS(_, nir, nir_opt_copy_prop);
-   NIR_PASS(_, nir, nir_opt_dce);
-   NIR_PASS(_, nir, nir_opt_cse);
-   NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
-   NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
-
-   /* Cleanup optimizations */
-   nir_move_options move_all = nir_move_const_undef | nir_move_load_ubo |
-                               nir_move_load_input | nir_move_load_frag_coord |
-                               nir_move_comparisons | nir_move_copies |
-                               nir_move_load_ssbo | nir_move_alu;
-   if (agx_has_derivative_in_control_flow(nir))
-      move_all &= ~(nir_move_load_input | nir_move_load_frag_coord |
-                    nir_move_alu);
-
-   /* Sinking a G17P buffer load into the arm that reads it saves the load when
-    * the arm is skipped. Sink leaves it at the top of that block; moving it on
-    * to its use would make each load wait alone instead of overlapping.
-    */
-   NIR_PASS(_, nir, nir_opt_sink,
-            g17p ? move_all : move_all & ~nir_move_load_ssbo);
-   NIR_PASS(_, nir, nir_opt_move, move_all & ~nir_move_load_ssbo);
-   NIR_PASS(progress, nir, nir_lower_all_phis_to_scalar);
-
-   /* After lowering phis to scalar, we must copy prop/DCE for correctness. RA
-    * can't deal with dead phis.
-    */
-   do {
-      NIR_PASS(progress, nir, nir_opt_copy_prop);
-      NIR_PASS(progress, nir, nir_opt_dce);
-      progress = false;
-   } while (progress);
+   agx_optimize_nir_late_tail(nir, g17p, g18_scans, agx3_compute_opts);
 }
 
 /*
@@ -16559,13 +16576,35 @@ agx_compile_shader_nir_once(nir_shader *nir, struct agx_shader_key *key,
    if (is_agx3 && source_imul64)
       NIR_PASS(_, nir, agx_nir_lower_imul64, m5_wide_product);
 
+   /* AGX_G17P_UNIFORM_DMA: only when no preamble is formed. Turning UBO loads
+    * inside short-circuit branches into load_preamble makes those branches
+    * trivial; fold them to selects just as the form_preamble path does. */
+   if (is_agx3 && key->g17p_uniform_dma && !form_preamble &&
+       agx3_nir_lower_uniform_dma(nir, key, info)) {
+      nir_opt_peephole_select_options peephole_select_options = {
+         .limit = 64,
+         .expensive_alu_ok = true,
+         .expensive_limit = 0,
+      };
+      bool dma_folded = false;
+      NIR_PASS(dma_folded, nir, nir_opt_peephole_select,
+               &peephole_select_options);
+      if (dma_folded) {
+         if (key->dev.encoding == AGX_ISA_ENCODING_AGX3B)
+            NIR_PASS(_, nir, agx_nir_scalarize_int64);
+         NIR_PASS(_, nir, nir_lower_int64);
+         const bool post_dma_agx3_opts =
+            (key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+             key->dev.encoding == AGX_ISA_ENCODING_AGX3C) &&
+            !key->dev.emit_agx3d;
+         agx_optimize_nir_late_tail(nir, key->dev.chip == AGX_CHIP_G17P,
+                                    key->dev.emit_agx3d, post_dma_agx3_opts);
+         nir_divergence_analysis(nir);
+      }
+   }
+
    if (is_agx3)
       nir->options = original_options;
-
-   /* AGX_G17P_UNIFORM_DMA: only when no preamble is formed. */
-   if (is_agx3 && key->g17p_uniform_dma && !form_preamble &&
-       agx3_nir_lower_uniform_dma(nir, key, info))
-      NIR_PASS(_, nir, nir_opt_dce);
 
    /* Late NIR cleanup can remove main-program uses of values exported by
     * preamble extraction. Preserve their SSA uses inside the CProg, while

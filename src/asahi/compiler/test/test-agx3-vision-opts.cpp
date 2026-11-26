@@ -3357,3 +3357,164 @@ TEST(AGX3VisionOpts, ExactTailConstInitOmitsDeadFallback)
       ralloc_free(opt);
    }
 }
+
+TEST(AGX3VisionOpts, UniformDmaNoPreambleFoldsShortCircuitIf)
+{
+   /* When !form_preamble (AGX3B compute) lowers a uniform-DMA load inside a
+    * short-circuit branch into load_preamble, post-DMA peephole select must
+    * fold the now-trivial branch into a select rather than leaving control
+    * flow around load_preamble. */
+   auto compile_once = [](enum agx_chip chip, bool dont_flatten) {
+      nir_builder b = make_compute_shader("uniform_dma_peephole");
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+
+      nir_if *nif = nir_push_if(&b, nir_ige_imm(&b, gid, 0));
+      if (dont_flatten)
+         nif->control = nir_selection_control_dont_flatten;
+      nir_def *limit = nir_load_global_constant(
+         &b, 1, 32, nir_iadd_imm(&b, root, 8), .align_mul = 4);
+      nir_def *oob = nir_ige(&b, gid, limit);
+      nir_push_else(&b, nif);
+      nir_def *t = nir_imm_true(&b);
+      nir_pop_if(&b, nif);
+
+      nir_def *res = nir_b2i32(&b, nir_if_phi(&b, oob, t));
+      nir_store_global(&b, res,
+                       nir_iadd(&b, out, nir_imul_imm(&b, nir_u2u64(&b, gid), 4)),
+                       .align_mul = 4);
+      agx_preprocess_nir(b.shader);
+
+      struct agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      key.dev.chip = chip;
+      key.reserved_preamble = 8;
+      key.no_preamble = true;
+      key.g17p_uniform_dma = true;
+      key.g17p_dma_root = 0;
+      struct agx_shader_part part = {};
+      EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+      EXPECT_GT(part.info.agx3_uniform_dma_count, 0u);
+      std::vector<uint8_t> bin;
+      if (part.binary)
+         bin.assign((const uint8_t *)part.binary,
+                    (const uint8_t *)part.binary + part.info.binary_size);
+      free(part.binary);
+      ralloc_free(b.shader);
+      return bin;
+   };
+
+   for (enum agx_chip chip : {AGX_CHIP_G15G, AGX_CHIP_G17P}) {
+      const std::vector<uint8_t> folded = compile_once(chip, false);
+      const std::vector<uint8_t> kept = compile_once(chip, true);
+      EXPECT_FALSE(folded.empty());
+      EXPECT_FALSE(kept.empty());
+      EXPECT_NE(folded, kept);
+      EXPECT_LT(folded.size(), kept.size());
+   }
+}
+
+TEST(AGX3VisionOpts, UniformDmaNoPreamblePreservesScalarizedVecStore)
+{
+   /* Post-uniform-DMA peephole select and constant folding can introduce vector
+    * bcsel or re-fold vec4 load_const values after agx_optimize_nir's final
+    * scalarization pass. Ensure the !form_preamble uniform-DMA path re-runs
+    * scalarization so vector SSBO/global stores never hit missing allocated_vec
+    * entries in agx_recollect_vector. */
+   nir_builder b = make_compute_shader("uniform_dma_vec4_store");
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *root = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+
+   nir_if *nif = nir_push_if(&b, nir_ige_imm(&b, gid, 0));
+   nir_def *limit = nir_load_global_constant(
+      &b, 1, 32, nir_iadd_imm(&b, root, 8), .align_mul = 4);
+   nir_def *v_then = nir_vec4(&b, limit, nir_imm_int(&b, 2),
+                              nir_imm_int(&b, 3), nir_imm_int(&b, 4));
+   nir_push_else(&b, nif);
+   nir_def *v_else = nir_imm_ivec4(&b, 10, 20, 30, 40);
+   nir_pop_if(&b, nif);
+
+   nir_def *sel = nir_if_phi(&b, v_then, v_else);
+   nir_def *cvec = nir_imm_ivec4(&b, 1, 2, 3, 4);
+   nir_def *addr0 = nir_iadd(&b, out, nir_imul_imm(&b, nir_u2u64(&b, gid), 32));
+   nir_def *addr1 = nir_iadd_imm(&b, addr0, 16);
+   nir_store_global(&b, sel, addr0, .align_mul = 16);
+   nir_store_global(&b, cvec, addr1, .align_mul = 16);
+   agx_preprocess_nir(b.shader);
+
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   key.dev.chip = AGX_CHIP_G17P;
+   key.reserved_preamble = 8;
+   key.no_preamble = true;
+   key.g17p_uniform_dma = true;
+   key.g17p_dma_root = 0;
+   struct agx_shader_part part = {};
+   EXPECT_TRUE(agx_compile_shader_nir(b.shader, &key, &part));
+   EXPECT_GT(part.info.agx3_uniform_dma_count, 0u);
+   EXPECT_GT(part.info.binary_size, 0u);
+   free(part.binary);
+   ralloc_free(b.shader);
+}
+
+TEST(AGX3VisionOpts, BinaryTailChunksSkippedLocallyWithoutDontFlatten)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "binary_tail_local_skip");
+   b.shader->info.workgroup_size[0] = 8;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *n = push_u32(&b, 0);
+   nir_def *src_addr = nir_pack_64_2x32_split(&b, push_u32(&b, 4), push_u32(&b, 8));
+   nir_def *dst_addr = nir_pack_64_2x32_split(&b, push_u32(&b, 12), push_u32(&b, 16));
+
+   nir_variable *iv = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+   nir_variable *acc = nir_local_variable_create(b.impl, glsl_float_type(), "acc");
+   nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+   nir_store_var(&b, acc, nir_imm_float(&b, 0.0f), 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, iv);
+      nir_if *brk = nir_push_if(&b, nir_ige(&b, i, n));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, brk);
+
+      nir_def *off = nir_u2u64(&b, nir_imul_imm(&b, nir_iadd(&b, gid, i), 4));
+      nir_def *v = nir_load_global(&b, 1, 32, nir_iadd(&b, src_addr, off), .align_mul = 4);
+      nir_store_var(&b, acc, nir_fadd(&b, nir_load_var(&b, acc), v), 1);
+      nir_store_var(&b, iv, nir_iadd_imm(&b, i, 1), 1);
+   }
+   nir_pop_loop(&b, loop);
+
+   nir_def *out_off = nir_u2u64(&b, nir_imul_imm(&b, gid, 4));
+   nir_store_global(&b, nir_load_var(&b, acc), nir_iadd(&b, dst_addr, out_off), .align_mul = 4);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_constant_folding(b.shader);
+   nir_opt_copy_prop(b.shader);
+   nir_opt_dce(b.shader);
+
+   ASSERT_TRUE(agx_nir_unroll_runtime_loops(b.shader, 8, 320, NULL));
+   nir_validate_shader(b.shader, "after unroll");
+
+   unsigned tail_ifs = 0;
+   unsigned dont_flatten_ifs = 0;
+   foreach_list_typed(nir_cf_node, node, node, &b.impl->body) {
+      if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         tail_ifs++;
+         if (nif->control == nir_selection_control_dont_flatten)
+            dont_flatten_ifs++;
+      }
+   }
+   EXPECT_GE(tail_ifs, 3u);
+   EXPECT_EQ(dont_flatten_ifs, 0u);
+   EXPECT_FALSE(agx_nir_opt_flatten_loads(b.shader, 48, 4));
+
+   ralloc_free(b.shader);
+}

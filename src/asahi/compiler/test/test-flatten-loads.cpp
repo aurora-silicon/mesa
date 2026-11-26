@@ -641,11 +641,13 @@ INSTANTIATE_TEST_SUITE_P(
              (std::get<2>(info.param) == ARM_THEN ? "Then" : "Else");
    });
 
-/* The pass is M5's: G18G compiles as AGX3C with emit_agx3d and keeps the if.
- * A guarded load compiles to a different program with and without
- * dont_flatten on M5, to the same one on G18G. */
+/* The pass runs on AGX3B and AGX3C (not G18G, which compiles as AGX3C with
+ * emit_agx3d and keeps the if). A guarded load compiles to a different program
+ * with and without dont_flatten on AGX3B and AGX3C, and to the same one on
+ * G18G. */
 static std::vector<uint8_t>
-compile_guarded_load(bool emit_agx3d, bool dont_flatten)
+compile_guarded_load(enum agx_isa_encoding encoding, enum agx_chip chip,
+                     bool emit_agx3d, bool dont_flatten)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, &agx_nir_options, "guarded load");
@@ -666,8 +668,8 @@ compile_guarded_load(bool emit_agx3d, bool dont_flatten)
    agx_preprocess_nir(b.shader);
 
    agx_shader_key key = {};
-   key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
-   key.dev.chip = emit_agx3d ? AGX_CHIP_G17G : AGX_CHIP_G17C;
+   key.dev.encoding = encoding;
+   key.dev.chip = chip;
    key.dev.emit_agx3d = emit_agx3d;
    key.reserved_preamble = 10;
    key.no_preamble = true;
@@ -683,13 +685,232 @@ compile_guarded_load(bool emit_agx3d, bool dont_flatten)
    return binary;
 }
 
-TEST_F(FlattenLoadsKeeps, G18GKeepsTheIf)
+TEST_F(FlattenLoadsKeeps, AGX3BAndM5FlattenWhileG18GKeepsTheIf)
 {
-   const std::vector<uint8_t> m5 = compile_guarded_load(false, false);
-   EXPECT_FALSE(m5.empty());
-   EXPECT_NE(m5, compile_guarded_load(false, true));
+   const std::vector<uint8_t> g15g = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, false);
+   EXPECT_FALSE(g15g.empty());
+   EXPECT_NE(g15g, compile_guarded_load(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G,
+                                        false, true));
 
-   const std::vector<uint8_t> g18g = compile_guarded_load(true, false);
+   const std::vector<uint8_t> agx3b = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, false);
+   EXPECT_FALSE(agx3b.empty());
+   EXPECT_NE(agx3b, compile_guarded_load(AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P,
+                                         false, true));
+
+   const std::vector<uint8_t> m5 = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C, false, false);
+   EXPECT_FALSE(m5.empty());
+   EXPECT_NE(m5, compile_guarded_load(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17C,
+                                      false, true));
+
+   const std::vector<uint8_t> g18g = compile_guarded_load(
+      AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, false);
    EXPECT_FALSE(g18g.empty());
-   EXPECT_EQ(g18g, compile_guarded_load(true, true));
+   EXPECT_EQ(g18g, compile_guarded_load(AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G,
+                                        true, true));
+}
+
+TEST_F(FlattenLoadsKeeps, SinkCommonStoreSharedAndFlattenBurst)
+{
+   /* Four sibling divergent if/else diamonds each loading one dword from
+    * global memory or zero and storing to the exact same shared-memory
+    * expression (as in tiled GEMM edge loaders) must sink all four
+    * store_shared instructions and flatten all four ifs. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "sink_and_burst");
+   b.shader->info.shared_size = 256;
+   b.shader->info.shared_element_index_agx = true;
+
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+   nir_def *base = nir_load_preamble(&b, 1, 64, .base = SLOT_BASE);
+   nir_def *limit = nir_load_preamble(&b, 1, 32, .base = SLOT_I);
+
+   for (unsigned k = 0; k < 4; ++k) {
+      nir_def *cond = nir_ilt(&b, nir_iadd_imm(&b, gid, k), limit);
+      nir_if *nif = nir_push_if(&b, cond);
+      {
+         nir_def *saddr_t = nir_u2u16(&b, nir_iadd_imm(&b, lid, (k + 1) * 16));
+         nir_def *gaddr = nir_iadd(
+            &b, base, nir_imul_imm(&b, nir_u2u64(&b, nir_iadd_imm(&b, gid, k)), 4));
+         nir_def *v = nir_load_global(&b, 1, 32, gaddr, .align_mul = 4);
+         nir_store_shared(&b, v, saddr_t, .base = 0, .write_mask = 1,
+                          .align_mul = 4);
+      }
+      nir_push_else(&b, nif);
+      {
+         /* Commuted add operand order to verify structural matching. */
+         nir_def *saddr_e = nir_u2u16(&b, nir_iadd(&b, nir_imm_int(&b, (k + 1) * 16), lid));
+         nir_store_shared(&b, nir_imm_int(&b, 0), saddr_e, .base = 0,
+                          .write_mask = 1, .align_mul = 4);
+      }
+      nir_pop_if(&b, nif);
+   }
+
+   ASSERT_TRUE(agx_nir_opt_flatten_loads(b.shader, 64, 4));
+   nir_validate_shader(b.shader, "sink_and_burst");
+   EXPECT_EQ(count_ifs(b.shader), 0u);
+
+   unsigned stores = 0;
+   nir_foreach_block(block, b.impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic ==
+                nir_intrinsic_store_shared)
+            stores++;
+      }
+   }
+   EXPECT_EQ(stores, 4u);
+   ralloc_free(b.shader);
+}
+
+TEST_F(FlattenLoadsKeeps, StoreSharedMismatchedOrVolatileNotSunk)
+{
+   for (unsigned mode = 0; mode < 2; ++mode) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "no_sink_shared");
+      b.shader->info.shared_size = 256;
+      b.shader->info.shared_element_index_agx = true;
+
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = SLOT_BASE);
+
+      nir_if *nif = nir_push_if(&b, nir_ilt_imm(&b, gid, 16));
+      nir_def *v = nir_load_global(&b, 1, 32, base, .align_mul = 4);
+      const gl_access_qualifier access = mode == 1 ? ACCESS_VOLATILE :
+         (gl_access_qualifier)0;
+      nir_store_shared(&b, v, nir_u2u16(&b, lid), .base = 0, .access = access,
+                       .write_mask = 1, .align_mul = 4);
+      nir_push_else(&b, nif);
+      nir_def *e_addr =
+         mode == 0 ? nir_u2u16(&b, nir_iadd_imm(&b, lid, 1)) : nir_u2u16(&b, lid);
+      nir_store_shared(&b, nir_imm_int(&b, 0), e_addr, .base = 0,
+                       .access = access, .write_mask = 1, .align_mul = 4);
+      nir_pop_if(&b, nif);
+
+      EXPECT_FALSE(agx_nir_opt_flatten_loads(b.shader, 64, 4));
+      EXPECT_EQ(count_ifs(b.shader), 1u);
+      ralloc_free(b.shader);
+   }
+}
+
+TEST_F(FlattenLoadsKeeps, DivergentBurstThresholdAndConstGlobalExclusion)
+{
+   auto run_burst = [](unsigned count, bool const_global) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_COMPUTE, &agx_nir_options, "burst_threshold");
+      nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *base = nir_load_preamble(&b, 1, 64, .base = SLOT_BASE);
+      nir_def *out = nir_load_preamble(&b, 1, 64, .base = SLOT_J);
+      nir_def *acc = nir_imm_int(&b, 0);
+
+      for (unsigned k = 0; k < count; ++k) {
+         nir_if *nif = nir_push_if(&b, nir_ilt_imm(&b, gid, 16 + k));
+         nir_def *addr = nir_iadd_imm(&b, base, k * 4);
+         nir_def *v =
+            const_global
+               ? nir_load_global_constant(&b, 1, 32, addr, .align_mul = 4)
+               : nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+         nir_push_else(&b, nif);
+         nir_def *z = nir_imm_int(&b, 0);
+         nir_pop_if(&b, nif);
+         acc = nir_iadd(&b, acc, nir_if_phi(&b, v, z));
+      }
+      nir_store_global(&b, acc, out, .align_mul = 4);
+      bool changed = agx_nir_opt_flatten_loads(b.shader, 64, 4);
+      unsigned rem = count_ifs(b.shader);
+      nir_validate_shader(b.shader, "burst_threshold");
+      ralloc_free(b.shader);
+      return std::pair<bool, unsigned>{changed, rem};
+   };
+
+   /* 3 sibling divergent ifs stay unflattened; 4 flatten completely. */
+   auto r3 = run_burst(3, false);
+   EXPECT_FALSE(r3.first);
+   EXPECT_EQ(r3.second, 3u);
+
+   auto r4 = run_burst(4, false);
+   EXPECT_TRUE(r4.first);
+   EXPECT_EQ(r4.second, 0u);
+
+   /* 4 sibling load_global_constant ifs stay unflattened for uniform DMA. */
+   auto rc = run_burst(4, true);
+   EXPECT_FALSE(rc.first);
+   EXPECT_EQ(rc.second, 4u);
+}
+
+TEST_F(FlattenLoadsKeeps, SkipsBinaryTailCascade)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "binary_tail_skip");
+   nir_def *iv = nir_load_preamble(&b, 1, 32, .base = 0);
+   nir_def *n = nir_load_preamble(&b, 1, 32, .base = 2);
+   nir_def *buf = nir_load_preamble(&b, 1, 64, .base = 4);
+   nir_def *out = nir_load_preamble(&b, 1, 64, .base = 8);
+
+   nir_def *acc = nir_imm_int(&b, 0);
+   for (unsigned step : {4u, 2u, 1u}) {
+      nir_def *lim = step > 1 ? nir_iadd_imm(&b, n, -(int)(step - 1)) : n;
+      nir_if *nif = nir_push_if(&b, nir_ilt(&b, iv, lim));
+      nir_def *v = nir_load_global(
+         &b, 1, 32, nir_iadd(&b, buf, nir_u2u64(&b, nir_ishl_imm(&b, iv, 2))),
+         .align_mul = 4);
+      nir_def *next_acc = nir_iadd(&b, acc, v);
+      nir_def *next_iv = nir_iadd_imm(&b, iv, step);
+      nir_pop_if(&b, nif);
+      acc = nir_if_phi(&b, next_acc, acc);
+      if (step > 1)
+         iv = nir_if_phi(&b, next_iv, iv);
+   }
+   nir_store_global(&b, acc, out, .align_mul = 4);
+
+   EXPECT_FALSE(agx_nir_opt_flatten_loads(b.shader, 64, 4));
+   unsigned ifs = 0;
+   nir_foreach_function_impl(impl, b.shader) {
+      foreach_list_typed(nir_cf_node, node, node, &impl->body) {
+         if (node->type == nir_cf_node_if) {
+            EXPECT_EQ(nir_cf_node_as_if(node)->control,
+                      nir_selection_control_none);
+            ifs++;
+         }
+      }
+   }
+   EXPECT_EQ(ifs, 3u);
+   nir_validate_shader(b.shader, "binary_tail_skip");
+   ralloc_free(b.shader);
+}
+
+TEST_F(FlattenLoadsKeeps, BurstRequiresContiguousRun)
+{
+   /* 2 + 2 matching divergent ifs separated by a barrier must not flatten. */
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "burst_noncontiguous");
+   nir_def *gid = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *buf = nir_load_preamble(&b, 1, 64, .base = 0);
+   nir_def *out = nir_load_preamble(&b, 1, 64, .base = 4);
+
+   nir_def *acc = nir_imm_int(&b, 0);
+   for (unsigned i = 0; i < 4; ++i) {
+      if (i == 2) {
+         nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                     .memory_scope = SCOPE_WORKGROUP,
+                     .memory_semantics = NIR_MEMORY_ACQ_REL,
+                     .memory_modes = nir_var_mem_shared);
+      }
+      nir_if *nif = nir_push_if(&b, nir_ult_imm(&b, gid, 64 + i));
+      nir_def *addr = nir_iadd(&b, buf, nir_u2u64(&b, nir_ishl_imm(&b, gid, 2)));
+      nir_def *v = nir_load_global(&b, 1, 32, addr, .align_mul = 4);
+      nir_push_else(&b, nif);
+      nir_def *z = nir_imm_int(&b, 0);
+      nir_pop_if(&b, nif);
+      acc = nir_iadd(&b, acc, nir_if_phi(&b, v, z));
+   }
+   nir_store_global(&b, acc, out, .align_mul = 4);
+
+   EXPECT_FALSE(agx_nir_opt_flatten_loads(b.shader, 64, 4));
+   nir_validate_shader(b.shader, "burst_noncontiguous");
+   ralloc_free(b.shader);
 }
