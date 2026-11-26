@@ -4675,8 +4675,9 @@ hk_g17p_tiled_upload(struct hk_cmd_buffer *cmd,
  * level can therefore take the raw tiled upload, which overlaps across
  * submissions, and then mark that level's tiles uncompressed, instead of a
  * render pass. The next render into the image compresses the tiles again.
- * A level too small to be allocated compressed is plain already. Any other
- * partial upload keeps the graphics path, which merges into compressed tiles.
+ * A level too small to be allocated compressed is plain already. Mipmapped
+ * images and partial uploads keep the graphics path, which writes compressed
+ * tiles.
  */
 static bool
 hk_hal200_upload_bypasses_compression(const struct hk_device *dev,
@@ -4693,6 +4694,16 @@ hk_hal200_upload_bypasses_compression(const struct hk_device *dev,
 
    if (!ail_is_level_allocated_compressed(layout, level))
       return true;
+
+   /* The levels of a mipmapped image are the sources its smaller levels are
+    * downsampled from, and the compressed mip blit reads them through the
+    * texture unit: stored compressed, those reads cost half. On the J516s
+    * (G15S, gpubench transfer.ops mipchain, ABBA over two boots against an
+    * uncompressed baseline) a raw level 0 left the chain 6 % slower at
+    * depth 2, a compressed one 1.76x faster. Only single-level images take
+    * the raw upload. */
+   if (image->vk.mip_levels > 1)
+      return false;
 
    return region->imageOffset.x == 0 && region->imageOffset.y == 0 &&
           region->imageOffset.z == 0 &&
