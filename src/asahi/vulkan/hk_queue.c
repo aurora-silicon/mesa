@@ -3027,6 +3027,44 @@ hk_pack_attachment_limit(const struct hk_device *dev)
  * for it until one does (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(hk_pack_gemm_dw_opt, "HK_PACK_GEMM_DW", true)
+
+/* PROFILING ONLY (never push): HK_PROBE_IM2A_TILE / HK_PROBE_DWA_TILE force the
+ * unguarded cmat tile of small-grid (M <= HK_PROBE_MMAX, default 6400)
+ * im2col_a / dw_a fused GEMMs, for per-dispatch tile A/B on hardware. */
+static enum hk_compute_pair_alt_kind
+hk_probe_tile(const struct hk_compute_pair_dispatch *p, bool im2a, bool dwa,
+              enum hk_compute_pair_alt_kind cur)
+{
+   const char *e = getenv(im2a ? "HK_PROBE_IM2A_TILE" : (dwa ? "HK_PROBE_DWA_TILE" : ""));
+   if (!e || (!im2a && !dwa) || p->info.gemm.is_guarded)
+      return cur;
+   const char *mm = getenv("HK_PROBE_MMAX");
+   const uint32_t mmax = mm ? (uint32_t)atoi(mm) : 6400u;
+   const enum hk_compute_pair_alt_kind k = (enum hk_compute_pair_alt_kind)atoi(e);
+   if (!hk_compute_pair_alt_is_gemm_cmat(k) || !hk_compute_pair_alt_is_gemm_unguarded(k))
+      return cur;
+   const uint32_t tm = hk_compute_pair_alt_gemm_tile_m(k), tn = hk_compute_pair_alt_gemm_tile_n(k);
+   const uint32_t otm = hk_compute_pair_alt_gemm_tile_m(p->alt_kind);
+   int32_t n = 0, kk = 0;
+   memcpy(&n, p->push + p->info.gemm.n_offset_B, 4);
+   memcpy(&kk, p->push + p->info.gemm.k_offset_B, 4);
+   const uint32_t m = p->exec_threads[1] * otm;
+   if ((tm != 32 && tm != 64) || n <= 0 || kk <= 0 || m > mmax || (m % tm) || ((uint32_t)n % tn) ||
+       ((uint32_t)kk % (tm == 32 ? 32u : 16u)) || p->exec_threads[0] != ((uint32_t)n / hk_compute_pair_alt_gemm_tile_n(p->alt_kind)) * 128u)
+      return cur;
+   return k;
+}
+
+static void
+hk_probe_regrid(struct hk_compute_pair_dispatch *d, const struct hk_compute_pair_dispatch *orig,
+                enum hk_compute_pair_alt_kind k)
+{
+   int32_t n = 0;
+   memcpy(&n, orig->push + orig->info.gemm.n_offset_B, 4);
+   const uint32_t m = orig->exec_threads[1] * hk_compute_pair_alt_gemm_tile_m(orig->alt_kind);
+   d->exec_threads[0] = ((uint32_t)n / hk_compute_pair_alt_gemm_tile_n(k)) * 128u;
+   d->exec_threads[1] = m / hk_compute_pair_alt_gemm_tile_m(k);
+}
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
 
 bool
@@ -5433,8 +5471,17 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             uint64_t kept_orig_work = 0, kept_fused_work = 0;
             unsigned kept_orig_loops = 0, kept_fused_loops = 0;
             unsigned span = 0;
+            const enum hk_compute_pair_alt_kind probe_saved_kind = eff_alt_kind;
+            if (dual != HK_COMPUTE_PAIR_DUAL_GEMM_DW)
+               eff_alt_kind = hk_probe_tile(p, has_im2col, has_dw_a, eff_alt_kind);
+            bool probe_on = eff_alt_kind != probe_saved_kind;
             for (unsigned attempt = 0; attempt < 6; ++attempt) {
-               if (attempt > 0) {
+               if (attempt > 0 && probe_on) {
+                  /* The forced tile did not build: retry the planner's own. */
+                  eff_alt_kind = probe_saved_kind;
+                  probe_on = false;
+                  attempt = 0;
+               } else if (attempt > 0) {
                   if (dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW) {
                      eff_alt_kind = p->alt_kind;
                      gemm_dw_idx = 0;
@@ -5492,6 +5539,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      eff_p.exec_threads[0] = ((uint32_t)n_o / gdw_tn) * 128u;
                      eff_p.exec_threads[1] = (in_h_o >> 3) * (in_w_o >> 3);
                      eff_p.exec_threads[2] = 1u;
+                  } else if (probe_on) {
+                     hk_probe_regrid(&eff_p, p, eff_alt_kind);
                   } else if (hk_compute_pair_alt_gemm_tile_m(eff_alt_kind) == 32u &&
                              hk_compute_pair_alt_gemm_tile_m(p->alt_kind) == 64u) {
                      eff_p.exec_threads[1] = p->exec_threads[1] * 2u;
@@ -6395,7 +6444,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   if (pl->alt_kind_override != HK_COMPUTE_PAIR_ALT_NONE &&
                       pl->dual_write != HK_COMPUTE_PAIR_DUAL_GEMM_DW) {
                      tmp_disp.alt_kind = pl->alt_kind_override;
-                     if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 32u &&
+                     if (hk_compute_pair_alt_gemm_tile_n(pl->alt_kind_override) !=
+                         hk_compute_pair_alt_gemm_tile_n(p_disp->alt_kind)) {
+                        hk_probe_regrid(&tmp_disp, p_disp, pl->alt_kind_override);
+                     } else if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 32u &&
                          hk_compute_pair_alt_gemm_tile_m(p_disp->alt_kind) == 64u) {
                         tmp_disp.exec_threads[1] = p_disp->exec_threads[1] * 2u;
                      } else if (hk_compute_pair_alt_gemm_tile_m(pl->alt_kind_override) == 64u &&
