@@ -370,6 +370,7 @@ enum hk_meta_object_key_type {
    HK_META_OBJECT_KEY_BLOCK_COPY,
    HK_META_OBJECT_KEY_G17P_MIP,
    HK_META_OBJECT_KEY_G17P_BLOCK_MIP,
+   HK_META_OBJECT_KEY_G17P_BLOCK_UPLOAD,
    HK_META_OBJECT_KEY_AGX3_GEN10_MIP,
    HK_META_OBJECT_KEY_G17P_BUFFER_FILL_PBE,
    HK_META_OBJECT_KEY_G17P_TILED_UPLOAD,
@@ -2898,6 +2899,277 @@ hk_g17p_block_mip_region(struct hk_cmd_buffer *cmd, struct hk_image *src,
       DIV_ROUND_UP((uint32_t)region->dstOffsets[1].x, HK_G17P_BLOCK_MIP_TILE),
       DIV_ROUND_UP((uint32_t)region->dstOffsets[1].y, HK_G17P_BLOCK_MIP_TILE),
       1);
+}
+
+/*
+ * A buffer-to-image upload of whole compressed RGBA8 levels of a HAL200
+ * image, through the compressed PBE.
+ *
+ * Each invocation loads its texel's four bytes from the buffer, a 32-thread
+ * row reading 128 contiguous bytes, and stores them unchanged to the
+ * workgroup's imageblock. Each 32x32 workgroup then writes its tile through
+ * the level's PBE in one block store, which tiles and compresses it. A tile
+ * past the level's edge is clipped by the PBE; its outside invocations load
+ * the nearest texel of the level, so every load stays in the buffer.
+ */
+struct hk_g17p_block_upload_key {
+   enum hk_meta_object_key_type key_type;
+};
+
+struct hk_g17p_block_upload_push {
+   uint64_t src;
+   uint32_t row_pitch_B;
+   uint32_t width;
+   uint32_t height;
+   uint32_t pad;
+};
+static_assert(sizeof(struct hk_g17p_block_upload_push) == 24,
+              "block upload push data must be tightly packed");
+
+#define block_upload_push(b, field)                                            \
+   nir_load_push_constant(                                                     \
+      b, 1, sizeof(((struct hk_g17p_block_upload_push *)0)->field) * 8,        \
+      nir_imm_int(b, offsetof(struct hk_g17p_block_upload_push, field)))
+
+static nir_shader *
+build_g17p_block_upload_shader(void)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, NULL, "hk-g17p-block-upload");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = HK_G17P_BLOCK_MIP_TILE;
+   b->shader->info.workgroup_size[1] = HK_G17P_BLOCK_MIP_TILE;
+
+   nir_variable *image = nir_variable_create(
+      b->shader, nir_var_image,
+      glsl_image_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT), "dest");
+   image->data.descriptor_set = 0;
+   image->data.binding = 0;
+   image->data.access = ACCESS_NON_READABLE;
+
+   nir_def *gid = nir_trim_vector(b, nir_load_global_invocation_id(b, 32), 2);
+   nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
+   nir_def *x = nir_umin(b, nir_channel(b, gid, 0),
+                         nir_iadd_imm(b, block_upload_push(b, width), -1));
+   nir_def *y = nir_umin(b, nir_channel(b, gid, 1),
+                         nir_iadd_imm(b, block_upload_push(b, height), -1));
+   nir_def *offset = nir_iadd(b, nir_imul(b, y, block_upload_push(b, row_pitch_B)),
+                              nir_ishl_imm(b, x, 2));
+   nir_def *word = nir_load_global(
+      b, 1, 32, nir_iadd(b, block_upload_push(b, src), nir_u2u64(b, offset)),
+      .align_mul = 4);
+
+   /* The texel's bytes, stored as they are: an 8-bit integer imageblock
+    * pixel takes them without conversion, and the RGBA8 UNORM block store
+    * below moves them to memory unchanged. */
+   nir_def *bytes[4];
+   for (unsigned c = 0; c < 4; ++c)
+      bytes[c] = nir_u2u16(b, nir_extract_u8_imm(b, word, c));
+   nir_store_local_pixel_agx(
+      b, nir_vec(b, bytes, 4), nir_imm_intN_t(b, 1, 16), nir_u2u16(b, lid),
+      .base = 0, .write_mask = 0xf,
+      .format = ail_pixel_format[PIPE_FORMAT_R8G8B8A8_UINT].renderable,
+      .explicit_coord = true);
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP);
+
+   nir_push_if(b, nir_ball(b, nir_ieq_imm(b, lid, 0)));
+   {
+      nir_image_deref_store_block_agx(
+         b, &nir_build_deref_var(b, image)->def, nir_imm_int(b, 0), gid,
+         .format = ail_pixel_format[PIPE_FORMAT_R8G8B8A8_UNORM].renderable,
+         .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = false,
+         .explicit_coord = true);
+   }
+   nir_pop_if(b, NULL);
+   b->shader->info.cs.image_block_size_per_thread_agx =
+      util_format_get_blocksize(PIPE_FORMAT_R8G8B8A8_UNORM);
+   return b->shader;
+}
+
+static VkResult
+hk_g17p_block_upload_pipeline(struct hk_device *dev,
+                              VkPipelineLayout *layout_out,
+                              VkPipeline *pipeline_out)
+{
+   const struct hk_g17p_block_upload_key key = {
+      .key_type = HK_META_OBJECT_KEY_G17P_BLOCK_UPLOAD,
+   };
+   const VkDescriptorSetLayoutBinding binding = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+   };
+   const VkDescriptorSetLayoutCreateInfo set_info = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+      .bindingCount = 1,
+      .pBindings = &binding,
+   };
+   const VkPushConstantRange push_range = {
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+      .size = sizeof(struct hk_g17p_block_upload_push),
+   };
+   static const char layout_key[] = "hk-g17p-block-upload-layout";
+   VkResult result = vk_meta_get_pipeline_layout(
+      &dev->vk, &dev->meta, &set_info, &push_range, layout_key,
+      sizeof(layout_key), layout_out);
+   if (result != VK_SUCCESS)
+      return result;
+
+   VkPipeline cached = vk_meta_lookup_pipeline(&dev->meta, &key, sizeof(key));
+   if (cached != VK_NULL_HANDLE) {
+      *pipeline_out = cached;
+      return VK_SUCCESS;
+   }
+
+   const VkPipelineShaderStageNirCreateInfoMESA nir_info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA,
+      .nir = build_g17p_block_upload_shader(),
+   };
+   const VkComputePipelineCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+         .pNext = &nir_info,
+         .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+         .pName = "main",
+      },
+      .layout = *layout_out,
+   };
+   result = vk_meta_create_compute_pipeline(&dev->vk, &dev->meta, &info, &key,
+                                            sizeof(key), pipeline_out);
+   ralloc_free(nir_info.nir);
+   return result;
+}
+
+/* Whole compressed levels of a one-plane 2D RGBA8 or BGRA8 image, from rows
+ * of four-byte texels. */
+static bool
+hk_g17p_block_upload_supported(struct hk_device *dev,
+                               const struct hk_image *image,
+                               const VkCopyBufferToImageInfo2 *info)
+{
+   if (!hk_g17p_block_mip_supported(dev) || info->regionCount == 0 ||
+       image->plane_count != 1 || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       (image->vk.format != VK_FORMAT_R8G8B8A8_UNORM &&
+        image->vk.format != VK_FORMAT_B8G8R8A8_UNORM))
+      return false;
+
+   const struct ail_layout *layout = &image->planes[0].layout;
+   if (layout->tiling != AIL_TILING_GPU || !layout->compressed ||
+       layout->policy == AIL_LAYOUT_POLICY_M5)
+      return false;
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &info->pRegions[r];
+      const uint32_t level = region->imageSubresource.mipLevel;
+      const uint32_t width = u_minify(image->vk.extent.width, level);
+      const uint32_t height = u_minify(image->vk.extent.height, level);
+      if (region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
+          region->imageOffset.x || region->imageOffset.y ||
+          region->imageOffset.z || region->imageExtent.width != width ||
+          region->imageExtent.height != height ||
+          region->imageExtent.depth != 1 ||
+          !ail_is_level_logically_compressed(layout, level) ||
+          (region->bufferOffset & 3) ||
+          (region->bufferRowLength && region->bufferRowLength < width) ||
+          (region->bufferImageHeight && region->bufferImageHeight < height))
+         return false;
+   }
+   return true;
+}
+
+static void
+hk_g17p_block_upload(struct hk_cmd_buffer *cmd, struct hk_buffer *buffer,
+                     struct hk_image *image,
+                     const VkCopyBufferToImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const struct vk_device_dispatch_table *disp = &dev->vk.dispatch_table;
+   VkCommandBuffer handle = vk_command_buffer_to_handle(&cmd->vk);
+
+   VkPipelineLayout layout;
+   VkPipeline pipeline;
+   VkResult result = hk_g17p_block_upload_pipeline(dev, &layout, &pipeline);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return;
+   }
+   disp->CmdBindPipeline(handle, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkBufferImageCopy2 *region = &info->pRegions[r];
+      const VkImageSubresourceLayers *sub = &region->imageSubresource;
+      const uint32_t width = region->imageExtent.width;
+      const uint32_t height = region->imageExtent.height;
+      const uint32_t row_texels =
+         region->bufferRowLength ? region->bufferRowLength : width;
+      const uint32_t rows =
+         region->bufferImageHeight ? region->bufferImageHeight : height;
+      const uint64_t row_pitch_B = (uint64_t)row_texels * 4;
+      const uint64_t layer_B = row_pitch_B * rows;
+      const uint32_t layers = vk_image_subresource_layer_count(&image->vk, sub);
+      if (row_pitch_B > UINT32_MAX) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         return;
+      }
+
+      for (uint32_t l = 0; l < layers; ++l) {
+         const VkImageViewUsageCreateInfo usage = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+         };
+         const VkImageViewCreateInfo view_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
+            .pNext = &usage,
+            .image = hk_image_to_handle(image),
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .subresourceRange = {
+               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+               .baseMipLevel = sub->mipLevel,
+               .levelCount = 1,
+               .baseArrayLayer = sub->baseArrayLayer + l,
+               .layerCount = 1,
+            },
+         };
+         VkImageView view;
+         result = vk_meta_create_image_view(&cmd->vk, &dev->meta, &view_info,
+                                            &view);
+         if (unlikely(result != VK_SUCCESS)) {
+            vk_command_buffer_set_error(&cmd->vk, result);
+            return;
+         }
+
+         const VkDescriptorImageInfo dst_info = {
+            .imageLayout = info->dstImageLayout,
+            .imageView = view,
+         };
+         const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstBinding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .descriptorCount = 1,
+            .pImageInfo = &dst_info,
+         };
+         const struct hk_g17p_block_upload_push push = {
+            .src = hk_buffer_address_ro(buffer, region->bufferOffset + l * layer_B),
+            .row_pitch_B = (uint32_t)row_pitch_B,
+            .width = width,
+            .height = height,
+         };
+         disp->CmdPushDescriptorSetKHR(handle, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                       layout, 0, 1, &write);
+         disp->CmdPushConstants(handle, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                sizeof(push), &push);
+         disp->CmdDispatch(handle,
+                           DIV_ROUND_UP(width, HK_G17P_BLOCK_MIP_TILE),
+                           DIV_ROUND_UP(height, HK_G17P_BLOCK_MIP_TILE), 1);
+      }
+   }
 }
 
 static void
@@ -6102,6 +6374,17 @@ hk_xfer_copybuffertoimage2(VkCommandBuffer commandBuffer,
                 cmd, dst_image, pCopyBufferToImageInfo))
             vk_command_buffer_set_error(&cmd->vk,
                                         VK_ERROR_FEATURE_NOT_PRESENT);
+         hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+         return;
+      }
+      /* Whole compressed RGBA8 levels through the compressed PBE, instead
+       * of a render pass per level. */
+      if (hk_g17p_block_upload_supported(dev, dst_image,
+                                         pCopyBufferToImageInfo)) {
+         struct hk_meta_save save;
+         hk_meta_begin(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
+         hk_g17p_block_upload(cmd, src_buffer, dst_image,
+                              pCopyBufferToImageInfo);
          hk_meta_end(cmd, &save, VK_PIPELINE_BIND_POINT_COMPUTE);
          return;
       }
