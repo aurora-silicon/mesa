@@ -5856,6 +5856,52 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    const int64_t t2_ns = trace ? os_time_get_nano() : 0;
    int64_t live_ns = 0;
 
+   if (do_prof_dump) {
+      /* Raw member data flow (pre-fusion): role, footprint intervals, binding
+       * addresses, im2col geometry. One line per API dispatch. */
+      for (unsigned idx = 0; idx < n; ++idx) {
+         const struct hk_cmd_buffer *src =
+            (const void *)submit->command_buffers[idx];
+         const struct hk_cs *mcs =
+            list_first_entry(&src->control_streams, struct hk_cs, node);
+         const struct hk_compute_pair_dispatch *cp =
+            hk_compute_pair_stream_eligible(mcs) ? mcs->compute_pair : NULL;
+         struct hk_compute_pair_footprint fpm;
+         const bool fk = cp && compute_pair_dispatch_footprint(cp, &fpm);
+         char buf[1024];
+         int o = snprintf(buf, sizeof(buf), "PROF_FLOW idx=%u role=%u alt=%u fk=%d grp=%ux%ux%u",
+                          idx, cp ? cp->info.role : 0u, cp ? cp->alt_kind : 0u, (int)fk,
+                          cp ? cp->groups[0] : 0u, cp ? cp->groups[1] : 0u, cp ? cp->groups[2] : 0u);
+         if (fk) {
+            for (unsigned r2 = 0; r2 < fpm.num_reads && o < 900; ++r2)
+               o += snprintf(buf + o, sizeof(buf) - o, " R%u=%u:%" PRIx64 "-%" PRIx64, r2,
+                             fpm.reads[r2].handle, fpm.reads[r2].start, fpm.reads[r2].end);
+            for (unsigned w2 = 0; w2 < fpm.num_writes && o < 900; ++w2)
+               o += snprintf(buf + o, sizeof(buf) - o, " W%u=%u:%" PRIx64 "-%" PRIx64, w2,
+                             fpm.writes[w2].handle, fpm.writes[w2].start, fpm.writes[w2].end);
+         }
+         if (cp) {
+            for (unsigned b2 = 0; b2 < 4 && o < 960; ++b2)
+               o += snprintf(buf + o, sizeof(buf) - o, " B%u=%u:%" PRIx64 "+%x", b2,
+                             cp->bindings[b2].handle, cp->bindings[b2].offset,
+                             cp->bindings[b2].size);
+            if (cp->info.role == HK_COMPUTE_PAIR_IM2COL && o < 960) {
+               const struct hk_compute_pair_im2col *im = &cp->extra.im2col;
+               o += snprintf(buf + o, sizeof(buf) - o,
+                             " im=%u,%u,%u,%u,%u,%u,%u,%u,%u,%u", im->iw, im->ih, im->kw,
+                             im->cols, im->step_x, im->sh, im->pad_x, im->pad_y, im->pw, im->ph);
+            }
+            if (cp->info.role == HK_COMPUTE_PAIR_GEMM && o < 980) {
+               int32_t n_v = 0, k_v = 0;
+               memcpy(&n_v, cp->push + cp->info.gemm.n_offset_B, 4);
+               memcpy(&k_v, cp->push + cp->info.gemm.k_offset_B, 4);
+               o += snprintf(buf + o, sizeof(buf) - o, " gN=%d gK=%d", n_v, k_v);
+            }
+         }
+         fprintf(stderr, "%s\n", buf);
+      }
+   }
+
    unsigned r = 0, fused_pairs = 0, im2a_fused = 0, dwa_fused = 0, gemm_dw_fused = 0;
    unsigned self_elided = 0;
    unsigned flushes_elided = 0, barriers_elided = 0, dead_writes_elided = 0;
