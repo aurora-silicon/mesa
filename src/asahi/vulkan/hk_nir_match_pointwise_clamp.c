@@ -5,6 +5,7 @@
 #include "hk_nir_wgid.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "compiler/nir/nir.h"
@@ -6984,6 +6985,39 @@ dw_a_load2(nir_builder *b, uint32_t va_off, uint32_t total_push_bytes,
                           .align_mul = 8, .access = read);
 }
 
+/* PROFILING ONLY (HK_PROBE_DWA_ALIAS=<bits>): fold every depthwise-A input
+ * index into a 2^bits vec4 window so the consumer's re-read of its
+ * producer's tensor hits on-chip caches. Wrong results; a bound only. */
+static nir_def *
+dw_a_probe_alias(nir_builder *b, nir_def *idx4)
+{
+   const char *e = getenv("HK_PROBE_DWA_ALIAS");
+   const int bits = e ? atoi(e) : 0;
+   if (bits <= 0 || bits >= 31)
+      return idx4;
+   return nir_iand_imm(b, idx4, (1u << bits) - 1u);
+}
+
+static nir_def *
+dw_a_load4_in(nir_builder *b, uint32_t va_off, uint32_t total_push_bytes, nir_def *idx4)
+{
+   return dw_a_load4(b, va_off, total_push_bytes, dw_a_probe_alias(b, idx4));
+}
+
+static nir_def *
+dw_a_load4_ordered_in(nir_builder *b, uint32_t va_off, uint32_t total_push_bytes,
+                      nir_def *idx4)
+{
+   return dw_a_load4_ordered(b, va_off, total_push_bytes, dw_a_probe_alias(b, idx4));
+}
+
+static nir_def *
+dw_a_load2_in(nir_builder *b, uint32_t va_off, uint32_t total_push_bytes,
+              nir_def *idx4, uint32_t byte_off)
+{
+   return dw_a_load2(b, va_off, total_push_bytes, dw_a_probe_alias(b, idx4), byte_off);
+}
+
 static void
 emit_cmat_dw_a_store_sh_pair(nir_builder *b,
                              const struct hk_nir_dw_a_cfg *cfg,
@@ -7073,9 +7107,9 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
             nir_iand_imm(b, nir_channel(b, nir_load_local_invocation_id(b), 0), a_c4_mask));
          nir_def *wt_tap = nir_iadd(b, nir_imul(b, nir_imul_imm(b, ky_v, 3), c4_k), ch4_k);
          nir_def *in_tap1 = nir_iadd(b, in_r, c4_k);
-         nir_def *x0 = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+         nir_def *x0 = dw_a_load4_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                   total_push_bytes, in_r);
-         nir_def *x1 = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+         nir_def *x1 = dw_a_load4_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                   total_push_bytes, in_tap1);
          nir_def *in_tap2 = NULL, *in_tap3 = NULL;
          nir_def *x2 = NULL, *x3 = NULL;
@@ -7084,9 +7118,9 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
              * all 4 horizontal input loads in one burst. */
             in_tap2 = nir_iadd(b, in_tap1, c4_k);
             in_tap3 = nir_iadd(b, in_tap2, c4_k);
-            x2 = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+            x2 = dw_a_load4_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                             total_push_bytes, in_tap2);
-            x3 = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+            x3 = dw_a_load4_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                             total_push_bytes, in_tap3);
          }
 
@@ -7102,7 +7136,7 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
 
          if (!pair_burst_x4) {
             in_tap2 = nir_iadd(b, in_tap1, c4_k);
-            x2 = dw_a_load4_ordered(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+            x2 = dw_a_load4_ordered_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                     total_push_bytes, in_tap2);
          }
          wt_tap = nir_iadd(b, wt_tap, c4_k);
@@ -7117,7 +7151,7 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
 
          if (!pair_burst_x4) {
             in_tap3 = nir_iadd(b, in_tap2, c4_k);
-            x3 = dw_a_load4_ordered(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+            x3 = dw_a_load4_ordered_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                     total_push_bytes, in_tap3);
          }
          wt_tap = nir_iadd(b, wt_tap, c4_k);
@@ -7312,7 +7346,7 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
          for (unsigned c = 0; c < 4; ++c)
             a_cur[c] = &a_phi[c]->def;
          for (unsigned kx = 0; kx < 3; ++kx) {
-            nir_def *xv = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+            nir_def *xv = dw_a_load4_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                      total_push_bytes, in_tap);
             nir_def *wv = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, wt_va_lo),
                                      total_push_bytes, wt_tap);
@@ -7371,7 +7405,7 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
             b, nir_ushr_imm(b, k_base, 2),
             nir_iand_imm(b, nir_channel(b, nir_load_local_invocation_id(b), 0), a_c4_mask));
          nir_def *wt_idx = nir_iadd(b, nir_imul(b, t_v, c4_t), ch4_t);
-         nir_def *xv = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+         nir_def *xv = dw_a_load4_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                   total_push_bytes, in_r);
          nir_def *wv = dw_a_load4(b, dw_off + offsetof(struct hk_dw_a_push, wt_va_lo),
                                   total_push_bytes, wt_idx);
@@ -7439,13 +7473,13 @@ emit_cmat_dw_a_store_sh_pair(nir_builder *b,
             nir_iand_imm(b, nir_channel(b, nir_load_local_invocation_id(b), 0), a_c4_mask));
          nir_def *in_idx = nir_iadd(b, nir_imul(b, nir_iadd(b, nir_imul(b, iy, in_w_b), ix), c4_b), ch4_b);
          nir_def *wt_idx = nir_iadd(b, nir_imul(b, t_v, c4_b), ch4_b);
-         nir_def *iv0 = dw_a_load2(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+         nir_def *iv0 = dw_a_load2_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                    total_push_bytes, in_idx, 0);
          nir_def *wv0 = dw_a_load2(b, dw_off + offsetof(struct hk_dw_a_push, wt_va_lo),
                                    total_push_bytes, wt_idx, 0);
          a_hit[0] = dw_a_fma1(b, &a_phi[0]->def, nir_channel(b, iv0, 0), nir_channel(b, wv0, 0), cfg);
          a_hit[1] = dw_a_fma1(b, &a_phi[1]->def, nir_channel(b, iv0, 1), nir_channel(b, wv0, 1), cfg);
-         nir_def *iv1 = dw_a_load2(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
+         nir_def *iv1 = dw_a_load2_in(b, dw_off + offsetof(struct hk_dw_a_push, in_va_lo),
                                    total_push_bytes, in_idx, 8);
          nir_def *wv1 = dw_a_load2(b, dw_off + offsetof(struct hk_dw_a_push, wt_va_lo),
                                    total_push_bytes, wt_idx, 8);
