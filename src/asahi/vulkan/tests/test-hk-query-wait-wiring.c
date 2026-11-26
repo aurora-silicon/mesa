@@ -134,6 +134,9 @@ submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    struct hk_device *dev = (void *)vk_queue->base.device;
    struct hk_queue *queue = container_of(vk_queue, struct hk_queue, vk);
    uint64_t serial;
+   /* The immediate stack-submit path must retain the same API identity as
+    * allocated/deferred submissions, before claim can use a late fallback. */
+   assert(submit->api_queue == vk_queue);
    if (check_registration_serial)
       assert(dev->query_wait.serial == registration_serial + 1);
    if (!tracking_expected || reset_only) {

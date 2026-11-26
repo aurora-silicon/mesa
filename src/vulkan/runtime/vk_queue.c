@@ -1436,6 +1436,7 @@ vk_common_QueueSubmit2(VkQueue _queue,
       struct vk_command_buffer *cmd_bufs[4];
       struct vk_sync_signal signals[4];
       struct vk_queue_submit stack_submit = {
+         .api_queue = queue,
          .command_buffers = cmd_bufs,
          .signals = signals,
          .is_protected = !!(pSubmits[0].flags & VK_SUBMIT_PROTECTED_BIT),
