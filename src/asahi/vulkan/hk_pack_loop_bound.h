@@ -161,13 +161,26 @@ hk_pack_eval_effective_instrs(const struct hk_pack_loop_bound *lb,
 
    uint64_t dyn_nir_ops = 0;
    if (hk_pack_eval_work_bound(lb, params, &dyn_nir_ops)) {
-      const __uint128_t num = (__uint128_t)2u * (__uint128_t)agx_instrs *
-                              (__uint128_t)dyn_nir_ops;
-      const __uint128_t scaled =
-         (num + (__uint128_t)lb->static_nir_ops - 1u) /
-         (__uint128_t)lb->static_nir_ops;
-      if (scaled <= UINT64_MAX) {
-         uint64_t eff = (uint64_t)scaled;
+      /* Split the product into whole multiples of divisor and a remainder.
+       * The divisor is 32-bit, so multiplying its two remainders fits in
+       * uint64_t. The low quotient is floor(agx_instrs * ops_remainder /
+       * divisor), which cannot exceed agx_instrs.
+       */
+      const uint64_t divisor = lb->static_nir_ops;
+      const uint64_t ops_remainder = dyn_nir_ops % divisor;
+      const uint64_t remainder_product =
+         (agx_instrs % divisor) * ops_remainder;
+      const uint64_t low_quotient =
+         (agx_instrs / divisor) * ops_remainder + remainder_product / divisor;
+      const uint64_t rounded_tail =
+         (2u * (remainder_product % divisor) + divisor - 1u) / divisor;
+
+      uint64_t quotient;
+      if (!__builtin_mul_overflow(agx_instrs, dyn_nir_ops / divisor,
+                                  &quotient) &&
+          !__builtin_add_overflow(quotient, low_quotient, &quotient) &&
+          quotient <= (UINT64_MAX - rounded_tail) / 2u) {
+         uint64_t eff = 2u * quotient + rounded_tail;
          if (eff < agx_instrs)
             eff = agx_instrs;
          if (naive_ok && eff > naive)
