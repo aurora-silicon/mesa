@@ -38,7 +38,8 @@ main(void)
                                                 AGX_CHIP_G17S, AGX_CHIP_G17C};
    for (unsigned i = 0; i < sizeof(native_chips) / sizeof(native_chips[0]);
         ++i) {
-      assert(agx_chip_vdm_indirect_index_bounds(native_chips[i]));
+      assert(agx_chip_has_cap(native_chips[i],
+                              AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS));
       init_cmd(&dev, &cmd, native_chips[i], true);
 
       struct agx_draw ind_u32 = agx_draw_indexed_indirect(
@@ -88,7 +89,8 @@ main(void)
    };
    for (unsigned i = 0; i < sizeof(rewrite_chips) / sizeof(rewrite_chips[0]);
         ++i) {
-      assert(!agx_chip_vdm_indirect_index_bounds(rewrite_chips[i]));
+      assert(!agx_chip_has_cap(rewrite_chips[i],
+                               AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS));
       init_cmd(&dev, &cmd, rewrite_chips[i], true);
       struct agx_draw ind_u32 = agx_draw_indexed_indirect(
          UINT64_C(0x200000000), UINT64_C(0x100000000), UINT32_C(0xfffffffc),
@@ -252,8 +254,8 @@ main(void)
       /* Where the VDM bounds indirect index fetches in hardware, an aligned
        * indirect draw never needs the software rewrite, robust or not; the
        * direct draw below still follows the robustness level. */
-      const bool hw_index_bounds =
-         agx_chip_vdm_indirect_index_bounds(AGX_CHIP_G17P);
+      const bool hw_index_bounds = agx_chip_has_cap(
+         AGX_CHIP_G17P, AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS);
 
       memset(&api_vs, 0, sizeof(api_vs));
       api_vs.vk.stage = MESA_SHADER_VERTEX;

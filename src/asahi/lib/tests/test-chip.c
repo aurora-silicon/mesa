@@ -138,8 +138,6 @@ static unsigned checks;
    ROW(agx_chip_usc_base_page_fill_returns_for(c, 4),                          \
        "0000 01110 0100 100000 0 0")                                            \
    ROW(agx_chip_explicit_robust_image_bounds(c), "0000 01110 0100 000000 0 0")  \
-   ROW(agx_chip_vdm_indirect_index_bounds(c), "0000 00000 0000 101110 0 0")     \
-   ROW(agx_chip_hw_texel_fetch_bounds(c), "0000 00000 0000 001110 0 0")         \
    ROW(agx_chip_native_imageblock(c), "0000 01110 0100 100000 0 0")             \
    ROW(agx_chip_uncovered_tile_ms_defect(c), "0000 01110 0100 100000 0 0")      \
    ROW(agx_chip_uncovered_tile_ms_reload_defect(c, 0x8140, 2),                 \

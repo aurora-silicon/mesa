@@ -40,12 +40,16 @@ enum agx_chip_cap {
     * ordering barrier between them (agx_chip_elide_app_dispatch_barrier). */
    AGX_CAP_ELIDE_APP_DISPATCH_BARRIER = 1u << 3,
 
-   /* An indirect indexed VDM Index List reads indices past its index-buffer
-    * size word as zero (agx_chip_vdm_indirect_index_bounds). */
+   /* Indirect indexed VDM Index List bounds: index fetches past the recorded
+    * index-buffer size (index_buffer_size_word, dwords minus one) read as 0.
+    * The bound is dword granular, so callers still rewrite 8-bit and unaligned
+    * 16-bit index ranges. */
    AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS = 1u << 4,
 
-   /* The texture unit bounds integer texel fetches to the view and returns
-    * the robustImageAccess2 value (agx_chip_hw_texel_fetch_bounds). */
+   /* Hardware texel-fetch bounds: the texture unit bounds integer texel fetches
+    * (texelFetch / OpImageFetch) to the view and returns the robustImageAccess2
+    * value for out-of-range spatial coordinates and 16-bit array layers, given
+    * a valid LOD and sample index (AGX_NIR_TEXTURE_HW_TXF_BOUNDS). */
    AGX_CAP_HW_TXF_BOUNDS = 1u << 5,
 
    /* Native fragment programs may merge triangles across memory writes and

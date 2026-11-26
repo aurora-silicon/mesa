@@ -39,7 +39,7 @@ struct agx_texture_lower_options {
    /* G17P texel fetches need explicit view-bounds checks (image robustness). */
    bool robust_texel_fetch;
    /* AGX_NIR_TEXTURE_HW_TXF_BOUNDS: hardware enforces view bounds and
-    * missing-alpha one on integer texelFetch (agx_chip_hw_texel_fetch_bounds);
+    * missing-alpha one on integer texelFetch (AGX_CAP_HW_TXF_BOUNDS);
     * saturate wide layer, LOD and sample indices before 16-bit narrowing and
     * validate nonzero LODs and multisample indices against the view. */
    bool hw_txf_bounds;

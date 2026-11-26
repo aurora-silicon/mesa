@@ -14456,7 +14456,7 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
          return agx_direct_draw_overreads_indices(*conditional_direct);
       }
 
-      /* Where agx_chip_vdm_indirect_index_bounds() holds, the indirect VDM
+      /* Where AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS holds, the indirect VDM
        * INDEX_LIST bounds index fetches in dword units and substitutes index
        * 0 for out-of-range indices (both partial and fully out-of-bounds
        * draws, including with primitive restart and vertex offsets). When the index buffer range fits within 32-bit byte
@@ -14469,7 +14469,7 @@ hk_needs_index_robustness(struct hk_cmd_buffer *cmd, struct agx_draw *draw,
        * unaligned 16-bit ranges, and 8-bit index buffers retain their full
        * 64-bit byte range and take the software rewrite path. */
       const uint64_t va_limit = UINT64_C(1) << 48;
-      if (agx_chip_vdm_indirect_index_bounds(dev->dev.chip) &&
+      if (agx_chip_has_cap(dev->dev.chip, AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS) &&
           draw->index_size != AGX_INDEX_SIZE_U8 &&
           draw->index_buffer_range_B <= UINT32_MAX &&
           (draw->index_buffer & 3) == 0 &&

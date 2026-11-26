@@ -235,10 +235,8 @@ enum agx_chip_quirk {
    AGX_QUIRK_NATIVE_PREAMBLE = 1 << 10,
    AGX_QUIRK_SCHEDULING_STALLS = 1 << 11,
    AGX_QUIRK_M5_PATHS = 1 << 12,
-   AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS = 1 << 13,
-   AGX_QUIRK_HW_TXF_BOUNDS = 1 << 14,
-   AGX_QUIRK_M5_LAYER_OPERAND = 1 << 15,
-   AGX_QUIRK_GL_THROUGH_ZINK = 1 << 16,
+   AGX_QUIRK_M5_LAYER_OPERAND = 1 << 13,
+   AGX_QUIRK_GL_THROUGH_ZINK = 1 << 14,
 };
 
 /* What the five native AGX3 chips share. */
@@ -254,8 +252,7 @@ enum agx_chip_quirk {
    (AGX_QUIRKS_NATIVE | AGX_QUIRK_NATIVE_RENDER_CONTEXT |                      \
     AGX_QUIRK_USC_HELPER_SLOT_PER_CORE |                                       \
     AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS |                                  \
-    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE |        \
-    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS)
+    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE)
 
 /*
  * The chip table: one row per chip, and the only place that says what a chip
@@ -344,17 +341,12 @@ enum agx_chip_quirk {
    X(G17A, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, NONE, UNKNOWN, NONE, 0, 0,     \
      __VA_ARGS__)                                                              \
    X(G17G, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
-     AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE,                        \
-     AGX_QUIRK_M5_PATHS | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS |                \
-        AGX_QUIRK_HW_TXF_BOUNDS,                                               \
+     AGX_RECORDS_M5 | AGX_RECORD_HAL300_NATIVE_CAPTURE, AGX_QUIRK_M5_PATHS,    \
      __VA_ARGS__)                                                              \
    X(G17S, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS,            \
-     __VA_ARGS__)                                                              \
+     0, __VA_ARGS__)                                                           \
    X(G17C, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300, AGX_RECORDS_M5,  \
-     AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS | AGX_QUIRK_HW_TXF_BOUNDS |           \
-        AGX_QUIRK_M5_LAYER_OPERAND,                                            \
-     __VA_ARGS__)                                                              \
+     AGX_QUIRK_M5_LAYER_OPERAND, __VA_ARGS__)                                  \
    X(G17D, AGX3, AGX3C, HAL300, 10, GEN5, GPU1, SKSM, HAL300,                  \
      AGX_RECORDS_M5 | AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY,                    \
      AGX_QUIRK_GL_THROUGH_ZINK, __VA_ARGS__)                                   \
@@ -812,46 +804,6 @@ agx_chip_sampler_generation(enum agx_chip chip)
    return agx_chip_info(chip)->sampler_generation;
 }
 
-/*
- * Whether an indirect indexed VDM Index List bounds its index fetch in
- * hardware the way robustBufferAccess2 requires: indices past the record's
- * index-buffer size (index_buffer_size_word, dwords minus one) read as 0.
- *
- * What is established, and by what:
- *   - The record carries that word on every AGX3 command-stream generation:
- *     the G15 and HAL200 records (agx_vdm_hal200_indirect_draw_pack) and the
- *     HAL300 one, which adds only the Unk 2 word before it
- *     (agx_vdm_index_list_indirect_pack_words). That is packet layout.
- *   - Enabled for the M5 AGX3C family (G17G, G17S, G17C; agx_chip_g17_m5()):
- *     zero substitution for out-of-range indices is measured on G17C (J716c)
- *     and G17S (J714s) by
- *     dEQP-VK.robustness.{index_access,vertex_access.*index*,robustness2}.*,
- *     dEQP-VK.draw.{*indexed*,renderpass.multi_draw.*}, and a 28-case
- *     bit-exact equivalence probe against the software rewrite (partial and
- *     full out-of-range draws, 32-bit firstIndex wrap, signed vertexOffset,
- *     multi-draw firstInstance, primitive restart, indirect count).
- *   - Enabled for G17P (HAL200): zero substitution past index_buffer_size_word
- *     is measured on A18 Pro (G17P B1) by the same 28-case bit-exact
- *     equivalence probe and all five Vulkan CTS groups above.
- *
- * Off elsewhere:
- *   - G17D (M5 Ultra) keeps the software rewrite until measured on the J775D.
- *   - G18G uses HAL300 records too, but its out-of-range hardware index
- *     behaviour is unmeasured, so it keeps the software rewrite.
- *   - G15 and G16G (G15/HAL200 records) keep the software rewrite until
- *     hardware rows (M3, M4) prove zero substitution past the size word.
- *   - AGX2 does not have it: its Index List does not read out-of-range
- *     indices as zero (libagx_draw_robust_index).
- *
- * The bound is dword granular, so callers still rewrite draws whose range
- * does not end on a dword: 8-bit indices and unaligned 16-bit ranges.
- */
-static inline bool
-agx_chip_vdm_indirect_index_bounds(enum agx_chip chip)
-{
-   return agx_chip_info(chip)->quirks & AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS;
-}
-
 /* Native sampler heap element size. The packed state word remains eight
  * bytes, but G15 and later place it at offset zero of a 32-byte sparse heap
  * element. Zero means the heap ABI is not proven for this identity. */
@@ -1155,43 +1107,6 @@ static inline bool
 agx_chip_explicit_robust_image_bounds(enum agx_chip chip)
 {
    return agx_chip_info(chip)->quirks & AGX_QUIRK_EXPLICIT_ROBUST_IMAGE_BOUNDS;
-}
-
-/*
- * Whether the texture unit bounds an integer texel fetch to the Vulkan view
- * and returns the robustImageAccess2 value (zero, alpha one for a missing
- * channel) for out-of-range spatial coordinates and 16-bit array layers,
- * given a valid LOD and sample index. Shaders then only saturate wider
- * layer/LOD/sample operands before 16-bit narrowing and validate nonzero
- * LODs and multisample sample indices against view metadata
- * (AGX_NIR_TEXTURE_HW_TXF_BOUNDS), instead of predicating every fetch on
- * the descriptor's spatial size.
- *
- * Enabled for the M5 Gen10 texture unit (G17G, G17S, G17C):
- *   - G17C (J716c): established by robustness and texelFetch Vulkan CTS
- *     suites plus a 33-case out-of-range probe (LOD and sample 65536/-65536,
- *     layer 65536, negative and large x/y/z, restricted subresource views,
- *     null descriptors, float and integer missing alpha).
- *   - G17G and G17S share the same M5 Gen10 texture unit; the existing G17G
- *     measurement (be91d344340: out-of-view 2D-array layer returns zero and
- *     layer 65536 wraps to layer 0) agrees with G17C. Full probe and CTS
- *     verification on M5 Pro (G17S) / M5 (G17G) is the merge gate.
- *
- * Off elsewhere:
- *   - G17D (M5 Ultra) keeps the software predicate until measured on the
- *     J775D.
- *   - G18G uses the Gen10 descriptor layout too, but its texture lowering
- *     (agx_nir_lower_texture_for_generation) always applies the software
- *     predicate and its behaviour is not measured, so it stays off so that
- *     no caller can skip the predicate there.
- *   - Gen9 parts (G15, G16, G17P) keep the software bounds: native 2D
- *     accesses outside the view alias other texels of the image on G17P
- *     (agx_chip_explicit_robust_image_bounds and the G17P lowering).
- */
-static inline bool
-agx_chip_hw_texel_fetch_bounds(enum agx_chip chip)
-{
-   return agx_chip_info(chip)->quirks & AGX_QUIRK_HW_TXF_BOUNDS;
 }
 
 /*

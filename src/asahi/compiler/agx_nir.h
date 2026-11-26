@@ -161,7 +161,7 @@ bool agx_nir_lower_texture(struct nir_shader *s);
 #define AGX_NIR_TEXTURE_IMAGE_SIDEBAND (1u << 9)
 /* Hardware enforces view bounds and missing-alpha one on integer texelFetch
  * for spatial coordinates and 16-bit array layers given a valid LOD and
- * sample index (agx_chip_hw_texel_fetch_bounds). Saturate wide
+ * sample index (AGX_CAP_HW_TXF_BOUNDS). Saturate wide
  * layer/LOD/sample indices before 16-bit narrowing and predicate nonzero LODs
  * and multisample sample indices against view metadata. */
 #define AGX_NIR_TEXTURE_HW_TXF_BOUNDS (1u << 10)

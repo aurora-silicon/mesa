@@ -35,22 +35,21 @@ static unsigned checks;
    X(AGX_CAP_NATIVE_IMAGEBLOCK, agx_chip_native_imageblock)                    \
    X(AGX_CAP_NATIVE_PREAMBLE, agx_chip_native_preamble)                        \
    X(AGX_CAP_ELIDE_APP_DISPATCH_BARRIER, agx_chip_elide_app_dispatch_barrier)  \
-   X(AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS, agx_chip_vdm_indirect_index_bounds)    \
-   X(AGX_CAP_HW_TXF_BOUNDS, agx_chip_hw_texel_fetch_bounds)                    \
    X(AGX_CAP_TRI_MERGE_ACROSS_SIDE_EFFECTS,                                    \
      agx_chip_tri_merge_across_side_effects)                                   \
    X(AGX_CAP_COOPERATIVE_MATRIX, agx_chip_cooperative_matrix_supported)
 
 #define CAP_BIT(cap, predicate) | (cap)
 static const unsigned all_caps =
-   (0 CAPS(CAP_BIT)) | AGX_CAP_SPARSE_RESIDENCY_3D | AGX_CAP_DESCRIPTOR_BUFFER |
-   AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |
-   AGX_CAP_GEN9_2D_COMPRESSION | AGX_CAP_MOD3_REG_BANK_RA |
-   AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SPARSE_BINDING |
-   AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG |
-   AGX_CAP_HAL200_LOSSLESS_COMPRESSION | AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION |
-   AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
-   AGX_CAP_CACHED_CMD_MEMORY;
+   (0 CAPS(CAP_BIT)) | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |
+   AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_SPARSE_RESIDENCY_3D |
+   AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |
+   AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_GEN9_2D_COMPRESSION |
+   AGX_CAP_MOD3_REG_BANK_RA | AGX_CAP_GEN10_2D_COMPRESSION |
+   AGX_CAP_SPARSE_BINDING | AGX_CAP_ZLS_FULL_RENDER_BOUNDS |
+   AGX_CAP_NATIVE_MIXED_EPILOG | AGX_CAP_HAL200_LOSSLESS_COMPRESSION |
+   AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |
+   AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY;
 #undef CAP_BIT
 
 /* Each chip of AGX_CHIPS has exactly one row, and the rows are in its
@@ -277,12 +276,38 @@ test_signed_zero_minmax_select(void)
    }
 }
 
+static void
+test_vdm_indirect_index_bounds(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS) ==
+                    expected,
+                 c);
+   }
+}
+
+static void
+test_hw_txf_bounds(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected =
+         c == AGX_CHIP_G17G || c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HW_TXF_BOUNDS) == expected, c);
+   }
+}
+
 int
 main(void)
 {
    test_table_covers_every_chip();
    test_caps_match_predicates();
    test_unknown_has_none();
+   test_vdm_indirect_index_bounds();
+   test_hw_txf_bounds();
    test_coalesce_pure_global_workgroups();
    test_cdm_war_weak_barrier();
    test_mod3_reg_bank_ra();

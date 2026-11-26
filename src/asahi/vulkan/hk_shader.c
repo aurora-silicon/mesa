@@ -3737,9 +3737,9 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    /* Where the texture unit bounds texel fetches to the view, only the wide
     * operands are saturated (AGX_NIR_TEXTURE_HW_TXF_BOUNDS below); see
-    * agx_chip_hw_texel_fetch_bounds(). */
+    * AGX_CAP_HW_TXF_BOUNDS. */
    const bool hw_txf_bounds =
-      agx_chip_hw_texel_fetch_bounds(dev->dev.chip) &&
+      agx_chip_has_cap(dev->dev.chip, AGX_CAP_HW_TXF_BOUNDS) &&
       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED_EXT;
    const bool native_robust_images =
       agx_chip_explicit_robust_image_bounds(dev->dev.chip) &&
