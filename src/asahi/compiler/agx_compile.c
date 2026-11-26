@@ -15446,6 +15446,16 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
       out->agx3_preamble_staging_known = ctx->agx3_staging_known;
    }
    else {
+      /* PROFILING ONLY: pad the register count reported for compute launches
+       * (the code is unchanged) to measure occupancy sensitivity. */
+      static int probe_pad = -1;
+      if (probe_pad < 0) {
+         const char *e = getenv("HK_PROBE_PAD_GPRS");
+         probe_pad = e ? atoi(e) : 0;
+      }
+      if (probe_pad > 0 && mesa_shader_stage_is_compute(ctx->stage) &&
+          (unsigned)probe_pad > nr_gprs)
+         nr_gprs = MIN2((unsigned)probe_pad, AGX3B_NUM_REGS);
       out->nr_gprs = nr_gprs;
       out->agx3_staging_halfs = ctx->agx3_staging_halfs;
       out->agx3_staging_known = ctx->agx3_staging_known;
