@@ -30,12 +30,13 @@ main(void)
    struct hk_device dev;
    struct hk_cmd_buffer cmd;
 
-   /* With robustness enabled, G17P (HAL200) and M5 (G17G/G17S/G17C) bound
+   /* With robustness enabled, G17P (HAL200) and M5 (G17G/G17S/G17C/G17D) bound
     * aligned 16/32-bit indirect draws within 32-bit byte bounds in hardware;
     * oversized, unaligned, and 8-bit indirect draws take the software rewrite
     * path. */
    static const enum agx_chip native_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G,
-                                                AGX_CHIP_G17S, AGX_CHIP_G17C};
+                                                AGX_CHIP_G17S, AGX_CHIP_G17C,
+                                                AGX_CHIP_G17D};
    for (unsigned i = 0; i < sizeof(native_chips) / sizeof(native_chips[0]);
         ++i) {
       assert(agx_chip_has_cap(native_chips[i],

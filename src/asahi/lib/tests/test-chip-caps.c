@@ -109,7 +109,7 @@ test_unknown_has_none(void)
 }
 
 /* AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS is enabled on G17P and M5 (G17G,
- * G17S, G17C); G15, G16, G18G, and AGX2 stay off until per-generation
+ * G17S, G17C, G17D); G15, G16, G18G, and AGX2 stay off until per-generation
  * hardware A/B benchmarks and CTS rows qualify them. */
 static void
 test_coalesce_pure_global_workgroups(void)
@@ -117,7 +117,8 @@ test_coalesce_pure_global_workgroups(void)
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C ||
+                            c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
                     expected,
                  c);
@@ -133,7 +134,8 @@ test_cdm_war_weak_barrier(void)
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C ||
+                            c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_CDM_WAR_WEAK_BARRIER) == expected,
                  c);
    }
@@ -149,22 +151,6 @@ test_mod3_reg_bank_ra(void)
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_MOD3_REG_BANK_RA) ==
                     (c == AGX_CHIP_G17P),
                  c);
-   }
-}
-
-/* G17D partitions AGX_CAPS_M5 into measured and excluded capabilities so any
- * new M5 capability fails this test until assigned to one set. */
-static void
-test_g17d_partitions_m5(void)
-{
-   CHECK((AGX_CAPS_G17D_MEASURED & AGX_CAPS_G17D_EXCLUDED) == 0);
-   CHECK((AGX_CAPS_G17D_MEASURED | AGX_CAPS_G17D_EXCLUDED) == AGX_CAPS_M5);
-   for (unsigned bit = 1; bit; bit <<= 1) {
-      if (!(all_caps & bit))
-         continue;
-      CHECK_CHIP(agx_chip_has_cap(AGX_CHIP_G17D, bit) ==
-                    ((AGX_CAPS_G17D_MEASURED & bit) != 0),
-                 AGX_CHIP_G17D);
    }
 }
 
@@ -269,7 +255,8 @@ test_signed_zero_minmax_select(void)
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C ||
+                            c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_SIGNED_ZERO_MINMAX_SELECT) ==
                     expected,
                  c);
@@ -282,7 +269,8 @@ test_vdm_indirect_index_bounds(void)
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+                            c == AGX_CHIP_G17S || c == AGX_CHIP_G17C ||
+                            c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS) ==
                     expected,
                  c);
@@ -294,8 +282,8 @@ test_hw_txf_bounds(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected =
-         c == AGX_CHIP_G17G || c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+      const bool expected = c == AGX_CHIP_G17G || c == AGX_CHIP_G17S ||
+                            c == AGX_CHIP_G17C || c == AGX_CHIP_G17D;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HW_TXF_BOUNDS) == expected, c);
    }
 }
@@ -311,7 +299,6 @@ main(void)
    test_coalesce_pure_global_workgroups();
    test_cdm_war_weak_barrier();
    test_mod3_reg_bank_ra();
-   test_g17d_partitions_m5();
    test_gen10_2d_compression();
    test_sparse_binding();
    test_zls_full_render_bounds();

@@ -71,7 +71,7 @@ enum agx_chip_cap {
     * larger power-of-two hardware workgroups (up to 256 threads, or 512 for
     * short low-register loop-free shaders) to avoid the AGX3 CDM per-workgroup
     * launch-rate floor on large grids. Measured and qualified on G17P
-    * (HAL200) and M5 (G17G/G17S/G17C, HAL300); off on G17D, G15, G16, G18G,
+    * (HAL200) and M5 (G17G/G17S/G17C/G17D, HAL300); off on G15, G16, G18G,
     * and AGX2 until per-generation hardware A/B and CTS rows are collected. */
    AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS = 1u << 10,
 
@@ -80,7 +80,9 @@ enum agx_chip_cap {
     * write-after-read) is met by the weak ordering record ending the
     * preceding launch, which holds the next launch until every earlier one
     * has finished, without the strong cache flush. Measured on G17P and M5
-    * (G17G, G17S, G17C); G15 and G16G keep the flush until measured there. */
+    * (inert on multi-die parts where agx_cdm_ordering_memory_scope() keeps
+    * memory-scoped barriers via num_dies); G15 and G16G keep the flush until
+    * measured there. */
    AGX_CAP_CDM_WAR_WEAK_BARRIER = 1u << 11,
 
    /* Gen9 2D depth compression and compressed DRM_FORMAT_MOD_APPLE_INTERCHANGE
@@ -157,7 +159,7 @@ enum agx_chip_cap {
     * independent post-barrier compute, multi-chunk submissions take per-chunk
     * timeline points, and a HAL200 render whose tiling half names fewer
     * earlier renders than its fragment half falls back to a staged render.
-    * Qualified on G17P and M5 (G17G, G17S, G17C); G15 and G16G (~0.3 ms
+    * Qualified on G17P and M5 (G17G, G17S, G17C, G17D); G15 and G16G (~0.3 ms
     * per-command turnaround) remain excluded until measured. */
    AGX_CAP_CDM_OVERLAP_SPLIT = 1u << 21,
 
@@ -165,7 +167,8 @@ enum agx_chip_cap {
     * BOs are mapped CPU write-back (AGX_BO_WRITEBACK) when util_has_cache_ops()
     * is available, cleaned before GPU submission, enabling CPU-cached root
     * reuse, push-descriptor elision, and direct fragment-root comparisons
-    * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C). */
+    * without shadow snapshots. Qualified on G17P and M5 (G17G, G17S, G17C,
+    * G17D). */
    AGX_CAP_CACHED_CMD_MEMORY = 1u << 22,
 };
 
@@ -191,7 +194,9 @@ enum agx_chip_cap {
     AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |            \
     AGX_CAP_CACHED_CMD_MEMORY)
 
-/* What the single-die M5 parts (G17G, G17S, G17C) share. */
+/* What the M5 parts (G17G, G17S, G17C, G17D) share. Multi-die coherence
+ * differences (such as memory-scoped CDM ordering barriers) are selected by
+ * num_dies rather than chip capability exclusions. */
 #define AGX_CAPS_M5                                                            \
    (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS |   \
     AGX_CAP_HW_TXF_BOUNDS | AGX_CAP_COOPERATIVE_MATRIX |                       \
@@ -199,22 +204,6 @@ enum agx_chip_cap {
     AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS | AGX_CAP_CDM_WAR_WEAK_BARRIER |   \
     AGX_CAP_GEN10_2D_COMPRESSION | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |         \
     AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY)
-
-/* G17D partitions AGX_CAPS_M5 into measured capabilities (enabled) and
- * unmeasured exclusions (kept off until measured on J775D). test-chip-caps.c
- * asserts the two sets are disjoint and cover AGX_CAPS_M5, so adding a new
- * capability to AGX_CAPS_M5 forces an explicit decision for G17D. */
-#define AGX_CAPS_G17D_MEASURED                                                 \
-   (AGX_CAP_ELIDE_APP_DISPATCH_BARRIER | AGX_CAP_COOPERATIVE_MATRIX |          \
-    AGX_CAP_SPARSE_BINDING | AGX_CAP_GEN10_2D_COMPRESSION)
-
-#define AGX_CAPS_G17D_EXCLUDED                                                 \
-   (AGX_CAP_VDM_INDIRECT_INDEX_BOUNDS | AGX_CAP_HW_TXF_BOUNDS |                \
-    AGX_CAP_DESCRIPTOR_BUFFER | AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS |      \
-    AGX_CAP_CDM_WAR_WEAK_BARRIER | AGX_CAP_SIGNED_ZERO_MINMAX_SELECT |         \
-    AGX_CAP_CDM_OVERLAP_SPLIT | AGX_CAP_CACHED_CMD_MEMORY)
-
-#define AGX_CAPS_G17D AGX_CAPS_G17D_MEASURED
 
 /*
  * One row per chip of AGX_CHIPS, in the same order: chip, capabilities.
@@ -246,7 +235,7 @@ enum agx_chip_cap {
    X(G17G, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17S, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G17C, AGX_CAPS_M5, __VA_ARGS__)                                           \
-   X(G17D, AGX_CAPS_G17D, __VA_ARGS__)                                         \
+   X(G17D, AGX_CAPS_M5, __VA_ARGS__)                                           \
    X(G18G, AGX_CAP_ZLS_FULL_RENDER_BOUNDS | AGX_CAP_NATIVE_MIXED_EPILOG,       \
      __VA_ARGS__)
 

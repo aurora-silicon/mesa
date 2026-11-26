@@ -450,13 +450,14 @@ int main(void)
       assert(!hk_coalesce_workgroup_size_ex(wg32, g118m, axis_bad, 1024, 256,
                                             256, out));
 
-      /* Capability table: enabled on G17P and M5 (G17G, G17S, G17C); other
-       * parts stay off until per-generation same-machine A/B + CTS rows
+      /* Capability table: enabled on G17P and M5 (G17G, G17S, G17C, G17D);
+       * other parts stay off until per-generation same-machine A/B + CTS rows
        * qualify them. */
       for (int chip = AGX_CHIP_G13G; chip <= AGX_CHIP_UNKNOWN; ++chip) {
          const enum agx_chip c = (enum agx_chip)chip;
          const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
-                               c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
+                               c == AGX_CHIP_G17S || c == AGX_CHIP_G17C ||
+                               c == AGX_CHIP_G17D;
          assert(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
                 expected);
       }

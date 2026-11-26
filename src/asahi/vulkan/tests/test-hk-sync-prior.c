@@ -2576,8 +2576,8 @@ test_cdm_overlap_splits(void)
 
    T("at least one chip tests CDM overlap splits", tested > 0);
 
-   /* Unmeasured chips (G15, G16G, G17D) do not enable compute overlap splits yet. */
-   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17D};
+   /* Unmeasured chips (G15, G16G) do not enable compute overlap splits yet. */
+   const enum agx_chip excluded[] = {AGX_CHIP_G15G, AGX_CHIP_G16G};
    for (unsigned i = 0; i < ARRAY_SIZE(excluded); ++i) {
       struct hk_cmd_buffer *cmd = timestamp_cmd(excluded[i], true);
       struct hk_cs *c1 = add(cmd, true);
