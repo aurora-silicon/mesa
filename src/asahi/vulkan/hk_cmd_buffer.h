@@ -616,6 +616,7 @@ struct hk_descriptor_state {
       uint8_t dirty_mask;
       bool bypass_launched;
       uint64_t dynbuf_dirty_mask;
+      uint64_t push_dirty_dwords;
    } root_change;
    uint64_t generation;
    /* Advances on every descriptor state change except hk_push_constants()
@@ -708,12 +709,35 @@ hk_root_mark_dirty(struct hk_descriptor_state *desc)
    desc->root_change.bypass_launched = false;
 }
 
-/* Root changed in its push constants. An earlier change of any other kind
- * since the last upload stays recorded in dirty_mask. */
+/* Root changed in its push constants at [offset, offset + size). An earlier
+ * change of any other kind since the last upload stays recorded in dirty_mask. */
+static inline void
+hk_root_mark_push_dirty_range(struct hk_descriptor_state *desc, uint32_t offset,
+                              uint32_t size)
+{
+   desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   if (size > 0) {
+      const uint32_t first_dw = offset >> 2;
+      const uint32_t last_dw = (offset + size - 1) >> 2;
+      if (first_dw < 64) {
+         const uint32_t clamped_last = MIN2(last_dw, 63u);
+         const uint32_t count = clamped_last - first_dw + 1;
+         const uint64_t mask =
+            count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << first_dw;
+         desc->root_change.push_dirty_dwords |= mask;
+      }
+   } else {
+      desc->root_change.push_dirty_dwords = UINT64_MAX;
+   }
+   desc->root_change.bypass_launched = false;
+}
+
+/* Root changed in its push constants (unknown range). */
 static inline void
 hk_root_mark_push_dirty(struct hk_descriptor_state *desc)
 {
    desc->root_change.dirty_mask |= HK_ROOT_DIRTY_PUSH;
+   desc->root_change.push_dirty_dwords = UINT64_MAX;
    desc->root_change.bypass_launched = false;
 }
 
@@ -762,12 +786,43 @@ hk_root_mark_clean(struct hk_descriptor_state *desc)
    desc->root_change.dirty_mask = 0;
    desc->root_change.bypass_launched = false;
    desc->root_change.dynbuf_dirty_mask = 0;
+   desc->root_change.push_dirty_dwords = 0;
 }
 
-/* Whether a shader reading root_reads / dynbuf_reads cannot observe any of the
- * root bytes currently dirty in desc. */
+/* Whether a root byte span [start, end) overlaps any of the four regions that
+ * may be dirty while hk_root_bypass_dirty() holds (push constants, dynamic
+ * buffers, or vertex attribute bases/clamps). Any other root field (such as
+ * draw.attrib_strides[]) marks HK_ROOT_DIRTY_OTHER when mutated, so a disjoint
+ * span stays current in gfx->root across root-bypass launches. */
+static inline bool
+hk_root_span_overlaps_bypassable(uint64_t start, uint64_t end)
+{
+   if (end <= start)
+      return false;
+   const uint64_t push_lo = hk_root_descriptor_offset(push);
+   const uint64_t push_hi = push_lo + HK_MAX_PUSH_SIZE;
+   const uint64_t dyn_lo = hk_root_descriptor_offset(dynamic_buffers);
+   const uint64_t dyn_hi =
+      dyn_lo + sizeof(((struct hk_root_descriptor_table *)0)->dynamic_buffers);
+   const uint64_t vb_base_lo = hk_root_descriptor_offset(draw.attrib_base);
+   const uint64_t vb_base_hi =
+      vb_base_lo +
+      sizeof(((struct hk_root_descriptor_table *)0)->draw.attrib_base);
+   const uint64_t vb_clamp_lo = hk_root_descriptor_offset(draw.attrib_clamps);
+   const uint64_t vb_clamp_hi =
+      vb_clamp_lo +
+      sizeof(((struct hk_root_descriptor_table *)0)->draw.attrib_clamps);
+   return (start < push_hi && end > push_lo) ||
+          (start < dyn_hi && end > dyn_lo) ||
+          (start < vb_base_hi && end > vb_base_lo) ||
+          (start < vb_clamp_hi && end > vb_clamp_lo);
+}
+
+/* Whether a shader reading root_reads / dynbuf_reads / push_reads cannot
+ * observe any of the root bytes currently dirty in desc. */
 static inline bool
 hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
+                           uint64_t push_reads,
                            const struct hk_descriptor_state *desc)
 {
    const uint8_t dm = desc->root_change.dirty_mask;
@@ -777,7 +832,8 @@ hk_root_reads_ignore_dirty(uint8_t root_reads, uint64_t dynbuf_reads,
       return false;
    if (root_reads & HK_ROOT_READS_ADDRESS)
       return false;
-   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH))
+   if ((dm & HK_ROOT_DIRTY_PUSH) && (root_reads & HK_ROOT_READS_PUSH) &&
+       (!push_reads || (push_reads & desc->root_change.push_dirty_dwords)))
       return false;
    if ((dm & (HK_ROOT_DIRTY_VB_BASE | HK_ROOT_DIRTY_VB_CLAMP)) &&
        (root_reads & HK_ROOT_READS_VERTEX_INPUT))
@@ -1787,6 +1843,18 @@ struct hk_cs {
     * stream ends first (hk_m5_ordered_draw_hazard()). */
    bool m5_ordered;
 
+   /* M5: an earlier continuation of this stream crossed a barrier whose first
+    * scope covers graphics work outside the attachment stages
+    * (hk_m5_pass_merge_non_local_src()). A later instance may not terminate
+    * this stream with a final-pass resolve, since earlier fragment shaders in
+    * the stream may have read or written the resolve target. */
+   bool m5_non_local_src;
+
+   /* M5: an earlier continuation of this stream crossed a barrier that made
+    * attachment writes available (hk_m5_barrier_makes_att_visible()). A later
+    * ordered barrier with srcAccessMask == 0 chains visibility onto it. */
+   bool m5_att_available;
+
    /* M5: every attachment of the continued instances is in an
     * attachment-only layout, so no descriptor can access one of them and
     * descriptor sets bound for graphics need not end an ordered continuation
@@ -1821,6 +1889,10 @@ struct hk_cs {
    /* Depth/stencil aspects whose store hk_g17p_zls_elide_store() dropped from
     * cr.zls_control, so render packing can union z_store/s_store across members. */
    uint8_t render_pack_zls_elided_store;
+
+   /* CDM stream: set if a meta or non-pre/post-graphics internal helper
+    * dispatch ran in this stream. */
+   bool render_pack_compute_internal;
 
    /* Scratch requirements */
    struct {
@@ -2402,6 +2474,7 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->anatomy_precomp[i].dispatches += b->anatomy_precomp[j].dispatches;
    }
    a->anatomy_precomp_other += b->anatomy_precomp_other;
+   a->render_pack_compute_internal |= b->render_pack_compute_internal;
 }
 
 static inline void
@@ -2510,6 +2583,14 @@ struct hk_cmd_buffer {
        * beyond attachment operations; continuing then needs the stronger
        * conditions of hk_m5_ordered_refusal(). */
       bool ordered;
+      /* A recorded barrier between this instance and the next has a graphics
+       * first scope outside the attachment stages
+       * (hk_m5_pass_merge_non_local_src()), so a final-pass resolve may not
+       * merge into this stream. */
+      bool non_local_src;
+      /* A recorded barrier between this instance and the next made attachment
+       * writes available (hk_m5_barrier_makes_att_visible()). */
+      bool att_available;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
    } pass_merge;
@@ -3315,6 +3396,12 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
       hk_tess_batch_flush(cmd);
 
    if ((*ptr) == NULL) {
+      if (compute && unlikely(cmd->sync.lead_ts.handle)) {
+         hk_sync_flush_lead_timestamp(cmd);
+         if (vk_command_buffer_has_error(&cmd->vk))
+            return NULL;
+      }
+
       struct hk_device *dev = hk_cmd_buffer_device(cmd);
       struct hk_cs *cs = hk_cs_create(cmd, compute);
       if (!cs)
@@ -3346,7 +3433,16 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
 
       *ptr = cs;
 
+      const bool rpack_head_cs_ok =
+         compute && ptr == &cmd->current_cs.cs && !cmd->in_meta &&
+         !cmd->current_cs.gfx && !cmd->current_cs.pre_gfx &&
+         !cmd->current_cs.post_gfx && cmd->render_pack.head_open &&
+         cmd->render_pack.head_epoch == cmd->sync.epoch &&
+         !cmd->sync.xfer_depth && !cmd->sync.brl_transition_active &&
+         !cmd->sync.kind_override;
       hk_sync_stream_created(cmd, cs, ptr, compute);
+      if (rpack_head_cs_ok)
+         cmd->render_pack.head_epoch = cmd->sync.epoch;
    }
 
    assert(*ptr != NULL);
@@ -3669,8 +3765,11 @@ hk_flush_oq_pending(struct hk_cmd_buffer *cmd)
    if (!count)
       return;
 
+   const uint8_t saved_kind = cmd->sync.kind_override;
+   cmd->sync.kind_override = HK_SYNC_STAMP;
    struct hk_cs *cs =
       hk_cmd_buffer_get_cs_general(cmd, &cmd->current_cs.post_gfx, true);
+   cmd->sync.kind_override = saved_kind;
    if (!cs || vk_command_buffer_has_error(&cmd->vk))
       return;
 

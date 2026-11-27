@@ -1125,6 +1125,8 @@ merge_control_streams(struct hk_cmd_buffer *cmd)
           !last->timestamp.end.handle &&
           !(last->timestamp.start.handle && cs->g17p_timestamp_query) &&
           !(last->timestamp.start.handle && cs->timestamp.start.handle) &&
+          !(last->sync.heap_slot && cs->sync.heap_slot &&
+            last->sync.heap_slot != cs->sync.heap_slot) &&
           !hk_sync_merge_delays(cmd, last, cs)) {
 
          hk_sync_merge(cmd, last, cs);
@@ -1262,9 +1264,14 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_resolve_deferred_oq_available(cmd);
 
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const bool rpack_tail_clean =
+      cmd->render_pack.tail_open &&
+      cmd->render_pack.tail_epoch == cmd->sync.epoch;
    if (likely(!(dev->dev.debug & AGX_DBG_NOMERGE))) {
       merge_control_streams(cmd);
    }
+   if (rpack_tail_clean)
+      cmd->render_pack.tail_epoch = cmd->sync.epoch;
 
    /* We cannot terminate CDM control streams until after merging, since merging
     * needs to append stream links late. Now that we've merged, insert all the
@@ -2068,7 +2075,7 @@ hk_push_constants_raw(struct hk_cmd_buffer *cmd,
       memcpy(dst, values, size);
    }
 
-   hk_root_mark_push_dirty(desc);
+   hk_root_mark_push_dirty_range(desc, offset, size);
    /* non_push_generation intentionally does not advance on push constants
     * (push constants carry no tracked resource addresses; BDA transfers
     * already set sync.xfer_any). */
@@ -2170,6 +2177,7 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
                                  const VkSetDescriptorBufferOffsetsInfoEXT *info)
 {
    VK_FROM_HANDLE(vk_pipeline_layout, pipeline_layout, info->layout);
+   bool changed = false;
 
    for (uint32_t i = 0; i < info->setCount; ++i) {
       const uint32_t s = info->firstSet + i;
@@ -2181,10 +2189,22 @@ hk_set_descriptor_buffer_offsets(struct hk_cmd_buffer *cmd,
       const uint64_t addr =
          cmd->state.descriptor_buffers[info->pBufferIndices[i]] +
          info->pOffsets[i];
+      const uint32_t size = set_layout ? set_layout->max_buffer_size : 0;
+      const uint32_t bit = BITFIELD_BIT(s);
 
-      hk_bind_buffer_set(desc, pipeline_layout, s, addr,
-                         set_layout ? set_layout->max_buffer_size : 0);
+      if ((desc->buffer_active & bit) && !(desc->push_active & bit) &&
+          desc->sets[s] == NULL && desc->root.sets[s] == addr &&
+          desc->set_sizes[s] == size &&
+          desc->root.set_dynamic_buffer_start[s] ==
+             pipeline_layout->dynamic_descriptor_offset[s])
+         continue;
+
+      hk_bind_buffer_set(desc, pipeline_layout, s, addr, size);
+      changed = true;
    }
+
+   if (!changed)
+      return;
 
    hk_root_mark_dirty(desc);
    desc->generation++;
@@ -3881,17 +3901,28 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
       case HK_G17P_RANGE_SOURCE_CONSTANT:
          offset = ranges[i].address;
          break;
-      case HK_G17P_RANGE_SOURCE_ROOT:
+      case HK_G17P_RANGE_SOURCE_ROOT: {
          offset = ranges[i].address - root;
-         /* The root/set table header range at offset 0 only exposes the
-          * root_desc_addr pointer when the main body, preamble, or prolog
-          * reads it; otherwise it only supplies root.sets[], which never
-          * change on push, dynamic-buffer, or VB base/clamp updates. */
-         if (offset != 0 || !s->b.info.agx3_root_uniform_usage_valid ||
-             s->b.info.agx3_main_uses_root_uniform ||
-             s->b.info.has_preamble || linked->g17p_prolog_uses_root)
+         const uint64_t end = offset + 2u * ranges[i].size_halfs;
+         /* Offset 0 is the root/set header: it exposes root_desc_addr only
+          * when the main body, preamble, or prolog reads it; otherwise it only
+          * supplies root.sets[], which never change on bypassable updates.
+          * Non-zero root uniform-DMA spans (e.g. draw.attrib_strides[]) read
+          * only [offset, end), so they remain up to date in gfx->root whenever
+          * disjoint from the four bypass-dirtyable regions. */
+         if (offset == 0) {
+            if (!s->b.info.agx3_root_uniform_usage_valid ||
+                s->b.info.agx3_main_uses_root_uniform ||
+                (s->b.info.has_preamble &&
+                 s->b.info.agx3_preamble_uses_root_uniform) ||
+                linked->g17p_prolog_uses_root ||
+                hk_root_span_overlaps_bypassable(offset, end))
+               has_general_root = true;
+         } else if (hk_root_span_overlaps_bypassable(offset, end)) {
             has_general_root = true;
+         }
          break;
+      }
       case HK_G17P_RANGE_SOURCE_ATTRIB_BASE:
          offset = ranges[i].address - root;
          if (offset != hk_root_descriptor_offset(draw.attrib_base) ||
@@ -4280,14 +4311,14 @@ hk_upload_native_mesh_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    if (!linked ||
        (dev->dev.chip == AGX_CHIP_G17P
           ? !linked->b.g17p_compiler_d_valid
-          : (dev->dev.chip != AGX_CHIP_G17S ||
+          : (!agx_chip_g17_m5(dev->dev.chip) ||
              !(dev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2))))
       goto refused;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
    /* An API task shader is a compiled object program with the ordinary
     * driver-root/descriptor ranges and its own threadgroup memory. */
-   const bool task_object = object && task && dev->dev.chip == AGX_CHIP_G17S &&
+   const bool task_object = object && task && agx_chip_g17_m5(dev->dev.chip) &&
                             s->info.stage == MESA_SHADER_TASK;
    if (task_object) {
       if (!hk_g17p_graphics_uniform_ranges(cmd, s, linked,
@@ -5165,7 +5196,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
    if (launch->has_general_root &&
        !hk_root_reads_ignore_dirty(s->info.agx3_root_reads,
-                                   s->info.agx3_dynbuf_reads, desc))
+                                   s->info.agx3_dynbuf_reads,
+                                   s->info.agx3_push_read_dwords, desc))
       return 0;
 
    const uint8_t dirty_mask = desc->root_change.dirty_mask;
@@ -5666,6 +5698,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
       struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
       if (!cs)
          return;
+      if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+         cs->render_pack_compute_internal = true;
 
       const uint32_t shared_bytes =
          prog->info.local_size
@@ -5750,6 +5784,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+   if (!(barrier & (AGX_PREGFX | AGX_POSTGFX)))
+      cs->render_pack_compute_internal = true;
 
    struct agx_ptr t = hk_pool_usc_alloc(cmd, agx_usc_size(15), 64);
    uint64_t uploaded_data = hk_pool_upload(cmd, data, data_size, 4);

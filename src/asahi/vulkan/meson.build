@@ -460,7 +460,8 @@ if with_tests
       'hk_render_pack',
       executable(
         'hk_render_pack_test',
-        files('tests/test-hk-render-pack.c', 'hk_render_pack.c', 'hk_sync.c'),
+        files('tests/test-hk-render-pack.c', 'hk_render_pack.c',
+              'hk_drm_render_core.c', 'hk_sync.c'),
         link_with : [libasahi_lib],
         include_directories : [
           include_directories('.'),
@@ -1598,6 +1599,15 @@ if with_tests
   executable(
     'vulkan-dynamic-offset-draws',
     files('tests/vulkan_dynamic_offset_draws.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
+    'vulkan-compute-store-visibility',
+    files('tests/vulkan_compute_store_visibility.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],
