@@ -634,6 +634,12 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
       break;
    case VK_FORMAT_R32G32_SFLOAT: bit = 16; break;
    case VK_FORMAT_R32G32B32A32_SFLOAT: bit = 32; break;
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+      /* DEV HACK (bound only, never merge). */
+      if (!getenv("HK_HACK_R11_COMPRESS"))
+         return false;
+      bit = 2048;
+      break;
    case VK_FORMAT_R8G8B8A8_UNORM: bit = 64; break;
    case VK_FORMAT_R16G16B16A16_UNORM:
    case VK_FORMAT_R16G16B16A16_SNORM:

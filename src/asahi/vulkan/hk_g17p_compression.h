@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* HAL200 lossless compression policy across native HAL200 AGX3B parts
  * (AGX_CAP_HAL200_LOSSLESS_COMPRESSION: G16G and G17P).
@@ -120,6 +121,9 @@ hk_g17p_compression_color_format(VkFormat format)
    /* Not B10G11R11_UFLOAT: G17P packs it into one tile word, and its
     * end-of-tile programs store that word through the format's own class
     * (hk_eot_pbe_format()), which loses NaN when compressed. */
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+      /* DEV HACK (bound only, never merge): compress anyway. */
+      return getenv("HK_HACK_R11_COMPRESS") != NULL;
    case VK_FORMAT_R16G16_UNORM:
    case VK_FORMAT_R16G16_SNORM:
    case VK_FORMAT_R16G16_UINT:
