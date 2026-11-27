@@ -101,6 +101,8 @@ setup_draw(struct pipe_context *pctx, struct draw_state *s)
    s->vs = create_vs(pctx, false, false, false);
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, &agx_nir_options, "VS dirty tracking fragment");
+   /* Exercise the application shader link, including inline blend epilogs. */
+   b.shader->info.internal = false;
    nir_store_output(&b, nir_imm_vec4(&b, 1, 0, 0, 1), nir_imm_int(&b, 0),
                     .base = 0, .write_mask = 0xf,
                     .io_semantics.location = FRAG_RESULT_DATA0);
@@ -358,6 +360,34 @@ check_vs(struct pipe_context *pctx)
       CHECK((size_t)(ctx->batch->vdm.current - before) ==
             AGX_VDM_STATE_UPDATE_LENGTH +
                AGX_VDM_HAL200_DIRECT_DRAW_BODY_LENGTH);
+   }
+   /* With a colour attachment, the launched FS can include its blend
+    * epilog. Its bind tail remains valid across vertex-only updates. */
+   if (native_agx3 && agx_chip_native_preamble(agx_device(pctx->screen)->chip)) {
+      const struct pipe_resource templ = {
+         .target = PIPE_TEXTURE_2D, .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+         .width0 = 16, .height0 = 16, .depth0 = 1, .array_size = 1,
+         .bind = PIPE_BIND_RENDER_TARGET,
+      };
+      struct pipe_resource *rt = pctx->screen->resource_create(pctx->screen,
+                                                                &templ);
+      CHECK(rt);
+      struct pipe_framebuffer_state fb = {
+         .width = 16, .height = 16, .layers = 1, .nr_cbufs = 1,
+         .cbufs = {{.texture = rt, .format = templ.format}},
+      };
+      pctx->set_framebuffer_state(pctx, &fb);
+      draw(pctx);
+      CHECK(ctx->linked.fs && ctx->linked.fs->inline_blend_fs);
+      CHECK(ctx->batch->g17p_fragment_shader == ctx->linked.fs->inline_blend_fs);
+      before = ctx->batch->vdm.current;
+      draw(pctx);
+      CHECK((size_t)(ctx->batch->vdm.current - before) ==
+            AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_DIRECT_DRAW_BODY_LENGTH);
+      fb.nr_cbufs = 0;
+      fb.cbufs[0] = (struct pipe_surface){0};
+      pctx->set_framebuffer_state(pctx, &fb);
+      pipe_resource_reference(&rt, NULL);
    }
    pctx->bind_vs_state(pctx, s.vs);
    pctx->delete_vs_state(pctx, id_vs);
@@ -626,13 +656,15 @@ check_vs(struct pipe_context *pctx)
          /* 3) Mid-MDI fast path -> VDM STREAM_LINK -> forced fallback on batch
           * flush (> 100,000 draws) -> fast path recovery through the last draw. */
          CHECK(ctx->batch->draws < 98700u);
-         struct agx_batch *pre_flush_batch = ctx->batch;
+         /* The flushed batch's slot can be reused, so compare its sequence
+          * number rather than its pointer. */
+         const uint64_t pre_flush_seqnum = ctx->batch->seqnum;
          ctx->batch->draws = 98700u;
          emits = ctx->perf.vs_emits;
          draws_before = ctx->perf.draws;
          pctx->draw_vbo(pctx, &mdi_info, 0, &mdi_large, &indirect_draw, 1);
          CHECK(!ctx->any_faults);
-         CHECK(ctx->batch && ctx->batch != pre_flush_batch);
+         CHECK(ctx->batch && ctx->batch->seqnum != pre_flush_seqnum);
          CHECK(ctx->batch->draws > 0 && ctx->batch->draws < large_count);
          CHECK(ctx->perf.draws == draws_before + large_count);
          CHECK(ctx->perf.vs_emits == emits + large_count);
