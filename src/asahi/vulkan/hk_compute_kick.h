@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 struct hk_device;
 struct hk_queue;
 
@@ -24,3 +27,14 @@ void hk_compute_kick_finish(struct hk_device *dev);
 /* Called from the queue's submission callback after compute work was
  * submitted to a watched queue, with its timeline value already advanced. */
 void hk_compute_kick_note(struct hk_device *dev, struct hk_queue *queue);
+
+/* Guard a single-queue packed global-atomic submission against concurrent
+ * kick-queue activation. Returns true when the queue is watched, no kick
+ * queue has been activated, and the caller has registered an in-flight
+ * packed-atomics submission (which must be paired with
+ * hk_compute_kick_pack_atomics_end()). */
+bool hk_compute_kick_pack_atomics_begin(struct hk_device *dev,
+                                        struct hk_queue *queue);
+void hk_compute_kick_pack_atomics_end(struct hk_device *dev,
+                                      struct hk_queue *queue,
+                                      uint64_t timeline_point);

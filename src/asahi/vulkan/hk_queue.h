@@ -153,6 +153,11 @@ struct hk_queue {
        * the kicker has seen it complete. */
       uint64_t pending;
 
+      /* Active packed global-atomic submissions guarded against concurrent
+       * kick-queue activation (protected by the kicker's lock). */
+      unsigned packed_atomics_inflight;
+      uint64_t packed_atomics_point;
+
       /* Kicker thread only: the queue timeline value last seen, and when
        * the next kick is due if it stays there (0: not yet seen). */
       uint64_t seen;
