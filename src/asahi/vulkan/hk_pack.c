@@ -469,6 +469,24 @@ hk_pack_finish_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs)
    packet->sync.last_any[HK_SYNC_CDM] = cs;
 }
 
+void
+hk_pack_relocate_sync(struct hk_cmd_buffer *packet, struct hk_cs *cs,
+                      const struct hk_cs *old_cs)
+{
+   for (unsigned sq = 0; sq < HK_SYNC_NUM_SQ; ++sq) {
+      if (packet->sync.last_any[sq] == old_cs)
+         packet->sync.last_any[sq] = cs;
+      if (cs->sync.dep[sq].cut == old_cs)
+         cs->sync.dep[sq].cut = cs;
+      for (unsigned k = 0; k < HK_SYNC_NUM_KINDS; ++k) {
+         if (packet->sync.last[k][sq] == old_cs)
+            packet->sync.last[k][sq] = cs;
+         if (packet->sync.req[k][sq].cut == old_cs)
+            packet->sync.req[k][sq].cut = cs;
+      }
+   }
+}
+
 bool
 hk_pack_add_bo(struct util_dynarray *bos, struct agx_bo *bo)
 {

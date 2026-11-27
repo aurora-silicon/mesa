@@ -3080,12 +3080,16 @@ struct hk_packed_runs {
    /* The fused programs' uniform loaders (hk_emit_fused_compute_dispatch()). */
    struct agx_bo *ioto_bo;
    struct agx_bo *root_bo;
+   size_t bo_total;
+   size_t ioto_total;
+   size_t root_total;
    /* Every buffer the packets read, for the submission to pin
     * (queue->pack.extra_bos). */
    struct util_dynarray *extra_bos;
    unsigned packet_count;
    struct hk_packed_submit *packets;
    struct vk_command_buffer **commands;
+   uint32_t *out_map;
    unsigned command_count;
 };
 
@@ -5728,17 +5732,22 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                            cached ? AGX_BO_WRITEBACK : 0,
                            "Packed compute submit");
    uint8_t *map = out->bo ? agx_bo_map(out->bo) : NULL;
+   const unsigned out_cap = n - packed_members + run_count;
    struct vk_command_buffer **commands =
-      hk_queue_pack_scratch(&queue->pack.commands,
-                            n - packed_members + run_count, sizeof(*commands));
-   if (!map || !commands || !hk_queue_pack_ensure_packets(queue, run_count) ||
+      hk_queue_pack_scratch(&queue->pack.commands, out_cap, sizeof(*commands));
+   uint32_t *out_map =
+      hk_queue_pack_scratch(&queue->pack.out_map, out_cap, sizeof(*out_map));
+   if (!map || !commands || !out_map ||
+       !hk_queue_pack_ensure_packets(queue, run_count) ||
        !hk_pack_add_bo(out->extra_bos, out->bo)) {
       hk_packed_runs_free(dev, out);
       memset(out, 0, sizeof(*out));
       return false;
    }
+   out->bo_total = total;
    out->packets = queue->pack.packets;
    out->commands = commands;
+   out->out_map = out_map;
 
    uint8_t *ioto_map = NULL;
    uint64_t ioto_va = 0;
@@ -5805,17 +5814,22 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    const int64_t t2_ns = trace ? os_time_get_nano() : 0;
    int64_t live_ns = 0;
 
+   out->ioto_total = ioto_total;
+   out->root_total = root_total;
+
    unsigned r = 0, fused_pairs = 0, im2a_fused = 0, dwa_fused = 0, gemm_dw_fused = 0;
    unsigned self_elided = 0;
    unsigned flushes_elided = 0, barriers_elided = 0, dead_writes_elided = 0;
    for (unsigned i = 0; i < n;) {
       if (r == run_count || i != runs[r].first) {
+         out->out_map[out->command_count] = i;
          out->commands[out->command_count++] = submit->command_buffers[i++];
          continue;
       }
 
       const struct hk_pack_run *pr = &runs[r];
-      struct hk_packed_submit *packet = &out->packets[out->packet_count++];
+      const unsigned pkt_idx = out->packet_count++;
+      struct hk_packed_submit *packet = &out->packets[pkt_idx];
       struct hk_cmd_buffer *cmd = &packet->cmd;
       struct hk_cs *cs = &packet->cs;
       hk_pack_init_packet(cmd, cs, dev, map + pr->offset,
@@ -6673,6 +6687,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
       }
       hk_pack_finish_sync(cmd, cs);
 
+      out->out_map[out->command_count] = 0x80000000u | pkt_idx;
       out->commands[out->command_count++] = &cmd->vk;
       i += pr->count;
       r++;
@@ -6988,6 +7003,276 @@ hk_render_pack_runs(struct hk_device *dev, struct hk_queue *queue,
    return true;
 }
 
+#define HK_PACK_CACHE_ENTRIES      8u
+#define HK_PACK_CACHE_MAX_CMDS     1024u
+#define HK_PACK_CACHE_MAX_BO_BYTES (2u * 1024u * 1024u)
+
+struct hk_pack_cache_entry {
+   bool valid;
+   uint64_t hash;
+   uint64_t lru_tick;
+   uint32_t n;
+   uint8_t render_kinds;
+   bool atomics;
+   bool alias_scope;
+   bool sparse_used;
+   bool frame_anatomy;
+   struct vk_command_buffer **key_cmds; /* pointer identity only */
+   uint64_t *key_gens;
+   struct agx_bo *bo;
+   struct agx_bo *ioto_bo;
+   struct agx_bo *root_bo;
+   struct agx_bo **extra_bos;
+   unsigned extra_bo_count;
+   unsigned packet_count;
+   struct hk_packed_submit *packets;
+   uint32_t *out_map;
+   unsigned command_count;
+};
+
+struct hk_pack_cache {
+   uint64_t tick;
+   struct hk_pack_cache_entry entries[HK_PACK_CACHE_ENTRIES];
+   struct vk_command_buffer **scratch_cmds;
+   unsigned scratch_cap;
+};
+
+static uint64_t
+hk_pack_cache_hash(uint32_t n, uint8_t render_kinds, bool atomics,
+                   bool alias_scope, bool sparse_used, bool frame_anatomy,
+                   struct vk_command_buffer *const *cmds, uint64_t *gens_out)
+{
+   uint64_t h = 0xcbf29ce484222325ull;
+   const uint64_t meta = ((uint64_t)n << 16) | ((uint64_t)render_kinds << 8) |
+                         ((uint64_t)sparse_used << 3) |
+                         ((uint64_t)atomics << 2) |
+                         ((uint64_t)alias_scope << 1) |
+                         (uint64_t)frame_anatomy;
+   h = (h ^ meta) * 0x100000001b3ull;
+   for (uint32_t i = 0; i < n; ++i) {
+      const struct hk_cmd_buffer *cb = (const struct hk_cmd_buffer *)cmds[i];
+      const uint64_t gen = p_atomic_read(&cb->pack_gen);
+      if (!gen)
+         return 0;
+      gens_out[i] = gen;
+      h = (h ^ (uintptr_t)cmds[i]) * 0x100000001b3ull;
+      h = (h ^ gen) * 0x100000001b3ull;
+   }
+   return h ? h : 1;
+}
+
+static void
+hk_pack_cache_entry_fini(struct hk_device *dev, struct hk_pack_cache_entry *e)
+{
+   if (!e->valid)
+      return;
+   for (unsigned i = 0; i < e->packet_count; ++i) {
+      util_dynarray_fini(&e->packets[i].cs.compute_resources);
+      util_dynarray_fini(&e->packets[i].cs.query_access_ranges);
+   }
+   for (unsigned i = 0; i < e->extra_bo_count; ++i) {
+      struct agx_bo *bo = e->extra_bos[i];
+      if (bo && bo != e->bo && bo != e->ioto_bo && bo != e->root_bo)
+         agx_bo_unreference(&dev->dev, bo);
+   }
+   agx_bo_unreference(&dev->dev, e->bo);
+   agx_bo_unreference(&dev->dev, e->ioto_bo);
+   agx_bo_unreference(&dev->dev, e->root_bo);
+   free(e->extra_bos);
+   free(e->packets);
+   free(e->out_map);
+   free(e->key_cmds);
+   free(e->key_gens);
+   memset(e, 0, sizeof(*e));
+}
+
+static void
+hk_pack_cache_fini(struct hk_device *dev, struct hk_queue *queue)
+{
+   if (!queue->pack_cache)
+      return;
+   for (unsigned i = 0; i < HK_PACK_CACHE_ENTRIES; ++i)
+      hk_pack_cache_entry_fini(dev, &queue->pack_cache->entries[i]);
+   free(queue->pack_cache->scratch_cmds);
+   free(queue->pack_cache);
+   queue->pack_cache = NULL;
+}
+
+static struct hk_pack_cache_entry *
+hk_pack_cache_lookup(struct hk_queue *queue, uint64_t hash, uint32_t n,
+                     uint8_t render_kinds, bool atomics, bool alias_scope,
+                     bool sparse_used, bool frame_anatomy,
+                     struct vk_command_buffer *const *cmds,
+                     const uint64_t *gens)
+{
+   struct hk_pack_cache *cache = queue->pack_cache;
+   if (!cache)
+      return NULL;
+   for (unsigned i = 0; i < HK_PACK_CACHE_ENTRIES; ++i) {
+      struct hk_pack_cache_entry *e = &cache->entries[i];
+      if (!e->valid || e->hash != hash || e->n != n ||
+          e->render_kinds != render_kinds || e->atomics != atomics ||
+          e->alias_scope != alias_scope || e->sparse_used != sparse_used ||
+          e->frame_anatomy != frame_anatomy)
+         continue;
+      if (memcmp(e->key_cmds, cmds, n * sizeof(*cmds)) == 0 &&
+          memcmp(e->key_gens, gens, n * sizeof(*gens)) == 0) {
+         e->lru_tick = ++cache->tick;
+         return e;
+      }
+   }
+   return NULL;
+}
+
+static bool
+hk_pack_clone_dynarray(struct util_dynarray *dst,
+                       const struct util_dynarray *src)
+{
+   util_dynarray_init(dst, NULL);
+   if (!src->size)
+      return true;
+   void *p = util_dynarray_grow_bytes(dst, 1, src->size);
+   if (!p)
+      return false;
+   memcpy(p, src->data, src->size);
+   return true;
+}
+
+static struct hk_pack_cache_entry *
+hk_pack_cache_store(struct hk_device *dev, struct hk_queue *queue,
+                    uint64_t hash, uint32_t n, uint8_t render_kinds,
+                    bool atomics, bool alias_scope, bool sparse_used,
+                    bool frame_anatomy, struct vk_command_buffer *const *cmds,
+                    const uint64_t *gens, struct hk_packed_runs *runs)
+{
+   if (!queue->pack_cache) {
+      queue->pack_cache = calloc(1, sizeof(*queue->pack_cache));
+      if (!queue->pack_cache)
+         return NULL;
+   }
+   struct hk_pack_cache *cache = queue->pack_cache;
+
+   const unsigned extra_bo_count =
+      util_dynarray_num_elements(runs->extra_bos, struct agx_bo *);
+   struct vk_command_buffer **key_cmds = malloc(n * sizeof(*key_cmds));
+   uint64_t *key_gens = malloc(n * sizeof(*key_gens));
+   struct hk_packed_submit *packets =
+      calloc(runs->packet_count, sizeof(*packets));
+   uint32_t *out_map = malloc(runs->command_count * sizeof(*out_map));
+   struct agx_bo **extra_bos =
+      extra_bo_count ? malloc(extra_bo_count * sizeof(*extra_bos)) : NULL;
+   if (!key_cmds || !key_gens || !packets || !out_map ||
+       (extra_bo_count && !extra_bos)) {
+      free(key_cmds);
+      free(key_gens);
+      free(packets);
+      free(out_map);
+      free(extra_bos);
+      return NULL;
+   }
+
+   for (unsigned p = 0; p < runs->packet_count; ++p) {
+      packets[p] = runs->packets[p];
+      list_inithead(&packets[p].cmd.control_streams);
+      list_addtail(&packets[p].cs.node, &packets[p].cmd.control_streams);
+      packets[p].cs.cmd = &packets[p].cmd;
+      hk_pack_relocate_sync(&packets[p].cmd, &packets[p].cs,
+                            &runs->packets[p].cs);
+      if (!hk_pack_clone_dynarray(&packets[p].cs.compute_resources,
+                                  &runs->packets[p].cs.compute_resources) ||
+          !hk_pack_clone_dynarray(&packets[p].cs.query_access_ranges,
+                                  &runs->packets[p].cs.query_access_ranges)) {
+         for (unsigned j = 0; j <= p; ++j) {
+            util_dynarray_fini(&packets[j].cs.compute_resources);
+            util_dynarray_fini(&packets[j].cs.query_access_ranges);
+         }
+         free(key_cmds);
+         free(key_gens);
+         free(packets);
+         free(out_map);
+         free(extra_bos);
+         return NULL;
+      }
+   }
+
+   memcpy(key_cmds, cmds, n * sizeof(*key_cmds));
+   memcpy(key_gens, gens, n * sizeof(*key_gens));
+   memcpy(out_map, runs->out_map, runs->command_count * sizeof(*out_map));
+   if (extra_bo_count) {
+      struct agx_bo *const *src_bos = util_dynarray_begin(runs->extra_bos);
+      memcpy(extra_bos, src_bos, extra_bo_count * sizeof(*extra_bos));
+      for (unsigned i = 0; i < extra_bo_count; ++i) {
+         struct agx_bo *bo = extra_bos[i];
+         if (bo && bo != runs->bo && bo != runs->ioto_bo && bo != runs->root_bo)
+            agx_bo_reference(bo);
+      }
+   }
+
+   unsigned victim = 0;
+   for (unsigned i = 0; i < HK_PACK_CACHE_ENTRIES; ++i) {
+      if (!cache->entries[i].valid) {
+         victim = i;
+         break;
+      }
+      if (cache->entries[i].lru_tick < cache->entries[victim].lru_tick)
+         victim = i;
+   }
+   struct hk_pack_cache_entry *e = &cache->entries[victim];
+   hk_pack_cache_entry_fini(dev, e);
+
+   e->valid = true;
+   e->hash = hash;
+   e->lru_tick = ++cache->tick;
+   e->n = n;
+   e->render_kinds = render_kinds;
+   e->atomics = atomics;
+   e->alias_scope = alias_scope;
+   e->sparse_used = sparse_used;
+   e->frame_anatomy = frame_anatomy;
+   e->key_cmds = key_cmds;
+   e->key_gens = key_gens;
+   e->bo = runs->bo;
+   e->ioto_bo = runs->ioto_bo;
+   e->root_bo = runs->root_bo;
+   e->extra_bos = extra_bos;
+   e->extra_bo_count = extra_bo_count;
+   e->packet_count = runs->packet_count;
+   e->packets = packets;
+   e->out_map = out_map;
+   e->command_count = runs->command_count;
+
+   /* Ownership of the packet BOs moved into the cache entry. */
+   runs->bo = NULL;
+   runs->ioto_bo = NULL;
+   runs->root_bo = NULL;
+   return e;
+}
+
+static struct vk_command_buffer **
+hk_pack_cache_build_commands(struct hk_queue *queue,
+                             struct hk_pack_cache_entry *e,
+                             const struct vk_queue_submit *submit)
+{
+   struct hk_pack_cache *cache = queue->pack_cache;
+   if (e->command_count > cache->scratch_cap) {
+      unsigned new_cap = MAX2(e->command_count, cache->scratch_cap * 2u);
+      struct vk_command_buffer **tmp =
+         realloc(cache->scratch_cmds, new_cap * sizeof(*tmp));
+      if (!tmp)
+         return NULL;
+      cache->scratch_cmds = tmp;
+      cache->scratch_cap = new_cap;
+   }
+   for (unsigned k = 0; k < e->command_count; ++k) {
+      uint32_t m = e->out_map[k];
+      if (m & 0x80000000u)
+         cache->scratch_cmds[k] = &e->packets[m & 0x7fffffffu].cmd.vk;
+      else
+         cache->scratch_cmds[k] = submit->command_buffers[m];
+   }
+   return cache->scratch_cmds;
+}
+
 static VkResult
 queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
                      struct vk_queue_submit *submit, bool *untouched)
@@ -7014,10 +7299,64 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
    const bool alias_dynamic = dev->host_alias.dynamic;
    if (unlikely(alias_dynamic))
       u_rwlock_rdlock(&dev->host_alias.patch_lock);
+
+   const uint32_t n = submit->command_buffer_count;
+   const uint8_t render_kinds = hk_sync_queue_kinds(&queue->sync, HK_SYNC_VDM);
+   const bool atomics = hk_pack_atomics_allowed(dev, queue);
+   const bool alias_scope = hk_cdm_alias_scope(dev);
+   const bool sparse_used = p_atomic_read(&dev->sparse_used) != 0;
+   const bool frame_anatomy = dev->frame_anatomy != NULL;
+
+   uint64_t stack_gens[HK_PACK_CACHE_MAX_CMDS];
+   uint64_t cache_hash = 0;
+   struct hk_pack_cache_entry *cached_entry = NULL;
+   if (n <= HK_PACK_CACHE_MAX_CMDS) {
+      cache_hash =
+         hk_pack_cache_hash(n, render_kinds, atomics, alias_scope, sparse_used,
+                            frame_anatomy, submit->command_buffers, stack_gens);
+      if (cache_hash) {
+         cached_entry = hk_pack_cache_lookup(
+            queue, cache_hash, n, render_kinds, atomics, alias_scope,
+            sparse_used, frame_anatomy, submit->command_buffers, stack_gens);
+      }
+   }
+
    struct hk_packed_runs runs;
-   const bool have_runs = hk_pack_runs(dev, queue, submit, &runs);
+   bool have_runs = false;
+   if (!cached_entry) {
+      have_runs = hk_pack_runs(dev, queue, submit, &runs);
+      if (have_runs && cache_hash && runs.packet_count > 0 &&
+          runs.bo_total <= HK_PACK_CACHE_MAX_BO_BYTES &&
+          runs.ioto_total <= HK_PACK_CACHE_MAX_BO_BYTES &&
+          runs.root_total <= HK_PACK_CACHE_MAX_BO_BYTES) {
+         cached_entry = hk_pack_cache_store(
+            dev, queue, cache_hash, n, render_kinds, atomics, alias_scope,
+            sparse_used, frame_anatomy, submit->command_buffers, stack_gens,
+            &runs);
+         if (cached_entry)
+            have_runs = false;
+      }
+   }
+
    if (unlikely(alias_dynamic))
       u_rwlock_rdunlock(&dev->host_alias.patch_lock);
+
+   if (cached_entry) {
+      struct vk_command_buffer **cmds =
+         hk_pack_cache_build_commands(queue, cached_entry, submit);
+      if (cmds) {
+         struct vk_queue_submit effective = *submit;
+         effective.command_buffer_count = cached_entry->command_count;
+         effective.command_buffers = cmds;
+         return queue_submit_recordings(dev, queue, &effective, original,
+                                        cached_entry->extra_bos,
+                                        cached_entry->extra_bo_count,
+                                        untouched);
+      }
+      /* Fallback on scratch OOM: submit unpacked original recordings. */
+      return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
+                                     untouched);
+   }
 
    if (!have_runs)
       return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
@@ -7578,6 +7917,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    agx_bo_unreference(&dev->dev, queue->g17p_sstt_flush_bo);
    agx_bo_unreference(&dev->dev, queue->ts_carrier_bo);
    agx_bo_unreference(&dev->dev, queue->host_flush_bo);
+   hk_pack_cache_fini(dev, queue);
    util_dynarray_fini(&queue->sync_resolved);
    hk_queue_pack_free_packets(queue);
    hk_queue_rpack_free_packets(queue);
@@ -7587,6 +7927,7 @@ hk_queue_finish(struct hk_device *dev, struct hk_queue *queue)
    util_dynarray_fini(&queue->pack.members);
    util_dynarray_fini(&queue->pack.runs);
    util_dynarray_fini(&queue->pack.commands);
+   util_dynarray_fini(&queue->pack.out_map);
    util_dynarray_fini(&queue->pack.fused);
    util_dynarray_fini(&queue->pack.plans);
    util_dynarray_fini(&queue->pack.planned_suppressed);

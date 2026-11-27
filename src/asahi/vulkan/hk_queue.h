@@ -13,6 +13,7 @@
 #include "vk_queue.h"
 
 struct hk_device;
+struct hk_pack_cache;
 struct hk_packed_submit;
 struct hk_render_packet;
 
@@ -120,6 +121,7 @@ struct hk_queue {
       struct util_dynarray members;
       struct util_dynarray runs;
       struct util_dynarray commands;
+      struct util_dynarray out_map;
       /* Per member: the fused compute-pair plan and its elision state. */
       struct util_dynarray fused;
       struct util_dynarray plans;
@@ -132,6 +134,9 @@ struct hk_queue {
       struct hk_packed_submit *packets;
       unsigned packets_cap;
    } pack;
+
+   /* Per-queue LRU cache of immutable packed compute submissions. */
+   struct hk_pack_cache *pack_cache;
 
    /* Reusable scratch and packets for submit-time render packing
     * (hk_render_pack_runs()). */
