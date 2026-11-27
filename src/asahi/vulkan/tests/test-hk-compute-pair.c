@@ -5189,6 +5189,254 @@ test_gemm_cmat_k32_small_tiles(void)
    ralloc_free(ref_orig);
 }
 
+static void
+test_general_pack_loop_bounds(void)
+{
+   /* 1. 2D grid-stride + inner push-bounded loop. */
+   {
+      nir_shader *s = new_compute_shader("grid_stride_2d", 32, 1, 1);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
+      nir_def *zero = nir_imm_int(&b, 0);
+      nir_def *off_h = nir_iadd(&b, zero, nir_imm_int(&b, 0));
+      nir_def *off_w = nir_iadd(&b, zero, nir_imm_int(&b, 4));
+      nir_def *off_k = nir_iadd(&b, zero, nir_imm_int(&b, 8));
+      nir_def *H = nir_load_push_constant(&b, 1, 32, off_h, .base = 0, .range = 16);
+      nir_def *W = nir_load_push_constant(&b, 1, 32, off_w, .base = 0, .range = 16);
+      nir_def *K = nir_load_push_constant(&b, 1, 32, off_k, .base = 0, .range = 16);
+      nir_def *wg = nir_load_workgroup_id(&b);
+      nir_def *nwg = nir_load_num_workgroups(&b);
+      nir_def *gid = nir_load_global_invocation_id(&b, 32);
+      nir_def *step_x = nir_imul_imm(&b, nir_channel(&b, nwg, 0), 32);
+
+      nir_variable *vy = nir_local_variable_create(b.impl, glsl_int_type(), "y");
+      nir_variable *vx = nir_local_variable_create(b.impl, glsl_int_type(), "x");
+      nir_variable *vk = nir_local_variable_create(b.impl, glsl_int_type(), "k");
+      nir_store_var(&b, vy, nir_channel(&b, wg, 1), 1);
+      nir_push_loop(&b);
+      {
+         nir_def *y = nir_load_var(&b, vy);
+         nir_push_if(&b, nir_ige(&b, y, H));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+
+         nir_store_var(&b, vx, nir_channel(&b, gid, 0), 1);
+         nir_push_loop(&b);
+         {
+            nir_def *x = nir_load_var(&b, vx);
+            nir_push_if(&b, nir_ige(&b, x, W));
+            nir_jump(&b, nir_jump_break);
+            nir_pop_if(&b, NULL);
+
+            nir_store_var(&b, vk, zero, 1);
+            nir_push_loop(&b);
+            {
+               nir_def *k = nir_load_var(&b, vk);
+               nir_push_if(&b, nir_ige(&b, k, K));
+               nir_jump(&b, nir_jump_break);
+               nir_pop_if(&b, NULL);
+               nir_store_var(&b, vk, nir_iadd_imm(&b, k, 1), 1);
+            }
+            nir_pop_loop(&b, NULL);
+            nir_store_var(&b, vx, nir_iadd(&b, x, step_x), 1);
+         }
+         nir_pop_loop(&b, NULL);
+         nir_store_var(&b, vy, nir_iadd(&b, y, nir_channel(&b, nwg, 1)), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_lower_vars_to_ssa(s);
+      nir_validate_shader(s, "grid_stride_2d");
+
+      struct hk_pack_loop_bound lb = {0};
+      HK_EVAL_CHECK(hk_nir_compute_pack_loop_bound(s, NULL, 0, &lb) && lb.valid);
+      int32_t push[4] = { 128, 320, 7, 0 };
+      uint32_t grid[3] = { 5, 64, 1 };
+      uint64_t val = 0;
+      /* y_trips = ceil(128/64)=2, x_trips = ceil(320/160)=2, k_trips = 7
+       * total = 1 + 2 * (1 + 2 * (1 + 7)) = 1 + 2 * 17 = 35 */
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      HK_EVAL_CHECK(val == 35);
+      /* Wrap hazard fails closed */
+      push[1] = INT32_MAX - 10;
+      HK_EVAL_CHECK(!hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      ralloc_free(s);
+   }
+
+   /* 2. Softmax pattern: next_pow2(C) bit-smear + countdown + halving loop. */
+   {
+      nir_shader *s = new_compute_shader("softmax_bounds", 32, 1, 1);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
+      nir_def *lid = nir_channel(&b, nir_load_local_invocation_id(&b), 0);
+      nir_def *C = nir_load_push_constant(&b, 1, 32, nir_iadd(&b, nir_imm_int(&b, 0), nir_imm_int(&b, 4)),
+                                          .base = 0, .range = 8);
+      nir_def *sm = nir_iadd_imm(&b, C, -1);
+      sm = nir_ior(&b, sm, nir_ishr_imm(&b, sm, 1));
+      sm = nir_ior(&b, sm, nir_ishr_imm(&b, sm, 2));
+      sm = nir_ior(&b, sm, nir_ishr_imm(&b, sm, 4));
+      sm = nir_ior(&b, sm, nir_ishr_imm(&b, sm, 8));
+      sm = nir_ior(&b, sm, nir_extract_i16(&b, sm, nir_imm_int(&b, 1)));
+      nir_def *np2 = nir_iadd_imm(&b, sm, 1);
+
+      /* Countdown loop: i = (next_pow2(C) - 1) - lid; while (i >= C) i -= 32 */
+      nir_variable *vi = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+      nir_store_var(&b, vi, nir_iadd(&b, sm, nir_ineg(&b, lid)), 1);
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, vi);
+         nir_push_if(&b, nir_ige(&b, i, C));
+         nir_push_else(&b, NULL);
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         nir_store_var(&b, vi, nir_iadd_imm(&b, i, -32), 1);
+      }
+      nir_pop_loop(&b, NULL);
+
+      /* Halving loop: s = next_pow2(C) / 2; while (0 < s) s = isign(s)*(|s|>>1) */
+      nir_variable *vs = nir_local_variable_create(b.impl, glsl_int_type(), "s");
+      nir_def *s_init = nir_idiv(&b, np2, nir_imm_int(&b, 2));
+      nir_store_var(&b, vs, s_init, 1);
+      nir_push_loop(&b);
+      {
+         nir_def *sv = nir_load_var(&b, vs);
+         nir_push_if(&b, nir_ilt(&b, nir_imm_int(&b, 0), sv));
+         nir_push_else(&b, NULL);
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         nir_def *mag = nir_ushr_imm(&b, nir_iabs(&b, sv), 1);
+         nir_def *sgn = nir_imin(&b, nir_imax(&b, sv, nir_imm_int(&b, -1)), nir_imm_int(&b, 1));
+         nir_store_var(&b, vs, nir_imul(&b, sgn, mag), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_lower_vars_to_ssa(s);
+      nir_validate_shader(s, "softmax_bounds");
+
+      struct hk_pack_loop_bound lb = {0};
+      HK_EVAL_CHECK(hk_nir_compute_pack_loop_bound(s, NULL, 0, &lb) && lb.valid);
+      int32_t push[2] = { 48384, 2 };
+      uint32_t grid[3] = { 24192, 1, 1 };
+      uint64_t val = 0;
+      /* countdown: ceil((2*2 + 1)/32) = 1; halving: log2(2*2/2)+1 = 2; total = 1 + 1 + 2 = 4 */
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      HK_EVAL_CHECK(val == 4);
+      /* Negative C must fail closed */
+      push[1] = -1;
+      HK_EVAL_CHECK(!hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      ralloc_free(s);
+   }
+
+   /* 3. Sliding-window stencil with if-phi min (Gaussian Blur H/V pattern). */
+   {
+      nir_shader *s = new_compute_shader("stencil_window", 32, 1, 1);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
+      nir_def *x = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+      nir_def *W0 = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 16);
+      nir_def *W1 = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 16);
+      nir_def *K = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 12), .base = 0, .range = 16);
+      nir_def *rad = nir_idiv(&b, K, nir_imm_int(&b, 2));
+      nir_def *start = nir_imax(&b, nir_iadd(&b, x, nir_ineg(&b, rad)), nir_imm_int(&b, 0));
+      nir_def *x_hi = nir_iadd(&b, x, rad);
+      nir_def *w_m1_a = nir_iadd_imm(&b, W0, -1);
+
+      nir_variable *vend = nir_local_variable_create(b.impl, glsl_int_type(), "end");
+      nir_push_if(&b, nir_ilt(&b, w_m1_a, x_hi));
+      {
+         nir_store_var(&b, vend, nir_iadd_imm(&b, W1, -1), 1);
+      }
+      nir_push_else(&b, NULL);
+      {
+         nir_store_var(&b, vend, x_hi, 1);
+      }
+      nir_pop_if(&b, NULL);
+      nir_def *end = nir_load_var(&b, vend);
+
+      nir_variable *vi = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+      nir_store_var(&b, vi, start, 1);
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, vi);
+         nir_push_if(&b, nir_ige(&b, end, i));
+         nir_push_else(&b, NULL);
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         nir_store_var(&b, vi, nir_iadd_imm(&b, i, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_lower_vars_to_ssa(s);
+      nir_validate_shader(s, "stencil_window");
+
+      struct hk_pack_loop_bound lb = {0};
+      HK_EVAL_CHECK(hk_nir_compute_pack_loop_bound(s, NULL, 0, &lb) && lb.valid);
+      int32_t push[4] = { 1920, 1088, 1920, 113 };
+      uint32_t grid[3] = { 60, 1088, 1 };
+      uint64_t val = 0;
+      /* rad = 56 -> span = 56 + 56 + 1 = 113 -> total = 114 */
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      HK_EVAL_CHECK(val == 114);
+      /* Negative kernel size fails closed */
+      push[3] = -4;
+      HK_EVAL_CHECK(!hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      /* Grid + rad + 2 overflowing INT32_MAX fails closed */
+      push[3] = 113;
+      grid[0] = (uint32_t)INT32_MAX / 32u;
+      HK_EVAL_CHECK(!hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      ralloc_free(s);
+   }
+
+   /* 4. Bottom-tested loop with additive limit expression (`2 * radius + 32`). */
+   {
+      nir_shader *s = new_compute_shader("bottom_tested_additive", 32, 1, 1);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
+      nir_def *rad = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 0, .range = 4);
+      nir_def *lim = nir_iadd_imm(&b, nir_imul_imm(&b, rad, 2), 32);
+      nir_variable *vi = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+      nir_store_var(&b, vi, nir_imm_int(&b, 0), 1);
+      nir_push_loop(&b);
+      {
+         nir_def *i_next = nir_iadd_imm(&b, nir_load_var(&b, vi), 32);
+         nir_store_var(&b, vi, i_next, 1);
+         nir_push_if(&b, nir_ige(&b, i_next, lim));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_lower_vars_to_ssa(s);
+      nir_validate_shader(s, "bottom_tested_additive");
+
+      struct hk_pack_loop_bound lb = {0};
+      HK_EVAL_CHECK(hk_nir_compute_pack_loop_bound(s, NULL, 0, &lb) && lb.valid);
+      int32_t push[1] = { 16 };
+      uint32_t grid[3] = { 1, 1, 1 };
+      uint64_t val = 0;
+      /* lim = 64, step = 32 -> trips = 2 -> total = 3 */
+      HK_EVAL_CHECK(hk_pack_eval_loop_bound_dispatch(&lb, NULL, push, sizeof(push), grid, &val));
+      HK_EVAL_CHECK(val == 3);
+      ralloc_free(s);
+   }
+
+   /* 5. SSBO-bounded loop must fail closed (valid == false). */
+   {
+      nir_shader *s = new_compute_shader("ssbo_unbounded", 32, 1, 1);
+      nir_builder b = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(s)));
+      nir_def *lim = nir_load_ssbo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+      nir_variable *vi = nir_local_variable_create(b.impl, glsl_int_type(), "i");
+      nir_store_var(&b, vi, nir_imm_int(&b, 0), 1);
+      nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, vi);
+         nir_push_if(&b, nir_ige(&b, i, lim));
+         nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, NULL);
+         nir_store_var(&b, vi, nir_iadd_imm(&b, i, 1), 1);
+      }
+      nir_pop_loop(&b, NULL);
+      nir_lower_vars_to_ssa(s);
+      nir_validate_shader(s, "ssbo_unbounded");
+
+      struct hk_pack_loop_bound lb = {0};
+      HK_EVAL_CHECK(!hk_nir_compute_pack_loop_bound(s, NULL, 0, &lb) && !lb.valid);
+      ralloc_free(s);
+   }
+}
+
 int
 main(void)
 {
@@ -5209,6 +5457,7 @@ main(void)
    test_gemm_dw_a_fusion();
    test_gemm_dw_fusion();
    test_nir_derived_pack_loop_bounds();
+   test_general_pack_loop_bounds();
    test_fast_udivmod_general();
    test_depthwise_shape_sweep_cpu_ref();
    test_g17p_compile_occupancy();
