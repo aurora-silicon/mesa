@@ -1122,6 +1122,10 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       const uint32_t border = p_atomic_read(&pdev->border_emulation);
       _mesa_blake3_update(&blake3_ctx, &border, sizeof(border));
    }
+   if (agx_chip_g17p_or_m5(pdev->dev.chip)) {
+      const uint32_t sparse = p_atomic_read(&pdev->sparse_buffer_emulation);
+      _mesa_blake3_update(&blake3_ctx, &sparse, sizeof(sparse));
+   }
 
    _mesa_blake3_final(&blake3_ctx, blake3_out);
 }
@@ -3681,12 +3685,74 @@ static uint8_t
 hk_static_set_mask(uint32_t set_layout_count,
                    struct vk_descriptor_set_layout *const *set_layouts);
 
+static bool
+hk_nir_needs_sparse_buffer(const nir_shader *nir, bool check_physical,
+                           bool check_ssbo)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               if (nir_instr_as_tex(instr)->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+                  return true;
+            } else if (instr->type == nir_instr_type_deref) {
+               if (check_ssbo &&
+                   nir_deref_mode_is(nir_instr_as_deref(instr),
+                                     nir_var_mem_ssbo))
+                  return true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               switch (intr->intrinsic) {
+               case nir_intrinsic_image_deref_load:
+               case nir_intrinsic_image_deref_sparse_load:
+               case nir_intrinsic_bindless_image_load:
+               case nir_intrinsic_bindless_image_sparse_load:
+                  if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF)
+                     return true;
+                  break;
+               case nir_intrinsic_vulkan_resource_index:
+               case nir_intrinsic_load_vulkan_descriptor:
+                  if (check_ssbo &&
+                      (nir_intrinsic_desc_type(intr) ==
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
+                       nir_intrinsic_desc_type(intr) ==
+                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC))
+                     return true;
+                  break;
+               case nir_intrinsic_load_deref:
+                  if (check_physical) {
+                     nir_deref_instr *leaf = nir_src_as_deref(intr->src[0]);
+                     if (leaf && leaf->modes == nir_var_mem_global)
+                        return true;
+                  }
+                  break;
+               default:
+                  break;
+               }
+            }
+         }
+      }
+   }
+   return false;
+}
+
+static bool
+hk_lazy_sparse_buffer_enabled(struct hk_device *dev, const nir_shader *nir)
+{
+   return dev->vk.enabled_features.sparseResidencyBuffer &&
+          agx_chip_g17p_or_m5(dev->dev.chip) &&
+          !nir->info.internal &&
+          hk_nir_needs_sparse_buffer(nir, agx_chip_g17_m5(dev->dev.chip),
+                                     hk_sparse_buffer_unmapped(&dev->dev));
+}
+
 static void
-hk_lower_nir(struct hk_device *dev, nir_shader *nir,
-             const struct vk_pipeline_robustness_state *rs, bool is_multiview,
-             VkShaderStageFlags next_stage_mask, uint32_t set_layout_count,
-             struct vk_descriptor_set_layout *const *set_layouts,
-             enum hk_feature_key features)
+hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
+                const struct vk_pipeline_robustness_state *rs,
+                bool is_multiview, VkShaderStageFlags next_stage_mask,
+                uint32_t set_layout_count,
+                struct vk_descriptor_set_layout *const *set_layouts,
+                enum hk_feature_key features, bool sparse_buffer_residency)
 {
    const bool already_preprocessed = nir->info.io_lowered;
    bool lowered_complex = false;
@@ -3911,7 +3977,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(lowered_complex, nir, agx_nir_lower_custom_border);
    }
 
-   if (dev->vk.enabled_features.sparseResidencyBuffer &&
+   if (sparse_buffer_residency &&
        agx_chip_g17_m5(dev->dev.chip)) {
       NIR_PASS(lowered_complex, nir, nir_shader_intrinsics_pass,
                lower_physical_sparse_load, nir_metadata_none, NULL);
@@ -3921,7 +3987,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
     * stays visible to later reads of its address, so storage-buffer stores
     * still check residency. */
    const bool sparse_store_guards =
-      dev->vk.enabled_features.sparseResidencyBuffer &&
+      sparse_buffer_residency &&
       hk_sparse_buffer_unmapped(&dev->dev);
 
    bool lowered_desc = false;
@@ -4213,7 +4279,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
          tex_gen |= AGX_NIR_TEXTURE_HW_TXF_BOUNDS;
       NIR_PASS(lowered_tex, nir, agx_nir_lower_texture_with_buffer_metadata,
                tex_gen, lower_agx3_robust_fetches, dev->dev.sparse_ro_offset,
-               dev->vk.enabled_features.sparseResidencyBuffer);
+               sparse_buffer_residency);
    } else {
       if (dev->physical_sparse_map &&
           hk_sparse_texel_residency_from_map(&dev->dev)) {
@@ -7118,6 +7184,7 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
 
    hk_fs_sample_source_destroy(obj->sample_source);
    hk_border_source_destroy(dev, obj->border_source);
+   hk_border_source_destroy(dev, obj->sparse_source);
    for (struct hk_mesh_fs_twin *twin = obj->mesh_twins, *next; twin;
         twin = next) {
       next = twin->next;

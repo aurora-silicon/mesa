@@ -99,6 +99,13 @@ struct hk_physical_device {
     * (hk_border_twin); the shader cache key carries it. Per physical device
     * because the cache key is computed from it (hk_hash_graphics_state). */
    uint32_t border_emulation;
+
+   /* Set once a device of this GPU creates a sparse resident buffer
+    * (VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT in hk_CreateBuffer). Shaders
+    * compiled before then leave out the software sparse-buffer residency
+    * lowering and are replaced by emulating twins when bound
+    * (hk_sparse_buffer_twin); the shader cache key carries it. */
+   uint32_t sparse_buffer_emulation;
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_physical_device, vk.base, VkPhysicalDevice,
@@ -132,6 +139,8 @@ void hk_cache_identity(const uint8_t build_sha[32],
 
 void hk_border_emulation_recall(struct hk_physical_device *pdev);
 void hk_border_emulation_remember(struct hk_physical_device *pdev);
+void hk_sparse_buffer_emulation_recall(struct hk_physical_device *pdev);
+void hk_sparse_buffer_emulation_remember(struct hk_physical_device *pdev);
 
 uint64_t hk_get_sysmem_heap_size(struct hk_physical_device *pdev);
 

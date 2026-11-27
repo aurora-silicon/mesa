@@ -1229,6 +1229,11 @@ struct hk_graphics_state {
     * has an emulating twin to switch to once the device needs it. */
    uint32_t border_free_stages;
 
+   /* Stages bound to a shader compiled without software sparse-buffer
+    * residency lowering that has an emulating twin to switch to once the
+    * device creates a sparse resident buffer. */
+   uint32_t sparse_free_stages;
+
    /* G17P: the twin of the bound fragment shader that reads its per-primitive
     * inputs from the bound mesh shader's records (hk_mesh_fs_twin()), or
     * NULL to draw with the bound fragment shader itself. */

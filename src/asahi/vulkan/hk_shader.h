@@ -588,6 +588,17 @@ struct hk_api_shader {
     * there, so a cache never hands it out unneeded). */
    bool border_emulating;
 
+   /* Non-NULL for a shader compiled without software sparse-buffer residency
+    * lowering because the device had created no sparse resident buffer: what
+    * its emulating twin compiles from, and the twin once built
+    * (hk_sparse_buffer_twin). */
+   struct hk_border_source *sparse_source;
+
+   /* Compiled with software sparse-buffer residency lowering that a device
+    * without a sparse resident buffer would have left out (serialized; such a
+    * binary is refused there, so a cache never hands it out unneeded). */
+   bool sparse_emulating;
+
    /* Compiled with agx_nir_lower_clip_m1_1 where it rasterizes; a mesh shader
     * sets it when its device enabled depthClipControl (serialized: a binary
     * without it is refused by a device that enabled the feature). */
@@ -637,6 +648,11 @@ nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
  * on first use. Thread-safe; NULL if it cannot be built. */
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
                                      struct hk_api_shader *obj);
+
+/* The sparse-buffer-emulating twin of a shader with a sparse source, built
+ * on first use. Thread-safe; NULL if it cannot be built. */
+struct hk_api_shader *hk_sparse_buffer_twin(struct hk_device *dev,
+                                            struct hk_api_shader *obj);
 
 /* The twin of a fragment shader with a feedback-loop source, compiled for a
  * depth/stencil feedback loop and built on first use. Thread-safe; NULL if it

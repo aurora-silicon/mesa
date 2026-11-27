@@ -547,6 +547,11 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       list_addtail(&buffer->sparse_link, &dev->sparse_buffers.list);
       p_atomic_inc(&dev->sparse_buffers.count);
       simple_mtx_unlock(&dev->sparse_buffers.lock);
+
+      struct hk_physical_device *pdev = hk_device_physical(dev);
+      if (!p_atomic_read(&pdev->sparse_buffer_emulation) &&
+          p_atomic_cmpxchg(&pdev->sparse_buffer_emulation, 0, 1) == 0)
+         hk_sparse_buffer_emulation_remember(pdev);
    }
 
    *pBuffer = hk_buffer_to_handle(buffer);

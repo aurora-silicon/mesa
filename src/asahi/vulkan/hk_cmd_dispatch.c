@@ -579,16 +579,29 @@ hk_cmd_bind_compute_shader(struct hk_cmd_buffer *cmd,
    cmd->state.cs.shader = shader;
 }
 
-/* A compute shader compiled without custom-border emulation dispatches as
- * its emulating twin once the device has created a sampler that needs it. */
+/* A compute shader compiled without custom-border or sparse-buffer emulation
+ * dispatches as its emulating twin once the device needs it. */
 static void
 hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
 {
    struct hk_api_shader *shader = cmd->state.cs.shader;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_physical_device *pdev = hk_device_physical(dev);
+
+   if (shader && unlikely(shader->sparse_source) &&
+       p_atomic_read(&pdev->sparse_buffer_emulation)) {
+      struct hk_api_shader *twin = hk_sparse_buffer_twin(dev, shader);
+      if (twin) {
+         cmd->state.cs.shader = twin;
+         shader = twin;
+      } else {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+         return;
+      }
+   }
 
    if (shader && unlikely(shader->border_source) &&
-       p_atomic_read(&hk_device_physical(dev)->border_emulation)) {
+       p_atomic_read(&pdev->border_emulation)) {
       struct hk_api_shader *twin = hk_border_twin(dev, shader);
       if (twin)
          cmd->state.cs.shader = twin;
