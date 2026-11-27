@@ -1285,9 +1285,10 @@ struct hk_graphics_state {
     * has an emulating twin to switch to once the device needs it. */
    uint32_t border_free_stages;
 
-   /* Stages bound to a shader compiled without image-view minLod emulation
-    * that has an emulating twin to switch to once the device needs it. */
-   uint32_t min_lod_free_stages;
+   /* Stages bound to a shader compiled without some texture-lowering
+    * emulations (hk_api_shader::tex_deferred) that has an emulating twin to
+    * switch to once the device needs them. */
+   uint32_t tex_free_stages;
 
    /* G17P: the twin of the bound fragment shader that reads its per-primitive
     * inputs from the bound mesh shader's records (hk_mesh_fs_twin()), or

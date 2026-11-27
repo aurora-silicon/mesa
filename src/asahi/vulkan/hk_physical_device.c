@@ -1964,18 +1964,21 @@ hk_border_emulation_remember(struct hk_physical_device *pdev)
 #endif
 }
 
+/* Lazily compiled emulations remembered per process in the disk cache, like
+ * the custom-border emulation above, so that the next run compiles shaders
+ * with them from the start. */
 static bool
-hk_min_lod_emulation_key(struct hk_physical_device *pdev, cache_key key)
+hk_lazy_emulation_key(struct hk_physical_device *pdev, const char *tag,
+                      cache_key key)
 {
 #ifdef ENABLE_SHADER_CACHE
    if (!pdev->vk.disk_cache)
       return false;
-   static const char tag[] = "hk min_lod emulation";
    const char *process = util_get_process_name();
    struct mesa_blake3 ctx;
    blake3_hash hash;
    _mesa_blake3_init(&ctx);
-   _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   _mesa_blake3_update(&ctx, tag, strlen(tag) + 1);
    if (process)
       _mesa_blake3_update(&ctx, process, strlen(process));
    _mesa_blake3_final(&ctx, hash);
@@ -1986,30 +1989,46 @@ hk_min_lod_emulation_key(struct hk_physical_device *pdev, cache_key key)
 #endif
 }
 
-void
-hk_min_lod_emulation_recall(struct hk_physical_device *pdev)
+static void
+hk_lazy_emulation_recall(struct hk_physical_device *pdev, const char *tag,
+                         uint32_t *flag)
 {
 #ifdef ENABLE_SHADER_CACHE
    cache_key key;
    size_t size;
-   if (!hk_min_lod_emulation_key(pdev, key))
+   if (!hk_lazy_emulation_key(pdev, tag, key))
       return;
    void *seen = disk_cache_get(pdev->vk.disk_cache, key, &size);
    if (seen)
-      p_atomic_set(&pdev->min_lod_emulation, 1);
+      p_atomic_set(flag, 1);
    free(seen);
 #endif
 }
 
-void
-hk_min_lod_emulation_remember(struct hk_physical_device *pdev)
+static void
+hk_lazy_emulation_remember(struct hk_physical_device *pdev, const char *tag)
 {
 #ifdef ENABLE_SHADER_CACHE
    static const uint8_t seen = 1;
    cache_key key;
-   if (hk_min_lod_emulation_key(pdev, key))
+   if (hk_lazy_emulation_key(pdev, tag, key))
       disk_cache_put(pdev->vk.disk_cache, key, &seen, sizeof(seen), NULL);
 #endif
+}
+
+static const char hk_min_lod_tag[] = "hk min_lod emulation";
+static const char hk_sparse_texel_tag[] = "hk sparse texel emulation";
+
+void
+hk_min_lod_emulation_remember(struct hk_physical_device *pdev)
+{
+   hk_lazy_emulation_remember(pdev, hk_min_lod_tag);
+}
+
+void
+hk_sparse_texel_emulation_remember(struct hk_physical_device *pdev)
+{
+   hk_lazy_emulation_remember(pdev, hk_sparse_texel_tag);
 }
 
 static void
@@ -2046,7 +2065,9 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, disk_cache_id);
    if (pdev->vk.disk_cache != NULL) {
       hk_border_emulation_recall(pdev);
-      hk_min_lod_emulation_recall(pdev);
+      hk_lazy_emulation_recall(pdev, hk_min_lod_tag, &pdev->min_lod_emulation);
+      hk_lazy_emulation_recall(pdev, hk_sparse_texel_tag,
+                               &pdev->sparse_texel_emulation);
       pdev->vk.properties.pipelineBinaryInternalCache = true;
       pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
       pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;

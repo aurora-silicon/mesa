@@ -579,17 +579,16 @@ hk_cmd_bind_compute_shader(struct hk_cmd_buffer *cmd,
    cmd->state.cs.shader = shader;
 }
 
-/* A compute shader compiled without custom-border emulation dispatches as
- * its emulating twin once the device has created a sampler that needs it. */
+/* A compute shader compiled without custom-border or texture-lowering
+ * emulations dispatches as its emulating twin once the device needs them. */
 static void
 hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
 {
    struct hk_api_shader *shader = cmd->state.cs.shader;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   if (shader && unlikely(shader->min_lod_source) &&
-       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
-      struct hk_api_shader *twin = hk_min_lod_twin(dev, shader);
+   if (shader && unlikely(shader->tex_source)) {
+      struct hk_api_shader *twin = hk_resolve_tex_twin(dev, shader);
       if (twin) {
          cmd->state.cs.shader = twin;
          shader = twin;

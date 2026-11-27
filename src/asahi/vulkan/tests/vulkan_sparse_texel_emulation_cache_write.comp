@@ -1,0 +1,9 @@
+#version 450
+/* Fills a storage texel buffer, unbound pages of a sparse buffer included. */
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, r32ui) uniform writeonly uimageBuffer img;
+layout(push_constant) uniform P { uint value; } p;
+void main()
+{
+   imageStore(img, int(gl_GlobalInvocationID.x), uvec4(p.value));
+}

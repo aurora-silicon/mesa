@@ -103,8 +103,15 @@ struct hk_physical_device {
    /* Set once a device of this GPU creates an image view with a non-zero
     * relative minLod (hk_image_view_init). Shaders compiled before then leave
     * image-view minLod emulation out and are replaced by emulating twins when
-    * bound (hk_min_lod_twin); the shader cache key carries it. */
+    * bound (hk_tex_twin); the shader cache key carries it. */
    uint32_t min_lod_emulation;
+
+   /* Set once a device of this GPU creates a buffer with a sparse residency
+    * map (hk_CreateBuffer). Until then every texel-buffer access reads a
+    * resident texel, so shaders compiled before leave its residency check
+    * out and are replaced by checking twins when bound (hk_tex_twin); the
+    * shader cache key carries it. */
+   uint32_t sparse_texel_emulation;
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_physical_device, vk.base, VkPhysicalDevice,
@@ -138,8 +145,8 @@ void hk_cache_identity(const uint8_t build_sha[32],
 
 void hk_border_emulation_recall(struct hk_physical_device *pdev);
 void hk_border_emulation_remember(struct hk_physical_device *pdev);
-void hk_min_lod_emulation_recall(struct hk_physical_device *pdev);
 void hk_min_lod_emulation_remember(struct hk_physical_device *pdev);
+void hk_sparse_texel_emulation_remember(struct hk_physical_device *pdev);
 
 uint64_t hk_get_sysmem_heap_size(struct hk_physical_device *pdev);
 

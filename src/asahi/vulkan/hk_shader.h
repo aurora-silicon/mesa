@@ -592,15 +592,20 @@ struct hk_api_shader {
     * there, so a cache never hands it out unneeded). */
    bool border_emulating;
 
-   /* Non-NULL for a shader compiled without image-view minLod emulation
-    * because the device had created no view with minLod > baseMipLevel: what
-    * its emulating twin compiles from, and the twin once built
-    * (hk_min_lod_twin). */
-   struct hk_border_source *min_lod_source;
+   /* Non-NULL for a shader compiled without some of the texture-lowering
+    * emulations in tex_deferred (enum hk_lazy_tex) because the device did not
+    * need them yet: its NIR before texture lowering, which its emulating twin
+    * compiles from, and the twin once built (hk_tex_twin). */
+   struct hk_border_source *tex_source;
+   uint8_t tex_deferred;
 
    /* Compiled with image-view minLod emulation that a device without a
     * non-zero minLod view would have left out (serialized; refused there). */
    bool min_lod_emulating;
+
+   /* Compiled with the texel-buffer residency check that a device without a
+    * sparse resident buffer would have left out (serialized; refused there). */
+   bool sparse_texel_emulating;
 
    /* Compiled with agx_nir_lower_clip_m1_1 where it rasterizes; a mesh shader
     * sets it when its device enabled depthClipControl (serialized: a binary
@@ -652,10 +657,36 @@ nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
 struct hk_api_shader *hk_border_twin(struct hk_device *dev,
                                      struct hk_api_shader *obj);
 
-/* The image-view-minLod-emulating twin of a shader with a min_lod source,
- * built on first use. Thread-safe; NULL if it cannot be built. */
-struct hk_api_shader *hk_min_lod_twin(struct hk_device *dev,
-                                      struct hk_api_shader *obj);
+/* Texture-lowering emulations compiled in only once the physical device
+ * needs them, until then deferred to an emulating twin (hk_tex_twin). */
+enum hk_lazy_tex {
+   /* VK_EXT_image_view_min_lod: a view with minLod > baseMipLevel exists. */
+   HK_LAZY_TEX_MIN_LOD = BITFIELD_BIT(0),
+   /* Sparse texel-buffer residency: a buffer with a residency map exists. */
+   HK_LAZY_TEX_SPARSE_TEXEL = BITFIELD_BIT(1),
+};
+
+/* The deferred emulations the physical device needs now. */
+uint8_t hk_lazy_tex_needed(struct hk_device *dev);
+
+/* The twin of a shader with a texture-lowering source that compiles in the
+ * deferred emulations the device needs now, built on first use. It may defer
+ * the others in turn. Thread-safe; NULL if it cannot be built. */
+struct hk_api_shader *hk_tex_twin(struct hk_device *dev,
+                                  struct hk_api_shader *obj);
+
+struct hk_api_shader *hk_resolve_tex_twin_slow(struct hk_device *dev,
+                                              struct hk_api_shader *shader);
+
+/* Replace shader by its texture-lowering twins until it compiles in every
+ * deferred emulation the device needs. NULL if a twin cannot be built. */
+static inline struct hk_api_shader *
+hk_resolve_tex_twin(struct hk_device *dev, struct hk_api_shader *shader)
+{
+   if (likely(!shader || !shader->tex_source))
+      return shader;
+   return hk_resolve_tex_twin_slow(dev, shader);
+}
 
 /* The twin of a fragment shader with a feedback-loop source, compiled for a
  * depth/stencil feedback loop and built on first use. Thread-safe; NULL if it

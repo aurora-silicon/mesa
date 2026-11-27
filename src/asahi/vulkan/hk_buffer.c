@@ -549,6 +549,15 @@ hk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       simple_mtx_unlock(&dev->sparse_buffers.lock);
    }
 
+   /* Texel buffers read through this buffer's residency map from now on, so
+    * shaders must check it (hk_tex_twin). */
+   if (buffer->sparse_map) {
+      struct hk_physical_device *pdev = hk_device_physical(dev);
+      if (!p_atomic_read(&pdev->sparse_texel_emulation) &&
+          p_atomic_cmpxchg(&pdev->sparse_texel_emulation, 0, 1) == 0)
+         hk_sparse_texel_emulation_remember(pdev);
+   }
+
    *pBuffer = hk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;

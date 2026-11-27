@@ -1321,6 +1321,15 @@ if with_tests
   )
 
   executable(
+    'vulkan-sparse-texel-emulation-cache',
+    files('tests/vulkan_sparse_texel_emulation_cache.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
     'vulkan-min-lod-emulation-cache',
     files('tests/vulkan_min_lod_emulation_cache.c'),
     include_directories : [inc_include],

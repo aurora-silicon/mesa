@@ -7916,11 +7916,11 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
       shader = dev->null_fs;
    }
 
-   /* A shader compiled without image-view minLod emulation is replaced by its
-    * emulating twin once the device has created a view with minLod > base. */
-   if (shader && unlikely(shader->min_lod_source) &&
-       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
-      struct hk_api_shader *twin = hk_min_lod_twin(dev, shader);
+   /* A shader compiled without texture-lowering emulations the device now
+    * needs (image-view minLod, sparse texel-buffer residency) is replaced by
+    * its emulating twin. */
+   if (shader && unlikely(shader->tex_source)) {
+      struct hk_api_shader *twin = hk_resolve_tex_twin(dev, shader);
       if (twin)
          shader = twin;
       else
@@ -7947,10 +7947,10 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
    else
       cmd->state.gfx.border_free_stages &= ~BITFIELD_BIT(stage);
 
-   if (shader && shader->min_lod_source)
-      cmd->state.gfx.min_lod_free_stages |= BITFIELD_BIT(stage);
+   if (shader && shader->tex_source)
+      cmd->state.gfx.tex_free_stages |= BITFIELD_BIT(stage);
    else
-      cmd->state.gfx.min_lod_free_stages &= ~BITFIELD_BIT(stage);
+      cmd->state.gfx.tex_free_stages &= ~BITFIELD_BIT(stage);
 
    /* Any direct stage replacement (shader objects, meta restore, or an
     * internal passthrough GS) invalidates the common runtime's redundant
@@ -15826,12 +15826,17 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    if (gfx->shaders[MESA_SHADER_FRAGMENT] == NULL)
       hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_FRAGMENT, NULL);
 
-   /* The device may have created its first view with minLod > base or its first
-    * sampler that needs custom-border emulation since these shaders were bound. */
-   if (unlikely(gfx->min_lod_free_stages) &&
-       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
-      u_foreach_bit(stage, gfx->min_lod_free_stages)
-         hk_cmd_bind_graphics_shader(cmd, stage, gfx->shaders[stage]);
+   /* The device may have created its first view with minLod > base, buffer
+    * with a sparse residency map, or sampler that needs custom-border
+    * emulation since these shaders were bound. */
+   if (unlikely(gfx->tex_free_stages)) {
+      const uint8_t needed = hk_lazy_tex_needed(dev);
+      if (needed) {
+         u_foreach_bit(stage, gfx->tex_free_stages) {
+            if (gfx->shaders[stage]->tex_deferred & needed)
+               hk_cmd_bind_graphics_shader(cmd, stage, gfx->shaders[stage]);
+         }
+      }
    }
    if (unlikely(gfx->border_free_stages) &&
        p_atomic_read(&hk_device_physical(dev)->border_emulation)) {

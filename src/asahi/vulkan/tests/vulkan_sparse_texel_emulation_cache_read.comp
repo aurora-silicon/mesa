@@ -1,0 +1,13 @@
+#version 450
+/* Reads a sparse buffer back through a storage and a uniform texel buffer. */
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0, r32ui) uniform readonly uimageBuffer img;
+layout(set = 0, binding = 1, std430) writeonly buffer Out { uint v[]; };
+layout(set = 0, binding = 2) uniform usamplerBuffer tb;
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   uint n = uint(imageSize(img));
+   v[i] = imageLoad(img, int(i)).x;
+   v[n + i] = texelFetch(tb, int(i)).x;
+}
