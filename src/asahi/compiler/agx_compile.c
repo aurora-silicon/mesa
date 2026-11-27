@@ -19788,6 +19788,14 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                                             : push_count,
                &push_count, place_load_bases_low);
       info->push_count = push_count;
+   } else if (!is_agx3 && form_preamble &&
+              key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+              agx_chip_has_cap(key->dev.chip, AGX_CAP_PREAMBLE_BASES_LOW) &&
+              info->push_count > key->reserved_preamble) {
+      unsigned push_count = info->push_count;
+      NIR_PASS(post_opt_progress, nir, agx_nir_place_preamble_bases_low,
+               key->reserved_preamble, push_count, &push_count);
+      info->push_count = push_count;
    }
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
