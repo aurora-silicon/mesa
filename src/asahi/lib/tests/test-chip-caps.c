@@ -283,18 +283,20 @@ test_signed_zero_minmax_select(void)
    }
 }
 
-/* AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED and AGX_CAP_FOLD_SHARED_OFFSETS are
- * enabled on the measured G13 rows (G13G, G13X) only. */
+/* AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED is enabled on the measured G13 rows
+ * (G13G, G13X) only; AGX_CAP_FOLD_SHARED_OFFSETS also covers G14X. */
 static void
 test_g13_compute_codegen_caps(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
+      const bool expected_g13 = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
+      const bool expected_fold = expected_g13 || c == AGX_CHIP_G14X;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED) ==
-                    expected,
+                    expected_g13,
                  c);
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_FOLD_SHARED_OFFSETS) == expected,
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_FOLD_SHARED_OFFSETS) ==
+                    expected_fold,
                  c);
    }
 }

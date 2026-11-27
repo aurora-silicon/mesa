@@ -175,7 +175,7 @@ enum agx_chip_cap {
 
    /* Constant deltas between a block's shared-memory accesses fold into the
     * lload/lstore index immediate (4 elements of the access type per unit).
-    * Measured on G13G and G13X; other generations keep the unfolded
+    * Measured on G13G, G13X, and G14X; other variants keep the unfolded
     * addresses until they are measured. */
    AGX_CAP_FOLD_SHARED_OFFSETS = 1u << 24,
 
@@ -253,7 +253,7 @@ enum agx_chip_cap {
    X(G13G, AGX_CAPS_G13 | AGX_CAP_CDM_DEFER_FLUSH, __VA_ARGS__)                \
    X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G14X, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
+   X(G14X, AGX_CAPS_AGX2 | AGX_CAP_FOLD_SHARED_OFFSETS, __VA_ARGS__)           \
    X(G15P, 0, __VA_ARGS__)                                                     \
    X(G15G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15S, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
