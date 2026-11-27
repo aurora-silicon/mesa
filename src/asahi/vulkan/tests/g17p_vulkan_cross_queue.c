@@ -508,6 +508,77 @@ run(bool compressed, bool tail, bool empty_wait, bool execute)
    return bad_frames;
 }
 
+static bool
+find_device_and_queue_family(VkInstance instance, VkPhysicalDevice *pdev_out,
+                             uint32_t *qfam_out, const char **skip_reason)
+{
+   uint32_t count = 0;
+   CHECK(vkEnumeratePhysicalDevices(instance, &count, NULL));
+   if (!count) {
+      *skip_reason = "no Vulkan device";
+      return false;
+   }
+   VkPhysicalDevice *pdevs = calloc(count, sizeof(*pdevs));
+   if (!pdevs) {
+      fprintf(stderr, "out of memory\n");
+      exit(2);
+   }
+   CHECK(vkEnumeratePhysicalDevices(instance, &count, pdevs));
+
+   bool had_capable_device = false;
+   for (uint32_t d = 0; d < count; ++d) {
+      VkPhysicalDeviceProperties props;
+      vkGetPhysicalDeviceProperties(pdevs[d], &props);
+      if (props.apiVersion < VK_API_VERSION_1_3)
+         continue;
+
+      VkPhysicalDeviceVulkan13Features f13 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+      };
+      VkPhysicalDeviceVulkan12Features f12 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+         .pNext = &f13,
+      };
+      VkPhysicalDeviceFeatures2 f2 = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+         .pNext = &f12,
+      };
+      vkGetPhysicalDeviceFeatures2(pdevs[d], &f2);
+      if (!f12.timelineSemaphore || !f13.synchronization2 ||
+          !f13.dynamicRendering)
+         continue;
+
+      had_capable_device = true;
+      uint32_t qcount = 0;
+      vkGetPhysicalDeviceQueueFamilyProperties(pdevs[d], &qcount, NULL);
+      VkQueueFamilyProperties *families = calloc(qcount, sizeof(*families));
+      if (!families) {
+         fprintf(stderr, "out of memory\n");
+         exit(2);
+      }
+      vkGetPhysicalDeviceQueueFamilyProperties(pdevs[d], &qcount, families);
+      for (uint32_t q = 0; q < qcount; ++q) {
+         const VkQueueFlags want = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+         if ((families[q].queueFlags & want) == want &&
+             families[q].queueCount >= 2) {
+            *pdev_out = pdevs[d];
+            *qfam_out = q;
+            free(families);
+            free(pdevs);
+            return true;
+         }
+      }
+      free(families);
+   }
+
+   free(pdevs);
+   *skip_reason = had_capable_device
+                     ? "two queues in one graphics+compute family are required"
+                     : "Vulkan 1.3 with timelineSemaphore, synchronization2, and "
+                       "dynamicRendering is required";
+   return false;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -523,11 +594,19 @@ main(int argc, char **argv)
    };
    VkInstance instance;
    CHECK(vkCreateInstance(&instance_info, NULL, &instance));
-   uint32_t count = 1;
-   CHECK(vkEnumeratePhysicalDevices(instance, &count, &pdev));
+
+   uint32_t qfam = 0;
+   const char *skip_reason = NULL;
+   if (!find_device_and_queue_family(instance, &pdev, &qfam, &skip_reason)) {
+      printf("SKIP: %s\n", skip_reason);
+      vkDestroyInstance(instance, NULL);
+      return 77;
+   }
+
    const float priorities[2] = {1.0f, 1.0f};
    const VkDeviceQueueCreateInfo queue_info = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = qfam,
       .queueCount = 2,
       .pQueuePriorities = priorities,
    };
@@ -548,10 +627,11 @@ main(int argc, char **argv)
       .pQueueCreateInfos = &queue_info,
    };
    CHECK(vkCreateDevice(pdev, &device_info, NULL, &dev));
-   vkGetDeviceQueue(dev, 0, 0, &queue[0]);
-   vkGetDeviceQueue(dev, 0, 1, &queue[1]);
+   vkGetDeviceQueue(dev, qfam, 0, &queue[0]);
+   vkGetDeviceQueue(dev, qfam, 1, &queue[1]);
    const VkCommandPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = qfam,
    };
    CHECK(vkCreateCommandPool(dev, &pool_info, NULL, &pool));
 
