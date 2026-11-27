@@ -3,8 +3,9 @@
  *
  * Linear vkCmdBlitImage mip chains on images G17P compresses (RGBA8/BGRA8
  * render targets), the commands zink records for glGenerateMipmap: upload
- * level 0, blit each level from the one above, read every level back and
- * compare it bit for bit with the G17P linear filter computed here.
+ * level 0 (from tightly packed or padded buffer rows), blit each level from
+ * the one above, read every level back and compare it bit for bit with the
+ * G17P linear filter computed here.
  *
  * Then, for each image: a render pass that loads and stores level 1 without
  * drawing must leave it unchanged, and for RGBA8 a blit from the compressed
@@ -311,6 +312,8 @@ capture_end(const char *needle)
 struct test_case {
    VkFormat format;
    uint32_t width, height;
+   /* bufferRowLength of the level 0 upload, 0 for tightly packed rows */
+   uint32_t row_length;
 };
 
 static void
@@ -375,12 +378,25 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
    to_general(cmd, image);
    if (with_plain)
       to_general(cmd, plain);
+   /* Padded rows: the same texels at a pitch of row_length texels, with the
+    * padding filled so that a misaddressed row reads back wrong. */
+   uint8_t *padded = NULL;
+   VkBuffer padded_buf = VK_NULL_HANDLE;
+   if (t->row_length) {
+      const uint64_t pitch = 4ull * t->row_length;
+      padded_buf = buffer_create(pitch * h, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                 &padded);
+      memset(padded, 0xa5, pitch * h);
+      for (uint32_t y = 0; y < h; ++y)
+         memcpy(padded + y * pitch, upload + 4ull * w * y, 4ull * w);
+   }
    const VkBufferImageCopy up = {
+      .bufferRowLength = t->row_length,
       .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
       .imageExtent = {w, h, 1},
    };
-   vkCmdCopyBufferToImage(cmd, upload_buf, image, VK_IMAGE_LAYOUT_GENERAL, 1,
-                          &up);
+   vkCmdCopyBufferToImage(cmd, t->row_length ? padded_buf : upload_buf, image,
+                          VK_IMAGE_LAYOUT_GENERAL, 1, &up);
    barrier(cmd);
 
    if (expect_compute)
@@ -499,6 +515,8 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
 
    vkDestroyImageView(dev, view, NULL);
    vkDestroyBuffer(dev, upload_buf, NULL);
+   if (padded_buf)
+      vkDestroyBuffer(dev, padded_buf, NULL);
    vkDestroyBuffer(dev, out_buf, NULL);
    vkDestroyBuffer(dev, again_buf, NULL);
    vkDestroyBuffer(dev, plain_buf, NULL);
@@ -563,6 +581,9 @@ main(int argc, char **argv)
       {VK_FORMAT_R8G8B8A8_UNORM, 40, 1000},
       {VK_FORMAT_B8G8R8A8_UNORM, 300, 17},
       {VK_FORMAT_B8G8R8A8_UNORM, 3840, 2160},
+      /* Level 0 uploaded from padded rows */
+      {VK_FORMAT_R8G8B8A8_UNORM, 256, 256, 300},
+      {VK_FORMAT_B8G8R8A8_UNORM, 129, 127, 1024},
    };
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
       run_case(&cases[i], !shim, expect_compute);

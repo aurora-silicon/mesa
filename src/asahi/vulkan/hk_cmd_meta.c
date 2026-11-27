@@ -2969,7 +2969,8 @@ build_g17p_block_upload_shader(void)
       nir_def *ly = nir_iadd_imm(b, nir_channel(b, lid, 1), r * wg_h);
       nir_def *y = nir_umin(b, nir_iadd(b, nir_channel(b, origin, 1), ly),
                             nir_iadd_imm(b, block_upload_push(b, height), -1));
-      nir_def *row_B = nir_u2u64(b, nir_imul(b, y, block_upload_push(b, row_pitch_B)));
+      /* A 32x32 -> 64-bit product: rows past 4 GiB of a large pitch. */
+      nir_def *row_B = nir_umul_2x32_64(b, y, block_upload_push(b, row_pitch_B));
       words[r] = nir_load_global(b, 1, 32, nir_iadd(b, src, row_B), .align_mul = 4);
    }
 
@@ -3062,7 +3063,9 @@ hk_g17p_block_upload_pipeline(struct hk_device *dev,
 }
 
 /* Whole compressed levels of a one-plane 2D RGBA8 or BGRA8 image, from rows
- * of four-byte texels. */
+ * of four-byte texels whose pitch fits the shader's 32-bit push constant
+ * (hk_g17p_block_upload_row_pitch()); wider rows keep the render-pass
+ * upload. */
 static bool
 hk_g17p_block_upload_supported(struct hk_device *dev,
                                const struct hk_image *image,
@@ -3085,6 +3088,7 @@ hk_g17p_block_upload_supported(struct hk_device *dev,
       const uint32_t level = region->imageSubresource.mipLevel;
       const uint32_t width = u_minify(image->vk.extent.width, level);
       const uint32_t height = u_minify(image->vk.extent.height, level);
+      uint32_t row_pitch_B;
       if (region->imageSubresource.aspectMask != VK_IMAGE_ASPECT_COLOR_BIT ||
           region->imageOffset.x || region->imageOffset.y ||
           region->imageOffset.z || region->imageExtent.width != width ||
@@ -3092,7 +3096,8 @@ hk_g17p_block_upload_supported(struct hk_device *dev,
           region->imageExtent.depth != 1 ||
           !ail_is_level_logically_compressed(layout, level) ||
           (region->bufferOffset & 3) ||
-          (region->bufferRowLength && region->bufferRowLength < width) ||
+          !hk_g17p_block_upload_row_pitch(width, region->bufferRowLength,
+                                          &row_pitch_B) ||
           (region->bufferImageHeight && region->bufferImageHeight < height))
          return false;
    }
@@ -3122,17 +3127,14 @@ hk_g17p_block_upload(struct hk_cmd_buffer *cmd, struct hk_buffer *buffer,
       const VkImageSubresourceLayers *sub = &region->imageSubresource;
       const uint32_t width = region->imageExtent.width;
       const uint32_t height = region->imageExtent.height;
-      const uint32_t row_texels =
-         region->bufferRowLength ? region->bufferRowLength : width;
       const uint32_t rows =
          region->bufferImageHeight ? region->bufferImageHeight : height;
-      const uint64_t row_pitch_B = (uint64_t)row_texels * 4;
-      const uint64_t layer_B = row_pitch_B * rows;
+      uint32_t row_pitch_B = 0;
+      ASSERTED bool pitch_ok = hk_g17p_block_upload_row_pitch(
+         width, region->bufferRowLength, &row_pitch_B);
+      assert(pitch_ok && "hk_g17p_block_upload_supported() checked the pitch");
+      const uint64_t layer_B = (uint64_t)row_pitch_B * rows;
       const uint32_t layers = vk_image_subresource_layer_count(&image->vk, sub);
-      if (row_pitch_B > UINT32_MAX) {
-         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         return;
-      }
 
       for (uint32_t l = 0; l < layers; ++l) {
          const VkImageViewUsageCreateInfo usage = {
@@ -3175,7 +3177,7 @@ hk_g17p_block_upload(struct hk_cmd_buffer *cmd, struct hk_buffer *buffer,
          };
          const struct hk_g17p_block_upload_push push = {
             .src = hk_buffer_address_ro(buffer, region->bufferOffset + l * layer_B),
-            .row_pitch_B = (uint32_t)row_pitch_B,
+            .row_pitch_B = row_pitch_B,
             .width = width,
             .height = height,
          };
