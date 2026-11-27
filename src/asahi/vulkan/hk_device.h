@@ -354,11 +354,17 @@ struct hk_device {
    } vdm;
 
    bool cmd_pending_ready;
+   /* Number of queues currently linked into cmd_pending_queues. */
+   int cmd_pending_active;
    simple_mtx_t cmd_pending_lock;
    /* Queues with pending submissions (hk_queue::cmd_link). */
    struct list_head cmd_pending_queues;
    /* Submissions that completed with an error: kept until destruction. */
    struct list_head cmd_pending_failed;
+   /* Recording memory quarantined after device loss. */
+   struct list_head cmd_lost_bos;
+   struct list_head cmd_lost_spans;
+   struct list_head cmd_lost_large_bos;
    /* Completion syncobjs of retired submissions, for reuse. */
    uint32_t cmd_syncobjs[HK_CMD_SYNCOBJ_POOL];
    unsigned cmd_syncobj_count;
@@ -416,7 +422,18 @@ struct hk_device {
       simple_mtx_t lock;
    } scratch;
 
+   /* Set once the device creates a sparse buffer or image; the CDM barrier
+    * then keeps the full word (hk_cdm_cache_flush). */
+   uint32_t sparse_used;
+
    uint32_t perftest;
+   /* drirc hk_submit_batch_size: at most this many commands per kernel
+    * submission (0: the kernel and batching limits alone). */
+   unsigned submit_batch_size;
+   /* The AGX2 CDM_BARRIER flag word emitted at a tracked dependency on
+    * this chip (agx2_cdm_barrier_default_word()): the reduced word on the
+    * dies it was measured on, the full word elsewhere. */
+   uint32_t cdm_barrier_default_mask;
 
    struct {
       struct u_rwlock lock;
@@ -443,6 +460,8 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
+   /* Force the full CDM barrier word on every chip (perftest only). */
+   HK_PERF_FULLCDMBARRIER = BITFIELD_BIT(11),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
@@ -490,6 +509,17 @@ hk_cdm_memory_scope_form(const struct hk_device *dev)
 {
    return agx_chip_has_record(dev->dev.chip,
                               AGX_RECORD_CDM_BARRIER_FLUSH_MEMORY);
+}
+
+/* Whether a compute command whose stream ends with the strong memory-scoped
+ * flush says so (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION), so the kernel can
+ * let another queue's kick wait for its completion in firmware. */
+static inline bool
+hk_cdm_visible_completion(const struct hk_device *dev)
+{
+   return agx_chip_g17_m5(dev->dev.chip) &&
+          (dev->dev.params.features &
+           DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION);
 }
 
 /* Whether it is still unknown if the GPU's caches are tagged by virtual
@@ -647,6 +677,9 @@ hk_device_alloc_scratch(struct hk_device *dev, mesa_shader_stage stage,
  * launch programs (hk_cmd_draw.c). */
 void hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev);
 void hk_g17p_bg_eot_dev_cache_finish(struct hk_device *dev);
+
+/* Alignment of every hk_code_alloc() offset. */
+#define HK_CODE_ALIGNMENT 256
 
 /* Allocate size bytes of executable memory. Returns a reference to the chunk
  * BO holding it, with the allocation at *offset; release it with

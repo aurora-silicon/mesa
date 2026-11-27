@@ -229,10 +229,15 @@ test_threaded_context(struct pipe_screen *screen)
    pctx->texture_subdata(pctx, tex, 0, PIPE_MAP_WRITE, &box, pixels, 32 * 4,
                          sizeof(pixels));
 
+   /* A compressed level (G17P) uploads and reads back through GPU staging
+    * blits, which the no-op shim never executes, so only an uncompressed
+    * level can be compared here. */
+   const bool compressed =
+      ail_is_level_logically_compressed(&agx_resource(tex)->layout, 0);
    xfer = NULL;
    ptr = pctx->texture_map(pctx, tex, 0, PIPE_MAP_READ, &box, &xfer);
    CHECK(ptr && xfer);
-   for (unsigned y = 0; y < 32; ++y) {
+   for (unsigned y = 0; y < 32 && !compressed; ++y) {
       const uint32_t *row = (const uint32_t *)((const uint8_t *)ptr + y * xfer->stride);
       for (unsigned x = 0; x < 32; ++x)
          CHECK(row[x] == pixels[y * 32 + x]);
@@ -281,6 +286,19 @@ test_threaded_context(struct pipe_screen *screen)
    CHECK(screen->fence_finish(screen, pctx, fence, OS_TIMEOUT_INFINITE));
    screen->fence_reference(screen, &fence, NULL);
    CHECK(fence == NULL);
+
+   /* An async frontend flush (glFlush) reaching an idle driver thread runs
+    * the recorded calls on the calling thread instead of waking the driver
+    * thread, so a following fence wait does not pay that wakeup. */
+   pctx->flush(pctx, NULL, 0);
+   pctx->buffer_subdata(pctx, buf, PIPE_MAP_WRITE, 0, sizeof(data), data);
+   CHECK(tc->batch_slots[tc->next].num_total_slots > 0);
+   const unsigned offloaded = p_atomic_read(&tc->num_offloaded_slots);
+   const unsigned direct = p_atomic_read(&tc->num_direct_slots);
+   pctx->flush(pctx, NULL, PIPE_FLUSH_ASYNC);
+   CHECK(p_atomic_read(&tc->num_offloaded_slots) == offloaded);
+   CHECK(p_atomic_read(&tc->num_direct_slots) > direct);
+   CHECK(tc->batch_slots[tc->next].num_total_slots == 0);
 
    /* Deferred fence flush (glFenceSync) followed by synchronous flush
     * (glFinish) and zero-timeout fence_finish

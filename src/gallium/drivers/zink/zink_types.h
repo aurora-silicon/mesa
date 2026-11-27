@@ -282,6 +282,8 @@ struct zink_tc_fence {
    struct pipe_reference reference;
    /* enables distinction between tc fence submission and vk queue submission */
    uint32_t submit_count;
+   /* batch flush generation this fence waits on */
+   uint32_t target_flush_id;
    /* when the tc fence is signaled for use */
    struct util_queue_fence ready;
    struct tc_unflushed_batch_token *tc_token;
@@ -642,6 +644,10 @@ struct zink_batch_state {
    simple_mtx_t exportable_lock;
 
    struct util_queue_fence flush_completed;
+   /* incremented atomically in zink_end_batch() after flush_completed is armed */
+   uint32_t flush_id;
+   /* updated atomically in reset_batch_state_internal() before clearing submitted/batch_id */
+   uint32_t reset_id;
 
    struct set programs;
    struct set dmabuf_exports;
@@ -1390,6 +1396,10 @@ struct zink_screen {
    VkSemaphore sem;
    VkFence fence;
    struct util_queue flush_queue;
+   /* jobs added to flush_queue that have not finished yet */
+   uint32_t flush_queue_jobs;
+   /* orders batch ids with their vkQueueSubmit when a submission bypasses an idle flush_queue */
+   simple_mtx_t submit_lock;
    simple_mtx_t copy_context_lock;
    struct zink_context *copy_context;
 
@@ -1404,6 +1414,9 @@ struct zink_screen {
    simple_mtx_t semaphores_lock;
    struct util_dynarray semaphores;
    struct util_dynarray fd_semaphores;
+
+   /* protects bs->fence.mfences and mfence->fence attachment/detachment; strict leaf lock */
+   simple_mtx_t mfences_lock;
 
    unsigned buffer_rebind_counter;
    unsigned image_rebind_counter;

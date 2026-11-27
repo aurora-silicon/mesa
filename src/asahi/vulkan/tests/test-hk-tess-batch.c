@@ -82,6 +82,13 @@ hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
    assert(!"no alias sites are recorded");
 }
 
+void
+hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd, const void *from,
+                                const void *from_end, uint8_t *to, size_t skip)
+{
+   assert(!"no sparse sites are recorded");
+}
+
 /* As the driver's: move to a new chunk through a link when the space does
  * not fit. */
 void
@@ -558,15 +565,6 @@ hk_sync_note_xfer_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 
 void
 hk_dispatch_imm_writes(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
-{
-   (void)cmd;
-   (void)cs;
-   abort();
-}
-
-/* Fixtures never copy timestamps. Emitting a copy is a bug. */
-void
-hk_sync_dispatch_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
 {
    (void)cmd;
    (void)cs;
