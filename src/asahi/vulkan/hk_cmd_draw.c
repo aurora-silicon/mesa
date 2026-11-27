@@ -7956,6 +7956,7 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
    }
    cmd->state.gfx.shaders_write_memory = writes;
    cmd->state.gfx.shaders_dirty |= BITFIELD_BIT(stage);
+   cmd->state.gfx.direct_draw_fast.unsupported_linked_vs = NULL;
 
    if (stage == MESA_SHADER_FRAGMENT)
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
@@ -16745,6 +16746,20 @@ hk_copy_small_inline(void *dst_v, const void *src_v, uint32_t size)
    }
 }
 
+/* Whether the bound vertex shaders and their linked program can take the cached
+ * direct-draw emitter at all. Depends only on the bound shaders and the linked
+ * program, so a failure is remembered per linked program
+ * (hk_agx3_direct_draw_fast::unsupported_linked_vs). */
+static inline bool
+hk_agx3_direct_draw_fast_shaders_supported(const struct hk_shader *hw_vs,
+                                           const struct hk_shader *sw_vs,
+                                           const struct hk_linked_shader *linked_vs)
+{
+   return hw_vs && hw_vs == sw_vs && linked_vs && !linked_vs->sw_indexing &&
+          !hw_vs->b.info.has_preamble && !hw_vs->b.info.uses_draw_id &&
+          !sw_vs->b.info.uses_base_param && !linked_vs->b.uses_base_param;
+}
+
 /* Arm the cached steady-state direct-draw emitter after a standard direct draw
  * completes cleanly. Every key snapshotted here is re-verified in O(1) before
  * any fast-path draw emits bytes, so state mutations outside push constants
@@ -16797,10 +16812,11 @@ hk_agx3_arm_direct_draw_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
    struct hk_shader *sw_vs = hk_bound_sw_vs(gfx);
    struct hk_shader *fs = hk_bound_fs(cmd);
-   if (!hw_vs || !sw_vs || !fs || hw_vs != sw_vs || !linked_vs || !linked_fs ||
-       linked_vs->sw_indexing || hw_vs->b.info.has_preamble ||
-       hw_vs->b.info.uses_draw_id || sw_vs->b.info.uses_base_param ||
-       linked_vs->b.uses_base_param || gfx->g17p_hoisted_preamble_va ||
+   if (!hk_agx3_direct_draw_fast_shaders_supported(hw_vs, sw_vs, linked_vs)) {
+      fast->unsupported_linked_vs = linked_vs;
+      return;
+   }
+   if (!fs || !linked_fs || gfx->g17p_hoisted_preamble_va ||
        !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
        !gfx->fast_link_vs.key.prolog.hw ||
        gfx->fast_link_vs.key.prolog.adjacency ||
@@ -17625,7 +17641,9 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       }
       cs->stats.cmds++;
 
-      if (draw_id == 0 && !agx_is_indirect(draw.b))
+      if (draw_id == 0 && !agx_is_indirect(draw.b) &&
+          gfx->linked[MESA_SHADER_VERTEX] !=
+             gfx->direct_draw_fast.unsupported_linked_vs)
          hk_agx3_arm_direct_draw_fast(cmd, cs, draw_id, draw, needs_idx_robust,
                                       geom, tess, adj);
    }

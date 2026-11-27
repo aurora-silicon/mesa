@@ -1198,6 +1198,12 @@ struct hk_agx3_direct_draw_fast {
    const struct hk_g17p_gfx_loader *loader;
    const struct hk_linked_shader *linked_vs;
 
+   /* The linked vertex program whose bound shaders can never take this path
+    * (hk_agx3_direct_draw_fast_shaders_supported()), so draws with it skip
+    * re-arming. The verdict depends only on the bound shaders and this linked
+    * program: cleared when a shader is bound and by hk_cmd_buffer_dirty_all(). */
+   const struct hk_linked_shader *unsupported_linked_vs;
+
    /* Pre-packed 28-byte AGX3 VDM State Update and its pipeline template word
     * (raw_state_load_count_18 << 3). */
    uint32_t vdm_words[7];
@@ -3497,6 +3503,7 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->g17p_bind_tail_memo.valid = false;
    gfx->g17p_bind_tail_memo.viewport_valid = false;
    gfx->direct_draw_fast.valid = false;
+   gfx->direct_draw_fast.unsupported_linked_vs = NULL;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
 }

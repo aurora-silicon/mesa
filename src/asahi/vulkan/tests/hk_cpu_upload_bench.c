@@ -2294,6 +2294,13 @@ direct_draw_fast_path_correctness(struct fixture *f)
       CHECK(cs.current == cur_before_zero);
       CHECK(cs.stats.calls == 2);
 
+      /* A remembered unsupported vertex program never outlives a full state
+       * invalidation. */
+      fast->unsupported_linked_vs = &linked_vs;
+      hk_cmd_buffer_dirty_all(cmd);
+      CHECK(fast->unsupported_linked_vs == NULL);
+      CHECK(!fast->valid);
+
       cmd->current_cs.gfx = NULL;
       hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
    }
