@@ -79,12 +79,38 @@ main(void)
    dev->host_as.queue = NULL;
    vk_queue_finish(&host_as.vk);
 
-   /* A watched compute-kick queue runs an extra kernel queue outside
-    * dev->vk.queues and must disable packed atomics. */
+   /* A watched compute-kick queue without an initialized dormant kicker or
+    * with an activated kick queue must disable packed atomics. While the
+    * kicker is dormant (compute_kick != NULL, compute_kick_queues == 0),
+    * single-queue packed atomics stay allowed (guarded against activation by
+    * hk_compute_kick_pack_atomics_{begin,end}()). */
    q0.kick.watched = true;
    CHECK(!hk_pack_atomics_allowed(dev, &q0));
+   dev->compute_kick = (struct hk_compute_kick *)(uintptr_t)0x1;
+   dev->compute_kick_queues = 0;
+   CHECK(hk_pack_atomics_allowed(dev, &q0));
+   dev->compute_kick_queues = 1;
+   CHECK(!hk_pack_atomics_allowed(dev, &q0));
+   dev->compute_kick_queues = 0;
+   dev->compute_kick = NULL;
    q0.kick.watched = false;
    CHECK(hk_pack_atomics_allowed(dev, &q0));
+
+   /* M5 (G17C) shares the same single-kernel-queue invariant as G17P:
+    * default-on with one queue and dormant kicker, disabled with a second
+    * non-emulated queue or active kick queue. */
+   dev->dev.chip = AGX_CHIP_G17C;
+   dev->compute_kick = (struct hk_compute_kick *)(uintptr_t)0x1;
+   q0.kick.watched = true;
+   CHECK(hk_pack_atomics_allowed(dev, &q0));
+   init_queue(dev, &q1, 1, UINT32_MAX);
+   CHECK(!hk_pack_atomics_allowed(dev, &q0));
+   vk_queue_finish(&q1.vk);
+   dev->compute_kick_queues = 1;
+   CHECK(!hk_pack_atomics_allowed(dev, &q0));
+   dev->compute_kick_queues = 0;
+   dev->compute_kick = NULL;
+   q0.kick.watched = false;
 
    /* G16G serializes all compute commands of a VM on one firmware queue, so a
     * second VkQueue does not block packed atomics there. */

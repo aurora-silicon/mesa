@@ -198,8 +198,10 @@ struct hk_device {
     * HK_FRAME_ANATOMY environment variable is set. */
    struct hk_frame_anatomy *frame_anatomy;
    /* Compute kick (hk_compute_kick.h); NULL unless G17C with
-    * hk_compute_kick_ms set. */
+    * hk_compute_kick_ms set. compute_kick_queues counts priority classes whose
+    * kick queue has been activated (0 while dormant). */
    struct hk_compute_kick *compute_kick;
+   uint32_t compute_kick_queues;
 
    struct hk_descriptor_table occlusion_queries;
    struct hk_sampler_heap samplers;

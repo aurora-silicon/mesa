@@ -85,6 +85,7 @@ struct hk_kick_class {
    /* Timeline semaphore that the nth kick signals to n. */
    VkSemaphore done;
    uint64_t sent;
+   bool counted;
 };
 
 struct hk_compute_kick {
@@ -271,17 +272,40 @@ hk_compute_kick_thread(void *data)
       int64_t deadline = INT64_MAX;
       unsigned count = 0;
       unsigned due = 0;
+      bool packed_atomics_active = false;
 
       for (unsigned i = 0; i < k->watch_count; i++) {
          struct hk_queue *queue = k->watch[i];
-         if (!queue->kick.pending)
+         if (queue->kick.packed_atomics_inflight)
+            packed_atomics_active = true;
+
+         if (!queue->kick.pending && !queue->kick.packed_atomics_point)
             continue;
 
          uint64_t value = 0;
-         if (drmSyncobjQuery(fd, &queue->drm.syncobj, &value, 1) ||
-             value >= queue->kick.pending) {
+         if (drmSyncobjQuery(fd, &queue->drm.syncobj, &value, 1)) {
             queue->kick.pending = 0;
             queue->kick.due_ns = 0;
+            queue->kick.packed_atomics_point = 0;
+            continue;
+         }
+
+         if (queue->kick.packed_atomics_point) {
+            if (value >= queue->kick.packed_atomics_point) {
+               queue->kick.packed_atomics_point = 0;
+            } else {
+               packed_atomics_active = true;
+            }
+         }
+
+         if (!queue->kick.pending || value >= queue->kick.pending) {
+            queue->kick.pending = 0;
+            queue->kick.due_ns = 0;
+            if (queue->kick.packed_atomics_point) {
+               k->handles[count] = queue->drm.syncobj;
+               k->points[count] = queue->kick.packed_atomics_point;
+               count++;
+            }
             continue;
          }
 
@@ -306,6 +330,23 @@ hk_compute_kick_thread(void *data)
          u_cnd_monotonic_wait(&k->wake, &k->lock);
          k->idle = false;
          continue;
+      }
+
+      /* Never activate or submit a concurrent kick queue while a bounded
+       * packed global-atomic submission is being built or executing on this
+       * device: wait for it to retire first. Once no packed atomic work is in
+       * flight and a kick is due, publish compute_kick_queues under k->lock
+       * before unlocking so no new submission packs atomics beside the kick. */
+      if (packed_atomics_active) {
+         due = 0;
+      } else if (due) {
+         u_foreach_bit(class, due) {
+            if (!k->class[class].counted && k->class[class].queue &&
+                !k->class[class].failed) {
+               k->class[class].counted = true;
+               p_atomic_inc(&k->dev->compute_kick_queues);
+            }
+         }
       }
 
       mtx_unlock(&k->lock);
@@ -357,6 +398,41 @@ hk_compute_kick_note(struct hk_device *dev, struct hk_queue *queue)
    } else if (k->idle) {
       u_cnd_monotonic_signal(&k->wake);
    }
+   mtx_unlock(&k->lock);
+}
+
+bool
+hk_compute_kick_pack_atomics_begin(struct hk_device *dev,
+                                   struct hk_queue *queue)
+{
+   struct hk_compute_kick *k = dev->compute_kick;
+   if (!k || !queue->kick.watched)
+      return false;
+
+   mtx_lock(&k->lock);
+   if (k->stop || p_atomic_read(&dev->compute_kick_queues) != 0) {
+      mtx_unlock(&k->lock);
+      return false;
+   }
+   queue->kick.packed_atomics_inflight++;
+   mtx_unlock(&k->lock);
+   return true;
+}
+
+void
+hk_compute_kick_pack_atomics_end(struct hk_device *dev,
+                                 struct hk_queue *queue,
+                                 uint64_t timeline_point)
+{
+   struct hk_compute_kick *k = dev->compute_kick;
+   if (!k || !queue->kick.watched)
+      return;
+
+   mtx_lock(&k->lock);
+   assert(queue->kick.packed_atomics_inflight > 0);
+   queue->kick.packed_atomics_inflight--;
+   if (timeline_point > queue->kick.packed_atomics_point)
+      queue->kick.packed_atomics_point = timeline_point;
    mtx_unlock(&k->lock);
 }
 
@@ -441,7 +517,11 @@ hk_compute_kick_init(struct hk_device *dev, unsigned period_ms)
       queue->kick.watched = c->queue != NULL;
    }
 
+   /* Leave compute_kick_queues at 0 until a class actually sends its first
+    * kick: dormant kick queues allocate no kernel queue and must not block
+    * single-queue global-atomic CDM packing. */
    dev->compute_kick = k;
+   dev->compute_kick_queues = 0;
 }
 
 void

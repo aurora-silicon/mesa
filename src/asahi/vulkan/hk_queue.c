@@ -3009,28 +3009,27 @@ hk_pack_attachment_limit(const struct hk_device *dev)
 }
 
 /* Streams with global atomics are packed only where no other kernel queue
- * of the device can run beside the packet. On M5, two kernel queues
- * running packed atomic chains on the same memory lost contributions (root
- * cause unknown), so such streams stay separate commands unless
- * ASAHI_M5_PACK_ATOMICS=1 (or HK_PACK_ATOMICS=1) and the device has a
- * single active kernel queue, which runs its commands in order. On G17P,
+ * of the device can run beside the packet. On M4/M5 (G17P and M5), two kernel
+ * queues running packed atomic chains on the same memory can lose updates, so
  * packed atomics are enabled by default (disable with HK_PACK_ATOMICS=0)
- * whenever the single-kernel-queue invariant holds for the lifetime of the
- * device: no sibling kernel queue is in flight (hk_sibling_in_flight()),
- * sibling routing stays off until any packed atomic submission completes
- * (packed_atomic_point), and no other non-emulated VkQueue, host-AS queue,
- * or compute-kick queue exists on the device. Because kernel queues are
- * admitted lazily on first submission, checking only whether another queue
- * already has a kernel queue ID leaves a race where a second queue admits
- * and submits concurrently before an in-flight packed atomic chain finishes
- * (and waiting for packed_atomic_point at admission would deadlock valid
- * wait-before-signal timeline semaphore submits). The G16 kernel puts every
- * compute command of a VM on its one firmware compute queue and never runs
- * one beside another VM's: several commands of one VM may be in flight there,
- * but the firmware runs them one after another, never beside a packet. G16G
- * packs them unless HK_PACK_ATOMICS=0. That is a property of the G16 kernel,
- * the only one for G16G, which no uAPI feature reports yet; the chip stands
- * for it until one does (hk_pack_atomics_choice()). */
+ * whenever the single-kernel-queue invariant holds: no sibling kernel queue
+ * is in flight (hk_sibling_in_flight()), sibling routing stays off until any
+ * packed atomic submission completes (packed_atomic_point), no other
+ * non-emulated VkQueue or host-AS queue exists on the device, and no
+ * compute-kick queue has been activated (while dormant, kick activation is
+ * deferred by hk_compute_kick_pack_atomics_{begin,end}()). Because kernel
+ * queues are admitted lazily on first submission, checking only whether
+ * another Vulkan queue already has a kernel queue ID leaves a race where a
+ * second queue admits and submits concurrently before an in-flight packed
+ * atomic chain finishes (and waiting for packed_atomic_point at admission
+ * would deadlock valid wait-before-signal timeline semaphore submits). The
+ * G16 kernel puts every compute command of a VM on its one firmware compute
+ * queue and never runs one beside another VM's: several commands of one VM
+ * may be in flight there, but the firmware runs them one after another, never
+ * beside a packet. G16G packs them unless HK_PACK_ATOMICS=0. That is a
+ * property of the G16 kernel, the only one for G16G, which no uAPI feature
+ * reports yet; the chip stands for it until one does
+ * (hk_pack_atomics_choice()). */
 DEBUG_GET_ONCE_OPTION(hk_pack_atomics_opt, "HK_PACK_ATOMICS", NULL)
 DEBUG_GET_ONCE_BOOL_OPTION(hk_pack_gemm_dw_opt, "HK_PACK_GEMM_DW", true)
 DEBUG_GET_ONCE_OPTION(m5_pack_atomics_opt, "ASAHI_M5_PACK_ATOMICS", NULL)
@@ -3051,10 +3050,12 @@ hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue)
 
    /* Check the chip default / option before querying the syncobj for
     * sibling activity so disabled callers never pay a drmSyncobjQuery ioctl. */
-   const bool default_on = dev->dev.chip == AGX_CHIP_G17P;
+   const bool default_on = agx_chip_native_or_m5(dev->dev.chip);
    if (!hk_pack_atomics_choice(default_on, opt, 1))
       return false;
-   if (queue->kick.watched || hk_sibling_in_flight(dev, queue))
+   if ((queue->kick.watched &&
+        (!dev->compute_kick || p_atomic_read(&dev->compute_kick_queues))) ||
+       hk_sibling_in_flight(dev, queue))
       return false;
 
    vk_foreach_queue(iter, &dev->vk) {
@@ -3087,6 +3088,7 @@ struct hk_packed_runs {
    struct hk_packed_submit *packets;
    struct vk_command_buffer **commands;
    unsigned command_count;
+   bool has_atomics;
 };
 
 static void
@@ -6672,6 +6674,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
          util_flush_range_no_fence(cs->start, written);
       }
       hk_pack_finish_sync(cmd, cs);
+      if (cs->uses_global_atomics)
+         out->has_atomics = true;
 
       out->commands[out->command_count++] = &cmd->vk;
       i += pr->count;
@@ -7008,6 +7012,8 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
       return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
                                      untouched);
 
+   const bool kick_guard = hk_compute_kick_pack_atomics_begin(dev, queue);
+
    /* Packing copies the command buffers' streams: no patch site may be
     * written meanwhile (host_alias.patch_lock). The copies are the only CPU
     * reads of stream words at submission; the GPU reads each word whole. */
@@ -7019,19 +7025,30 @@ queue_submit_segment(struct hk_device *dev, struct hk_queue *queue,
    if (unlikely(alias_dynamic))
       u_rwlock_rdunlock(&dev->host_alias.patch_lock);
 
-   if (!have_runs)
-      return queue_submit_recordings(dev, queue, submit, original, NULL, 0,
-                                     untouched);
+   VkResult result;
+   bool packed_atomics = false;
+   if (!have_runs) {
+      result = queue_submit_recordings(dev, queue, submit, original, NULL, 0,
+                                       untouched);
+   } else {
+      struct vk_queue_submit effective = *submit;
+      effective.command_buffer_count = runs.command_count;
+      effective.command_buffers = runs.commands;
+      packed_atomics = runs.has_atomics;
+      result = queue_submit_recordings(dev, queue, &effective, original,
+                                       util_dynarray_begin(runs.extra_bos),
+                                       util_dynarray_num_elements(
+                                          runs.extra_bos, struct agx_bo *),
+                                       untouched);
+      hk_packed_runs_free(dev, &runs);
+   }
 
-   struct vk_queue_submit effective = *submit;
-   effective.command_buffer_count = runs.command_count;
-   effective.command_buffers = runs.commands;
-   VkResult result = queue_submit_recordings(dev, queue, &effective, original,
-                                             util_dynarray_begin(runs.extra_bos),
-                                             util_dynarray_num_elements(
-                                                runs.extra_bos, struct agx_bo *),
-                                             untouched);
-   hk_packed_runs_free(dev, &runs);
+   if (kick_guard) {
+      hk_compute_kick_pack_atomics_end(
+         dev, queue,
+         (result == VK_SUCCESS && packed_atomics) ? queue->drm.timeline_value
+                                                  : 0);
+   }
    return result;
 }
 
