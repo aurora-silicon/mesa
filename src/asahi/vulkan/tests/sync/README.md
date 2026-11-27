@@ -34,7 +34,9 @@ claim to be complete. CTS remains the authority on conformance.
   source comment why no further dependency is needed. A new strict case
   must also run clean under the Khronos validation layer with
   synchronization validation (`VK_LAYER_VALIDATE_SYNC=1`) on a driver that
-  can run it. Strict cases run by default.
+  can run it. Strict cases run by default unless marked `opt_in` (such as
+  `submit-pack-dup`, which tracks a known pre-existing kernel device-loss
+  case and runs only when named).
 - **compat**: the case does something applications do that Vulkan does not
   guarantee, such as unsynchronized writes from two queues to different
   texels of one optimally tiled subresource, or storage writes across draws
@@ -119,9 +121,9 @@ added load.
 ## Case file
 
 `cases.json` is versioned. A leaf case names an `executable` relative to
-`--bindir` (no `..`) with optional `args`, `env`, `timeout`, `tier` and
-`optional`. A parallel case lists `members` (leaf cases) instead of an
-executable; parallel cases do not nest.
+`--bindir` (no `..`) with optional `args`, `env`, `timeout`, `tier`,
+`opt_in` and `optional`. A parallel case lists `members` (leaf cases)
+instead of an executable; parallel cases do not nest.
 
 ## Not covered yet
 

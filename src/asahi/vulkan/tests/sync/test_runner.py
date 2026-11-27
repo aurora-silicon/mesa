@@ -194,6 +194,63 @@ class RunnerTest(unittest.TestCase):
         )
         self.assertEqual([result["name"] for result in selected], ["compat"])
 
+    def test_opt_in_case_is_excluded_from_default_and_compat(self):
+        strict = self.leaf("strict", "pass")
+        compat = self.leaf("compat", "pass", tier="compat")
+        opt_in = self.leaf("known-device-loss", "fail", opt_in=True)
+        cases, _ = self.load([strict, compat, opt_in])
+        default, _ = runner.execute_suite(cases, self.bindir)
+        self.assertEqual([result["name"] for result in default], ["strict"])
+        with_compat, _ = runner.execute_suite(
+            cases, self.bindir, include_compat=True
+        )
+        self.assertEqual(
+            [result["name"] for result in with_compat], ["strict", "compat"]
+        )
+        selected, exit_code = runner.execute_suite(
+            cases, self.bindir, requested=["known-device-loss"]
+        )
+        self.assertEqual(
+            [result["name"] for result in selected], ["known-device-loss"]
+        )
+        self.assertEqual(exit_code, 1)
+
+    def test_opt_in_validation_and_parallel_guard(self):
+        with self.assertRaisesRegex(runner.HarnessError, "opt_in must be boolean"):
+            self.load([self.leaf("bad", "pass", opt_in="yes")])
+        with self.assertRaisesRegex(runner.HarnessError, "cannot contain opt-in"):
+            self.load(
+                [
+                    self.leaf("strict", "pass"),
+                    self.leaf("optin", "fail", opt_in=True),
+                    {
+                        "name": "pressure",
+                        "tier": "strict",
+                        "members": ["strict", "optin"],
+                    },
+                ]
+            )
+
+    def test_suite_cases_json_excludes_dup_from_default(self):
+        cases_path = Path(__file__).with_name("cases.json")
+        _, cases = runner.load_cases(cases_path)
+        default_names = [
+            case["name"] for case in runner.select_cases(cases, [], False)
+        ]
+        compat_names = [
+            case["name"] for case in runner.select_cases(cases, [], True)
+        ]
+        self.assertIn("submit-pack-ordering", default_names)
+        self.assertNotIn("dup", cases["submit-pack-ordering"].get("args", []))
+        self.assertIn("submit-pack-dup", cases)
+        self.assertTrue(cases["submit-pack-dup"]["opt_in"])
+        self.assertNotIn("submit-pack-dup", default_names)
+        self.assertNotIn("submit-pack-dup", compat_names)
+        self.assertEqual(
+            [c["name"] for c in runner.select_cases(cases, ["submit-pack-dup"], False)],
+            ["submit-pack-dup"],
+        )
+
     def test_seed_makes_order_repeatable(self):
         cases, _ = self.load(
             [self.leaf(name, "pass") for name in ("one", "two", "three", "four")]

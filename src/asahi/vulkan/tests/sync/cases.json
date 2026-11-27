@@ -93,9 +93,18 @@
       "name": "submit-pack-ordering",
       "tier": "strict",
       "executable": "aurora-packtest",
-      "args": ["5", "indep-order", "sem", "depth", "split-render", "split-event", "dup"],
+      "args": ["5", "indep-order", "sem", "depth", "split-render", "split-event"],
       "timeout": 180,
       "description": "Semaphore and deep compute submission ordering across packed command buffers."
+    },
+    {
+      "name": "submit-pack-dup",
+      "tier": "strict",
+      "opt_in": true,
+      "executable": "aurora-packtest",
+      "args": ["5", "dup"],
+      "timeout": 180,
+      "description": "Duplicate command buffer submitted several times in one batch; opt-in until the kernel accepts duplicate recordings."
     },
     {
       "name": "cross-process-pressure",

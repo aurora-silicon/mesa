@@ -85,6 +85,10 @@ def load_cases(path):
         if not _valid_timeout(timeout):
             raise HarnessError("case {} timeout must be positive".format(name))
         normalized["timeout"] = timeout
+        opt_in = normalized.get("opt_in", False)
+        if not isinstance(opt_in, bool):
+            raise HarnessError("case {} opt_in must be boolean".format(name))
+        normalized["opt_in"] = opt_in
 
         if has_executable:
             executable = normalized["executable"]
@@ -126,6 +130,12 @@ def load_cases(path):
                 raise HarnessError(
                     "strict parallel case {} cannot contain {} case {}".format(
                         name, cases[member]["tier"], member
+                    )
+                )
+            if not case["opt_in"] and cases[member]["opt_in"]:
+                raise HarnessError(
+                    "default parallel case {} cannot contain opt-in case {}".format(
+                        name, member
                     )
                 )
 
@@ -334,7 +344,8 @@ def select_cases(cases, requested, include_compat):
     return [
         case
         for case in cases.values()
-        if case["tier"] == "strict" or include_compat
+        if not case.get("opt_in", False)
+        and (case["tier"] == "strict" or include_compat)
     ]
 
 
@@ -465,6 +476,7 @@ def main(argv=None):
                         "event": "case_info",
                         "name": case["name"],
                         "tier": case["tier"],
+                        "opt_in": case.get("opt_in", False),
                         "optional": case.get("optional", False),
                         "description": case.get("description", ""),
                     }
