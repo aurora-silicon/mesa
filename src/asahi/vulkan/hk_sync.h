@@ -55,7 +55,8 @@ struct hk_queue;
 
 /* Which class of Vulkan pipeline stages a stream's work belongs to. Streams
  * the driver adds for its own bookkeeping are HK_SYNC_ALL: every source scope
- * covers them and they wait as their own semantics require.
+ * covers them and they wait as their own semantics require. Streams that only
+ * write timestamps are HK_SYNC_STAMP instead.
  */
 enum hk_sync_kind {
    HK_SYNC_GFX = 1 << 0,
@@ -92,16 +93,60 @@ enum hk_sync_kind {
     * render's vertex half only after the latest such stream on the render
     * subqueue (hk_sync_barrier()). */
    HK_SYNC_GFX_MEM = 1 << 5,
+
+   /* Stream kinds and first scopes only, never named by an application
+    * dependency: a command the driver records to carry a timestamp alone, or
+    * to copy timestamps (hk_sync_write_timestamp()). It writes nothing but
+    * query memory, which only query commands and later timestamps read, so
+    * only their first scopes name it (HK_SYNC_QUERY_SCOPE,
+    * hk_sync_stamp_scope()); a pipeline barrier, even an ALL_COMMANDS one,
+    * does not order later work after it. It waits like work of every class
+    * (hk_sync_full_kinds()). */
+   HK_SYNC_STAMP = 1 << 6,
+
+   /* Stream kinds and first scopes only, never named by an application
+    * dependency: a command that resets timestamp queries
+    * (hk_CmdResetQueryPool()). Like HK_SYNC_STAMP it writes nothing but
+    * query memory, and only later query commands and timestamps are in its
+    * second scope (Vulkan 1.4, 17.2: the reset is ordered against the
+    * commands that reference the same queries). Unlike a timestamp write it
+    * is not in the first scope of another reset: two resets write the same
+    * values, so their order does not matter. It waits like work of every
+    * class. */
+   HK_SYNC_QRESET = 1 << 7,
 };
 
-#define HK_SYNC_NUM_KINDS 6
+#define HK_SYNC_NUM_KINDS 8
+
+/* Every kind a stream can be of: a first scope naming all of them is every
+ * earlier stream on a subqueue. */
+#define HK_SYNC_STREAM_KINDS (HK_SYNC_ALL | HK_SYNC_STAMP | HK_SYNC_QRESET)
+
+/* The first scope of a query command (reset, result copy, property write):
+ * every earlier stream, timestamp carriers included. */
+#define HK_SYNC_QUERY_SCOPE HK_SYNC_STREAM_KINDS
+
+/* The first scope of a timestamp query reset: every earlier stream but other
+ * timestamp query resets. */
+#define HK_SYNC_QRESET_SCOPE (HK_SYNC_STREAM_KINDS & ~HK_SYNC_QRESET)
+
+/* The first scope of a timestamp or event of the given source kinds: an
+ * earlier timestamp write is in it unless it is empty (TOP_OF_PIPE). */
+static inline uint8_t
+hk_sync_stamp_scope(uint8_t src_kinds)
+{
+   return src_kinds ? src_kinds | HK_SYNC_STAMP : 0;
+}
 
 /* The destination classes a stream of the given kinds belongs to: graphics
- * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG). A
- * stream waits for the requirements carried in for each of them. */
+ * work is in every graphics class (HK_SYNC_GFX_FRAG, HK_SYNC_GFX_IMG), and a
+ * timestamp stream in every class. A stream waits for the requirements
+ * carried in for each of them. */
 static inline uint8_t
 hk_sync_full_kinds(uint8_t kinds)
 {
+   if (kinds & (HK_SYNC_STAMP | HK_SYNC_QRESET))
+      kinds |= HK_SYNC_ALL;
    return kinds & HK_SYNC_GFX
              ? kinds | HK_SYNC_GFX_FRAG | HK_SYNC_GFX_IMG
              : kinds;
@@ -138,6 +183,16 @@ struct agx_timestamp_req {
    uint32_t offset_B;
 };
 
+/* A timestamp write satisfied by copying an earlier stamp: the query it
+ * writes and the stamp it reads. */
+struct hk_stamp_copy {
+   struct agx_timestamp_req dst;
+   struct agx_timestamp_req src;
+};
+
+/* Copies one recording waits with before it records them in one launch. */
+#define HK_SYNC_STAMP_COPIES 64
+
 /*
  * Tile hazards. A render pass instance's load, store and resolve operations
  * only affect pixels inside its render area (Vulkan 1.4, "Render Pass Load
@@ -170,6 +225,10 @@ struct agx_timestamp_req {
 struct hk_sync_footprint {
    /* The hardware preserves pixels or inactive layers outside the API writes. */
    bool preserve;
+   /* It does so for the area or the layers: a partly covered tile, or layers
+    * a sparse view mask skips. A footprint that preserves only because it
+    * loads its attachment covers whole tiles of every layer it names. */
+   bool partial;
    /* Identity of the written image; compared, never dereferenced. */
    const void *image;
    uint32_t level;
@@ -229,12 +288,34 @@ struct hk_sync_xfer_dst {
    bool device_address;
 };
 
+#define HK_SYNC_RECENT_VDM_ATT 64
+
+static inline uint64_t
+hk_sync_image_bloom(uint64_t key)
+{
+   if (!key)
+      return 0;
+   uint64_t h = key;
+   h ^= h >> 33;
+   h *= UINT64_C(0xff51afd7ed558ccd);
+   h ^= h >> 33;
+   return UINT64_C(1) << (h & 63);
+}
+
+struct hk_sync_vdm_att {
+   uint64_t ordinal;
+   uint64_t att_bloom;
+};
+
 /* Per-stream state, embedded in hk_cs. */
 struct hk_sync_stream {
    /* Recording order. Equal to list order for every pair the tracking
     * compares: a pre-graphics stream takes the number reserved just below
-    * its render so it sorts before it, where the list places it. */
+    * its render so it sorts before it, where the list places it. Multiple
+    * pre-graphics streams ahead of the same render break ties by pre_seq. */
    uint32_t seq;
+   uint32_t pre_seq;
+   uint32_t pre_count;
 
    /* The latest HK_SYNC_GFX_MEM stream on this stream's subqueue recorded
     * before it. */
@@ -254,13 +335,18 @@ struct hk_sync_stream {
    uint64_t prior[HK_SYNC_NUM_SQ];
 
    uint8_t kind;
+   /* Render stream had an optimal VK_IMAGE_CREATE_ALIAS_BIT attachment whose
+    * memory had no buffer binding at record time. Upgraded to HK_SYNC_GFX_MEM
+    * at submit if hk_device::buffer_alias_mem_gen advanced since recording. */
+   bool alias_image_render;
 
    struct hk_sync_dep dep[HK_SYNC_NUM_SQ];
 
    /* For a render: what its vertex (tiling) half needs, a subset of dep
-    * without the fragment-only requirements (HK_SYNC_GFX_FRAG) and tile
-    * hazards. Resolved like dep into barrier_ta/prior_ta; ta_split when
-    * they differ from barrier/prior. */
+    * without the fragment-only requirements (HK_SYNC_GFX_FRAG). Tile
+    * hazards stay in it: starting tiling ahead of them corrupts the shared
+    * tile. Resolved like dep into barrier_ta/prior_ta; ta_split when they
+    * differ from barrier/prior. */
    struct hk_sync_dep dep_ta[HK_SYNC_NUM_SQ];
    uint16_t barrier_ta[HK_SYNC_NUM_SQ];
    uint64_t prior_ta[HK_SYNC_NUM_SQ];
@@ -268,9 +354,15 @@ struct hk_sync_stream {
 
    /* For a render: it draws with a pre-rasterization shader that reads
     * images, so its vertex half also waits on HK_SYNC_GFX_IMG, as of the
-    * dependency epoch vtx_images_epoch. */
+    * dependency epoch vtx_images_epoch. When !vtx_img_unsafe, vtx_img_bloom
+    * holds the bloom filter of image plane GPU VAs read by vertex shaders
+    * so VDM waits only on renders whose att_bloom intersects it. */
    bool vtx_images;
+   bool vtx_img_unsafe;
+   uint8_t dep_ta_img_prior;
    uint32_t vtx_images_epoch;
+   uint64_t att_bloom;
+   uint64_t vtx_img_bloom;
 
    /* A layout transition the driver records as work
     * (brl_sync_transition_begin()), or a stream one was merged into: a
@@ -352,13 +444,20 @@ struct hk_sync_state {
    struct hk_cs *xfer_any;
    uint32_t xfer_version;
 
-   /* The draw state the last draw-time check found no noted write in: valid
-    * while xfer_version, the descriptor and vertex buffer generations and the
-    * index buffer are unchanged (hk_cmd_draw.c). */
+   /* Draw-state slices the last draw-time check found no noted write in:
+    * each slice stays valid independently while xfer_version and that
+    * slice's resource identity are unchanged (hk_cmd_draw.c). */
    struct {
-      bool valid;
-      uint32_t version;
-      uint64_t descriptors, vertex_buffers, index;
+      uint32_t desc_version;
+      uint32_t vb_version;
+      uint32_t index_version;
+      bool desc_valid;
+      bool vb_valid;
+      bool index_valid;
+      uint64_t descriptors;
+      uint64_t vertex_buffers;
+      uint64_t index_addr;
+      uint64_t index_range;
    } xfer_clean;
 
    /* A top-of-pipe timestamp waiting for the next stream to carry it as its
@@ -368,8 +467,41 @@ struct hk_sync_state {
     * it, and otherwise moves it to an ordered end-stamp carrier. */
    struct agx_timestamp_req pending_start_ts;
    bool pending_start_ts_unordered;
+
+   /* On chips whose start stamps latch before barriers resolve: a
+    * timestamp recorded before any stream of the command buffer, waiting for
+    * the first one to carry it on an end stamp, which is latched after that
+    * stream's barriers (a render's vertex end, a compute stream's end). That
+    * stream waits for lead_scope, the kinds of the stamp's first scope as
+    * hk_sync_src_dep() takes them: the resets of timestamp queries alone for
+    * a top-of-pipe stamp, whose first scope is empty; the earlier work of
+    * its stages and the earlier timestamps for any other. Then the end stamp
+    * is latched no earlier than a command of its own could latch it. */
+   struct agx_timestamp_req lead_ts;
+   uint8_t lead_scope;
    bool has_unordered_start_ts;
    bool has_gpu_query_reset;
+
+   /* Recording the commands of an acceleration-structure build
+    * (hk_sync_barrier()). */
+   bool as_build;
+
+   /* Timestamps written as copies of an earlier end stamp
+    * (hk_sync_write_timestamp()), and the latest stream on each subqueue
+    * whose stamp they read. They are recorded in one launch in a
+    * timestamp-only compute stream ordered after those streams: the next
+    * timestamp carrier that follows them anyway, or a command of their own
+    * before the next query command or event write, at the end of the
+    * command buffer, or when the batch is full
+    * (hk_sync_flush_stamp_copies()). */
+   struct hk_stamp_copy stamp_copies[HK_SYNC_STAMP_COPIES];
+   uint8_t stamp_copy_count;
+   struct hk_cs *stamp_copy_after[HK_SYNC_NUM_SQ];
+
+   /* Source kinds of the host-availability dependencies recorded and not yet
+    * flushed (hk_sync_defer_host_flush()). Submission flushes them once,
+    * after this submission's work (hk_sync_host_flush_prefix()). */
+   uint8_t host_flush_kinds;
 
    /* Tile hazards: attachment footprints of the open pass instance and
     * the latest earlier render stream it shares a tile with. The command
@@ -377,6 +509,10 @@ struct hk_sync_state {
    struct hk_sync_footprint pass_fp[HK_SYNC_MAX_PASS_FOOTPRINTS];
    uint8_t pass_fp_count;
    struct hk_cs *pass_tile_wait[HK_SYNC_NUM_SQ];
+   /* The latest earlier render that only the fragment half waits for: it
+    * shares only whole tiles with the instance, which loads them
+    * (hk_sync_queue::load_hazard_frag). */
+   struct hk_cs *pass_tile_wait_frag;
    /* Attachment producers, including a compute replacement of a clear. */
    struct hk_cs *pass_tile_first, *pass_tile_last;
    /* The last attachment producer of a suspended pass instance, which the
@@ -397,6 +533,12 @@ struct hk_sync_state {
    /* The event wait being recorded (brl_sync_event_poll()): its latest poll
     * stream. */
    struct hk_cs *brl_event_poll;
+
+   /* Snapshot of hk_device::buffer_alias_mem_gen taken before the first
+    * alias-image-only render in this command buffer was exempted from
+    * HK_SYNC_GFX_MEM. */
+   bool has_alias_image_render;
+   uint32_t buffer_alias_mem_gen;
 };
 
 /* Per-queue state: kinds of streams ever submitted on each subqueue. A
@@ -433,7 +575,18 @@ struct hk_sync_queue {
    bool precise_tile_evictions;
    /* A single command buffer already owns the complete footprint list. */
    bool direct_single_footprints;
+   /* The kernel runs a render's fragment work after the previous render's on
+    * this queue, partial renders included, so a render that only loads whole
+    * tiles an earlier render stores waits for it in its fragment half alone
+    * (hk_sync.h, tile hazards). */
+   bool load_hazard_frag;
    uint64_t last_preserve, evicted_preserve;
+
+   /* Recent VDM renders' attachment blooms for exact-image HK_SYNC_GFX_IMG
+    * narrowing across submissions. */
+   struct hk_sync_vdm_att recent_vdm_att[HK_SYNC_RECENT_VDM_ATT];
+   uint32_t recent_vdm_att_next, recent_vdm_att_count;
+   uint64_t recent_vdm_att_evicted;
 };
 
 void hk_sync_reset(struct hk_cmd_buffer *cmd);
@@ -502,6 +655,34 @@ void brl_sync_transition_end(struct hk_cmd_buffer *cmd, uint8_t dst_kinds);
 void hk_sync_dependency_kinds(const VkDependencyInfo *info, bool image_class,
                               uint8_t *src, uint8_t *dst);
 
+/* Whether a dependency performs a device-to-host memory domain operation: a
+ * barrier names a host access, or MEMORY_READ or MEMORY_WRITE with the host
+ * stage in its destination scope. */
+bool hk_sync_dependency_has_host_access(const VkDependencyInfo *info);
+
+/* The first synchronization scopes, as kinds, of the barriers of a dependency
+ * that perform a device-to-host domain operation. Zero when none does, or
+ * when their first scopes hold no device work. */
+uint8_t hk_sync_host_flush_kinds(const VkDependencyInfo *info);
+
+/* Defer the host availability a dependency asks for to the submission:
+ * nothing is recorded, so a barrier-only command buffer stays without
+ * streams. */
+void hk_sync_defer_host_flush(struct hk_cmd_buffer *cmd,
+                              const VkDependencyInfo *info);
+
+/* The host availability a pipeline barrier asks for: the open compute stream
+ * to record the memory-scoped flush in, when that stream holds work and
+ * already follows the dependency's first scope (it then also waits for what
+ * that scope names), or NULL, with the flush deferred to the submission
+ * (hk_sync_defer_host_flush()) or none needed. */
+struct hk_cs *hk_sync_host_flush(struct hk_cmd_buffer *cmd,
+                                 const VkDependencyInfo *info);
+
+/* Take the deferred host-availability kinds, for an operation the host can
+ * observe before the submission completes (an event write). */
+uint8_t hk_sync_take_host_flush(struct hk_cmd_buffer *cmd);
+
 /* Record an execution dependency: all earlier streams of the source kinds
  * complete before any later stream of the destination kinds starts. */
 void hk_sync_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
@@ -515,9 +696,14 @@ void hk_sync_pass_barrier(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
 void hk_sync_src_dep(struct hk_cmd_buffer *cmd, uint8_t src_kinds,
                      struct hk_cs *self, struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
 
+/* A compute stream for a query command, ordered after earlier query work. */
+struct hk_cs *hk_query_command_cs(struct hk_cmd_buffer *cmd);
+
 /* The render stream draws with a pre-rasterization shader that reads images:
  * its vertex half joins the image-barrier requirements (HK_SYNC_GFX_IMG). */
 void hk_sync_vertex_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
+void hk_sync_vertex_images_bloom(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                 uint64_t bloom);
 void hk_sync_note_memory_write(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* Every later stream of the given kinds waits on cs. */
@@ -553,12 +739,26 @@ struct hk_cs *hk_sync_get_cs_after(struct hk_cmd_buffer *cmd,
 /* End the general compute stream if it carries an end timestamp, so a query
  * command that follows cannot run before the stamp is taken. */
 void hk_sync_end_cs_if_timestamped(struct hk_cmd_buffer *cmd);
+void hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd);
 
 /* Timestamps. */
 void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
+
+/* Record the pending timestamp copies (hk_sync_state::stamp_copies) in a
+ * timestamp-only compute stream positioned after the streams they read, and
+ * end it. Every later first scope that names HK_SYNC_STAMP orders after
+ * them; no application dependency does. */
+void hk_sync_flush_stamp_copies(struct hk_cmd_buffer *cmd);
+
+/* The compute stream a timestamp query reset records into: after every
+ * earlier stream but other such resets (HK_SYNC_QRESET_SCOPE). Record with
+ * hk_sync_state::kind_override set to HK_SYNC_QRESET, then call
+ * hk_sync_query_reset_done() with the stream that holds the reset. */
+struct hk_cs *hk_query_reset_cs(struct hk_cmd_buffer *cmd);
+void hk_sync_query_reset_done(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
 /* G17P transfer writes (see hk_sync_xfer_write). Note that the transfer
  * being recorded writes into cs. */
@@ -603,10 +803,16 @@ void hk_sync_heap_used(struct hk_cmd_buffer *cmd);
 void hk_sync_pass_footprint(struct hk_cmd_buffer *cmd, const void *image,
                             uint32_t level, uint32_t layer0, uint32_t layer1,
                             uint32_t level_width, uint32_t level_height,
-                            VkRect2D area, bool preserve_layers);
+                            VkRect2D area, bool preserve_layers,
+                            bool preserve_load);
 void hk_sync_pass_footprints_done(struct hk_cmd_buffer *cmd);
+
+/* hk_device::load_hazard_frag, false without a device (unit fixtures). */
+bool hk_sync_load_hazard_frag(const struct hk_device *dev);
 void hk_sync_replace_render(struct hk_cmd_buffer *cmd, struct hk_cs *from,
                             struct hk_cs *into);
+void hk_sync_apply_dep(struct hk_cmd_buffer *cmd, struct hk_cs *into,
+                       const struct hk_sync_dep dep[HK_SYNC_NUM_SQ]);
 /* Whether a submission records tile-hazard footprints, and whether the
  * queue may still be running one, so the caller fetches the completed
  * timeline point only when it can matter. */
@@ -634,6 +840,12 @@ void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
  * into its stream (hk_sync_load_resolved()) before emitting it. The streams
  * keep the fields of their last occurrence.
  */
+bool hk_sync_resolve_submit_ex(struct hk_queue *queue,
+                               struct hk_cmd_buffer *const *cmdbufs,
+                               unsigned count, bool first_cdm_is_flush,
+                               bool chain_first, uint64_t completed,
+                               struct hk_sync_resolved *out,
+                               bool *tail_raised_out);
 bool hk_sync_resolve_submit(struct hk_queue *queue,
                             struct hk_cmd_buffer *const *cmdbufs,
                             unsigned count, bool first_cdm_is_flush,
@@ -646,6 +858,25 @@ bool hk_sync_resolve_submit(struct hk_queue *queue,
  * hk_sync_cmd_kinds() for those after it in the submission. A driver-added
  * flush opening the payload (first_cdm_is_flush) is not counted. */
 uint8_t hk_sync_queue_kinds(const struct hk_sync_queue *q, unsigned sq);
+
+/* The barrier fields of the compute command that ends a submission with the
+ * host flush its command buffers deferred (hk_sync_defer_host_flush()),
+ * called after hk_sync_resolve_submit(). With exact priors it follows the
+ * latest command of each of `kinds` and every requirement still carried, on
+ * both subqueues and earlier submissions included, and the submission's last
+ * command on each subqueue it has commands on, as legacy prefixes do; with
+ * none there, legacy prefixes follow every earlier command. A flush that
+ * trails render-dependent compute work then names a render too, so the
+ * kernel takes it behind a render dependency like that work instead of as a
+ * command with no dependency. base holds the
+ * ordinals before the submission, count its commands on each subqueue. With
+ * exact priors it also takes the flush's ordinal; false if that overflows.
+ * The flush is no later command's source: no kind names it. */
+bool hk_sync_host_flush_prefix(struct hk_sync_queue *q, uint8_t kinds,
+                               const uint64_t base[HK_SYNC_NUM_SQ],
+                               const uint32_t count[HK_SYNC_NUM_SQ],
+                               uint16_t barrier[HK_SYNC_NUM_SQ],
+                               uint64_t prior[HK_SYNC_NUM_SQ]);
 uint8_t hk_sync_cmd_kinds(const struct hk_cmd_buffer *cmd, unsigned sq);
 void hk_sync_load_resolved(struct hk_cs *cs, const struct hk_sync_resolved *r);
 
