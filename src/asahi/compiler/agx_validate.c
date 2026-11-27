@@ -87,7 +87,7 @@ is_stack_valid(agx_instr *I)
 }
 
 static bool
-agx_validate_sources(agx_instr *I)
+agx_validate_sources(agx_instr *I, enum agx_isa_encoding enc)
 {
    agx_foreach_src(I, s) {
       agx_index src = I->src[s];
@@ -97,7 +97,7 @@ agx_validate_sources(agx_instr *I)
          agx_validate_assert(!src.cache);
          agx_validate_assert(!src.discard);
 
-         bool ldst = agx_allows_16bit_immediate(I);
+         bool ldst = agx_allows_16bit_immediate(I, enc);
 
          /* Immediates are encoded as 8-bit (16-bit for memory load/store). For
           * integers, they extend to 16-bit. For floating point, they are 8-bit
@@ -179,6 +179,10 @@ agx_write_registers(const agx_context *ctx, const agx_instr *I, unsigned d)
       return 16;
    case AGX_OPCODE_MATMAD8_AGX3:
       return (I->matrix_type & AGX3_MATRIX_ACCUM_F16) ? 2 : 4;
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment (2 elements/lane) */
+      return agx_index_size_16(I->dest[d]);
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_PHI:
       /* Tautological */
@@ -351,6 +355,10 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
       if (I->matrix_type & AGX3_MATRIX_ACCUM_F16)
          return 2;
       return s == 2 || (I->matrix_type & 15) == 2 ? 4 : 2;
+   case AGX_OPCODE_SIMD_MATRIX_FMADD32:
+   case AGX_OPCODE_SIMD_MATRIX_FMADD16:
+      /* paired-register fragment operands (2 elements/lane) */
+      return agx_index_size_16(I->src[s]);
    case AGX_OPCODE_MOV:
    case AGX_OPCODE_EXPORT:
       /* Tautological */
@@ -750,7 +758,7 @@ agx_validate(agx_context *ctx, const char *after)
    }
 
    agx_foreach_instr_global(ctx, I) {
-      if (!agx_validate_sources(I)) {
+      if (!agx_validate_sources(I, ctx->key->dev.encoding)) {
          fprintf(stderr, "Invalid sources form after %s\n", after);
          agx_print_instr(I, stderr);
          fail = true;

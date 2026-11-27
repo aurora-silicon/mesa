@@ -97,6 +97,8 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
+   {"fullcdmbarrier", HK_PERF_FULLCDMBARRIER,
+    "Force the full CDM barrier word on every chip"},
    DEBUG_NAMED_VALUE_END
 };
 /* clang-format on */
@@ -528,7 +530,6 @@ hk_init_vm_status_mirror(struct hk_device *dev)
 }
 
 #define HK_CODE_CHUNK_SIZE (1024 * 1024)
-#define HK_CODE_ALIGNMENT  256
 
 struct agx_bo *
 hk_code_alloc(struct hk_device *dev, size_t size, uint32_t *offset)
@@ -1069,7 +1070,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    u_rwlock_init(&dev->host_alias.patch_lock);
    dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
+   /* A device whose dependencies always take memory scope has none to
+    * decide per resource (agx_cdm_ordering_memory_scope()). */
    if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
+       !agx_cdm_ordering_memory_scope(&pdev->dev) &&
        !debug_get_option_m5_host_alias_static()) {
       /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
       const struct agx3_cdm_barrier_info info = {
@@ -1107,6 +1111,20 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
+   /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
+    * Off by default; pays CPU to skip wake-up latency on short submit->signal
+    * round trips. */
+   dev->vk.sync_wait_poll_us =
+      CLAMP(debug_get_num_option("HK_SUBMIT_POLL_US", 0), 0, 1000000);
+
+   /* The default AGX2 CDM barrier word on this chip: the reduced 0x1ff on
+    * the dies it was measured on (agx2_cdm_barrier_default_word()), the
+    * full word elsewhere. fullcdmbarrier and a device that created a sparse
+    * resource upgrade to the full word in hk_cdm_flush().
+    */
+   dev->cdm_barrier_default_mask =
+      agx2_cdm_barrier_default_word(pdev->dev.chip,
+                                    pdev->dev.params.gpu_generation);
 
    /* Native graphics compiles the emulation in only once a custom border
     * sampler exists, and most samples then pay one branch, so D3D content keeps
@@ -1135,6 +1153,15 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                          "Failed to get DRM device: %m");
       goto fail_fd;
    }
+
+   /* The kernel's feature word, read when the device was opened: queues copy
+    * this into their submission tracking when they are created. */
+   dev->load_hazard_frag = dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS;
+
+   /* Splitting a long submission lets the GPU start work from the first ioctl
+    * while the kernel validates later ioctls, so a profile may cap batch size. */
+   dev->submit_batch_size = instance->drirc.performance.submit_batch_size;
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
    dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
@@ -1307,10 +1334,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = hk_device_to_handle(dev);
 
-   simple_mtx_init(&dev->cmd_pending_lock, mtx_plain);
-   list_inithead(&dev->cmd_pending_queues);
-   list_inithead(&dev->cmd_pending_failed);
-   dev->cmd_pending_ready = true;
+   hk_cmd_pending_init(dev);
    hk_query_stamps_init(dev);
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
    for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {
@@ -1391,6 +1415,9 @@ fail_alloc:
    return result;
 }
 
+/* At most this long, for all queues together, at vkDestroyDevice. */
+#define HK_DESTROY_WAIT_NS (5ull * 1000000000ull)
+
 VKAPI_ATTR void VKAPI_CALL
 hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 {
@@ -1401,6 +1428,12 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    /* Its thread and kicks use the queues and the device's kernels. */
    hk_compute_kick_stop(dev);
+
+   /* Freeing the device's memory below unmaps it from the GPU at once, so let
+    * the GPU finish what the queues submitted first, including work the
+    * application did not wait for. Bounded, so a submission that cannot
+    * complete does not hang teardown. */
+   hk_device_wait_submitted(dev, HK_DESTROY_WAIT_NS);
 
    util_dynarray_fini(&dev->external_bos.counts);
    util_dynarray_fini(&dev->external_bos.list);

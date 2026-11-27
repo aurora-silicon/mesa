@@ -33,7 +33,10 @@
 #include "libagx_shaders.h"
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <xf86drm.h>
+#include "util/os_misc.h"
+#include "agx_userptr_limits.h"
 #include "drm-uapi/dma-buf.h"
 #include "vdrm.h"
 #include "util/blob.h"
@@ -921,6 +924,39 @@ agx_get_params(struct agx_device *dev, void *buf, size_t size)
    return get_param.size;
 }
 
+/* The RLIMIT_MEMLOCK soft limit in bytes, UINT64_MAX if unlimited, 0 if it
+ * cannot be read. */
+static uint64_t
+agx_memlock_limit(void)
+{
+   struct rlimit lim;
+   if (getrlimit(RLIMIT_MEMLOCK, &lim))
+      return 0;
+   return lim.rlim_cur == RLIM_INFINITY ? UINT64_MAX : (uint64_t)lim.rlim_cur;
+}
+
+/* See agx_userptr_imports_any_size(). */
+static bool
+agx_check_userptr_any_size(const struct agx_device *dev)
+{
+   if (!agx_has_userptr(dev))
+      return false;
+
+   const bool no_memlock = !agx_userptr_charges_memlock(dev);
+   if (no_memlock)
+      return true;
+
+   uint64_t gpu_limit_B = dev->params.client_memory_limit;
+   if (!gpu_limit_B)
+      gpu_limit_B = dev->params.memory_limit;
+   if (!gpu_limit_B && !os_get_total_physical_memory(&gpu_limit_B))
+      gpu_limit_B = UINT64_MAX;
+
+   return agx_userptr_imports_any_size(no_memlock, agx_memlock_limit(),
+                                       gpu_limit_B);
+}
+
+
 static int
 agx_submit(struct agx_device *dev, struct drm_asahi_submit *submit,
            struct agx_submit_virt *virt)
@@ -1105,6 +1141,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
       sizeof(dev->params.client_memory_limit);
    dev->has_memory_limits =
       !dev->is_virtio && (size_t)params_size >= limits_params_size;
+   dev->userptr_any_size = agx_check_userptr_any_size(dev);
 
    dev->chip = agx_chip_from_params(&dev->params);
 
@@ -1120,7 +1157,7 @@ agx_open_device(void *memctx, struct agx_device *dev)
     * (agx_gather_device_key). */
    const bool g18g_bringup =
       agx_params_g18g_bringup_supported(&dev->params);
-   if (g18g_bringup)
+   if (g18g_bringup && (dev->debug & AGX_DBG_FAULTTRACE))
       fprintf(stderr, "Experimental M6 G18G integration enabled (M5 paths, agx3d code); rendering is unqualified\n");
    if (!agx_params_driver_supported(&dev->params) && !m5 && !g18g_bringup) {
       if (dev->chip == AGX_CHIP_UNKNOWN) {
@@ -2038,16 +2075,11 @@ agx_gather_device_key(struct agx_device *dev)
                     dev->params.num_clusters_total > 1) ||
                    dev->params.num_dies > 1;
 
-   /* G18G compiles as G17G and re-encodes as agx3d; see emit_agx3d. */
-   const bool g18g = dev->chip == AGX_CHIP_G18G;
-   const enum agx_chip chip = g18g ? AGX_CHIP_G17G : dev->chip;
-
-   return (struct agx_device_key){
-      .chip = chip,
-      .encoding = agx_chip_isa_encoding(chip),
+   struct agx_device_key key = {
       .needs_g13x_coherency = u_tristate_make(g13x_coh),
       .soft_fault = agx_has_soft_fault(dev),
-      .emit_agx3d = g18g,
-      .shader_quad_control = dev->chip == AGX_CHIP_G17P,
    };
+   agx_device_key_set_target(&key, dev->chip);
+   key.shader_quad_control = agx_chip_agx3_shader_quad_control(key.chip);
+   return key;
 }

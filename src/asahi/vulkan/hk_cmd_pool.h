@@ -9,6 +9,7 @@
 
 #include "hk_private.h"
 #include "util/macros.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "asahi/lib/agx_device.h"
 #include "util/cache_ops.h"
 
@@ -65,10 +66,14 @@ hk_cmd_pool_ioto_span_cache_max(const struct agx_device *dev)
              : HK_CMD_POOL_BO_MAX;
 }
 
+static inline unsigned
+hk_cmd_pool_vdm_span_cache_max(const struct agx_device *dev)
+{
+   return hk_cmd_pool_ioto_span_cache_max(dev);
+}
+
 /* Recyclable command buffer BO, used for both push buffers and upload */
 struct hk_cmd_bo {
-   /* Recording/pool ownership plus immutable in-flight submission pins. */
-   int refcount;
    struct agx_bo *bo;
 
    void *map;
@@ -91,7 +96,6 @@ struct hk_cmd_bo {
 struct hk_vdm_slab;
 
 struct hk_vdm_allocation {
-   int refcount;
    struct list_head link;
    struct hk_vdm_slab *slab;
    uint64_t addr;
@@ -103,13 +107,14 @@ struct agx_device;
 struct agx_ptr;
 struct hk_device;
 
-/* G17P command-buffer memory (main/USC pools, VDM slabs, Ioto arenas) is
- * CPU-cached; recording cleans what it wrote before submission
- * (hk_cmd_buffer_publish_cached_uploads()). */
+/* Command-buffer memory (main/USC/root pools, VDM slabs, Ioto arenas) is
+ * CPU-cached on chips with AGX_CAP_CACHED_CMD_MEMORY; recording cleans what it
+ * wrote before submission (hk_cmd_buffer_publish_cached_uploads()). */
 static inline bool
 hk_g17p_cached_cmd_memory(const struct agx_device *dev)
 {
-   return dev->chip == AGX_CHIP_G17P && util_has_cache_ops();
+   return agx_chip_has_cap(dev->chip, AGX_CAP_CACHED_CMD_MEMORY) &&
+          util_has_cache_ops();
 }
 
 struct hk_cmd_pool;
@@ -142,6 +147,12 @@ struct hk_cmd_pool {
    /** Recyclable Ioto arena spans (HK_CMD_SLAB_IOTO, HK_CMD_SPAN_SIZE). */
    struct list_head free_ioto_spans;
    uint32_t num_free_ioto_spans;
+   /** Recyclable VDM spans (HK_CMD_SLAB_VDM, HK_G17P_VDM_UPLOAD_CHUNK_SIZE). */
+   struct list_head free_vdm_spans;
+   uint32_t num_free_vdm_spans;
+   /** Recyclable control-stream descriptors with warm scissor/depth_bias storage. */
+   struct list_head free_cs;
+   uint32_t num_free_cs;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(hk_cmd_pool, vk.base, VkCommandPool,
@@ -175,26 +186,37 @@ VkResult hk_cmd_pool_alloc_ioto_span(struct hk_cmd_pool *pool,
                                      struct hk_vdm_allocation **allocation);
 void hk_cmd_pool_free_ioto_span(struct hk_cmd_pool *pool,
                                 struct hk_vdm_allocation *allocation);
+VkResult hk_cmd_pool_alloc_vdm_span(struct hk_cmd_pool *pool, uint64_t size,
+                                    uint64_t alignment, struct agx_ptr *ptr,
+                                    struct hk_vdm_allocation **allocation);
+void hk_cmd_pool_free_vdm_span(struct hk_cmd_pool *pool,
+                               struct hk_vdm_allocation *allocation);
 void hk_device_free_span(struct hk_device *dev,
                          struct hk_vdm_allocation *allocation);
 void hk_device_finish_vdm_slabs(struct hk_device *dev);
 
-/* Command-memory retirement, independent of API semaphores: on native M5
- * for the memory of every submitted recording, elsewhere only for a
- * driver-owned buffer a submission reads (extra_bo, a packed compute
- * stream), which goes back to the BO cache only once the submission
- * retired. */
+/* Command-memory retirement, independent of API semaphores:
+ * - Driver-owned packed compute stream buffers (extra_bo) have no application
+ *   handle to keep them alive, so submissions pin them until their completion
+ *   syncobj retires.
+ * - Application command recordings follow Vulkan lifetime rules while the
+ *   device is healthy; when a device is lost (or its VM reports a kernel
+ *   error), hk_cmd_pending_retain_lost() keeps their BOs and spans out of
+ *   reuse lists and BO caches until device destruction. */
 struct agx_bo;
+struct hk_cmd_buffer;
 struct hk_cmd_pending;
 struct hk_queue;
-struct vk_queue_submit;
-VkResult hk_cmd_pending_begin(struct hk_device *dev,
-                               const struct vk_queue_submit *submit,
-                               unsigned chunks, struct agx_bo *extra_bo,
+void hk_cmd_pending_init(struct hk_device *dev);
+VkResult hk_cmd_pending_begin(struct hk_device *dev, unsigned chunks,
+                               struct agx_bo *const *extra_bos,
+                               unsigned extra_bo_count,
                                struct hk_cmd_pending **out);
 uint32_t hk_cmd_pending_signal(struct hk_cmd_pending *pending);
 void hk_cmd_pending_end(struct hk_device *dev, struct hk_cmd_pending *pending,
                         struct hk_queue *queue, VkResult result);
+void hk_cmd_pending_retain_lost(struct hk_device *dev,
+                                struct hk_cmd_buffer *cmd);
 void hk_cmd_pending_reap(struct hk_device *dev);
 void hk_cmd_pending_finish_queue(struct hk_device *dev, struct hk_queue *queue);
 void hk_cmd_pending_finish(struct hk_device *dev);

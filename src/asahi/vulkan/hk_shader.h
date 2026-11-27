@@ -20,6 +20,9 @@
 
 #include "hk_device.h"
 #include "hk_device_memory.h"
+#include "hk_identity_copy4.h"
+#include "hk_nir_tensor_ops.h"
+#include "hk_pack_loop_bound.h"
 #include "hk_private.h"
 #include "hk_nir_lower_mesh.h"
 
@@ -32,7 +35,17 @@
 
 #include "vk_shader.h"
 
+static inline bool
+hk_local_read_tilebuffer(enum agx_chip chip)
+{
+   return agx_chip_local_read_tilebuffer(chip) ||
+          (agx_chip_isa_encoding(chip) == AGX_ISA_ENCODING_AGX2 &&
+           agx_chip_command_stream_generation(chip) == AGX_CS_GENERATION_AGX2);
+}
+
 struct hk_physical_device;
+struct hk_compute_pair_info;
+struct hk_compute_pair_producer;
 struct hk_pipeline_compilation_ctx;
 struct vk_descriptor_set_layout;
 struct vk_graphics_pipeline_state;
@@ -78,7 +91,13 @@ struct hk_shader_info {
           * triangle covering the whole clip-space square in front of the
           * viewer (hk_vs_covers_clip_square()). */
          bool covers_clip_square;
-         uint8_t _pad[6];
+         /* Per-pipeline vertex input robustness (enum agx_robustness_level).
+          * Valid only when has_vertex_robustness is true; shader objects leave
+          * it false so draw-time prolog/index robustness derives from enabled
+          * device features. */
+         uint8_t vertex_robustness;
+         bool has_vertex_robustness;
+         uint8_t _pad[4];
       } vs;
 
       struct {
@@ -168,6 +187,9 @@ struct hk_shader_info {
    bool agx3_gen1_fragment_rq;
    /* HK_ROOT_READS_* classes of root bytes the shader may read. */
    uint8_t agx3_root_reads;
+   /* Bitmask of root.dynamic_buffers[] slots statically read by this shader.
+    * Non-constant dynamic-buffer indexing sets HK_ROOT_READS_DYNAMIC_BUFFERS. */
+   uint64_t agx3_dynbuf_reads;
    /* Actual uniform address selected after stage and resource lowering. */
    unsigned agx3_root_uniform;
    bool agx3_txf_texture_valid;
@@ -238,6 +260,7 @@ struct hk_local_read_shader_meta {
    struct agx_fs_epilog_link_info epilog_key;
    uint8_t set_count;
    uint8_t agx3_root_reads;
+   uint64_t agx3_dynbuf_reads;
    bool g17p_colour_unit_range;
    bool static_tests;
    bool may_kill;
@@ -298,6 +321,8 @@ struct hk_shader {
     * dispatch for multi-draw batches. */
    struct agx_vdm_state_update_program_info agx3_vdm_state_update_no_cprog;
 
+   struct hk_pack_loop_bound pack_loop_bound;
+
    const void *code_ptr;
    uint32_t code_size;
 
@@ -307,15 +332,22 @@ struct hk_shader {
    uint64_t constant_data_id;
 
    /* BO for any uploaded shader part */
-   /* Code heap chunk holding the binary, at bo_offset. */
+   /* Code heap chunk holding the binary from byte bo_skip on, at bo_offset. */
    struct agx_bo *bo;
    uint32_t bo_offset;
+
+   /* Leading bytes of the binary left out of the upload (hk_upload_code()). */
+   uint32_t bo_skip;
 
    /* Cache of fast linked variants */
    struct {
       simple_mtx_t lock;
       struct hash_table *ht;
       bool lazy_ht;
+      /* Lock-free fast path for the first linked variant (first_key is
+       * write-once under lock before release-storing first). */
+      struct hk_linked_shader *first;
+      const void *first_key;
    } linked;
 
    /* The variant was compiled (hk_compile_nir) or deserialized from a
@@ -371,10 +403,12 @@ struct hk_shader {
    bool preamble_cs_attempted;
 };
 
+/* The address byte 0 of the binary would have. Only the bytes from bo_skip on
+ * are uploaded, so address no offset below that. */
 static inline uint64_t
 hk_shader_code_va(const struct hk_shader *s)
 {
-   return s->bo->va->addr + s->bo_offset;
+   return s->bo->va->addr + s->bo_offset - s->bo_skip;
 }
 
 enum hk_vs_variant {
@@ -496,10 +530,22 @@ hk_g17p_sparse_vertex_outputs(const struct shader_info *info,
  * multiple hardware hk_shader's, built at shader compile time. This complexity
  * implements the legacy geometry pipeline and native sample-count variants.
  */
+#include "hk_2d_stencil.h"
 #include "hk_byte_stencil.h"
+#include "hk_compute_opt.h"
 
 struct hk_byte_stencil_variant {
    struct hk_byte_stencil_plan plan;
+   struct hk_shader shader;
+};
+
+struct hk_2d_stencil_variant {
+   struct hk_2d_stencil_plan plan;
+   struct hk_shader shader;
+};
+
+struct hk_compute_opt_variant {
+   struct hk_compute_opt_plan plan;
    struct hk_shader shader;
 };
 
@@ -509,6 +555,18 @@ struct hk_api_shader {
    /* Non-NULL only for a fresh API wrapper borrowing immutable deserialized
     * code/data from the device's bounded binary cache. */
    struct hk_shader_binary_cache_entry *binary_cache_entry;
+
+   /* Optional compile-time packed vec4 alternates and lazy compute-pair fusion
+    * state for eligible AGX3/M5 compute shaders. */
+   struct hk_compute_pair_info *compute_pair;
+   struct hk_compute_pair_producer *compute_pair_producer;
+   struct hk_shader *identity_copy4;
+   struct hk_shader *im2col_vec4;
+   struct hk_shader *depthwise_vec4;
+   struct hk_shader *gemm_cmat16;
+   struct hk_shader *gemm_cmat32;
+   struct hk_shader *gemm_cmat64;
+   struct hk_identity_copy4 identity_copy4_info;
 
    /* Is this an internal passthrough geometry shader? */
    bool is_passthrough;
@@ -552,8 +610,28 @@ struct hk_api_shader {
     * stencil: holds the dispatch validation plan and compiled tiled variant. */
    struct hk_byte_stencil_variant *byte_stencil;
 
+   /* Non-NULL for a compute shader matched as a 2D neighborhood / block
+    * stencil: holds the dispatch validation plan and compiled tiled variant. */
+   struct hk_2d_stencil_variant *stencil_2d;
+
+   /* Non-NULL for a compute shader matched by hk_compute_opt: holds the
+    * dispatch validation plan and compiled vectorized/tiled variant. */
+   struct hk_compute_opt_variant *compute_opt;
+
+   /* Non-NULL for a compute shader matched as a 3D tensor concat or
+    * nearest-neighbor resample: holds zero-division vectorized alternate(s). */
+   struct hk_shader *tensor_op_primary;
+   struct hk_shader *tensor_op_secondary;
+   struct hk_tensor_op_info tensor_op_info;
+
    struct hk_shader variants[];
 };
+
+/* Deserialize NIR that a shader keeps in a blob of its own (from the shader
+ * binary or the cache) to build from later. NULL unless the blob holds exactly
+ * one shader of `stage` with an entrypoint. */
+nir_shader *hk_deserialize_nested_nir(void *mem_ctx, const void *data,
+                                      size_t size, mesa_shader_stage stage);
 
 /* The custom-border-emulating twin of a shader with a border source, built
  * on first use. Thread-safe; NULL if it cannot be built. */
@@ -578,6 +656,11 @@ VkResult hk_mesh_fs_twin(struct hk_device *dev, struct hk_api_shader *obj,
 VkResult hk_fs_build_sample_variant(struct hk_device *dev,
                                     struct hk_api_shader *obj,
                                     unsigned samples);
+
+/* Whether variant `idx` of a fragment shader has been completely published
+ * and is safe to read locklessly (acquire-loads sample_source->ready_mask
+ * when lazy sample variants are present). */
+bool hk_fs_sample_variant_ready(const struct hk_api_shader *obj, unsigned idx);
 
 void hk_shader_binary_cache_finish(struct hk_device *dev);
 bool hk_shader_ensure_link_ht_locked(struct hk_shader *shader);
@@ -652,6 +735,8 @@ void hk_prelink_pipeline_fragment(struct hk_device *dev,
 void hk_prelink_object_fragment(struct hk_device *dev,
                                 struct hk_api_shader *fs);
 void hk_prelink_vertex(struct hk_device *dev, struct hk_api_shader *vs,
+                       const struct hk_api_shader *fs,
+                       const struct vk_graphics_pipeline_state *state,
                        bool hw_program, bool sw_program);
 
 static inline struct hk_shader *
@@ -744,6 +829,13 @@ struct hk_linked_shader {
     * on-chip tile memory instead of texture descriptors. */
    bool uses_local_read_tile;
 
+   /* Linked fragment executable is translucent solely because it writes a
+    * proper non-empty subset of the bound colour attachments without reading
+    * the tilebuffer, blending, logic ops, partial channel/sample masks, or
+    * spilling. Eligible for per-stream opaque/punch-through HSR promotion. */
+   bool partial_mrt_opaque_eligible;
+   uint8_t partial_mrt_written_mask;
+
    /* An inline-blend fragment program that forms its own constant program
     * (hk_g17p_inline_epilog_part()) has its own uniform layout: this shader
     * describes it, and the draw takes the program's launch (uniform ranges,
@@ -831,6 +923,9 @@ extern const struct vk_device_shader_ops hk_device_shader_ops;
 
 uint64_t
 hk_physical_device_compiler_flags(const struct hk_physical_device *pdev);
+
+uint32_t
+hk_graphics_max_scratch_B(const struct agx_device *dev, mesa_shader_stage stage);
 
 /* The bounded native CProg shape both graphics stages admit: imported
  * uniform inputs stored in, and exactly filling, the preamble's TPS frame,
@@ -922,6 +1017,40 @@ hk_allow_vs_cprog(enum agx_chip chip, uint64_t features, bool hw,
           stage == MESA_SHADER_VERTEX && !agx3_gen1_fragment_rq;
 }
 
+static inline enum agx_robustness_level
+hk_vertex_robustness_from_vk(VkPipelineRobustnessBufferBehaviorEXT behavior)
+{
+   switch (behavior) {
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT:
+      return AGX_ROBUSTNESS_DISABLED;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT:
+      return AGX_ROBUSTNESS_GL;
+   case VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT:
+      return AGX_ROBUSTNESS_D3D;
+   default:
+      UNREACHABLE("Invalid VkPipelineRobustnessBufferBehaviorEXT");
+   }
+}
+
+static inline enum agx_robustness_level
+hk_vertex_robustness_level(const struct hk_device *dev,
+                           const struct hk_shader *vs,
+                           VkPipelineRobustnessBufferBehaviorEXT vi_robustness)
+{
+   if (vs && vs->info.vs.has_vertex_robustness) {
+      if (vi_robustness !=
+          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT)
+         return hk_vertex_robustness_from_vk(vi_robustness);
+      return (enum agx_robustness_level)vs->info.vs.vertex_robustness;
+   }
+
+   if (dev->vk.enabled_features.robustBufferAccess2)
+      return AGX_ROBUSTNESS_D3D;
+   if (dev->vk.enabled_features.robustBufferAccess)
+      return AGX_ROBUSTNESS_GL;
+   return AGX_ROBUSTNESS_DISABLED;
+}
+
 /* A null uniform buffer is based at the zero page, which spans
  * maxUniformBufferRange, so null descriptors need no bounds when uniform
  * buffer robustness is disabled. Null storage buffers still need them to
@@ -932,6 +1061,14 @@ hk_ubo_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
    return robustness == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT
              ? nir_address_format_64bit_global_32bit_offset
              : nir_address_format_64bit_bounded_global;
+}
+
+/* Gen10 descriptor sets carry the 5-component SSBO address format with the
+ * sparse residency map slot (matching hk_nir_lower_descriptors()). */
+static inline bool
+hk_ssbo_addr_has_map(enum agx_chip chip)
+{
+   return agx_chip_descriptor_generation(chip) == AGX_DESCRIPTOR_GENERATION_10;
 }
 
 static inline nir_address_format
@@ -976,7 +1113,8 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          uint64_t sparse_ro_offset, bool scaled_sampling,
                          bool sampler_has_lod_bias, bool d3d_nearest_mip,
                          bool coherent_images_in_memory,
-                         bool m5_store_window);
+                         bool m5_store_window,
+                         bool lower_array_cube_lod_query);
 
 VkResult hk_compile_shader(struct hk_device *dev,
                            struct vk_shader_compile_info *info,
@@ -1011,8 +1149,23 @@ bool hk_tes_ray_queries_in_compute(const struct hk_device *dev);
  * the software task stage. */
 void hk_g17p_lower_task_kernel(nir_shader *nir);
 
+/* Lower provably non-overflowing 32-bit scalar uadd_sat(term, k) to iadd.nuw. */
+bool hk_nir_lower_aligned_uadd_sat(nir_shader *nir);
+
+/* Merge adjacent reorderable 32-bit buffer word reads into vector loads. */
+bool hk_nir_merge_buffer_words(nir_shader *nir);
+
 /* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
  * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble
  * or compilation fails. */
 struct hk_shader *hk_shader_get_preamble_cs(struct hk_device *dev,
                                             struct hk_shader *vs);
+
+struct blob;
+struct blob_reader;
+
+void hk_shader_serialize(struct vk_device *vk_dev,
+                         const struct hk_shader *shader, struct blob *blob);
+VkResult hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
+                               struct hk_shader *shader, bool absent,
+                               bool cache_candidate);

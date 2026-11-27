@@ -304,8 +304,9 @@ struct agx_compiled_shader {
     * native texture and sampler table pointers when they access resources. */
    bool g17p_texture_resources;
 
-   /* Exact G17P compute write-only image protocol: PBE pointer and native
-    * write-control record occupy uniform halves 0..15. */
+   /* Native compute write-only image protocol (currently enabled only on
+    * G18G): PBE pointer and write-control record occupy the reserved low
+    * uniform root halves. */
    bool g17p_storage_write;
 
    /* The variant contains Honeykrisp-style custom-border emulation. */
@@ -319,6 +320,12 @@ struct agx_compiled_shader {
    /* Uniforms the driver must push */
    unsigned push_range_count;
    struct agx_push_range push[AGX_MAX_PUSH_RANGES];
+
+   /* Precomputed byte prefixes of agx_stage_uniforms and agx_draw_uniforms
+    * read through push[]. UINT16_MAX means indirect access requires the full
+    * table. */
+   uint16_t stage_uniforms_upload_size;
+   uint16_t root_uniforms_upload_size;
 
    /* UVS layout for the last vertex stage */
    struct agx_unlinked_uvs_layout uvs;
@@ -399,8 +406,23 @@ struct agx_uncompiled_shader {
       bool writes_memory;
       /* A vertex or tessellation evaluation shader that writes gl_Layer. */
       bool writes_layer;
+      /* A vertex shader that writes gl_ViewportIndex or clip distances. */
+      bool writes_viewport;
+      bool writes_clip_distance;
       /* API output, excluding synthetic early depth/stencil mask updates. */
       bool writes_api_sample_mask;
+
+      /* Static fullscreen-triangle coverage analysis for vertex shaders:
+       * 0 = none, 1 = CCW in NDC, 2 = CW in NDC. */
+      uint8_t fullscreen_tri_winding;
+      bool fullscreen_tri_z_in_01;
+      bool fullscreen_tri_z_in_m11;
+
+      /* Fragment shader static opaque overwrite analysis: bit i is set iff
+       * colour attachment i is unconditionally written in all four channels
+       * on every non-discarded execution path. */
+      uint8_t fs_unconditional_color_outputs;
+      bool fs_uses_discard;
 
       /* Some image intrinsic other than a read or a size/sample query:
        * stores, atomics, texel addresses and anything not known to only
@@ -591,7 +613,6 @@ struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
    uint64_t seqnum;
-   uint64_t submit_seq;
    uint32_t syncobj;
    /* Failed waits retain these fences and all batch resources until exit. */
    uint32_t failed_syncobjs[2];
@@ -605,6 +626,14 @@ struct agx_batch {
    uint64_t g17p_emrt_heap;
    struct agx_compiled_shader *g17p_fragment_shader;
    struct agx_linked_shader *g17p_fragment_linked;
+
+   /* HAL200 VDM bind-tail and vertex-state tracking for the current VDM chunk.
+    * Reset on a new batch and whenever a VDM STREAM_LINK starts a new chunk. */
+   bool g17p_bind_tail_latched;
+   bool g17p_have_latched_vs;
+   const struct agx_compiled_shader *g17p_latched_vs_shader;
+   uint32_t g17p_latched_vs_word0;
+   uint32_t g17p_latched_vs_outputs[2];
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
@@ -621,6 +650,7 @@ struct agx_batch {
    /* Only a loader-provided resolve may seed the multisample tile reload. */
    bool g17p_resolve_reload;
    bool g17p_resolve_preserve;
+   bool g17p_resolve_blit_attached;
 
    /* M5: every colour attachment of this multi-attachment batch stays in the
     * tilebuffer, moved by the multi-target tile programs
@@ -660,14 +690,13 @@ struct agx_batch {
     * class, DRM_ASAHI_RENDER_SHADER_WRITES). */
    bool m5_shader_writes;
 
-   /* Conservative vertex-stage dependency and primitive-count tracking for
-    * DRM_ASAHI_RENDER_FRAGMENT_BARRIERS and DRM_ASAHI_RENDER_FEW_PRIMITIVES. */
-   bool vs_needs_render_barrier;
-   bool prims_unknown;
-   uint32_t known_prims;
-
    uint64_t uploaded_clear_color[PIPE_MAX_COLOR_BUFS];
    union pipe_color_union clear_color[PIPE_MAX_COLOR_BUFS];
+
+   /* Zeroes that constant and storage buffers with nothing in range point at,
+    * 0 until the first one (agx_uniforms.c).
+    */
+   uint64_t zero_sink;
    double clear_depth;
    unsigned clear_stencil;
 
@@ -688,6 +717,7 @@ struct agx_batch {
    /* CPU snapshot: never read back the write-combined GPU root upload. */
    struct agx_draw_uniforms vs_root;
    bool vs_root_valid;
+   unsigned uploaded_attribs;
    struct agx_stage_uniforms stage_uniforms[MESA_SHADER_STAGES];
 
    /* Heap descriptor if dynamic allocation is required */
@@ -707,27 +737,52 @@ struct agx_batch {
    struct {
       struct set *set;
       struct util_dynarray list; /* struct agx_bo * */
-      /* Subset of BOs written by this batch (subset of list; borrows its ref). */
-      struct util_dynarray written; /* struct agx_bo * */
       /* Byte ranges of buffer BOs this batch reads or writes, for buffers
        * accessed only through ranged bindings. A BO in the set without an
        * entry here counts as accessed in full. */
       struct hash_table *ranges; /* agx_bo * -> index + 1 into range_list */
       struct util_dynarray range_list; /* struct agx_bo_range */
+      struct agx_bo *recent_bos[4];
+      uint8_t recent_bo_next;
+      struct agx_bo *recent_range_bos[4];
+      uint32_t recent_range_idx[4];
+      uint8_t recent_range_next;
    } bo_list;
-
-   /* Per-batch subqueue and barrier-tracking state retained while submitted. */
-   bool submitted_has_vdm;
-   bool submitted_has_cdm;
-   bool barrier_untracked;
 
    /* If true, this batch contains a shader with a potentially incoherent write
     * (e.g. image_write), needing a barrier later to access.
     */
    bool incoherent_writes;
 
-   /* If true, a compute dispatch in this batch accesses a query BO. */
-   bool query_access;
+   /* Whether this batch wrote a resource other than through a shader storage
+    * binding (SSBO, image or global buffer). Shader storage writes are
+    * incoherent in GL: later commands see them only after a memory barrier.
+    */
+   bool coherent_writes;
+
+   /* Plain application compute dispatches (a direct grid, no query), and the
+    * fewest threads any of them launched. A compute-only batch with only
+    * these, no driver work (compute_internal), no scratch and only shader
+    * storage writes may run on a sibling kernel queue
+    * (agx_batch_sibling_queue).
+    */
+   unsigned storage_dispatches;
+   uint64_t storage_min_threads;
+   bool compute_internal;
+
+   /* agx_context::memory_barrier_epoch when the batch began. */
+   uint64_t barrier_epoch;
+
+   /* Set at submission: the batch is compute-only and its writes are all
+    * incoherent, so later independent work need not wait for it. */
+   bool storage_only;
+
+   /* If true, this render batch's tiling/vertex work reads or writes a BO with
+    * an in-flight GPU writer (or uses a pre-fragment stage that writes memory),
+    * so tiling must wait for prior renders instead of deferring the barrier to
+    * the fragment stage via DRM_ASAHI_RENDER_FRAGMENT_BARRIERS.
+    */
+   bool vtx_needs_render_barrier;
 
    struct agx_pool pool, pipeline_pool;
    struct util_dynarray g17p_vdm_aliases;
@@ -802,6 +857,10 @@ struct agx_blend {
 
    /* PIPE_CLEAR_* bitmask corresponding to this blend state */
    uint32_t store;
+
+   /* PIPE_CLEAR_COLOR* mask of render targets whose blend state writes all
+    * four channels without reading the destination tilebuffer. */
+   uint32_t opaque_overwrite;
 };
 
 struct asahi_vs_shader_key {
@@ -942,6 +1001,14 @@ struct asahi_blitter {
    bool active;
    struct hash_table *blit_cs;
 
+   /* Compressed mip-level compute shaders, by enum agx_g17p_mip_key */
+   void *g17p_mip_cs[32];
+
+   /* HAL200/AGX3B compressed block-mip compute shader and unnormalized linear
+    * sampler for exact 2x2 compressed mip levels. */
+   void *g17p_block_mip_cs;
+   void *g17p_block_mip_sampler;
+
    /* [filter] */
    void *sampler[2];
 
@@ -956,15 +1023,6 @@ struct asahi_blitter {
    struct pipe_sampler_view *saved_sampler_view;
 
    void *saved_cs;
-};
-
-struct agx_pending_batch {
-   struct agx_batch *batch;
-   struct drm_asahi_cmd_compute compute;
-   struct drm_asahi_cmd_render render;
-   bool has_compute;
-   bool has_render;
-   bool untracked;
 };
 
 struct agx_oq_heap;
@@ -1023,17 +1081,10 @@ struct agx_context {
     */
    struct {
       uint64_t seqnum;
-      /* Batches with seqnum <= barrier_seqnum must be waited on by later
-       * submissions until they retire (explicit memory/texture/resource
-       * barriers). */
-      uint64_t barrier_seqnum;
       struct agx_batch slots[AGX_MAX_BATCHES];
 
       /** Set of active batches for faster traversal */
       BITSET_DECLARE(active, AGX_MAX_BATCHES);
-
-      /** Set of flushed batches queued for a coalesced multi-command submit */
-      BITSET_DECLARE(queued, AGX_MAX_BATCHES);
 
       /** Set of submitted batches for faster traversal */
       BITSET_DECLARE(submitted, AGX_MAX_BATCHES);
@@ -1057,17 +1108,37 @@ struct agx_context {
       } query_state[AGX_MAX_BATCHES];
    } batches;
 
-   /* Hazard-flushed batches awaiting a coalesced multi-command submit. */
-   struct {
-      struct util_dynarray batches; /* struct agx_pending_batch */
-      unsigned hw_cmds;
-   } pending;
-
    /* Queue handle */
    uint32_t queue_id, virt_ring_idx;
    /* The queue returns from a submission with output syncs before it retires
     * (DRM_ASAHI_QUEUE_CREATE_ASYNC_SUBMIT). */
    bool async_submit;
+
+   /* Incremented by every memory barrier. */
+   uint64_t memory_barrier_epoch;
+
+   /* Sibling kernel queues (agx_batch_sibling_queue): independent
+    * storage-only compute batches go round-robin to id[0] (queue_id) and the
+    * siblings, which the firmware runs at the same time. count is 1 when the
+    * kernel cannot order completion across them.
+    */
+   struct {
+      uint32_t id[AGX_SIBLING_COMPUTE_QUEUES];
+      unsigned count, next;
+      enum drm_asahi_priority priority;
+
+      /* Private cumulative timeline: once the context first has work a
+       * sibling could run (anchored), every submission signals the next
+       * point and its outputs include all earlier points, so completion
+       * stays in submission order even when execution does not. */
+      uint32_t anchor;
+      uint64_t anchor_point, anchor_signalled;
+      bool anchored;
+
+      /* Anchor point of the latest sibling submission that work which must
+       * be ordered after it has not waited for yet (0 for none). */
+      uint64_t pending_point;
+   } sib;
 
    struct agx_batch *batch;
    struct agx_bo *timestamps;
@@ -1124,6 +1195,7 @@ struct agx_context {
     * waits for these before the draw reads the shaders, then clears them.
     */
    uint32_t stages_compiling;
+   uint8_t stages_with_textures;
 
    struct agx_vertex_elements *attributes;
    struct agx_rasterizer *rast;
@@ -1198,6 +1270,9 @@ struct agx_context {
 
    uint32_t syncobj;
    uint32_t dummy_syncobj;
+   /* Private output of the last successful submit, owned until a GL fence
+    * takes it or another submission replaces it. */
+   uint32_t last_submit_fence;
    int in_sync_fd;
    uint32_t in_sync_obj;
    uint64_t flush_last_seqid;
@@ -1284,6 +1359,9 @@ void agx_launch(struct agx_batch *batch, struct agx_grid grid,
                 struct agx_linked_shader *linked, mesa_shader_stage stage,
                 unsigned variable_shared_mem, uint64_t indirect_num_workgroups);
 
+bool agx_precomp_launchable(struct agx_context *ctx,
+                            enum libagx_program program);
+
 void agx_launch_precomp(struct agx_batch *batch, struct agx_grid grid,
                         enum agx_barrier barrier, enum libagx_program program,
                         void *args, size_t arg_size);
@@ -1321,6 +1399,25 @@ void agx_xfb_cpu_draw(struct agx_context *ctx,
                       const struct pipe_draw_start_count_bias *draw);
 void agx_xfb_cpu_destroy(struct agx_context *ctx);
 
+/* A buffer range is bound as the application gave it and can extend past the
+ * end of its resource, for example when the buffer's data store is later
+ * replaced by a smaller one. Returns the bytes of the range inside the
+ * resource: 0 when it starts at or past the end. */
+static inline unsigned
+agx_buffer_range_in_resource(const struct pipe_resource *prsc, unsigned offset,
+                             unsigned size)
+{
+   if (offset >= prsc->width0)
+      return 0;
+
+   return MIN2(size, prsc->width0 - offset);
+}
+
+bool agx_cpu_bind_constant_buffer(struct agx_context *ctx,
+                                  struct draw_context *draw,
+                                  mesa_shader_stage s, unsigned i,
+                                  struct pipe_transfer **transfer);
+
 bool agx_swtnl_lower_for_draw(nir_shader *nir);
 bool agx_m5_gpu_tess(struct agx_context *ctx);
 bool agx_swtnl_applies(struct agx_context *ctx);
@@ -1338,10 +1435,10 @@ void agx_g17g_layered_clear(struct agx_context *ctx, unsigned buffers,
                             uint8_t stencil_clear_mask,
                             const union pipe_color_union *color,
                             double depth, unsigned stencil);
-bool agx_g17g_level_renderable(struct agx_context *ctx,
-                               struct pipe_resource *prsc,
-                               enum pipe_format format, unsigned level,
-                               unsigned layer);
+bool agx_level_renderable(struct agx_context *ctx,
+                          struct pipe_resource *prsc,
+                          enum pipe_format format, unsigned level,
+                          unsigned layer);
 void agx_g17g_split_mrt_clear(struct agx_context *ctx, unsigned buffers,
                               uint32_t color_clear_mask,
                               uint8_t stencil_clear_mask,
@@ -1511,40 +1608,7 @@ struct agx_resource {
     * times multiplied by the resource size.
     */
    size_t shadowed_bytes;
-
-   /* Set once any render batch in this context writes this resource (as a
-    * render target or via fragment shader image/SSBO stores). Used to avoid
-    * overlapping a later batch's vertex stage ahead of a render it reads. */
-   bool render_written;
 };
-
-static inline void
-agx_batch_note_vs_read(struct agx_batch *batch, struct agx_resource *rsrc)
-{
-   if (!rsrc || batch->vs_needs_render_barrier)
-      return;
-
-   if (rsrc->render_written) {
-      batch->vs_needs_render_barrier = true;
-      return;
-   }
-
-   if (rsrc->bo) {
-      if (rsrc->bo->flags & AGX_BO_SHARED) {
-         batch->vs_needs_render_barrier = true;
-         return;
-      }
-
-      uint64_t writer = p_atomic_read_relaxed(&rsrc->bo->writer);
-      if (writer && agx_bo_writer_queue(writer) != batch->ctx->queue_id) {
-         batch->vs_needs_render_barrier = true;
-         return;
-      }
-   }
-
-   if (rsrc->separate_stencil)
-      agx_batch_note_vs_read(batch, rsrc->separate_stencil);
-}
 
 static inline struct agx_resource *
 agx_resource(struct pipe_resource *pctx)
@@ -1592,6 +1656,30 @@ agx_valid_buffer_range_intersects(struct agx_resource *rsrc, unsigned start,
    return intersects;
 }
 
+/* Whether the resource is, or may be, shared with another process or the
+ * display controller. Its backing BO must never be replaced via
+ * transition_resource() or agx_shadow().
+ */
+static inline bool
+agx_resource_is_shared(const struct agx_resource *rsrc)
+{
+   return (rsrc->base.b.bind &
+           (PIPE_BIND_SHARED | PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)) ||
+          (rsrc->bo &&
+           (rsrc->bo->flags & (AGX_BO_SHARED | AGX_BO_SHAREABLE)));
+}
+
+/* Whether the resource is a shared/shareable compressed Interchange surface.
+ * Its backing BO cannot be reallocated uncompressed in agx_decompress(), and
+ * pixel-granular writable storage-image bindings must fail closed.
+ */
+static inline bool
+agx_resource_is_shared_interchange(const struct agx_resource *rsrc)
+{
+   return agx_resource_is_shared(rsrc) && rsrc->layout.compressed &&
+          rsrc->layout.tiling == AIL_TILING_INTERCHANGE;
+}
+
 static inline bool
 agx_resource_valid(struct agx_resource *rsrc, int level)
 {
@@ -1629,6 +1717,37 @@ agx_map_texture_gpu(struct agx_resource *rsrc, unsigned z)
 {
    return agx_map_gpu(rsrc) +
           (uint64_t)ail_get_layer_offset_B(&rsrc->layout, z);
+}
+
+static inline bool
+agx_mdi_subdraw_offset(const struct pipe_draw_indirect_info *indirect,
+                       unsigned draw_index, uint32_t arg_size_B,
+                       uint32_t *offset_out)
+{
+   assert(indirect && indirect->buffer && offset_out);
+
+   const uint64_t buf_size = indirect->buffer->width0;
+   const uint64_t base_offset = indirect->offset;
+   const uint64_t stride = indirect->stride;
+
+   if ((base_offset & 3u) || (stride & 3u) ||
+       base_offset > buf_size || arg_size_B > buf_size - base_offset)
+      return false;
+
+   /* Widen and bound the delta against both the 32-bit
+    * pipe_draw_indirect_info::offset field and the indirect buffer size
+    * before multiplying draw_index * stride. */
+   const uint64_t max_delta =
+      MIN2((uint64_t)UINT32_MAX - base_offset,
+           buf_size - arg_size_B - base_offset);
+   if (stride && (uint64_t)draw_index > max_delta / stride)
+      return false;
+
+   const uint64_t sub_offset = base_offset + (uint64_t)draw_index * stride;
+   assert(sub_offset <= UINT32_MAX &&
+          sub_offset <= buf_size - arg_size_B);
+   *offset_out = (uint32_t)sub_offset;
+   return true;
 }
 
 void agx_decompress(struct agx_context *ctx, struct agx_resource *rsrc,
@@ -1741,17 +1860,7 @@ struct agx_bo_range {
    uint64_t start, end;
 };
 
-static inline unsigned
-agx_build_timestamp_offset(struct agx_batch *batch, unsigned offset)
-{
-   return (agx_batch_idx(batch) * sizeof(struct agx_timestamps)) + offset;
-}
-
-#define agx_timestamp_offset(batch, offs)                                      \
-   agx_build_timestamp_offset(batch, offsetof(struct agx_timestamps, offs))
-
 bool agx_batch_is_active(struct agx_batch *batch);
-bool agx_batch_is_queued(struct agx_batch *batch);
 bool agx_batch_is_submitted(struct agx_batch *batch);
 
 /* BO pointers remain stable while the batch holds its reference. */
@@ -1762,10 +1871,66 @@ agx_batch_uses_bo(struct agx_batch *batch, struct agx_bo *bo)
 }
 
 static inline void
+agx_compute_shader_upload_sizes(struct agx_compiled_shader *cs)
+{
+   const unsigned stage_table = AGX_SYSVAL_STAGE(cs->stage);
+   const size_t stage_ptr_off =
+      offsetof(struct agx_draw_uniforms, tables[stage_table]);
+   const size_t stage_ptr_end = stage_ptr_off + sizeof(uint64_t);
+   const size_t root_ptr_end = sizeof(uint64_t);
+
+   bool indirect_stage = false;
+   bool indirect_root = false;
+   size_t stage_end = 0;
+   size_t root_end = 0;
+
+   for (unsigned i = 0; i < cs->push_range_count; ++i) {
+      const struct agx_push_range *push = &cs->push[i];
+      if (push->table == AGX_SYSVAL_TABLE_ROOT) {
+         const size_t start = push->offset;
+         const size_t end = start + (size_t)ALIGN_POT(push->length, 2) * 2;
+         if (start < root_ptr_end && end > 0)
+            indirect_root = true;
+         if (start < stage_ptr_end && end > stage_ptr_off)
+            indirect_stage = true;
+         root_end = MAX2(root_end, end);
+      } else if (push->table == stage_table) {
+         /* Native Ioto loaders move uniform dwords, so an odd 16-bit range
+          * reads one more half (agx_build_g17p_graphics_program). */
+         const size_t end =
+            (size_t)push->offset + (size_t)ALIGN_POT(push->length, 2) * 2;
+         stage_end = MAX2(stage_end, end);
+      }
+   }
+
+   if (indirect_root) {
+      if (cs->stage != MESA_SHADER_FRAGMENT)
+         indirect_stage = true;
+      cs->root_uniforms_upload_size = UINT16_MAX;
+   } else {
+      cs->root_uniforms_upload_size = (uint16_t)MIN2(
+         ALIGN_POT(root_end, 16), sizeof(struct agx_draw_uniforms));
+   }
+
+   if (indirect_stage) {
+      cs->stage_uniforms_upload_size = UINT16_MAX;
+   } else {
+      cs->stage_uniforms_upload_size = (uint16_t)MIN2(
+         ALIGN_POT(stage_end, 16), sizeof(struct agx_stage_uniforms));
+   }
+}
+
+static inline void
 agx_batch_add_bo_internal(struct agx_batch *batch, struct agx_bo *bo)
 {
+   for (unsigned i = 0; i < ARRAY_SIZE(batch->bo_list.recent_bos); ++i) {
+      if (batch->bo_list.recent_bos[i] == bo)
+         return;
+   }
+
    bool found;
    _mesa_set_search_or_add(batch->bo_list.set, bo, &found);
+   batch->bo_list.recent_bos[batch->bo_list.recent_bo_next++ & 3u] = bo;
    if (found)
       return;
 
@@ -1790,12 +1955,9 @@ struct drm_asahi_cmd_render;
 void agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
                       struct drm_asahi_cmd_compute *compute,
                       struct drm_asahi_cmd_render *render);
-void agx_batch_queue_or_submit(struct agx_context *ctx, struct agx_batch *batch,
-                               struct drm_asahi_cmd_compute *compute,
-                               struct drm_asahi_cmd_render *render);
-void agx_submit_pending(struct agx_context *ctx);
 
 void agx_flush_batch(struct agx_context *ctx, struct agx_batch *batch);
+bool agx_try_fast_clear_batch(struct agx_context *ctx, struct agx_batch *batch);
 void agx_flush_batch_for_reason(struct agx_context *ctx,
                                 struct agx_batch *batch, const char *reason);
 void agx_flush_all(struct agx_context *ctx, const char *reason);
@@ -1823,6 +1985,11 @@ void agx_batch_reads_range(struct agx_batch *batch, struct agx_resource *rsrc,
                            uint64_t offset, uint64_t size);
 void agx_batch_writes_range(struct agx_batch *batch, struct agx_resource *rsrc,
                             unsigned offset, unsigned size);
+void agx_batch_writes_storage(struct agx_batch *batch,
+                              struct agx_resource *rsrc, unsigned level);
+void agx_batch_writes_storage_range(struct agx_batch *batch,
+                                    struct agx_resource *rsrc,
+                                    unsigned offset, unsigned size);
 void agx_batch_track_image(struct agx_batch *batch,
                            struct pipe_image_view *image);
 
@@ -1896,6 +2063,9 @@ bool agx_generate_mipmap_agx3_supported(const struct agx_device *dev,
                                         unsigned first_layer,
                                         unsigned last_layer);
 
+bool agx_g17p_compressed_mip_chain_allowed(const struct agx_device *dev,
+                                           const struct pipe_resource *templ);
+
 bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
@@ -1916,10 +2086,19 @@ void agx_copy_buffer_range(struct pipe_context *pctx, struct pipe_resource *dst,
 struct agx_encoder agx_encoder_allocate(struct agx_batch *batch,
                                         struct agx_device *dev);
 
+void agx_encoder_cleanup(struct agx_device *dev, struct agx_encoder *encoder);
+
 uint64_t agx_batch_get_g17p_vdm_alias(struct agx_batch *batch,
                                       struct agx_bo *bo, uint64_t address);
 
 void agx_batch_init_state(struct agx_batch *batch);
+void agx_batch_note_vtx_read(struct agx_batch *batch,
+                             struct agx_resource *rsrc);
+uint8_t agx_nir_analyze_fullscreen_tri(nir_shader *nir,
+                                       bool *out_z_in_01,
+                                       bool *out_z_in_m11);
+uint8_t agx_nir_analyze_fs_color_outputs(nir_shader *nir,
+                                         bool *out_uses_discard);
 
 struct asahi_bg_eot {
    uint64_t usc;
