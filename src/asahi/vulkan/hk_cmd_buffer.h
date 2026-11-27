@@ -1240,8 +1240,6 @@ struct hk_graphics_state {
    /* A bound graphics program writes external memory. */
    bool shaders_write_memory;
 
-   struct hk_agx3_direct_draw_fast direct_draw_fast;
-
    struct hk_rendering_state render;
    struct hk_descriptor_state descriptors;
 
@@ -1528,6 +1526,10 @@ struct hk_graphics_state {
    /* Needed by vk_command_buffer::dynamic_graphics_state */
    struct vk_vertex_input_state _dynamic_vi;
    struct vk_sample_locations_state _dynamic_sl;
+
+   /* Last: its ~7 KiB Ioto template would otherwise push every hot graphics
+    * field above it out of the cache lines and load offsets it had. */
+   struct hk_agx3_direct_draw_fast direct_draw_fast;
 };
 
 /* The CPU source is mutable. Snapshot its visible bytes at publication,
