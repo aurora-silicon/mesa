@@ -456,6 +456,7 @@ hk_destroy_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer)
       _mesa_set_destroy(cmd->m5_pushed_images, NULL);
    util_dynarray_fini(&cmd->sync_pass_records);
    util_dynarray_fini(&cmd->oq_ends);
+   hk_query_wait_recording_finish(&cmd->query_wait_ops);
    vk_command_buffer_finish(&cmd->vk);
    vk_free(&pool->vk.alloc, cmd);
 }
@@ -561,6 +562,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    if (cmd->m5_pushed_images)
       _mesa_set_clear(cmd->m5_pushed_images, NULL);
    util_dynarray_clear(&cmd->oq_ends);
+   hk_query_wait_recording_finish(&cmd->query_wait_ops);
 
    /* Reset the common state on either side of the four contiguous native
     * graphics caches (g17p_ioto..g17p_spilled_rt_descs, ~8.5 KiB) without

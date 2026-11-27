@@ -16,6 +16,24 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+
+/* Oversized pools must be rejected before allocating per-query WAIT state.
+ * Block calloc during that control so a regression cannot allocate gigabytes. */
+static bool forbid_calloc;
+static unsigned blocked_callocs;
+void *__real_calloc(size_t count, size_t size);
+void *__wrap_calloc(size_t count, size_t size);
+
+void *
+__wrap_calloc(size_t count, size_t size)
+{
+   if (forbid_calloc) {
+      blocked_callocs++;
+      return NULL;
+   }
+   return __real_calloc(count, size);
+}
 
 #define MOCK_SYNCOBJ_MAX 128u
 static uint64_t mock_syncobj_points[MOCK_SYNCOBJ_MAX];
@@ -367,13 +385,24 @@ main(void)
       .queryType = VK_QUERY_TYPE_TIMESTAMP,
       .queryCount = 0x30000000u,
    };
-   assert(hk_CreateQueryPool(hk_device_to_handle(&dev), &huge_ci, NULL,
-                             &huge_pool) == VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   assert(hk_query_wait_device_init(&dev.query_wait));
+   dev.dev.params.features |= DRM_ASAHI_FEATURE_VM_STATUS;
+   forbid_calloc = true;
+   VkResult huge_result = hk_CreateQueryPool(hk_device_to_handle(&dev),
+                                            &huge_ci, NULL, &huge_pool);
+   forbid_calloc = false;
+   bool oversized_ok = huge_result == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+                       blocked_callocs == 0;
+   printf("oversized tracked timestamp pool: result=%d blocked_callocs=%u\n",
+          huge_result, blocked_callocs);
    assert(huge_pool == VK_NULL_HANDLE);
+   hk_query_wait_device_finish(&dev.query_wait);
    mtx_destroy(&dummy_inst.debug_report.callbacks_mutex);
    mtx_destroy(&dummy_inst.debug_utils.callbacks_mutex);
 
    hk_query_stamps_finish(&dev);
+   if (!oversized_ok)
+      return 1;
    puts("hk_query_stamps: ok");
    return 0;
 }
