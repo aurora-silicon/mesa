@@ -13627,7 +13627,9 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
     */
    bool g17p_blend_protocol =
       (enc == AGX_ISA_ENCODING_AGX3B ||
-       (enc == AGX_ISA_ENCODING_AGX3C && ctx->key->m5_uniform_blend &&
+       (enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+        (ctx->key->m5_uniform_blend ||
+         (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND)) &&
         !ctx->key->secondary && !ctx->key->no_stop &&
         ctx->key->fs.nr_samples == 1)) &&
       ctx->stage == MESA_SHADER_FRAGMENT &&
@@ -13664,8 +13666,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             } else if (P->op == AGX_OPCODE_LD_TILE ||
                        P->op == AGX_OPCODE_ST_TILE) {
                const bool load = P->op == AGX_OPCODE_LD_TILE;
+               const bool m5_inline_format =
+                  enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
+                  !ctx->key->m5_uniform_blend &&
+                  agx3_tile_format_width(P->format) >= 0 &&
+                  P->mask >= 1 && P->mask <= 15;
                if (phase != (load ? 1 : 3) ||
-                   !((agx3_g17p_8norm_format(P->format) &&
+                   !(m5_inline_format ||
+                     (agx3_g17p_8norm_format(P->format) &&
                       (P->mask == 3 || P->mask == 15)) ||
                      ((P->format == AGX_FORMAT_RGB10A2 ||
                        P->format == AGX_FORMAT_RGB9E5) && P->mask == 1)) ||
@@ -13927,9 +13935,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
    unsigned vertex_loads_scheduled = 0;
    const bool batch_device_loads =
       enc == AGX_ISA_ENCODING_AGX3C && !ctx->is_preamble &&
+      ctx->nir && !ctx->nir->info.internal &&
       (ctx->stage == MESA_SHADER_COMPUTE ||
-       ctx->stage == MESA_SHADER_FRAGMENT) &&
-      ctx->nir && !ctx->nir->info.internal;
+       ctx->stage == MESA_SHADER_FRAGMENT ||
+       (!ctx->key->dev.emit_agx3d && ctx->stage == MESA_SHADER_VERTEX));
    agx_foreach_block(ctx, slot_block) {
       agx_foreach_instr_in_block(slot_block, I) {
          if (I->op == AGX_OPCODE_STOP)
@@ -13955,13 +13964,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
          e->is_async = agx3_is_async(I) || I->agx3_tex_coord_start;
-         /* Native G17G loads16/loads32 issue several independent 32-bit
-          * device loads on each queue before the first consumer wait.
-          * Keep coherent operations and other asynchronous engines separate. */
+         /* Native G17G loads16/loads32 issue several independent device loads
+          * on each queue before the first consumer wait (W32/F16/W16/W8 all
+          * share the non-coherent LDDEV engine). Keep coherent operations and
+          * other asynchronous engines separate. */
          if (batch_device_loads &&
              I->op == AGX_OPCODE_DEVICE_LOAD &&
-             I->format == AGX_FORMAT_I32 && !I->coherent &&
-             !I->agx3_tex_coord_start) {
+             (I->format == AGX_FORMAT_I32 ||
+              (!ctx->key->dev.emit_agx3d &&
+               (I->format == AGX_FORMAT_F16 || I->format == AGX_FORMAT_I16 ||
+                I->format == AGX_FORMAT_I8))) &&
+             !I->coherent && !I->agx3_tex_coord_start) {
             e->join_class = 1;
             e->join_limit = 8;
          }
