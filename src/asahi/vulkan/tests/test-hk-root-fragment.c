@@ -41,13 +41,39 @@ fresh_select(struct hk_graphics_state *gfx, uint8_t reads,
    return gfx->root;
 }
 
+/* The root steps hk_g17p_flush_dynamic_state_fast() takes for a draw that
+ * changes nothing but what the test marked, with a push-only vertex launch
+ * that succeeds whenever it is tried. draw_fits stands for the draw's own
+ * terms of push_launch_fits: a direct draw, a vertex shader without a
+ * preamble, and a fragment shader that reads neither push constants nor the
+ * root's address. */
+enum fast_root_step {
+   FAST_ROOT_KEEP,        /* early return: the published launch is current */
+   FAST_ROOT_PUSH_LAUNCH, /* vertex launch over push constants, root kept */
+   FAST_ROOT_UPLOAD,      /* full root upload */
+};
+
+static enum fast_root_step
+fast_draw_root(struct hk_descriptor_state *d, bool draw_fits)
+{
+   const bool push_launch_fits = hk_root_push_only_dirty(d) && draw_fits;
+   if (hk_root_launch_current(d, push_launch_fits))
+      return FAST_ROOT_KEEP;
+   if (push_launch_fits && hk_root_push_only_dirty(d)) {
+      hk_root_mark_push_launched(d);
+      return FAST_ROOT_PUSH_LAUNCH;
+   }
+   hk_root_mark_clean(d);
+   return FAST_ROOT_UPLOAD;
+}
+
 static void
 select_and_check_size(struct hk_graphics_state *fresh,
                       struct hk_graphics_state *cached, uint8_t reads,
                       uint32_t required_size, bool memo, bool shadow)
 {
    CHECK(fresh_select(fresh, reads, required_size) ==
-         hk_agx3_fragment_root_select(cached, reads, required_size, memo,
+         hk_agx3_fragment_root_select(cached, reads, 0, required_size, memo,
                                       shadow));
    CHECK(fresh->fs_root == cached->fs_root);
    CHECK(fresh->fs_root_cpu == cached->fs_root_cpu);
@@ -271,6 +297,143 @@ main(void)
       fresh->root = cached->root = 0;
       select_and_check(fresh, cached, 0, memo, shadow);
    }
+   /* Root change tracking: push-only until any other change. */
+   {
+      struct hk_descriptor_state *d = calloc(1, sizeof(*d));
+      CHECK(d != NULL);
+      CHECK(!hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_push_only_dirty(d));
+
+      /* Any other change makes the root fully dirty, and a later push does
+       * not make it push-only again. */
+      hk_root_mark_dirty(d);
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+      hk_root_mark_push_dirty(d);
+      CHECK(hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d) && !hk_root_push_only_dirty(d));
+
+      /* A change before the push keeps it fully dirty too. */
+      hk_root_mark_dirty(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_push_only_dirty(d));
+      hk_root_mark_clean(d);
+      hk_root_mark_push_dirty(d);
+      hk_root_mark_clean(d);
+      CHECK(!hk_root_dirty(d));
+      free(d);
+   }
+
+   /* A push-only vertex launch is current for the next draw that changes
+    * nothing, while the root itself stays dirty for every other reader. */
+   {
+      struct hk_descriptor_state *d = calloc(1, sizeof(*d));
+      CHECK(d != NULL);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+
+      /* Push once, draw three times: one push-only launch, then the early
+       * return, as after a full upload. */
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+      CHECK(hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+      CHECK(hk_root_dirty(d) && hk_root_push_only_dirty(d));
+
+      /* New push constants need a new push-only launch. */
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+
+      /* New descriptors need a full upload. The next push launches
+       * push-only again. */
+      hk_root_mark_dirty(d);
+      CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
+      CHECK(!hk_root_dirty(d));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+      hk_root_mark_push_dirty(d);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_KEEP);
+
+      /* A draw that needs the full root (an indirect draw, a fragment
+       * shader reading push constants, or any path but the fast one) still
+       * finds it dirty and uploads it. */
+      CHECK(hk_root_dirty(d));
+      CHECK(!hk_root_launch_current(d, false));
+      CHECK(fast_draw_root(d, false) == FAST_ROOT_UPLOAD);
+      CHECK(!hk_root_dirty(d) && hk_root_launch_current(d, false));
+
+      /* Any upload, through any path, ends the push-only launch, and so
+       * does a push that follows another change. */
+      hk_root_mark_push_dirty(d);
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      hk_root_mark_clean(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_PUSH_LAUNCH);
+      hk_root_mark_dirty(d);
+      hk_root_mark_push_dirty(d);
+      CHECK(!hk_root_launch_current(d, true) && !hk_root_push_only_dirty(d));
+      CHECK(fast_draw_root(d, true) == FAST_ROOT_UPLOAD);
+      free(d);
+   }
+
+   /* Constant-offset dynamic-buffer reads are compared slot by slot where
+    * the roots are compared in place (CPU-cached roots, !use_shadow): a
+    * fragment shader reading only slot 4 keeps fs_root when only slot 0 (a
+    * vertex-stage per-draw uniform buffer) changes, adopts the new root when
+    * slot 4 changes, and the positive memo never vouches for another slot.
+    * Where the caller relies on the snapshots, which leave the dynamic
+    * buffers out, such a shader always follows the current root. */
+   for (unsigned in_place = 0; in_place < 2; ++in_place) {
+      const bool use_shadow = !in_place;
+      memset(cached, 0, sizeof(*cached));
+      memset(&source, 0, sizeof(source));
+      source.dynamic_buffers[0] =
+         (struct hk_buffer_address){.base_addr = 0x10000, .size = 256};
+      source.dynamic_buffers[4] =
+         (struct hk_buffer_address){.base_addr = 0x40000, .size = 256};
+      source.dynamic_buffers[5] =
+         (struct hk_buffer_address){.base_addr = 0x50000, .size = 256};
+      publish(fresh, cached, &gpu[0], &source, 6, 0x1000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(4), 0,
+                                         true, use_shadow) == 0x1000);
+
+      /* Slot 0 changes: a shader reading slot 4 keeps 0x1000 in place. */
+      source.dynamic_buffers[0].base_addr = 0x10100;
+      publish(fresh, cached, &gpu[1], &source, 6, 0x2000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(4), 0,
+                                         true, use_shadow) ==
+            (in_place ? 0x1000 : 0x2000));
+      /* A shader reading slot 0 adopts 0x2000, memo or not. */
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(0), 0,
+                                         true, use_shadow) == 0x2000);
+
+      /* Slot 5 changes: slot 4 readers keep 0x2000, slot 5 readers adopt. */
+      source.dynamic_buffers[5].base_addr = 0x50200;
+      publish(fresh, cached, &gpu[2], &source, 6, 0x3000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(4), 0,
+                                         true, use_shadow) ==
+            (in_place ? 0x2000 : 0x3000));
+      CHECK(hk_agx3_fragment_root_select(cached, 0, BITFIELD64_BIT(5), 0,
+                                         true, use_shadow) == 0x3000);
+
+      /* A non-constant index (the opaque class) always adopts. */
+      source.dynamic_buffers[0].base_addr = 0x10200;
+      publish(fresh, cached, &gpu[3], &source, 6, 0x4000, true);
+      CHECK(hk_agx3_fragment_root_select(cached, HK_ROOT_READS_DYNAMIC_BUFFERS,
+                                         0, 0, true, use_shadow) == 0x4000);
+   }
+
    printf("root fragment: %" PRIu64 " checks passed\n", checks);
    free(fresh);
    free(cached);
