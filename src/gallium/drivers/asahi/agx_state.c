@@ -6659,6 +6659,20 @@ agx_destroy_compute_blitter(struct pipe_context *ctx, struct asahi_blitter *bl)
    if (bl->g17p_block_mip_sampler)
       ctx->delete_sampler_state(ctx, bl->g17p_block_mip_sampler);
 
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->g17p_block_buf2img_cs); ++i) {
+      for (unsigned j = 0; j < ARRAY_SIZE(bl->g17p_block_buf2img_cs[i]); ++j) {
+         if (bl->g17p_block_buf2img_cs[i][j])
+            ctx->delete_compute_state(ctx, bl->g17p_block_buf2img_cs[i][j]);
+      }
+   }
+
+   for (unsigned i = 0; i < ARRAY_SIZE(bl->g17p_tiled_buf2img_cs); ++i) {
+      for (unsigned j = 0; j < ARRAY_SIZE(bl->g17p_tiled_buf2img_cs[i]); ++j) {
+         if (bl->g17p_tiled_buf2img_cs[i][j])
+            ctx->delete_compute_state(ctx, bl->g17p_tiled_buf2img_cs[i][j]);
+      }
+   }
+
    ctx->delete_sampler_state(ctx, bl->sampler[0]);
    ctx->delete_sampler_state(ctx, bl->sampler[1]);
 
@@ -8313,6 +8327,11 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
                                                  &count, NULL))
       return 0;
 
+   if (cs->stage == MESA_SHADER_VERTEX) {
+      batch->g17p_fast_vs.valid = false;
+      batch->g17p_fast_vs.plan = NULL;
+   }
+
    if (!agx_va_in_usc_window(dev, linked->bo->va->addr + linked->entry_offset))
       return 0;
 
@@ -8351,6 +8370,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
     * program_va. Try the cached patch plan before computing a conservative size
     * bound so plan hits allocate the exact program size with no 6 KiB staging
     * buffer. */
+   const struct agx_g17p_graphics_template *matched_plan = NULL;
    bool relocated = false;
    if (!fs_cprog && linked->g17p_graphics_templates) {
       const struct agx_g17p_graphics_template *plan =
@@ -8364,6 +8384,7 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
              !agx_g17p_graphics_template_emit_plan(plan, ranges, t.cpu, len,
                                                    &program_length))
             return 0;
+         matched_plan = plan;
          relocated = true;
       }
    }
@@ -8404,6 +8425,12 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       if (!agx_g17p_graphics_program_cached(dev->chip, linked, &desc, t.cpu,
                                             capacity, &program_length))
          return 0;
+
+      if (!fs_cprog && linked->g17p_graphics_templates &&
+          linked->g17p_graphics_templates->has_plan &&
+          agx_g17p_graphics_template_matches_shape(
+             linked->g17p_graphics_templates, &desc))
+         matched_plan = linked->g17p_graphics_templates;
    }
 
    agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
@@ -8414,6 +8441,54 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       batch->g17p_fragment_program = t.gpu;
       batch->g17p_fragment_shader = cs;
       batch->g17p_fragment_linked = linked;
+   } else if (cs->stage == MESA_SHADER_VERTEX && matched_plan &&
+              !matched_plan->plan.shared && !matched_plan->plan.short_count &&
+              count <= ARRAY_SIZE(batch->g17p_fast_vs.ranges) &&
+              cs->stage_uniforms_upload_size != UINT16_MAX &&
+              cs->root_uniforms_upload_size != UINT16_MAX &&
+              !cs->b.info.uses_draw_id && !linked->uses_base_param &&
+              !(cs->so && cs->so->info.writes_memory)) {
+      const size_t full_stage_size = agx_stage_uniforms_size(dev->chip);
+      const uint64_t stage_table =
+         batch->uniforms.tables[AGX_SYSVAL_STAGE(MESA_SHADER_VERTEX)];
+      const uint64_t root_table = batch->uniforms.tables[AGX_SYSVAL_TABLE_ROOT];
+      bool fast_ok = true;
+      uint8_t stage_range_count = 0;
+      uint8_t stage_range_idx[4];
+      uint16_t stage_range_off[4];
+      for (size_t r = 0; r < count; ++r) {
+         if (stage_table && ranges[r].address >= stage_table &&
+             ranges[r].address < stage_table + full_stage_size) {
+            if (stage_range_count < ARRAY_SIZE(stage_range_idx)) {
+               stage_range_idx[stage_range_count] = (uint8_t)r;
+               stage_range_off[stage_range_count] =
+                  (uint16_t)(ranges[r].address - stage_table);
+               stage_range_count++;
+            } else {
+               fast_ok = false;
+               break;
+            }
+         } else if (root_table && ranges[r].address >= root_table &&
+                    ranges[r].address <
+                       root_table + sizeof(batch->uniforms.tables)) {
+            fast_ok = false;
+            break;
+         }
+      }
+      if (fast_ok) {
+         batch->g17p_fast_vs.vs = cs;
+         batch->g17p_fast_vs.linked_vs = linked;
+         batch->g17p_fast_vs.plan = matched_plan;
+         batch->g17p_fast_vs.range_count = (uint8_t)count;
+         memcpy(batch->g17p_fast_vs.ranges, ranges, count * sizeof(ranges[0]));
+         batch->g17p_fast_vs.stage_range_count = stage_range_count;
+         memcpy(batch->g17p_fast_vs.stage_range_idx, stage_range_idx,
+                stage_range_count * sizeof(stage_range_idx[0]));
+         memcpy(batch->g17p_fast_vs.stage_range_off, stage_range_off,
+                stage_range_count * sizeof(stage_range_off[0]));
+         batch->g17p_fast_vs.stage_upload_size = (uint16_t)MIN2(
+            (size_t)cs->stage_uniforms_upload_size, full_stage_size);
+      }
    }
    return agx_usc_addr(dev, t.gpu);
 }
@@ -15936,6 +16011,7 @@ agx_ensure_cmdbuf_has_space(struct agx_batch *batch, struct agx_encoder *enc,
       memcpy(enc->current, link.bytes, link.length);
       batch->g17p_bind_tail_latched = false;
       batch->g17p_have_latched_vs = false;
+      batch->g17p_fast_vs.valid = false;
    } else if (vdm && agx_chip_g17_m5(dev->chip)) {
       /* The M5 command processor adds the render-context base to a Stream
        * Link target, as it does to a PPP payload pointer: an absolute target
@@ -17828,6 +17904,246 @@ agx_draw_multi(struct pipe_context *pctx, const struct pipe_draw_info *info,
    }
 }
 
+/* HAL200 direct-draw fast path for consecutive draws in the same render batch
+ * where the VDM bind tail is already latched and at most VS constant buffers
+ * changed (e.g., per-draw UBO offset rebinds). Bypasses redundant shader
+ * validation, feedback-loop/XFB checks, root uniform comparison, and template
+ * lookup, patching the cached VS Ioto plan and emitting VDM state+draw records
+ * directly. Returns false to fall back to the full agx_draw_vbo() path. */
+static bool
+agx_g17p_try_fast_direct_draw(struct agx_context *ctx,
+                              const struct pipe_draw_info *info,
+                              const struct pipe_draw_start_count_bias *draws)
+{
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   if (unlikely(!agx_chip_native_agx3(dev->chip)))
+      return false;
+
+#ifndef NDEBUG
+   if (unlikely(dev->debug & AGX_DBG_DIRTY))
+      return false;
+#endif
+
+   struct agx_batch *batch = ctx->batch;
+   if (unlikely(!batch || !batch->g17p_fast_vs.valid ||
+                !batch->g17p_bind_tail_latched || !batch->g17p_have_latched_vs ||
+                ctx->dirty || agx_batch_is_compute(batch)))
+      return false;
+
+   if (unlikely(ctx->stage[MESA_SHADER_FRAGMENT].dirty ||
+                ctx->stage[MESA_SHADER_GEOMETRY].dirty ||
+                ctx->stage[MESA_SHADER_TESS_CTRL].dirty ||
+                ctx->stage[MESA_SHADER_TESS_EVAL].dirty ||
+                (ctx->stage[MESA_SHADER_VERTEX].dirty & ~AGX_STAGE_DIRTY_CONST)))
+      return false;
+
+   if (unlikely(ctx->active_queries || ctx->cond_query || ctx->time_elapsed ||
+                ctx->gs || ctx->in_tess || ctx->streamout.num_targets ||
+                ctx->swtnl_inner || ctx->active_draw_without_restart ||
+                info->start_instance != 0 || info->has_user_indices))
+      return false;
+
+   __typeof__(batch->g17p_fast_vs) *fv = &batch->g17p_fast_vs;
+   if (unlikely(info->mode != fv->prim_mode ||
+                info->index_size != fv->index_size ||
+                ctx->vs != fv->vs || ctx->linked.vs != fv->linked_vs ||
+                ctx->fs != fv->fs || ctx->linked.fs != fv->linked_fs ||
+                !fv->plan))
+      return false;
+
+   /* Require enough VDM chunk space without triggering a stream link (which
+    * resets the latched bind tail and belongs on the full path). */
+   const size_t command_space =
+      AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_INDEXED_DRAW_BODY_LENGTH +
+      AGX_VDM_STREAM_LINK_LENGTH + 0x800;
+   if (unlikely((size_t)(batch->vdm.end - batch->vdm.current) < command_space))
+      return false;
+
+   uint64_t ib = 0;
+   size_t ib_extent = 0;
+   if (info->index_size) {
+      const uint64_t offset = (uint64_t)draws->start * info->index_size;
+      struct agx_resource *ib_rsrc = agx_resource(info->index.resource);
+      if (unlikely(!ib_rsrc || !ib_rsrc->bo))
+         return false;
+
+      if (likely(ib_rsrc == fv->ib_rsrc && ib_rsrc->bo == fv->ib_bo &&
+                 !agx_writer_get(ctx, ib_rsrc->bo->handle) &&
+                 !(ib_rsrc->bo->flags & AGX_BO_SHARED) &&
+                 agx_bo_writer_syncobj(p_atomic_read(&ib_rsrc->bo->writer)) == 0)) {
+         if (unlikely(((fv->ib_base + offset) & 3) || offset >= fv->ib_size))
+            return false;
+         ib = fv->ib_base + offset;
+         ib_extent = ALIGN_POT(
+            MIN2(fv->ib_size - offset, (uint64_t)draws->count * info->index_size),
+            4);
+      } else {
+         if (unlikely((offset & 3) ||
+                      (agx_map_gpu(ib_rsrc) + offset) & 3))
+            return false;
+         size_t full_size = 0;
+         uint64_t base = agx_index_buffer_rsrc_ptr(batch, info, &full_size);
+         if (unlikely(offset >= full_size))
+            return false;
+         ib = base + offset;
+         ib_extent = ALIGN_POT(
+            MIN2(full_size - offset, (uint64_t)draws->count * info->index_size),
+            4);
+      }
+   }
+
+   uint8_t *out = batch->vdm.current;
+   const bool vs_const_dirty =
+      (ctx->stage[MESA_SHADER_VERTEX].dirty & AGX_STAGE_DIRTY_CONST) != 0;
+
+   if (vs_const_dirty && fv->stage_range_count) {
+      struct agx_stage *st = &ctx->stage[MESA_SHADER_VERTEX];
+      struct agx_stage_uniforms *unif =
+         &batch->stage_uniforms[MESA_SHADER_VERTEX];
+
+      /* Validate all bound VS constant buffers before mutating batch state. */
+      u_foreach_bit(cb_idx, st->cb_mask) {
+         const struct pipe_constant_buffer *cb = &st->cb[cb_idx];
+         if (unlikely(!cb->buffer || !cb->buffer_size))
+            return false;
+      }
+
+      if (unlikely(!fv->stage_upload_size))
+         return false;
+
+      u_foreach_bit(cb_idx, st->cb_mask) {
+         struct pipe_constant_buffer *cb = &st->cb[cb_idx];
+         struct agx_resource *rsrc = agx_resource(cb->buffer);
+         if (likely(cb_idx == fv->ubo_slot && rsrc == fv->ubo_rsrc &&
+                    rsrc->bo == fv->ubo_bo &&
+                    fv->ubo_range_idx != UINT32_MAX &&
+                    !agx_writer_get(ctx, rsrc->bo->handle) &&
+                    !(rsrc->bo->flags & AGX_BO_SHARED) &&
+                    agx_bo_writer_syncobj(p_atomic_read(&rsrc->bo->writer)) == 0)) {
+            struct agx_bo_range *r = util_dynarray_element(
+               &batch->bo_list.range_list, struct agx_bo_range,
+               fv->ubo_range_idx);
+            const uint64_t start = cb->buffer_offset;
+            const uint64_t end = start + cb->buffer_size;
+            r->start = MIN2(r->start, start);
+            r->end = MAX2(r->end, end);
+            unif->ubo_base[cb_idx] = fv->ubo_base + start;
+            unif->ubo_size[cb_idx] = cb->buffer_size;
+         } else {
+            agx_batch_reads_range(batch, rsrc, cb->buffer_offset,
+                                  cb->buffer_size);
+            agx_batch_note_vtx_read(batch, rsrc);
+            unif->ubo_base[cb_idx] = agx_map_gpu(rsrc) + cb->buffer_offset;
+            unif->ubo_size[cb_idx] = cb->buffer_size;
+         }
+      }
+
+      const uint64_t stage_va =
+         agx_pool_upload_aligned(&batch->pool, unif, fv->stage_upload_size, 16);
+      if (unlikely(!stage_va))
+         return false;
+
+      for (unsigned i = 0; i < fv->stage_range_count; ++i)
+         fv->ranges[fv->stage_range_idx[i]].address =
+            stage_va + fv->stage_range_off[i];
+
+      const size_t len = fv->plan->program.program.length;
+      struct agx_bo *program_bo = NULL;
+      struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
+         &batch->pipeline_pool, len, AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
+      size_t program_length = 0;
+      if (unlikely(!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu) ||
+                   !agx_g17p_graphics_template_emit_plan(
+                      fv->plan, fv->ranges, t.cpu, len, &program_length)))
+         return false;
+
+      agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
+                          program_length);
+
+      struct agx_vdm_state_vertex_pipeline_pair pair;
+      if (unlikely(!agx_vdm_state_vertex_pipeline_pair_pack(dev->chip, t.gpu, 0,
+                                                            &pair)))
+         return false;
+
+      static_assert(sizeof(fv->vdm_vs_bytes) >= AGX_VDM_STATE_UPDATE_LENGTH,
+                    "vdm_vs_bytes fits AGX3 VDM state update");
+      memcpy(out, fv->vdm_vs_bytes, AGX_VDM_STATE_UPDATE_LENGTH);
+      memcpy(out + 8, pair.bytes, sizeof(pair.bytes));
+      out += AGX_VDM_STATE_UPDATE_LENGTH;
+
+      batch->uniforms.tables[AGX_SYSVAL_STAGE(MESA_SHADER_VERTEX)] = stage_va;
+
+      if (unlikely(dev->debug & AGX_DBG_PERF))
+         ctx->perf.vs_emits++;
+   }
+
+   const bool restart = info->index_size ? info->primitive_restart : false;
+   const uint32_t restart_idx = restart ? info->restart_index : 0;
+   const uint32_t draw_start = info->index_size ? 0 : draws->start;
+   const int32_t index_bias = info->index_size ? draws->index_bias : 0;
+   if (likely(fv->draw_body_valid && fv->draw_count == draws->count &&
+              fv->draw_instances == info->instance_count &&
+              fv->draw_start == draw_start &&
+              fv->draw_index_bias == index_bias && fv->draw_ib == ib &&
+              fv->draw_ib_extent == ib_extent && fv->draw_restart == restart &&
+              fv->draw_restart_index == restart_idx)) {
+      memcpy(out, fv->draw_body_bytes, fv->draw_body_len);
+      out += fv->draw_body_len;
+   } else {
+      struct agx_draw draw = {0};
+      if (info->index_size) {
+         draw.index_size = agx_translate_index_size(info->index_size);
+         draw.index_buffer = ib;
+         draw.index_buffer_range_B = ib_extent;
+         draw.restart = restart;
+         draw.indexed = true;
+         draw.index_bias = index_bias;
+      } else {
+         draw.start = draw_start;
+      }
+      draw.b = agx_3d(draws->count, info->instance_count, 1);
+
+      uint8_t *body_start = out;
+      out = agx_g17p_emit_draw_body(dev->chip, out, &draw,
+                                    agx_primitive_for_pipe(info->mode),
+                                    info->restart_index, 0);
+      const size_t body_len = (size_t)(out - body_start);
+      static_assert(
+         sizeof(fv->draw_body_bytes) >= AGX_VDM_HAL200_INDEXED_DRAW_BODY_LENGTH,
+         "draw_body_bytes fits HAL200 draw body");
+      if (likely(body_len <= sizeof(fv->draw_body_bytes))) {
+         memcpy(fv->draw_body_bytes, body_start, body_len);
+         fv->draw_body_len = (uint8_t)body_len;
+         fv->draw_count = draws->count;
+         fv->draw_instances = info->instance_count;
+         fv->draw_start = draw_start;
+         fv->draw_index_bias = index_bias;
+         fv->draw_ib = ib;
+         fv->draw_ib_extent = ib_extent;
+         fv->draw_restart = restart;
+         fv->draw_restart_index = restart_idx;
+         fv->draw_body_valid = true;
+      } else {
+         fv->draw_body_valid = false;
+      }
+   }
+
+   batch->vdm.current = out;
+   assert((batch->vdm.current + AGX_VDM_STREAM_LINK_LENGTH) <= batch->vdm.end &&
+          "Failed to reserve sufficient space in encoder");
+
+   ctx->stage[MESA_SHADER_VERTEX].dirty = 0;
+   batch->draws++;
+
+   if (unlikely(dev->debug & AGX_DBG_PERF))
+      ctx->perf.draws++;
+
+   if (unlikely(batch->draws > 100000))
+      agx_flush_batch_for_reason(ctx, batch, "Absurd number of draws");
+
+   return true;
+}
+
 /* Return the smallest 4-byte-aligned address >= start such that every draw_id
  * slice within [addr, addr + span] lies more than INT16_MAX bytes away from
  * every other uniform range. Keeping the per-draw draw_id range in its own
@@ -18735,6 +19051,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    if (!indirect && (!draws->count || !info->instance_count))
       return;
 
+   if (likely(!indirect && ctx->batch && ctx->batch->g17p_fast_vs.valid &&
+              !ctx->dirty) &&
+       agx_g17p_try_fast_direct_draw(ctx, info, draws))
+      return;
+
    /* G17P's index fetch starts at a dword boundary even for U8/U16
     * indices. Qt's image strips commonly start at the second U16 in an
     * element buffer, which otherwise fetches the preceding restart index
@@ -19453,6 +19774,81 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    batch->draws++;
    if (ctx->stage[MESA_SHADER_FRAGMENT].shader)
       batch->last_fs_source = ctx->stage[MESA_SHADER_FRAGMENT].shader->source_hash;
+
+   if (agx_chip_native_agx3(dev->chip)) {
+      __typeof__(batch->g17p_fast_vs) *fv = &batch->g17p_fast_vs;
+      if (!indirect && !ctx->gs && !ctx->in_tess &&
+          !ctx->stage[MESA_SHADER_GEOMETRY].shader &&
+          !ctx->stage[MESA_SHADER_TESS_EVAL].shader &&
+          !ctx->streamout.num_targets && !ctx->active_queries &&
+          !ctx->cond_query && !ctx->time_elapsed && !ctx->swtnl_inner &&
+          !ctx->active_draw_without_restart && info->mode != MESA_PRIM_PATCHES &&
+          !info->has_user_indices && batch->g17p_bind_tail_latched &&
+          batch->g17p_have_latched_vs && fv->plan && fv->vs == ctx->vs &&
+          fv->linked_vs == ctx->linked.vs && ctx->fs && ctx->linked.fs &&
+          agx_multidraw_state_clean(ctx)) {
+         const struct agx_vdm_state_update_info vdm_info = {
+            .raw_vertex_shader_word0 = batch->g17p_latched_vs_word0,
+            .pipeline = 0,
+            .raw_pipeline_template = 0,
+            .raw_vertex_outputs = {batch->g17p_latched_vs_outputs[0],
+                                   batch->g17p_latched_vs_outputs[1]},
+            .raw_vertex_unknown = 0,
+         };
+         struct agx_vdm_state_update encoded;
+         if (agx_vdm_state_update_pack(dev->chip, &vdm_info, &encoded)) {
+            memcpy(fv->vdm_vs_bytes, encoded.bytes, encoded.length);
+            fv->fs = ctx->fs;
+            fv->linked_fs = ctx->linked.fs;
+            fv->prim_mode = (uint8_t)info->mode;
+            fv->index_size = (uint8_t)info->index_size;
+            fv->draw_body_valid = false;
+
+            if (info->index_size && info->index.resource) {
+               struct agx_resource *ib_rsrc = agx_resource(info->index.resource);
+               fv->ib_rsrc = ib_rsrc;
+               fv->ib_bo = ib_rsrc->bo;
+               fv->ib_base = agx_map_gpu(ib_rsrc);
+               fv->ib_size = ALIGN_POT(
+                  ib_rsrc->layout.size_B - ib_rsrc->layout.level_offsets_B[0], 4);
+            } else {
+               fv->ib_rsrc = NULL;
+               fv->ib_bo = NULL;
+               fv->ib_base = 0;
+               fv->ib_size = 0;
+            }
+
+            fv->ubo_slot = 0;
+            fv->ubo_rsrc = NULL;
+            fv->ubo_bo = NULL;
+            fv->ubo_base = 0;
+            fv->ubo_range_idx = UINT32_MAX;
+            struct agx_stage *vs_st = &ctx->stage[MESA_SHADER_VERTEX];
+            if (util_is_power_of_two_nonzero(vs_st->cb_mask)) {
+               const unsigned slot = ffs(vs_st->cb_mask) - 1;
+               if (vs_st->cb[slot].buffer && vs_st->cb[slot].buffer_size) {
+                  struct agx_resource *ubo_rsrc =
+                     agx_resource(vs_st->cb[slot].buffer);
+                  struct hash_entry *he = _mesa_hash_table_search(
+                     batch->bo_list.ranges, ubo_rsrc->bo);
+                  if (he) {
+                     fv->ubo_slot = (uint8_t)slot;
+                     fv->ubo_rsrc = ubo_rsrc;
+                     fv->ubo_bo = ubo_rsrc->bo;
+                     fv->ubo_base = agx_map_gpu(ubo_rsrc);
+                     fv->ubo_range_idx = (uint32_t)((uintptr_t)he->data - 1);
+                  }
+               }
+            }
+
+            fv->valid = true;
+         } else {
+            fv->valid = false;
+         }
+      } else {
+         fv->valid = false;
+      }
+   }
 
    if (unlikely(dev->debug & AGX_DBG_PERF))
       ctx->perf.draws++;

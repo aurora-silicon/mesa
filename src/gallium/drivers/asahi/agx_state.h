@@ -8,6 +8,7 @@
 
 #include <xf86drm.h>
 #include "asahi/compiler/agx_compile.h"
+#include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
 #include "asahi/lib/agx_bo.h"
@@ -617,6 +618,8 @@ struct agx_encoder {
  * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
+struct agx_g17p_graphics_template;
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -642,6 +645,46 @@ struct agx_batch {
    const struct agx_compiled_shader *g17p_latched_vs_shader;
    uint32_t g17p_latched_vs_word0;
    uint32_t g17p_latched_vs_outputs[2];
+
+   /* HAL200 direct-draw fast-path state for consecutive draws that reuse the
+    * latched VDM bind tail and only rebind VS constant buffers (or nothing). */
+   struct {
+      bool valid;
+      bool draw_body_valid;
+      bool draw_restart;
+      uint8_t range_count;
+      uint8_t stage_range_count;
+      uint8_t stage_range_idx[4];
+      uint16_t stage_range_off[4];
+      uint16_t stage_upload_size;
+      uint8_t prim_mode;
+      uint8_t index_size;
+      uint8_t ubo_slot;
+      uint8_t draw_body_len;
+      const struct agx_compiled_shader *vs;
+      const struct agx_linked_shader *linked_vs;
+      const struct agx_compiled_shader *fs;
+      const struct agx_linked_shader *linked_fs;
+      const struct agx_g17p_graphics_template *plan;
+      struct agx3_ioto_uniform_range ranges[8];
+      uint8_t vdm_vs_bytes[32];
+      uint8_t draw_body_bytes[40];
+      uint32_t draw_count;
+      uint32_t draw_instances;
+      uint32_t draw_start;
+      uint32_t draw_restart_index;
+      int32_t draw_index_bias;
+      uint64_t draw_ib;
+      size_t draw_ib_extent;
+      const struct agx_resource *ib_rsrc;
+      const struct agx_bo *ib_bo;
+      uint64_t ib_base;
+      size_t ib_size;
+      const struct agx_resource *ubo_rsrc;
+      const struct agx_bo *ubo_bo;
+      uint64_t ubo_base;
+      uint32_t ubo_range_idx;
+   } g17p_fast_vs;
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
@@ -1016,6 +1059,12 @@ struct asahi_blitter {
     * sampler for exact 2x2 compressed mip levels. */
    void *g17p_block_mip_cs;
    void *g17p_block_mip_sampler;
+
+   /* HAL200/AGX3B buffer-to-image upload compute shaders:
+    * - g17p_block_buf2img_cs[format_slot][partial]: 32x32 imgwblk uploads
+    * - g17p_tiled_buf2img_cs[log2_block_B][log2_per_thread]: Morton uploads */
+   void *g17p_block_buf2img_cs[3][2];
+   void *g17p_tiled_buf2img_cs[5][3];
 
    /* [filter] */
    void *sampler[2];
@@ -2082,6 +2131,24 @@ bool agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                          enum pipe_format format, unsigned base_level,
                          unsigned last_level, unsigned first_layer,
                          unsigned last_layer);
+
+enum pipe_format agx_g17p_block_buf2img_format(enum pipe_format format);
+
+bool agx_g17p_block_buf2img_aligned(const struct pipe_box *box, uint32_t mip_w,
+                                    uint32_t mip_h);
+
+bool agx_g17p_tiled_buf2img_plan(const struct ail_layout *layout,
+                                 unsigned level, const struct pipe_box *box,
+                                 unsigned buffer_offset, unsigned row_stride,
+                                 unsigned layer_stride, uint32_t groups[3],
+                                 uint32_t *per_thread_out);
+
+void agx_image_copy_buffer(struct pipe_context *pctx,
+                           struct pipe_resource *dst,
+                           struct pipe_resource *src, unsigned buffer_offset,
+                           unsigned buffer_stride,
+                           unsigned buffer_layer_stride, unsigned level,
+                           const struct pipe_box *box);
 
 void agx_resource_copy_region(struct pipe_context *pctx,
                               struct pipe_resource *dst, unsigned dst_level,

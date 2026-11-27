@@ -373,6 +373,8 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_bind_tail_latched = false;
    batch->g17p_have_latched_vs = false;
    batch->g17p_latched_vs_shader = NULL;
+   memset(&batch->g17p_fast_vs, 0, sizeof(batch->g17p_fast_vs));
+   batch->g17p_fast_vs.ubo_range_idx = UINT32_MAX;
 
    agx_bo_reference(screen->rodata);
    agx_pool_init(&batch->pool, dev, "Batch pool", 0, true);
