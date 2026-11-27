@@ -36,6 +36,7 @@
 #include "hk_nir_forward_image_stores.h"
 #include "hk_nir_widen_16bit_varyings.h"
 #include "hk_nir_lower_robust_image.h"
+#include "hk_nir_shared_zero_init.h"
 #include "hk_nir_lower_image_view_min_lod.h"
 #include "hk_entrypoints.h"
 
@@ -4107,7 +4108,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(lowered_shared_io, nir, nir_lower_explicit_io, nir_var_mem_shared,
             nir_address_format_32bit_offset);
 
-   if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
+   if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0 &&
+       !hk_nir_shared_memory_fully_initialized(nir)) {
       lowered_complex = true;
       /* Align everything up to 16B so we can write whole vec4s. */
       nir->info.shared_size = align(nir->info.shared_size, 16);
