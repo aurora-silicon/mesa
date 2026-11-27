@@ -95,6 +95,7 @@ init_base_fixture(struct hk_device *dev, struct hk_physical_device *pdev,
    p->exec_threads[1] = 16;
    p->exec_threads[2] = 1;
    p->root_va = UINT64_C(0x5a89abcde0);
+   p->root_size = sizeof(struct hk_root_descriptor_table);
 }
 
 static void

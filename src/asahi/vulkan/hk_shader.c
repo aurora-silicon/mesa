@@ -6421,22 +6421,27 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          wg_coalesce_cand = true;
    }
 
-   /* Measure while root markers are still explicit. Uniform lowering loads
-    * the root pointer and set bases separately, so retain that prefix too.
-    * Hardware VS and FS prologs/epilogs access only the draw arm preceding
-    * push constants, so flooring graphics stages at offsetof(push) preserves
+   /* Measure while root markers are still explicit, so that
+    * hk_cmd_buffer_upload_root() uploads only the prefix a compute shader
+    * reads (on every generation) or a native HAL200 graphics shader reads.
+    * Uniform lowering loads the root pointer and set bases separately, so
+    * retain that prefix too: it is also all that a compute launch preloads
+    * from the root on every generation (the AGX2 USC root uniform and the
+    * AGX3 Ioto root range are both root_desc_addr plus set_count set bases).
+    * Uniform DMA spans over the root come from loads measured here. Hardware
+    * VS and FS prologs/epilogs access only the draw arm preceding push
+    * constants, so flooring HAL200 graphics stages at offsetof(push) preserves
     * every driver-synthesized root load while trimming unused push-constant,
     * dynamic-buffer and trailing tail bytes. Round up for native
-    * uniform/global load granularity. */
-   const bool trimmed_root =
+    * uniform/global load granularity. Every other stage keeps the whole table. */
+   const bool gfx_trimmed_root =
       agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip);
-   if (trimmed_root)
-      shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
-   if (trimmed_root &&
-       (sw_stage == MESA_SHADER_COMPUTE ||
-        sw_stage == MESA_SHADER_FRAGMENT ||
-        (sw_stage == MESA_SHADER_VERTEX &&
-         nir->info.stage == MESA_SHADER_VERTEX))) {
+   shader->root_descriptor_size = sizeof(struct hk_root_descriptor_table);
+   if (sw_stage == MESA_SHADER_COMPUTE ||
+       (gfx_trimmed_root &&
+        (sw_stage == MESA_SHADER_FRAGMENT ||
+         (sw_stage == MESA_SHADER_VERTEX &&
+          nir->info.stage == MESA_SHADER_VERTEX)))) {
       shader->root_descriptor_size = hk_shader_root_descriptor_size(
          nir, sw_stage, set_count, hk_root_descriptor_offset(sets),
          hk_root_descriptor_offset(push),
@@ -11665,10 +11670,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
    /* A short read leaves info as it was: use none of it. */
    if (blob->overrun)
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
-   const uint32_t root_descriptor_size =
-      (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
-         ? blob_read_uint32(blob)
-         : 0;
+   const uint32_t root_descriptor_size = blob_read_uint32(blob);
    uint8_t mesh_primitive_comps[64] = {0};
    if (dev->dev.chip == AGX_CHIP_G17P && info.stage == MESA_SHADER_MESH)
       blob_copy_bytes(blob, mesh_primitive_comps, sizeof(mesh_primitive_comps));
@@ -13118,8 +13120,7 @@ hk_shader_serialize(struct vk_device *vk_dev, const struct hk_shader *shader,
 {
    struct hk_device *dev = container_of(vk_dev, struct hk_device, vk);
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
-   if (agx_chip_native_hal200(dev->dev.chip) || agx_chip_g17_m5(dev->dev.chip))
-      blob_write_uint32(blob, shader->root_descriptor_size);
+   blob_write_uint32(blob, shader->root_descriptor_size);
    if (dev->dev.chip == AGX_CHIP_G17P &&
        shader->info.stage == MESA_SHADER_MESH)
       blob_write_bytes(blob, shader->g17p_mesh_primitive_comps,

@@ -4916,7 +4916,7 @@ hk_agx2_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_device *dev,
    uint64_t root_ptr;
 
    if (sw_stage == MESA_SHADER_COMPUTE) {
-      root_ptr = hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+      root_ptr = hk_cmd_buffer_upload_compute_root(cmd, s);
    } else {
       root_ptr = cmd->state.gfx.root;
    }

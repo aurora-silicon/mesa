@@ -2230,7 +2230,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          return;
    }
    const uint64_t root = internal ? cmd->state.gfx.root :
-      hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+      hk_cmd_buffer_upload_compute_root(cmd, s);
    if (!root)
       return;
    const uint64_t texture_pointers = s->info.agx3_indexed_sampler_valid
@@ -2518,7 +2518,7 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    const uint64_t root_ptr = internal_graphics
       ? cmd->state.gfx.root
-      : hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+      : hk_cmd_buffer_upload_compute_root(cmd, s);
    if (!root_ptr) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       return;
@@ -3018,7 +3018,7 @@ hk_dispatch_g17g_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    }
    const uint64_t root = internal
       ? cmd->state.gfx.root
-      : hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
+      : hk_cmd_buffer_upload_compute_root(cmd, s);
    uint64_t texture_pointers = 0;
    if (s->info.agx3_indexed_sampler_valid) {
       /* The sampled-image heap may be a chunked table (no single BO): its
@@ -3469,6 +3469,7 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    memcpy(record.exec_local, selected->b.info.workgroup_size,
           sizeof(record.exec_local));
    record.root_va = desc->uploaded_root.gpu;
+   record.root_size = desc->uploaded_root.gpu ? desc->uploaded_root_size : 0;
    memcpy(record.root_sets, desc->root.sets, sizeof(record.root_sets));
    memcpy(record.push, desc->root.push, sizeof(record.push));
    record.cs_group_count_addr = desc->root.cs.group_count_addr;
@@ -3582,6 +3583,11 @@ hk_fused_compute_shader_eligible_ranges(
    if (!hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, max_spill_B))
       return false;
    if (memcmp(s->b.info.workgroup_size, p->exec_local, sizeof(p->exec_local)))
+      return false;
+   const size_t required_root =
+      s->root_descriptor_size ? s->root_descriptor_size
+                              : sizeof(struct hk_root_descriptor_table);
+   if (p->root_size < required_root)
       return false;
    if (!p->exec_threads[0] || !p->exec_threads[1] || !p->exec_threads[2])
       return false;
@@ -4135,6 +4141,7 @@ hk_record_copy4_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       memcpy(record->exec_local, selected->b.info.workgroup_size,
              sizeof(record->exec_local));
       record->root_va = desc->uploaded_root.gpu;
+      record->root_size = desc->uploaded_root.gpu ? desc->uploaded_root_size : 0;
       memcpy(record->root_sets, desc->root.sets, sizeof(record->root_sets));
       memcpy(record->push, desc->root.push, sizeof(record->push));
       record->cs_group_count_addr = desc->root.cs.group_count_addr;

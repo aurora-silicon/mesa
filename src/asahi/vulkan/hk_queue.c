@@ -6438,6 +6438,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                   has_im2col, has_dw_a ? &dw_a_cfg : NULL,
                   dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW ? &gemm_dw_cfg : NULL);
                struct hk_compute_pair_dispatch eff_p = *p;
+               if (dual != HK_COMPUTE_PAIR_DUAL_NONE || has_im2col || has_dw_a)
+                  eff_p.root_size = sizeof(struct hk_root_descriptor_table);
                if (eff_alt_kind != p->alt_kind ||
                    (dual == HK_COMPUTE_PAIR_DUAL_GEMM_DW && gemm_dw_cfg.has_proj)) {
                   eff_p.alt_kind = eff_alt_kind;
@@ -7605,6 +7607,7 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                      }
                   }
                   tmp_disp.root_va = root_va + root_off;
+                  tmp_disp.root_size = sizeof(struct hk_root_descriptor_table);
                }
 
                const size_t unique = cs->compute_resources.size;

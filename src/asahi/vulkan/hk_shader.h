@@ -305,8 +305,9 @@ struct hk_shader {
    struct agx_shader_part b;
 
    struct hk_shader_info info;
-   /* G17P-only root prefix; serialized separately in its version-35 payload.
-    * Keep hk_shader_info and version-34 payloads unchanged on other chips. */
+   /* Root table prefix a compute shader (or native HAL200 graphics shader)
+    * reads (whole table for other stages, zero when unmeasured); serialized
+    * after hk_shader_info. */
    uint32_t root_descriptor_size;
    /* G17P mesh: 32-bit words each varying slot takes in the per-primitive
     * record (agx_gen1_mesh_record_layout()), serialized like the root prefix.
