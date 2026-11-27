@@ -2112,6 +2112,88 @@ main(int argc, char **argv)
       plan_on(cbs, 2, 0, false, runs, &rc);
       T("two bounded looping members pack into one packet",
         rc == 1 && runs[0].count == 2);
+
+      /* General dispatch-time loop-bound ops (push constants, grid dims,
+       * ceil-div, div-const, log2+1, i32 overflow assertions). */
+      {
+         struct hk_pack_loop_bound dlb = {
+            .valid = true,
+            .count = 6,
+            .ops = {
+               [0] = { .kind = HK_PACK_LOOP_OP_PUSH_I32_POS, .imm = 0 },
+               [1] = { .kind = HK_PACK_LOOP_OP_GRID_GROUPS, .imm = 0 },
+               [2] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 32 },
+               [3] = { .kind = HK_PACK_LOOP_OP_MUL, .lhs = 1, .rhs = 2 },
+               [4] = { .kind = HK_PACK_LOOP_OP_CEIL_DIV_I32, .lhs = 0, .rhs = 3 },
+               [5] = { .kind = HK_PACK_LOOP_OP_ADD, .lhs = 4, .rhs = 2 },
+            },
+         };
+         int32_t push[4] = { 1000, 113, 0, 0 };
+         uint32_t grid[3] = { 10, 1, 1 };
+         uint64_t out = 0;
+         /* ceil(1000 / 320) + 32 = 4 + 32 = 36 */
+         T("dispatch eval push i32 + grid groups ceil_div",
+           hk_pack_eval_loop_bound_dispatch(&dlb, NULL, push, sizeof(push), grid, &out) &&
+           out == 36);
+         /* Negative push -> clamped to 0 for PUSH_I32_POS -> 0 + 32 = 32 */
+         push[0] = -50;
+         T("dispatch eval PUSH_I32_POS clamps negative to 0",
+           hk_pack_eval_loop_bound_dispatch(&dlb, NULL, push, sizeof(push), grid, &out) &&
+           out == 32);
+         /* Wrap hazard: lim + step > INT32_MAX fails closed */
+         push[0] = INT32_MAX - 100;
+         T("dispatch eval CEIL_DIV_I32 fails closed on 32-bit wrap hazard",
+           !hk_pack_eval_loop_bound_dispatch(&dlb, NULL, push, sizeof(push), grid, &out));
+         /* Zero step fails closed */
+         push[0] = 100;
+         grid[0] = 0;
+         T("dispatch eval CEIL_DIV_I32 fails closed on zero step",
+           !hk_pack_eval_loop_bound_dispatch(&dlb, NULL, push, sizeof(push), grid, &out));
+         /* Out-of-bounds push offset fails closed */
+         grid[0] = 10;
+         T("dispatch eval fails closed when push buffer is too small",
+           !hk_pack_eval_loop_bound_dispatch(&dlb, NULL, push, 2, grid, &out));
+
+         /* PUSH_I32_NONNEG + DIV_CONST + LOG2_PLUS1 + ASSERT_I32 */
+         struct hk_pack_loop_bound slb = {
+            .valid = true,
+            .count = 6,
+            .ops = {
+               [0] = { .kind = HK_PACK_LOOP_OP_PUSH_I32_NONNEG, .imm = 4 },
+               [1] = { .kind = HK_PACK_LOOP_OP_DIV_CONST, .lhs = 0, .imm = 2 },
+               [2] = { .kind = HK_PACK_LOOP_OP_ASSERT_I32, .lhs = 1 },
+               [3] = { .kind = HK_PACK_LOOP_OP_LOG2_PLUS1, .lhs = 1 },
+               [4] = { .kind = HK_PACK_LOOP_OP_ADD, .lhs = 3, .rhs = 2 },
+               [5] = { .kind = HK_PACK_LOOP_OP_ADD, .lhs = 4, .rhs = 1 },
+            },
+         };
+         /* push[1]=113 -> div 2 = 56, log2(56)+1 = 6, + 56 = 62 */
+         T("dispatch eval PUSH_I32_NONNEG + DIV_CONST + LOG2_PLUS1 + ASSERT_I32",
+           hk_pack_eval_loop_bound_dispatch(&slb, NULL, push, sizeof(push), grid, &out) &&
+           out == 62);
+         /* Negative push fails closed on PUSH_I32_NONNEG */
+         push[1] = -1;
+         T("dispatch eval PUSH_I32_NONNEG fails closed on negative input",
+           !hk_pack_eval_loop_bound_dispatch(&slb, NULL, push, sizeof(push), grid, &out));
+
+         /* Unsigned wrap hazard on CEIL_DIV_U32 */
+         struct hk_pack_loop_bound ulb = {
+            .valid = true,
+            .count = 3,
+            .ops = {
+               [0] = { .kind = HK_PACK_LOOP_OP_PUSH_U32, .imm = 0 },
+               [1] = { .kind = HK_PACK_LOOP_OP_CONST, .imm = 32 },
+               [2] = { .kind = HK_PACK_LOOP_OP_CEIL_DIV_U32, .lhs = 0, .rhs = 1 },
+            },
+         };
+         uint32_t upush[2] = { UINT32_MAX - 10u, 0 };
+         T("dispatch eval CEIL_DIV_U32 fails closed on uint32 wrap hazard",
+           !hk_pack_eval_loop_bound_dispatch(&ulb, NULL, upush, sizeof(upush), grid, &out));
+         upush[0] = 65u;
+         T("dispatch eval CEIL_DIV_U32 computes exact ceil",
+           hk_pack_eval_loop_bound_dispatch(&ulb, NULL, upush, sizeof(upush), grid, &out) &&
+           out == 3);
+      }
    }
 
    test_packet_reuse(false);

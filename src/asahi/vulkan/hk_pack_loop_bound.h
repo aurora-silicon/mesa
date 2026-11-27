@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 enum hk_pack_loop_param {
    HK_PACK_LOOP_PARAM_IM2COL_KH = 0,
@@ -26,6 +27,15 @@ enum hk_pack_loop_op_kind {
    HK_PACK_LOOP_OP_ADD,
    HK_PACK_LOOP_OP_MUL,
    HK_PACK_LOOP_OP_MAX,
+   HK_PACK_LOOP_OP_PUSH_U32,
+   HK_PACK_LOOP_OP_PUSH_I32_POS,
+   HK_PACK_LOOP_OP_PUSH_I32_NONNEG,
+   HK_PACK_LOOP_OP_GRID_GROUPS,
+   HK_PACK_LOOP_OP_DIV_CONST,
+   HK_PACK_LOOP_OP_LOG2_PLUS1,
+   HK_PACK_LOOP_OP_ASSERT_I32,
+   HK_PACK_LOOP_OP_CEIL_DIV_U32,
+   HK_PACK_LOOP_OP_CEIL_DIV_I32,
 };
 
 struct hk_pack_loop_op {
@@ -57,10 +67,11 @@ struct hk_pack_loop_bound {
 };
 
 static inline bool
-hk_pack_eval_ops(const struct hk_pack_loop_op *ops, uint8_t count,
-                 uint8_t max_ops,
-                 const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
-                 uint64_t *val_out)
+hk_pack_eval_ops_dispatch(const struct hk_pack_loop_op *ops, uint8_t count,
+                          uint8_t max_ops,
+                          const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
+                          const void *push_data, uint32_t push_size,
+                          const uint32_t grid_groups[3], uint64_t *val_out)
 {
    *val_out = 0;
    if (!ops || count == 0 || count > max_ops || max_ops > HK_PACK_LOOP_WORK_MAX_OPS)
@@ -94,6 +105,77 @@ hk_pack_eval_ops(const struct hk_pack_loop_op *ops, uint8_t count,
             return false;
          v = vals[op.lhs] >= vals[op.rhs] ? vals[op.lhs] : vals[op.rhs];
          break;
+      case HK_PACK_LOOP_OP_PUSH_U32: {
+         if (!push_data || op.imm > push_size || push_size - op.imm < 4u)
+            return false;
+         uint32_t u = 0;
+         memcpy(&u, (const uint8_t *)push_data + op.imm, sizeof(u));
+         v = u;
+         break;
+      }
+      case HK_PACK_LOOP_OP_PUSH_I32_POS: {
+         if (!push_data || op.imm > push_size || push_size - op.imm < 4u)
+            return false;
+         int32_t s = 0;
+         memcpy(&s, (const uint8_t *)push_data + op.imm, sizeof(s));
+         v = s > 0 ? (uint64_t)s : 0ull;
+         break;
+      }
+      case HK_PACK_LOOP_OP_PUSH_I32_NONNEG: {
+         if (!push_data || op.imm > push_size || push_size - op.imm < 4u)
+            return false;
+         int32_t s = 0;
+         memcpy(&s, (const uint8_t *)push_data + op.imm, sizeof(s));
+         if (s < 0)
+            return false;
+         v = (uint64_t)s;
+         break;
+      }
+      case HK_PACK_LOOP_OP_GRID_GROUPS:
+         if (!grid_groups || op.imm >= 3u)
+            return false;
+         v = grid_groups[op.imm];
+         break;
+      case HK_PACK_LOOP_OP_DIV_CONST:
+         if (op.lhs >= i || op.imm == 0)
+            return false;
+         v = vals[op.lhs] / op.imm;
+         break;
+      case HK_PACK_LOOP_OP_LOG2_PLUS1:
+         if (op.lhs >= i)
+            return false;
+         v = vals[op.lhs] == 0 ? 0ull
+                               : (uint64_t)(64 - __builtin_clzll(vals[op.lhs]));
+         break;
+      case HK_PACK_LOOP_OP_ASSERT_I32:
+         if (op.lhs >= i || vals[op.lhs] > (uint64_t)INT32_MAX)
+            return false;
+         v = 0;
+         break;
+      case HK_PACK_LOOP_OP_CEIL_DIV_U32: {
+         if (op.lhs >= i || op.rhs >= i)
+            return false;
+         const uint64_t lim = vals[op.lhs];
+         const uint64_t stp = vals[op.rhs];
+         /* Fail closed if step == 0 or lim + step could wrap 32-bit unsigned. */
+         if (stp == 0 || lim > UINT32_MAX || stp > UINT32_MAX ||
+             lim + stp > UINT32_MAX)
+            return false;
+         v = lim == 0 ? 0 : (lim + stp - 1ull) / stp;
+         break;
+      }
+      case HK_PACK_LOOP_OP_CEIL_DIV_I32: {
+         if (op.lhs >= i || op.rhs >= i)
+            return false;
+         const uint64_t lim = vals[op.lhs];
+         const uint64_t stp = vals[op.rhs];
+         /* Fail closed if step == 0 or lim + step could wrap 32-bit signed. */
+         if (stp == 0 || lim > (uint64_t)INT32_MAX || stp > (uint64_t)INT32_MAX ||
+             lim + stp > (uint64_t)INT32_MAX)
+            return false;
+         v = lim == 0 ? 0 : (lim + stp - 1ull) / stp;
+         break;
+      }
       default:
          return false;
       }
@@ -105,18 +187,61 @@ hk_pack_eval_ops(const struct hk_pack_loop_op *ops, uint8_t count,
 }
 
 static inline bool
-hk_pack_eval_loop_bound(const struct hk_pack_loop_bound *lb,
-                        const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
-                        uint64_t *bound_out)
+hk_pack_eval_ops(const struct hk_pack_loop_op *ops, uint8_t count,
+                 uint8_t max_ops,
+                 const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
+                 uint64_t *val_out)
+{
+   return hk_pack_eval_ops_dispatch(ops, count, max_ops, params, NULL, 0, NULL,
+                                    val_out);
+}
+
+static inline bool
+hk_pack_eval_loop_bound_dispatch(const struct hk_pack_loop_bound *lb,
+                                 const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
+                                 const void *push_data, uint32_t push_size,
+                                 const uint32_t grid_groups[3],
+                                 uint64_t *bound_out)
 {
    *bound_out = 0;
    if (!lb || !lb->valid)
       return false;
    uint64_t res = 0;
-   if (!hk_pack_eval_ops(lb->ops, lb->count, HK_PACK_LOOP_MAX_OPS, params, &res) ||
+   if (!hk_pack_eval_ops_dispatch(lb->ops, lb->count, HK_PACK_LOOP_MAX_OPS,
+                                  params, push_data, push_size, grid_groups,
+                                  &res) ||
        res == 0)
       return false;
    *bound_out = res;
+   return true;
+}
+
+static inline bool
+hk_pack_eval_loop_bound(const struct hk_pack_loop_bound *lb,
+                        const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
+                        uint64_t *bound_out)
+{
+   return hk_pack_eval_loop_bound_dispatch(lb, params, NULL, 0, NULL,
+                                           bound_out);
+}
+
+static inline bool
+hk_pack_eval_work_bound_dispatch(const struct hk_pack_loop_bound *lb,
+                                 const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
+                                 const void *push_data, uint32_t push_size,
+                                 const uint32_t grid_groups[3],
+                                 uint64_t *dyn_nir_ops_out)
+{
+   *dyn_nir_ops_out = 0;
+   if (!lb || !lb->valid || !lb->work_valid || lb->static_nir_ops == 0)
+      return false;
+   uint64_t res = 0;
+   if (!hk_pack_eval_ops_dispatch(lb->work_ops, lb->work_count,
+                                  HK_PACK_LOOP_WORK_MAX_OPS, params, push_data,
+                                  push_size, grid_groups, &res) ||
+       res == 0)
+      return false;
+   *dyn_nir_ops_out = res;
    return true;
 }
 
@@ -125,16 +250,8 @@ hk_pack_eval_work_bound(const struct hk_pack_loop_bound *lb,
                         const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
                         uint64_t *dyn_nir_ops_out)
 {
-   *dyn_nir_ops_out = 0;
-   if (!lb || !lb->valid || !lb->work_valid || lb->static_nir_ops == 0)
-      return false;
-   uint64_t res = 0;
-   if (!hk_pack_eval_ops(lb->work_ops, lb->work_count, HK_PACK_LOOP_WORK_MAX_OPS,
-                         params, &res) ||
-       res == 0)
-      return false;
-   *dyn_nir_ops_out = res;
-   return true;
+   return hk_pack_eval_work_bound_dispatch(lb, params, NULL, 0, NULL,
+                                           dyn_nir_ops_out);
 }
 
 /* Match the unsigned 128-bit numerator, including wraparound, on targets
@@ -172,24 +289,26 @@ hk_pack_scale_instrs_portable(uint64_t instrs, uint64_t work, uint32_t divisor,
  * ceil(2 * dyn_nir_ops / static_nir_ops) (clamped to [agx_instrs, agx_instrs *
  * loop_bound]) so cold mutually-exclusive paths do not multiply loop trips. */
 static inline bool
-hk_pack_eval_effective_instrs(const struct hk_pack_loop_bound *lb,
-                              uint64_t agx_instrs,
-                              const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
-                              uint64_t *eff_instrs_out)
+hk_pack_eval_effective_instrs_dispatch(
+   const struct hk_pack_loop_bound *lb, uint64_t agx_instrs,
+   const uint64_t params[HK_PACK_LOOP_PARAM_COUNT], const void *push_data,
+   uint32_t push_size, const uint32_t grid_groups[3], uint64_t *eff_instrs_out)
 {
    *eff_instrs_out = 0;
    if (!agx_instrs)
       return false;
 
    uint64_t loop_bound = 0;
-   if (!hk_pack_eval_loop_bound(lb, params, &loop_bound))
+   if (!hk_pack_eval_loop_bound_dispatch(lb, params, push_data, push_size,
+                                         grid_groups, &loop_bound))
       return false;
 
    uint64_t naive = 0;
    const bool naive_ok = !__builtin_mul_overflow(agx_instrs, loop_bound, &naive);
 
    uint64_t dyn_nir_ops = 0;
-   if (hk_pack_eval_work_bound(lb, params, &dyn_nir_ops)) {
+   if (hk_pack_eval_work_bound_dispatch(lb, params, push_data, push_size,
+                                        grid_groups, &dyn_nir_ops)) {
 #if defined(__SIZEOF_INT128__)
       const __uint128_t num = (__uint128_t)2u * (__uint128_t)agx_instrs *
                               (__uint128_t)dyn_nir_ops;
@@ -216,4 +335,14 @@ hk_pack_eval_effective_instrs(const struct hk_pack_loop_bound *lb,
       return false;
    *eff_instrs_out = naive;
    return true;
+}
+
+static inline bool
+hk_pack_eval_effective_instrs(const struct hk_pack_loop_bound *lb,
+                              uint64_t agx_instrs,
+                              const uint64_t params[HK_PACK_LOOP_PARAM_COUNT],
+                              uint64_t *eff_instrs_out)
+{
+   return hk_pack_eval_effective_instrs_dispatch(
+      lb, agx_instrs, params, NULL, 0, NULL, eff_instrs_out);
 }

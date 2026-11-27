@@ -9,6 +9,7 @@
 #include "hk_shader.h"
 #include "hk_compute_pair.h"
 #include "hk_identity_copy4.h"
+#include "hk_nir_loop_bound.h"
 #include "hk_nir_match_pointwise_clamp.h"
 #include "hk_shader_upload_core.h"
 #include "hk_buffer.h"
@@ -3619,7 +3620,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
              const struct vk_pipeline_robustness_state *rs, bool is_multiview,
              VkShaderStageFlags next_stage_mask, uint32_t set_layout_count,
              struct vk_descriptor_set_layout *const *set_layouts,
-             enum hk_feature_key features)
+             enum hk_feature_key features,
+             struct hk_pack_loop_bound *pack_loop_bound_out)
 {
    const bool already_preprocessed = nir->info.io_lowered;
    bool lowered_complex = false;
@@ -3856,6 +3858,13 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    const bool sparse_store_guards =
       dev->vk.enabled_features.sparseResidencyBuffer &&
       hk_sparse_buffer_unmapped(&dev->dev);
+
+   /* Compute general dispatch-time loop bounds while push constants and
+    * compute grid intrinsics are still in canonical NIR form. */
+   if (nir->info.stage == MESA_SHADER_COMPUTE && pack_loop_bound_out &&
+       !pack_loop_bound_out->valid && !nir->info.internal) {
+      hk_nir_compute_pack_loop_bound(nir, NULL, 0, pack_loop_bound_out);
+   }
 
    bool lowered_desc = false;
    NIR_PASS(lowered_desc, nir, hk_nir_lower_descriptors, rs, set_layout_count,
@@ -8859,6 +8868,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                   nir_shader *lr_nir,
                   const struct hk_local_read_info *lr_info_in,
                   bool has_ia_in,
+                  const struct hk_pack_loop_bound *pack_loop_bound,
                   struct hk_api_shader **shader_out)
 {
    VkResult result;
@@ -8915,6 +8925,9 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "mesh gl_NumWorkGroups under a task stage needs the task record");
    }
+   struct hk_pack_loop_bound local_pack_lb = {0};
+   if (pack_loop_bound && pack_loop_bound->valid)
+      local_pack_lb = *pack_loop_bound;
    if (!nir->info.io_lowered) {
       if (nir->info.stage == MESA_SHADER_FRAGMENT && !lr_nir) {
          bool scanned_ia = false;
@@ -8928,7 +8941,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                hk_nir_lower_input_attachments_to_outputs(lr_nir);
                hk_lower_nir(dev, lr_nir, info->robustness, false,
                             info->next_stage_mask, info->set_layout_count,
-                            info->set_layouts, features);
+                            info->set_layouts, features, NULL);
                NIR_PASS(_, lr_nir, hk_nir_widen_16bit_varyings,
                         HK_NIR_WIDEN_16BIT_INPUTS);
                NIR_PASS(_, lr_nir, nir_shader_intrinsics_pass,
@@ -8937,7 +8950,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          }
       }
       hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
-                   info->set_layout_count, info->set_layouts, features);
+                   info->set_layout_count, info->set_layouts, features,
+                   &local_pack_lb);
    }
    /* A G17P fragment shader compiled without its mesh shader cannot know
     * where that shader's per-primitive records keep each input. Keep the NIR,
@@ -9864,6 +9878,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
    } else {
       struct hk_shader *shader = hk_only_variant(obj);
+      if (sw_stage == MESA_SHADER_COMPUTE && local_pack_lb.valid)
+         shader->pack_loop_bound = local_pack_lb;
 
       /* hk_compile_nir takes ownership of nir */
       result = hk_compile_nir(dev, pAllocator, nir, info->flags,
@@ -9883,7 +9899,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             bs->plan = bs_cand->plan;
             hk_lower_nir(dev, tiled_nir, info->robustness, false,
                          info->next_stage_mask, info->set_layout_count,
-                         info->set_layouts, features);
+                         info->set_layouts, features,
+                         &bs->shader.pack_loop_bound);
             VkResult bs_res = hk_compile_nir(
                dev, pAllocator, tiled_nir, info->flags, info->robustness, key,
                features, &bs->shader, sw_stage, true, NULL,
@@ -9906,7 +9923,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             s2d->plan = s2d_cand->plan;
             hk_lower_nir(dev, tiled_nir, info->robustness, false,
                          info->next_stage_mask, info->set_layout_count,
-                         info->set_layouts, features);
+                         info->set_layouts, features,
+                         &s2d->shader.pack_loop_bound);
             VkResult s2d_res = hk_compile_nir(
                dev, pAllocator, tiled_nir, info->flags, info->robustness, key,
                features, &s2d->shader, sw_stage, true, NULL,
@@ -9929,7 +9947,8 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
             co->plan = co_cand->plan;
             hk_lower_nir(dev, opt_nir, info->robustness, false,
                          info->next_stage_mask, info->set_layout_count,
-                         info->set_layouts, features);
+                         info->set_layouts, features,
+                         &co->shader.pack_loop_bound);
             VkResult co_res = hk_compile_nir(
                dev, pAllocator, opt_nir, info->flags, info->robustness, key,
                features, &co->shader, sw_stage, true, NULL,
@@ -9999,7 +10018,7 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
    VkResult result = hk_compile_shader_impl(dev, info, state, features,
                                             allocator, NULL, NULL, false, false,
                                             -1, false, false, bs_ptr, s2d_ptr,
-                                            co_ptr, NULL, NULL, false,
+                                            co_ptr, NULL, NULL, false, NULL,
                                             shader_out);
    if (bs_cand.tiled_nir)
       ralloc_free(bs_cand.tiled_nir);
@@ -10045,7 +10064,7 @@ hk_compile_twin(struct hk_device *dev, const struct hk_api_shader *obj,
                                             m5_no_grid_record,
                                             twin_has_vertex_robustness, NULL,
                                             NULL, NULL, NULL, NULL, has_ia,
-                                            &shader);
+                                            NULL, &shader);
    *built = result == VK_SUCCESS ? shader : NULL;
    return result;
 }
@@ -10286,7 +10305,7 @@ hk_compile_compute_alt_nir(struct hk_device *dev,
       alternate->pack_loop_bound = *loop_bound;
 
    hk_lower_nir(dev, nir, info->robustness, false, info->next_stage_mask,
-                info->set_layout_count, info->set_layouts, features);
+                info->set_layout_count, info->set_layouts, features, NULL);
    const VkResult result =
       hk_compile_nir(dev, allocator, nir, info->flags, info->robustness, NULL,
                      features, alternate, MESA_SHADER_COMPUTE, true, NULL,
@@ -10807,7 +10826,9 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
    struct hk_byte_stencil_candidate bs_cands[shader_count];
    struct hk_2d_stencil_candidate s2d_cands[shader_count];
    struct hk_compute_opt_candidate co_cands[shader_count];
+   struct hk_pack_loop_bound pack_loop_bounds[shader_count];
    memset(bs_cands, 0, sizeof(bs_cands));
+   memset(pack_loop_bounds, 0, sizeof(pack_loop_bounds));
    memset(s2d_cands, 0, sizeof(s2d_cands));
    memset(co_cands, 0, sizeof(co_cands));
    memset(lr_nirs, 0, sizeof(lr_nirs));
@@ -10902,7 +10923,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                hk_nir_lower_input_attachments_to_outputs(lr_nirs[i]);
                hk_lower_nir(dev, lr_nirs[i], info->robustness, is_multiview,
                             info->next_stage_mask, info->set_layout_count,
-                            info->set_layouts, hk_features);
+                            info->set_layouts, hk_features, NULL);
                NIR_PASS(_, lr_nirs[i], hk_nir_widen_16bit_varyings,
                         HK_NIR_WIDEN_16BIT_INPUTS);
                NIR_PASS(_, lr_nirs[i], nir_shader_intrinsics_pass,
@@ -10976,7 +10997,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
 
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->next_stage_mask, info->set_layout_count,
-                    info->set_layouts, hk_features);
+                   info->set_layouts, hk_features, &pack_loop_bounds[i]);
       if (nir->info.stage == MESA_SHADER_FRAGMENT && has_mesh)
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_fs_mesh_builtin_per_primitive, nir_metadata_control_flow,
@@ -11162,6 +11183,7 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                                 s2d_cands[i].tiled_nir ? &s2d_cands[i] : NULL,
                                 co_cands[i].opt_nir ? &co_cands[i] : NULL,
                                 lr_nirs[i], &lr_infos[i], has_ias[i],
+                                &pack_loop_bounds[i],
                                 (struct hk_api_shader **)&shaders_out[i]);
       if (bs_cands[i].tiled_nir) {
          ralloc_free(bs_cands[i].tiled_nir);

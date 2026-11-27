@@ -5048,6 +5048,20 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
       cs->sib_threads = threads > UINT64_MAX - cs->sib_threads
                            ? UINT64_MAX : cs->sib_threads + threads;
 
+      if (selected->b.info.has_loops && loop_bound == 0 && !in_threads &&
+          selected->pack_loop_bound.valid &&
+          desc->root.cs.base_group[0] == 0 &&
+          desc->root.cs.base_group[1] == 0 &&
+          desc->root.cs.base_group[2] == 0 &&
+          grid.count[0] <= (uint32_t)INT32_MAX &&
+          grid.count[1] <= (uint32_t)INT32_MAX &&
+          grid.count[2] <= (uint32_t)INT32_MAX) {
+         hk_pack_eval_effective_instrs_dispatch(
+            &selected->pack_loop_bound, selected->b.info.stats.instrs,
+            pack_loop_params, desc->root.push, sizeof(desc->root.push),
+            orig_groups, &loop_bound);
+      }
+
       uint64_t work = 0;
       cs->pack_loops |= hk_pack_account_dispatch_work_eff(
          threads, selected->b.info.stats.instrs,
