@@ -17140,7 +17140,7 @@ hk_agx3_try_fast_direct_draw(struct hk_cmd_buffer *cmd, uint32_t vertexCount,
    return true;
 }
 
-static __attribute__((hot)) bool
+static ATTRIBUTE_NOINLINE __attribute__((hot)) bool
 hk_agx3_try_fast_direct_draw_indexed(struct hk_cmd_buffer *cmd,
                                      uint32_t indexCount,
                                      uint32_t instanceCount,
@@ -18164,12 +18164,6 @@ hk_draw_indexed(VkCommandBuffer commandBuffer, uint16_t draw_id,
                 uint32_t firstInstance)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
-
-   if (likely(!HK_TEST_INDIRECTS && draw_id == 0 &&
-              hk_agx3_try_fast_direct_draw_indexed(
-                 cmd, indexCount, instanceCount, firstIndex, vertexOffset)))
-      return;
-
    struct agx_draw draw;
    struct hk_addr_range buf = cmd->state.gfx.index.buffer;
 
@@ -18194,6 +18188,17 @@ hk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                   uint32_t instanceCount, uint32_t firstIndex,
                   int32_t vertexOffset, uint32_t firstInstance)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   const struct hk_agx3_direct_draw_fast *fast =
+      &cmd->state.gfx.direct_draw_fast;
+
+   /* Only an armed indexed emitter pays for the attempt; every other draw
+    * keeps hk_draw_indexed()'s plain path. */
+   if (!HK_TEST_INDIRECTS && fast->valid && fast->indexed &&
+       hk_agx3_try_fast_direct_draw_indexed(cmd, indexCount, instanceCount,
+                                            firstIndex, vertexOffset))
+      return;
+
    hk_draw_indexed(commandBuffer, 0, indexCount, instanceCount, firstIndex,
                    vertexOffset, firstInstance);
 }
