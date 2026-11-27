@@ -452,18 +452,58 @@ sched_apply_instr(struct sched_ctx *s, const agx_instr *I)
    }
 }
 
+enum pressure_sched_mode {
+   PRESSURE_MODE_GREEDY,
+   PRESSURE_MODE_WAVEFRONT_DIST,
+   PRESSURE_MODE_WAVEFRONT_ORIG,
+};
+
+static bool
+pressure_node_better(const struct sched_node *a, int32_t da,
+                     const struct sched_node *b, int32_t db,
+                     enum pressure_sched_mode mode, const uint32_t *dist_sink)
+{
+   if (mode == PRESSURE_MODE_GREEDY)
+      return da < db;
+
+   const bool a_pos = da > 0;
+   const bool b_pos = db > 0;
+   if (a_pos != b_pos)
+      return !a_pos;
+
+   if (!a_pos) {
+      if (da != db)
+         return da < db;
+      return a->index > b->index;
+   }
+
+   if (mode == PRESSURE_MODE_WAVEFRONT_DIST) {
+      const uint32_t dist_a = dist_sink[a->index];
+      const uint32_t dist_b = dist_sink[b->index];
+      if (dist_a != dist_b)
+         return dist_a < dist_b;
+      if (da != db)
+         return da < db;
+      return a->index > b->index;
+   }
+
+   if (a->index != b->index)
+      return a->index > b->index;
+   return da < db;
+}
+
 /*
- * Choose the next instruction, bottom-up. For now we use a simple greedy
- * heuristic: choose the instruction that has the best effect on liveness, while
- * hoisting sample_mask.
+ * Choose the next instruction, bottom-up, according to `mode`, while hoisting
+ * sample_mask/zs_emit and sinking wait_pix.
  */
 static struct sched_node *
-choose_instr(struct sched_ctx *s)
+choose_instr(struct sched_ctx *s, struct list_head *heads,
+             enum pressure_sched_mode mode, const uint32_t *dist_sink)
 {
-   int32_t min_delta = INT32_MAX;
+   int32_t best_delta = INT32_MAX;
    struct sched_node *best = NULL;
 
-   list_for_each_entry(struct sched_node, n, &s->dag->heads, dag.link) {
+   list_for_each_entry(struct sched_node, n, heads, dag.link) {
       /* Heuristic: hoist sample_mask/zs_emit. This allows depth/stencil tests
        * to run earlier, and potentially to discard the entire quad invocation
        * earlier, reducing how much redundant fragment shader we run.
@@ -478,7 +518,7 @@ choose_instr(struct sched_ctx *s)
 
          if (!best) {
             best = n;
-            assert(min_delta == INT32_MAX);
+            assert(best_delta == INT32_MAX);
          }
 
          continue;
@@ -491,15 +531,64 @@ choose_instr(struct sched_ctx *s)
          return n;
 
       assert(n->delta == calculate_pressure_delta_dense(n->instr, s->live));
-      int32_t delta = n->delta;
+      const int32_t delta = n->delta;
 
-      if (delta < min_delta) {
+      if (!best || best_delta == INT32_MAX ||
+          pressure_node_better(n, delta, best, best_delta, mode, dist_sink)) {
          best = n;
-         min_delta = delta;
+         best_delta = delta;
       }
    }
 
    return best;
+}
+
+static signed
+pressure_schedule_run(agx_context *ctx, agx_block *block, struct sched_ctx *s,
+                      struct sched_node **nodes, unsigned nr_dag,
+                      uint32_t *rem_parents, enum pressure_sched_mode mode,
+                      const uint32_t *dist_sink, struct sched_node **schedule)
+{
+   memset(s->live, 0, BITSET_BYTES(ctx->alloc));
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
+      BITSET_SET(s->live, v);
+
+   struct list_head heads;
+   list_inithead(&heads);
+
+   for (unsigned i = 0; i < nr_dag; ++i) {
+      struct sched_node *node = nodes[i];
+      node->delta = calculate_pressure_delta_dense(node->instr, s->live);
+      rem_parents[i] = node->dag.parent_count;
+      list_delinit(&node->dag.link);
+      if (rem_parents[i] == 0)
+         list_addtail(&node->dag.link, &heads);
+   }
+
+   /* off by a constant, that's ok */
+   signed max_pressure = 0;
+   signed pressure = 0;
+   unsigned nr_ins = 0;
+
+   while (!list_is_empty(&heads)) {
+      struct sched_node *node = choose_instr(s, &heads, mode, dist_sink);
+      assert(node->delta == calculate_pressure_delta_dense(node->instr, s->live));
+      pressure += node->delta;
+      max_pressure = MAX2(pressure, max_pressure);
+      list_delinit(&node->dag.link);
+
+      util_dynarray_foreach(&node->dag.edges, struct dag_edge, edge) {
+         struct sched_node *child = (struct sched_node *)edge->child;
+         if (--rem_parents[child->index] == 0)
+            list_addtail(&child->dag.link, &heads);
+      }
+
+      schedule[nr_ins++] = node;
+      sched_apply_instr(s, node->instr);
+   }
+
+   assert(nr_ins == nr_dag);
+   return max_pressure;
 }
 
 static void
@@ -510,6 +599,8 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
       util_dynarray_num_elements(all_nodes, struct sched_node *);
    if (nr_dag <= 1)
       return;
+
+   struct sched_node **nodes = all_nodes->data;
 
    /* off by a constant, that's ok */
    signed pressure = 0;
@@ -525,11 +616,7 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
       sched_liveness_update_dense(s->live, I);
    }
 
-   memset(s->live, 0, BITSET_BYTES(ctx->alloc));
-   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
-      BITSET_SET(s->live, v);
-
-   /* Initialize per-node deltas and incremental def/use tables */
+   /* Build incremental def/use tables once for all passes on this block */
    if (s->touched_start < s->touched_end) {
       const unsigned span = s->touched_end - s->touched_start;
       memset(s->def_node + s->touched_start, 0, span * sizeof(*s->def_node));
@@ -539,10 +626,9 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
    s->touched_end = 0;
    util_dynarray_clear(s->use_pool);
 
-   util_dynarray_foreach(all_nodes, struct sched_node *, np) {
-      struct sched_node *node = *np;
+   for (unsigned i = 0; i < nr_dag; ++i) {
+      struct sched_node *node = nodes[i];
       const agx_instr *I = node->instr;
-      int32_t delta = 0;
 
       agx_foreach_ssa_dest(I, d) {
          const unsigned v = I->dest[d].value;
@@ -551,14 +637,12 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
          s->def_size[v] = sz;
          s->touched_start = MIN2(s->touched_start, v);
          s->touched_end = MAX2(s->touched_end, v + 1);
-         if (BITSET_TEST(s->live, v))
-            delta -= sz;
       }
 
       agx_foreach_ssa_src(I, src) {
          bool dupe = false;
-         for (unsigned i = 0; i < src; ++i) {
-            if (agx_is_equiv(I->src[i], I->src[src])) {
+         for (unsigned k = 0; k < src; ++k) {
+            if (agx_is_equiv(I->src[k], I->src[src])) {
                dupe = true;
                break;
             }
@@ -579,44 +663,98 @@ pressure_schedule_block(agx_context *ctx, agx_block *block, struct sched_ctx *s,
          s->use_head[v] = entry_idx;
          s->touched_start = MIN2(s->touched_start, v);
          s->touched_end = MAX2(s->touched_end, v + 1);
-         if (!BITSET_TEST(s->live, v))
-            delta += sz;
       }
-
-      node->delta = delta;
    }
 
-   /* off by a constant, that's ok */
-   signed max_pressure = 0;
-   pressure = 0;
-
-   struct sched_node **schedule = malloc(nr_dag * sizeof(struct sched_node *));
-   unsigned nr_ins = 0;
-
-   while (!list_is_empty(&s->dag->heads)) {
-      struct sched_node *node = choose_instr(s);
-      assert(node->delta == calculate_pressure_delta_dense(node->instr, s->live));
-      pressure += node->delta;
-      max_pressure = MAX2(pressure, max_pressure);
-      dag_prune_head(s->dag, &node->dag);
-
-      schedule[nr_ins++] = node;
-      sched_apply_instr(s, node->instr);
-   }
-
-   /* Bail if it looks like it's worse */
-   if (max_pressure >= orig_max_pressure) {
-      free(schedule);
+   uint32_t *rem_parents = malloc(nr_dag * sizeof(*rem_parents));
+   struct sched_node **best_schedule = malloc(nr_dag * sizeof(*best_schedule));
+   struct sched_node **cand_schedule = malloc(nr_dag * sizeof(*cand_schedule));
+   if (!rem_parents || !best_schedule || !cand_schedule) {
+      free(rem_parents);
+      free(best_schedule);
+      free(cand_schedule);
       return;
    }
 
-   /* Apply the schedule */
-   for (unsigned i = 0; i < nr_ins; ++i) {
-      agx_remove_instruction(schedule[i]->instr);
-      list_add(&schedule[i]->instr->link, &block->instructions);
+   signed best_pressure = orig_max_pressure;
+   bool have_best = false;
+
+   const signed greedy_pressure =
+      pressure_schedule_run(ctx, block, s, nodes, nr_dag, rem_parents,
+                            PRESSURE_MODE_GREEDY, NULL, cand_schedule);
+   if (greedy_pressure < best_pressure) {
+      best_pressure = greedy_pressure;
+      have_best = true;
+      struct sched_node **tmp = best_schedule;
+      best_schedule = cand_schedule;
+      cand_schedule = tmp;
    }
 
-   free(schedule);
+   /* Pure greedy min-delta can unwind one reduction chain completely ahead of
+    * sibling chains with deeper post-processing (e.g. unrolled AO + bent-normal
+    * taps), keeping all intermediate tap outputs live simultaneously. For
+    * high-pressure blocks, also try reverse-wavefront orders and keep the
+    * strictly lowest peak pressure. */
+   if (best_pressure > 40 && nr_dag >= 16) {
+      uint32_t *dist_sink = malloc(nr_dag * sizeof(*dist_sink));
+      if (dist_sink) {
+         for (unsigned i = 0; i < nr_dag; ++i)
+            dist_sink[i] = nodes[i]->dag.parent_count == 0 ? 0u : UINT32_MAX;
+         for (unsigned i = nr_dag; i-- > 0;) {
+            if (dist_sink[i] == UINT32_MAX)
+               continue;
+            const uint32_t next_dist = dist_sink[i] + 1u;
+            util_dynarray_foreach(&nodes[i]->dag.edges, struct dag_edge, edge) {
+               const struct sched_node *child =
+                  (const struct sched_node *)edge->child;
+               if (next_dist < dist_sink[child->index])
+                  dist_sink[child->index] = next_dist;
+            }
+         }
+
+         const signed dist_pressure = pressure_schedule_run(
+            ctx, block, s, nodes, nr_dag, rem_parents,
+            PRESSURE_MODE_WAVEFRONT_DIST, dist_sink, cand_schedule);
+         if (dist_pressure < best_pressure) {
+            best_pressure = dist_pressure;
+            have_best = true;
+            struct sched_node **tmp = best_schedule;
+            best_schedule = cand_schedule;
+            cand_schedule = tmp;
+         }
+         free(dist_sink);
+      }
+
+      if (best_pressure > 40) {
+         const signed orig_rev_pressure = pressure_schedule_run(
+            ctx, block, s, nodes, nr_dag, rem_parents,
+            PRESSURE_MODE_WAVEFRONT_ORIG, NULL, cand_schedule);
+         if (orig_rev_pressure < best_pressure) {
+            best_pressure = orig_rev_pressure;
+            have_best = true;
+            struct sched_node **tmp = best_schedule;
+            best_schedule = cand_schedule;
+            cand_schedule = tmp;
+         }
+      }
+   }
+
+   free(rem_parents);
+   free(cand_schedule);
+
+   /* Bail if no candidate beat the original order */
+   if (!have_best) {
+      free(best_schedule);
+      return;
+   }
+
+   /* Apply the winning schedule */
+   for (unsigned i = 0; i < nr_dag; ++i) {
+      agx_remove_instruction(best_schedule[i]->instr);
+      list_add(&best_schedule[i]->instr->link, &block->instructions);
+   }
+
+   free(best_schedule);
 }
 
 void
