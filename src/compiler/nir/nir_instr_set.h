@@ -67,7 +67,7 @@ nir_instr_set_add_or_rewrite(struct set *instr_set, nir_instr *instr,
  */
 void nir_instr_set_remove(struct set *instr_set, nir_instr *instr);
 
-#define NIR_CSE_INSTR_SET_INLINE_CAP 128
+#define NIR_CSE_INSTR_SET_INLINE_CAP 256
 
 /**
  * Compact power-of-2 open-addressed linear-probing instruction set for

@@ -170,7 +170,12 @@ nir_opt_cse_impl(nir_function_impl *impl)
    struct nir_cse_instr_set per_block_set;
    per_block_set.capacity = 0;
 
-   nir_metadata_require(impl, nir_metadata_dominance);
+   const bool single_block = exec_list_is_singular(&impl->body);
+   if (!single_block)
+      nir_metadata_require(impl, nir_metadata_dominance);
+
+   bool (*dom_cond)(const nir_instr *a, const nir_instr *b) =
+      single_block ? NULL : dominates;
 
    bool progress = false;
    nir_foreach_block(block, impl) {
@@ -186,7 +191,7 @@ nir_opt_cse_impl(nir_function_impl *impl)
                progress = true;
                nir_instr_remove(instr);
             }
-         } else if (nir_cse_instr_set_add_or_rewrite(&instr_set, instr, allow_discard, NULL, dominates)) {
+         } else if (nir_cse_instr_set_add_or_rewrite(&instr_set, instr, allow_discard, NULL, dom_cond)) {
             progress = true;
             nir_instr_remove(instr);
          } else if (per_block_set.capacity && may_change_active_invocations(instr)) {

@@ -24,7 +24,9 @@
 #include "nir_range_analysis.h"
 #include <float.h>
 #include <math.h>
+#include "util/bitscan.h"
 #include "util/hash_table.h"
+#include "util/u_call_once.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include "c99_alloca.h"
@@ -185,33 +187,6 @@ push_fp_query(struct analysis_state *state, const nir_def *def)
    pushed_q->def = def;
 }
 
-static uint32_t
-get_fp_key(struct analysis_query *q)
-{
-   return ((struct fp_query *)q)->def->index;
-}
-
-static bool
-fp_lookup(void *table, uint32_t key, uint32_t *value)
-{
-   nir_fp_analysis_state *state = table;
-   if (BITSET_TEST(state->bitset, key)) {
-      *value = state->arr[key];
-      return true;
-   } else {
-      return false;
-   }
-}
-
-static void
-fp_insert(void *table, uint32_t key, uint32_t value)
-{
-   nir_fp_analysis_state *state = table;
-   BITSET_SET(state->bitset, key);
-   state->max = MAX2(state->max, (int)key);
-   state->arr[key] = value;
-}
-
 static fp_class_mask
 fneg_fp_class(fp_class_mask src)
 {
@@ -235,12 +210,8 @@ fneg_fp_class(fp_class_mask src)
 }
 
 static fp_class_mask
-fmul_fp_class(fp_class_mask left, fp_class_mask right, bool mulz, bool src_eq, bool src_neg_eq)
+fmul_fp_class_core(fp_class_mask left, fp_class_mask right, bool mulz)
 {
-   /* For runtime performance, shortcut the common completely unknown case. */
-   if (left == FP_CLASS_UNKNOWN && right == FP_CLASS_UNKNOWN && !src_eq && !src_neg_eq)
-      return FP_CLASS_UNKNOWN;
-
    fp_class_mask result = 0;
 
    if (left & FP_CLASS_NAN) {
@@ -409,37 +380,12 @@ fmul_fp_class(fp_class_mask left, fp_class_mask right, bool mulz, bool src_eq, b
       }
    }
 
-   if (src_eq || src_neg_eq) {
-      /* This case can't create new ones. */
-      if (!(left & (FP_CLASS_POS_ONE | FP_CLASS_NEG_ONE)))
-         result &= ~(FP_CLASS_POS_ONE | FP_CLASS_NEG_ONE);
-
-      if (src_eq)
-         result &= ~(FP_CLASS_ANY_NEG | FP_CLASS_NEG_ZERO);
-      else if (src_neg_eq && mulz)
-         result &= ~FP_CLASS_ANY_POS;
-      else if (src_neg_eq)
-         result &= ~(FP_CLASS_ANY_POS | FP_CLASS_POS_ZERO);
-   }
-
-   if ((left | right) & FP_CLASS_NON_INTEGRAL) {
-      if (result & (FP_CLASS_LT_NEG_ONE | FP_CLASS_LT_ZERO_GT_NEG_ONE |
-                    FP_CLASS_GT_ZERO_LT_POS_ONE | FP_CLASS_GT_POS_ONE))
-         result |= FP_CLASS_NON_INTEGRAL;
-   } else {
-      result &= ~(FP_CLASS_LT_ZERO_GT_NEG_ONE | FP_CLASS_GT_ZERO_LT_POS_ONE);
-   }
-
    return result;
 }
 
 static fp_class_mask
-fadd_fp_class(fp_class_mask left, fp_class_mask right)
+fadd_fp_class_core(fp_class_mask left, fp_class_mask right)
 {
-   /* For runtime performance, shortcut the common completely unknown case. */
-   if (left == FP_CLASS_UNKNOWN && right == FP_CLASS_UNKNOWN)
-      return FP_CLASS_UNKNOWN;
-
    fp_class_mask result = (left | right) & FP_CLASS_NAN;
    /* X + Y is NaN if either operand is NaN or if one operand is +Inf and
     * the other is -Inf.
@@ -587,6 +533,118 @@ fadd_fp_class(fp_class_mask left, fp_class_mask right)
       if (right & FP_CLASS_NEG_ZERO)
          result |= FP_CLASS_POS_ZERO;
    }
+
+   return result;
+}
+
+static once_flag fp_class_tables_once = ONCE_FLAG_INIT;
+static uint16_t fmul_fp_lo[2][11][64];
+static uint16_t fmul_fp_hi[2][11][32];
+static uint16_t fadd_fp_lo[10][64];
+static uint16_t fadd_fp_hi[10][32];
+
+static void
+init_fp_class_tables(void)
+{
+   for (unsigned mulz = 0; mulz < 2; ++mulz) {
+      for (unsigned b = 0; b < 11; ++b) {
+         const fp_class_mask lb = (fp_class_mask)(1u << b);
+         for (unsigned rlo = 1; rlo < 64; ++rlo)
+            fmul_fp_lo[mulz][b][rlo] = fmul_fp_class_core(lb, (fp_class_mask)rlo, mulz);
+         for (unsigned rhi = 1; rhi < 32; ++rhi)
+            fmul_fp_hi[mulz][b][rhi] = fmul_fp_class_core(lb, (fp_class_mask)(rhi << 6), mulz);
+      }
+   }
+   for (unsigned b = 0; b < 10; ++b) {
+      const fp_class_mask lb = (fp_class_mask)(1u << b);
+      for (unsigned rlo = 1; rlo < 64; ++rlo)
+         fadd_fp_lo[b][rlo] = fadd_fp_class_core(lb, (fp_class_mask)rlo);
+      for (unsigned rhi = 1; rhi < 32; ++rhi)
+         fadd_fp_hi[b][rhi] = fadd_fp_class_core(lb, (fp_class_mask)(rhi << 6));
+   }
+}
+
+static fp_class_mask
+fmul_fp_class(fp_class_mask left, fp_class_mask right, bool mulz, bool src_eq, bool src_neg_eq)
+{
+   /* For runtime performance, shortcut the common completely unknown case. */
+   if (left == FP_CLASS_UNKNOWN && right == FP_CLASS_UNKNOWN && !src_eq && !src_neg_eq)
+      return FP_CLASS_UNKNOWN;
+
+   uint32_t lm = left & 0x7ffu;
+   uint32_t rm = right & 0x7ffu;
+   if (util_bitcount(rm) < util_bitcount(lm)) {
+      uint32_t tmp = lm;
+      lm = rm;
+      rm = tmp;
+   }
+
+   const unsigned rlo = rm & 0x3fu;
+   const unsigned rhi = (rm >> 6) & 0x1fu;
+   fp_class_mask result = 0;
+   while (lm) {
+      const unsigned b = u_bit_scan(&lm);
+      result |= fmul_fp_lo[mulz][b][rlo] | fmul_fp_hi[mulz][b][rhi];
+   }
+   /* The tables only see the number classes of one operand.  The +/-1 terms
+    * pass the other operand's NON_INTEGRAL bit through, and with mulz a
+    * zero on the left gives +0.0 whatever the right is.  Both depend on the
+    * original operand order.
+    */
+   if (left & (FP_CLASS_POS_ONE | FP_CLASS_NEG_ONE))
+      result |= right & FP_CLASS_NON_INTEGRAL;
+   if (mulz && (left & FP_CLASS_ANY_ZERO))
+      result |= FP_CLASS_POS_ZERO;
+
+   if (src_eq || src_neg_eq) {
+      /* This case can't create new ones. */
+      if (!(left & (FP_CLASS_POS_ONE | FP_CLASS_NEG_ONE)))
+         result &= ~(FP_CLASS_POS_ONE | FP_CLASS_NEG_ONE);
+
+      if (src_eq)
+         result &= ~(FP_CLASS_ANY_NEG | FP_CLASS_NEG_ZERO);
+      else if (src_neg_eq && mulz)
+         result &= ~FP_CLASS_ANY_POS;
+      else if (src_neg_eq)
+         result &= ~(FP_CLASS_ANY_POS | FP_CLASS_POS_ZERO);
+   }
+
+   if ((left | right) & FP_CLASS_NON_INTEGRAL) {
+      if (result & (FP_CLASS_LT_NEG_ONE | FP_CLASS_LT_ZERO_GT_NEG_ONE |
+                    FP_CLASS_GT_ZERO_LT_POS_ONE | FP_CLASS_GT_POS_ONE))
+         result |= FP_CLASS_NON_INTEGRAL;
+   } else {
+      result &= ~(FP_CLASS_LT_ZERO_GT_NEG_ONE | FP_CLASS_GT_ZERO_LT_POS_ONE);
+   }
+
+   return result;
+}
+
+static fp_class_mask
+fadd_fp_class(fp_class_mask left, fp_class_mask right)
+{
+   /* For runtime performance, shortcut the common completely unknown case. */
+   if (left == FP_CLASS_UNKNOWN && right == FP_CLASS_UNKNOWN)
+      return FP_CLASS_UNKNOWN;
+
+   uint32_t lm = left & 0x3ffu;
+   uint32_t rm = right & 0x3ffu;
+   if (util_bitcount(rm) < util_bitcount(lm)) {
+      uint32_t tmp = lm;
+      lm = rm;
+      rm = tmp;
+   }
+
+   const unsigned rlo = rm & 0x3fu;
+   const unsigned rhi = (rm >> 6) & 0x1fu;
+   fp_class_mask result = (left | right) & FP_CLASS_NAN;
+   while (lm) {
+      const unsigned b = u_bit_scan(&lm);
+      result |= fadd_fp_lo[b][rlo] | fadd_fp_hi[b][rhi];
+   }
+   /* The +/-0 terms pass the right operand's NON_INTEGRAL bit through. */
+   if (left & FP_CLASS_ANY_ZERO)
+      result |= right & FP_CLASS_NON_INTEGRAL;
 
    if ((left | right) & FP_CLASS_NON_INTEGRAL) {
       if (result & (FP_CLASS_LT_NEG_ONE | FP_CLASS_LT_ZERO_GT_NEG_ONE |
@@ -1411,9 +1469,11 @@ process_fp_query(struct analysis_state *state, struct analysis_query *aq, uint32
    *result = r;
 }
 
-fp_class_mask
-nir_analyze_fp_class(nir_fp_analysis_state *fp_state, const nir_def *def)
+static ATTRIBUTE_NOINLINE fp_class_mask
+nir_analyze_fp_class_slow(nir_fp_analysis_state *fp_state, const nir_def *def)
 {
+   call_once(&fp_class_tables_once, init_fp_class_tables);
+
    if (unlikely(!fp_state->bitset)) {
       /* Over-allocate, so that we can keep using the allocated table memory
        * even when new SSA values are added. */
@@ -1430,14 +1490,61 @@ nir_analyze_fp_class(nir_fp_analysis_state *fp_state, const nir_def *def)
    util_dynarray_init_from_stack(&state.query_stack, query_alloc, sizeof(query_alloc));
    util_dynarray_init_from_stack(&state.result_stack, result_alloc, sizeof(result_alloc));
    state.query_size = sizeof(struct fp_query);
-   state.get_key = &get_fp_key;
-   state.lookup = &fp_lookup;
-   state.insert = &fp_insert;
-   state.process_query = &process_fp_query;
 
    push_fp_query(&state, def);
 
-   return perform_analysis(&state);
+   while (state.query_stack.size) {
+      struct fp_query *cur =
+         (struct fp_query *)((char *)util_dynarray_end(&state.query_stack) - sizeof(struct fp_query));
+      uint32_t *result =
+         util_dynarray_element(&state.result_stack, uint32_t, cur->head.result_index);
+
+      const uint32_t key = cur->def->index;
+      if (cur->head.pushed_queries == 0 && BITSET_TEST(fp_state->bitset, key)) {
+         *result = fp_state->arr[key];
+         state.query_stack.size -= sizeof(struct fp_query);
+         continue;
+      }
+
+      uint32_t *src =
+         (uint32_t *)util_dynarray_end(&state.result_stack) - cur->head.pushed_queries;
+      state.result_stack.size -= sizeof(uint32_t) * cur->head.pushed_queries;
+
+      const uint32_t prev_num_queries = state.query_stack.size;
+      process_fp_query(&state, &cur->head, result, src);
+
+      const uint32_t num_queries = state.query_stack.size;
+      if (num_queries > prev_num_queries) {
+         cur = (struct fp_query *)util_dynarray_element(&state.query_stack, char,
+                                                        prev_num_queries - sizeof(struct fp_query));
+         cur->head.pushed_queries = (num_queries - prev_num_queries) / sizeof(struct fp_query);
+         continue;
+      }
+
+      BITSET_SET(fp_state->bitset, key);
+      fp_state->max = MAX2(fp_state->max, (int)key);
+      fp_state->arr[key] = *result;
+
+      state.query_stack.size -= sizeof(struct fp_query);
+   }
+
+   assert(state.result_stack.size == sizeof(uint32_t));
+
+   const uint32_t res = util_dynarray_top(&state.result_stack, uint32_t);
+   util_dynarray_fini(&state.query_stack);
+   util_dynarray_fini(&state.result_stack);
+
+   return res;
+}
+
+fp_class_mask
+nir_analyze_fp_class(nir_fp_analysis_state *fp_state, const nir_def *def)
+{
+   if (likely(fp_state->bitset && def->index < fp_state->size &&
+              BITSET_TEST(fp_state->bitset, def->index)))
+      return fp_state->arr[def->index];
+
+   return nir_analyze_fp_class_slow(fp_state, def);
 }
 
 nir_fp_analysis_state

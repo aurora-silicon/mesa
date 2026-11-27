@@ -23,6 +23,7 @@
 
 #include "nir_search.h"
 #include <inttypes.h>
+#include "util/bitscan.h"
 #include "util/half_float.h"
 #include "util/u_call_once.h"
 #include "nir_builder.h"
@@ -41,6 +42,7 @@ struct match_variable {
 struct match_state {
    unsigned fp_math_ctrl;
    uint8_t comm_op_direction;
+   uint8_t comm_mask_used;
    unsigned variables_seen;
 
    /* Used for running the automaton on newly-constructed instructions. */
@@ -416,19 +418,28 @@ match_value(const nir_algebraic_table *table,
           * 1-bit float types.  This prevents potential assertion failures in
           * nir_src_comp_as_float.
           */
-         if (load->def.bit_size < 16)
+         const unsigned bit_size = load->def.bit_size;
+         if (bit_size < 16)
             return false;
 
+         const double target = const_val->data.d;
+         const bool target_pos_zero = dui(target) == 0;
          for (unsigned i = 0; i < num_components; ++i) {
-            double val = nir_src_comp_as_float(instr->src[src].src,
-                                               instr->src[src].swizzle[swizzle[i]]);
-            if (val != const_val->data.d)
+            const unsigned comp = instr->src[src].swizzle[swizzle[i]];
+            double val;
+            if (likely(bit_size == 32))
+               val = (double)load->value[comp].f32;
+            else if (bit_size == 64)
+               val = load->value[comp].f64;
+            else
+               val = (double)_mesa_half_to_float(load->value[comp].u16);
+            if (val != target)
                return false;
 
             /* The comparison above does not check the sign bit for 0.0,
              * so do it manually.
              */
-            if ((dui(val) == 0) != (dui(const_val->data.d) == 0))
+            if ((dui(val) == 0) != target_pos_zero)
                return false;
          }
          return true;
@@ -437,12 +448,39 @@ match_value(const nir_algebraic_table *table,
       case nir_type_int:
       case nir_type_uint:
       case nir_type_bool: {
-         unsigned bit_size = nir_src_bit_size(instr->src[src].src);
-         uint64_t mask = u_uintN_max(bit_size);
+         nir_load_const_instr *const load =
+            nir_def_as_load_const(instr->src[src].src.ssa);
+         const unsigned bit_size = load->def.bit_size;
+         if (likely(bit_size == 32)) {
+            const uint32_t target = (uint32_t)const_val->data.u;
+            for (unsigned i = 0; i < num_components; ++i) {
+               if (load->value[instr->src[src].swizzle[swizzle[i]]].u32 != target)
+                  return false;
+            }
+            return true;
+         }
+         const uint64_t mask = u_uintN_max(bit_size);
+         const uint64_t target = const_val->data.u & mask;
          for (unsigned i = 0; i < num_components; ++i) {
-            uint64_t val = nir_src_comp_as_uint(instr->src[src].src,
-                                                instr->src[src].swizzle[swizzle[i]]);
-            if ((val & mask) != (const_val->data.u & mask))
+            const unsigned comp = instr->src[src].swizzle[swizzle[i]];
+            uint64_t val;
+            switch (bit_size) {
+            case 64:
+               val = load->value[comp].u64;
+               break;
+            case 16:
+               val = load->value[comp].u16;
+               break;
+            case 8:
+               val = load->value[comp].u8;
+               break;
+            case 1:
+               val = load->value[comp].b;
+               break;
+            default:
+               UNREACHABLE("Invalid bit size");
+            }
+            if (val != target)
                return false;
          }
          return true;
@@ -469,28 +507,29 @@ match_expression_sources(const nir_algebraic_table *table,
     * up its direction for the current search operation.  We'll use that value
     * to possibly flip the sources for the match.
     */
-   unsigned comm_op_flip =
+   state->comm_mask_used |= expr->comm_expr_mask;
+   const unsigned comm_op_flip =
       !!(state->comm_op_direction & expr->comm_expr_mask);
 
+   const nir_search_value_union *values = table->values;
+   const unsigned src1_is_const = expr->src1_is_const;
    const unsigned num_inputs = info->num_inputs;
-   bool matched = true;
    for (unsigned i = 0; i < num_inputs; i++) {
       /* If src1 of the search expression is a constant, check that first since it's faster. */
-      unsigned src_idx = i < 2 ? i ^ expr->src1_is_const : i;
+      unsigned src_idx = i < 2 ? i ^ src1_is_const : i;
       unsigned instr_src = i < 2 ? src_idx ^ comm_op_flip : src_idx;
 
       /* 2src_commutative instructions that have 3 sources are only commutative
        * in the first two sources.  Source 2 is always source 2.
        */
-      if (!match_value(table, &state->table->values[expr->srcs[src_idx]].value, instr,
+      if (!match_value(table, &values[expr->srcs[src_idx]].value, instr,
                        instr_src, info->input_sizes[instr_src],
                        num_components, swizzle, state)) {
-         matched = false;
-         break;
+         return false;
       }
    }
 
-   return matched;
+   return true;
 }
 
 static bool
@@ -809,75 +848,117 @@ nir_algebraic_update_automaton(nir_instr *new_instr,
    nir_instr_worklist_fini(&automaton_worklist);
 }
 
-static bool
-nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
-                  const nir_search_state *search_state,
-                  struct util_dynarray *states,
-                  const nir_algebraic_table *table,
-                  const nir_search_expression *search,
-                  const nir_search_value *replace,
-                  nir_instr_worklist *algebraic_worklist,
-                  struct exec_list *dead_instrs)
+static inline uint64_t
+comm_equiv_mask64(unsigned comb6, uint8_t used6)
 {
-   struct match_state state;
-   state.state = search_state;
-   state.pass_op_table = table->pass_op_table;
-   state.table = table;
+   uint64_t kill = UINT64_C(1) << (comb6 & used6);
+   if (!(used6 & 1u))
+      kill |= kill << 1;
+   if (!(used6 & 2u))
+      kill |= kill << 2;
+   if (!(used6 & 4u))
+      kill |= kill << 4;
+   if (!(used6 & 8u))
+      kill |= kill << 8;
+   if (!(used6 & 16u))
+      kill |= kill << 16;
+   if (!(used6 & 32u))
+      kill |= kill << 32;
+   return kill;
+}
 
-   STATIC_ASSERT(sizeof(state.comm_op_direction) * 8 >= NIR_SEARCH_MAX_COMM_OPS);
-   STATIC_ASSERT(sizeof(search->comm_expr_mask) * 8 >= NIR_SEARCH_MAX_COMM_OPS);
+static ATTRIBUTE_NOINLINE bool
+match_comm_multi(const nir_algebraic_table *table,
+                 const nir_search_expression *search,
+                 nir_alu_instr *instr, const nir_op_info *info,
+                 bool direct_root, unsigned root_fp_math_ctrl,
+                 unsigned comm_bits, struct match_state *state)
+{
+   if (comm_bits <= 6) {
+      const unsigned comm_expr_combinations = 1u << comm_bits;
+      const uint8_t all_bits = (uint8_t)(comm_expr_combinations - 1u);
+      uint64_t todo = (comm_bits == 6)
+                         ? ~UINT64_C(0)
+                         : ((UINT64_C(1) << comm_expr_combinations) - 1u);
+      while (todo) {
+         const unsigned comb = u_bit_scan64(&todo);
+         state->comm_op_direction = (uint8_t)comb;
+         state->comm_mask_used = 0;
+         state->fp_math_ctrl = root_fp_math_ctrl;
+         state->variables_seen = 0;
 
-   unsigned comm_expr_combinations =
-      1 << MIN2(search->comm_exprs, NIR_SEARCH_MAX_COMM_OPS);
+         const bool matched = direct_root
+            ? match_expression_sources(table, search, instr, info,
+                                       instr->def.num_components,
+                                       identity_swizzle, state)
+            : match_expression(table, search, instr,
+                               instr->def.num_components,
+                               identity_swizzle, state);
+         if (matched)
+            return true;
 
-   const bool direct_root = search->cond_index == -1;
-   const nir_op_info *info = NULL;
-   if (direct_root) {
-      if (!nir_op_matches_search_op(instr->op, search->opcode) ||
-          (search->value.bit_size > 0 &&
-           instr->def.bit_size != search->value.bit_size) ||
-          (search->fp_math_ctrl_exclude & instr->fp_math_ctrl) ||
-          (search->swizzle >= 0 &&
-           (instr->def.num_components != 1 || search->swizzle != 0)))
-         return false;
-      info = &nir_op_infos[instr->op];
-      assert(info->num_inputs > 0);
+         const uint8_t used = state->comm_mask_used & all_bits;
+         if (!used)
+            return false;
+         if (used != all_bits)
+            todo &= ~comm_equiv_mask64(comb, used);
+      }
+      return false;
    }
-   const unsigned root_fp_math_ctrl = nir_fp_fast_math |
-      (direct_root ? instr->fp_math_ctrl : 0);
 
-   bool found = false;
-   for (unsigned comb = 0; comb < comm_expr_combinations; comb++) {
-      /* The bitfield of directions is just the current iteration.  Hooray for
-       * binary.
-       */
-      state.comm_op_direction = comb;
-      state.fp_math_ctrl = root_fp_math_ctrl;
-      state.variables_seen = 0;
+   const unsigned nwords = 1u << (comm_bits - 6);
+   const uint8_t all_bits = (uint8_t)((1u << comm_bits) - 1u);
+   uint64_t todo[4] = {
+      ~UINT64_C(0),
+      ~UINT64_C(0),
+      nwords > 2 ? ~UINT64_C(0) : 0u,
+      nwords > 2 ? ~UINT64_C(0) : 0u,
+   };
+   for (unsigned w = 0; w < nwords; ++w) {
+      while (todo[w]) {
+         const unsigned bit = u_bit_scan64(&todo[w]);
+         const unsigned comb = (w << 6) | bit;
+         state->comm_op_direction = (uint8_t)comb;
+         state->comm_mask_used = 0;
+         state->fp_math_ctrl = root_fp_math_ctrl;
+         state->variables_seen = 0;
 
-      const bool matched = direct_root
-         ? match_expression_sources(table, search, instr, info,
-                                    instr->def.num_components,
-                                    identity_swizzle, &state)
-         : match_expression(table, search, instr,
-                            instr->def.num_components,
-                            identity_swizzle, &state);
-      if (matched) {
-         found = true;
-         break;
+         const bool matched = direct_root
+            ? match_expression_sources(table, search, instr, info,
+                                       instr->def.num_components,
+                                       identity_swizzle, state)
+            : match_expression(table, search, instr,
+                               instr->def.num_components,
+                               identity_swizzle, state);
+         if (matched)
+            return true;
+
+         const uint8_t used = state->comm_mask_used & all_bits;
+         if (!used)
+            return false;
+         if (used != all_bits) {
+            const uint64_t kill64 = comm_equiv_mask64(bit, used & 0x3fu);
+            const unsigned used_hi = used >> 6;
+            const unsigned w_match = w & used_hi;
+            for (unsigned kw = w; kw < nwords; ++kw) {
+               if ((kw & used_hi) == w_match)
+                  todo[kw] &= ~kill64;
+            }
+         }
       }
    }
-   if (!found)
-      return false;
+   return false;
+}
 
-#if 0
-   fprintf(stderr, "matched: ");
-   dump_value(table, &search->value);
-   fprintf(stderr, " -> ");
-   dump_value(table, replace);
-   fprintf(stderr, " ssa_%d\n", instr->def.index);
-#endif
-
+static ATTRIBUTE_NOINLINE void
+nir_apply_replacement(nir_builder *build, nir_alu_instr *instr,
+                      struct util_dynarray *states,
+                      const nir_algebraic_table *table,
+                      const nir_search_value *replace,
+                      struct match_state *state,
+                      nir_instr_worklist *algebraic_worklist,
+                      struct exec_list *dead_instrs)
+{
    /* If the instruction at the root of the expression tree being replaced is
     * a unary operation, insert the replacement instructions at the location
     * of the source of the unary operation.  Otherwise, insert the replacement
@@ -914,12 +995,12 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
       build->cursor = nir_before_instr(&instr->instr);
    }
 
-   state.states = states;
+   state->states = states;
 
    nir_alu_src val = construct_value(build, replace,
                                      instr->def.num_components,
                                      instr->def.bit_size,
-                                     &state, &instr->instr);
+                                     state, &instr->instr);
 
    /* Note that NIR builder will elide the MOV if it's a no-op, which may
     * allow more work to be done in a single pass through algebraic.
@@ -944,7 +1025,9 @@ nir_replace_instr(nir_builder *build, nir_alu_instr *instr,
    nir_instr_remove(&instr->instr);
    exec_list_push_tail(dead_instrs, &instr->instr.node);
 
-   return true;
+   nir_invalidate_fp_analysis_state(state->state->range_ht);
+   if (state->state->numlsb_ht->entries)
+      _mesa_hash_table_clear(state->state->numlsb_ht, NULL);
 }
 
 static bool
@@ -977,14 +1060,13 @@ nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
 
 static bool
 nir_algebraic_instr(nir_builder *build, nir_instr *instr,
-                    const nir_search_state *state,
+                    const nir_search_state *search_state,
                     const bool *condition_flags,
                     const nir_algebraic_table *table,
                     struct util_dynarray *states,
                     nir_instr_worklist *worklist,
                     struct exec_list *dead_instrs)
 {
-
    if (instr->type != nir_instr_type_alu)
       return false;
 
@@ -992,16 +1074,86 @@ nir_algebraic_instr(nir_builder *build, nir_instr *instr,
 
    int xform_idx = *util_dynarray_element(states, uint16_t,
                                           alu->def.index);
-   for (const struct transform *xform = &table->transforms[table->transform_offsets[xform_idx]];
-        xform->condition_offset != ~0;
-        xform++) {
-      if (condition_flags[xform->condition_offset] &&
-          nir_replace_instr(build, alu, state, states, table,
-                            &table->values[xform->search].expression,
-                            &table->values[xform->replace].value, worklist, dead_instrs)) {
-         nir_invalidate_fp_analysis_state(state->range_ht);
-         if (state->numlsb_ht->entries)
-            _mesa_hash_table_clear(state->numlsb_ht, NULL);
+   const struct transform *xform =
+      &table->transforms[table->transform_offsets[xform_idx]];
+   if (xform->condition_offset == ~0u)
+      return false;
+
+   STATIC_ASSERT(sizeof(((struct match_state *)0)->comm_op_direction) * 8 >=
+                 NIR_SEARCH_MAX_COMM_OPS);
+   STATIC_ASSERT(sizeof(((const nir_search_expression *)0)->comm_expr_mask) * 8 >=
+                 NIR_SEARCH_MAX_COMM_OPS);
+   STATIC_ASSERT(NIR_SEARCH_MAX_COMM_OPS <= 8);
+
+   const nir_search_value_union *values = table->values;
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   const nir_op alu_op = alu->op;
+   const uint8_t alu_bs = alu->def.bit_size;
+   const unsigned alu_fp_ctrl = alu->fp_math_ctrl;
+   const uint8_t alu_comps = alu->def.num_components;
+
+   struct match_state mstate;
+   mstate.state = search_state;
+   mstate.pass_op_table = table->pass_op_table;
+   mstate.table = table;
+
+   for (; xform->condition_offset != ~0u; xform++) {
+      if (!condition_flags[xform->condition_offset])
+         continue;
+
+      const nir_search_expression *search = &values[xform->search].expression;
+      const bool direct_root = search->cond_index == -1;
+      if (direct_root) {
+         if (!nir_op_matches_search_op(alu_op, search->opcode) ||
+             (search->value.bit_size > 0 && alu_bs != search->value.bit_size) ||
+             (search->fp_math_ctrl_exclude & alu_fp_ctrl) ||
+             (search->swizzle >= 0 && (alu_comps != 1 || search->swizzle != 0)))
+            continue;
+      }
+
+      const unsigned root_fp_math_ctrl = nir_fp_fast_math |
+         (direct_root ? alu_fp_ctrl : 0);
+      const unsigned comm_bits = MIN2(search->comm_exprs, NIR_SEARCH_MAX_COMM_OPS);
+
+      bool found;
+      if (comm_bits == 0) {
+         mstate.comm_op_direction = 0;
+         mstate.fp_math_ctrl = root_fp_math_ctrl;
+         mstate.variables_seen = 0;
+         found = direct_root
+            ? match_expression_sources(table, search, alu, info,
+                                       alu_comps, identity_swizzle, &mstate)
+            : match_expression(table, search, alu,
+                               alu_comps, identity_swizzle, &mstate);
+      } else if (comm_bits == 1) {
+         mstate.comm_op_direction = 0;
+         mstate.comm_mask_used = 0;
+         mstate.fp_math_ctrl = root_fp_math_ctrl;
+         mstate.variables_seen = 0;
+         found = direct_root
+            ? match_expression_sources(table, search, alu, info,
+                                       alu_comps, identity_swizzle, &mstate)
+            : match_expression(table, search, alu,
+                               alu_comps, identity_swizzle, &mstate);
+         if (!found && (mstate.comm_mask_used & 1u)) {
+            mstate.comm_op_direction = 1;
+            mstate.fp_math_ctrl = root_fp_math_ctrl;
+            mstate.variables_seen = 0;
+            found = direct_root
+               ? match_expression_sources(table, search, alu, info,
+                                          alu_comps, identity_swizzle, &mstate)
+               : match_expression(table, search, alu,
+                                  alu_comps, identity_swizzle, &mstate);
+         }
+      } else {
+         found = match_comm_multi(table, search, alu, info, direct_root,
+                                  root_fp_math_ctrl, comm_bits, &mstate);
+      }
+
+      if (unlikely(found)) {
+         nir_apply_replacement(build, alu, states, table,
+                               &values[xform->replace].value, &mstate,
+                               worklist, dead_instrs);
          return true;
       }
    }

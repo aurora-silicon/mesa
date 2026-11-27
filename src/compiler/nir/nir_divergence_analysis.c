@@ -141,10 +141,22 @@ visit_alu(nir_alu_instr *instr, struct divergence_state *state)
    if (instr->def.divergent)
       return false;
 
-   unsigned num_src = nir_op_infos[instr->op].num_inputs;
+   const unsigned num_src = nir_op_infos[instr->op].num_inputs;
+   const bool check_id_z =
+      (state->options & nir_divergence_uniform_local_invocation_id_z) != 0;
+
+   if (likely(!check_id_z && !state->consider_loop_invariance)) {
+      for (unsigned i = 0; i < num_src; i++) {
+         if (instr->src[i].src.ssa->divergent) {
+            instr->def.divergent = true;
+            return true;
+         }
+      }
+      return false;
+   }
 
    for (unsigned i = 0; i < num_src; i++) {
-      if ((state->options & nir_divergence_uniform_local_invocation_id_z) &&
+      if (check_id_z &&
           nir_src_is_intrinsic(instr->src[i].src) &&
           nir_src_as_intrinsic(instr->src[i].src)->intrinsic == nir_intrinsic_load_local_invocation_id &&
           instr->src[i].swizzle[0] == 2 &&
@@ -1387,14 +1399,6 @@ visit_jump(nir_jump_instr *jump, struct divergence_state *state)
 }
 
 static bool
-set_ssa_def_not_divergent(nir_def *def, void *invariant)
-{
-   def->divergent = false;
-   def->loop_invariant = *(bool *)invariant;
-   return true;
-}
-
-static bool
 instr_is_loop_invariant(nir_instr *instr, struct divergence_state *state)
 {
    if (!state->loop)
@@ -1452,15 +1456,39 @@ static bool
 visit_block(nir_block *block, struct divergence_state *state)
 {
    bool has_changed = false;
+   const bool first_visit = state->first_visit;
+   const bool in_loop = state->loop != NULL;
 
    nir_foreach_instr(instr, block) {
       /* phis are handled when processing the branches */
       if (instr->type == nir_instr_type_phi)
          continue;
 
-      if (state->first_visit) {
-         bool invariant = state->loop_all_invariant || instr_is_loop_invariant(instr, state);
-         nir_foreach_def(instr, set_ssa_def_not_divergent, &invariant);
+      if (instr->type == nir_instr_type_load_const) {
+         if (first_visit) {
+            nir_def *def = &nir_instr_as_load_const(instr)->def;
+            def->divergent = false;
+            def->loop_invariant = in_loop;
+         }
+         continue;
+      }
+      if (instr->type == nir_instr_type_undef) {
+         if (first_visit) {
+            nir_def *def = &nir_instr_as_undef(instr)->def;
+            def->divergent = false;
+            def->loop_invariant = in_loop;
+         }
+         continue;
+      }
+
+      if (first_visit) {
+         nir_def *def = nir_instr_def(instr);
+         if (def) {
+            def->divergent = false;
+            def->loop_invariant =
+               in_loop &&
+               (state->loop_all_invariant || instr_is_loop_invariant(instr, state));
+         }
       }
 
       if (instr->type == nir_instr_type_jump) {
