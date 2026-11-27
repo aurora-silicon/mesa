@@ -186,6 +186,13 @@ enum agx_chip_cap {
     * combined with 0x1ff/0x160; +1.16% to +1.25% incremental over 0x1ff/0x160,
     * bit-identical output, 0 regressions on synchronization/memory_model CTS). */
    AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
+
+   /* Pack 64-bit AGX2 preamble memory base pointers (load_agx,
+    * load_constant_agx, store_agx, global_atomic_agx) into low uniform slots
+    * (< 256 halfwords) so memory instructions read them directly without
+    * per-load mov1 copies. Measured on G14X (Apple M2 Max); other chips keep
+    * stock preamble order until measured on aurora-wip. */
+   AGX_CAP_PREAMBLE_BASES_LOW = 1u << 26,
 };
 
 /* What the admitted AGX2 chips (G13G, G13X, G14G, G14X) share. */
@@ -253,7 +260,9 @@ enum agx_chip_cap {
    X(G13G, AGX_CAPS_G13 | AGX_CAP_CDM_DEFER_FLUSH, __VA_ARGS__)                \
    X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
-   X(G14X, AGX_CAPS_AGX2 | AGX_CAP_FOLD_SHARED_OFFSETS, __VA_ARGS__)           \
+   X(G14X,                                                                     \
+     AGX_CAPS_AGX2 | AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_PREAMBLE_BASES_LOW, \
+     __VA_ARGS__)                                                              \
    X(G15P, 0, __VA_ARGS__)                                                     \
    X(G15G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
    X(G15S, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \
