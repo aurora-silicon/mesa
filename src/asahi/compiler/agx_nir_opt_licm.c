@@ -34,8 +34,8 @@
 struct sim_block {
    nir_block *block;
    struct util_dynarray instrs;
-   struct u_sparse_bitset live_in;
-   struct u_sparse_bitset live_out;
+   BITSET_WORD *live_in;
+   BITSET_WORD *live_out;
 };
 
 struct licm_estimate {
@@ -46,7 +46,8 @@ struct licm_estimate {
    unsigned align;
    void *mem_ctx;
 
-   struct u_sparse_bitset live;
+   BITSET_WORD *live;
+   unsigned ssa_alloc;
    unsigned live_halves;
 };
 
@@ -228,26 +229,13 @@ scan_shader_ra_props(struct licm_estimate *est, nir_function_impl *impl,
    }
 }
 
-static void
+static inline void
 set_live(struct licm_estimate *est, unsigned index)
 {
-   if (!u_sparse_bitset_test(&est->live, index)) {
-      u_sparse_bitset_set(&est->live, index);
+   if (!BITSET_TEST(est->live, index)) {
+      BITSET_SET(est->live, index);
       est->live_halves += est->halves[index];
    }
-}
-
-static bool
-kill_def(nir_def *def, void *data)
-{
-   struct licm_estimate *est = data;
-
-   if (u_sparse_bitset_test(&est->live, def->index)) {
-      u_sparse_bitset_clear(&est->live, def->index);
-      est->live_halves -= est->halves[def->index];
-   }
-
-   return true;
 }
 
 static bool
@@ -290,13 +278,23 @@ instr_is_enter_query(const nir_instr *instr)
 
 static unsigned
 block_peak_instrs(struct licm_estimate *est, nir_block *block,
-                  struct u_sparse_bitset *live_out, nir_instr *const *instrs,
+                  struct u_sparse_bitset *sparse_live_out,
+                  const BITSET_WORD *dense_live_out, nir_instr *const *instrs,
                   unsigned nr_instrs)
 {
-   u_sparse_bitset_dup_with_ctx(&est->live, live_out, est->mem_ctx);
+   const unsigned words = BITSET_WORDS(est->ssa_alloc);
+   if (dense_live_out) {
+      memcpy(est->live, dense_live_out, words * sizeof(BITSET_WORD));
+   } else {
+      memset(est->live, 0, words * sizeof(BITSET_WORD));
+      U_SPARSE_BITSET_FOREACH_SET(sparse_live_out, i)
+         BITSET_SET(est->live, i);
+   }
+
    est->live_halves = 0;
-   U_SPARSE_BITSET_FOREACH_SET(&est->live, i)
-      est->live_halves += est->halves[i];
+   unsigned idx;
+   BITSET_FOREACH_SET(idx, est->live, est->ssa_alloc)
+      est->live_halves += est->halves[idx];
 
    /* Unread RT-completion SCS loads stay live from their write to block exit;
     * seeding them at exit keeps them live through the reverse walk until
@@ -319,15 +317,45 @@ block_peak_instrs(struct licm_estimate *est, nir_block *block,
        * unread enter_query_agx, whose destination is freed right after write. */
       unsigned dead_write = 0;
       nir_def *def = nir_instr_def(instr);
-      if (def && !u_sparse_bitset_test(&est->live, def->index) &&
+      if (def && !BITSET_TEST(est->live, def->index) &&
           instr_is_enter_query(instr))
          dead_write = est->halves[def->index];
-      nir_foreach_src(instr, gen_src, est);
+      switch (instr->type) {
+      case nir_instr_type_alu: {
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         const unsigned num_inputs = nir_op_infos[alu->op].num_inputs;
+         for (unsigned s = 0; s < num_inputs; ++s)
+            set_live(est, alu->src[s].src.ssa->index);
+         break;
+      }
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         const unsigned num_srcs =
+            nir_intrinsic_infos[intr->intrinsic].num_srcs;
+         for (unsigned s = 0; s < num_srcs; ++s)
+            set_live(est, intr->src[s].ssa->index);
+         break;
+      }
+      case nir_instr_type_tex: {
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         for (unsigned s = 0; s < tex->num_srcs; ++s)
+            set_live(est, tex->src[s].src.ssa->index);
+         break;
+      }
+      default:
+         nir_foreach_src(instr, gen_src, est);
+         break;
+      }
       peak = MAX2(peak, est->live_halves + dead_write);
-      nir_foreach_def(instr, kill_def, est);
+      if (def && BITSET_TEST(est->live, def->index)) {
+         BITSET_CLEAR(est->live, def->index);
+         est->live_halves -= est->halves[def->index];
+      }
    }
 
-   u_sparse_bitset_free(&est->live);
    return peak;
 }
 
@@ -917,17 +945,26 @@ sim_visit_cf_list(struct exec_list *list, struct licm_sim *sim)
    return progress;
 }
 
+struct sim_gen_kill_ctx {
+   BITSET_WORD *gen;
+   BITSET_WORD *kill;
+};
+
 static bool
-sim_set_def_dead(nir_def *def, void *live)
+sim_kill_def(nir_def *def, void *data)
 {
-   u_sparse_bitset_clear(live, def->index);
+   struct sim_gen_kill_ctx *gk = data;
+   BITSET_CLEAR(gk->gen, def->index);
+   BITSET_SET(gk->kill, def->index);
    return true;
 }
 
 static bool
-sim_set_src_live(nir_src *src, void *live)
+sim_gen_src(nir_src *src, void *data)
 {
-   u_sparse_bitset_set(live, src->ssa->index);
+   struct sim_gen_kill_ctx *gk = data;
+   BITSET_SET(gk->gen, src->ssa->index);
+   BITSET_CLEAR(gk->kill, src->ssa->index);
    return true;
 }
 
@@ -935,54 +972,96 @@ static void
 compute_sim_liveness(nir_function_impl *impl, struct sim_block *blocks,
                      void *mem_ctx)
 {
+   const unsigned words = BITSET_WORDS(impl->ssa_alloc);
+   const size_t total = (size_t)impl->num_blocks * words;
+   BITSET_WORD *slab =
+      rzalloc_array(mem_ctx, BITSET_WORD, 4 * total + words);
+   BITSET_WORD *gen = slab;
+   BITSET_WORD *kill = gen + total;
+   BITSET_WORD *live_in = kill + total;
+   BITSET_WORD *live_out = live_in + total;
+   BITSET_WORD *tmp = live_out + total;
+   bool *has_phi = rzalloc_array(mem_ctx, bool, impl->num_blocks);
+
    nir_block_worklist worklist;
    nir_block_worklist_init(&worklist, impl->num_blocks, NULL);
 
    nir_foreach_block(block, impl) {
-      u_sparse_bitset_init(&blocks[block->index].live_in, impl->ssa_alloc,
-                           mem_ctx);
-      u_sparse_bitset_init(&blocks[block->index].live_out, impl->ssa_alloc,
-                           mem_ctx);
+      const unsigned b = block->index;
+      struct sim_block *sb = &blocks[b];
+      sb->live_in = live_in + (size_t)b * words;
+      sb->live_out = live_out + (size_t)b * words;
+
+      struct sim_gen_kill_ctx gk = {
+         .gen = gen + (size_t)b * words,
+         .kill = kill + (size_t)b * words,
+      };
+      nir_if *following_if = nir_block_get_following_if(block);
+      if (following_if)
+         sim_gen_src(&following_if->condition, &gk);
+
+      unsigned nr = util_dynarray_num_elements(&sb->instrs, nir_instr *);
+      nir_instr *const *instrs = util_dynarray_begin(&sb->instrs);
+      for (unsigned i = nr; i-- > 0;) {
+         nir_foreach_def(instrs[i], sim_kill_def, &gk);
+         nir_foreach_src(instrs[i], sim_gen_src, &gk);
+      }
+
+      nir_foreach_phi(phi, block) {
+         has_phi[b] = true;
+         break;
+      }
+
       nir_block_worklist_push_head(&worklist, block);
    }
 
    while (!nir_block_worklist_is_empty(&worklist)) {
       nir_block *block = nir_block_worklist_pop_head(&worklist);
-      struct sim_block *sb = &blocks[block->index];
+      const unsigned b = block->index;
+      const BITSET_WORD *gb = gen + (size_t)b * words;
+      const BITSET_WORD *kb = kill + (size_t)b * words;
+      BITSET_WORD *in_b = blocks[b].live_in;
+      const BITSET_WORD *out_b = blocks[b].live_out;
 
-      u_sparse_bitset_free(&sb->live_in);
-      u_sparse_bitset_dup_with_ctx(&sb->live_in, &sb->live_out, mem_ctx);
+      for (unsigned w = 0; w < words; ++w)
+         in_b[w] = (out_b[w] & ~kb[w]) | gb[w];
 
-      nir_if *following_if = nir_block_get_following_if(block);
-      if (following_if)
-         sim_set_src_live(&following_if->condition, &sb->live_in);
-
-      unsigned nr = util_dynarray_num_elements(&sb->instrs, nir_instr *);
-      nir_instr *const *instrs = util_dynarray_begin(&sb->instrs);
-      for (unsigned i = nr; i-- > 0;) {
-         nir_foreach_def(instrs[i], sim_set_def_dead, &sb->live_in);
-         nir_foreach_src(instrs[i], sim_set_src_live, &sb->live_in);
+      const BITSET_WORD *prop = in_b;
+      if (has_phi[b]) {
+         memcpy(tmp, in_b, words * sizeof(BITSET_WORD));
+         nir_foreach_phi(phi, block)
+            BITSET_CLEAR(tmp, phi->def.index);
+         prop = tmp;
       }
 
       nir_foreach_pred(pred, block) {
-         struct u_sparse_bitset tmp;
-         u_sparse_bitset_dup_with_ctx(&tmp, &sb->live_in, mem_ctx);
+         BITSET_WORD *out_p = blocks[pred->index].live_out;
+         bool changed = false;
 
-         nir_foreach_phi(phi, block)
-            u_sparse_bitset_clear(&tmp, phi->def.index);
+         for (unsigned w = 0; w < words; ++w) {
+            BITSET_WORD old = out_p[w];
+            BITSET_WORD nw = old | prop[w];
+            if (nw != old) {
+               out_p[w] = nw;
+               changed = true;
+            }
+         }
 
-         nir_foreach_phi(phi, block) {
-            nir_foreach_phi_src(src, phi) {
-               if (src->pred == pred) {
-                  sim_set_src_live(&src->src, &tmp);
-                  break;
+         if (has_phi[b]) {
+            nir_foreach_phi(phi, block) {
+               nir_foreach_phi_src(src, phi) {
+                  if (src->pred == pred) {
+                     const unsigned idx = src->src.ssa->index;
+                     if (!BITSET_TEST(out_p, idx)) {
+                        BITSET_SET(out_p, idx);
+                        changed = true;
+                     }
+                     break;
+                  }
                }
             }
          }
 
-         bool changed =
-            u_sparse_bitset_merge(&blocks[pred->index].live_out, &tmp);
-         u_sparse_bitset_free(&tmp);
          if (changed)
             nir_block_worklist_push_tail(&worklist, pred);
       }
@@ -1253,11 +1332,17 @@ simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
                                     nir_metadata_live_defs);
 
       void *mem_ctx = ralloc_context(NULL);
+      BITSET_DECLARE(stack_live, 4096);
+      BITSET_WORD *est_live =
+         impl->ssa_alloc <= 4096 ? stack_live
+                                 : BITSET_RZALLOC(mem_ctx, impl->ssa_alloc);
       struct licm_estimate est = {
          .encoding = spec_mode == LICM_SPEC_AGX2_INTEGER
                         ? AGX_ISA_ENCODING_AGX2 : AGX_ISA_ENCODING_AGX3C,
          .halves = rzalloc_array(mem_ctx, uint8_t, impl->ssa_alloc),
          .mem_ctx = mem_ctx,
+         .live = est_live,
+         .ssa_alloc = impl->ssa_alloc,
       };
 
       unsigned impl_limit = budget;
@@ -1295,7 +1380,7 @@ simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
          }
 
          base_peaks[block->index] = block_peak_instrs(
-            &est, block, &block->live_out, util_dynarray_begin(&sb->instrs),
+            &est, block, &block->live_out, NULL, util_dynarray_begin(&sb->instrs),
             util_dynarray_num_elements(&sb->instrs, nir_instr *));
          func_base_pre = MAX2(func_base_pre, base_peaks[block->index]);
       }
@@ -1332,7 +1417,7 @@ simulate_shader_licm(nir_shader *shader, unsigned budget, bool cap_rt_compute,
          nir_foreach_block(block, impl) {
             struct sim_block *sb = &blocks[block->index];
             post_peaks[block->index] = block_peak_instrs(
-               &est, block, &sb->live_out, util_dynarray_begin(&sb->instrs),
+               &est, block, NULL, sb->live_out, util_dynarray_begin(&sb->instrs),
                util_dynarray_num_elements(&sb->instrs, nir_instr *));
             func_base = MAX2(func_base, base_peaks[block->index]);
             func_post = MAX2(func_post, post_peaks[block->index]);

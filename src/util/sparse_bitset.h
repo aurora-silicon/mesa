@@ -395,4 +395,49 @@ _u_sparse_bitset_first_set(struct u_sparse_bitset *s, uintptr_t *node_)
    for (uintptr_t _node, it = _u_sparse_bitset_first_set((s), &_node);         \
         it != UINT_MAX; it = _u_sparse_bitset_next_set((s), &_node, it + 1))
 
+/* Populate an empty sparse bitset from a dense BITSET_WORD array in one pass,
+ * allocating at most one RB-tree node per U_SPARSE_BITSET_BITS_PER_NODE chunk.
+ */
+static inline void
+u_sparse_bitset_from_dense(struct u_sparse_bitset *s,
+                           const BITSET_WORD *dense, unsigned num_bits)
+{
+   if (!num_bits)
+      return;
+
+   const unsigned words = BITSET_WORDS(num_bits);
+   const unsigned rem_bits = num_bits % BITSET_WORDBITS;
+   const BITSET_WORD last_mask =
+      rem_bits ? BITFIELD_MASK(rem_bits) : ~((BITSET_WORD)0);
+
+   if (_u_sparse_bitset_is_small(s)) {
+      assert(num_bits <= s->capacity);
+      memcpy(s->vals, dense, words * sizeof(BITSET_WORD));
+      s->vals[words - 1] &= last_mask;
+      return;
+   }
+
+   const unsigned chunk_words = BITSET_WORDS(U_SPARSE_BITSET_BITS_PER_NODE);
+   for (unsigned base_w = 0; base_w < words; base_w += chunk_words) {
+      const unsigned n = MIN2(chunk_words, words - base_w);
+      BITSET_WORD any = 0;
+      for (unsigned i = 0; i < n; ++i) {
+         BITSET_WORD w = dense[base_w + i];
+         if (base_w + i == words - 1)
+            w &= last_mask;
+         any |= w;
+      }
+      if (!any)
+         continue;
+
+      struct u_sparse_bitset_node *node =
+         rzalloc(s->mem_ctx, struct u_sparse_bitset_node);
+      node->offset = base_w * BITSET_WORDBITS;
+      memcpy(node->vals, dense + base_w, n * sizeof(BITSET_WORD));
+      if (base_w + n == words)
+         node->vals[n - 1] &= last_mask;
+      rb_tree_insert(&s->tree, &node->node, _u_sparse_bitset_node_compare);
+   }
+}
+
 #endif //_UTIL_SPARSE_BITSET_H
