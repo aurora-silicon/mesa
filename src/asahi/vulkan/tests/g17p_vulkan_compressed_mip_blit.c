@@ -57,7 +57,7 @@ memory_type(uint32_t bits, VkMemoryPropertyFlags flags)
 
 static VkImage
 image_create(VkFormat format, uint32_t w, uint32_t h, uint32_t levels,
-             VkImageUsageFlags usage)
+             uint32_t layers, VkImageUsageFlags usage)
 {
    const VkImageCreateInfo info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -65,7 +65,7 @@ image_create(VkFormat format, uint32_t w, uint32_t h, uint32_t levels,
       .format = format,
       .extent = {w, h, 1},
       .mipLevels = levels,
-      .arrayLayers = 1,
+      .arrayLayers = layers,
       .samples = VK_SAMPLE_COUNT_1_BIT,
       .tiling = VK_IMAGE_TILING_OPTIMAL,
       .usage = usage,
@@ -331,11 +331,11 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    if (expect_compute)
       capture_begin();
-   VkImage image = image_create(t->format, w, h, levels, usage);
+   VkImage image = image_create(t->format, w, h, levels, 1, usage);
    /* Storage usage keeps this one uncompressed. */
    const bool with_plain = t->format == VK_FORMAT_R8G8B8A8_UNORM;
    VkImage plain = with_plain ? image_create(t->format, minify(w, 1),
-                                             minify(h, 1), 1,
+                                             minify(h, 1), 1, 1,
                                              usage | VK_IMAGE_USAGE_STORAGE_BIT)
                               : VK_NULL_HANDLE;
    if (expect_compute) {
@@ -525,6 +525,153 @@ run_case(const struct test_case *t, bool readback, bool expect_compute)
       vkDestroyImage(dev, plain, NULL);
 }
 
+/* One region of a layered upload: whole levels of one or more array layers,
+ * at a pitch of row_length texels and image_height rows per layer (0 for
+ * the level's own size). */
+struct layered_region {
+   uint32_t level, base_layer, layer_count;
+   uint32_t row_length, image_height;
+};
+
+struct layered_case {
+   VkFormat format;
+   uint32_t width, height, levels, layers;
+   uint32_t region_count;
+   struct layered_region regions[2];
+};
+
+/* One vkCmdCopyBufferToImage of every region into a compressed array image.
+ * Each region starts at a nonzero bufferOffset that is not 16-byte aligned
+ * and has padded rows and padded layer heights (bufferImageHeight), with
+ * the padding filled so that a misaddressed row or layer reads back wrong.
+ * Every uploaded level of every layer is read back and compared bit for bit.
+ * With --expect-compute, recording the copy must log no render pass: every
+ * region qualifies for the compute upload through the compressed PBE. */
+static void
+run_layered_upload(const struct layered_case *t, bool readback,
+                   bool expect_compute)
+{
+   const uint32_t w = t->width, h = t->height;
+   const bool bgra = t->format == VK_FORMAT_B8G8R8A8_UNORM;
+   char name[64];
+   snprintf(name, sizeof(name), "%s %ux%u x%u layers", bgra ? "bgra8" : "rgba8",
+            w, h, t->layers);
+
+   const VkImageUsageFlags usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   if (expect_compute)
+      capture_begin();
+   VkImage image = image_create(t->format, w, h, t->levels, t->layers, usage);
+   if (expect_compute) {
+      char needle[96];
+      snprintf(needle, sizeof(needle), "compression enabled: %s_unorm %ux%u",
+               bgra ? "b8g8r8a8" : "r8g8b8a8", w, h);
+      if (capture_end(needle) != 1) {
+         fprintf(stderr, "%s: FAIL: the image is not compressed\n", name);
+         failures++;
+      }
+   }
+
+   /* Source layout: region r at offset[r], 12 bytes past a 4 KiB boundary
+    * (4-byte aligned, as Vulkan requires of a colour copy, but not
+    * 16-byte aligned), its layers image_height rows of row_length texels
+    * apart. Readback layout: every uploaded level and layer packed. */
+   VkBufferImageCopy regions[2];
+   uint64_t offset[2], src_size = 0, out_size = 0;
+   uint64_t out_offset[2][8];
+   for (uint32_t r = 0; r < t->region_count; ++r) {
+      const struct layered_region *g = &t->regions[r];
+      const uint32_t lw = minify(w, g->level), lh = minify(h, g->level);
+      const uint64_t pitch = 4ull * (g->row_length ? g->row_length : lw);
+      const uint64_t rows = g->image_height ? g->image_height : lh;
+      offset[r] = ((src_size + 4095) & ~4095ull) + 4096 + 12;
+      src_size = offset[r] + pitch * rows * g->layer_count;
+      for (uint32_t l = 0; l < g->layer_count; ++l) {
+         out_offset[r][l] = out_size;
+         out_size += 4ull * lw * lh;
+      }
+      regions[r] = (VkBufferImageCopy){
+         .bufferOffset = offset[r],
+         .bufferRowLength = g->row_length,
+         .bufferImageHeight = g->image_height,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, g->level,
+                              g->base_layer, g->layer_count},
+         .imageExtent = {lw, lh, 1},
+      };
+   }
+
+   uint8_t *src, *out;
+   VkBuffer src_buf =
+      buffer_create(src_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &src);
+   VkBuffer out_buf =
+      buffer_create(out_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &out);
+   uint8_t *want = malloc(out_size);
+   memset(src, 0xa5, src_size);
+   uint32_t seed = w * 2654435761u ^ h ^ t->layers;
+   for (uint32_t r = 0; r < t->region_count; ++r) {
+      const struct layered_region *g = &t->regions[r];
+      const uint32_t lw = minify(w, g->level), lh = minify(h, g->level);
+      const uint64_t pitch = 4ull * (g->row_length ? g->row_length : lw);
+      const uint64_t rows = g->image_height ? g->image_height : lh;
+      for (uint32_t l = 0; l < g->layer_count; ++l) {
+         uint8_t *texels = want + out_offset[r][l];
+         for (uint64_t i = 0; i < 4ull * lw * lh; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            texels[i] = seed >> 24;
+         }
+         for (uint32_t y = 0; y < lh; ++y)
+            memcpy(src + offset[r] + (l * rows + y) * pitch,
+                   texels + 4ull * lw * y, 4ull * lw);
+      }
+   }
+
+   VkCommandBuffer cmd = begin();
+   to_general(cmd, image);
+   if (expect_compute)
+      capture_begin();
+   vkCmdCopyBufferToImage(cmd, src_buf, image, VK_IMAGE_LAYOUT_GENERAL,
+                          t->region_count, regions);
+   if (expect_compute && capture_end("Rendering ") != 0) {
+      fprintf(stderr, "%s: FAIL: the upload recorded a render pass\n", name);
+      failures++;
+   }
+   barrier(cmd);
+   for (uint32_t r = 0; r < t->region_count; ++r) {
+      const struct layered_region *g = &t->regions[r];
+      for (uint32_t l = 0; l < g->layer_count; ++l) {
+         const VkBufferImageCopy back = {
+            .bufferOffset = out_offset[r][l],
+            .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, g->level,
+                                 g->base_layer + l, 1},
+            .imageExtent = regions[r].imageExtent,
+         };
+         vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_GENERAL, out_buf,
+                                1, &back);
+      }
+   }
+   barrier(cmd);
+   submit(cmd);
+
+   if (readback) {
+      char what[96];
+      for (uint32_t r = 0; r < t->region_count; ++r) {
+         const struct layered_region *g = &t->regions[r];
+         for (uint32_t l = 0; l < g->layer_count; ++l) {
+            snprintf(what, sizeof(what), "%s level %u layer %u", name,
+                     g->level, g->base_layer + l);
+            compare(what, out + out_offset[r][l], want + out_offset[r][l],
+                    minify(w, g->level), minify(h, g->level));
+         }
+      }
+   }
+
+   free(want);
+   vkDestroyBuffer(dev, src_buf, NULL);
+   vkDestroyBuffer(dev, out_buf, NULL);
+   vkDestroyImage(dev, image, NULL);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -588,12 +735,26 @@ main(int argc, char **argv)
    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
       run_case(&cases[i], !shim, expect_compute);
 
+   /* Array layers from offset, padded rows and padded layer heights: an
+    * edge-clipped level whose regions start in the middle of the buffer,
+    * and two levels of a BGRA8 array in one copy, the second starting at
+    * layer 1 with tightly packed rows but padded layers. */
+   static const struct layered_case layered[] = {
+      {VK_FORMAT_R8G8B8A8_UNORM, 200, 136, 1, 3, 1,
+       {{0, 0, 3, 232, 150}}},
+      {VK_FORMAT_B8G8R8A8_UNORM, 256, 256, 2, 4, 2,
+       {{0, 0, 4, 300, 260}, {1, 1, 2, 0, 140}}},
+   };
+   for (unsigned i = 0; i < sizeof(layered) / sizeof(layered[0]); ++i)
+      run_layered_upload(&layered[i], !shim, expect_compute);
+
    vkDestroyCommandPool(dev, pool, NULL);
    vkDestroyDevice(dev, NULL);
    vkDestroyInstance(instance, NULL);
 
-   printf("%u mip chains%s: %s\n",
+   printf("%u mip chains, %u layered uploads%s: %s\n",
           (unsigned)(sizeof(cases) / sizeof(cases[0])),
+          (unsigned)(sizeof(layered) / sizeof(layered[0])),
           shim ? " (no readback)" : "", failures ? "FAIL" : "PASS");
    return failures ? 1 : 0;
 }
