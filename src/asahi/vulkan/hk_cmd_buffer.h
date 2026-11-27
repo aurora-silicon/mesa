@@ -1108,9 +1108,77 @@ struct hk_g17p_vdm_update_key {
    bool hoisted_preamble;
 };
 
+/* A push-constant relocation in a pre-baked AGX3 vertex-stage Ioto template
+ * (hk_agx3_direct_draw_fast). Every non-push relocation is already applied to
+ * the template bytes; each push-only draw only patches these LDIMM pairs. */
+struct hk_agx3_push_ioto_reloc {
+   uint64_t dest[2];
+   uint32_t delta;
+   uint16_t offset;
+   uint8_t short_mask;
+};
+
+struct hk_agx3_push_range_sync {
+   uint8_t range;
+   uint16_t rel_offset;
+};
+
+/* Cached steady-state direct-draw emitter for HAL200 (G17P/G16G) and M5
+ * (G17G/G17S/G17C). Validated in O(1) against command-buffer generations on
+ * every hk_CmdDraw() / hk_CmdDrawIndexed() call so consecutive draws with
+ * unchanged non-push state skip state-flush bookkeeping and emit identical
+ * push slices, patched Ioto loaders, VDM state updates, and draw packets
+ * directly into the open control stream. */
+struct hk_agx3_direct_draw_fast {
+   struct hk_cs *cs;
+   uint64_t cs_chunk_gpu;
+   uint64_t dyn_generation;
+   uint64_t non_push_generation;
+   uint64_t vertex_buffer_generation;
+   uint64_t root;
+   uint32_t sync_epoch;
+   uint32_t border_free_stages;
+   uint32_t bind_tail_compact;
+   const struct hk_g17p_gfx_loader *loader;
+   const struct hk_linked_shader *linked_vs;
+
+   /* Pre-packed 28-byte AGX3 VDM State Update and its pipeline template word
+    * (raw_state_load_count_18 << 3). */
+   uint32_t vdm_words[7];
+   uint32_t vdm_raw_template;
+
+   /* Pre-packed HAL200 direct draw header word (or indexed base header word). */
+   uint32_t draw_header_word;
+
+   /* Indexed draw keys (active when indexed == true). */
+   struct hk_addr_range index_buffer;
+   enum agx_index_size index_size;
+   uint32_t restart_index;
+
+   /* Pre-baked vertex-stage Ioto program with all static relocations applied. */
+   uint8_t ioto_bytes[HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
+   struct hk_agx3_push_ioto_reloc push_relocs[HK_G17P_PATCH_MAX_RELOCS];
+   struct hk_agx3_push_range_sync push_ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint16_t ioto_length;
+   uint16_t push_min_B;
+   uint16_t push_size_B;
+   uint8_t push_reloc_count;
+   uint8_t push_range_count;
+   uint8_t topology;
+   bool valid;
+   bool indexed;
+   bool restart_enable;
+   bool emit_restart_record;
+   bool is_hal200;
+   bool cached_cmd_mem;
+   bool push_bypass_ready;
+};
+
 struct hk_graphics_state {
    /* A bound graphics program writes external memory. */
    bool shaders_write_memory;
+
+   struct hk_agx3_direct_draw_fast direct_draw_fast;
 
    struct hk_rendering_state render;
    struct hk_descriptor_state descriptors;
@@ -3332,6 +3400,7 @@ hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
    gfx->g17p_bind_tail.fs_record_in_tail_valid = false;
    gfx->g17p_bind_tail_memo.valid = false;
    gfx->g17p_bind_tail_memo.viewport_valid = false;
+   gfx->direct_draw_fast.valid = false;
    if (cmd->current_cs.gfx)
       cmd->current_cs.gfx->g17p_bind_tail.valid = false;
 }
@@ -3795,6 +3864,11 @@ void hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
                                     const struct hk_agx3_multi_draw_ioto_tpl *tpl,
                                     uint64_t pipeline_program,
                                     uint64_t draw_params, uint64_t draw_id_ptr);
+
+bool hk_agx3_push_bypass_ioto_prepare(struct hk_cmd_buffer *cmd,
+                                      struct hk_shader *s,
+                                      struct hk_linked_shader *linked,
+                                      struct hk_agx3_direct_draw_fast *fast);
 
 struct libagx_indirect_ioto_reloc;
 
