@@ -267,6 +267,7 @@ hk_meta_end(struct hk_cmd_buffer *cmd, struct hk_meta_save *save,
       desc->push_active &= ~BITFIELD_BIT(0);
    }
    desc->non_push_generation++;
+   desc->non_dynbuf_generation++;
 
    /* Nested meta operations end in the reverse order they begin, so this
     * save is the last one stacked. */
@@ -7025,6 +7026,9 @@ hk_CmdResolveImage2(VkCommandBuffer commandBuffer,
                     const VkResolveImageInfo2 *pResolveImageInfo)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (hk_try_fold_msaa_resolve(cmd, pResolveImageInfo))
+      return;
 
    /* Transfer stage: the streams recorded here belong to the transfer
     * class for every recorded dependency. */

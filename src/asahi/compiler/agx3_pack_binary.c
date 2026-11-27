@@ -62,6 +62,7 @@
 #include "agx3_writeout_core.h"
 #include "agx_compiler.h"
 #include "agx_debug.h"
+#include "asahi/lib/agx_chip_caps.h"
 #include "util/half_float.h"
 #include "util/u_debug.h"
 
@@ -2767,7 +2768,7 @@ agx3_emit_storage_image_write(struct util_dynarray *emission,
     * Gallium does on G17C) need it: their layer count does not shrink with
     * the selected mip level, unlike 3D depth.
     */
-   const bool layer_operand = !m5 || chip == AGX_CHIP_G17C;
+   const bool layer_operand = !m5 || agx_chip_m5_layer_operand(chip);
    const bool array = I->dim == AGX_DIM_2D_ARRAY && layer_operand;
    const bool three_d = I->dim == AGX_DIM_3D ||
                         (!layer_operand && I->dim == AGX_DIM_2D_ARRAY);
@@ -4735,7 +4736,7 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       !query_lod && !I->sparse && (bank_base & 7) == 0;
    const bool relocatable_array = array && !cube && !register_operands &&
       !query_lod && !staged_offset && !register_offset &&
-      !combined_array_lod && !gradient_lod && !bias_min && !gradient_min &&
+      !gradient_lod && !bias_min && !gradient_min &&
       !(bank_base & 7);
    if (bank_base != 0 &&
        ((enc != AGX_ISA_ENCODING_AGX3B && enc != AGX_ISA_ENCODING_AGX3C) ||
@@ -4746,15 +4747,15 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
         (three_d && !m5_banked_3d &&
          !(enc == AGX_ISA_ENCODING_AGX3B && vertex_stage)) ||
         cube || (gradient_lod && !m5_banked_3d) || bias_min || gradient_min || query_lod ||
-        (enc == AGX_ISA_ENCODING_AGX3B &&
-         ((explicit_lod && !immediate_lod) || register_bias)) ||
-        (enc == AGX_ISA_ENCODING_AGX3C &&
-         (((explicit_lod && !immediate_lod) || register_bias) &&
-          (bank_base & 7))) ||
+        (((explicit_lod && !immediate_lod) || register_bias) &&
+         (bank_base & 7)) ||
         register_offset || (bank_base & 3) ||
         bank_base > AGX3_STAGING_HALFS -
            (m5_banked_3d && gradient_lod
-               ? (vertex_stage ? 40 : 32) : (array || three_d) ? 8 : 4)))
+               ? (vertex_stage ? 40 : 32)
+               : (vertex_stage && explicit_lod && !immediate_lod) ? 16
+               : (array || three_d ||
+                  (explicit_lod && !immediate_lod) || register_bias) ? 8 : 4)))
       return agx3_tex_decline(I, __LINE__);
    const uint16_t coord = (enc == AGX_ISA_ENCODING_AGX3B ||
                            enc == AGX_ISA_ENCODING_AGX3C ||
@@ -5223,8 +5224,17 @@ agx3_emit_texture_sample(struct util_dynarray *emission,
       .compute_stage = compute_stage,
       .sample_abi = AGX3_TEX_SAMPLE_ABI_DRIVER,
    };
-   return agx3_tex_encode_sample(enc, &d, bytes, &len) &&
-          agx3_append(emission, bytes, len);
+   /* Every gate above passed, so a refusal here is the SMP form itself
+    * (an operand field it cannot name). Say so rather than leave only the
+    * caller's line, which reads like an operand-shape refusal. */
+   if (!agx3_tex_encode_sample(enc, &d, bytes, &len)) {
+      char why[64];
+      snprintf(why, sizeof(why), "no SMP form for coord=half%u slot=%u",
+               d.coord, d.slot);
+      agx3_report_refusal_why(I, __LINE__, why);
+      return false;
+   }
+   return agx3_append(emission, bytes, len);
 }
 
 static int
@@ -10193,8 +10203,11 @@ agx3_g17p_colour_writeout(uint32_t writeout, unsigned pair)
  * one LSTCOL per sample, release 524 once.
  *
  * Admitted shapes: a background emits one two- or four-store set to
- * partition zero with no pixel transaction (one set per target, at disjoint
- * whole-sample tile ranges, for several targets); a colour epilog emits one
+ * partition zero (one set per target, at disjoint whole-sample tile ranges,
+ * for several targets) with no pixel transaction or, when it reloads the
+ * samples, inside one class-12 transaction: pixwait 12 before the first
+ * store, pixrel 12 after the last (agx_background_holds_colour()). A colour
+ * epilog emits one
  * set to partition zero, at most one store per framebuffer sample, after its
  * class-12 wait. Stores of API-disabled samples (zero coverage) may be
  * missing. Within a target each store's mask must come from its own
@@ -10239,6 +10252,7 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
     * fragments do before their colour stores: 1 waited, 2 written,
     * 3 released. */
    unsigned depth = 0, colour_signals = 0;
+   bool bg_waited = false, bg_released = false;
 
    agx_block *store_block = tail ? tail : agx_start_block(ctx);
    agx_foreach_instr_in_block(store_block, I) {
@@ -10271,6 +10285,19 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
          waited = true;
          continue;
       }
+      /* A reloading background's class-12 transaction around all its stores. */
+      if (!colour && I->op == AGX_OPCODE_WAIT_PIX && I->writeout == 12 &&
+          !bg_waited && !target_count) {
+         bg_waited = true;
+         continue;
+      }
+      if (!colour && I->op == AGX_OPCODE_SIGNAL_PIX && I->writeout == 12 &&
+          bg_waited && !bg_released && target_count) {
+         bg_released = true;
+         continue;
+      }
+      if (bg_released && I->op == AGX_OPCODE_ST_TILE)
+         return 0;
 
       /* G18's generic tile lowering releases after each unrolled sample.
        * Native sample-ID and texture-reload fragments instead hold class12
@@ -10389,6 +10416,7 @@ agx3_g17p_sample_store_protocol(agx_context *ctx, bool colour)
            samples > 0 && samples <= ctx->key->fs.nr_samples
       : samples == 2 || samples == 4;
    return stopped && waited == colour && complete &&
+                bg_waited == bg_released &&
                 (depth == 0 || depth == 3) &&
                 (target_count == 1 || ctx->key->g17p_mrt_bg)
              ? target_count : 0;
@@ -16204,9 +16232,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                I->src[3].type != AGX_INDEX_REGISTER &&
                I->src[4].type != AGX_INDEX_REGISTER &&
                (I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-                 I->src[1].type == AGX_INDEX_IMMEDIATE));
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                I->lod_mode == AGX_LOD_MODE_LOD_MIN);
             const bool banked_shadow_array =
                enc == AGX_ISA_ENCODING_AGX3C && !ctx->key->dev.emit_agx3d &&
                ctx->stage == MESA_SHADER_COMPUTE && I->dim == AGX_DIM_2D_ARRAY &&
@@ -16229,10 +16256,8 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                !I->query_lod && !(I->offset && !I->offset_xyz) &&
                (m5_banked_3d || relocatable_2d_array || banked_shadow_array ||
                 I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-                ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-                  I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-                 (I->src[1].type == AGX_INDEX_IMMEDIATE ||
-                  enc == AGX_ISA_ENCODING_AGX3C)));
+                I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+                I->lod_mode == AGX_LOD_MODE_LOD_MIN);
             const bool staged_scalar =
                (I->lod_mode == AGX_LOD_MODE_LOD_MIN &&
                 I->src[1].type != AGX_INDEX_IMMEDIATE) ||
@@ -17540,6 +17565,17 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             uint8_t len = 0;
             if (!agx3_translate_mem(enc, I, is_store, slot, wait, &d))
                AGX3_REFUSE(I);
+            if (is_store && ctx->stage == MESA_SHADER_COMPUTE &&
+                agx_chip_has_cap(ctx->key->dev.chip,
+                                 AGX_CAP_COMPUTE_COHERENT_STORE)) {
+               /* Promote non-coherent compute device stores to stdev f75=1 on
+                * chips carrying AGX_CAP_COMPUTE_COHERENT_STORE (see
+                * agx_chip_caps.h): writes bypass per-core L1 write-allocation
+                * directly into the shared L2 domain, preserving L1 capacity
+                * for streaming reads while maintaining strictly stronger store
+                * visibility for same-core and post-barrier consumers. */
+               d.coherent = true;
+            }
             if (g17p_vertex_load_policy && !is_store) {
                const bool first = vertex_loads_seen++ == 0;
                const bool last = --device_loads_left == 0;
