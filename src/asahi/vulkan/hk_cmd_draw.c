@@ -16306,6 +16306,27 @@ hk_g17p_draw_primitive_supported(enum agx_primitive topology)
    return topology < 16 && (UINT32_C(0xea6b) >> topology) & 1;
 }
 
+/* The restart State Update policy for HAL200 indexed direct draws. G17P keeps
+ * the VDM stream's restart index across draws, so it re-emits the record only
+ * when hk_g17p_restart_state_needed(); the other native chips carry the record
+ * on every indexed draw. Shared by hk_g17p_emit_draw() and the cached
+ * direct-draw emitter (hk_agx3_arm_direct_draw_fast()), so both emit the same
+ * record sequence. */
+static inline bool
+hk_hal200_restart_record_every_draw(enum agx_chip chip)
+{
+   return chip != AGX_CHIP_G17P;
+}
+
+static inline bool
+hk_hal200_indexed_restart_record(enum agx_chip chip, bool tail_emitted,
+                                 const struct hk_cs *cs, uint32_t restart_index)
+{
+   return hk_hal200_restart_record_every_draw(chip) ||
+          hk_g17p_restart_state_needed(tail_emitted, cs->restart_index_set,
+                                       cs->restart_index, restart_index);
+}
+
 /* The G17P draw record after any state publication: the context-relative
  * draw-state selector record when a fresh bind tail precedes it, then the
  * HAL200 draw body (indirect, indexed or direct).  Shared by hk_draw_impl()
@@ -16401,10 +16422,8 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
             ? (uint64_t)UINT32_MAX
             : (rem_B + (ib & 3) + 3) >> 2;
       restart_index = hk_draw_restart_index(cmd, draw);
-      restart_record =
-         dev->dev.chip != AGX_CHIP_G17P ||
-         hk_g17p_restart_state_needed(tail_emitted, cs->restart_index_set,
-                                      cs->restart_index, restart_index);
+      restart_record = hk_hal200_indexed_restart_record(
+         dev->dev.chip, tail_emitted, cs, restart_index);
       if (restart_record) {
          w[n++] = UINT32_C(0x40000001);
          w[n++] = restart_index;
@@ -16819,9 +16838,12 @@ hk_agx3_arm_direct_draw_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          return;
       restart_index = hk_draw_restart_index(cmd, draw);
       if (is_hal200) {
-         emit_restart_record = chip != AGX_CHIP_G17P;
+         /* Cache only draws whose record need does not depend on the stream:
+          * a record on every draw, or none while the stream holds the index.
+          * No bind tail precedes a cached draw. */
+         emit_restart_record = hk_hal200_restart_record_every_draw(chip);
          if (!emit_restart_record &&
-             (!cs->restart_index_set || cs->restart_index != restart_index))
+             hk_hal200_indexed_restart_record(chip, false, cs, restart_index))
             return;
          draw_header_word =
             UINT32_C(0x61f00000) | ((uint32_t)gfx->topology << 8) |
@@ -17131,8 +17153,9 @@ hk_agx3_try_fast_direct_draw_indexed(struct hk_cmd_buffer *cmd,
       return false;
    if (fast->is_hal200) {
       if (unlikely(!fast->emit_restart_record &&
-                   (!cs->restart_index_set ||
-                    cs->restart_index != fast->restart_index)))
+                   hk_g17p_restart_state_needed(false, cs->restart_index_set,
+                                                cs->restart_index,
+                                                fast->restart_index)))
          return false;
    } else if (unlikely(fast->restart_enable &&
                        (!cs->restart_index_set ||
