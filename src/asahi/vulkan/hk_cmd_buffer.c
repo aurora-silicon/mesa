@@ -13,6 +13,7 @@
 #include "hk_sampler_index.h"
 #include "asahi/compiler/agx3_graphics_program.h"
 #include "hk_g17p_patch.h"
+#include "hk_g17p_varyings.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -611,6 +612,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       cmd->used_group_count_cache = false;
    }
    cmd->pass_merge.valid = false;
+   memset(&cmd->render_pack, 0, sizeof(cmd->render_pack));
    /* Nothing has been recorded since this reset. */
    cmd->g17p_pristine = true;
 }
@@ -634,6 +636,8 @@ hk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
       cmd->state.conditional;
 
    hk_flush_deferred_clears(cmd);
+   cmd->state.cs.cdm_barrier_full_needed = true;
+   cmd->state.cs.cdm_stream_has_images = true;
 
    /* Secondary command buffers are materialized by replaying their common
     * command queues into the primary.  Their last bound state is therefore
@@ -834,11 +838,11 @@ hk_pool_cs_alloc(struct hk_cmd_buffer *cmd, uint32_t size, uint32_t alignment)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
-   /* A G17P compute root consumes a whole command BO. Keep control-stream
-    * roots on their own bump cursor so allocating one cannot evict a partially
-    * used main-upload BO and move that allocator's slow path into the next
-    * application command. Ownership remains on the ordinary main BO list. */
-   struct hk_uploader *uploader = agx_chip_native_agx3(dev->dev.chip)
+   /* Keep control-stream roots on their own bump cursor on native AGX3 and M5
+    * so allocating one cannot evict a partially used main-upload BO and so
+    * unlinked stream BOs are marked stream_only for exact-extent cache cleans
+    * at vkEndCommandBuffer(). Ownership remains on the ordinary main BO list. */
+   struct hk_uploader *uploader = agx_chip_native_or_m5(dev->dev.chip)
                                      ? &cmd->uploader.streams
                                      : &cmd->uploader.main;
    return hk_pool_alloc_from(cmd, uploader, size, alignment, HK_CMD_BO_MAIN);
@@ -1081,6 +1085,13 @@ hk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    hk_cmd_buffer_begin_compute(cmd, pBeginInfo);
    hk_cmd_buffer_begin_graphics(cmd, pBeginInfo);
 
+   /* Submit-time render packing: until something but a pipeline barrier is
+    * recorded, the first render pass instance may continue the previous
+    * command buffer's last one (hk_render_pack.h). */
+   cmd->render_pack.head_open =
+      cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+   cmd->render_pack.head_epoch = cmd->sync.epoch;
+
    return VK_SUCCESS;
 }
 
@@ -1239,6 +1250,10 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    hk_sync_flush_stamp_copies(cmd);
    hk_sync_flush_pending_timestamp(cmd);
    hk_cmd_buffer_end_compute(cmd);
+   cmd->state.cs.cdm_barrier_pending = false;
+   cmd->state.cs.cdm_barrier_full_needed = false;
+   cmd->state.cs.cdm_stream_has_images = false;
+
    hk_cmd_buffer_end_compute_internal(cmd, &cmd->current_cs.post_gfx);
    hk_resolve_pending_oq_available(cmd);
    hk_resolve_deferred_oq_available(cmd);
@@ -1302,6 +1317,8 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    const bool fenced = hk_cmd_buffer_publish_cached_uploads(cmd);
    hk_cmd_buffer_publish_root_uploads(cmd, fenced);
    hk_cmd_buffer_end_alias_sites(cmd);
+
+   hk_render_pack_end_cmd(cmd);
 
    hk_cmd_print_upload_stats(cmd);
    return vk_command_buffer_end(&cmd->vk);
@@ -1519,6 +1536,8 @@ brl_discard_init_record(struct hk_cmd_buffer *cmd,
    /* The transition is work now: an ended pass instance cannot continue
     * across it (hk_m5_pass_merge_classify() assumes transitions do none). */
    cmd->pass_merge.valid = false;
+   cmd->render_pack.tail_open = false;
+   cmd->render_pack.tail_why = "layout transition work";
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1578,7 +1597,14 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          return;
       }
 
-      hk_cmd_buffer_end_compute(cmd);
+      /* On AGX2 outside a render pass, keep an open compute stream alive
+       * across the barrier so the next pure compute SSBO launch can narrow
+       * the previous launch's trailing barrier word in place (hk_cmd_dispatch.c).
+       * Non-AGX2 command streams (such as G18G/HAL300), fullcdmbarrier, and
+       * open graphics batches still end the compute stream as on the base. */
+      if (hk_cdm_record_pipeline_barrier(cmd, pDependencyInfo))
+         hk_cmd_buffer_end_compute(cmd);
+
       hk_cmd_buffer_end_graphics(cmd);
       /* Preserve the same conservative ordering in the shared submit graph,
        * including kernels that advertise exact prior barriers on AGX2. */
@@ -1595,6 +1621,10 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * next one if this dependency is framebuffer-local. */
    if (unlikely(cmd->pass_merge.valid))
       hk_m5_pass_merge_barrier(cmd, pDependencyInfo);
+   /* Likewise across command buffers, at submission (hk_render_pack.h): a
+    * barrier before the first instance or after the last. */
+   if (cmd->render_pack.head_open || cmd->render_pack.tail_open)
+      hk_render_pack_note_barrier(cmd, pDependencyInfo);
 
    /* Host availability is recorded against the work already recorded. */
    if (cmd->state.deferred_clear_count &&
@@ -1706,6 +1736,7 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
     * or extended still ends the candidacy there. */
    if (unlikely(cmd->pass_merge.valid))
       cmd->pass_merge.sync_epoch = cmd->sync.epoch;
+   hk_render_pack_barrier_done(cmd);
 }
 
 __attribute__((hot)) void
@@ -2661,12 +2692,12 @@ hk_g17p_smooth_varyings_supported_uncached(struct hk_cmd_buffer *cmd,
                                 b->slot == VARYING_SLOT_VIEWPORT || clip_slot ||
                                 cull_slot;
          if (!user_slot || (cull_slot && (b->perspective || !b->smooth)) ||
-             (b->perspective && !has_rhw) ||
-             b->offset + b->count > vs->info.uvs.components[b->slot])
+             (b->perspective && !has_rhw))
             return false;
          ++user_bindings;
-         const unsigned slot = gfx->linked_varyings.slots[b->slot];
-         if (slot < 4 || slot + b->offset + b->count > vs->info.uvs.size)
+         if (!hk_g17p_user_varying_binding_fits(
+                b->offset, b->count, vs->info.uvs.components[b->slot],
+                gfx->linked_varyings.slots[b->slot], vs->info.uvs.size))
             return false;
       }
       next_cf += b->count;
@@ -4855,7 +4886,8 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
 
    s = hk_linked_shader_source(s, linked);
-   if (!agx_chip_native_hal200(dev->dev.chip) ||
+   if ((!agx_chip_native_hal200(dev->dev.chip) &&
+        !agx_chip_g17_m5(dev->dev.chip)) ||
        s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
        !gfx->root || gfx->g17p_hoisted_preamble_va)
       return 0;
@@ -5393,6 +5425,8 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
 
    agx_usc_words_precomp(t.cpu, &prog->b, uploaded_data, data_size);
 
+   cmd->state.cs.cdm_barrier_full_needed = true;
+   cmd->state.cs.cdm_stream_has_images = true;
    hk_dispatch_with_usc_launch(dev, cs, prog->b.launch,
                                agx_usc_addr(&dev->dev, t.gpu), grid,
                                prog->b.workgroup);

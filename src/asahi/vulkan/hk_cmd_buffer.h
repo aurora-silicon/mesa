@@ -38,6 +38,7 @@
 #include "hk_shader.h"
 #include "hk_compute_pair.h"
 #include "hk_sync.h"
+#include "hk_render_pack.h"
 #include "hk_tess_batch.h"
 
 #include "hk_cmd_pool.h"
@@ -1407,6 +1408,18 @@ hk_agx3_fragment_root_select(struct hk_graphics_state *gfx, uint8_t root_reads,
 struct hk_compute_state {
    struct hk_descriptor_state descriptors;
    struct hk_api_shader *shader;
+   /* vkCmdPipelineBarrier2 dependency not yet consumed by a CDM launch.
+    * Lives on the command buffer so it survives CS splits and
+    * merge_control_streams. */
+   bool cdm_barrier_pending;
+   /* True when the pending barrier requires the full default CDM barrier word
+    * (0x1ff, with USC/PBE/texture maintenance) rather than the pure compute
+    * SSBO word (0x160). */
+   bool cdm_barrier_full_needed;
+   /* True if any launch in the open CDM stream used images, textures, or
+    * samplers (including bindless), so Vulkan 1.0 SHADER_READ/WRITE barriers
+    * keep the default word. */
+   bool cdm_stream_has_images;
 };
 
 /*
@@ -1463,6 +1476,11 @@ struct hk_cs {
 
    /* Parent command buffer. Convenience. */
    struct hk_cmd_buffer *cmd;
+
+   /* The command buffer whose recording holds the control stream at addr,
+    * when that is not cmd: a submission's render packet runs the first
+    * member's stream (hk_render_pack_init()). */
+   struct hk_cmd_buffer *stream_owner;
 
    /* Data master */
    enum hk_cs_type type;
@@ -1607,6 +1625,23 @@ struct hk_cs {
     * descriptor sets bound for graphics need not end an ordered continuation
     * (hk_m5_attachments_exclude_descriptors()). */
    bool m5_layout_proof;
+
+   /* A draw recorded into this stream could break the memory equivalence of
+    * an ordered continuation (hk_m5_ordered_draw_hazard()): transform
+    * feedback, conditional rendering, software or mesh stages, or adjacency.
+    * Submit-time render packing (hk_render_pack.h) continues across an
+    * ordered dependency only into and out of streams without one. */
+   bool render_pack_unsafe;
+
+   /* A submit-time render packet: how many command buffers it runs. */
+   uint16_t render_pack_members;
+
+   /* Colour attachments whose load and store hk_g17p_elide_untouched_color()
+    * dropped from this stream's tile programs. Two streams' programs are the
+    * same programs, recorded in two command buffers, when their passes have
+    * the same attachments and operations and this mask is the same
+    * (hk_render_pack_streams_match()). */
+   uint8_t render_pack_elided;
 
    /* Scratch requirements */
    struct {
@@ -2292,6 +2327,10 @@ struct hk_cmd_buffer {
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
    } pass_merge;
+
+   /* How the command buffer begins and ends, for submit-time render packing
+    * (hk_render_pack.h). */
+   struct hk_render_pack_edges render_pack;
 
    /* Per-recording compute group-count cache (384 B) lives outside `state` so
     * empty and graphics-only command buffer resets skip zeroing it. */
@@ -3355,6 +3394,13 @@ void *hk_cmd_buffer_emit_vdm_terminate(struct hk_cmd_buffer *cmd,
  * patch site (hk_cdm_note_alias_site()). */
 void hk_cdm_end_stream_flush(struct hk_cmd_buffer *cmd, struct hk_cs *cs);
 
+/* Record a non-native pipeline barrier against the open compute stream.
+ * Returns true when the caller must end the open compute stream (non-AGX2
+ * command streams such as G18G/HAL300, fullcdmbarrier, or an open graphics
+ * batch). */
+bool hk_cdm_record_pipeline_barrier(struct hk_cmd_buffer *cmd,
+                                    const VkDependencyInfo *dep);
+
 static void
 hk_cmd_buffer_end_compute_internal(struct hk_cmd_buffer *cmd,
                                    struct hk_cs **ptr)
@@ -3542,6 +3588,14 @@ struct agx_shader_part *hk_part_from_blob(const uint8_t *data, size_t size,
  * may continue in its stream. */
 void hk_m5_pass_merge_barrier(struct hk_cmd_buffer *cmd,
                               const VkDependencyInfo *info);
+
+/* Submit-time render packing (hk_render_pack.h, hk_cmd_draw.c): a pipeline
+ * barrier beside the command buffer's first or last render pass instance
+ * (and its end), and the edges of a command buffer whose recording ends. */
+void hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
+                                 const VkDependencyInfo *info);
+void hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd);
+void hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd);
 
 /* An ordered continuation (hk_cs::m5_ordered) ends at a command that may
  * break its memory equivalence (reason names the command). */
@@ -3907,6 +3961,14 @@ hk_dispatch_with_local_size(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       return;
    }
    uint32_t usc = uploaded;
+
+   if (s->info.reads_images || s->b.info.texture_state_count != 0 ||
+       s->b.info.sampler_state_count != 0 || s->b.info.uses_sampler_heap ||
+       s->b.info.uses_txf || s->info.stage != MESA_SHADER_COMPUTE ||
+       cmd->in_meta) {
+      cmd->state.cs.cdm_barrier_full_needed = true;
+      cmd->state.cs.cdm_stream_has_images = true;
+   }
 
    hk_reserve_scratch(cmd, cs, s);
    hk_dispatch_with_usc(dev, cs, &s->b.info, usc, grid, local_size);
