@@ -10,6 +10,7 @@
 #include "hk_compute_pair.h"
 #include "hk_identity_copy4.h"
 #include "hk_nir_match_pointwise_clamp.h"
+#include "hk_shader_upload_core.h"
 #include "hk_buffer.h"
 #include "hk_frame_anatomy.h"
 #include "hk_agx3_ioto_program_core.h"
@@ -149,6 +150,13 @@ struct hk_fs_key {
     * keep the NIR to compile the zs_self_dep twin (hk_fbl_twin()).
     */
    bool dynamic_zs_self_dep : 1;
+
+   /** A fragment library compiled without its output interface. Only a fast
+    * link uses this compile (an optimized link compiles the shader again), so
+    * draws link it with the split epilog rather than compile an inline-blend
+    * program for it.
+    */
+   bool output_interface_later : 1;
 
    uint8_t pad[3];
 };
@@ -797,6 +805,10 @@ hk_populate_fs_key(struct hk_fs_key *key,
                     MESA_VK_DYNAMIC_MS_ALPHA_TO_COVERAGE_ENABLE) &&
        !ms->alpha_to_coverage_enable)
       key->discard_color_outputs = true;
+
+   key->output_interface_later =
+      !state->cal &&
+      !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_COLOR_ATTACHMENT_MAP);
 }
 
 static bool
@@ -4183,6 +4195,32 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
                nir_opt_if_avoid_64bit_phis);
 }
 
+/* Upload the part of the binary the GPU reads from the shader itself: its
+ * constant program and promoted constants. The main runs from fast-linked
+ * copies, so a large main does not take the USC window twice
+ * (hk_shader_upload_start()). */
+static bool
+hk_upload_code(struct hk_device *dev, struct hk_shader *s)
+{
+   const struct agx_shader_info *info = &s->b.info;
+   const uint32_t start = hk_shader_upload_start(
+      info->binary_size, info->has_preamble, info->preamble_offset,
+      info->rodata.offset, info->rodata.size_16, HK_CODE_ALIGNMENT);
+   assert(start < info->binary_size);
+   const size_t size = info->binary_size - start;
+
+   s->bo = hk_code_alloc(dev, size, &s->bo_offset);
+   if (!s->bo)
+      return false;
+
+   s->bo_skip = start;
+   memcpy((uint8_t *)agx_bo_map(s->bo) + s->bo_offset,
+          (const uint8_t *)s->b.binary + start, size);
+   agx_bo_assert_range(s->bo, s->bo_offset, size);
+   s->preamble_addr = hk_shader_code_va(s) + info->preamble_offset;
+   return true;
+}
+
 /* Report a failed executable-preamble upload, so the caller's error path
  * destroys the half-built shader instead of keeping one with preamble_addr
  * 0. */
@@ -4197,19 +4235,8 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
       shader->constant_data_id = p_atomic_inc_return(&next_constant_data_id);
 
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
-      /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
-      size_t size = shader->b.info.binary_size;
-      assert(size > 0);
-
-      shader->bo = hk_code_alloc(dev, size, &shader->bo_offset);
-      if (!shader->bo)
+      if (!hk_upload_code(dev, shader))
          return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-
-      memcpy((uint8_t *)agx_bo_map(shader->bo) + shader->bo_offset,
-             shader->b.binary, size);
-      agx_bo_assert_range(shader->bo, shader->bo_offset, size);
-      shader->preamble_addr =
-         hk_shader_code_va(shader) + shader->b.info.preamble_offset;
    }
 
    if (!shader->linked.ht) {
@@ -4368,15 +4395,16 @@ hk_g17p_pbe_record(nir_builder *b, nir_scalar s)
 }
 
 /* Honeykrisp names a storage image by the byte offset of its PBE in the
- * descriptor set. G17P's imgwci instead takes a PBE heap from a uniform and
- * the index of a PBE record in that heap, so the set itself is the heap and
- * the store carries its record index.
+ * descriptor set. G17P's imgwci and imgwblk instead take a PBE heap from a
+ * uniform and the index of a PBE record in that heap, so the set itself is
+ * the heap and the store carries its record index.
  */
 static bool
 hk_g17p_lower_storage_records(nir_builder *b, nir_intrinsic_instr *intr,
                               UNUSED void *data)
 {
-   if (intr->intrinsic != nir_intrinsic_bindless_image_store)
+   if (intr->intrinsic != nir_intrinsic_bindless_image_store &&
+       intr->intrinsic != nir_intrinsic_bindless_image_store_block_agx)
       return false;
 
    nir_intrinsic_instr *handle = nir_src_as_intrinsic(intr->src[0]);
@@ -6290,11 +6318,6 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (agx_chip_has_cap(dev->dev.chip,
                            AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) &&
           sw_stage == MESA_SHADER_COMPUTE &&
-          !hk_nir_root_reads_range(
-             nir, hk_root_descriptor_offset(cs.group_count_addr),
-             hk_root_descriptor_offset(cs.group_count_addr) +
-                sizeof(uint64_t),
-             sizeof(struct hk_root_descriptor_table)) &&
           hk_nir_can_coalesce_workgroup(nir))
          wg_coalesce_cand = true;
    }
@@ -6518,11 +6541,12 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       (sw_stage == MESA_SHADER_FRAGMENT &&
        shader->info.fs.m5_inline_sample_shading);
    const bool capture_g17p_preopt_mono =
-      !preserve_raw_mono && agx_chip_native_agx3(dev->dev.chip) &&
+      !preserve_raw_mono && agx_chip_native_or_m5(dev->dev.chip) &&
       (agx_get_fs_structure_flags() & AGX_FS_STRUCTURE_INLINE_BLEND) &&
       sw_stage == MESA_SHADER_FRAGMENT &&
       nir->info.stage == MESA_SHADER_FRAGMENT &&
-      !nir->info.fs.uses_sample_shading;
+      !nir->info.fs.uses_sample_shading &&
+      !(key && key->fs.output_interface_later);
 
    if (preserve_raw_mono) {
       struct blob blob;
@@ -6843,6 +6867,7 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->code_size = s->b.info.binary_size;
    s->bo = NULL;
    s->bo_offset = 0;
+   s->bo_skip = 0;
    s->preamble_addr = 0;
    memset(&s->linked, 0, sizeof(s->linked));
    s->only_linked = NULL;
@@ -6858,16 +6883,11 @@ hk_g17p_layout_shader_create(struct hk_device *dev, const struct hk_shader *api,
    s->preamble_cs_attempted = false;
 
    if (s->b.info.has_preamble || s->b.info.rodata.size_16) {
-      const size_t size = s->b.info.binary_size;
-      s->bo = size ? hk_code_alloc(dev, size, &s->bo_offset) : NULL;
-      if (!s->bo) {
+      if (!hk_upload_code(dev, s)) {
          free(s->b.binary);
          free(s);
          return NULL;
       }
-      memcpy((uint8_t *)agx_bo_map(s->bo) + s->bo_offset, s->b.binary, size);
-      agx_bo_assert_range(s->bo, s->bo_offset, size);
-      s->preamble_addr = hk_shader_code_va(s) + s->b.info.preamble_offset;
    }
    return s;
 }
@@ -10957,7 +10977,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                   hk_fs_mesh_builtin_per_primitive, nir_metadata_control_flow,
                   NULL);
 
-      if (agx_chip_native_or_m5(dev->dev.chip)) {
+      if (!agx_chip_hal300_path(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip)) {
          enum hk_nir_widen_16bit_varyings_mode mode = 0;
 
          if (nir->info.stage == MESA_SHADER_FRAGMENT) {
@@ -10992,7 +11013,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
          nir_io_add_intrinsic_xfb_info(nir);
       }
 
-      if (agx_chip_native_or_m5(dev->dev.chip))
+      if (!agx_chip_hal300_path(dev->dev.chip) ||
+          agx_chip_g17_m5(dev->dev.chip))
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_widen_integer_io,
                   nir_metadata_control_flow, NULL);
 
@@ -11294,17 +11316,19 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
        * either way. */
       if (vs) {
          const bool pre_raster_after_vs = tes || gs;
-         hk_prelink_vertex(dev, vs, !state || !pre_raster_after_vs,
+         hk_prelink_vertex(dev, vs, fs, state, !state || !pre_raster_after_vs,
                            !state || pre_raster_after_vs);
       }
 
       if (fs && !state) {
          hk_prelink_object_fragment(dev, fs);
-      } else if (fs && vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
-         const struct hk_shader *hw_vs =
-            gs    ? &gs->variants[HK_GS_VARIANT_RAST]
-            : tes ? &tes->variants[HK_VS_VARIANT_HW]
-                  : &vs->variants[HK_VS_VARIANT_HW];
+      } else if (fs && state) {
+         const struct hk_shader *hw_vs = NULL;
+         if (vs && !api[MESA_SHADER_TASK] && !api[MESA_SHADER_MESH]) {
+            hw_vs = gs    ? &gs->variants[HK_GS_VARIANT_RAST]
+                    : tes ? &tes->variants[HK_VS_VARIANT_HW]
+                          : &vs->variants[HK_VS_VARIANT_HW];
+         }
          hk_prelink_pipeline_fragment(dev, hw_vs, fs, state);
       }
    }
