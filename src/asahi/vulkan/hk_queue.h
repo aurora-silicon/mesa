@@ -7,12 +7,16 @@
 
 #pragma once
 
+#include "hk_pack.h"
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
 #include "vk_queue.h"
 
 struct hk_device;
 struct hk_packed_submit;
+struct hk_render_packet;
 
 /* Queues advertised per family when the kernel reports independent queues
  * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
@@ -54,10 +58,16 @@ struct hk_queue {
        */
       uint64_t timeline_value;
 
-      /* The highest timeline value a host wait has seen signalled, for
-       * occlusion query reads (hk_oq_submission_done()). Every value at or
-       * below it is complete. */
+      /* The highest timeline value a host wait or syncobj query has seen
+       * signalled, updated monotonically via hk_queue_note_signalled(). Every
+       * value at or below it is complete. */
       uint64_t signalled_value;
+      /* Monotonic timestamp (ns) and highest timeline point covered by it,
+       * advanced monotonically by hk_queue_note_signalled() before publishing
+       * signalled_value so observed-duration retirement never uses a stale
+       * timestamp from an earlier point. */
+      uint64_t signalled_ns;
+      uint64_t signalled_ns_point;
 
       /* Latest timeline point that received the waits of a submission
        * without control streams (queue_submit_empty()), 0 once it is known
@@ -118,15 +128,34 @@ struct hk_queue {
       struct util_dynarray members;
       struct util_dynarray runs;
       struct util_dynarray commands;
-      /* Per member: the fused compute-pair shader that replaces it and its
-       * consumer, and whether the replacement was emitted. */
+      /* Per member: the fused compute-pair plan and its elision state. */
       struct util_dynarray fused;
+      struct util_dynarray plans;
+      struct util_dynarray planned_suppressed;
+      struct util_dynarray suppressed_arr;
+      struct util_dynarray run_sup;
       /* Buffers the packets read until they complete: their streams, the
-       * fused shaders' code and the fused programs' uniform loaders. */
+       * fused shaders' code, uniform loaders and root tables. */
       struct util_dynarray extra_bos;
       struct hk_packed_submit *packets;
       unsigned packets_cap;
+      /* Observed completion durations for repeated multi-CB looping
+       * submissions, used to budget packets safely below firmware timeouts. */
+      struct hk_pack_obs_entry obs[HK_PACK_OBS_SLOTS];
+      uint32_t obs_pending;
+      uint64_t obs_epoch;
+      uint64_t obs_tick;
    } pack;
+
+   /* Reusable scratch and packets for submit-time render packing
+    * (hk_render_pack_runs()). */
+   struct {
+      struct util_dynarray commands;
+      struct util_dynarray runs;
+      struct util_dynarray targets;
+      struct hk_render_packet *packets;
+      unsigned packets_cap;
+   } rpack;
 
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
@@ -178,6 +207,49 @@ hk_queue_device(struct hk_queue *queue)
    return (struct hk_device *)queue->vk.base.device;
 }
 
+static inline void
+hk_queue_note_signalled_at(struct hk_queue *queue, uint64_t point,
+                           uint64_t now_ns)
+{
+   uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   if (seen >= point)
+      return;
+
+   uint64_t seen_ns = p_atomic_read(&queue->drm.signalled_ns);
+   while (seen_ns < now_ns) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_ns, seen_ns, now_ns);
+      if (prev == seen_ns)
+         break;
+      seen_ns = prev;
+   }
+
+   uint64_t seen_pt = p_atomic_read(&queue->drm.signalled_ns_point);
+   while (seen_pt < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_ns_point, seen_pt, point);
+      if (prev == seen_pt)
+         break;
+      seen_pt = prev;
+   }
+
+   while (seen < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
+      if (prev == seen)
+         break;
+      seen = prev;
+   }
+}
+
+static inline void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   if (p_atomic_read(&queue->drm.signalled_value) >= point)
+      return;
+   hk_queue_note_signalled_at(queue, point, (uint64_t)os_time_get_nano());
+}
+
 
 /* Whether a queue publishes API signals from its cumulative queue timeline
  * because independent engines or sibling kernel queues may finish out of
@@ -211,7 +283,7 @@ hk_queue_sibling_compute_supported(const struct agx_device *dev,
 {
    const uint64_t required = DRM_ASAHI_FEATURE_CUMULATIVE_SIGNALS |
                              DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS;
-   return !dev->is_virtio && exact_prior &&
+   return !dev->is_virtio && !(dev->debug & AGX_DBG_1QUEUE) && exact_prior &&
           hk_queue_uses_cumulative_signals(dev) &&
           (dev->params.features & required) == required &&
           !(dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
@@ -228,6 +300,7 @@ VkResult hk_queue_init_kick(struct hk_device *dev,
 void hk_queue_finish(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_device_quiesce_lost_submissions(struct hk_device *dev);
+void hk_device_wait_submitted(struct hk_device *dev, uint64_t timeout_ns);
 
 /* The first command buffer of the submission whose recording failed, or NULL.
  * Such a command buffer is not executable (vkEndCommandBuffer returned its
@@ -239,5 +312,7 @@ VkResult hk_queue_submit_bind_sparse_memory(struct hk_device *device,
                                             struct vk_queue_submit *submission);
 
 uint32_t hk_queue_independent_budget(struct hk_device *dev);
+
+bool hk_pack_atomics_allowed(struct hk_device *dev, struct hk_queue *queue);
 
 void hk_queue_share(struct hk_device *dev, struct hk_queue *queue);

@@ -182,11 +182,12 @@ static const struct agx_soc agx_socs[] = {
    {AGX_CHIP_ID_M4_MAX, AGX_CHIP_G17P, 1, 4, DRM_ASAHI_GPU_HAL_200,
     AGX_SOC_NATIVE, NULL},
 
-   /* T8142 (M5), and T6050 as the M5 Pro (J714s, J716s) and the M5 Max
-    * (J716c). */
+   /* T8142 (M5), and T6050 as the M5 Pro (J714s, J716s), the M5 Max (J716c),
+    * and the M5 Ultra (J775D). */
    {0x8142, AGX_CHIP_G17G, 1, 1, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
    {0x6050, AGX_CHIP_G17S, 1, 2, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
    {0x6050, AGX_CHIP_G17C, 1, 4, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
+   {0x6050, AGX_CHIP_G17D, 2, 8, DRM_ASAHI_GPU_HAL_300, AGX_SOC_M5, NULL},
 
    /* T8152 (M6, J873). The shim's G18G profile and the J873 G18G kernel
     * driver both publish HAL 300 until the uAPI has a PI_400 value. */
@@ -251,15 +252,23 @@ agx_params_native_kernel_abi_supported(
    if (!agx_chip_native_agx3(chip))
       return true;
 
+   /* The shared native contract (the g16 backend, and every native AGX3 part). */
+   const uint64_t native = DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
+                           DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
+
    if (chip == AGX_CHIP_G15G) {
-      const uint64_t required = DRM_ASAHI_FEATURE_VM_STATUS |
-                                DRM_ASAHI_FEATURE_SCHEDULED_QUEUES;
-      return (params->features & required) == required;
+      /* T8122 runs either the older M3 runtime, which advertises VM status
+       * and scheduled queues, or the shared g16 backend, which advertises
+       * VM status and the native contract. Either complete contract is
+       * accepted; VM status is required in both. */
+      const uint64_t m3_runtime = DRM_ASAHI_FEATURE_VM_STATUS |
+                                  DRM_ASAHI_FEATURE_SCHEDULED_QUEUES;
+      const uint64_t g16 = DRM_ASAHI_FEATURE_VM_STATUS | native;
+      return (params->features & m3_runtime) == m3_runtime ||
+             (params->features & g16) == g16;
    }
 
-   const uint64_t required = DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS |
-                             DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS;
-   return (params->features & required) == required;
+   return (params->features & native) == native;
 }
 
 const char *

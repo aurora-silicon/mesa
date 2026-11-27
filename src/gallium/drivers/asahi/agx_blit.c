@@ -1114,8 +1114,8 @@ agx_generate_mipmap_g17g(struct pipe_context *pctx, struct pipe_resource *prsc,
       bool renderable = true;
       for (unsigned level = base_level + 1;
            level <= last_level && renderable; ++level) {
-         renderable = agx_g17g_level_renderable(agx_context(pctx), prsc,
-                                                format, level, 0);
+         renderable = agx_level_renderable(agx_context(pctx), prsc,
+                                           format, level, 0);
       }
       if (renderable)
          return false;
@@ -1573,6 +1573,63 @@ agx_g17p_mip_compute_shader(struct pipe_context *pctx, unsigned key)
    return pipe_shader_from_nir(pctx, b->shader);
 }
 
+#define AGX_G17P_BLOCK_MIP_TILE 32
+
+/* Exact 2x downsample into a compressed level of a HAL200/AGX3B image through
+ * the compressed PBE, matching Borealis's build_g17p_block_mip_shader(). Each
+ * invocation samples the centre of its 2x2 source block at unnormalized pixel
+ * coordinates (2x + 1, 2y + 1), writes the pixel to the workgroup's
+ * imageblock, and one invocation per 32x32 workgroup stores the compressed
+ * tile through the level's compressed storage PBE. */
+static void *
+agx_g17p_block_mip_compute_shader(struct pipe_context *pctx)
+{
+   nir_builder build = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, pctx->screen->nir_options[MESA_SHADER_COMPUTE],
+      "agx-g17p-block-mip");
+   nir_builder *b = &build;
+   b->shader->info.workgroup_size[0] = AGX_G17P_BLOCK_MIP_TILE;
+   b->shader->info.workgroup_size[1] = AGX_G17P_BLOCK_MIP_TILE;
+   b->shader->info.workgroup_size[2] = 1;
+   b->shader->info.num_textures = 1;
+   b->shader->info.num_images = 1;
+   BITSET_SET(b->shader->info.textures_used, 0);
+   BITSET_SET(b->shader->info.samplers_used, 0);
+   BITSET_SET(b->shader->info.images_used, 0);
+
+   nir_def *gid = nir_trim_vector(b, nir_load_global_invocation_id(b, 32), 2);
+   nir_def *lid = nir_trim_vector(b, nir_load_local_invocation_id(b), 2);
+   nir_def *u = nir_u2f32(
+      b, nir_ior_imm(b, nir_ishl_imm(b, nir_channel(b, gid, 0), 1), 1));
+   nir_def *v = nir_u2f32(
+      b, nir_ior_imm(b, nir_ishl_imm(b, nir_channel(b, gid, 1), 1), 1));
+   nir_def *texel =
+      nir_tex(b, nir_vec2(b, u, v), .lod = nir_imm_float(b, 0.0),
+              .texture_index = 0, .sampler_index = 0,
+              .backend_flags = AGX_TEXTURE_FLAG_NO_CLAMP,
+              .dim = GLSL_SAMPLER_DIM_2D, .dest_type = nir_type_float32);
+
+   const enum pipe_format isa_format =
+      ail_pixel_format[PIPE_FORMAT_R8G8B8A8_UNORM].renderable;
+   nir_store_local_pixel_agx(b, texel, nir_imm_intN_t(b, 1, 16),
+                             nir_u2u16(b, lid), .base = 0, .write_mask = 0xf,
+                             .format = isa_format, .explicit_coord = true);
+   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP);
+
+   nir_push_if(b, nir_ball(b, nir_ieq_imm(b, lid, 0)));
+   {
+      nir_image_store_block_agx(b, nir_imm_int(b, 0), nir_imm_int(b, 0), gid,
+                                .format = isa_format,
+                                .image_dim = GLSL_SAMPLER_DIM_2D,
+                                .image_array = false, .explicit_coord = true);
+   }
+   nir_pop_if(b, NULL);
+   b->shader->info.cs.image_block_size_per_thread_agx =
+      util_format_get_blocksize(PIPE_FORMAT_R8G8B8A8_UNORM);
+
+   return pipe_shader_from_nir(pctx, b->shader);
+}
+
 /* Private 2D UNORM8x4 mip chains that the compute path below generates. Like
  * Borealis on images that are not attachments, keep chains whose top level
  * is below the size where a compressed level pays for its render-pass upload
@@ -1598,6 +1655,72 @@ struct agx_g17p_mip_level_plan {
    uint32_t src_w, src_h;
    uint32_t groups_x, groups_y;
 };
+
+static void
+agx_generate_mipmap_agx3_levels(struct agx_context *ctx,
+                                struct agx_batch **batchp,
+                                struct agx_resource *rsrc,
+                                unsigned start_level, unsigned last_level,
+                                unsigned first_layer, unsigned last_layer,
+                                bool has_2level);
+
+static bool
+agx_g17p_can_precompiled_tail(const struct agx_device *dev,
+                              struct agx_context *ctx,
+                              const struct agx_resource *rsrc,
+                              unsigned tail_start, unsigned last_level,
+                              uint64_t *out_meta_start, uint64_t *out_meta_end)
+{
+   *out_meta_start = 0;
+   *out_meta_end = 0;
+
+   if (!agx_chip_native_agx3(dev->chip))
+      return false;
+
+   if (!agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4) ||
+       !agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_ODD))
+      return false;
+
+   const struct ail_layout *layout = &rsrc->layout;
+   for (unsigned level = tail_start - 1; level <= last_level; ++level) {
+      const struct ail_tile tile = layout->tilesize_el[level];
+      struct agx_tile_address_config cfg;
+      if (!agx_tile_address_config_init(layout->stride_el[level],
+                                        tile.width_el, tile.height_el, &cfg))
+         return false;
+   }
+
+   unsigned last_comp = 0;
+   bool has_meta = false;
+   for (unsigned level = tail_start; level <= last_level; ++level) {
+      if (ail_is_level_logically_compressed(layout, level)) {
+         if (!ail_is_level_allocated_compressed(layout, level))
+            return false;
+         has_meta = true;
+         last_comp = level;
+      }
+   }
+
+   if (has_meta) {
+      if (!agx_get_precompiled(&ctx->bg_eot, LIBAGX_FILL_UINT4) ||
+          !ail_is_level_allocated_compressed(layout, tail_start))
+         return false;
+
+      const uint64_t meta_start = layout->level_offsets_compressed_B[tail_start];
+      const uint64_t meta_end =
+         (last_comp + 1 < layout->levels &&
+          ail_is_level_allocated_compressed(layout, last_comp + 1))
+            ? layout->level_offsets_compressed_B[last_comp + 1]
+            : layout->compression_layer_stride_B;
+      if ((meta_start & 15u) || (meta_end & 15u) || meta_end <= meta_start)
+         return false;
+
+      *out_meta_start = meta_start;
+      *out_meta_end = meta_end;
+   }
+
+   return true;
+}
 
 static bool
 agx_g17p_plan_mip_level(const struct agx_resource *rsrc, unsigned level,
@@ -1688,19 +1811,28 @@ agx_g17p_plan_mip_level(const struct agx_resource *rsrc, unsigned level,
 }
 
 static bool
-agx_generate_mipmap_compressed(struct pipe_context *pctx,
-                               struct agx_resource *rsrc,
-                               enum pipe_format format, unsigned base_level,
-                               unsigned last_level, unsigned first_layer,
-                               unsigned last_layer)
+agx_generate_mipmap_sampled(struct pipe_context *pctx,
+                            struct agx_resource *rsrc,
+                            enum pipe_format format, unsigned base_level,
+                            unsigned last_level, unsigned first_layer,
+                            unsigned last_layer)
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_device *dev = agx_device(pctx->screen);
    const struct pipe_resource *prsc = &rsrc->base.b;
    const struct ail_layout *layout = &rsrc->layout;
 
-   if (!agx_chip_gen9_color_compression(dev->chip) || !layout->compressed ||
-       layout->policy == AIL_LAYOUT_POLICY_M5 ||
+   /* The shader samples the source and stores Morton-ordered texels directly.
+    * Only the Gen9 compressed layout has a metadata writer here. Gen10 plain
+    * tiles need no metadata and use the same address calculation.
+    */
+   const bool supported_layout =
+      layout->compressed ? agx_chip_gen9_color_compression(dev->chip) &&
+                           layout->policy != AIL_LAYOUT_POLICY_M5
+                         : agx_chip_descriptor_generation(dev->chip) ==
+                              AGX_DESCRIPTOR_GENERATION_10;
+   if (!supported_layout || prsc->width0 > UINT16_MAX + 1u ||
+       prsc->height0 > UINT16_MAX + 1u ||
        prsc->target != PIPE_TEXTURE_2D || prsc->nr_samples > 1 ||
        layout->sample_count_sa != 1 || layout->tiling != AIL_TILING_GPU ||
        layout->format != format || !agx_agx3_mipmap_format_supported(format) ||
@@ -1709,11 +1841,92 @@ agx_generate_mipmap_compressed(struct pipe_context *pctx,
        last_level - base_level > PIPE_MAX_TEXTURE_LEVELS)
       return false;
 
-   /* Plan every level before recording anything: an unsupported level makes
-    * the whole request fall back to util_gen_mipmap(). */
+   /* Large levels amortize a render pass and benefit from the PBE storing
+    * compressed tiles for the next level. On HAL200/AGX3B, exact 2x2
+    * compressed levels use the compressed compute block-mip path instead,
+    * keeping all levels compressed in one compute batch without render-pass
+    * or cross-queue handoff overhead. */
+   const unsigned first_src = base_level;
+   const bool block_mip_supported =
+      layout->compressed && hk_g17p_block_mip_supported(dev->chip);
+   while ((prsc->bind & PIPE_BIND_RENDER_TARGET) && base_level < last_level) {
+      const unsigned w = u_minify(prsc->width0, base_level);
+      const unsigned h = u_minify(prsc->height0, base_level);
+      if ((w | h) & 1 ||
+          !(block_mip_supported
+               ? hk_compressed_mip_level_through_pbe(dev->chip, w, h, w / 2,
+                                                     h / 2)
+               : hk_mip_level_through_pbe(dev->chip, w / 2, h / 2)) ||
+          !agx_level_renderable(ctx, &rsrc->base.b, format, base_level + 1, 0))
+         break;
+      ++base_level;
+   }
+
+   /* Leading exact 2x2 compressed levels stay compressed via the compute
+    * block-mip shader; the first remaining level (if any) decodes the last
+    * compressed level into raw GPU-tiled storage for the precompiled tail. */
+   unsigned block_last = base_level;
+   if (block_mip_supported) {
+      while (block_last < last_level) {
+         const unsigned level = block_last + 1;
+         const unsigned sw = u_minify(prsc->width0, level - 1);
+         const unsigned sh = u_minify(prsc->height0, level - 1);
+         const unsigned dw = u_minify(prsc->width0, level);
+         const unsigned dh = u_minify(prsc->height0, level);
+         if (sw != dw * 2u || sh != dh * 2u ||
+             !ail_is_level_logically_compressed(layout, level))
+            break;
+         block_last = level;
+      }
+   }
+
+   if (block_last > base_level) {
+      if (!ctx->compute_blitter.g17p_block_mip_cs) {
+         ctx->compute_blitter.g17p_block_mip_cs =
+            agx_g17p_block_mip_compute_shader(pctx);
+         if (!ctx->compute_blitter.g17p_block_mip_cs)
+            return false;
+      }
+      if (!ctx->compute_blitter.g17p_block_mip_sampler) {
+         struct pipe_sampler_state sampler_state = {
+            .wrap_s = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_t = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE,
+            .min_img_filter = PIPE_TEX_FILTER_LINEAR,
+            .mag_img_filter = PIPE_TEX_FILTER_LINEAR,
+            .min_mip_filter = PIPE_TEX_MIPFILTER_NEAREST,
+            .compare_func = PIPE_FUNC_ALWAYS,
+            .seamless_cube_map = true,
+            .unnormalized_coords = true,
+         };
+         ctx->compute_blitter.g17p_block_mip_sampler =
+            pctx->create_sampler_state(pctx, &sampler_state);
+         if (!ctx->compute_blitter.g17p_block_mip_sampler)
+            return false;
+      }
+   }
+
+   const unsigned sampled_start = block_last + 1;
+
+   /* Level sampled_start - 1 may hold compressed tiles and is decoded through
+    * the sampled compute shader into raw GPU-tiled level sampled_start. Every
+    * subsequent level reads that uncompressed level and can run directly via
+    * precompiled libagx_mipmap_unorm8x4{,_2level,_odd} (plus one contiguous
+    * libagx_fill_uint4 to mark remaining compressed metadata tiles
+    * uncompressed), avoiding per-level sampler-view and launch_grid overhead. */
+   uint64_t meta_start = 0, meta_end = 0;
+   const bool precompiled_tail =
+      sampled_start < last_level &&
+      agx_g17p_can_precompiled_tail(dev, ctx, rsrc, sampled_start + 1,
+                                    last_level, &meta_start, &meta_end);
+   const unsigned sampled_last =
+      precompiled_tail ? sampled_start : last_level;
+
+   /* Plan every sampled level before recording anything: an unsupported level
+    * makes the whole request fall back to util_gen_mipmap(). */
    struct agx_g17p_mip_level_plan plans[PIPE_MAX_TEXTURE_LEVELS];
-   for (unsigned level = base_level + 1; level <= last_level; ++level) {
-      struct agx_g17p_mip_level_plan *plan = &plans[level - base_level - 1];
+   for (unsigned level = sampled_start; level <= sampled_last; ++level) {
+      struct agx_g17p_mip_level_plan *plan = &plans[level - sampled_start];
       if (!agx_g17p_plan_mip_level(rsrc, level, plan))
          return false;
 
@@ -1725,6 +1938,14 @@ agx_generate_mipmap_compressed(struct pipe_context *pctx,
       }
    }
 
+   if (base_level > first_src) {
+      if (!util_gen_mipmap(pctx, &rsrc->base.b, format, first_src, base_level,
+                           first_layer, last_layer, PIPE_TEX_FILTER_LINEAR))
+         return false;
+      if (base_level == last_level)
+         return true;
+   }
+
    asahi_compute_save(ctx);
 
    /* glGenerateMipmap runs no application compute shader. */
@@ -1732,14 +1953,74 @@ agx_generate_mipmap_compressed(struct pipe_context *pctx,
       ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS];
    ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = NULL;
 
-   for (unsigned level = base_level + 1; level <= last_level; ++level) {
-      struct agx_g17p_mip_level_plan *plan = &plans[level - base_level - 1];
-
-      /* The compute batch launch_grid() records into, which a full encoder
-       * may have replaced since the previous level. */
-      struct agx_batch *batch = agx_get_compute_batch(ctx);
-      agx_batch_init_state(batch);
+   struct agx_batch *batch = agx_get_compute_batch(ctx);
+   agx_batch_init_state(batch);
+   for (unsigned level = base_level + 1; level <= last_level; ++level)
       agx_batch_writes(batch, rsrc, level);
+
+   void *bound_cs = NULL;
+   if (block_last > base_level) {
+      pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, 1,
+                                &ctx->compute_blitter.g17p_block_mip_sampler);
+      pctx->bind_compute_state(pctx, ctx->compute_blitter.g17p_block_mip_cs);
+      bound_cs = ctx->compute_blitter.g17p_block_mip_cs;
+
+      for (unsigned level = base_level + 1; level <= block_last; ++level) {
+         if (unlikely(ctx->batch != batch)) {
+            batch = agx_get_compute_batch(ctx);
+            agx_batch_init_state(batch);
+            for (unsigned l = level; l <= last_level; ++l)
+               agx_batch_writes(batch, rsrc, l);
+         }
+
+         struct pipe_sampler_view templ;
+         u_sampler_view_default_template(&templ, &rsrc->base.b,
+                                         PIPE_FORMAT_R8G8B8A8_UNORM);
+         templ.target = PIPE_TEXTURE_2D;
+         templ.u.tex.first_level = level - 1;
+         templ.u.tex.last_level = level - 1;
+         templ.u.tex.first_layer = 0;
+         templ.u.tex.last_layer = 0;
+         struct pipe_sampler_view *view =
+            pctx->create_sampler_view(pctx, &rsrc->base.b, &templ);
+         pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &view);
+         pctx->sampler_view_release(pctx, view);
+
+         struct pipe_image_view image = {
+            .resource = &rsrc->base.b,
+            .access = PIPE_IMAGE_ACCESS_WRITE | PIPE_IMAGE_ACCESS_DRIVER_INTERNAL,
+            .shader_access = PIPE_IMAGE_ACCESS_WRITE,
+            .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+            .u.tex.level = level,
+            .u.tex.first_layer = 0,
+            .u.tex.last_layer = 0,
+            .u.tex.single_layer_view = true,
+         };
+         pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &image);
+
+         const uint32_t width = u_minify(prsc->width0, level);
+         const uint32_t height = u_minify(prsc->height0, level);
+         const struct pipe_grid_info grid = {
+            .block = {AGX_G17P_BLOCK_MIP_TILE, AGX_G17P_BLOCK_MIP_TILE, 1},
+            .grid = {DIV_ROUND_UP(width, AGX_G17P_BLOCK_MIP_TILE),
+                     DIV_ROUND_UP(height, AGX_G17P_BLOCK_MIP_TILE), 1},
+         };
+         pctx->launch_grid(pctx, &grid);
+      }
+
+      pctx->set_shader_images(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+   }
+
+   for (unsigned level = sampled_start; level <= sampled_last; ++level) {
+      struct agx_g17p_mip_level_plan *plan = &plans[level - sampled_start];
+
+      /* Re-acquire only if a full encoder replaced the compute batch. */
+      if (unlikely(ctx->batch != batch)) {
+         batch = agx_get_compute_batch(ctx);
+         agx_batch_init_state(batch);
+         for (unsigned l = level; l <= last_level; ++l)
+            agx_batch_writes(batch, rsrc, l);
+      }
 
       if (plan->key & AGX_G17P_MIP_ODD) {
          const uint32_t width = plan->params.width;
@@ -1777,8 +2058,11 @@ agx_generate_mipmap_compressed(struct pipe_context *pctx,
       pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 1, 0, &view);
       pctx->sampler_view_release(pctx, view);
 
-      pctx->bind_compute_state(pctx,
-                               ctx->compute_blitter.g17p_mip_cs[plan->key]);
+      void *cs = ctx->compute_blitter.g17p_mip_cs[plan->key];
+      if (cs != bound_cs) {
+         pctx->bind_compute_state(pctx, cs);
+         bound_cs = cs;
+      }
 
       const struct pipe_grid_info grid = {
          .block = {AGX_G17P_MIP_WG_SIZE, AGX_G17P_MIP_WG_SIZE, 1},
@@ -1787,55 +2071,58 @@ agx_generate_mipmap_compressed(struct pipe_context *pctx,
       pctx->launch_grid(pctx, &grid);
    }
 
+   if (precompiled_tail) {
+      if (unlikely(ctx->batch != batch)) {
+         batch = agx_get_compute_batch(ctx);
+         agx_batch_init_state(batch);
+         agx_batch_reads(batch, rsrc);
+         for (unsigned l = sampled_start + 1; l <= last_level; ++l)
+            agx_batch_writes(batch, rsrc, l);
+      }
+
+      if (meta_end > meta_start) {
+         agx_agx3_mipmap_ensure_cdm_space(ctx, &batch, rsrc, sampled_start + 1,
+                                          last_level);
+         const uint32_t mode =
+            (uint32_t)ail_tile_mode_uncompressed(layout->format);
+         const uint64_t meta_addr =
+            agx_map_gpu(rsrc) + layout->metadata_offset_B + meta_start;
+         libagx_fill_uint4(batch, agx_2d((meta_end - meta_start) / 16u, 1),
+                           AGX_BARRIER_NONE, meta_addr, 0, mode, mode, mode,
+                           mode);
+      }
+
+      const bool has_2level =
+         agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_2LEVEL) !=
+         NULL;
+      agx_generate_mipmap_agx3_levels(ctx, &batch, rsrc, sampled_start + 1,
+                                      last_level, 0, 0, has_2level);
+   }
+
    ctx->pipeline_statistics[PIPE_STAT_QUERY_CS_INVOCATIONS] = cs_invocations;
    pctx->set_constant_buffer(pctx, MESA_SHADER_COMPUTE, 0, NULL);
    pctx->set_sampler_views(pctx, MESA_SHADER_COMPUTE, 0, 0, 1, NULL);
+   if (!ctx->compute_blitter.saved_num_sampler_states &&
+       block_last > base_level)
+      pctx->bind_sampler_states(pctx, MESA_SHADER_COMPUTE, 0, 0, NULL);
    asahi_compute_restore(ctx);
    return true;
 }
 
-/* Native AGX3 compute mipchain generation for uncompressed GPU-tiled UNORM8x4
- * 2D / 2D_ARRAY / CUBE textures. Runs all levels in one CDM compute batch via
- * libagx_mipmap_unorm8x4 / libagx_mipmap_unorm8x4_2level /
- * libagx_mipmap_unorm8x4_odd (matching Borealis's hk_g17p_compute_blit()),
- * avoiding one 3D render pass per mip level. Unsupported formats or layouts
- * return false and fall back to util_gen_mipmap(). */
-static bool
-agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
-                         enum pipe_format format, unsigned base_level,
-                         unsigned last_level, unsigned first_layer,
-                         unsigned last_layer)
+static void
+agx_generate_mipmap_agx3_levels(struct agx_context *ctx,
+                                struct agx_batch **batchp,
+                                struct agx_resource *rsrc,
+                                unsigned start_level, unsigned last_level,
+                                unsigned first_layer, unsigned last_layer,
+                                bool has_2level)
 {
-   struct agx_context *ctx = agx_context(pctx);
-   struct agx_device *dev = agx_device(pctx->screen);
-   struct agx_resource *rsrc = agx_resource(prsc);
-
-   if (rsrc->layout.compressed)
-      return agx_generate_mipmap_compressed(pctx, rsrc, format, base_level,
-                                            last_level, first_layer,
-                                            last_layer);
-
-   if (!agx_generate_mipmap_agx3_supported(dev, rsrc, format, base_level,
-                                           last_level, first_layer, last_layer))
-      return false;
-
-   if (!agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4) ||
-       !agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_ODD))
-      return false;
-
-   const bool has_2level =
-      agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_2LEVEL) != NULL;
-
-   struct agx_batch *batch = agx_get_compute_batch(ctx);
-   agx_batch_init_state(batch);
-   agx_batch_reads(batch, rsrc);
-   for (unsigned level = base_level + 1; level <= last_level; ++level)
-      agx_batch_writes(batch, rsrc, level);
-
+   struct agx_batch *batch = *batchp;
+   const struct pipe_resource *prsc = &rsrc->base.b;
    const struct ail_layout *layout = &rsrc->layout;
    const uint64_t base_addr = agx_map_gpu(rsrc);
 
-   for (unsigned level = base_level + 1; level <= last_level;) {
+   for (unsigned level = start_level; level <= last_level;) {
       const uint32_t src_w = u_minify(prsc->width0, level - 1);
       const uint32_t src_h = u_minify(prsc->height0, level - 1);
       const uint32_t dst_w = u_minify(prsc->width0, level);
@@ -1971,6 +2258,45 @@ agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
       ++level;
    }
 
+   *batchp = batch;
+}
+
+/* Native AGX3 compute mipchain generation for uncompressed GPU-tiled UNORM8x4
+ * 2D / 2D_ARRAY / CUBE textures. Runs all levels in one CDM compute batch via
+ * libagx_mipmap_unorm8x4 / libagx_mipmap_unorm8x4_2level /
+ * libagx_mipmap_unorm8x4_odd (matching Borealis's hk_g17p_compute_blit()),
+ * avoiding one 3D render pass per mip level. Unsupported formats or layouts
+ * return false and fall back to util_gen_mipmap(). */
+static bool
+agx_generate_mipmap_agx3(struct pipe_context *pctx, struct pipe_resource *prsc,
+                         enum pipe_format format, unsigned base_level,
+                         unsigned last_level, unsigned first_layer,
+                         unsigned last_layer)
+{
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
+   struct agx_resource *rsrc = agx_resource(prsc);
+
+   if (!agx_generate_mipmap_agx3_supported(dev, rsrc, format, base_level,
+                                           last_level, first_layer, last_layer))
+      return false;
+
+   if (!agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4) ||
+       !agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_ODD))
+      return false;
+
+   const bool has_2level =
+      agx_get_precompiled(&ctx->bg_eot, LIBAGX_MIPMAP_UNORM8X4_2LEVEL) != NULL;
+
+   struct agx_batch *batch = agx_get_compute_batch(ctx);
+   agx_batch_init_state(batch);
+   agx_batch_reads(batch, rsrc);
+   for (unsigned level = base_level + 1; level <= last_level; ++level)
+      agx_batch_writes(batch, rsrc, level);
+
+   agx_generate_mipmap_agx3_levels(ctx, &batch, rsrc, base_level + 1,
+                                   last_level, first_layer, last_layer,
+                                   has_2level);
    return true;
 }
 
@@ -1987,6 +2313,10 @@ agx_generate_mipmap(struct pipe_context *pctx, struct pipe_resource *prsc,
                     unsigned last_layer)
 {
    const enum agx_chip chip = agx_device(pctx->screen)->chip;
+   if (agx_generate_mipmap_sampled(pctx, agx_resource(prsc), format, base_level,
+                                   last_level, first_layer, last_layer))
+      return true;
+
    const bool native =
       agx_chip_g17_m5(chip)
          ? agx_generate_mipmap_g17g(pctx, prsc, format, base_level,

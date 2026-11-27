@@ -423,6 +423,10 @@ typedef struct {
    /* Invert icond/fcond */
    bool invert_cond : 1;
 
+   /* if_*cmp/else_*cmp of a NIR if whose condition is the same for every lane
+    * of the subgroup. */
+   bool uniform_cond : 1;
+
    /*
     * G17P carries a texture coordinate offset as an immediate field in the
     * sample instruction (f43), while the depth comparator is a staged
@@ -661,6 +665,11 @@ typedef struct {
    /* Mask of pixel fences we've definitely already waited for. */
    uint16_t already_pixel_waited;
 
+   /* Tile stores a multisample reload background has left before it releases
+    * the colour class (agx_background_holds_colour); -1 once it is known not
+    * to hold it. */
+   int background_stores_left;
+
    /* G17P depth/stencil writes not yet emitted. Every sample's write shares
     * one class-1 transaction, released after the last. */
    unsigned zs_writes_left;
@@ -729,8 +738,10 @@ typedef struct {
    /* M5 CEM owns halves 8..15, beyond CF/shuffle/parallel-copy scratch. */
    bool agx3_cem_low_scratch;
 
-   /* The remat-only spiller had to spill a value to scratch; register
-    * allocation must finish with real spilling under the full budget. */
+   /* A remat-only spill pass left a value in memory. The remat-only spiller
+    * keeps every value it cannot rematerialize in a register, so this is a
+    * backstop for memory values that other paths create; when set, register
+    * allocation finishes with real spilling under the full budget. */
    bool remat_fallback_spilled;
    unsigned spill_pcopy_base;
 
@@ -807,7 +818,7 @@ typedef struct {
    /* Halves taken off the spill budget after a failed allocation, so the
     * live-range shuffle gets free room (agx_compile_function_nir retries). */
    unsigned ra_budget_cut;
-   /* Set by agx_ra_impl() while it assigns registers: a failed allocation
+   /* Set by agx_ra() while it assigns registers: a failed allocation
     * that has no legal region left at all leaves RA through it (a
     * jmp_buf *), see find_best_region_to_evict(). */
    void *ra_abort;
@@ -1115,14 +1126,16 @@ enum agx_cursor_option {
 /* The stages whose AGX3 samples take an explicit level the vertex way: the
  * packer's vertex_explicit_lod (agx3_pack_binary.c), which also lets an array
  * comparison keep an immediate level (agx_optimizer_inline_imm). A G17P mesh
- * program is VDM-launched like a vertex program. */
+ * program and M5 mesh/task programs are VDM-launched like vertex programs. */
 static inline bool
 agx3_vertex_explicit_lod_stage(mesa_shader_stage stage,
                                enum agx_isa_encoding enc)
 {
    return stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_GEOMETRY ||
           stage == MESA_SHADER_TESS_CTRL || stage == MESA_SHADER_TESS_EVAL ||
-          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH);
+          (enc == AGX_ISA_ENCODING_AGX3B && stage == MESA_SHADER_MESH) ||
+          (enc == AGX_ISA_ENCODING_AGX3C &&
+           (stage == MESA_SHADER_MESH || stage == MESA_SHADER_TASK));
 }
 
 typedef struct {
@@ -1312,6 +1325,8 @@ void agx_print_instr(const agx_instr *I, FILE *fp);
 void agx_print_block(const agx_block *block, FILE *fp);
 void agx_print_shader(const agx_context *ctx, FILE *fp);
 void agx_optimizer_forward(agx_context *ctx);
+void agx_opt_sink_cold_cmp(agx_context *ctx);
+void agx_opt_pack_bool_or_branch(agx_context *ctx);
 bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
                               agx_index x, agx_index y, bool *result);
 void agx_optimizer_backward(agx_context *ctx);
@@ -1326,13 +1341,17 @@ bool agx3_lower_scalar_cube_coordinates(agx_context *ctx);
 bool agx3_split_texture_coordinates(agx_context *ctx);
 bool agx3_reserve_cube_scratch(agx_context *ctx);
 void agx_lower_uniform_sources(agx_context *ctx);
+void agx3_lower_m5_live_scalar_lods(agx_context *ctx);
 void agx_lower_agx3_fma_sources(agx_context *ctx);
 void agx_lower_agx3_immediates(agx_context *ctx);
-void agx_materialize_agx3_cf_constants(agx_context *ctx);
+bool agx_lower_agx3_cf_constants(agx_context *ctx);
 void agx_opt_cse(agx_context *ctx);
 bool agx_opt_collect_split(agx_context *ctx);
 void agx_opt_cse_pressure(agx_context *ctx);
 bool agx_opt_licm(agx_context *ctx, unsigned max_demand, unsigned file_regs);
+unsigned agx_licm_demand_bound(agx_context *ctx, unsigned demand,
+                               unsigned max_possible_regs);
+bool agx_opt_sink_immediates(agx_context *ctx);
 void agx_opt_cse_bounded(agx_context *ctx);
 bool agx_can_rematerialize_uniform(const agx_context *ctx, const agx_instr *I);
 bool agx_has_uniform_store(const agx_context *ctx);
@@ -1343,6 +1362,7 @@ void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
 int agx_ilp_m5_device_load_cap(int program_peak);
+unsigned agx3_register_budget(agx_context *ctx);
 bool agx3_lower_uniform_program(agx_context *ctx);
 /* Success/refusal, not a progress flag. Call only for AGX3B preambles. */
 bool agx3_lower_cprog_inputs(agx_context *ctx);
@@ -1410,11 +1430,10 @@ agx_reserved_registers(const agx_context *ctx)
 }
 
 void agx_spill(agx_context *ctx, unsigned k, bool remat_only);
-bool agx_fold_m5_spill_constant_phis(agx_context *ctx);
+bool agx_fold_agx3_spill_constant_phis(agx_context *ctx);
 void agx_repair_ssa(agx_context *ctx);
 void agx_reindex_ssa(agx_context *ctx);
 void agx_ra(agx_context *ctx);
-void agx_ra_without_remat(agx_context *ctx);
 bool agx_ra_find_regs_simple(const BITSET_WORD *used, unsigned count,
                              unsigned align, unsigned minimum, unsigned limit,
                              unsigned *out);
@@ -1423,6 +1442,7 @@ unsigned agx_calc_register_demand(agx_context *ctx, bool remat);
 unsigned agx3_tile_store_bank(agx_context *ctx);
 
 void agx_lower_64bit_postra(agx_context *ctx);
+bool agx_lower_agx3_widening_int(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);
@@ -1490,7 +1510,7 @@ agx_validate_ra(UNUSED agx_context *ctx)
 #endif
 
 enum agx_size agx_split_width(const agx_instr *I);
-bool agx_allows_16bit_immediate(agx_instr *I);
+bool agx_allows_16bit_immediate(agx_instr *I, enum agx_isa_encoding enc);
 unsigned agx_negate_src_index(agx_instr *I);
 
 static inline bool
@@ -1642,6 +1662,7 @@ bool agx_nir_opt_preamble(nir_shader *s, unsigned *sizes, bool g17p,
                           bool agx3c,
                           const nir_opt_peephole_select_options *flatten);
 bool agx_nir_export_select_flags_as_halves(nir_shader *s, bool branches);
+bool agx_nir_cancel_preamble_fneg(nir_shader *s, unsigned reserved);
 bool agx_nir_remove_unused_preamble_exports(nir_shader *s, unsigned reserved);
 bool agx_nir_coalesce_preamble_half_exports(nir_shader *s, unsigned reserved,
                                           unsigned allocated);
@@ -1665,6 +1686,7 @@ void agx_lower_agx3_half_converts(agx_context *ctx);
 void agx_opt_agx3_normflt_byte_pairs(agx_context *ctx);
 void agx_materialize_agx3_alu_constants(agx_context *ctx);
 void agx_lower_agx3_mixed_width_unary(agx_context *ctx);
+void agx_lower_m5_alu_operands(agx_context *ctx);
 bool agx_lower_g17g_retry_float_operands(agx_context *ctx);
 
 struct agx_cycle_estimate {
