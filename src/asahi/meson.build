@@ -59,9 +59,10 @@ endif
 if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # Shader-object binaries: an exported binary imports and exports again
   # unchanged; one whose root prefix or root metadata was edited and resealed
-  # is refused. M5 and G17P binaries carry the trimmed root prefix.
+  # is refused. All tested chips carry the trimmed root prefix.
   foreach chip : [['g17s', ['--expect-root-size']],
-                  ['g17p', ['--expect-root-size']], ['g13g', []]]
+                  ['g17p', ['--expect-root-size']],
+                  ['g13g', ['--expect-root-size']]]
     test(
       'hk-' + chip[0] + '-shader-binary-root',
       prog_python,
