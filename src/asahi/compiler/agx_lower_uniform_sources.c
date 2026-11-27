@@ -132,13 +132,18 @@ agx_instr_accepts_uniform(enum agx_isa_encoding encoding, enum agx_opcode op,
       return src_index == (op == AGX_OPCODE_LOCAL_LOAD ? 0 : 1);
    case AGX_OPCODE_IMAGE_WRITE:
       return src_index == 3;
+   case AGX_OPCODE_BLOCK_IMAGE_STORE:
+      /* AGX3B compute block stores read their PBE heap from a uniform, as
+       * image writes do. */
+      if (encoding == AGX_ISA_ENCODING_AGX3B)
+         return src_index == 0 && is_64 && memory_base;
+      return false;
    case AGX_OPCODE_ST_VARY:
       /* G17P's vertex output store reads a 16-bit index from the uniform
        * file (agx3_vary_uvsw_uniform_index), as an unlinked vertex shader's
        * per-draw output indices are. */
       return encoding == AGX_ISA_ENCODING_AGX3B && src_index == 0 &&
              size == AGX_SIZE_16;
-   case AGX_OPCODE_BLOCK_IMAGE_STORE:
    case AGX_OPCODE_ZS_EMIT:
    case AGX_OPCODE_ZS_EMIT_AGX3:
    case AGX_OPCODE_ST_TILE:
@@ -409,20 +414,21 @@ agx3_fold_m5_constant_lods(agx_context *ctx)
    free(defs);
 }
 
-static void
+void
 agx3_lower_m5_live_scalar_lods(agx_context *ctx)
 {
    /* G18G samples through j873's G17G-family sampler
     * (agx3_emit_texture_sample_g17g), which takes a per-lane level or bias
     * only as the 16-bit scalar itself, not as a packed word.
     */
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
        agx_is_g18g(&ctx->key->dev))
       return;
 
    bool needed = false;
    agx_foreach_instr_global(ctx, I) {
-      needed |= I->op == AGX_OPCODE_TEXTURE_SAMPLE && I->nr_srcs == 6 &&
+      needed |= I->op == AGX_OPCODE_TEXTURE_SAMPLE &&
+                (I->nr_srcs == 6 || I->agx3_split_coords) &&
                 !I->memory_is_packed &&
                 (I->dim == AGX_DIM_2D || I->dim == AGX_DIM_3D) &&
                 (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
@@ -432,6 +438,12 @@ agx3_lower_m5_live_scalar_lods(agx_context *ctx)
    }
    if (!needed)
       return;
+
+   /* A single static use inside a uniform loop whose LOD is defined outside
+    * the loop is still live across the back-edge, so agx_opt_register_cache()
+    * cannot mark it discard. Compute SSA liveness so only a killed single-use
+    * scalar in uniform control flow retains the direct unpacked path. */
+   agx_compute_liveness(ctx);
 
    const unsigned alloc = ctx->alloc;
    unsigned *uses = calloc(alloc, sizeof(*uses));
@@ -443,7 +455,8 @@ agx3_lower_m5_live_scalar_lods(agx_context *ctx)
    agx_index *packed = NULL;
    agx_block **owner = NULL;
    agx_foreach_instr_global_safe(ctx, I) {
-      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE || I->nr_srcs != 6 ||
+      if (I->op != AGX_OPCODE_TEXTURE_SAMPLE ||
+          (I->nr_srcs != 6 && !I->agx3_split_coords) ||
           I->memory_is_packed ||
           (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_3D) ||
           (I->lod_mode != AGX_LOD_MODE_LOD_MIN &&
@@ -453,7 +466,8 @@ agx3_lower_m5_live_scalar_lods(agx_context *ctx)
       const agx_index lod = I->src[1];
       if (lod.type != AGX_INDEX_NORMAL || lod.size != AGX_SIZE_16 ||
           agx_channels(lod) != 1 ||
-          (!v_block->cf_divergent && uses[lod.value] == 1))
+          (!v_block->cf_divergent && !ctx->any_quad_divergent_shuffle &&
+           uses[lod.value] == 1 && lod.kill))
          continue;
 
       if (!owner) {

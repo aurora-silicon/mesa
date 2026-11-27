@@ -151,8 +151,8 @@ struct agx_shader_info {
    /* Number of uniforms */
    uint16_t push_count;
 
-   /* G17P load_preamble declarations after NIR optimization, in native
-    * half-register units. This is a publication contract, not a CProg TPS
+   /* G17P load_preamble declarations and bindless texture/sampler heap bases
+    * after NIR optimization, in native half-register units. This is a publication contract, not a CProg TPS
     * import layout. Consumers must also publish compiler rodata separately. */
    uint64_t agx3_uniform_halfs[AGX3_CPROG_INPUT_WORDS];
    bool agx3_uniform_halfs_valid;
@@ -214,6 +214,16 @@ struct agx_shader_info {
     * +agx3_preamble_out_size_halfs). The driver may execute @preamble once as a
     * 1-thread compute shader and bind the output buffer as a vertex uniform
     * range instead of re-running the per-draw vertex constant program. */
+   /* Post-DMA root-uniform liveness for AGX3 shaders compiled with
+    * g17p_uniform_dma: distinguishes whether the main shader and/or its
+    * @preamble still load the 64-bit root pointer uniform at g17p_dma_root.
+    * When false, uniform DMA and/or preamble hoisting retired every root load
+    * so the driver can omit the dead root-pointer range (when set_count == 0
+    * and no prolog reads the root). */
+   bool agx3_root_uniform_usage_valid;
+   bool agx3_main_uses_root_uniform;
+   bool agx3_preamble_uses_root_uniform;
+
    bool agx3_preamble_hoistable;
    uint16_t agx3_preamble_in_base_half;
    uint16_t agx3_preamble_in_size_halfs;
@@ -397,6 +407,10 @@ agx_compact_kernel_info(struct agx_shader_info *info)
 {
    assert(info->has_preamble == (info->nr_preamble_gprs > 0));
    assert(info->texture_state_count <= 8 && "static maximum, no need to plumb");
+   assert(info->scratch_size <= UINT16_MAX &&
+          "precompiled kernel scratch_size overflows uint16_t");
+   assert(info->agx3_spectpr_scratch_size <= UINT16_MAX &&
+          "precompiled kernel agx3_spectpr_scratch_size overflows uint16_t");
 
    return (struct agx_precompiled_kernel_info){
       .preamble_offset = info->preamble_offset,
@@ -497,17 +511,7 @@ struct agx_device_key {
     * the instruction encoding, notably formatted PBE store inputs. */
    enum agx_chip chip;
 
-   /*
-    * Binary encoding of the instruction set to emit.
-    *
-    * Every part this compiler supports is AGX2, so the packer accepts only
-    * that and asserts on anything else. Carrying it explicitly is what makes
-    * a future AGX3 table a dispatch rather than a rewrite, and it means a
-    * caller that reaches the compiler with an unsupported part is caught in
-    * the compiler instead of producing an instruction stream for the wrong
-    * hardware. See agx_chip.h for why the encoding, rather than the chip, is
-    * the thing that decides.
-    */
+   /* Encoding used by the instruction packer, before any transcoding. */
    enum agx_isa_encoding encoding;
 
    /* Does the target GPU need explicit cluster coherency for atomics?
@@ -532,6 +536,17 @@ struct agx_device_key {
     */
    bool emit_agx3d;
 };
+
+/* AGX3D uses the AGX3C packer and transcodes its output. Resolve the
+ * physical target once for both runtime and precompiled shaders. */
+static inline void
+agx_device_key_set_target(struct agx_device_key *dev, enum agx_chip chip)
+{
+   const enum agx_isa_encoding encoding = agx_chip_isa_encoding(chip);
+   dev->emit_agx3d = encoding == AGX_ISA_ENCODING_AGX3D;
+   dev->chip = dev->emit_agx3d ? AGX_CHIP_G17G : chip;
+   dev->encoding = dev->emit_agx3d ? AGX_ISA_ENCODING_AGX3C : encoding;
+}
 
 /*
  * Is this a compile for the M6 GPU (G18G)? G18G compiles with the G17G key
@@ -630,6 +645,8 @@ struct agx_shader_key {
     * g17p_dma_static_set_mask. !g17p_uniform_dma leaves code unchanged. */
    bool g17p_uniform_dma;
    uint16_t g17p_dma_root;
+   /* Guaranteed resident prefix at g17p_dma_root for speculative VS loads. */
+   uint16_t preamble_root_size_B;
    uint8_t g17p_dma_set_mask;
    uint8_t g17p_dma_static_set_mask;
    uint8_t g17p_dma_buffer_count;
@@ -757,6 +774,11 @@ extern "C" {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+/* Generic preprocessing with an explicit ISA encoding so frontends that keep
+ * the generic lowering mode (such as Gallium on AGX3B) still inherit AGX3B's
+ * early branch-preservation and conditional-load-sinking policy. */
+void agx_preprocess_nir_for_encoding(nir_shader *nir,
+                                     enum agx_isa_encoding encoding);
 void agx_preprocess_nir_g17p(nir_shader *nir);
 /* For any native AGX3 chip (agx_chip_native_agx3); passes validated on G17P
  * alone check chip. */
@@ -865,7 +887,6 @@ agx_round_registers(unsigned halfregs)
 }
 
 static const nir_shader_compiler_options agx_nir_options = {
-   .lower_fdiv = true,
    .float_mul_add16 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_flrp16 = true,

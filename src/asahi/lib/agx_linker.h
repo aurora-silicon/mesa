@@ -10,6 +10,7 @@
 #include "agx_compile.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_pack.h"
+#include "agx_tilebuffer.h"
 #include "nir_lower_blend.h"
 #include "util/macros.h"
 
@@ -112,6 +113,22 @@ void agx3_build_container_lead(uint8_t *image, enum agx_chip chip,
 void agx3_build_usc_base_page(uint8_t *image, size_t size, enum agx_chip chip,
                               unsigned cores_per_cluster,
                               unsigned num_clusters);
+
+/* Whether the coefficient bindings and code extents a part's info names fit
+ * its binding array and binary, as they do for every part the compiler
+ * builds. A part restored from storage that need not have come from the
+ * compiler, such as the disk cache, must pass before it is linked. */
+static inline bool
+agx_shader_part_info_valid(const struct agx_shader_info *info)
+{
+   return info->varyings.fs.nr_bindings <=
+             ARRAY_SIZE(info->varyings.fs.bindings) &&
+          info->main_offset <= info->binary_size &&
+          info->main_size <= info->binary_size - info->main_offset &&
+          (!info->has_preamble ||
+           (info->preamble_offset <= info->binary_size &&
+            info->preamble_size <= info->binary_size - info->preamble_offset));
+}
 
 /* `uvs_map` (agx_uvs_relocation_map()) places the varyings of a vertex
  * program with a relocatable UVS layout, which cannot link without it. */
@@ -479,6 +496,33 @@ agx_fs_epilog_clear_fill_mask(uint16_t clear_fill_rt)
          mask |= BITFIELD_BIT(rt);
    }
    return mask;
+}
+
+static inline struct agx_tilebuffer_layout
+agx_fs_epilog_tilebuffer_layout(const struct agx_fs_epilog_key *key)
+{
+   struct agx_tilebuffer_layout tib =
+      key->g18_native_mixed
+         ? agx_build_tilebuffer_layout_g18_mixed(key->rt_formats,
+                                                 ARRAY_SIZE(key->rt_formats))
+      : key->rt0_resident
+         ? agx_build_tilebuffer_layout_rt0_resident(
+              key->rt_formats, ARRAY_SIZE(key->rt_formats), key->nr_samples,
+              key->max_bytes_per_tile, key->max_samples_per_tile)
+         : key->native_imageblock
+              ? agx_build_tilebuffer_layout_resident(
+                   key->rt_formats, ARRAY_SIZE(key->rt_formats),
+                   key->nr_samples, true, key->max_sample_size_B,
+                   key->max_bytes_per_tile, key->max_samples_per_tile,
+                   key->resident_mask)
+              : agx_build_tilebuffer_layout_with_limits_resident(
+                   key->rt_formats, ARRAY_SIZE(key->rt_formats),
+                   key->nr_samples, true, key->max_sample_size_B,
+                   key->max_bytes_per_tile, key->max_samples_per_tile,
+                   key->resident_mask);
+   if (key->first_mask && !tib.resident_mask)
+      agx_tilebuffer_apply_first_mask(&tib, key->first_mask);
+   return tib;
 }
 
 /* Apply framebuffer rules which are properties of the hardware generation,

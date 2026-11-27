@@ -247,7 +247,7 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_maximal_reconvergence = true,
       .KHR_shader_non_semantic_info = true,
-      .KHR_shader_quad_control = true,
+      .KHR_shader_quad_control = agx_chip_has_shader_quad_control(dev->chip),
       .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_shader_subgroup_rotate = true,
@@ -272,9 +272,10 @@ hk_get_device_extensions(const struct agx_device *dev,
       .KHR_zero_initialize_workgroup_memory = true,
       .EXT_4444_formats = true,
       .EXT_attachment_feedback_loop_layout = true,
-      /* Qualified on G17P; the draw-time selection is shared with M5. */
+      /* Requires EXT_attachment_feedback_loop_layout plus the depth/stencil
+       * shader twin (hk_fbl_twin()) and draw-time selection (hk_select_fbl_fs()). */
       .EXT_attachment_feedback_loop_dynamic_state =
-         dev->chip == AGX_CHIP_G17P,
+         agx_chip_has_feedback_loop_dynamic_state(dev->chip),
       .EXT_blend_operation_advanced = true,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
@@ -285,10 +286,13 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
       /* Lowered in NIR (agx_nir_lower_clip_m1_1) via the shared root table on
-       * AGX2 and native AGX3; HAL300 PPP admission still rejects negative-one
-       * depth clip. */
-      .EXT_depth_clip_control = !agx_chip_hal300_path(dev->chip),
+       * AGX2, native AGX3, and AGX3C/HAL300 (M5: G17G/G17S/G17C); other HAL300
+       * encodings such as AGX3D (G18G) stay off until qualified. */
+      .EXT_depth_clip_control = agx_chip_has_depth_clip_control(dev->chip),
       .EXT_depth_clip_enable = true,
+      /* Descriptor buffers use AGX_CAP_DESCRIPTOR_BUFFER (agx_chip_caps.h):
+       * AGX2, native AGX3, and M5 are qualified; G18G still uses AGX2-biased
+       * sampler indices and record-time compute image lowering. */
       .EXT_descriptor_buffer =
          agx_chip_has_cap(dev->chip, AGX_CAP_DESCRIPTOR_BUFFER),
       .EXT_descriptor_indexing = true,
@@ -301,7 +305,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_host_import(dev),
-      .EXT_fragment_shader_interlock = agx_chip_native_agx3(dev->chip),
+      .EXT_fragment_shader_interlock =
+         !agx_chip_hal300_path(dev->chip) || agx_chip_g17_m5(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -342,7 +347,9 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_provoking_vertex = true,
       .EXT_queue_family_foreign = true,
       .EXT_robustness2 = true,
-      .EXT_sample_locations = true,
+      /* The G18G kernel admission only accepts standard MSAA sample
+       * positions; custom sample locations are rejected with ENOTSUPP. */
+      .EXT_sample_locations = dev->chip != AGX_CHIP_G18G,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
@@ -391,6 +398,8 @@ hk_get_device_features(
    const struct vk_device_extension_table *supported_extensions,
    struct vk_features *features)
 {
+   const bool sparse = agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_BINDING);
+
    *features = (struct vk_features){
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
@@ -451,9 +460,9 @@ hk_get_device_features(
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,
-      .shaderResourceResidency = true,
+      .shaderResourceResidency = sparse,
       .shaderResourceMinLod = true,
-      .sparseBinding = true,
+      .sparseBinding = sparse,
 
       /* We probably could advertise multisampled sparse but we don't have a use
        * case yet and it isn't trivial.
@@ -461,9 +470,9 @@ hk_get_device_features(
       .sparseResidency2Samples = false,
       .sparseResidency4Samples = false,
       .sparseResidency8Samples = false,
-      .sparseResidencyAliased = true,
-      .sparseResidencyImage2D = true,
-      .sparseResidencyBuffer = true,
+      .sparseResidencyAliased = sparse,
+      .sparseResidencyImage2D = sparse,
+      .sparseResidencyBuffer = sparse,
 
       /* The sparse binder and SSTT use the same slice layout for 3D images
        * as for 2D arrays (nonstandard, one-slice block shape). */
@@ -476,9 +485,11 @@ hk_get_device_features(
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
-      /* HAL200 interpolation is 32-bit, but the compiler performs matching
-       * type-correct widening at ST_VARY and narrowing after interpolation. */
-      .storageInputOutput16 = agx_chip_native_or_m5(dev->chip),
+      /* Interpolation uses 32-bit UVS slots; hk_nir_widen_16bit_varyings()
+       * and hk_widen_integer_io() perform matching type-correct widening on
+       * outputs and narrowing on inputs across AGX2, native AGX3, and M5. */
+      .storageInputOutput16 =
+         !agx_chip_hal300_path(dev->chip) || agx_chip_g17_m5(dev->chip),
       .multiview = true,
       /* ViewIndex is lowered into the layer output of the last
        * pre-rasterization stage and the draw is duplicated per view, so
@@ -653,7 +664,6 @@ hk_get_device_features(
 
       /* VK_KHR_maintenance9 */
       .maintenance9 = true,
-      .maintenance10 = true,
 
       /* VK_KHR_maintenance10 */
       .maintenance10 = true,
@@ -695,7 +705,7 @@ hk_get_device_features(
       .shaderMaximalReconvergence = true,
 
       /* VK_KHR_shader_quad_control */
-      .shaderQuadControl = true,
+      .shaderQuadControl = supported_extensions->KHR_shader_quad_control,
 
       /* VK_KHR_shader_subgroup_rotate */
       .shaderSubgroupRotate = true,
@@ -1043,31 +1053,6 @@ hk_get_device_features(
        * falls back to SwiftShader. */
       features->fragmentStoresAndAtomics = true;
       features->advancedBlendCoherentOperations = true;
-      /* Sparse binding and residency reuse the AGX2 architecture wholesale:
-       * per-page VM_BIND with unbound pages mapped to the scratch/zero page,
-       * a read-only shadow at +sparse_ro_offset, and a userspace sparse map
-       * that the G17P texture descriptor points at in Sparse mode. The kernel
-       * already accepts DRM_ASAHI_BIND_SINGLE_PAGE binds, and the G17P user VA
-       * window is split for the RO alias exactly as AGX2 is. Sparse texture
-       * updates flush the SSTT with a HAL200 CDM record, so other native
-       * chips do not advertise it. */
-      const bool sparse = dev->chip == AGX_CHIP_G17P;
-      features->shaderResourceResidency = sparse;
-      features->sparseBinding = sparse;
-      /* A memory range may back several sparse VAs, including several
-       * locations within one resource. The common binder preserves the BO
-       * offset for each mapping and its RO shadow; G17P's transactional
-       * VM_BIND path retains each mapping independently. Residency metadata
-       * is per resource VA, not per backing allocation. */
-      features->sparseResidencyAliased = sparse;
-      features->sparseResidencyImage2D = sparse;
-      /* The sparse binder and SSTT use the same slice layout for 3D images
-       * as for 2D arrays. Report the nonstandard, one-slice block shape rather
-       * than requiring the standard 3D block shape.
-       */
-      features->sparseResidencyImage3D =
-         agx_chip_has_cap(dev->chip, AGX_CAP_SPARSE_RESIDENCY_3D);
-      features->sparseResidencyBuffer = sparse;
       /* The common Honeykrisp lowering duplicates a draw per view, writes
        * ViewIndex through the draw root and routes it through the packed
        * layer/viewport UVS output.  G17P now also has exact array BG/EOT
@@ -1084,11 +1069,6 @@ hk_get_device_features(
        * layer/viewport UVS scalar.  The public bit is backed by the exact
        * two-instance/two-layer image qualification. */
       features->shaderOutputLayer = true;
-      /* G17P uses the common reconvergence and subgroup lowering with AGX3
-       * quad encodings. The execution modes also select helper-capable
-       * fragment entry and prevent merging triangles across derivative quads.
-       */
-      features->shaderQuadControl = dev->chip == AGX_CHIP_G17P;
    }
 
    /* Compute derivatives lower in NIR to quad swaps and explicit-gradient
@@ -1152,32 +1132,29 @@ hk_get_device_properties(const struct agx_device *dev,
 {
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->chip);
-   /* Native AGX3 (G15G/S/C, G16G, G17P) and every M5 part (G17G, G17S, G17C) view texel buffers
-    * through the 2D texture/PBE descriptor with the software alignment tail.
-    * G18G takes the legacy buffer-view path, which has no tail.
+   /* Both AGX2 and AGX3/M5/G18G view texel buffers through the 2D texture/PBE
+    * descriptor with a software alignment tail.
     */
-   const bool agx3_texel_buffer_tail = agx_chip_native_or_m5(dev->chip);
    const bool texel_buffer_single_texel_alignment =
-      hk_descriptor_generation_is_agx2(descriptor_generation) || agx3_texel_buffer_tail;
+      hk_descriptor_generation_is_agx2(descriptor_generation) ||
+      agx_chip_agx3_path(dev->chip);
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
     * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
    const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
 
    /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
-      dev->chip == AGX_CHIP_G18G
-         ? VK_SAMPLE_COUNT_1_BIT
-         : (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
-            VK_SAMPLE_COUNT_4_BIT |
-            (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0));
+      VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT |
+      (agx_chip_g17_m5(dev->chip) ? VK_SAMPLE_COUNT_8_BIT : 0);
 
    /* Integer colour attachments and sampled multisample images use the same
     * native tile store/reload and texel-fetch paths as other colour formats.
     * Storage-image multisampling is an independent capability: keep its
-    * G17P restriction until that image descriptor path is qualified.
+    * G17P/G18G restriction until that image descriptor path is qualified.
     */
    const VkSampleCountFlagBits storage_sample_counts =
-      agx_chip_native_agx3(dev->chip) ? VK_SAMPLE_COUNT_1_BIT : sample_counts;
+      agx_chip_native_or_g18g(dev->chip) ? VK_SAMPLE_COUNT_1_BIT
+                                         : sample_counts;
 
    uint64_t os_page_size = 16384;
    os_get_page_size(&os_page_size);
@@ -1223,14 +1200,14 @@ hk_get_device_properties(const struct agx_device *dev,
           agx_chip_g17_m5(dev->chip)) ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      /* The native AGX3 and M5 texture/PBE includes the software alignment
-       * tail in its height. Reserve the worst-case 15 R8 texels so a
-       * maximally sized view at a single-texel offset still fits the native
-       * 2D descriptor.
+      /* Every 2D texel-buffer texture/PBE with single-texel alignment includes
+       * its software alignment tail in its height. Reserve the worst-case 15
+       * R8 texels so a maximally sized view at a single-texel offset still
+       * fits the 2D descriptor.
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
-                               (agx3_texel_buffer_tail ? 15 : 0),
-      .maxUniformBufferRange = BRL_MAX_UBO_RANGE,
+                               (texel_buffer_single_texel_alignment ? 15 : 0),
+      .maxUniformBufferRange = 65536,
 
       /* Storage buffers are lowered to global address arithmetic with a
        * zero-extended 32-bit offset, so the whole 32-bit range works. Direct3D
@@ -1813,25 +1790,8 @@ hk_get_device_properties(const struct agx_device *dev,
       properties->sparseResidencyNonResidentStrict =
          instance->drirc.misc.sparse_strict_residency;
 
-   if (agx_chip_native_agx3(dev->chip)) {
-      /* Measured per operation under the G17P drm-shim:
-       *
-       *   BASIC             g22_subgroup_basic          encodes
-       *   VOTE              g21_subgroup_vote           encodes
-       *   BALLOT            g05_subgroup_ballot         encodes
-       *   ARITHMETIC        g06_subgroup_arith          encodes
-       *   SHUFFLE           g07_subgroup_shuffle        encodes
-       *   SHUFFLE_RELATIVE  g25_subgroup_shuffle_rel    encodes
-       *   CLUSTERED         g23_subgroup_clustered      encodes
-       *   QUAD              g08_subgroup_quad           encodes
-       *   ROTATE/CLUSTERED  g24_subgroup_rotate         encodes
-       *
-       * G17P uses the same lane instructions in native vertex/fragment
-       * programs and the compute programs implementing tessellation and
-       * geometry. Other AGX3 targets retain their stage restriction. */
-      properties->subgroupQuadOperationsInAllStages =
-         dev->chip == AGX_CHIP_G17P;
-   }
+   properties->subgroupQuadOperationsInAllStages =
+      agx_chip_has_shader_quad_control(dev->chip);
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
             (strlen(instance->drirc.debug.force_vk_devicename) > 0) ?
@@ -2274,11 +2234,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    supported_extensions.EXT_sampler_filter_minmax =
       agx_chip_sampler_generation(pdev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
 
-   if (agx_chip_native_agx3(pdev->dev.chip)) {
-      supported_extensions.KHR_shader_quad_control =
-         pdev->dev.chip == AGX_CHIP_G17P;
-   }
-
    struct vk_features supported_features;
    /* G17P runs mesh shaders natively and task shaders in software. */
    if (pdev->dev.chip == AGX_CHIP_G17P)
@@ -2394,7 +2349,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * buffer .pointer refers to, so the queue-limits query cannot work there.
     */
    if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
-       !pdev->dev.is_virtio) {
+       !pdev->dev.is_virtio && !(pdev->dev.debug & AGX_DBG_1QUEUE)) {
       struct drm_asahi_queue_limits limits = {0};
       struct drm_asahi_get_params query = {
          .param_group = DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS,
@@ -2437,10 +2392,18 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * clears and blits the same way on any family. These families only
     * narrow what the application may record, so they reuse the universal
     * queue implementation, and like it they create their kernel queue on
-    * first submission, in the device's one VM. The G17P and M3 kernels
-    * report independent queues too, but the families are qualified on M5. */
-   if (agx_chip_g17_m5(pdev->dev.chip) &&
-       (pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES)) {
+    * first submission, in the device's one VM.
+    *
+    * Advertising queue_count on each family exposes up to 3 * queue_count
+    * (24) total logical queues across the three families, all drawing from
+    * the kernel's limits.max_queues budget (the G17 context pool or G15's
+    * 58-queue policy bound). Because kernel queues are created lazily on
+    * first submission rather than at vkCreateDevice time (with entry
+    * admission via hk_queue_admits_at_entry() on G17P/M5; other runtimes
+    * report exhaustion at submit time), unused families consume no kernel
+    * queues. */
+   if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES) &&
+       !(pdev->dev.debug & AGX_DBG_1QUEUE)) {
       pdev->queue_families[pdev->queue_family_count++] = (struct hk_queue_family){
          .queue_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          .queue_count = queue_count,
