@@ -363,6 +363,7 @@ check_fused_m5_dispatch(enum agx_chip chip, uint32_t clusters, uint32_t dies,
       .exec_local = {64, 1, 1},
       .exec_threads = {64, 1, 1},
       .root_va = UINT64_C(0x200000000),
+      .root_size = sizeof(struct hk_root_descriptor_table),
    };
 
    uint8_t cs_bytes[HK_CS_SPACE_PADDING + 256];
