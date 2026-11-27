@@ -17642,8 +17642,8 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
       cs->stats.cmds++;
 
       if (draw_id == 0 && !agx_is_indirect(draw.b) &&
-          gfx->linked[MESA_SHADER_VERTEX] !=
-             gfx->direct_draw_fast.unsupported_linked_vs)
+          cmd->state.gfx.linked[MESA_SHADER_VERTEX] !=
+             cmd->state.gfx.direct_draw_fast.unsupported_linked_vs)
          hk_agx3_arm_direct_draw_fast(cmd, cs, draw_id, draw, needs_idx_robust,
                                       geom, tess, adj);
    }
