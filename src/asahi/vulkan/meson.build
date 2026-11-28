@@ -100,9 +100,7 @@ hk_files = files(
   'hk_nir_widen_16bit_varyings.h',
   'hk_native_descriptor.h',
   'hk_native_vertex_template.h',
-  'hk_native_descriptor_pack.c',
   'hk_native_descriptor_pack.h',
-  'hk_native_sampler.c',
   'hk_native_sampler.h',
   'hk_physical_device.c',
   'hk_physical_device.h',
@@ -683,7 +681,7 @@ if with_tests
     'hk_g17p_decompress',
     executable(
       'hk_g17p_decompress_test',
-      files('tests/test-hk-g17p-decompress.c', 'hk_native_descriptor_pack.c'),
+      files('tests/test-hk-g17p-decompress.c'),
       include_directories : [
         include_directories('.'), inc_gallium, inc_gallium_aux, inc_include,
         inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm,
@@ -798,7 +796,7 @@ if with_tests
     executable(
       'hk_native_descriptor_test',
       files('tests/test-hk-native-descriptor.c',
-            'hk_native_descriptor_pack.c',
+            '../lib/agx_native_descriptor.c',
             '../lib/agx_pbe_agx3_core.c'),
       include_directories : [
         include_directories('.'), inc_include, inc_src, inc_asahi,
@@ -814,7 +812,7 @@ if with_tests
     'hk_native_sampler',
     executable(
       'hk_native_sampler_test',
-      files('tests/test-hk-native-sampler.c', 'hk_native_sampler.c'),
+      files('tests/test-hk-native-sampler.c'),
       include_directories : [
         include_directories('.'), inc_include, inc_src, inc_asahi,
       ],
