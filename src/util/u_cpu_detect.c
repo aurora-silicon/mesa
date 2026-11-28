@@ -554,6 +554,8 @@ get_cpu_topology(bool zen)
    }
    free(caps);
    util_cpu_caps.nr_big_cpus = num_big_cpus;
+   if (num_big_cpus && num_big_cpus < util_cpu_caps.max_cpus)
+      util_cpu_caps.big_cpu_capacity = MIN2(big_cap / 2, UINT16_MAX);
 #endif
 
 #if DETECT_ARCH_X86 || DETECT_ARCH_X86_64

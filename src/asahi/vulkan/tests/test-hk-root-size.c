@@ -526,12 +526,13 @@ int main(void)
       assert(!hk_split_workgroup_size_ex(wg32x3, g2d_odd, 80, out) &&
              out[0] == 32 && out[1] == 3 && out[2] == 1);
 
-      /* Capability table: enabled on G17P and M5 (G17G, G17S, G17C); other
-       * parts stay off until per-generation same-machine A/B + CTS rows
-       * qualify them. */
+      /* Capability table: enabled across native AGX3 (G15, G16G, G17P) and M5
+       * (G17G, G17S, G17C); AGX2 and G18G stay off. */
       for (int chip = AGX_CHIP_G13G; chip <= AGX_CHIP_UNKNOWN; ++chip) {
          const enum agx_chip c = (enum agx_chip)chip;
-         const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+         const bool expected = c == AGX_CHIP_G15G || c == AGX_CHIP_G15S ||
+                               c == AGX_CHIP_G15C || c == AGX_CHIP_G16G ||
+                               c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
                                c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
          assert(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
                 expected);

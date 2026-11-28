@@ -121,7 +121,9 @@ test_coalesce_pure_global_workgroups(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+      const bool expected = c == AGX_CHIP_G15G || c == AGX_CHIP_G15S ||
+                            c == AGX_CHIP_G15C || c == AGX_CHIP_G16G ||
+                            c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
                             c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COALESCE_PURE_GLOBAL_WORKGROUPS) ==
                     expected,
@@ -129,15 +131,15 @@ test_coalesce_pure_global_workgroups(void)
    }
 }
 
-/* AGX_CAP_CDM_WAR_WEAK_BARRIER is enabled on G17P and M5 only. G15 and G16G
- * elide application dispatch barriers too but keep the flush at execution-only
- * and WAR barriers until hardware rows qualify them. */
+/* AGX_CAP_CDM_WAR_WEAK_BARRIER is enabled across native AGX3 and M5. */
 static void
 test_cdm_war_weak_barrier(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
+      const bool expected = c == AGX_CHIP_G15G || c == AGX_CHIP_G15S ||
+                            c == AGX_CHIP_G15C || c == AGX_CHIP_G16G ||
+                            c == AGX_CHIP_G17P || c == AGX_CHIP_G17G ||
                             c == AGX_CHIP_G17S || c == AGX_CHIP_G17C;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_CDM_WAR_WEAK_BARRIER) == expected,
                  c);

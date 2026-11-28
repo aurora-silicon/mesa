@@ -244,7 +244,7 @@ enum agx_chip_quirk {
 /* What the five native AGX3 chips share. */
 #define AGX_QUIRKS_NATIVE                                                      \
    (AGX_QUIRK_NATIVE_INDIRECT_COMPUTE | AGX_QUIRK_NATIVE_IMAGEBLOCK |          \
-    AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT)
+    AGX_QUIRK_UNCOVERED_TILE_MS_DEFECT | AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS)
 
 /* The native chips that are not G17P: G15G, G15S, G15C and G16G. */
 #define AGX_QUIRKS_NATIVE_PRE_G17                                              \
@@ -254,8 +254,7 @@ enum agx_chip_quirk {
    (AGX_QUIRKS_NATIVE | AGX_QUIRK_NATIVE_RENDER_CONTEXT |                      \
     AGX_QUIRK_USC_HELPER_SLOT_PER_CORE |                                       \
     AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS |                                  \
-    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE |        \
-    AGX_QUIRK_VDM_INDIRECT_INDEX_BOUNDS)
+    AGX_QUIRK_IMAGE_LOAD_MISSES_OWN_STORE | AGX_QUIRK_NATIVE_PREAMBLE)
 
 /*
  * The chip table: one row per chip, and the only place that says what a chip
@@ -333,7 +332,8 @@ enum agx_chip_quirk {
      __VA_ARGS__)                                                              \
    X(G16G, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, CLASSIC, NATIVE_AGX3,    \
      AGX_RECORDS_G15_G17 | AGX_RECORD_CDM_BARRIER_WIDE_VISIBILITY,             \
-     AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_NATIVE_PREAMBLE, __VA_ARGS__)       \
+     AGX_QUIRKS_NATIVE_PRE_G17 | AGX_QUIRK_NATIVE_PREAMBLE |                   \
+        AGX_QUIRK_TRI_MERGE_ACROSS_SIDE_EFFECTS, __VA_ARGS__)                  \
    X(G16S, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \
      AGX_RECORDS_G15_G17, 0, __VA_ARGS__)                                      \
    X(G16C, AGX3, AGX3B, HAL200, 9, GEN4_HAL200, GPU0, DUAL, NONE,              \

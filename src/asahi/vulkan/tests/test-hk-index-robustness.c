@@ -34,8 +34,10 @@ main(void)
     * aligned 16/32-bit indirect draws within 32-bit byte bounds in hardware;
     * oversized, unaligned, and 8-bit indirect draws take the software rewrite
     * path. */
-   static const enum agx_chip native_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17G,
-                                                AGX_CHIP_G17S, AGX_CHIP_G17C};
+   static const enum agx_chip native_chips[] = {
+      AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G16G,
+      AGX_CHIP_G17P, AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   };
    for (unsigned i = 0; i < sizeof(native_chips) / sizeof(native_chips[0]);
         ++i) {
       assert(agx_chip_vdm_indirect_index_bounds(native_chips[i]));
@@ -83,8 +85,7 @@ main(void)
     * index bounds are unmeasured) keeps the software rewrite for robust
     * indirect draws. */
    static const enum agx_chip rewrite_chips[] = {
-      AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G15G, AGX_CHIP_G15S,
-      AGX_CHIP_G15C, AGX_CHIP_G16G, AGX_CHIP_G18G,
+      AGX_CHIP_G13G, AGX_CHIP_G14X, AGX_CHIP_G18G,
    };
    for (unsigned i = 0; i < sizeof(rewrite_chips) / sizeof(rewrite_chips[0]);
         ++i) {
