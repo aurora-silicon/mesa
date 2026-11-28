@@ -3841,7 +3841,7 @@ agx_compile_variant(struct agx_device *dev,
       if (agx_chip_g17_m5(dev->chip) && !g17g_samples_unrolled &&
           !nir->info.fs.uses_sample_shading &&
           !writes_sample_mask)
-         NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+         NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5, false);
       else if (g17g_samples_unrolled && key->nr_samples > 1 &&
                !nir->info.fs.early_fragment_tests &&
                !(nir->info.outputs_written & m5_zs) &&

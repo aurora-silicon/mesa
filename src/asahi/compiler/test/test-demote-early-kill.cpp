@@ -788,12 +788,76 @@ expect_m5_final_update(nir_shader *s)
 
 TEST_F(DemoteEarlyKill, M5FinalCoverageUpdateIsUniform)
 {
-   for (enum shape s : {UNGUARDED, GUARDED_NOT, QUAD_IN_LOOP}) {
+   for (bool early_update : {false, true}) {
+      for (enum shape s : {UNGUARDED, GUARDED_NOT, QUAD_IN_LOOP}) {
+         nir_shader *nir = build(s);
+         agx_nir_lower_discard_zs_emit(nir);
+         agx_nir_lower_sample_mask_deferred_m5(nir, early_update);
+         nir_validate_shader(nir, "M5 coverage update");
+         expect_m5_final_update(nir);
+         ralloc_free(nir);
+      }
+   }
+}
+
+static bool
+lower_m5(enum shape s, bool early_update = true)
+{
+   nir_shader *nir = build(s);
+   agx_nir_lower_discard_zs_emit(nir);
+   agx_nir_lower_sample_mask_deferred_m5(nir, early_update);
+   nir_validate_shader(nir, "M5 early demote lowering");
+   bool early = kill_is_early(nir);
+   ralloc_free(nir);
+   return early;
+}
+
+TEST_F(DemoteEarlyKill, M5UpdatesEarlyAfterLastDemote)
+{
+   for (enum shape s :
+        {UNGUARDED, OTHER_CONDITION, QUAD_IN_LOOP, GUARDED_LOOP_AFTER,
+         QUAD_BEFORE_SECOND_DEMOTE, DEMOTE_IN_LOOP_IN_ARM,
+         DEMOTES_IN_NESTED_ARMS}) {
+      EXPECT_TRUE(lower_m5(s, true)) << s;
+      EXPECT_FALSE(lower_m5(s, false)) << s;
+
       nir_shader *nir = build(s);
       agx_nir_lower_discard_zs_emit(nir);
-      agx_nir_lower_sample_mask_deferred_m5(nir);
-      nir_validate_shader(nir, "M5 coverage update");
+      agx_nir_lower_sample_mask_deferred_m5(nir, true);
+      nir_validate_shader(nir, "M5 early coverage");
       expect_m5_final_update(nir);
+      updates u = count_updates(&nir_shader_get_entrypoint(nir)->body);
+      EXPECT_EQ(u.min, 1u) << s;
+      EXPECT_EQ(u.max, 1u) << s;
+      EXPECT_EQ(count_quad_ballots(nir), 0u) << s;
+      ralloc_free(nir);
+   }
+}
+
+TEST_F(DemoteEarlyKill, M5KeepsUpdateLateWhereObservable)
+{
+   EXPECT_FALSE(lower_m5(SUBGROUP_AFTER));
+   EXPECT_FALSE(lower_m5(ACTIVE_COUNT_AFTER));
+   EXPECT_FALSE(lower_m5(ACTIVE_INDEX_AFTER));
+   EXPECT_FALSE(lower_m5(LOWERED_QUAD_BALLOT_AFTER));
+   EXPECT_FALSE(lower_m5(MEMORY_WRITE_AFTER));
+   EXPECT_FALSE(lower_m5(SAMPLE_SHADING_AFTER));
+
+   for (enum shape s : {DEPTH_WRITE_AFTER, FORCED_EARLY_AFTER}) {
+      nir_shader *nir = build(s);
+      agx_nir_lower_discard_zs_emit(nir);
+      agx_nir_lower_sample_mask_deferred_m5(nir, true);
+      nir_validate_shader(nir, "M5 late coverage");
+
+      nir_block *last = nir_impl_last_block(nir_shader_get_entrypoint(nir));
+      bool kill_in_last_block = false;
+      nir_foreach_instr(instr, last) {
+         kill_in_last_block |=
+            instr->type == nir_instr_type_intrinsic &&
+            nir_instr_as_intrinsic(instr)->intrinsic ==
+               nir_intrinsic_sample_mask_agx;
+      }
+      EXPECT_TRUE(kill_in_last_block) << s;
       ralloc_free(nir);
    }
 }

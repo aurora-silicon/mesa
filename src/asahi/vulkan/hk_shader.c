@@ -6359,7 +6359,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                dev->dev.chip, &shader->info.fs.epilog_key);
       if (agx_chip_hal300_path(dev->dev.chip)) {
          if (!m5_test_once)
-            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+            NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5,
+                     agx_chip_g17_m5(dev->dev.chip));
       } else if (dev->dev.chip == AGX_CHIP_G17P) {
          if (!g17p_test_once) {
             NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_g17p,
@@ -6413,7 +6414,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
                shader->info.fs.m5_inline_sample_shading = true;
                /* Not unrolled here: lower as before. */
                if (m5_test_once) {
-                  NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+                  NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5, true);
                   if (fold_tests) {
                      bool folded = false;
                      NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
@@ -6459,7 +6460,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
             if (!(nir->info.outputs_written & zs) && !nir->info.writes_memory)
                NIR_PASS(_, nir, agx_nir_lower_sample_mask_one_update_m5);
             else
-               NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+               NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5,
+                        agx_chip_g17_m5(dev->dev.chip));
             if (fold_tests) {
                bool folded = false;
                NIR_PASS(folded, nir, nir_shader_intrinsics_pass,
@@ -7860,7 +7862,7 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, agx_nir_lower_fs_output_to_epilog_for_device, dev->dev.chip,
             &meta.epilog_key);
    if (agx_chip_g17_m5(dev->dev.chip)) {
-      NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5);
+      NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred_m5, true);
    } else {
       NIR_PASS(_, nir, agx_nir_lower_sample_mask_deferred);
    }

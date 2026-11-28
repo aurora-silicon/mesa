@@ -14029,8 +14029,11 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       fs && (fs->b.info.early_fragment_tests &&
              (fs->b.info.writes_sample_mask || fs->info.fs.writes_memory));
    bool epilog_discards = hk_fs_epilog_discards(fs, dyn, nontrivial_force_early);
-   bool defer_api_sample_mask = agx_chip_native_agx3(dev->dev.chip) &&
-                                has_sample_mask && !nontrivial_force_early;
+   bool defer_api_sample_mask =
+      has_sample_mask && !nontrivial_force_early &&
+      (agx_chip_native_agx3(dev->dev.chip) ||
+       (agx_chip_g17_m5(dev->dev.chip) && !fs->b.info.writes_sample_mask &&
+        !in->cull_distance_size));
 
    const bool native_samples = agx_chip_agx3_path(dev->dev.chip);
    if (native_samples && fs->info.fs.uses_sample_shading &&
@@ -14182,7 +14185,7 @@ hk_fs_link_key_build(const struct hk_device *dev, struct hk_shader *fs,
       if (format != VK_FORMAT_UNDEFINED && write_mask != BITFIELD_MASK(4))
          has_masked_rt = true;
 
-      if (agx_chip_native_agx3(dev->dev.chip) && !write_enable) {
+      if (agx_chip_native_or_m5(dev->dev.chip) && !write_enable) {
          key->epilog.preserve_rt |= BITFIELD_BIT(i);
          key->epilog.blend.rt[i] = (struct agx_blend_rt_key){
             .colormask = BITFIELD_MASK(4),
@@ -15214,8 +15217,11 @@ hk_flush_dynamic_state_slow(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    const bool early_reject_has_api_mask =
       (dyn->ms.sample_mask & early_reject_full_mask) != early_reject_full_mask;
    const bool early_reject_defer_api_mask =
-      agx_chip_native_agx3(dev->dev.chip) && early_reject_has_api_mask &&
-      !nontrivial_force_early;
+      early_reject_has_api_mask && !nontrivial_force_early &&
+      (agx_chip_native_agx3(dev->dev.chip) ||
+       (agx_chip_g17_m5(dev->dev.chip) &&
+        (!fs || !fs->b.info.writes_sample_mask) &&
+        !hw_vs->info.cull_distance_array_size));
    const bool early_reject_prolog_discards =
       (early_reject_has_api_mask && !early_reject_defer_api_mask) ||
       hw_vs->info.cull_distance_array_size;
