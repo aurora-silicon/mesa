@@ -1929,8 +1929,10 @@ int main(void)
    }
    /* M5 8x MSAA MRT reload regression (dEQP-VK multisample dynamic_rendering
     * random_107): RGBA16F @ RT0, RGBA16_SINT @ RT1, NONE @ RT2, RGBA8_UNORM @
-    * RT3 must stay on W32 and compile cleanly in both single-layer and layered
-    * forms without overflowing the tile-store payload bank. */
+    * RT3 under the production M5 imageblock budget (all three resident at byte
+    * offsets 0, 8, 16 with a 24-byte sample stride) must stay on W32 and
+    * compile cleanly in both single-layer and layered forms without
+    * overflowing the tile-store payload bank. */
    {
       const enum pipe_format fmts[4] = {
          PIPE_FORMAT_R16G16B16A16_FLOAT,
@@ -1941,8 +1943,16 @@ int main(void)
       struct agx_device dev = {.chip = AGX_CHIP_G17S};
       bool msaa_ok = true;
       for (unsigned layered = 0; layered < 2; ++layered) {
+         struct agx_tilebuffer_layout tib = agx_build_tilebuffer_layout_resident(
+            fmts, 4, 8, layered != 0, AGX_MAX_RENDER_TARGETS * 16, 65536, 2048,
+            0);
+         msaa_ok &= !tib.spilled[0] && !tib.spilled[1] && !tib.spilled[3] &&
+                    tib.sample_size_B == 24 &&
+                    agx_tilebuffer_offset_B(&tib, 0) == 0 &&
+                    agx_tilebuffer_offset_B(&tib, 1) == 8 &&
+                    agx_tilebuffer_offset_B(&tib, 3) == 16;
          struct agx_bg_eot_key bg = {
-            .tib = agx_build_tilebuffer_layout(fmts, 4, 8, layered != 0),
+            .tib = tib,
             .op = {AGX_BG_LOAD, AGX_BG_LOAD, AGX_BG_EOT_NONE, AGX_BG_LOAD},
             .mixed_mrt = true,
          };

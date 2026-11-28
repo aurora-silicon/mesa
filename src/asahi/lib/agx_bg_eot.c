@@ -596,47 +596,6 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
       }
    }
 
-   /* Native single-RT G18G background clear (run 1132): Apple's U8NORM clear
-    * converts four clear-colour uniforms into two packed U8NORM words with
-    * two fltnorm instructions and stores them with a single lstcol at sample
-    * mask 0x1, saving register pressure and matching Apple's byte stream. */
-   if (cache->dev->chip == AGX_CHIP_G18G && !key->mixed_mrt &&
-       key->tib.nr_samples == 1 && !key->tib.spilled[0] &&
-       key->op[0] == AGX_BG_CLEAR &&
-       agx_tilebuffer_offset_B(&key->tib, 0) == 0) {
-      bool rt0_only = true;
-      for (unsigned rt = 1; rt < ARRAY_SIZE(key->op); ++rt)
-         rt0_only &= key->op[rt] == AGX_BG_EOT_NONE;
-      const enum pipe_format phys = agx_tilebuffer_physical_format(&key->tib, 0);
-      if (rt0_only && (phys == (enum pipe_format)AIL_ISA_FORMAT_U8NORM ||
-                       phys == (enum pipe_format)AIL_ISA_FORMAT_SRGBA8)) {
-         static const uint8_t text[] = {
-            0x27, 0x04, 0x20, 0x05, 0x45, 0x1e, 0x00, 0x80, 0x04, 0x43, 0x00, 0x00,
-            0x27, 0x04, 0x20, 0x05, 0x45, 0x1e, 0x00, 0x80, 0x0c, 0x43, 0x02, 0x00,
-            0x04, 0x04, 0x02, 0x00, 0x10, 0x00, 0x00, 0x00,
-            0x27, 0x04, 0x08, 0x00, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00,
-         };
-         struct agx_shader_part bin = {
-            .binary = (void *)text,
-            .info = {
-               .binary_size = sizeof(text),
-               .main_size = sizeof(text),
-               .nr_gprs = 2,
-               .agx3_staging_known = true,
-               .agx3_staging_halfs = 0,
-            },
-         };
-         struct agx_bg_eot_shader *res =
-            rzalloc(cache->ht, struct agx_bg_eot_shader);
-         if (!res || !agx_g17p_upload_bg_eot(cache, &bin, res)) {
-            ralloc_free(res);
-            return NULL;
-         }
-         res->info = bin.info;
-         return res;
-      }
-   }
-
    struct agx_shader_part bin = {0};
    if (!agx_compile_background_shader(cache->dev, key, &bin))
       return NULL;
