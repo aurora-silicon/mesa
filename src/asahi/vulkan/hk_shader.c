@@ -7328,8 +7328,7 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    }
    if (obj->stencil_2d) {
       hk_shader_destroy(dev, &obj->stencil_2d->shader, owns_payload);
-      if (obj->stencil_2d->has_sobel_nms)
-         hk_shader_destroy(dev, &obj->stencil_2d->sobel_nms, owns_payload);
+      hk_compute_pair_producer_unref(obj->stencil_2d->sobel_nms);
       free(obj->stencil_2d);
    }
    if (obj->compute_opt) {
@@ -10251,20 +10250,23 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                obj->stencil_2d = s2d;
                /* Optional: without it the queue just never fuses this
                 * Sobel. */
-               if (sobel_nms_nir) {
+               struct hk_compute_pair_producer *producer =
+                  sobel_nms_nir ? hk_compute_pair_sobel_producer_create(dev)
+                                : NULL;
+               if (producer) {
                   hk_lower_nir(dev, sobel_nms_nir, info->robustness, false,
                                info->next_stage_mask, info->set_layout_count,
                                info->set_layouts, features);
                   VkResult fused_res = hk_compile_nir(
                      dev, pAllocator, sobel_nms_nir, info->flags,
-                     info->robustness, key, features, &s2d->sobel_nms,
+                     info->robustness, key, features, producer->variants[0].shader,
                      sw_stage, true, NULL, info->set_layout_count,
                      static_set_mask);
                   sobel_nms_nir = NULL;
                   if (fused_res == VK_SUCCESS)
-                     s2d->has_sobel_nms = true;
+                     s2d->sobel_nms = producer;
                   else
-                     hk_shader_destroy(dev, &s2d->sobel_nms, true);
+                     hk_compute_pair_producer_unref(producer);
                }
             } else {
                hk_shader_destroy(dev, &s2d->shader, true);
@@ -10781,6 +10783,26 @@ hk_compute_pair_producer_alloc(struct hk_device *dev,
    p->dev = dev;
    simple_mtx_init(&p->lock, mtx_plain);
    p->info = *pair;
+   return p;
+}
+
+struct hk_compute_pair_producer *
+hk_compute_pair_sobel_producer_create(struct hk_device *dev)
+{
+   const struct hk_compute_pair_info info = {
+      .role = HK_COMPUTE_PAIR_SOBEL3X3,
+   };
+   struct hk_compute_pair_producer *p = hk_compute_pair_producer_alloc(dev, &info);
+   if (!p)
+      return NULL;
+
+   p->variants[0].shader = calloc(1, sizeof(struct hk_shader));
+   if (!p->variants[0].shader) {
+      hk_compute_pair_producer_unref(p);
+      return NULL;
+   }
+
+   p->variant_count = 1;
    return p;
 }
 
@@ -12907,14 +12929,17 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
       }
       if (has_sobel_nms) {
-         s2d_res = hk_deserialize_shader(dev, blob, &s2d->sobel_nms, false,
-                                         cache_candidate);
+         s2d->sobel_nms = hk_compute_pair_sobel_producer_create(dev);
+         if (!s2d->sobel_nms) {
+            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         s2d_res = hk_deserialize_shader(
+            dev, blob, s2d->sobel_nms->variants[0].shader, false, cache_candidate);
          if (s2d_res != VK_SUCCESS) {
-            hk_shader_destroy(dev, &s2d->sobel_nms, true);
             hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
             return s2d_res;
          }
-         s2d->has_sobel_nms = true;
       }
    }
 
@@ -13076,10 +13101,9 @@ hk_shader_binary_payload_cacheable(struct hk_api_shader *obj)
          return false;
    }
 
-   if (obj->stencil_2d && obj->stencil_2d->has_sobel_nms &&
-       obj->stencil_2d->sobel_nms.compiled) {
-      const struct hk_shader *fused = &obj->stencil_2d->sobel_nms;
-      if (fused->bo || fused->only_linked || !fused->linked.ht)
+   if (obj->stencil_2d && obj->stencil_2d->sobel_nms) {
+      const struct hk_shader *fused = obj->stencil_2d->sobel_nms->variants[0].shader;
+      if (fused->compiled && (fused->bo || fused->only_linked || !fused->linked.ht))
          return false;
    }
 
@@ -13279,22 +13303,21 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
       s2d->plan = src_obj->stencil_2d->plan;
-      s2d->has_sobel_nms = src_obj->stencil_2d->has_sobel_nms;
-      for (unsigned v = 0; v < (s2d->has_sobel_nms ? 2 : 1); ++v) {
-         struct hk_shader *dst = v ? &s2d->sobel_nms : &s2d->shader;
-         const struct hk_shader *src = v ? &src_obj->stencil_2d->sobel_nms
-                                         : &src_obj->stencil_2d->shader;
-         *dst = *src;
-         memset(&dst->linked, 0, sizeof(dst->linked));
-         dst->only_linked = NULL;
-         dst->uvs_linked = NULL;
-         dst->bo = NULL;
-         dst->g17p_mono_nir = NULL;
-         dst->g17p_mono_nir_size = 0;
-         dst->g17p_mono_postopt_nir = NULL;
-         simple_mtx_init(&dst->linked.lock, mtx_plain);
-         dst->linked.lazy_ht = src->compiled;
-      }
+      struct hk_shader *dst = &s2d->shader;
+      const struct hk_shader *src = &src_obj->stencil_2d->shader;
+      *dst = *src;
+      memset(&dst->linked, 0, sizeof(dst->linked));
+      dst->only_linked = NULL;
+      dst->uvs_linked = NULL;
+      dst->bo = NULL;
+      dst->g17p_mono_nir = NULL;
+      dst->g17p_mono_nir_size = 0;
+      dst->g17p_mono_postopt_nir = NULL;
+      simple_mtx_init(&dst->linked.lock, mtx_plain);
+      dst->linked.lazy_ht = src->compiled;
+      /* The fused variant owns its payload independently of the cache entry. */
+      s2d->sobel_nms =
+         hk_compute_pair_producer_ref(src_obj->stencil_2d->sobel_nms);
       obj->stencil_2d = s2d;
    }
 
@@ -13672,9 +13695,10 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       blob_write_bytes(blob, &obj->stencil_2d->plan,
                        sizeof(obj->stencil_2d->plan));
       hk_shader_serialize(vk_dev, &obj->stencil_2d->shader, blob);
-      blob_write_uint8(blob, obj->stencil_2d->has_sobel_nms);
-      if (obj->stencil_2d->has_sobel_nms)
-         hk_shader_serialize(vk_dev, &obj->stencil_2d->sobel_nms, blob);
+      const struct hk_compute_pair_producer *fused = obj->stencil_2d->sobel_nms;
+      blob_write_uint8(blob, fused != NULL);
+      if (fused)
+         hk_shader_serialize(vk_dev, fused->variants[0].shader, blob);
    }
 
    if (obj->compute_opt) {

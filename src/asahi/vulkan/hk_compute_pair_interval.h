@@ -112,7 +112,7 @@ hk_compute_pair_canny_match(const struct hk_compute_pair_dispatch *sobel,
 {
    if (!sobel || !nms || sobel->info.role != HK_COMPUTE_PAIR_SOBEL3X3 ||
        nms->info.role != HK_COMPUTE_PAIR_CANNY_NMS ||
-       !sobel->extra.canny.fused || !sobel->root_va)
+       !sobel->producer || !sobel->root_va)
       return false;
 
    const struct hk_compute_pair_canny *sc = &sobel->extra.canny;

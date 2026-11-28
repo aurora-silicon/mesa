@@ -10,11 +10,14 @@
  * matches, and each broken precondition keeps the two dispatches apart. */
 
 #include "hk_2d_stencil.h"
+#include "hk_cmd_buffer.h"
 #include "hk_compute_opt.h"
 #include "hk_compute_pair_interval.h"
+#include "hk_device.h"
 
 #include "compiler/glsl_types.h"
 #include "nir_builder.h"
+#include "vk_alloc.h"
 
 #include "hk_nir_eval_test.h"
 
@@ -314,7 +317,7 @@ test_fused_kernel_matches(void)
 
 enum { W = 64, H = 32, STRIDE = 72 };
 
-static struct hk_shader *const fake_fused = (struct hk_shader *)(uintptr_t)0x1000;
+static struct hk_compute_pair_producer fake_producer;
 
 static struct hk_storage_backing
 backing(uint32_t handle, uint64_t bo_off, uint64_t va, uint32_t size)
@@ -333,8 +336,9 @@ make_pair(struct hk_compute_pair_dispatch *s, struct hk_compute_pair_dispatch *n
    memset(n, 0, sizeof(*n));
    s->info.role = HK_COMPUTE_PAIR_SOBEL3X3;
    s->root_va = 0x7000000;
+   s->producer = &fake_producer;
    s->extra.canny = (struct hk_compute_pair_canny){
-      .width = W, .height = H, .stride = STRIDE, .fused = fake_fused};
+      .width = W, .height = H, .stride = STRIDE};
    s->bindings[0] = backing(1, 0, 0x100000, src);
    s->bindings[1] = backing(2, 256, 0x200100, px * 4);
    s->bindings[2] = backing(3, 0, 0x300000, px * 4);
@@ -369,7 +373,7 @@ test_pairing_rule(void)
    s.info.role = HK_COMPUTE_PAIR_GEMM;
    HK_EVAL_CHECK(!hk_compute_pair_canny_match(&s, &n, NULL));
    make_pair(&s, &n);
-   s.extra.canny.fused = NULL;
+   s.producer = NULL;
    HK_EVAL_CHECK(!hk_compute_pair_canny_match(&s, &n, NULL));
    make_pair(&s, &n);
    s.root_va = 0;
@@ -465,11 +469,81 @@ test_pairing_rule(void)
    HK_EVAL_CHECK(!hk_2d_stencil_sobel_nms_supported(&sp));
 }
 
+static unsigned producer_destroy_count;
+static unsigned linked_destroy_count;
+static void (*destroy_producer)(struct hk_compute_pair_producer *);
+
+static void
+count_producer_destroy(struct hk_compute_pair_producer *p)
+{
+   ++producer_destroy_count;
+   destroy_producer(p);
+}
+
+static void
+count_linked_destroy(UNUSED void *data)
+{
+   ++linked_destroy_count;
+}
+
+static void
+test_fused_shader_lifetime(void)
+{
+   struct hk_device *dev = calloc(1, sizeof(*dev));
+   HK_EVAL_CHECK(dev);
+   dev->vk.alloc = *vk_default_allocator();
+
+   struct hk_api_shader *api = vk_shader_zalloc(
+      &dev->vk, NULL, MESA_SHADER_COMPUTE, NULL,
+      hk_api_shader_size(MESA_SHADER_COMPUTE, 0));
+   HK_EVAL_CHECK(api);
+   simple_mtx_init(&api->variants[0].linked.lock, mtx_plain);
+   api->stencil_2d = calloc(1, sizeof(*api->stencil_2d));
+   HK_EVAL_CHECK(api->stencil_2d);
+   simple_mtx_init(&api->stencil_2d->shader.linked.lock, mtx_plain);
+   struct hk_compute_pair_producer *producer =
+      hk_compute_pair_sobel_producer_create(dev);
+   HK_EVAL_CHECK(producer && producer->variant_count == 1);
+   api->stencil_2d->sobel_nms = producer;
+   destroy_producer = producer->destroy;
+   producer->destroy = count_producer_destroy;
+
+   struct hk_shader *fused = producer->variants[0].shader;
+   simple_mtx_init(&fused->linked.lock, mtx_plain);
+   struct hk_linked_shader *linked = rzalloc(NULL, struct hk_linked_shader);
+   HK_EVAL_CHECK(linked);
+   ralloc_set_destructor(linked, count_linked_destroy);
+   fused->only_linked = linked;
+
+   struct hk_cs cs = {.compute_pair = malloc(sizeof(*cs.compute_pair))};
+   struct hk_compute_pair_dispatch nms;
+   HK_EVAL_CHECK(cs.compute_pair);
+   make_pair(cs.compute_pair, &nms);
+   cs.compute_pair->producer = hk_compute_pair_producer_ref(producer);
+
+   hk_api_shader_destroy(&dev->vk, &api->vk, NULL);
+   HK_EVAL_CHECK(producer_destroy_count == 0 && linked_destroy_count == 0);
+   for (unsigned submit = 0; submit < 2; ++submit) {
+      HK_EVAL_CHECK(hk_compute_pair_canny_match(cs.compute_pair, &nms, NULL));
+      struct hk_shader *recorded = cs.compute_pair->producer->variants[0].shader;
+      HK_EVAL_CHECK(recorded == fused && recorded->only_linked == linked);
+   }
+
+   hk_cs_invalidate_compute_pair(&cs);
+   HK_EVAL_CHECK(!cs.compute_pair);
+   HK_EVAL_CHECK(producer_destroy_count == 1 && linked_destroy_count == 1);
+   hk_cs_invalidate_compute_pair(&cs);
+   HK_EVAL_CHECK(producer_destroy_count == 1 && linked_destroy_count == 1);
+   free(dev);
+   puts("hk_canny_fuse: fused shader lifetime, OK");
+}
+
 int
 main(void)
 {
    glsl_type_singleton_init_or_ref();
    test_pairing_rule();
+   test_fused_shader_lifetime();
    test_fused_kernel_matches();
    glsl_type_singleton_decref();
    printf("hk_canny_fuse: %u image cases, OK\n", cases_run);

@@ -159,10 +159,9 @@ struct hk_compute_pair_variant {
 };
 
 /* Refcounted producer state shared between hk_api_shader and any recorded
- * command-buffer dispatch that may lazily fuse with a consumer clamp at submit
- * time. Holds references on the descriptor set layouts and owns its cloned
- * preprocessed NIR + lazily compiled fused shader variants, so it remains
- * valid even if the application destroys the pipeline/layouts after recording.
+ * command-buffer dispatch that may fuse at submit time. Owns the compiled
+ * fused variants and, for producers compiled on demand, the cloned NIR and
+ * references on its descriptor set layouts.
  */
 struct hk_compute_pair_producer {
    struct pipe_reference ref;
@@ -195,6 +194,11 @@ hk_compute_pair_producer_unref(struct hk_compute_pair_producer *p)
    if (p && pipe_reference(&p->ref, NULL))
       p->destroy(p);
 }
+
+/* Allocates the producer and its single Sobel + NMS shader for compilation
+ * or deserialization. The producer owns the shader and its payload. */
+struct hk_compute_pair_producer *
+hk_compute_pair_sobel_producer_create(struct hk_device *dev);
 
 /* The producer state of a depthwise or GEMM compute shader that `info`
  * compiles from `nir`, its NIR before hk_lower_nir(). NULL on failure. */
@@ -277,9 +281,6 @@ struct hk_compute_pair_canny {
    int32_t width, height, stride;
    /* NMS: the plan's dx_lut, dy_lut, low and high threshold bits. */
    uint32_t params[4];
-   /* Sobel: its fused Sobel + NMS shader (hk_2d_stencil_variant), owned by
-    * the pipeline, which outlives every submission of this record. */
-   struct hk_shader *fused;
 };
 
 struct hk_compute_pair_dispatch {
@@ -303,6 +304,7 @@ struct hk_compute_pair_dispatch {
    enum hk_compute_pair_alt_kind alt_kind;
    bool overlap_safe;
    uint64_t pack_loop_params[HK_PACK_LOOP_PARAM_COUNT];
+   /* The Sobel producer owns the fused Sobel + NMS shader in variants[0]. */
    struct hk_compute_pair_producer *producer;
 };
 

@@ -3529,7 +3529,7 @@ hk_record_canny_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    uint16_t w_off, h_off;
    if (api->stencil_2d && selected == &api->stencil_2d->shader &&
        api->stencil_2d->plan.kind == HK_2D_STENCIL_SOBEL_3X3_U8 &&
-       api->stencil_2d->has_sobel_nms) {
+       api->stencil_2d->sobel_nms) {
       /* The fused kernel takes the Sobel's grid and workgroup. */
       if (selected->data_size != 0 ||
           local.x != selected->b.info.workgroup_size[0] ||
@@ -3545,7 +3545,6 @@ hk_record_canny_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
       w_off = plan->width_pc_offset_B;
       h_off = plan->height_pc_offset_B;
       memcpy(&canny->stride, desc->root.push + plan->stride_pc_offset_B, 4);
-      canny->fused = (struct hk_shader *)&api->stencil_2d->sobel_nms;
    } else if (api->compute_opt && selected == &api->compute_opt->shader &&
               api->compute_opt->plan.kind == HK_COMPUTE_OPT_CANNY_NMS_U8) {
       const struct hk_compute_opt_plan *plan = &api->compute_opt->plan;
@@ -3585,8 +3584,11 @@ hk_record_canny_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    record.overlap_safe = hk_compute_shader_overlap_safe(selected, desc);
 
    cs->compute_pair = malloc(sizeof(record));
-   if (cs->compute_pair)
-      *cs->compute_pair = record;
+   if (!cs->compute_pair)
+      return;
+   if (record.info.role == HK_COMPUTE_PAIR_SOBEL3X3)
+      record.producer = hk_compute_pair_producer_ref(api->stencil_2d->sobel_nms);
+   *cs->compute_pair = record;
 }
 
 static bool

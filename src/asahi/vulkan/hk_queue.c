@@ -329,7 +329,8 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
 
-   static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
+   static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control),
+                 "Queued and recorded ZLS control sizes must match");
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
    const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
@@ -5857,12 +5858,14 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                 * dispatch (hk_nir_build_sobel_nms()). */
                const unsigned k = i + 1;
                struct hk_sobel_nms_push nms_push;
-               struct hk_shader *cand = p->extra.canny.fused;
                if (k >= end || planned_suppressed[k] || !members[k].cs ||
                    !hk_compute_pair_stream_eligible(members[k].cs) ||
                    !hk_compute_pair_canny_match(p, members[k].cs->compute_pair,
-                                                &nms_push) ||
-                   !hk_fused_compute_shader_eligible(dev, cand, p))
+                                                &nms_push))
+                  continue;
+
+               struct hk_shader *cand = p->producer->variants[0].shader;
+               if (!hk_fused_compute_shader_eligible(dev, cand, p))
                   continue;
 
                uint64_t replaced_work = 0;
