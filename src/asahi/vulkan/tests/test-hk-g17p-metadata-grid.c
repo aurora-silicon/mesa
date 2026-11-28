@@ -484,11 +484,58 @@ check_resolve_slice(void)
           "non-zero srcOffset.z should refuse resolve slice helper");
 }
 
+static void
+check_r11_422_element_plan(void)
+{
+   static const VkFormat yuv_fmts[] = {
+      VK_FORMAT_G8B8G8R8_422_UNORM,
+      VK_FORMAT_B8G8R8G8_422_UNORM,
+   };
+
+   for (unsigned i = 0; i < sizeof(yuv_fmts) / sizeof(yuv_fmts[0]); ++i) {
+      const VkImageCopy2 r11_to_422 = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .srcOffset = {5, 7, 0},
+         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .dstOffset = {6, 5, 0},
+         .extent = {37, 29, 1},
+      };
+      struct hk_g17p_image_copy_element_plan plan;
+      EXPECT(hk_g17p_image_copy_element_plan(
+                VK_FORMAT_B10G11R11_UFLOAT_PACK32, yuv_fmts[i], &r11_to_422,
+                &plan) &&
+                plan.block_size_B == 4 && plan.src_x_el == 5 &&
+                plan.src_y_el == 7 && plan.dst_x_el == 3 &&
+                plan.dst_y_el == 5 && plan.width_el == 37 &&
+                plan.height_el == 29,
+             "B10G11R11 -> 422 element plan mismatch");
+
+      const VkImageCopy2 yuv_to_r11 = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
+         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .srcOffset = {6, 5, 0},
+         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .dstOffset = {5, 7, 0},
+         .extent = {74, 29, 1},
+      };
+      EXPECT(hk_g17p_image_copy_element_plan(
+                yuv_fmts[i], VK_FORMAT_B10G11R11_UFLOAT_PACK32, &yuv_to_r11,
+                &plan) &&
+                plan.block_size_B == 4 && plan.src_x_el == 3 &&
+                plan.src_y_el == 5 && plan.dst_x_el == 5 &&
+                plan.dst_y_el == 7 && plan.width_el == 37 &&
+                plan.height_el == 29,
+             "422 -> B10G11R11 element plan mismatch");
+   }
+}
+
 int
 main(void)
 {
    check_g18g_meta_copy_admission();
    check_resolve_slice();
+   check_r11_422_element_plan();
    check_layered_layouts();
    check_mip_split();
    check_exact_2x2_rounding();

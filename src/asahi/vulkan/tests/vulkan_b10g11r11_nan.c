@@ -264,20 +264,28 @@ gpipe(void)
 static const struct pc PC = {W, H, 0, 0x7fc00000u};
 
 static void
-draw(VkCommandBuffer cb, VkImageView v, bool load, VkRect2D sc)
+draw_extent(VkCommandBuffer cb, VkImageView v, bool load, uint32_t w,
+            uint32_t h, VkRect2D sc)
 {
+   const struct pc pc = {w, h, 0, 0x7fc00000u};
    vkCmdBeginRendering(cb, &(VkRenderingInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-      .renderArea = {{0, 0}, {W, H}}, .layerCount = 1, .colorAttachmentCount = 1,
+      .renderArea = {{0, 0}, {w, h}}, .layerCount = 1, .colorAttachmentCount = 1,
       .pColorAttachments = &(VkRenderingAttachmentInfo){.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
          .imageView = v, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
          .loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR,
          .storeOp = VK_ATTACHMENT_STORE_OP_STORE}});
    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p_gfx);
-   vkCmdSetViewport(cb, 0, 1, &(VkViewport){0, 0, W, H, 0, 1});
+   vkCmdSetViewport(cb, 0, 1, &(VkViewport){0, 0, (float)w, (float)h, 0, 1});
    vkCmdSetScissor(cb, 0, 1, &sc);
-   vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_ALL, 0, sizeof(PC), &PC);
+   vkCmdPushConstants(cb, pl, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
    vkCmdDraw(cb, 3, 1, 0, 0);
    vkCmdEndRendering(cb);
+}
+
+static void
+draw(VkCommandBuffer cb, VkImageView v, bool load, VkRect2D sc)
+{
+   draw_extent(cb, v, load, W, H, sc);
 }
 
 /* returns the number of failing read paths */
@@ -1129,6 +1137,320 @@ run_r11_array_to_rgba8_3d(void)
    return fails;
 }
 
+static uint32_t
+payload_422_word(uint32_t x, uint32_t y, uint32_t x_bias, uint32_t y_bias,
+                 uint32_t hot_x, uint32_t hot_y)
+{
+   if (x == 0 && y == 0) return 0x000007e1u;
+   if (x == 1 && y == 0) return 0x000007c1u;
+   if (x == hot_x && y == hot_y) return 0x000007e1u;
+   if (x == hot_x + 1 && y == hot_y) return 0x000007c1u;
+   if (x == hot_x + 2 && y == hot_y) return 0x000007ffu;
+   if (x == hot_x + 3 && y == hot_y) return 0x003e0800u;
+   if (x == hot_x + 4 && y == hot_y) return 0xf8400000u;
+   if (x == hot_x + 5 && y == hot_y) return 0xffffffffu;
+   return pack_expected_payload((x + x_bias) % W, (y + y_bias) % H);
+}
+
+/* Regression for size-compatible copies between compressed 64x96 B10G11R11
+ * (1x1 4-byte block) and 128x96 packed 4:2:2 (2x1 4-byte block), verified
+ * through the opposite image's native buffer-copy path:
+ *   1. full compressed B10G11R11 -> 4:2:2 preserving noncanonical NaN 0x7e1;
+ *   2. partial B10G11R11 -> 4:2:2 with nonzero offsets and guard texels;
+ *   3. rendered (compressed tiles) B10G11R11 -> 4:2:2;
+ *   4. inverse partial 4:2:2 -> rendered compressed B10G11R11 with nonzero
+ *      offsets, noncanonical NaNs, and rendered compressed guard texels. */
+static unsigned
+run_r11_packed_422(VkFormat fmt_422, const char *name, unsigned *cases_out)
+{
+   VkFormatProperties fp;
+   vkGetPhysicalDeviceFormatProperties(pdev, fmt_422, &fp);
+   const VkFormatFeatureFlags need =
+      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+   if ((fp.optimalTilingFeatures & need) != need) {
+      printf("SKIP %s lacks optimal transfer support\n", name);
+      return 0;
+   }
+   *cases_out += 4;
+
+   const uint32_t R11_W = 64, R11_H = 96;
+   const uint32_t YUV_W = R11_W * 2, YUV_H = R11_H;
+   const uint32_t plane_el = R11_W * R11_H;
+   const VkDeviceSize plane_B = (VkDeviceSize)plane_el * 4;
+
+   VkImage img_r11, img_422;
+   VkDeviceMemory m_r11, m_422;
+   CHECK(vkCreateImage(dev, &(VkImageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+      .extent = {R11_W, R11_H, 1}, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &img_r11));
+   VkMemoryRequirements mr_r11;
+   vkGetImageMemoryRequirements(dev, img_r11, &mr_r11);
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr_r11.size,
+      .memoryTypeIndex = mem_type(mr_r11.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)},
+      NULL, &m_r11));
+   CHECK(vkBindImageMemory(dev, img_r11, m_r11, 0));
+
+   CHECK(vkCreateImage(dev, &(VkImageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = fmt_422,
+      .extent = {YUV_W, YUV_H, 1}, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &img_422));
+   VkMemoryRequirements mr_422;
+   vkGetImageMemoryRequirements(dev, img_422, &mr_422);
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr_422.size,
+      .memoryTypeIndex = mem_type(mr_422.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)},
+      NULL, &m_422));
+   CHECK(vkBindImageMemory(dev, img_422, m_422, 0));
+
+   VkImageView v_r11;
+   CHECK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img_r11,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+      NULL, &v_r11));
+
+   const VkDeviceSize hsz = 4 * plane_B; /* [src_r11 | guard_422 | src_422 | rb] */
+   VkBuffer hb;
+   CHECK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = hsz,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT}, NULL, &hb));
+   VkMemoryRequirements hr;
+   vkGetBufferMemoryRequirements(dev, hb, &hr);
+   VkDeviceMemory hm;
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = hr.size,
+      .memoryTypeIndex = mem_type(hr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}, NULL, &hm));
+   CHECK(vkBindBufferMemory(dev, hb, hm, 0));
+   uint32_t *hp;
+   CHECK(vkMapMemory(dev, hm, 0, VK_WHOLE_SIZE, 0, (void **)&hp));
+   memset(hp, 0, hsz);
+
+   const uint32_t r11_x = 5, r11_y = 7, yuv_x_el = 3, yuv_y = 5;
+   const uint32_t rw_el = 37, rh_el = 29;
+   uint32_t *src_r11 = hp;
+   uint32_t *guard_422 = hp + plane_el;
+   uint32_t *src_422 = hp + 2 * plane_el;
+   uint32_t *rb = hp + 3 * plane_el;
+   for (uint32_t y = 0; y < R11_H; ++y) {
+      for (uint32_t x = 0; x < R11_W; ++x) {
+         src_r11[y * R11_W + x] = payload_422_word(x, y, 0, 0, r11_x, r11_y);
+         guard_422[y * R11_W + x] = 0x5a000000u | ((y & 0xffu) << 8) | (x & 0xffu);
+         src_422[y * R11_W + x] = payload_422_word(x, y, 17, 11, yuv_x_el, yuv_y);
+      }
+   }
+
+   unsigned fails = 0;
+   char label[64];
+
+   /* 1. Full compressed 64x96 B10G11R11 -> 128x96 4:2:2, native 4:2:2 readback */
+   VkCommandBuffer cb = begin();
+   to_general(cb, img_r11);
+   to_general(cb, img_422);
+   vkCmdCopyBufferToImage(cb, hb, img_r11, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 0,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {R11_W, R11_H, 1}});
+   barrier(cb);
+   vkCmdCopyImage(cb, img_r11, VK_IMAGE_LAYOUT_GENERAL, img_422,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {0, 0, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {0, 0, 0},
+                     .extent = {R11_W, R11_H, 1},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, img_422, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 3 * plane_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {YUV_W, YUV_H, 1}});
+   submit(cb);
+
+   snprintf(label, sizeof(label), "%s/r11->422/full", name);
+   fails += check_exact_words(label, rb, src_r11, plane_el);
+
+   /* 2. Partial compressed B10G11R11 -> 4:2:2 with nonzero offsets and guard */
+   memset(rb, 0, plane_B);
+   cb = begin();
+   vkCmdCopyBufferToImage(cb, hb, img_422, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = plane_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {YUV_W, YUV_H, 1}});
+   barrier(cb);
+   vkCmdCopyImage(cb, img_r11, VK_IMAGE_LAYOUT_GENERAL, img_422,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {(int32_t)r11_x, (int32_t)r11_y, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {(int32_t)(yuv_x_el * 2), (int32_t)yuv_y, 0},
+                     .extent = {rw_el, rh_el, 1},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, img_422, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 3 * plane_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {YUV_W, YUV_H, 1}});
+   submit(cb);
+
+   {
+      unsigned ok = 0;
+      char first[160] = {0};
+      for (uint32_t y = 0; y < R11_H; ++y) {
+         for (uint32_t x = 0; x < R11_W; ++x) {
+            uint32_t got = rb[y * R11_W + x];
+            bool in = x >= yuv_x_el && x < yuv_x_el + rw_el &&
+                      y >= yuv_y && y < yuv_y + rh_el;
+            uint32_t want = in
+               ? src_r11[(r11_y + (y - yuv_y)) * R11_W + (r11_x + (x - yuv_x_el))]
+               : guard_422[y * R11_W + x];
+            if (got == want) ok++;
+            else if (!first[0])
+               snprintf(first, sizeof(first), "%u,%u(%s) got=0x%08x want=0x%08x",
+                        x, y, in ? "in" : "guard", got, want);
+         }
+      }
+      bool pass = ok == plane_el;
+      snprintf(label, sizeof(label), "%s/r11->422/partial", name);
+      printf("RESULT %-21s exact=%u/%u %s%s%s\n", label, ok, plane_el,
+             pass ? "PASS" : "FAIL", first[0] ? " first " : "", first);
+      if (!pass) fails++;
+   }
+
+   /* 3. Rendered (compressed tiles) B10G11R11 -> 4:2:2, native 4:2:2 readback */
+   memset(rb, 0, plane_B);
+   cb = begin();
+   draw_extent(cb, v_r11, false, R11_W, R11_H, (VkRect2D){{0, 0}, {R11_W, R11_H}});
+   barrier(cb);
+   vkCmdCopyImage(cb, img_r11, VK_IMAGE_LAYOUT_GENERAL, img_422,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {0, 0, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {0, 0, 0},
+                     .extent = {R11_W, R11_H, 1},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, img_422, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 3 * plane_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {YUV_W, YUV_H, 1}});
+   submit(cb);
+
+   {
+      struct tally tr = {0};
+      for (uint32_t y = 0; y < R11_H; ++y)
+         for (uint32_t x = 0; x < R11_W; ++x)
+            check_word(&tr, x, y, rb[y * R11_W + x]);
+      bool pass = tr.nan_ok == tr.nan_n && tr.inf_ok == tr.inf_n &&
+                  tr.oth_ok == tr.oth_n;
+      snprintf(label, sizeof(label), "%s/r11->422/render", name);
+      printf("RESULT %-21s nan=%u/%u inf=%u/%u other=%u/%u %s%s%s\n", label,
+             tr.nan_ok, tr.nan_n, tr.inf_ok, tr.inf_n, tr.oth_ok, tr.oth_n,
+             pass ? "PASS" : "FAIL", tr.first[0] ? " first " : "", tr.first);
+      if (!pass) fails++;
+   }
+
+   /* 4. Inverse partial 4:2:2 -> rendered compressed B10G11R11 */
+   memset(rb, 0, plane_B);
+   cb = begin();
+   draw_extent(cb, v_r11, false, R11_W, R11_H, (VkRect2D){{0, 0}, {R11_W, R11_H}});
+   vkCmdCopyBufferToImage(cb, hb, img_422, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 2 * plane_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {YUV_W, YUV_H, 1}});
+   barrier(cb);
+   vkCmdCopyImage(cb, img_422, VK_IMAGE_LAYOUT_GENERAL, img_r11,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {(int32_t)(yuv_x_el * 2), (int32_t)yuv_y, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {(int32_t)r11_x, (int32_t)r11_y, 0},
+                     .extent = {rw_el * 2, rh_el, 1},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, img_r11, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 3 * plane_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {R11_W, R11_H, 1}});
+   submit(cb);
+
+   {
+      unsigned in_ok = 0, in_n = 0;
+      struct tally tg = {0};
+      char first_in[160] = {0};
+      for (uint32_t y = 0; y < R11_H; ++y) {
+         for (uint32_t x = 0; x < R11_W; ++x) {
+            uint32_t got = rb[y * R11_W + x];
+            bool in = x >= r11_x && x < r11_x + rw_el &&
+                      y >= r11_y && y < r11_y + rh_el;
+            if (in) {
+               in_n++;
+               uint32_t want =
+                  src_422[(yuv_y + (y - r11_y)) * R11_W + (yuv_x_el + (x - r11_x))];
+               if (got == want) in_ok++;
+               else if (!first_in[0])
+                  snprintf(first_in, sizeof(first_in), "%u,%u got=0x%08x want=0x%08x",
+                           x, y, got, want);
+            } else {
+               check_word(&tg, x, y, got);
+            }
+         }
+      }
+      bool ok_in = in_ok == in_n;
+      bool ok_g = tg.nan_ok == tg.nan_n && tg.inf_ok == tg.inf_n &&
+                  tg.oth_ok == tg.oth_n;
+      snprintf(label, sizeof(label), "%s/422->r11/partial", name);
+      printf("RESULT %-21s in=%u/%u out_nan=%u/%u out_oth=%u/%u %s%s%s%s%s\n",
+             label, in_ok, in_n, tg.nan_ok, tg.nan_n, tg.oth_ok, tg.oth_n,
+             (ok_in && ok_g) ? "PASS" : "FAIL",
+             first_in[0] ? " in:" : "", first_in,
+             tg.first[0] ? " out:" : "", tg.first);
+      if (!ok_in || !ok_g) fails++;
+   }
+
+   vkUnmapMemory(dev, hm);
+   vkDestroyBuffer(dev, hb, NULL);
+   vkFreeMemory(dev, hm, NULL);
+   vkDestroyImageView(dev, v_r11, NULL);
+   vkDestroyImage(dev, img_r11, NULL);
+   vkDestroyImage(dev, img_422, NULL);
+   vkFreeMemory(dev, m_r11, NULL);
+   vkFreeMemory(dev, m_422, NULL);
+   return fails;
+}
+
 int
 main(void)
 {
@@ -1203,6 +1525,8 @@ main(void)
    }
    fails += run_r11_array_to_rgba8_3d();
    cases += 3;
+   fails += run_r11_packed_422(VK_FORMAT_G8B8G8R8_422_UNORM, "g8b8g8r8", &cases);
+   fails += run_r11_packed_422(VK_FORMAT_B8G8R8G8_422_UNORM, "b8g8r8g8", &cases);
    printf("SUMMARY %u/%u cases pass\n", cases - fails, cases);
    return fails ? 1 : 0;
 }

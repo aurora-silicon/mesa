@@ -7602,14 +7602,150 @@ hk_m5_r11_staged_barrier(struct hk_cmd_buffer *cmd,
       vk_command_buffer_to_handle(&cmd->vk), &dep);
 }
 
+struct hk_m5_r11_staged_region_plan {
+   struct hk_g17p_image_copy_element_plan el;
+   uint32_t src_block_w;
+   uint32_t src_block_h;
+   uint32_t dst_block_w;
+   uint32_t dst_block_h;
+   uint32_t src_w_px;
+   uint32_t src_h_px;
+   uint32_t dst_w_px;
+   uint32_t dst_h_px;
+   uint32_t src_slices;
+   uint32_t dst_slices;
+   uint64_t row_B;
+   uint32_t chunk_h_el;
+   uint32_t batch_slices;
+   uint64_t need_B;
+};
+
+static bool
+hk_m5_r11_staged_plan_region(struct hk_device *dev, const struct hk_image *src,
+                             const struct hk_image *dst,
+                             const VkImageCopy2 *region, uint64_t max_stage_B,
+                             uint32_t max_batch_slices,
+                             struct hk_m5_r11_staged_region_plan *out)
+{
+   uint8_t src_plane, dst_plane;
+   VkFormat src_fmt, dst_fmt;
+   if (!util_is_power_of_two_nonzero(region->srcSubresource.aspectMask) ||
+       !util_is_power_of_two_nonzero(region->dstSubresource.aspectMask) ||
+       region->srcSubresource.mipLevel >= src->vk.mip_levels ||
+       region->dstSubresource.mipLevel >= dst->vk.mip_levels ||
+       !hk_g17p_buffer_upload_plane(src, region->srcSubresource.aspectMask,
+                                    &src_plane, &src_fmt) ||
+       !hk_g17p_buffer_upload_plane(dst, region->dstSubresource.aspectMask,
+                                    &dst_plane, &dst_fmt))
+      return false;
+
+   struct hk_g17p_image_copy_element_plan el;
+   if (!hk_g17p_image_copy_element_plan(src_fmt, dst_fmt, region, &el) ||
+       el.block_size_B != 4)
+      return false;
+
+   const uint32_t src_bw = vk_format_get_blockwidth(src_fmt);
+   const uint32_t src_bh = vk_format_get_blockheight(src_fmt);
+   const uint32_t dst_bw = vk_format_get_blockwidth(dst_fmt);
+   const uint32_t dst_bh = vk_format_get_blockheight(dst_fmt);
+   const uint32_t src_x = (uint32_t)region->srcOffset.x;
+   const uint32_t src_y = (uint32_t)region->srcOffset.y;
+   const uint32_t dst_x = (uint32_t)region->dstOffset.x;
+   const uint32_t dst_y = (uint32_t)region->dstOffset.y;
+   if ((src_x % src_bw) || (src_y % src_bh) ||
+       (dst_x % dst_bw) || (dst_y % dst_bh))
+      return false;
+
+   const struct ail_layout *src_layout = &src->planes[src_plane].layout;
+   const struct ail_layout *dst_layout = &dst->planes[dst_plane].layout;
+   const uint32_t src_mip_w =
+      u_minify(src_layout->width_px, region->srcSubresource.mipLevel);
+   const uint32_t src_mip_h =
+      u_minify(src_layout->height_px, region->srcSubresource.mipLevel);
+   const uint32_t dst_mip_w =
+      u_minify(dst_layout->width_px, region->dstSubresource.mipLevel);
+   const uint32_t dst_mip_h =
+      u_minify(dst_layout->height_px, region->dstSubresource.mipLevel);
+   if (src_x >= src_mip_w || src_y >= src_mip_h ||
+       region->extent.width > src_mip_w - src_x ||
+       region->extent.height > src_mip_h - src_y ||
+       dst_x >= dst_mip_w || dst_y >= dst_mip_h)
+      return false;
+
+   const uint32_t dst_w_px = (uint32_t)MIN2((uint64_t)el.width_el * dst_bw,
+                                            (uint64_t)(dst_mip_w - dst_x));
+   const uint32_t dst_h_px = (uint32_t)MIN2((uint64_t)el.height_el * dst_bh,
+                                            (uint64_t)(dst_mip_h - dst_y));
+   if (DIV_ROUND_UP(dst_w_px, dst_bw) != el.width_el ||
+       DIV_ROUND_UP(dst_h_px, dst_bh) != el.height_el)
+      return false;
+
+   const uint32_t src_slices =
+      src->vk.image_type == VK_IMAGE_TYPE_3D
+         ? region->extent.depth
+         : vk_image_subresource_layer_count(&src->vk, &region->srcSubresource);
+   const uint32_t dst_slices =
+      dst->vk.image_type == VK_IMAGE_TYPE_3D
+         ? region->extent.depth
+         : vk_image_subresource_layer_count(&dst->vk, &region->dstSubresource);
+   VkImageCopy2 last;
+   if (!src_slices ||
+       !hk_g17p_image_copy_slice(dev->dev.chip, src->vk.image_type,
+                                 dst->vk.image_type, src_slices, dst_slices,
+                                 region, src_slices - 1, &last))
+      return false;
+
+   const uint64_t row_B = (uint64_t)el.width_el * 4u;
+   if (row_B == 0 || row_B > UINT32_MAX)
+      return false;
+
+   uint32_t chunk_h_el = el.height_el;
+   uint32_t batch_slices = 1;
+   if (row_B <= max_stage_B / el.height_el) {
+      const uint64_t slice_B = align64(row_B * el.height_el, 16);
+      batch_slices = MIN2(MIN2(src_slices, max_batch_slices),
+                          (uint32_t)MAX2(1ull, max_stage_B / slice_B));
+   } else {
+      uint32_t rows_el = (uint32_t)MAX2(1ull, max_stage_B / row_B);
+      if (rows_el >= 16)
+         rows_el &= ~15u;
+      chunk_h_el = MIN2(el.height_el, rows_el);
+   }
+
+   const uint64_t strip_stride_B = align64(row_B * chunk_h_el, 16);
+   const uint64_t need_B = (uint64_t)batch_slices * strip_stride_B;
+   if (need_B > UINT32_MAX)
+      return false;
+
+   *out = (struct hk_m5_r11_staged_region_plan){
+      .el = el,
+      .src_block_w = src_bw,
+      .src_block_h = src_bh,
+      .dst_block_w = dst_bw,
+      .dst_block_h = dst_bh,
+      .src_w_px = region->extent.width,
+      .src_h_px = region->extent.height,
+      .dst_w_px = dst_w_px,
+      .dst_h_px = dst_h_px,
+      .src_slices = src_slices,
+      .dst_slices = dst_slices,
+      .row_B = row_B,
+      .chunk_h_el = chunk_h_el,
+      .batch_slices = batch_slices,
+      .need_B = need_B,
+   };
+   return true;
+}
+
 /*
  * Packed-word staging fallback for compressed M5 B10G11R11 image copies that
- * hk_m5_copy_compressed_r11_image() declines (for example, a compressed
- * B10G11R11 2D array copied into a size-compatible compressed 3D RGBA8 image,
- * which cannot be decompressed in place). Staging raw 32-bit words through a
- * command-local temporary buffer reuses the bit-exact ImageToBuffer and
- * BufferToImage paths and avoids the graphics meta fallback that samples
- * B10G11R11 as float and repacks with a NaN-dropping clamp.
+ * hk_m5_copy_compressed_r11_image() declines (for example, copies into a
+ * size-compatible compressed 3D RGBA8 destination or between 1x1 B10G11R11 and
+ * 2x1 packed 4:2:2 formats). Size and partition each region in 4-byte elements
+ * via hk_g17p_image_copy_element_plan() and issue the per-endpoint
+ * ImageToBuffer and BufferToImage copies in each endpoint's native texel
+ * coordinates, avoiding the graphics meta fallback that samples B10G11R11 as
+ * float and repacks with a NaN-dropping clamp.
  */
 static bool
 hk_m5_copy_compressed_r11_image_staged(struct hk_cmd_buffer *cmd,
@@ -7630,67 +7766,11 @@ hk_m5_copy_compressed_r11_image_staged(struct hk_cmd_buffer *cmd,
    uint64_t buf_size = 0;
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
-      const VkImageCopy2 *region = &info->pRegions[r];
-      if (!util_is_power_of_two_nonzero(region->srcSubresource.aspectMask) ||
-          !util_is_power_of_two_nonzero(region->dstSubresource.aspectMask) ||
-          region->srcSubresource.mipLevel >= src->vk.mip_levels ||
-          region->dstSubresource.mipLevel >= dst->vk.mip_levels ||
-          region->extent.width == 0 || region->extent.height == 0)
+      struct hk_m5_r11_staged_region_plan plan;
+      if (!hk_m5_r11_staged_plan_region(dev, src, dst, &info->pRegions[r],
+                                        max_stage_B, max_batch_slices, &plan))
          return false;
-
-      const VkFormat src_fmt =
-         aspect_format(src->vk.format, region->srcSubresource.aspectMask);
-      const VkFormat dst_fmt =
-         aspect_format(dst->vk.format, region->dstSubresource.aspectMask);
-      if (src_fmt == VK_FORMAT_UNDEFINED || dst_fmt == VK_FORMAT_UNDEFINED ||
-          vk_format_get_blocksize(src_fmt) != 4 ||
-          vk_format_get_blocksize(dst_fmt) != 4 ||
-          vk_format_get_blockwidth(src_fmt) != 1 ||
-          vk_format_get_blockheight(src_fmt) != 1 ||
-          vk_format_get_blockwidth(dst_fmt) != 1 ||
-          vk_format_get_blockheight(dst_fmt) != 1)
-         return false;
-
-      const uint32_t src_slices =
-         src->vk.image_type == VK_IMAGE_TYPE_3D
-            ? region->extent.depth
-            : vk_image_subresource_layer_count(&src->vk,
-                                               &region->srcSubresource);
-      const uint32_t dst_slices =
-         dst->vk.image_type == VK_IMAGE_TYPE_3D
-            ? region->extent.depth
-            : vk_image_subresource_layer_count(&dst->vk,
-                                               &region->dstSubresource);
-      VkImageCopy2 last;
-      if (!src_slices ||
-          !hk_g17p_image_copy_slice(dev->dev.chip, src->vk.image_type,
-                                    dst->vk.image_type, src_slices, dst_slices,
-                                    region, src_slices - 1, &last))
-         return false;
-
-      const uint64_t row_B = (uint64_t)region->extent.width * 4u;
-      if (row_B == 0 || row_B > UINT32_MAX)
-         return false;
-
-      uint32_t strip_h = region->extent.height;
-      uint32_t batch_slices = 1;
-      if (row_B <= max_stage_B / region->extent.height) {
-         const uint64_t slice_B = align64(row_B * region->extent.height, 16);
-         batch_slices = MIN2(
-            MIN2(src_slices, max_batch_slices),
-            (uint32_t)MAX2(1ull, max_stage_B / slice_B));
-      } else {
-         uint32_t rows = (uint32_t)MAX2(1ull, max_stage_B / row_B);
-         if (rows >= 16)
-            rows &= ~15u;
-         strip_h = MIN2(region->extent.height, rows);
-      }
-
-      const uint64_t strip_stride_B = align64(row_B * strip_h, 16);
-      const uint64_t need_B = (uint64_t)batch_slices * strip_stride_B;
-      if (need_B > UINT32_MAX)
-         return false;
-      buf_size = MAX2(buf_size, need_B);
+      buf_size = MAX2(buf_size, plan.need_B);
    }
 
    if (buf_size == 0)
@@ -7725,36 +7805,27 @@ hk_m5_copy_compressed_r11_image_staged(struct hk_cmd_buffer *cmd,
 
    for (uint32_t r = 0; r < info->regionCount; ++r) {
       const VkImageCopy2 *region = &info->pRegions[r];
-      const uint32_t src_slices =
-         src->vk.image_type == VK_IMAGE_TYPE_3D
-            ? region->extent.depth
-            : vk_image_subresource_layer_count(&src->vk,
-                                               &region->srcSubresource);
-      const uint32_t dst_slices =
-         dst->vk.image_type == VK_IMAGE_TYPE_3D
-            ? region->extent.depth
-            : vk_image_subresource_layer_count(&dst->vk,
-                                               &region->dstSubresource);
-      const uint64_t row_B = (uint64_t)region->extent.width * 4u;
-      uint32_t chunk_h = region->extent.height;
-      uint32_t batch_slices = 1;
-      if (row_B <= max_stage_B / region->extent.height) {
-         const uint64_t slice_B = align64(row_B * region->extent.height, 16);
-         batch_slices = MIN2(
-            MIN2(src_slices, max_batch_slices),
-            (uint32_t)MAX2(1ull, max_stage_B / slice_B));
-      } else {
-         uint32_t rows = (uint32_t)MAX2(1ull, max_stage_B / row_B);
-         if (rows >= 16)
-            rows &= ~15u;
-         chunk_h = MIN2(region->extent.height, rows);
-      }
+      struct hk_m5_r11_staged_region_plan plan;
+      ASSERTED const bool planned = hk_m5_r11_staged_plan_region(
+         dev, src, dst, region, max_stage_B, max_batch_slices, &plan);
+      assert(planned);
 
-      for (uint32_t s = 0; s < src_slices; s += batch_slices) {
-         const uint32_t cur_batch = MIN2(batch_slices, src_slices - s);
-         for (uint32_t y = 0; y < region->extent.height; y += chunk_h) {
-            const uint32_t strip_h = MIN2(chunk_h, region->extent.height - y);
-            const uint64_t strip_B = align64(row_B * strip_h, 16);
+      for (uint32_t s = 0; s < plan.src_slices; s += plan.batch_slices) {
+         const uint32_t cur_batch =
+            MIN2(plan.batch_slices, plan.src_slices - s);
+         for (uint32_t y_el = 0; y_el < plan.el.height_el;
+              y_el += plan.chunk_h_el) {
+            const uint32_t strip_h_el =
+               MIN2(plan.chunk_h_el, plan.el.height_el - y_el);
+            const uint64_t strip_B = align64(plan.row_B * strip_h_el, 16);
+            const uint32_t src_y_off_px = y_el * plan.src_block_h;
+            const uint32_t dst_y_off_px = y_el * plan.dst_block_h;
+            const uint32_t src_strip_h_px = (uint32_t)MIN2(
+               (uint64_t)strip_h_el * plan.src_block_h,
+               (uint64_t)(plan.src_h_px - src_y_off_px));
+            const uint32_t dst_strip_h_px = (uint32_t)MIN2(
+               (uint64_t)strip_h_el * plan.dst_block_h,
+               (uint64_t)(plan.dst_h_px - dst_y_off_px));
 
             if (used_buf) {
                hk_m5_r11_staged_barrier(
@@ -7770,7 +7841,7 @@ hk_m5_copy_compressed_r11_image_staged(struct hk_cmd_buffer *cmd,
                VkImageCopy2 one;
                ASSERTED const bool sliced = hk_g17p_image_copy_slice(
                   dev->dev.chip, src->vk.image_type, dst->vk.image_type,
-                  src_slices, dst_slices, region, s + b, &one);
+                  plan.src_slices, plan.dst_slices, region, s + b, &one);
                assert(sliced);
 
                src_copies[b] = (VkBufferImageCopy2){
@@ -7778,18 +7849,18 @@ hk_m5_copy_compressed_r11_image_staged(struct hk_cmd_buffer *cmd,
                   .bufferOffset = (uint64_t)b * strip_B,
                   .imageSubresource = one.srcSubresource,
                   .imageOffset = {one.srcOffset.x,
-                                  one.srcOffset.y + (int32_t)y,
+                                  one.srcOffset.y + (int32_t)src_y_off_px,
                                   one.srcOffset.z},
-                  .imageExtent = {one.extent.width, strip_h, 1},
+                  .imageExtent = {plan.src_w_px, src_strip_h_px, 1},
                };
                dst_copies[b] = (VkBufferImageCopy2){
                   .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
                   .bufferOffset = (uint64_t)b * strip_B,
                   .imageSubresource = one.dstSubresource,
                   .imageOffset = {one.dstOffset.x,
-                                  one.dstOffset.y + (int32_t)y,
+                                  one.dstOffset.y + (int32_t)dst_y_off_px,
                                   one.dstOffset.z},
-                  .imageExtent = {one.extent.width, strip_h, 1},
+                  .imageExtent = {plan.dst_w_px, dst_strip_h_px, 1},
                };
             }
 
