@@ -792,16 +792,20 @@ ilp_latency(const agx_context *ctx, const agx_instr *I, unsigned alu,
    case AGX_OPCODE_LOCAL_ATOMIC:
       return load;
    case AGX_OPCODE_RSQRT:
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          !ctx->key->dev.emit_agx3d)
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+           ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) ||
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+           !ctx->key->dev.emit_agx3d))
          return 3 * alu;
       return alu;
    case AGX_OPCODE_RCP:
    case AGX_OPCODE_LOG2:
    case AGX_OPCODE_EXP2:
    case AGX_OPCODE_SIN_PT_2:
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          !ctx->key->dev.emit_agx3d)
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+           ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) ||
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+           !ctx->key->dev.emit_agx3d))
          return 2 * alu;
       return alu;
    case AGX_OPCODE_SPLIT:
@@ -1797,6 +1801,26 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
 }
 
 static unsigned
+ilp_block_sfu_ops(const agx_block *block)
+{
+   unsigned n = 0;
+   agx_foreach_instr_in_block(block, I) {
+      switch (I->op) {
+      case AGX_OPCODE_RSQRT:
+      case AGX_OPCODE_RCP:
+      case AGX_OPCODE_LOG2:
+      case AGX_OPCODE_EXP2:
+      case AGX_OPCODE_SIN_PT_2:
+         n++;
+         break;
+      default:
+         break;
+      }
+   }
+   return n;
+}
+
+static unsigned
 ilp_block_compute_loads(const agx_block *block, unsigned *device_loads)
 {
    unsigned local_loads = 0;
@@ -1996,6 +2020,26 @@ ilp_block_has_discard_or_zs(const agx_block *block)
    return false;
 }
 
+/* True when WAIT_PIX precedes any texture sample/load or image load in the
+ * block (e.g. a fragment shader interlock critical section), including
+ * non-relocatable forms such as 3D samples, where hoisting could move a sample
+ * ahead of WAIT_PIX. Trailing epilog WAIT_PIX emitted before st_tile after all
+ * samples is unaffected. */
+static bool
+ilp_block_has_wait_pix_before_sample(const agx_block *block)
+{
+   bool saw_wait_pix = false;
+   agx_foreach_instr_in_block(block, I) {
+      if (I->op == AGX_OPCODE_WAIT_PIX)
+         saw_wait_pix = true;
+      else if (saw_wait_pix && (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+                                I->op == AGX_OPCODE_TEXTURE_LOAD ||
+                                I->op == AGX_OPCODE_IMAGE_LOAD))
+         return true;
+   }
+   return false;
+}
+
 /* M5 compute sample-issue budget: register halves kept free below an
  * occupancy bucket for allocation alignment, and the register file size. */
 #define AGX_ILP_M5_OCCUPANCY_MARGIN 8
@@ -2125,9 +2169,13 @@ agx_ilp_agx3b_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
    if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > max_halves)
       return 0;
 
-   return agx_occupancy_for_register_count(
-             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
-          AGX_ILP_M5_OCCUPANCY_MARGIN;
+   const int step_top =
+      agx_occupancy_for_register_count(program_peak).max_registers;
+   const int bound = MIN2(step_top, max_halves);
+   if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > bound)
+      return 0;
+
+   return bound - AGX_ILP_M5_OCCUPANCY_MARGIN;
 }
 
 /* Work within the shader's physical budget, retaining space for later
@@ -2523,18 +2571,31 @@ agx_ilp_schedule(agx_context *ctx)
                             &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
-                 ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
+                 (samples >= AGX_ILP_FS_MIN_SAMPLES ||
+                  (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                   samples >= 2 && !ilp_block_has_discard_or_zs(block) &&
+                   !ilp_block_has_wait_pix_before_sample(block) &&
+                   ilp_block_sfu_ops(block) >= 3))) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.
           * Apple's fragment programs issue independent samples back to back
           * and consume the results afterwards: move each sample and what it
-          * depends on up, and keep the pressure order for everything else. */
+          * depends on up, and keep the pressure order for everything else.
+          *
+          * On AGX3B, also cover 2-3 sample SFU-heavy fragment shaders without
+          * discard, zs_emit, or WAIT_PIX interlocks strictly inside their
+          * current occupancy step, and interleave independent post-sample
+          * SFU/ALU chains across channels as on AGX3C. */
+         const bool agx3b_fragment =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+         const bool agx3b_sfu_only =
+            agx3b_fragment && samples < AGX_ILP_FS_MIN_SAMPLES;
          signed slack = AGX_ILP_FS_SAMPLE_SLACK;
          signed peak = 0;
          if (m5_fragment) {
             peak = ilp_block_peak(ctx, block, size16, memctx);
             slack = MAX2(slack, occupancy_cap - peak);
-         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+         } else if (agx3b_fragment) {
             if (!agx3b_frag_cap_ready) {
                agx3b_frag_cap =
                   agx_ilp_agx3b_fragment_cap(ctx, &size16, memctx);
@@ -2545,6 +2606,8 @@ agx_ilp_schedule(agx_context *ctx)
                slack = MAX2(slack, agx3b_frag_cap - peak);
             }
          }
+         const signed agx3b_strict_slack =
+            agx3b_frag_cap > peak ? MIN2(slack, agx3b_frag_cap - peak) : 0;
          bool scheduled = false;
          if (m5_fragment_ilp && !ilp_block_has_discard_or_zs(block)) {
             const signed tight_slack =
@@ -2565,13 +2628,28 @@ agx_ilp_schedule(agx_context *ctx)
                   AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
                   false, false, false, true, false, &dag_state);
             }
+         } else if (agx3b_fragment && !ilp_block_has_discard_or_zs(block) &&
+                    !ilp_block_has_wait_pix_before_sample(block)) {
+            if (agx3b_strict_slack > 0) {
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, alu_latency,
+                  16 * alu_latency, agx3b_strict_slack, 0, NULL, false, true,
+                  AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
+                  false, false, false, true, false, &dag_state);
+            }
          }
-         if (!scheduled) {
-            ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                               16 * alu_latency, slack, 0, NULL, false,
-                               true, AGX_ILP_FS_SAMPLE_HALVES,
-                               AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
-                               false, false, false, &dag_state);
+         if (!scheduled && !agx3b_sfu_only &&
+             !(agx3b_fragment && ilp_block_has_wait_pix_before_sample(block))) {
+            const signed fallback_slack =
+               agx3b_fragment ? agx3b_strict_slack : slack;
+            if (!agx3b_fragment || fallback_slack > 0) {
+               ilp_schedule_block(ctx, block, memctx, native_uniforms,
+                                  alu_latency, 16 * alu_latency, fallback_slack,
+                                  0, NULL, false, true,
+                                  AGX_ILP_FS_SAMPLE_HALVES,
+                                  AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
+                                  false, false, false, &dag_state);
+            }
          }
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
