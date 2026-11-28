@@ -21,6 +21,7 @@
 #include "hk_compute_kick.h"
 #include "hk_descriptor_table.h"
 #include "hk_entrypoints.h"
+#include "hk_event.h"
 #include "hk_instance.h"
 #include "hk_native_sampler.h"
 #include "hk_ray_tracing_pipeline.h"
@@ -1165,7 +1166,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->submit_batch_size = instance->drirc.performance.submit_batch_size;
 
    vk_device_set_drm_fd(&dev->vk, dev->dev.fd);
-   dev->vk.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
+   hk_gpu_waits_init(dev);
+   dev->vk.copy_sync_payloads = dev->gpu_waits.enabled
+      ? hk_gpu_waits_copy_sync_payloads
+      : vk_drm_syncobj_copy_payloads;
    dev->vk.command_buffer_ops = &hk_cmd_buffer_ops;
    dev->vk.check_status = hk_check_status;
    dev->vk.get_timestamp = hk_get_timestamp;
@@ -1337,6 +1341,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
 
    hk_cmd_pending_init(dev);
    hk_query_stamps_init(dev);
+   hk_events_init(dev);
    simple_mtx_init(&dev->vdm.lock, mtx_plain);
    for (unsigned class = 0; class < HK_CMD_SLAB_COUNT; ++class) {
       list_inithead(&dev->vdm.slabs[class]);
@@ -1407,6 +1412,7 @@ fail_dev:
    agx_bo_unreference(&dev->dev, dev->code_heap.chunk);
    agx_close_device(&dev->dev);
    /* agx_close_device owns the DRM fd after agx_open_device succeeds. */
+   hk_gpu_waits_finish(dev);
    goto fail_init;
 fail_fd:
    close(dev->dev.fd);
@@ -1469,11 +1475,13 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    hk_compute_kick_finish(dev);
 
    vk_device_finish(&dev->vk);
+   hk_gpu_waits_finish(dev);
 
    /* All submit workers/queues are gone. No command bytes can be handed to
     * a new recording during teardown. Kernel job pins retain failed work. */
    hk_cmd_pending_finish(dev);
    simple_mtx_destroy(&dev->cmd_pending_lock);
+   hk_events_finish(dev);
    hk_query_stamps_finish(dev);
    hk_device_finish_vdm_slabs(dev);
    simple_mtx_destroy(&dev->vdm.lock);

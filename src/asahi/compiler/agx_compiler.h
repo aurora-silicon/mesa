@@ -47,8 +47,9 @@ extern "C" {
 
 /* Representable spill-slot bitfield capacity in agx_index::reg (8192 halves =
  * 16 KiB). Actual RA spill allocation is bounded per-target and per-stage in
- * agx_register_allocate.c; AGX2 stays at AGX2_MAX_SPILL_SLOTS (4 KiB) to
- * preserve its per-core agx_scratch memory bound.
+ * agx_register_allocate.c; AGX2 defaults to AGX2_MAX_SPILL_SLOTS (4 KiB) when
+ * max_scratch_B is unset and honors larger max_scratch_B up to
+ * AGX_NUM_MODELED_REGS within its 64 KiB immediate stack offset ceiling.
  */
 #define AGX_NUM_MODELED_REGS_LOG2 (13)
 #define AGX_NUM_MODELED_REGS      (1 << AGX_NUM_MODELED_REGS_LOG2)
@@ -453,6 +454,12 @@ typedef struct {
 
    /* TODO: Handle tilebuffer ops more efficient */
    bool explicit_coords : 1;
+
+   /* AGX3B: this ld_tile is PIXINFO (nir_intrinsic_load_sample_groups_agx).
+    * Its source is the coverage word and its 16-bit destination the packed
+    * sample groups. It names no target bytes: the tile protocols give it the
+    * colour transaction of a first read, and nothing else. */
+   bool sample_groups : 1;
 
    /* Logical attachment identity, independent of the physical pixel_offset. */
    uint8_t colour_target;
@@ -1360,6 +1367,7 @@ void agx_opt_promote_constants(agx_context *ctx);
 void agx_opt_promote_m5_float_constants(agx_context *ctx);
 void agx_dce(agx_context *ctx, bool partial);
 void agx_pressure_schedule(agx_context *ctx);
+void agx_hoist_loads(agx_context *ctx);
 void agx_ilp_schedule(agx_context *ctx);
 int agx_ilp_m5_device_load_cap(int program_peak);
 unsigned agx3_register_budget(agx_context *ctx);
@@ -1456,6 +1464,11 @@ void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);
  * encoding. */
 bool agx3_g17p_interleaved_zs(const agx_context *ctx);
 bool agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission);
+/* The general M5 float select's encoder descriptor, as the packer builds it
+ * (agx3_pack_binary.c); `ssa` before register allocation. */
+struct agx3_fsel32_gpu1_desc;
+bool agx3_m5_fcmpsel_gpu1_desc(const agx_context *ctx, const agx_instr *I,
+                               bool ssa, struct agx3_fsel32_gpu1_desc *d);
 /* agx3_pack_binary, packed once more for a G18G vertex shader whose texture
  * reads reach past AGX3_G18G_READ_STAGING_LIMIT, with its outputs above
  * them (agx3_pack_binary.c). */
