@@ -397,6 +397,12 @@ surviving_branches(nir_shader *nir, const nir_opt_preamble_options *options,
 }
 
 static float
+instr_cost_weighted(nir_instr *instr, const void *data)
+{
+   return instr_cost(instr, data) * execution_weight(instr->block, data);
+}
+
+static float
 instr_cost_g17p(nir_instr *instr, const void *data)
 {
    float weight = execution_weight(instr->block, data);
@@ -506,13 +512,7 @@ rewrite_cost_impl(nir_def *def, bool g17p)
 }
 
 static float
-rewrite_cost(nir_def *def, const void *data)
-{
-   return rewrite_cost_impl(def, false);
-}
-
-static float
-rewrite_cost_g17p(nir_def *def, const void *data)
+rewrite_weight(nir_def *def, const void *data)
 {
    /* A phi is worth what its arms are, one if deeper than it sits. */
    nir_block *block = nir_def_block(def);
@@ -521,7 +521,19 @@ rewrite_cost_g17p(nir_def *def, const void *data)
        is_branch(data, nir_cf_node_prev(&block->cf_node)))
       weight /= 8.0f;
 
-   return rewrite_cost_impl(def, true) * weight;
+   return weight;
+}
+
+static float
+rewrite_cost(nir_def *def, const void *data)
+{
+   return rewrite_cost_impl(def, false) * rewrite_weight(def, data);
+}
+
+static float
+rewrite_cost_g17p(nir_def *def, const void *data)
+{
+   return rewrite_cost_impl(def, true) * rewrite_weight(def, data);
 }
 
 /* AGX3C publishes constant-program results with 32-bit uniform copies only
@@ -532,7 +544,7 @@ rewrite_cost_agx3c(nir_def *def, const void *data)
 {
    if (def->bit_size < 32 && def->num_components > 1)
       return 1e30f;
-   return rewrite_cost_impl(def, true);
+   return rewrite_cost_impl(def, true) * rewrite_weight(def, data);
 }
 
 static bool
@@ -587,7 +599,7 @@ static const nir_opt_preamble_options preamble_options = {
    /* not supported in hardware */
    .load_workgroup_size_allowed = false,
    .def_size = def_size,
-   .instr_cost_cb = instr_cost,
+   .instr_cost_cb = instr_cost_weighted,
    .rewrite_cost_cb = rewrite_cost,
    .avoid_instr_cb = avoid_instr,
 
@@ -1099,15 +1111,14 @@ agx_nir_opt_preamble(nir_shader *nir, unsigned *sizes, bool g17p,
       options.instr_cost_cb = agx3c ? instr_cost_agx3c : instr_cost_g17p;
       options.rewrite_cost_cb = agx3c ? rewrite_cost_agx3c : rewrite_cost_g17p;
    }
-   /* The AGX3B encoding: the uniform file the preamble fills is the
-    * encoding's. */
+   /* The AGX3B encoding: keep 16-bit float loop operands in registers. */
    const bool agx3b = g17p && !agx3c;
-   struct set *branches = NULL;
-   if (agx3b) {
+   if (agx3b)
       options.avoid_instr_cb = keep_half_loop_operand_in_registers;
-      branches = surviving_branches(nir, &options, sizes, flatten);
-      options.cb_data = branches;
-   }
+   /* Every encoding: code under an if that stays a branch may not run on
+    * any of them, and each fills its own uniform file the same way. */
+   struct set *branches = surviving_branches(nir, &options, sizes, flatten);
+   options.cb_data = branches;
    bool speculative = false;
    struct set *promoted_speculative = NULL;
    if (!agx3c &&
