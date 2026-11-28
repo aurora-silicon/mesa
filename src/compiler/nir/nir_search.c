@@ -42,7 +42,16 @@ struct match_variable {
 struct match_state {
    unsigned fp_math_ctrl;
    uint8_t comm_op_direction;
+
+   /* Commutative expressions whose direction bit a failed attempt looked at,
+    * and whether that attempt called an expression or variable condition.
+    * Combinations that agree on the looked-at bits fail the same way and are
+    * skipped, but only after an attempt that called no condition: a condition
+    * may count or record its calls, so every combination that would reach one
+    * is still tried, in order.
+    */
    uint8_t comm_mask_used;
+   bool cond_called;
    unsigned variables_seen;
 
    /* Used for running the automaton on newly-constructed instructions. */
@@ -294,6 +303,7 @@ match_variable_cond(const nir_algebraic_table *table,
    for (unsigned i = 0; i < num_components; ++i)
       new_swizzle[i] = instr->src[src].swizzle[swizzle[i]];
 
+   state->cond_called = true;
    if (!table->variable_cond[var->cond_index](state->state, instr,
                                               src, num_components, new_swizzle))
       return false;
@@ -537,8 +547,11 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
                  unsigned num_components, const uint8_t *swizzle,
                  struct match_state *state)
 {
-   if (expr->cond_index != -1 && !table->expression_cond[expr->cond_index](instr))
-      return false;
+   if (expr->cond_index != -1) {
+      state->cond_called = true;
+      if (!table->expression_cond[expr->cond_index](instr))
+         return false;
+   }
 
    if (!nir_op_matches_search_op(instr->op, expr->opcode))
       return false;
@@ -884,6 +897,7 @@ match_comm_multi(const nir_algebraic_table *table,
          const unsigned comb = u_bit_scan64(&todo);
          state->comm_op_direction = (uint8_t)comb;
          state->comm_mask_used = 0;
+         state->cond_called = false;
          state->fp_math_ctrl = root_fp_math_ctrl;
          state->variables_seen = 0;
 
@@ -897,6 +911,8 @@ match_comm_multi(const nir_algebraic_table *table,
          if (matched)
             return true;
 
+         if (state->cond_called)
+            continue;
          const uint8_t used = state->comm_mask_used & all_bits;
          if (!used)
             return false;
@@ -920,6 +936,7 @@ match_comm_multi(const nir_algebraic_table *table,
          const unsigned comb = (w << 6) | bit;
          state->comm_op_direction = (uint8_t)comb;
          state->comm_mask_used = 0;
+         state->cond_called = false;
          state->fp_math_ctrl = root_fp_math_ctrl;
          state->variables_seen = 0;
 
@@ -933,6 +950,8 @@ match_comm_multi(const nir_algebraic_table *table,
          if (matched)
             return true;
 
+         if (state->cond_called)
+            continue;
          const uint8_t used = state->comm_mask_used & all_bits;
          if (!used)
             return false;
@@ -1128,6 +1147,7 @@ nir_algebraic_instr(nir_builder *build, nir_instr *instr,
       } else if (comm_bits == 1) {
          mstate.comm_op_direction = 0;
          mstate.comm_mask_used = 0;
+         mstate.cond_called = false;
          mstate.fp_math_ctrl = root_fp_math_ctrl;
          mstate.variables_seen = 0;
          found = direct_root
@@ -1135,7 +1155,7 @@ nir_algebraic_instr(nir_builder *build, nir_instr *instr,
                                        alu_comps, identity_swizzle, &mstate)
             : match_expression(table, search, alu,
                                alu_comps, identity_swizzle, &mstate);
-         if (!found && (mstate.comm_mask_used & 1u)) {
+         if (!found && ((mstate.comm_mask_used & 1u) || mstate.cond_called)) {
             mstate.comm_op_direction = 1;
             mstate.fp_math_ctrl = root_fp_math_ctrl;
             mstate.variables_seen = 0;
