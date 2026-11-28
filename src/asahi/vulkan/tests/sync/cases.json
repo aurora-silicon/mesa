@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "defaults": {
+    "timeout": 120
+  },
+  "cases": [
+    {
+      "name": "layer-disjoint-queues",
+      "tier": "strict",
+      "executable": "borealis-sync",
+      "args": ["--iterations", "300", "layer-disjoint-queues"],
+      "timeout": 240,
+      "description": "Two queues render partial areas of different array layers of one image at once."
+    },
+    {
+      "name": "feedback-loop-outside-area",
+      "tier": "strict",
+      "executable": "borealis-sync",
+      "args": ["--iterations", "300", "feedback-loop-outside-area"],
+      "timeout": 240,
+      "description": "A cross-queue upload, then a feedback-loop render that samples the same image outside its render area."
+    },
+    {
+      "name": "cross-queue-render-compute",
+      "tier": "strict",
+      "executable": "g17p-vulkan-cross-queue",
+      "timeout": 240,
+      "description": "Timeline-ordered render and compute work on independent queues."
+    },
+    {
+      "name": "partial-render-area",
+      "tier": "strict",
+      "executable": "vulkan-render-area",
+      "description": "Partial-tile load and store preservation across render areas."
+    },
+    {
+      "name": "sparse-multiview-preservation",
+      "tier": "strict",
+      "executable": "g17p-vulkan-multiview-clear",
+      "args": ["500", "128"],
+      "description": "Sparse multiview clear/load/store preservation between API-disjoint layers."
+    },
+    {
+      "name": "msaa-transfer-copy",
+      "tier": "strict",
+      "executable": "vulkan-msaa-xfer",
+      "args": ["d32", "rgba8", "copy"],
+      "description": "Transfer-to-render ordering with compressed multisample attachments."
+    },
+    {
+      "name": "msaa-transfer-mixed",
+      "tier": "strict",
+      "executable": "vulkan-msaa-xfer",
+      "args": ["d32", "rgba8", "mixed"],
+      "description": "Transfer-to-render ordering across compressed and plain attachments."
+    },
+    {
+      "name": "tessellation-batch",
+      "tier": "strict",
+      "executable": "vulkan-tess-batch",
+      "args": ["20"],
+      "timeout": 180,
+      "description": "Batched pre-rasterization work and attachment completion."
+    },
+    {
+      "name": "tile-submit-lifetime",
+      "tier": "strict",
+      "executable": "aurora-tilesubmit",
+      "args": ["1500"],
+      "timeout": 240,
+      "description": "Long bursts of transfer submissions and command-buffer retirement."
+    },
+    {
+      "name": "sparse-first-submit",
+      "tier": "strict",
+      "executable": "hk-vulkan-sparse-bind-first-submit",
+      "description": "Sparse-bind completion and visibility on a queue's first submission."
+    },
+    {
+      "name": "metadata-preservation",
+      "tier": "strict",
+      "executable": "g17p-vulkan-garbage-metadata",
+      "description": "Attachment metadata initialization, preservation, and readback ordering."
+    },
+    {
+      "name": "storage-compression",
+      "tier": "strict",
+      "executable": "vulkan-storage-compression",
+      "timeout": 180,
+      "description": "Storage, render, and transfer visibility across compressed images."
+    },
+    {
+      "name": "submit-pack-ordering",
+      "tier": "strict",
+      "executable": "aurora-packtest",
+      "args": ["5", "indep-order", "sem", "depth", "split-render", "split-event"],
+      "timeout": 180,
+      "description": "Semaphore and deep compute submission ordering across packed command buffers."
+    },
+    {
+      "name": "submit-pack-dup",
+      "tier": "strict",
+      "opt_in": true,
+      "executable": "aurora-packtest",
+      "args": ["5", "dup"],
+      "timeout": 180,
+      "description": "Duplicate command buffer submitted several times in one batch; opt-in until the kernel accepts duplicate recordings."
+    },
+    {
+      "name": "cross-process-pressure",
+      "tier": "strict",
+      "members": [
+        "layer-disjoint-queues",
+        "feedback-loop-outside-area",
+        "partial-render-area",
+        "msaa-transfer-mixed"
+      ],
+      "timeout": 300,
+      "description": "Strict cases run at the same time in separate processes for cross-process GPU pressure."
+    },
+    {
+      "name": "same-image-disjoint-tiles",
+      "tier": "compat",
+      "executable": "borealis-sync",
+      "args": ["--iterations", "300", "same-image-disjoint-tiles"],
+      "timeout": 240,
+      "description": "Two queues render texel-disjoint halves of the same tiles of one image with no dependency."
+    },
+    {
+      "name": "tessellation-stage-compat",
+      "tier": "compat",
+      "executable": "vulkan-tess-batch-order",
+      "args": ["20"],
+      "timeout": 180,
+      "description": "Storage writes across tessellated draws with no API barrier, relying on in-order stages."
+    },
+    {
+      "name": "layered-depth-compat",
+      "tier": "compat",
+      "executable": "g17p-vulkan-layered-depth",
+      "timeout": 180,
+      "description": "Layered depth rendering and readback."
+    },
+    {
+      "name": "clear-pass-load-compat",
+      "tier": "compat",
+      "executable": "g17p-vulkan-clear-pass-load",
+      "optional": true,
+      "description": "A clear-only pass followed by a depth/stencil load without the barrier between them; skipped when not built."
+    }
+  ]
+}

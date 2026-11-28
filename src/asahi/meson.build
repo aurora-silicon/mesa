@@ -506,23 +506,53 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
   # A render on one queue read by compute on another, ordered by timeline
   # semaphores, including waits made by submissions without command buffers;
   # recorded and submitted, not executed (the ordering check needs the GPU).
-  test(
-    'hk-g17p-cross-queue',
-    prog_python,
-    args : [
-      files('../gallium/drivers/asahi/tests/run-shim.py'),
-      libasahi_noop_drm_shim,
-      g17p_vulkan_cross_queue,
-      '--shim',
-    ],
-    env : [
-      'ASAHI_SHIM_CHIP=g17p',
-      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
-    ],
-    depends : [_dev_icd, libvulkan_asahi],
-    suite : ['asahi'],
-    timeout : 120,
-  )
+  # t6041 advertises independent queues and runs the submission path; g17p
+  # exposes one queue and verifies the exit-77 skip path.
+  foreach chip : ['t6041', 'g17p']
+    test(
+      'hk-' + chip + '-cross-queue',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        g17p_vulkan_cross_queue,
+        '--shim',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+      timeout : 120,
+    )
+  endforeach
+
+  # Synchronization regression cases: recorded, submitted and waited for,
+  # without checking contents (the pixel oracles need the GPU). The t6041
+  # profile has independent queues, so Borealis exposes the two queues the
+  # cases need.
+  foreach sync_case : ['layer-disjoint-queues', 'feedback-loop-outside-area',
+                       'same-image-disjoint-tiles']
+    test(
+      'borealis-sync-' + sync_case,
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        borealis_sync,
+        '--shim',
+        sync_case,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=t6041',
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+      timeout : 120,
+    )
+  endforeach
 
   # Background/end-of-tile shader cache shared by command buffers recording
   # on several threads.
