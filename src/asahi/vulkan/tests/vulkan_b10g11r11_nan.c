@@ -423,6 +423,399 @@ run(int kind, int wpath)
    return fails;
 }
 
+static uint32_t
+pack_expected_payload(uint32_t x, uint32_t y)
+{
+   /* Non-canonical NaN payloads (0x7c1, 0x7ff, 0x3e1, 0x3ff) alongside normal
+    * and +inf encodings so bit-exact copy readbacks catch payload dropping. */
+   struct texel t = expect(x, y);
+   uint32_t e[3];
+   const uint32_t sel = ((x >> 3) + (y >> 3)) & 3u;
+   for (int c = 0; c < 3; ++c) {
+      unsigned mb = c == 2 ? 5 : 6;
+      if (t.kind[c] == 1) {
+         uint32_t mant = sel == 0 ? 1u
+                       : sel == 1 ? ((1u << mb) - 1u)
+                       : sel == 2 ? (1u << (mb - 1))
+                                  : (0x15u & ((1u << mb) - 1u));
+         e[c] = (31u << mb) | mant;
+      } else if (t.kind[c] == 2) {
+         e[c] = 31u << mb;
+      } else {
+         e[c] = t.enc[c];
+      }
+   }
+   uint32_t w = e[0] | (e[1] << 11) | (e[2] << 22);
+   /* Explicitly hit the exact corner payloads on the first row. */
+   if (y == 0 && x == 0) return 0x000007c1u;
+   if (y == 0 && x == 1) return 0x000007ffu;
+   if (y == 0 && x == 2) return 0x003e0800u;
+   if (y == 0 && x == 3) return 0x003ff800u;
+   if (y == 0 && x == 4) return 0xf8400000u;
+   if (y == 0 && x == 5) return 0xffffffffu;
+   return w;
+}
+
+static unsigned
+check_exact_words(const char *tag, const uint32_t *got, const uint32_t *want,
+                  uint32_t count)
+{
+   unsigned ok = 0;
+   char first[160] = {0};
+   for (uint32_t i = 0; i < count; ++i) {
+      if (got[i] == want[i]) {
+         ok++;
+      } else if (!first[0]) {
+         snprintf(first, sizeof(first), "%u,%u got=0x%08x want=0x%08x",
+                  i % W, i / W, got[i], want[i]);
+      }
+   }
+   const bool pass = ok == count;
+   printf("RESULT %-21s exact=%u/%u %s%s%s\n", tag, ok, count,
+          pass ? "PASS" : "FAIL", first[0] ? " first " : "", first);
+   return !pass;
+}
+
+static VkImage
+make_image(VkFormat fmt, VkImageUsageFlags usage, VkImageCreateFlags flags,
+           VkDeviceMemory *mem_out, VkMemoryRequirements *mr_out)
+{
+   VkImage img;
+   CHECK(vkCreateImage(dev, &(VkImageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags,
+      .imageType = VK_IMAGE_TYPE_2D, .format = fmt, .extent = {W, H, 1},
+      .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &img));
+   VkMemoryRequirements mr;
+   vkGetImageMemoryRequirements(dev, img, &mr);
+   if (mr_out)
+      *mr_out = mr;
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr.size,
+      .memoryTypeIndex = mem_type(mr.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)},
+      NULL, mem_out));
+   CHECK(vkBindImageMemory(dev, img, *mem_out, 0));
+   return img;
+}
+
+/* Bit-exact copy contract for non-canonical NaN payloads across:
+ *   1. upload -> CopyImageToBuffer (bit-exact)
+ *   2. upload -> CopyImage(B10G11R11 -> R32_UINT) -> CopyImageToBuffer
+ *   3. R32_UINT -> CopyImage(R32_UINT -> B10G11R11) -> CopyImageToBuffer
+ *   4. B10G11R11 -> CopyImage(partial + full -> B10G11R11) -> CopyImageToBuffer
+ *   5. render (compressed) -> partial non-aligned upload -> CopyImageToBuffer
+ *   6. ALIAS_BIT garbage memory -> full upload -> CopyImageToBuffer
+ *   7. vkCmdClearColorImage -> CopyImageToBuffer */
+static unsigned
+run_bitexact_copies(int kind)
+{
+   const bool storage = kind == 0;
+   const char *kn = storage ? "storage" : "colour";
+   const VkImageUsageFlags r11_usage =
+      (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | VK_IMAGE_USAGE_SAMPLED_BIT |
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   const VkImageCreateFlags r11_flags = storage ? VK_IMAGE_CREATE_ALIAS_BIT : 0;
+
+   VkDeviceMemory m_a, m_b, m_u32;
+   VkMemoryRequirements mr_a;
+   VkImage img_a = make_image(VK_FORMAT_B10G11R11_UFLOAT_PACK32, r11_usage,
+                              r11_flags, &m_a, &mr_a);
+   VkImage img_b = make_image(VK_FORMAT_B10G11R11_UFLOAT_PACK32, r11_usage,
+                              r11_flags, &m_b, NULL);
+   VkImage img_u32 = make_image(VK_FORMAT_R32_UINT,
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                   VK_IMAGE_USAGE_SAMPLED_BIT,
+                                0, &m_u32, NULL);
+
+   VkImageView v_a;
+   CHECK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img_a,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}}, NULL, &v_a));
+
+   const VkDeviceSize plane = (VkDeviceSize)W * H * 4;
+   const VkDeviceSize hsz = 6 * plane;
+   VkBuffer hb;
+   CHECK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = hsz,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT}, NULL, &hb));
+   VkMemoryRequirements hr;
+   vkGetBufferMemoryRequirements(dev, hb, &hr);
+   VkDeviceMemory hm;
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = hr.size,
+      .memoryTypeIndex = mem_type(hr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}, NULL, &hm));
+   CHECK(vkBindBufferMemory(dev, hb, hm, 0));
+   uint32_t *hp;
+   CHECK(vkMapMemory(dev, hm, 0, VK_WHOLE_SIZE, 0, (void **)&hp));
+   memset(hp, 0, hsz);
+
+   uint32_t *want = hp;
+   for (uint32_t y = 0; y < H; ++y)
+      for (uint32_t x = 0; x < W; ++x)
+         want[y * W + x] = pack_expected_payload(x, y);
+
+   unsigned fails = 0;
+   char tag[48];
+   VkBufferImageCopy full_bic = {
+      .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .imageExtent = {W, H, 1},
+   };
+   VkImageCopy full_ic = {
+      .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+      .extent = {W, H, 1},
+   };
+
+   /* 1..4: upload -> copy2buf, -> R32_UINT, R32_UINT -> R11, partial R11 -> R11 */
+   VkCommandBuffer cb = begin();
+   to_general(cb, img_a);
+   to_general(cb, img_b);
+   to_general(cb, img_u32);
+   /* Upload non-canonical payloads to img_a */
+   full_bic.bufferOffset = 0;
+   vkCmdCopyBufferToImage(cb, hb, img_a, VK_IMAGE_LAYOUT_GENERAL, 1, &full_bic);
+   barrier(cb);
+   /* Readback 1: img_a -> buf[1] */
+   full_bic.bufferOffset = 1 * plane;
+   vkCmdCopyImageToBuffer(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+   /* Copy 2: img_a (compressed R11) -> img_u32 (R32_UINT) -> buf[2] */
+   vkCmdCopyImage(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, img_u32,
+                  VK_IMAGE_LAYOUT_GENERAL, 1, &full_ic);
+   barrier(cb);
+   full_bic.bufferOffset = 2 * plane;
+   vkCmdCopyImageToBuffer(cb, img_u32, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+   /* Copy 3: img_u32 (R32_UINT) -> img_b (compressed R11) -> buf[3] */
+   vkCmdCopyImage(cb, img_u32, VK_IMAGE_LAYOUT_GENERAL, img_b,
+                  VK_IMAGE_LAYOUT_GENERAL, 1, &full_ic);
+   barrier(cb);
+   full_bic.bufferOffset = 3 * plane;
+   vkCmdCopyImageToBuffer(cb, img_b, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+   submit(cb);
+
+   snprintf(tag, sizeof(tag), "%s/up->c2b", kn);
+   fails += check_exact_words(tag, hp + 1 * (W * H), want, W * H);
+   snprintf(tag, sizeof(tag), "%s/r11->r32", kn);
+   fails += check_exact_words(tag, hp + 2 * (W * H), want, W * H);
+   snprintf(tag, sizeof(tag), "%s/r32->r11", kn);
+   fails += check_exact_words(tag, hp + 3 * (W * H), want, W * H);
+
+   /* 5: Render compressed img_a, then partial non-16-aligned upload (3,5,37,29)
+    * of non-canonical NaN payloads, then CopyImageToBuffer: inside the rect
+    * must be bit-exact payload, outside (including shared border tiles!) must
+    * match rendered values. */
+   const uint32_t rx = 3, ry = 5, rw = 37, rh = 29;
+   uint32_t *sub_up = hp + 4 * (W * H);
+   for (uint32_t y = 0; y < rh; ++y)
+      for (uint32_t x = 0; x < rw; ++x)
+         sub_up[y * rw + x] = pack_expected_payload(x, y);
+
+   cb = begin();
+   to_general(cb, img_a);
+   draw(cb, v_a, false, (VkRect2D){{0, 0}, {W, H}});
+   barrier(cb);
+   vkCmdCopyBufferToImage(cb, hb, img_a, VK_IMAGE_LAYOUT_GENERAL, 1,
+                          &(VkBufferImageCopy){
+                             .bufferOffset = 4 * plane,
+                             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                             .imageOffset = {(int32_t)rx, (int32_t)ry, 0},
+                             .imageExtent = {rw, rh, 1},
+                          });
+   barrier(cb);
+   full_bic.bufferOffset = 5 * plane;
+   vkCmdCopyImageToBuffer(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+   submit(cb);
+
+   {
+      const uint32_t *got = hp + 5 * (W * H);
+      unsigned inside_ok = 0, inside_n = 0;
+      struct tally tout = {0};
+      char first_in[160] = {0};
+      for (uint32_t y = 0; y < H; ++y) {
+         for (uint32_t x = 0; x < W; ++x) {
+            uint32_t v = got[y * W + x];
+            if (x >= rx && x < rx + rw && y >= ry && y < ry + rh) {
+               uint32_t w = sub_up[(y - ry) * rw + (x - rx)];
+               inside_n++;
+               if (v == w) inside_ok++;
+               else if (!first_in[0])
+                  snprintf(first_in, sizeof(first_in), "%u,%u got=0x%08x want=0x%08x", x, y, v, w);
+            } else {
+               check_word(&tout, x, y, v);
+            }
+         }
+      }
+      bool ok_in = inside_ok == inside_n;
+      bool ok_out = tout.nan_ok == tout.nan_n && tout.inf_ok == tout.inf_n &&
+                    tout.oth_ok == tout.oth_n;
+      printf("RESULT %s/partial-up  in=%u/%u out_nan=%u/%u out_oth=%u/%u %s%s%s%s%s\n",
+             kn, inside_ok, inside_n, tout.nan_ok, tout.nan_n, tout.oth_ok,
+             tout.oth_n, (ok_in && ok_out) ? "PASS" : "FAIL",
+             first_in[0] ? " in:" : "", first_in,
+             tout.first[0] ? " out:" : "", tout.first);
+      if (!ok_in || !ok_out) fails++;
+   }
+
+   /* 6: Partial CopyImage (non-aligned rect from img_b -> rendered img_a) */
+   cb = begin();
+   to_general(cb, img_a);
+   draw(cb, v_a, false, (VkRect2D){{0, 0}, {W, H}});
+   barrier(cb);
+   vkCmdCopyImage(cb, img_b, VK_IMAGE_LAYOUT_GENERAL, img_a,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .srcOffset = {0, 0, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {(int32_t)rx, (int32_t)ry, 0},
+                     .extent = {rw, rh, 1},
+                  });
+   barrier(cb);
+   full_bic.bufferOffset = 5 * plane;
+   vkCmdCopyImageToBuffer(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+   submit(cb);
+   {
+      const uint32_t *got = hp + 5 * (W * H);
+      unsigned inside_ok = 0, inside_n = 0;
+      struct tally tout = {0};
+      char first_in[160] = {0};
+      for (uint32_t y = 0; y < H; ++y) {
+         for (uint32_t x = 0; x < W; ++x) {
+            uint32_t v = got[y * W + x];
+            if (x >= rx && x < rx + rw && y >= ry && y < ry + rh) {
+               uint32_t w = want[(y - ry) * W + (x - rx)];
+               inside_n++;
+               if (v == w) inside_ok++;
+               else if (!first_in[0])
+                  snprintf(first_in, sizeof(first_in), "%u,%u got=0x%08x want=0x%08x", x, y, v, w);
+            } else {
+               check_word(&tout, x, y, v);
+            }
+         }
+      }
+      bool ok_in = inside_ok == inside_n;
+      bool ok_out = tout.nan_ok == tout.nan_n && tout.inf_ok == tout.inf_n &&
+                    tout.oth_ok == tout.oth_n;
+      printf("RESULT %s/partial-c2i in=%u/%u out_nan=%u/%u out_oth=%u/%u %s%s%s%s%s\n",
+             kn, inside_ok, inside_n, tout.nan_ok, tout.nan_n, tout.oth_ok,
+             tout.oth_n, (ok_in && ok_out) ? "PASS" : "FAIL",
+             first_in[0] ? " in:" : "", first_in,
+             tout.first[0] ? " out:" : "", tout.first);
+      if (!ok_in || !ok_out) fails++;
+   }
+
+   /* 7: vkCmdClearColorImage on compressed B10G11R11 */
+   cb = begin();
+   to_general(cb, img_a);
+   vkCmdClearColorImage(cb, img_a, VK_IMAGE_LAYOUT_GENERAL,
+                        &(VkClearColorValue){.float32 = {1.0f, 0.5f, 2.0f, 0.0f}},
+                        1, &(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1});
+   barrier(cb);
+   full_bic.bufferOffset = 5 * plane;
+   vkCmdCopyImageToBuffer(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+   submit(cb);
+   {
+      const uint32_t exp_clear = 0x3c0u | (0x380u << 11) | (0x200u << 22);
+      const uint32_t *got = hp + 5 * (W * H);
+      uint32_t *wclr = hp + 4 * (W * H);
+      for (uint32_t i = 0; i < W * H; ++i) wclr[i] = exp_clear;
+      snprintf(tag, sizeof(tag), "%s/clear-img", kn);
+      fails += check_exact_words(tag, got, wclr, W * H);
+   }
+
+   /* 8: compressed B10G11R11 <-> linear host-visible B10G11R11 via vkMapMemory */
+   {
+      VkImage img_lin;
+      CHECK(vkCreateImage(dev, &(VkImageCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+         .extent = {W, H, 1}, .mipLevels = 1, .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &img_lin));
+      VkMemoryRequirements lmr;
+      vkGetImageMemoryRequirements(dev, img_lin, &lmr);
+      VkDeviceMemory m_lin;
+      CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         .allocationSize = lmr.size,
+         .memoryTypeIndex = mem_type(lmr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}, NULL, &m_lin));
+      CHECK(vkBindImageMemory(dev, img_lin, m_lin, 0));
+      VkSubresourceLayout sl;
+      vkGetImageSubresourceLayout(dev, img_lin,
+         &(VkImageSubresource){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0}, &sl);
+      uint8_t *lp;
+      CHECK(vkMapMemory(dev, m_lin, 0, VK_WHOLE_SIZE, 0, (void **)&lp));
+
+      cb = begin();
+      to_general(cb, img_a);
+      to_general(cb, img_lin);
+      full_bic.bufferOffset = 0;
+      vkCmdCopyBufferToImage(cb, hb, img_a, VK_IMAGE_LAYOUT_GENERAL, 1, &full_bic);
+      barrier(cb);
+      vkCmdCopyImage(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, img_lin,
+                     VK_IMAGE_LAYOUT_GENERAL, 1, &full_ic);
+      submit(cb);
+
+      uint32_t *got_lin = hp + 5 * (W * H);
+      for (uint32_t y = 0; y < H; ++y)
+         memcpy(got_lin + y * W, lp + sl.offset + y * sl.rowPitch, W * 4);
+      snprintf(tag, sizeof(tag), "%s/host-linear", kn);
+      fails += check_exact_words(tag, got_lin, want, W * H);
+
+      vkUnmapMemory(dev, m_lin);
+      vkDestroyImage(dev, img_lin, NULL);
+      vkFreeMemory(dev, m_lin, NULL);
+   }
+
+   /* 9 (storage/ALIAS_BIT): fill backing memory with 0x5a garbage, then full
+    * upload of non-canonical NaN payloads without clearing first. */
+   if (storage) {
+      VkBuffer alias_buf;
+      CHECK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = mr_a.size,
+         .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT}, NULL, &alias_buf));
+      CHECK(vkBindBufferMemory(dev, alias_buf, m_a, 0));
+      cb = begin();
+      vkCmdFillBuffer(cb, alias_buf, 0, mr_a.size, 0x5a5a5a5au);
+      barrier(cb);
+      to_general(cb, img_a);
+      full_bic.bufferOffset = 0;
+      vkCmdCopyBufferToImage(cb, hb, img_a, VK_IMAGE_LAYOUT_GENERAL, 1, &full_bic);
+      barrier(cb);
+      full_bic.bufferOffset = 5 * plane;
+      vkCmdCopyImageToBuffer(cb, img_a, VK_IMAGE_LAYOUT_GENERAL, hb, 1, &full_bic);
+      submit(cb);
+      fails += check_exact_words("storage/alias-garb", hp + 5 * (W * H), want, W * H);
+      vkDestroyBuffer(dev, alias_buf, NULL);
+   }
+
+   vkUnmapMemory(dev, hm);
+   vkDestroyBuffer(dev, hb, NULL);
+   vkFreeMemory(dev, hm, NULL);
+   vkDestroyImageView(dev, v_a, NULL);
+   vkDestroyImage(dev, img_a, NULL);
+   vkDestroyImage(dev, img_b, NULL);
+   vkDestroyImage(dev, img_u32, NULL);
+   vkFreeMemory(dev, m_a, NULL);
+   vkFreeMemory(dev, m_b, NULL);
+   vkFreeMemory(dev, m_u32, NULL);
+   return fails;
+}
+
 int
 main(void)
 {
@@ -485,13 +878,16 @@ main(void)
    }
    printf("DEVICE %s\n", props.deviceName);
    unsigned fails = 0, cases = 0;
-   for (int kind = 0; kind < 2; ++kind)
+   for (int kind = 0; kind < 2; ++kind) {
       for (int wpath = 0; wpath < 4; ++wpath) {
          if (wpath == 2 && kind)
             continue;
          fails += run(kind, wpath);
          cases += kind ? 2 : 3;
       }
+      fails += run_bitexact_copies(kind);
+      cases += kind ? 7 : 8;
+   }
    printf("SUMMARY %u/%u cases pass\n", cases - fails, cases);
    return fails ? 1 : 0;
 }

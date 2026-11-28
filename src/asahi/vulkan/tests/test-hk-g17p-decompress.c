@@ -211,8 +211,31 @@ main(void)
    }
    assert(format_count == 49);
    assert(pack_mode_mask == ((1u << (LIBAGX_AGX3_DECOMPRESS_R32G32B32A32 + 1)) - 1u));
+   uint32_t r11_mode = UINT32_MAX;
+   assert(hk_g17p_decompress_pack_mode(AGX_CHANNELS_R11G11B10, &r11_mode));
+   assert(r11_mode == LIBAGX_AGX3_DECOMPRESS_R11G11B10);
+   {
+      struct AGX_TEXTURE cfg = texture_header();
+      cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+      cfg.layout = AGX_LAYOUT_GPU;
+      cfg.channels = AGX_CHANNELS_R11G11B10;
+      cfg.type = AGX_TEXTURE_TYPE_FLOAT;
+      cfg.swizzle_r = AGX_CHANNEL_R;
+      cfg.swizzle_g = AGX_CHANNEL_G;
+      cfg.swizzle_b = AGX_CHANNEL_B;
+      cfg.swizzle_a = AGX_CHANNEL_A;
+      cfg.address = 0x100000;
+      cfg.width = 256;
+      cfg.height = 128;
+      cfg.compressed = true;
+      cfg.extended = true;
+      cfg.acceleration_buffer = 0x200000;
+      cfg.depth = 1;
+      struct hk_native_texture_descriptor packed;
+      assert(hk_pack_native_texture(10, &packed, &cfg));
+   }
    uint32_t bad_mode = 0;
-   assert(!hk_g17p_decompress_pack_mode(AGX_CHANNELS_R11G11B10, &bad_mode));
+   assert(!hk_g17p_decompress_pack_mode(AGX_CHANNELS_R9G9B9E5, &bad_mode));
    assert(hk_g17p_decompress_image_type_supported(VK_IMAGE_TYPE_2D));
    assert(!hk_g17p_decompress_image_type_supported(VK_IMAGE_TYPE_3D));
 

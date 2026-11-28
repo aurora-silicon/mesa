@@ -5099,19 +5099,21 @@ hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd)
    e->tail = true;
 }
 
-static bool
-hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
-                              struct hk_device *dev,
-                              const struct hk_rendering_state *render,
-                              const struct hk_image *image,
-                              struct ail_layout *layout,
-                              unsigned level, unsigned layer,
-                              uint32_t layer_count, uint64_t base,
-                              VkAttachmentLoadOp load_op,
-                              VkRenderingFlags rendering_flags,
-                              bool incomplete_render_area)
+bool
+hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
+                               const struct hk_image *image, unsigned plane,
+                               unsigned level, unsigned layer,
+                               uint32_t layer_count, bool reset_only,
+                               unsigned barrier)
 {
-   if (!hk_g17p_decompress_image_type_supported(image->vk.image_type))
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct ail_layout *layout = (struct ail_layout *)&image->planes[plane].layout;
+   if (!hk_g17p_decompress_image_type_supported(image->vk.image_type) ||
+       !ail_is_level_logically_compressed(layout, level))
+      return false;
+
+   const uint64_t base = hk_image_base_address(image, plane);
+   if (!base)
       return false;
 
    const uint16_t width_tl = ail_metadata_width_tl(layout, level);
@@ -5122,24 +5124,11 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
       ((uint64_t)layer * layout->compression_layer_stride_B);
    const uint64_t tile_uncompressed = ail_tile_mode_uncompressed(layout->format);
 
-   /* A resumed dynamic render pass preserves pixels rendered by the suspended
-    * pass even when loadOp is CLEAR/DONT_CARE, and a sparse multiview mask
-    * leaves untouched layers live, so never drop existing tiles in those cases. */
-   const bool sparse_view_mask =
-      render->view_mask &&
-      render->view_mask != BITFIELD64_MASK(layer_count);
-   const bool discard =
-      !incomplete_render_area && !sparse_view_mask &&
-      !(rendering_flags & VK_RENDERING_RESUMING_BIT) &&
-      u_minify(image->vk.extent.width, level) == render->cr.width &&
-      u_minify(image->vk.extent.height, level) == render->cr.height &&
-      (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
-       load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
-   if (discard) {
+   if (reset_only) {
       libagx_reset_compression_metadata(
-         cmd, agx_3d(width_tl, height_tl, layer_count),
-         AGX_BARRIER_ALL | AGX_PREGFX, metadata, tile_uncompressed,
-         layout->compression_layer_stride_B / 8, width_tl, height_tl);
+         cmd, agx_3d(width_tl, height_tl, layer_count), barrier, metadata,
+         tile_uncompressed, layout->compression_layer_stride_B / 8, width_tl,
+         height_tl);
       return true;
    }
 
@@ -5153,6 +5142,19 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
 
    const bool msaa = layout->sample_count_sa > 1;
    const bool layered = layer_count > 1;
+   const enum agx_texture_type tex_type =
+      channels == AGX_CHANNELS_R5G6B5     ? AGX_TEXTURE_TYPE_UNORM
+      : channels == AGX_CHANNELS_R11G11B10 ? AGX_TEXTURE_TYPE_FLOAT
+                                           : AGX_TEXTURE_TYPE_UINT;
+   const bool has_g =
+      channels != AGX_CHANNELS_R8 && channels != AGX_CHANNELS_R16 &&
+      channels != AGX_CHANNELS_R32;
+   const bool has_b =
+      has_g && channels != AGX_CHANNELS_R8G8 &&
+      channels != AGX_CHANNELS_R16G16 && channels != AGX_CHANNELS_R32G32;
+   const bool has_a =
+      has_b && channels != AGX_CHANNELS_R5G6B5 &&
+      channels != AGX_CHANNELS_R11G11B10;
    struct AGX_TEXTURE cfg = {
       AGX_TEXTURE_header,
       .dimension = msaa
@@ -5162,12 +5164,11 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
                                  : AGX_TEXTURE_DIMENSION_2D),
       .layout = AGX_LAYOUT_GPU,
       .channels = channels,
-      .type = channels == AGX_CHANNELS_R5G6B5 ? AGX_TEXTURE_TYPE_UNORM
-                                              : AGX_TEXTURE_TYPE_UINT,
+      .type = tex_type,
       .swizzle_r = AGX_CHANNEL_R,
-      .swizzle_g = AGX_CHANNEL_G,
-      .swizzle_b = AGX_CHANNEL_B,
-      .swizzle_a = AGX_CHANNEL_A,
+      .swizzle_g = has_g ? AGX_CHANNEL_G : AGX_CHANNEL_0,
+      .swizzle_b = has_b ? AGX_CHANNEL_B : AGX_CHANNEL_0,
+      .swizzle_a = has_a ? AGX_CHANNEL_A : AGX_CHANNEL_1,
       .address = base + ail_get_layer_offset_B(layout, layer),
       .width = layout->width_px,
       .height = layout->height_px,
@@ -5201,8 +5202,7 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
    struct agx_grid grid = agx_3d(width_tl * 32, height_tl, layer_count);
 
    libagx_agx3_decompress(
-      cmd, grid, AGX_BARRIER_ALL | AGX_PREGFX, desc_va,
-      dev->samplers.table.bo->va->addr, metadata,
+      cmd, grid, barrier, desc_va, dev->samplers.table.bo->va->addr, metadata,
       base + ail_get_layer_level_B(layout, layer, level), tile_uncompressed,
       layout->layer_stride_B, layout->compression_layer_stride_B / 8,
       align(level_width_px, tile.width_el), level_width_px, level_height_px,
@@ -5210,6 +5210,39 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
       ail_metadata_tile(layout).height_el, 0, pack_mode,
       util_logbase2(layout->sample_count_sa), layered ? 1 : 0);
    return true;
+}
+
+static bool
+hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
+                              struct hk_device *dev,
+                              const struct hk_rendering_state *render,
+                              const struct hk_image *image,
+                              struct ail_layout *layout,
+                              unsigned level, unsigned layer,
+                              uint32_t layer_count, uint64_t base,
+                              VkAttachmentLoadOp load_op,
+                              VkRenderingFlags rendering_flags,
+                              bool incomplete_render_area)
+{
+   /* A resumed dynamic render pass preserves pixels rendered by the suspended
+    * pass even when loadOp is CLEAR/DONT_CARE, and a sparse multiview mask
+    * leaves untouched layers live, so never drop existing tiles in those cases. */
+   const bool sparse_view_mask =
+      render->view_mask &&
+      render->view_mask != BITFIELD64_MASK(layer_count);
+   const bool discard =
+      !incomplete_render_area && !sparse_view_mask &&
+      !(rendering_flags & VK_RENDERING_RESUMING_BIT) &&
+      u_minify(image->vk.extent.width, level) == render->cr.width &&
+      u_minify(image->vk.extent.height, level) == render->cr.height &&
+      (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
+       load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
+   unsigned plane = (unsigned)(layout - &image->planes[0].layout);
+   assert(plane < image->plane_count &&
+          hk_image_base_address(image, plane) == base);
+   return hk_agx3_decompress_image_level(
+      cmd, image, plane, level, layer, layer_count, discard,
+      AGX_BARRIER_ALL | AGX_PREGFX);
 }
 
 /* A 2D block store resolves four RGBA8 tile samples through the destination

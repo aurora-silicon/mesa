@@ -809,6 +809,9 @@ check_m5_color(void)
    CHECK(hk_m5_color_compression_eligible(AGX_CHIP_G17C, 0, &c));
    CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17P, 0, &c));
    CHECK(!hk_g17p_compression_color_format(VK_FORMAT_B10G11R11_UFLOAT_PACK32));
+   c.imageType = VK_IMAGE_TYPE_3D;
+   c.extent.depth = 4;
+   CHECK(!hk_m5_color_compression_eligible(AGX_CHIP_G17S, 0, &c));
 
    /* A placed alias of identical parameters gets the same layout on every M5
     * part. A single-plane alias of a multi-planar plane needs DISJOINT, which

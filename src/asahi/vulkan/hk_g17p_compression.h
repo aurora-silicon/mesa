@@ -536,7 +536,12 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
       return false;
 
    const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
-   if (color_16b && (three_d || info->arrayLayers != 1))
+   /* 3D images cannot use libagx_agx3_decompress / per-slice metadata reset,
+    * which B10G11R11 requires to keep bit-exact copy semantics for NaN
+    * payloads. */
+   if (three_d && (color_16b || info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
+      return false;
+   if (color_16b && info->arrayLayers != 1)
       return false;
 
    VkImageCreateFlags allowed_flags =

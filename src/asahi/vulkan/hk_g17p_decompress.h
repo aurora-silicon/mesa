@@ -56,6 +56,9 @@ hk_g17p_decompress_pack_mode(enum agx_channels channels, uint32_t *out)
    case AGX_CHANNELS_R32G32B32A32:
       *out = LIBAGX_AGX3_DECOMPRESS_R32G32B32A32;
       return true;
+   case AGX_CHANNELS_R11G11B10:
+      *out = LIBAGX_AGX3_DECOMPRESS_R11G11B10;
+      return true;
    default:
       return false;
    }
