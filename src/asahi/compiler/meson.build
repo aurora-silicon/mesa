@@ -427,6 +427,25 @@ if with_tests
   )
 
   test(
+    'agx3c_fsel_uniform',
+    executable(
+      'agx3c_fsel_uniform_test',
+      files(
+        'agx3_alu_core.c',
+        'agx3_falu_mod_core.c',
+        'agx3_binder.c',
+        'agx3_pack.c',
+        'test/test-agx3c-fsel-uniform.c',
+      ),
+      link_with : [libagx3_compose],
+      c_args : [c_msvc_compat_args, no_override_init_args, '-UNDEBUG'],
+      gnu_symbol_visibility : 'hidden',
+      include_directories : [inc_include, inc_src],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
     'agx3_g17p_producers',
     executable(
       'agx3_g17p_producers_test',
@@ -796,6 +815,7 @@ if with_tests
          'test/test-lower-divmod64.cpp',
          'test/test-spill-fallback.cpp',
          'test/test-spill-repeat-pair.cpp',
+         'test/test-spill-phi-sources.cpp',
          'test/test-agx-register-cache.cpp',
          'test/test-agx3c-collect-split.cpp',
          'test/test-opt-licm.cpp',
@@ -877,7 +897,8 @@ if with_tests
          'test/test-shared-phase-cse.cpp',
          'test/test-u8x4-hsum.cpp',
          'test/test-guard-chains.cpp',
-         'test/test-insert-waits.cpp',
+         'test/test-hoist-loads.cpp',
+      'test/test-insert-waits.cpp',
          # agx_chip_isa_encoding() (test-native-form-regressions.cpp) lives
          # in libasahi_lib, which this test does not link.
          '../lib/agx_chip.c',

@@ -322,6 +322,8 @@ hk_record_stamp_copies(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    struct libagx_timestamp_copy *pairs = params.cpu;
    for (unsigned i = 0; i < count; ++i) {
+      /* Only timestamp queries are copied (agx_timestamp_req::event). */
+      assert(copies[i].src.addr && !copies[i].src.event && copies[i].dst.addr);
       pairs[i] = (struct libagx_timestamp_copy){
          .dest = copies[i].dst.addr,
          .src = copies[i].src.addr,
@@ -639,6 +641,11 @@ emit_zero_queries(struct hk_cmd_buffer *cmd, struct hk_query_pool *pool,
 
    libagx_reset_query_struct(cmd, agx_1d(num_queries), AGX_BARRIER_ALL, info);
    hk_note_query_access(cmd, pool, first_index, num_queries);
+   if (!set_available && !vk_command_buffer_has_error(&cmd->vk) &&
+       cmd->current_cs.cs) {
+      cmd->current_cs.cs->stats.query_reset_dispatches++;
+      cmd->current_cs.cs->stats.query_reset_queries += num_queries;
+   }
 }
 
 static void

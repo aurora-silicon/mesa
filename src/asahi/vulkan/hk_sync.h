@@ -182,6 +182,11 @@ struct agx_timestamp_req {
    uint64_t addr;
    uint32_t handle;
    uint32_t offset_B;
+   /* A VkEvent status word set by the retirement timestamp
+    * (hk_sync_stamp_event()), not a timestamp query: it has no address to
+    * read, and a reset of the event can clear it before a copy would read it,
+    * so it is never the source of a timestamp copy. */
+   bool event;
 };
 
 /* A timestamp write satisfied by copying an earlier stamp: the query it
@@ -565,6 +570,11 @@ struct hk_sync_queue {
     * half after the serialized prefix. */
    bool stage_overlap;
    uint64_t submitted[HK_SYNC_NUM_SQ];
+   /* Exact priors: every command of the submission being resolved waits
+    * through these ordinals (same-queue semaphore waits, hk_gpu_waits.h).
+    * Set by the submitter around hk_sync_resolve_submit_ex() and
+    * hk_sync_host_flush_prefix(), zero otherwise. */
+   uint64_t wait_floor[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t last_heap_slot[HK_HEAP_SLOTS][HK_SYNC_NUM_SQ];
@@ -769,6 +779,8 @@ void hk_sync_end_cs_if_gfx_waits(struct hk_cmd_buffer *cmd);
 void hk_sync_write_timestamp(struct hk_cmd_buffer *cmd,
                              VkPipelineStageFlags2 stage,
                              struct agx_timestamp_req req);
+bool hk_sync_stamp_event(struct hk_cmd_buffer *cmd,
+                         struct agx_timestamp_req req, uint8_t src_kinds);
 void hk_sync_flush_lead_timestamp(struct hk_cmd_buffer *cmd);
 void hk_sync_flush_pending_timestamp(struct hk_cmd_buffer *cmd);
 

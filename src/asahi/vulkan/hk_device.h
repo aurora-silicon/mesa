@@ -25,6 +25,7 @@
 #include "hk_private.h"
 
 #include "hk_descriptor_table.h"
+#include "hk_gpu_waits.h"
 #include "hk_host_alias.h"
 #include "hk_native_sampler.h"
 #include "hk_queue.h"
@@ -133,6 +134,8 @@ struct hk_compute_kick;
 struct hk_device {
    struct vk_device vk;
    struct agx_device dev;
+   /* Same-queue binary semaphore waits ordered on the GPU. */
+   struct hk_gpu_waits gpu_waits;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
    /* Live resources through which memory has or may have a second GPU virtual
@@ -399,6 +402,15 @@ struct hk_device {
       size_t slot_cap;
       size_t prune_threshold;
    } query_stamps;
+
+   /* Device-wide slab allocator for VkEvent status words, bound once per slab
+    * as a kernel timestamp buffer on HAL200/M5 so vkCmdSetEvent2 can ride on
+    * the producing stream's retirement timestamp without a CDM store. */
+   struct {
+      bool ready;
+      simple_mtx_t lock;
+      struct list_head slabs;
+   } events;
 
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a
