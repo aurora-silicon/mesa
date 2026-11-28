@@ -437,6 +437,298 @@ TEST(GemmMatch, UninitializedTileSlot) { check_gemm_refusal(GemmMutation::Uninit
 TEST(GemmMatch, UninitializedAccumulator) { check_gemm_refusal(GemmMutation::UninitializedAccumulator); }
 TEST(GemmMatch, DivergentBreak) { check_gemm_refusal(GemmMutation::DivergentBreak); }
 TEST(GemmMatch, SharedAccessAfterLoop) { check_gemm_refusal(GemmMutation::SharedAccessAfterLoop); }
+
+enum class DirectGemmCase {
+   UnguardedBC,
+   GuardedClampC,
+   DirectBExtraReader,
+   DirectBWriteableLoad,
+   DirectBInLoopExternalWrite,
+   DirectCPreLoopWrite,
+   DirectCPostLoopRead,
+   DirectCNonAdjacentGuardedIfs,
+};
+
+static nir_builder
+build_direct_gemm_shader(DirectGemmCase tc)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "gemm-direct");
+   b.shader->info.io_lowered = true;
+   b.shader->info.shared_element_index_agx = true;
+   b.shader->info.workgroup_size[0] = AGX_GEMM_WIDTH;
+   b.shader->info.workgroup_size[1] = AGX_GEMM_SUBGROUPS;
+   b.shader->info.workgroup_size[2] = 1;
+   b.shader->info.min_subgroup_size = AGX_GEMM_WIDTH;
+   b.shader->info.max_subgroup_size = AGX_GEMM_WIDTH;
+   b.shader->info.shared_size = 8 * AGX_GEMM_TILE_WORDS;
+
+   const int a_bytes = 0;
+   const int b_bytes = 4 * AGX_GEMM_TILE_WORDS;
+
+   nir_def *n_tiles = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .range = 4);
+   nir_def *b_stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4), .range = 4);
+   nir_def *c_stride = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 8), .range = 4);
+   nir_def *m_limit = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 12), .range = 4);
+   nir_def *n_limit = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 16), .range = 4);
+   nir_def *b_base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 24), .range = 8);
+   nir_def *c_base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 32), .range = 8);
+   nir_def *aux_base = nir_load_push_constant(&b, 1, 64, nir_imm_int(&b, 40), .range = 8);
+
+   nir_def *local = nir_load_local_invocation_id(&b);
+   nir_def *wg = nir_load_workgroup_id(&b);
+   nir_def *x = nir_channel(&b, local, 0);
+   nir_def *y8 = nir_ishl_imm(&b, nir_channel(&b, local, 1), 3);
+   nir_def *col_orig = nir_ishl_imm(&b, nir_channel(&b, wg, 0), 5);
+   nir_def *col = nir_iadd(&b, col_orig, x);
+   nir_def *row_orig = nir_ishl_imm(&b, nir_channel(&b, wg, 1), 5);
+   nir_def *c_row_base = nir_iadd(&b, row_orig, y8);
+
+   nir_def *zero = nir_imm_float(&b, 0.0f);
+   nir_def *one = nir_imm_float(&b, 1.0f);
+   nir_def *k_zero = nir_imm_int(&b, 0);
+
+   auto fence = [&]() {
+      nir_barrier(&b, .execution_scope = SCOPE_WORKGROUP,
+                        .memory_scope = SCOPE_WORKGROUP,
+                        .memory_semantics = NIR_MEMORY_ACQ_REL,
+                        .memory_modes = nir_var_mem_shared);
+   };
+
+   if (tc == DirectGemmCase::DirectCPreLoopWrite) {
+      nir_store_agx(&b, zero, aux_base, col,
+                    .access = (gl_access_qualifier)0, .base = 0,
+                    .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+   }
+
+   nir_if *guard = nir_push_if(&b, nir_ine_imm(&b, n_tiles, 0));
+   nir_loop *loop = nir_push_loop(&b);
+   nir_block *preheader = nir_loop_predecessor_block(loop);
+   nir_block *header = nir_loop_first_block(loop);
+
+   nir_phi_instr *k_phi = create_scalar_phi(b.shader);
+   nir_phi_instr_add_src(k_phi, preheader, k_zero);
+
+   nir_phi_instr *initial[AGX_GEMM_ROWS_PER_LANE];
+   nir_def *acc[AGX_GEMM_ROWS_PER_LANE];
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      initial[row] = create_scalar_phi(b.shader);
+      nir_phi_instr_add_src(initial[row], preheader, zero);
+      acc[row] = &initial[row]->def;
+   }
+
+   nir_def *k_base = nir_ishl_imm(&b, &k_phi->def, 5);
+   const gl_access_qualifier b_access =
+      tc == DirectGemmCase::DirectBWriteableLoad ?
+         (gl_access_qualifier)0 : ACCESS_NON_WRITEABLE;
+
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      nir_def *row_idx = nir_iadd_imm(&b, y8, row);
+      nir_def *word = nir_u2u16(&b, nir_iadd(&b, nir_ishl_imm(&b, row_idx, 5), x));
+      nir_store_shared(&b, one, word, .base = a_bytes, .align_mul = 4);
+
+      nir_def *b_row = nir_iadd(&b, k_base, row_idx);
+      nir_def *b_idx = nir_iadd(&b, nir_imul(&b, b_row, b_stride), col);
+      nir_def *b_ld = nir_load_agx(&b, 1, 32, b_base, b_idx,
+                                   .access = b_access, .base = 0,
+                                   .format = PIPE_FORMAT_R32_UINT,
+                                   .sign_extend = false);
+      nir_store_shared(&b, b_ld, word, .base = b_bytes, .align_mul = 4);
+   }
+
+   fence();
+
+   nir_def *extra_b = NULL;
+   for (unsigned k = 0; k < AGX_GEMM_WIDTH; ++k) {
+      nir_def *b_idx = nir_u2u16(&b, nir_iadd_imm(&b, x, k * AGX_GEMM_WIDTH));
+      nir_def *b_val = nir_load_shared(&b, 1, 32, b_idx, .base = b_bytes, .align_mul = 4);
+      if (tc == DirectGemmCase::DirectBExtraReader && k == 0)
+         extra_b = nir_fadd(&b, b_val, one);
+      for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+         nir_def *row_idx = nir_iadd_imm(&b, y8, row);
+         nir_def *a_idx =
+            nir_u2u16(&b, nir_iadd_imm(&b, nir_ishl_imm(&b, row_idx, 5), k));
+         nir_def *a_val =
+            nir_load_shared(&b, 1, 32, a_idx, .base = a_bytes, .align_mul = 4);
+         acc[row] = nir_ffma(&b, a_val, b_val, acc[row]);
+      }
+   }
+
+   fence();
+
+   if (tc == DirectGemmCase::DirectBExtraReader) {
+      nir_store_scratch(&b, extra_b, nir_imm_int(&b, 0), .align_mul = 4);
+   }
+
+   if (tc == DirectGemmCase::DirectBInLoopExternalWrite) {
+      nir_push_if(&b, nir_ine_imm(&b, m_limit, 0));
+      nir_store_agx(&b, one, aux_base, col,
+                    .access = (gl_access_qualifier)0, .base = 0,
+                    .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+      nir_pop_if(&b, NULL);
+   }
+
+   nir_def *k_next = nir_iadd_imm(&b, &k_phi->def, 1);
+   nir_push_if(&b, nir_uge(&b, k_next, n_tiles));
+   nir_jump(&b, nir_jump_break);
+   nir_pop_if(&b, NULL);
+
+   nir_block *latch = nir_loop_last_block(loop);
+   nir_phi_instr_add_src(k_phi, latch, k_next);
+   nir_instr_insert(nir_before_block(header), &k_phi->instr);
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      nir_phi_instr_add_src(initial[row], latch, acc[row]);
+      nir_instr_insert(nir_before_block(header), &initial[row]->instr);
+   }
+
+   nir_pop_loop(&b, loop);
+   nir_push_else(&b, guard);
+   nir_pop_if(&b, guard);
+
+   nir_block *after_loop = nir_if_last_then_block(guard);
+   nir_block *else_block = nir_if_last_else_block(guard);
+
+   nir_phi_instr *exit_phi[AGX_GEMM_ROWS_PER_LANE];
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      exit_phi[row] = create_scalar_phi(b.shader);
+      nir_phi_instr_add_src(exit_phi[row], after_loop, acc[row]);
+      nir_phi_instr_add_src(exit_phi[row], else_block, zero);
+      nir_builder_instr_insert(&b, &exit_phi[row]->instr);
+   }
+
+   const bool guarded =
+      tc == DirectGemmCase::GuardedClampC ||
+      tc == DirectGemmCase::DirectCNonAdjacentGuardedIfs;
+
+   for (unsigned row = 0; row < AGX_GEMM_ROWS_PER_LANE; ++row) {
+      nir_def *c_row = nir_iadd_imm(&b, c_row_base, row);
+      nir_def *c_idx = nir_iadd(&b, nir_imul(&b, c_row, c_stride), col);
+      nir_def *val = &exit_phi[row]->def;
+      if (tc == DirectGemmCase::GuardedClampC) {
+         val = nir_fmin_agx(&b, nir_fmax_agx(&b, val, nir_imm_float(&b, 0.0f)),
+                            nir_imm_float(&b, 6.0f));
+      }
+      if (guarded) {
+         nir_def *in_bounds = nir_iand(&b, nir_ilt(&b, c_row, m_limit),
+                                       nir_ilt(&b, col, n_limit));
+         nir_push_if(&b, in_bounds);
+         nir_store_agx(&b, val, c_base, c_idx,
+                       .access = (gl_access_qualifier)0, .base = 0,
+                       .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+         nir_pop_if(&b, NULL);
+         if (tc == DirectGemmCase::DirectCNonAdjacentGuardedIfs && row == 0) {
+            nir_push_if(&b, nir_ine_imm(&b, m_limit, 0));
+            nir_store_scratch(&b, one, nir_imm_int(&b, 0), .align_mul = 4);
+            nir_pop_if(&b, NULL);
+         }
+      } else {
+         nir_store_agx(&b, val, c_base, c_idx,
+                       .access = (gl_access_qualifier)0, .base = 0,
+                       .format = PIPE_FORMAT_R32_UINT, .sign_extend = false);
+      }
+   }
+
+   if (tc == DirectGemmCase::DirectCPostLoopRead) {
+      nir_def *rd = nir_load_agx(&b, 1, 32, c_base, col,
+                                 .access = ACCESS_NON_WRITEABLE, .base = 0,
+                                 .format = PIPE_FORMAT_R32_UINT,
+                                 .sign_extend = false);
+      nir_store_scratch(&b, rd, nir_imm_int(&b, 0), .align_mul = 4);
+   }
+
+   nir_validate_shader(b.shader, "gemm-direct input");
+   nir_divergence_analysis(b.shader);
+   return b;
+}
+
+TEST(GemmMatch, DirectBAndCUnguarded)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::UnguardedBC);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_TRUE(match.b_direct);
+   EXPECT_TRUE(match.c_direct);
+   ASSERT_TRUE(agx_nir_lower_gemm(b.shader, &match));
+   nir_validate_shader(b.shader, "gemm-direct unguarded lowered");
+   EXPECT_EQ(b.shader->info.shared_size, 4u * AGX_GEMM_TILE_WORDS);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectCGuardedClamp)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::GuardedClampC);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_TRUE(match.b_direct);
+   EXPECT_TRUE(match.c_direct);
+   ASSERT_EQ(match.c_group_count, 1u);
+   EXPECT_TRUE(match.c_groups[0].guarded);
+   EXPECT_TRUE(match.c_groups[0].has_clamp);
+   EXPECT_TRUE(match.c_groups[0].clamp_agx);
+   ASSERT_TRUE(agx_nir_lower_gemm(b.shader, &match));
+   nir_validate_shader(b.shader, "gemm-direct guarded clamp lowered");
+   EXPECT_EQ(b.shader->info.shared_size, 4u * AGX_GEMM_TILE_WORDS);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectBRejectsExtraReader)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::DirectBExtraReader);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_FALSE(match.b_direct);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectBRejectsWriteableLoad)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::DirectBWriteableLoad);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_FALSE(match.b_direct);
+   EXPECT_TRUE(match.c_direct);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectBRejectsInLoopExternalWrite)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::DirectBInLoopExternalWrite);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_FALSE(match.b_direct);
+   EXPECT_FALSE(match.c_direct);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectCRejectsPreLoopWrite)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::DirectCPreLoopWrite);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_TRUE(match.b_direct);
+   EXPECT_FALSE(match.c_direct);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectCRejectsPostLoopRead)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::DirectCPostLoopRead);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_FALSE(match.c_direct);
+   ralloc_free(b.shader);
+}
+
+TEST(GemmMatch, DirectCRejectsNonAdjacentGuardedIfs)
+{
+   nir_builder b = build_direct_gemm_shader(DirectGemmCase::DirectCNonAdjacentGuardedIfs);
+   struct agx_gemm_match match = {};
+   ASSERT_TRUE(agx_nir_match_gemm(b.shader, &match));
+   EXPECT_TRUE(match.b_direct);
+   EXPECT_FALSE(match.c_direct);
+   ralloc_free(b.shader);
+}
+
 /* Lowering bit size first (as agx_preprocess_nir() and deferred AGX3 compute
  * lowering do) and then running agx_nir_lower_shared_element_index() must
  * chase through u2u16 in 32 bits so constant byte addends still fold into
