@@ -217,7 +217,7 @@ check_as_contracts(void)
    };
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
       dev.chip = chip;
-      if (chip != AGX_CHIP_G17P && chip != AGX_CHIP_G16G)
+      if (!agx_chip_gen1_rt(chip))
          assert(!hk_g16s_as_enabled(&dev) && !hk_g17p_rt_enabled(&dev));
    }
 }
@@ -247,19 +247,22 @@ check_g16g_as_contracts(void)
       assert(hk_gen1_as_enabled(&dev) == (rt || as_only));
       assert(hk_gen1_rt_chip(&dev) == (rt || as_only));
    }
-   /* Other chips do not take the G16G/G17P GEN1 paths even with every bit. */
+   /* Chips outside the GEN1 runtime do not take its paths even with every
+    * bit. */
    dev.params.features = UINT64_MAX;
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip) {
       dev.chip = chip;
-      if (chip == AGX_CHIP_G16G || chip == AGX_CHIP_G17P)
+      if (agx_chip_gen1_rt(chip))
          continue;
       assert(!hk_g17p_rt_enabled(&dev) && !hk_gen1_as_enabled(&dev) &&
              !hk_gen1_rt_chip(&dev));
    }
-   /* The GEN1 runtime's chips are G17P and G16G. */
+   /* The GEN1 runtime's chips are G17P, G16G and the Mac G15 parts. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip < AGX_CHIP_UNKNOWN; ++chip)
       assert(agx_chip_gen1_rt(chip) ==
-             (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G));
+             (chip == AGX_CHIP_G17P || chip == AGX_CHIP_G16G ||
+              chip == AGX_CHIP_G15G || chip == AGX_CHIP_G15S ||
+              chip == AGX_CHIP_G15C));
    /* G17P keeps RT enabled as before. */
    dev.chip = AGX_CHIP_G17P;
    assert(hk_g17p_rt_enabled(&dev) && hk_gen1_rt_chip(&dev));
@@ -293,7 +296,7 @@ int main(void)
    /* Even a future kernel advertising every bit keeps zero flags on the
     * chips without the GEN1 builder. */
    for (enum agx_chip chip = AGX_CHIP_G13G; chip <= AGX_CHIP_G17A; ++chip)
-      if (chip != AGX_CHIP_G17P && chip != AGX_CHIP_G16G)
+      if (!agx_chip_gen1_rt(chip))
          assert(hk_as_build_flags(chip, UINT64_MAX, true) == 0);
    for (unsigned a = 0; a < 2; ++a)
       for (unsigned b = 0; b < 2; ++b)
