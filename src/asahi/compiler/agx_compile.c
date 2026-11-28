@@ -33,6 +33,7 @@
 #include "agx_nir.h"
 #include "agx_nir_match_gemm.h"
 #include "agx3_alu_core.h"
+#include "agx3_isel_core.h"
 #include "agx3_matrix_core.h"
 #include "agx3_native_stats.h"
 #include "agx_opcodes.h"
@@ -5831,6 +5832,297 @@ agx3_fold_constant_fmovs(agx_context *ctx)
    }
 
    free(defs);
+}
+
+/*
+ * G18G's iseli16 witnesses cover only a witnessed subset of compare-select
+ * shapes (encode_gpu1 in agx3_isel_core.c); every other compare-select shape
+ * refuses at pack time, and a refusal kills the whole shader. Ask the encoder
+ * itself which shapes pack -- mirroring its gates by hand produced false
+ * refusals that broke shaders that used to compile -- and rewrite a refusing
+ * shape into the plain word form: both comparands and both selected operands
+ * become word registers and the word result is truncated back. Runs after
+ * optimization so these moves survive copy propagation, which deliberately
+ * preserves 16-to-32 widening on AGX3.
+ */
+
+/* Before register allocation NORMAL values are SSA IDs, not physical
+ * half-register indices. Give those operands valid representative indices
+ * when asking the encoder whether their shape is supported. */
+static uint16_t
+g18g_probe_reg_value(agx_index s)
+{
+   return s.type == AGX_INDEX_NORMAL ? 0 : s.value;
+}
+
+/* Build the same encoder description the packer builds, with no waits and
+ * no lifetime hints, and report whether that shape encodes. */
+static bool
+g18g_icmpsel_encodes(const agx_instr *I)
+{
+#define G18G_IS_REG(s) (!(s).memory && ((s).type == AGX_INDEX_REGISTER || \
+                                        (s).type == AGX_INDEX_NORMAL))
+   struct agx3_isel_desc d;
+   memset(&d, 0, sizeof(d));
+
+   agx_index a = I->src[0], b = I->src[1];
+   const agx_index dest = I->dest[0];
+
+   const bool narrow_first =
+      G18G_IS_REG(a) && G18G_IS_REG(b) &&
+      a.size == AGX_SIZE_16 && b.size == AGX_SIZE_32;
+   const bool swap_compare =
+      a.type == AGX_INDEX_IMMEDIATE || narrow_first;
+   if (swap_compare) {
+      const agx_index tmp = a;
+      a = b;
+      b = tmp;
+   }
+
+   const bool narrow_second =
+      G18G_IS_REG(a) && G18G_IS_REG(b) &&
+      a.size == AGX_SIZE_32 && b.size == AGX_SIZE_16;
+
+   const bool dest_ok =
+      G18G_IS_REG(dest) && agx_channels(dest) == 1 &&
+      (dest.size == AGX_SIZE_32 || dest.size == AGX_SIZE_16);
+   /* One aligned 32-bit uniform comparand is native beside a 32-bit
+    * register (agx3_isel_core.c); agx_lower_uniform_sources keeps no other
+    * uniform compare shape. */
+   const bool a_uniform = a.type == AGX_INDEX_UNIFORM;
+   const bool b_uniform = b.type == AGX_INDEX_UNIFORM;
+   const bool a_reg32 = G18G_IS_REG(a) && a.size == AGX_SIZE_32 &&
+                        agx_channels(a) == 1;
+   const bool b_reg32 = G18G_IS_REG(b) && b.size == AGX_SIZE_32 &&
+                        agx_channels(b) == 1;
+   const bool cmp_ok =
+      !a.memory && !a.abs && !a.neg &&
+      !b.memory && !b.abs && !b.neg &&
+      ((a_uniform && a.size == AGX_SIZE_32 && b_reg32) ||
+       (b_uniform && b.size == AGX_SIZE_32 && a_reg32) ||
+       (G18G_IS_REG(a) && (a.size == AGX_SIZE_32 || a.size == AGX_SIZE_16) &&
+        agx_channels(a) == 1 &&
+        ((b.type == AGX_INDEX_IMMEDIATE && b.value <= 255) ||
+         (G18G_IS_REG(b) && (b.size == a.size || narrow_second) &&
+          agx_channels(b) == 1))));
+   if (!dest_ok || !cmp_ok)
+      return false;
+
+   unsigned cond;
+   switch (I->icond) {
+   case AGX_ICOND_UEQ:
+   case AGX_ICOND_SEQ:
+      cond = AGX3_ISEL_ICOND_EQ;
+      break;
+   case AGX_ICOND_ULT: cond = AGX3_ISEL_ICOND_ULT; break;
+   case AGX_ICOND_UGT: cond = AGX3_ISEL_ICOND_UGT; break;
+   case AGX_ICOND_SLT: cond = AGX3_ISEL_ICOND_SLT; break;
+   case AGX_ICOND_SGT: cond = AGX3_ISEL_ICOND_SGT; break;
+   default: return false;
+   }
+   if (swap_compare) {
+      switch (cond) {
+      case AGX3_ISEL_ICOND_ULT: cond = AGX3_ISEL_ICOND_UGT; break;
+      case AGX3_ISEL_ICOND_UGT: cond = AGX3_ISEL_ICOND_ULT; break;
+      case AGX3_ISEL_ICOND_SLT: cond = AGX3_ISEL_ICOND_SGT; break;
+      case AGX3_ISEL_ICOND_SGT: cond = AGX3_ISEL_ICOND_SLT; break;
+      default: break;
+      }
+   }
+
+   const agx_index sel[2] = {I->src[2], I->src[3]};
+   enum agx3_isel_operand kind[2];
+   uint16_t value[2];
+   for (unsigned n = 0; n < 2; ++n) {
+      const agx_index s = sel[n];
+      if (s.type == AGX_INDEX_IMMEDIATE && !s.memory && !s.abs && !s.neg) {
+         kind[n] = AGX3_ISEL_IMMEDIATE;
+         value[n] = s.value;
+      } else if (G18G_IS_REG(s) && !s.abs && !s.neg &&
+                 s.size == dest.size && agx_channels(s) == 1) {
+         kind[n] = AGX3_ISEL_REGISTER;
+         value[n] = g18g_probe_reg_value(s);
+      } else if (s.type == AGX_INDEX_UNIFORM && !s.memory && !s.abs &&
+                 !s.neg && s.size == AGX_SIZE_32 &&
+                 dest.size == AGX_SIZE_32) {
+         kind[n] = AGX3_ISEL_UNIFORM;
+         value[n] = s.value;
+      } else {
+         return false;
+      }
+   }
+
+   d.dest = g18g_probe_reg_value(dest);
+   d.dest_16 = dest.size == AGX_SIZE_16;
+   d.cmp0 = g18g_probe_reg_value(a);
+   d.cmp1 = g18g_probe_reg_value(b);
+   d.cmp1_immediate = b.type == AGX_INDEX_IMMEDIATE;
+   d.cmp0_uniform = a_uniform;
+   d.cmp1_uniform = b_uniform;
+   d.cmp_16 = a.size == AGX_SIZE_16;
+   d.cmp1_16 = narrow_second;
+   d.explicit_hints = true;
+   d.dest_cache = dest.cache;
+   const agx_index hinted[4] = {a, b, I->src[2], I->src[3]};
+   for (unsigned n = 0; n < 4; ++n) {
+      if (hinted[n].type == AGX_INDEX_REGISTER) {
+         d.cache[n] = hinted[n].cache;
+         d.discard[n] = hinted[n].discard;
+      }
+   }
+   d.cond = cond;
+   d.true_kind = kind[0];
+   d.false_kind = kind[1];
+   d.sel_true = value[0];
+   d.sel_false = value[1];
+
+   uint8_t bytes[AGX3_ISEL_MAX_LENGTH];
+   uint8_t len = 0;
+   if (!agx3_isel_encode_g18g(AGX_ISA_ENCODING_AGX3C, &d, bytes, &len))
+      return false;
+
+   /* RA may place a narrow second comparand in either half. Stock packing
+    * refuses the odd half (encode_gpu1: every witnessed narrow comparand is
+    * a low half), so keep only forms that encode at both parities. */
+   if (narrow_second && b.type == AGX_INDEX_NORMAL) {
+      d.cmp1 = 1;
+      if (!agx3_isel_encode_g18g(AGX_ISA_ENCODING_AGX3C, &d, bytes, &len))
+         return false;
+   }
+
+   return true;
+#undef G18G_IS_REG
+}
+
+static char
+g18g_opchar(const agx_index s)
+{
+   switch (s.type) {
+   case AGX_INDEX_REGISTER: return 'r';
+   case AGX_INDEX_NORMAL: return 'n';
+   case AGX_INDEX_UNIFORM: return 'u';
+   case AGX_INDEX_IMMEDIATE: return 'i';
+   default: return '?';
+   }
+}
+
+static void
+g18g_log_icmpsel(const agx_context *ctx, const agx_instr *I, bool rewritten)
+{
+   if (!(agx_compiler_debug & AGX_DBG_SHADERS))
+      return;
+   fprintf(stderr,
+           "[g18g-icmpsel] %s stage=%d icond=%d dest=r%u/%u "
+           "c0=%c%u/%u%s%s c1=%c%u/%u%s%s "
+           "t=%c%u/%u%s%s f=%c%u/%u%s%s\n",
+           rewritten ? "rewrite" : "still-refuses", (int)ctx->stage,
+           (int)I->icond, I->dest[0].value,
+           I->dest[0].size == AGX_SIZE_16 ? 16 : 32,
+           g18g_opchar(I->src[0]), I->src[0].value,
+           I->src[0].size == AGX_SIZE_16 ? 16 : 32,
+           I->src[0].abs ? " abs" : "", I->src[0].neg ? " neg" : "",
+           g18g_opchar(I->src[1]), I->src[1].value,
+           I->src[1].size == AGX_SIZE_16 ? 16 : 32,
+           I->src[1].abs ? " abs" : "", I->src[1].neg ? " neg" : "",
+           g18g_opchar(I->src[2]), I->src[2].value,
+           I->src[2].size == AGX_SIZE_16 ? 16 : 32,
+           I->src[2].abs ? " abs" : "", I->src[2].neg ? " neg" : "",
+           g18g_opchar(I->src[3]), I->src[3].value,
+           I->src[3].size == AGX_SIZE_16 ? 16 : 32,
+           I->src[3].abs ? " abs" : "", I->src[3].neg ? " neg" : "");
+}
+
+bool
+agx_lower_agx3_g18g_half_icmpsel(agx_context *ctx)
+{
+   if (!agx_is_g18g(&ctx->key->dev))
+      return false;
+
+#define G18G_IS_REG(s) (!(s).memory && ((s).type == AGX_INDEX_REGISTER || \
+                                        (s).type == AGX_INDEX_NORMAL))
+   bool progress = false;
+   agx_foreach_instr_global_safe(ctx, I) {
+      if (I->op != AGX_OPCODE_ICMPSEL || I->nr_dests != 1 ||
+          I->nr_srcs != 4 ||
+          (I->dest[0].size != AGX_SIZE_16 && I->dest[0].size != AGX_SIZE_32) ||
+          agx_channels(I->dest[0]) != 1)
+         continue;
+
+      if (g18g_icmpsel_encodes(I))
+         continue;
+
+      g18g_log_icmpsel(ctx, I, true);
+
+      const bool cond_signed =
+         I->icond == AGX_ICOND_SLT || I->icond == AGX_ICOND_SGT;
+
+      agx_builder wb = agx_init_builder(ctx, agx_before_instr(I));
+      for (unsigned s = 0; s < 4; ++s) {
+         agx_index src = I->src[s];
+         const bool comparand = s < 2;
+
+         if (src.type == AGX_INDEX_IMMEDIATE) {
+            uint64_t v = src.value;
+            if (comparand && cond_signed) {
+               /* The comparison is a signed one at the immediate's width:
+                  extend the pattern the way the relation reads it. */
+               if (src.size == AGX_SIZE_16 && v >= 0x8000)
+                  v -= 0x10000ull;
+               else if (src.size == AGX_SIZE_32 && v >= 0x80000000ull)
+                  v -= 0x100000000ull;
+            }
+            I->src[s] = agx_mov_imm(&wb, 32, v);
+         } else if (src.type == AGX_INDEX_UNIFORM) {
+            /* A move zero-extends, but a signed comparison reads its
+               comparand signed: sign-extend a 16-bit uniform comparand
+               exactly like the half-register path below. */
+            agx_index w = agx_temp(ctx, AGX_SIZE_32);
+            if (comparand && cond_signed && src.size == AGX_SIZE_16) {
+               agx_index t16 = agx_temp(ctx, AGX_SIZE_16);
+               agx_mov_to(&wb, t16, src);
+               agx_signext_to(&wb, w, t16);
+            } else {
+               agx_mov_to(&wb, w, src);
+            }
+            I->src[s] = w;
+         } else if (G18G_IS_REG(src) && src.size == AGX_SIZE_32) {
+            if (!src.abs && !src.neg)
+               continue;
+            agx_index w = agx_temp(ctx, AGX_SIZE_32);
+            agx_mov_to(&wb, w, src);
+            I->src[s] = w;
+         } else {
+            /* A half register: materialize any modifier at half width,
+               then extend by the relation (a select only cares about the
+               bits, so it always zero-extends). */
+            agx_index half = src;
+            half.abs = half.neg = false;
+            if (src.abs || src.neg) {
+               agx_index t16 = agx_temp(ctx, AGX_SIZE_16);
+               agx_mov_to(&wb, t16, src);
+               half = t16;
+            }
+            agx_index w = agx_temp(ctx, AGX_SIZE_32);
+            if (comparand && cond_signed)
+               agx_signext_to(&wb, w, half);
+            else
+               agx_mov_to(&wb, w, half);
+            I->src[s] = w;
+         }
+      }
+
+      if (I->dest[0].size == AGX_SIZE_16) {
+         agx_index half = I->dest[0];
+         I->dest[0] = agx_temp(ctx, AGX_SIZE_32);
+         wb.cursor = agx_after_instr(I);
+         agx_subdivide_to(&wb, half, I->dest[0], 0);
+      }
+      if (!g18g_icmpsel_encodes(I))
+         g18g_log_icmpsel(ctx, I, false);
+      progress = true;
+   }
+   return progress;
+#undef G18G_IS_REG
 }
 
 void
@@ -12152,13 +12444,17 @@ static bool agx3_nir_lower_uniform_dma(nir_shader *nir,
                                        struct agx_shader_info *info);
 
 /* G18 has no admitted native quad or integer min/max/bitwise prefix encoding.
- * Use the common activity-aware subgroup algorithms, then let the normal AGX
- * pass lower generated shuffles and ballots. Whole-subgroup native operations
- * stay intact. */
+ * Under DenormFlushToZero(32), G18G also preserves fp32 denormals in native
+ * whole-wave float reductions and scans, so lower fp32 fadd/fmul reduce and
+ * scan through the shuffle/ALU path where agx_nir_lower_g18_ftz flushes every
+ * input, intermediate, and result. Use the common activity-aware subgroup
+ * algorithms, then let the normal AGX pass lower generated shuffles and
+ * ballots. Other whole-subgroup native operations stay intact. */
 static bool
 agx_g18_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 {
-   (void)data;
+   const bool ftz32 = data && *(const bool *)data;
+
    switch (intr->intrinsic) {
    case nir_intrinsic_quad_broadcast:
    case nir_intrinsic_quad_swap_horizontal:
@@ -12167,13 +12463,25 @@ agx_g18_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
       return true;
    case nir_intrinsic_reduce: {
       unsigned cluster = nir_intrinsic_cluster_size(intr);
-      return cluster > 0 && cluster < 32;
+      if (cluster > 0 && cluster < 32)
+         return true;
+      if (ftz32 && intr->def.bit_size == 32) {
+         nir_op op = nir_intrinsic_reduction_op(intr);
+         return op == nir_op_fadd || op == nir_op_fmul;
+      }
+      return false;
    }
    case nir_intrinsic_inclusive_scan:
    case nir_intrinsic_exclusive_scan:
       break;
    default:
       return false;
+   }
+
+   if (ftz32 && intr->def.bit_size == 32) {
+      nir_op op = nir_intrinsic_reduction_op(intr);
+      if (op == nir_op_fadd || op == nir_op_fmul)
+         return true;
    }
 
    switch (nir_intrinsic_reduction_op(intr)) {
@@ -12191,10 +12499,47 @@ agx_g18_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 }
 
 static bool
+agx_g18_val_is_flushed(nir_def *def)
+{
+   if (!nir_def_is_alu(def))
+      return false;
+   nir_alu_instr *alu = nir_def_as_alu(def);
+   if (alu->op == nir_op_fcanonicalize)
+      return true;
+   return alu->op == nir_op_fadd && nir_src_is_const(alu->src[1].src) &&
+          nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[0]) ==
+             0x80000000u;
+}
+
+static bool
+agx_g18_flush_subgroup_fp32_arith(nir_builder *b, nir_intrinsic_instr *intr,
+                                  UNUSED void *data)
+{
+   if ((intr->intrinsic != nir_intrinsic_reduce &&
+        intr->intrinsic != nir_intrinsic_inclusive_scan &&
+        intr->intrinsic != nir_intrinsic_exclusive_scan) ||
+       intr->def.bit_size != 32)
+      return false;
+
+   const nir_op op = nir_intrinsic_reduction_op(intr);
+   if ((op != nir_op_fadd && op != nir_op_fmul) ||
+       agx_g18_val_is_flushed(intr->src[0].ssa))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   b->fp_math_ctrl = nir_fp_no_fast_math;
+   nir_src_rewrite(&intr->src[0], nir_fadd_imm(b, intr->src[0].ssa, -0.0));
+   return true;
+}
+
+static bool
 agx_nir_lower_g18_subgroups(nir_shader *nir)
 {
+   const bool ftz32 =
+      nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode, 32);
    const nir_lower_subgroups_options options = {
       .filter = agx_g18_subgroup_filter,
+      .filter_data = &ftz32,
       .lower_reduce = true,
       .lower_quad = true,
       .lower_to_scalar = true,
@@ -12204,6 +12549,11 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
       .subgroup_size = 32,
    };
    bool progress = agx_nir_flush_subgroup_minmax(nir);
+   if (ftz32) {
+      progress |= nir_shader_intrinsics_pass(
+         nir, agx_g18_flush_subgroup_fp32_arith, nir_metadata_control_flow,
+         NULL);
+   }
    while (nir_lower_subgroups(nir, &options))
       progress = true;
    return progress;
@@ -12689,7 +13039,7 @@ agx_factor_loop_mac(nir_shader *nir)
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
                  bool byte_indices, bool discard_word, bool m5,
-                 bool g18_scans, bool checked_offsets,
+                 bool g18_scans, bool g18_ftz, bool checked_offsets,
                  uint16_t *preamble_size, uint8_t *ts_count, uint8_t *ss_count,
                  const struct agx_shader_key *dma_key,
                  struct agx_shader_info *dma_info,
@@ -13367,6 +13717,12 @@ pre_preamble:
    bool late_progress = false;
    NIR_PASS(late_progress, nir, nir_opt_algebraic_late);
    NIR_PASS(late_progress, nir, agx_nir_lower_fminmax, agx3b || m5);
+
+   /* G18G fp32 arithmetic preserves denorms and nothing in the encoding
+    * flushes them, so DenormFlushToZero(32) shaders need the flush in
+    * software. Runs after the last float-changing optimization. */
+   if (g18_ftz)
+      NIR_PASS(_, nir, agx_nir_lower_g18_ftz);
 
    /* The AGX3 byte-address backend cannot encode 64-bit shifted adds.
     * Lower remaining 64x64 multiplies before fusion turns x * 3 into one; the
@@ -16139,6 +16495,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    agx_lower_agx3_half_converts(ctx);
    agx_lower_agx3_fma_sources(ctx);
    agx_lower_agx3_mixed_width_unary(ctx);
+   AGX_PASS(ctx, agx_lower_agx3_g18g_half_icmpsel);
    agx_lower_agx3_shifted_iadd_dest(ctx);
    agx_lower_m5_alu_operands(ctx);
 
@@ -17864,7 +18221,9 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
             } else if (instr->type == nir_instr_type_intrinsic) {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
                if (g18g) {
-                  assert(!agx_g18_subgroup_filter(intr, NULL) &&
+                  const bool ftz32 = nir_is_denorm_flush_to_zero(
+                     nir->info.float_controls_execution_mode, 32);
+                  assert(!agx_g18_subgroup_filter(intr, &ftz32) &&
                          "post_lower requires G18G subgroups already lowered");
                }
                assert(!agx_nir_subgroup_intrinsic_needs_lowering(
@@ -20612,12 +20971,16 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       nir->info.stage == MESA_SHADER_FRAGMENT &&
       MAX2(key->fs.nr_samples, 1) == 1 && !key->fs.inside_sample_loop;
 
+   const bool g18_ftz =
+      agx_is_g18g(&key->dev) &&
+      nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode, 32);
+
    if (!post_opt_skip) {
       agx_optimize_nir(
          nir, key->dev.soft_fault, uniform_atomics,
          key->dev.encoding == AGX_ISA_ENCODING_AGX3B, discard_word,
          key->dev.encoding == AGX_ISA_ENCODING_AGX3C,
-         key->dev.emit_agx3d, key->checked_offsets,
+         key->dev.emit_agx3d, g18_ftz, key->checked_offsets,
          form_preamble ? &info->push_count : NULL,
          (form_preamble && key->promote_textures) ? &info->texture_state_count
                                                  : NULL,
