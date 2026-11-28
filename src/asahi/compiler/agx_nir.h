@@ -442,6 +442,9 @@ bool agx_nir_opt_uniform_stride(struct nir_shader *shader);
 bool agx_nir_fold_m5_offsets(struct nir_shader *shader, bool soft_fault);
 bool agx_nir_unroll_runtime_loops(struct nir_shader *shader, unsigned factor,
                                   unsigned max_instrs, unsigned *widest);
+bool agx_nir_unroll_runtime_loops_ex(struct nir_shader *shader, unsigned factor,
+                                     unsigned max_instrs, unsigned *widest,
+                                     bool rotate_main);
 bool agx_nir_unroll_and_jam(struct nir_shader *shader, unsigned factor,
                             unsigned *widest);
 bool agx_nir_opt_u8_absdiff_fp(struct nir_shader *shader);

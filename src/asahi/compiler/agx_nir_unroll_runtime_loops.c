@@ -761,9 +761,54 @@ latch_register(nir_loop *loop, nir_def *value)
    return NULL;
 }
 
+static bool
+loop_is_int_alu_only(nir_loop *loop)
+{
+   unsigned int_ops = 0;
+   foreach_list_typed(nir_cf_node, n, node, &loop->body) {
+      if (n->type == nir_cf_node_loop)
+         return false;
+   }
+   nir_foreach_block_in_cf_node(blk, &loop->cf_node) {
+      nir_foreach_instr(instr, blk) {
+         if (instr->type == nir_instr_type_alu) {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            const nir_op_info *info = &nir_op_infos[alu->op];
+            if (nir_alu_type_get_base_type(info->output_type) == nir_type_float)
+               return false;
+            for (unsigned i = 0; i < info->num_inputs; ++i) {
+               if (nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float)
+                  return false;
+            }
+            int_ops++;
+         } else if (instr->type == nir_instr_type_tex ||
+                    instr->type == nir_instr_type_deref) {
+            return false;
+         } else if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_reg &&
+                intr->intrinsic != nir_intrinsic_store_reg)
+               return false;
+         }
+      }
+   }
+   return int_ops > 0;
+}
+
+static nir_def *
+emit_guard_cont(nir_builder *b, const struct counted_loop *cl, nir_def *iv,
+                nir_def *g, bool exact_tail)
+{
+   if (cl->offset && !exact_tail)
+      iv = nir_iadd_imm(b, iv, cl->offset);
+   if (cl->rel == REL_LT || cl->rel == REL_LE)
+      return cl->is_unsigned ? nir_ult(b, iv, g) : nir_ilt(b, iv, g);
+   return cl->is_unsigned ? nir_ult(b, g, iv) : nir_ilt(b, g, iv);
+}
+
 static void
 unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
-            nir_def *step_val, unsigned factor)
+            nir_def *step_val, unsigned factor, bool rotate_main)
 {
    nir_loop *loop = cl->loop;
    nir_builder b = nir_builder_create(impl);
@@ -796,14 +841,7 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
     * main loop's factor iterations, plus the first one of the original loop,
     * which runs its body before its test. The same guard covers both. */
    b.cursor = nir_after_phis(nir_loop_first_block(loop));
-   nir_def *iv = &cl->iv->def;
-   if (cl->offset && !exact_tail)
-      iv = nir_iadd_imm(&b, iv, cl->offset);
-   nir_def *cont;
-   if (cl->rel == REL_LT || cl->rel == REL_LE)
-      cont = cl->is_unsigned ? nir_ult(&b, iv, g) : nir_ilt(&b, iv, g);
-   else
-      cont = cl->is_unsigned ? nir_ult(&b, g, iv) : nir_ilt(&b, g, iv);
+   nir_def *cont = emit_guard_cont(&b, cl, &cl->iv->def, g, exact_tail);
    nir_def *guard = cl->break_in_then ? nir_inot(&b, cont) : cont;
    /* Which source of the compare reads the induction variable: after the
     * header phis become registers, it is the load of the iv's register. */
@@ -836,54 +874,109 @@ unroll_loop(nir_function_impl *impl, struct counted_loop *cl, nir_def *bound,
    nir_def *main_guard = he->data;
    _mesa_hash_table_destroy(remap, NULL);
 
-   nir_if *main_if;
-   if (!cl->bottom) {
-      main_if = nir_cf_node_as_if(
-         nir_cf_node_next(&nir_loop_first_block(main_loop)->cf_node));
-      nir_src_rewrite(&main_if->condition, main_guard);
-   } else {
-      /* Test at the top instead, and drop the bottom test. Its continue
-       * branch holds the register writes that replaced the header phis'
-       * back-edge sources: keep them, after the dropped test. */
+   if (rotate_main && cl->bottom && exact_tail &&
+       loop_is_int_alu_only(loop)) {
+      nir_intrinsic_instr *guard_iv_load =
+         nir_def_as_intrinsic(cont_alu->src[iv_src].src.ssa);
+      assert(guard_iv_load->intrinsic == nir_intrinsic_load_reg);
+      nir_def *guard_iv_reg = guard_iv_load->src[0].ssa;
+
+      /* Keep an exact-tail rotated loop bottom-tested in its unrolled main
+       * loop: guard entry once outside the loop, repeat the body `factor`
+       * times, and exit with `if (!b_cont) break` at the latch. Requiring
+       * exact_tail avoids emitting an extra `iv_next + offset` add and
+       * back-edge copy or duplicating wide (>16 live-out) entry-guard copies,
+       * while preserving native bottom-exit compare placement and exposing the
+       * full body as a single header block for bounded-pressure ALU ILP. */
       nir_if *bottom_if = nir_cf_node_as_if(
          nir_cf_node_prev(&nir_loop_last_block(main_loop)->cf_node));
       struct exec_list *cont_list = cl->break_in_then ? &bottom_if->else_list
                                                       : &bottom_if->then_list;
-      nir_cf_list cont;
-      nir_cf_extract(&cont, nir_before_cf_list(cont_list),
+      nir_cf_list cont_cf;
+      nir_cf_extract(&cont_cf, nir_before_cf_list(cont_list),
                      nir_after_cf_list(cont_list));
-      nir_cf_reinsert(&cont, nir_after_cf_node(&bottom_if->cf_node));
+      nir_cf_reinsert(&cont_cf, nir_after_cf_node(&bottom_if->cf_node));
       nir_cf_node_remove(&bottom_if->cf_node);
-      b.cursor = nir_after_instr(nir_def_instr(main_guard));
-      main_if = nir_push_if(&b, main_guard);
-      if (cl->break_in_then)
-         nir_jump(&b, nir_jump_break);
-      nir_push_else(&b, main_if);
-      if (!cl->break_in_then)
-         nir_jump(&b, nir_jump_break);
-      nir_pop_if(&b, main_if);
-   }
-   /* Repeat the iteration factor - 1 more times inside the main loop. */
-   nir_cf_list head, rest;
-   nir_cf_extract(&head, nir_before_cf_list(&main_loop->body),
-                  nir_before_cf_node(&main_if->cf_node));
-   nir_cf_extract(&rest, nir_after_cf_node(&main_if->cf_node),
-                  nir_after_cf_list(&main_loop->body));
 
-   nir_cf_list copies[2 * 16];
-   assert(factor <= 16);
-   for (unsigned i = 1; i < factor; ++i) {
-      remap = _mesa_pointer_hash_table_create(NULL);
-      nir_cf_list_clone(&copies[2 * i], &head, &main_loop->cf_node, remap);
-      nir_cf_list_clone(&copies[2 * i + 1], &rest, &main_loop->cf_node, remap);
-      _mesa_hash_table_destroy(remap, NULL);
-   }
+      nir_cf_list iter;
+      nir_cf_extract(&iter, nir_before_cf_list(&main_loop->body),
+                     nir_after_cf_list(&main_loop->body));
 
-   nir_cf_reinsert(&head, nir_before_cf_node(&main_if->cf_node));
-   nir_cf_reinsert(&rest, nir_after_cf_list(&main_loop->body));
-   for (unsigned i = 1; i < factor; ++i) {
-      nir_cf_reinsert(&copies[2 * i], nir_after_cf_list(&main_loop->body));
-      nir_cf_reinsert(&copies[2 * i + 1], nir_after_cf_list(&main_loop->body));
+      nir_cf_list copies[16];
+      assert(factor <= 16);
+      for (unsigned i = 1; i < factor; ++i) {
+         remap = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&copies[i], &iter, &main_loop->cf_node, remap);
+         _mesa_hash_table_destroy(remap, NULL);
+      }
+      nir_cf_reinsert(&iter, nir_after_cf_list(&main_loop->body));
+      for (unsigned i = 1; i < factor; ++i)
+         nir_cf_reinsert(&copies[i], nir_after_cf_list(&main_loop->body));
+
+      b.cursor = nir_after_cf_list(&main_loop->body);
+      nir_def *b_cont =
+         emit_guard_cont(&b, cl, nir_load_reg(&b, guard_iv_reg), g, exact_tail);
+      nir_if *b_if = nir_push_if(&b, b_cont);
+      nir_push_else(&b, b_if);
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, b_if);
+
+      b.cursor = nir_before_cf_node(&main_loop->cf_node);
+      nir_def *e_cont =
+         emit_guard_cont(&b, cl, nir_load_reg(&b, guard_iv_reg), g, exact_tail);
+      nir_if *enter = nir_push_if(&b, e_cont);
+      nir_pop_if(&b, enter);
+
+      nir_cf_list main_cf;
+      nir_cf_extract(&main_cf, nir_before_cf_node(&main_loop->cf_node),
+                     nir_after_cf_node(&main_loop->cf_node));
+      nir_cf_reinsert(&main_cf, nir_before_cf_list(&enter->then_list));
+   } else {
+      nir_if *main_if;
+      if (!cl->bottom) {
+         main_if = nir_cf_node_as_if(
+            nir_cf_node_next(&nir_loop_first_block(main_loop)->cf_node));
+         nir_src_rewrite(&main_if->condition, main_guard);
+      } else {
+         nir_if *bottom_if = nir_cf_node_as_if(
+            nir_cf_node_prev(&nir_loop_last_block(main_loop)->cf_node));
+         struct exec_list *cont_list = cl->break_in_then ? &bottom_if->else_list
+                                                         : &bottom_if->then_list;
+         nir_cf_list cont;
+         nir_cf_extract(&cont, nir_before_cf_list(cont_list),
+                        nir_after_cf_list(cont_list));
+         nir_cf_reinsert(&cont, nir_after_cf_node(&bottom_if->cf_node));
+         nir_cf_node_remove(&bottom_if->cf_node);
+         b.cursor = nir_after_instr(nir_def_instr(main_guard));
+         main_if = nir_push_if(&b, main_guard);
+         if (cl->break_in_then)
+            nir_jump(&b, nir_jump_break);
+         nir_push_else(&b, main_if);
+         if (!cl->break_in_then)
+            nir_jump(&b, nir_jump_break);
+         nir_pop_if(&b, main_if);
+      }
+      nir_cf_list head, rest;
+      nir_cf_extract(&head, nir_before_cf_list(&main_loop->body),
+                     nir_before_cf_node(&main_if->cf_node));
+      nir_cf_extract(&rest, nir_after_cf_node(&main_if->cf_node),
+                     nir_after_cf_list(&main_loop->body));
+
+      nir_cf_list copies[2 * 16];
+      assert(factor <= 16);
+      for (unsigned i = 1; i < factor; ++i) {
+         remap = _mesa_pointer_hash_table_create(NULL);
+         nir_cf_list_clone(&copies[2 * i], &head, &main_loop->cf_node, remap);
+         nir_cf_list_clone(&copies[2 * i + 1], &rest, &main_loop->cf_node, remap);
+         _mesa_hash_table_destroy(remap, NULL);
+      }
+
+      nir_cf_reinsert(&head, nir_before_cf_node(&main_if->cf_node));
+      nir_cf_reinsert(&rest, nir_after_cf_list(&main_loop->body));
+      for (unsigned i = 1; i < factor; ++i) {
+         nir_cf_reinsert(&copies[2 * i], nir_after_cf_list(&main_loop->body));
+         nir_cf_reinsert(&copies[2 * i + 1], nir_after_cf_list(&main_loop->body));
+      }
    }
 
    if (!exact_tail)
@@ -2679,8 +2772,9 @@ unswitch_uniform_ifs(nir_function_impl *impl)
 }
 
 bool
-agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
-                             unsigned max_instrs, unsigned *widest)
+agx_nir_unroll_runtime_loops_ex(nir_shader *shader, unsigned factor,
+                                unsigned max_instrs, unsigned *widest,
+                                bool rotate_main)
 {
    bool any = false;
    assert(factor >= 2 && factor <= 16);
@@ -2798,7 +2892,7 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
          }
          if (widest)
             *widest = MAX2(*widest, f);
-         unroll_loop(impl, &cl, bound, step_val, f);
+         unroll_loop(impl, &cl, bound, step_val, f, rotate_main);
 
          nir_progress(true, impl, nir_metadata_none);
          nir_lower_reg_intrinsics_to_ssa_impl(impl);
@@ -2818,4 +2912,12 @@ agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
       }
    }
    return any;
+}
+
+bool
+agx_nir_unroll_runtime_loops(nir_shader *shader, unsigned factor,
+                             unsigned max_instrs, unsigned *widest)
+{
+   return agx_nir_unroll_runtime_loops_ex(shader, factor, max_instrs, widest,
+                                          false);
 }

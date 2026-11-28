@@ -1715,3 +1715,232 @@ TEST(M5RuntimeLoops, SharedStepOverflowSkipsUnroll)
       ralloc_free(b.shader);
    }
 }
+
+static bool
+loop_has_bottom_exit_only(nir_loop *loop)
+{
+   nir_block *first = nir_loop_first_block(loop);
+   nir_cf_node *after_first = nir_cf_node_next(&first->cf_node);
+   nir_cf_node *last_cf = nir_cf_node_prev(&nir_loop_last_block(loop)->cf_node);
+   if (!last_cf || last_cf->type != nir_cf_node_if)
+      return false;
+   if (after_first != last_cf)
+      return false;
+   nir_if *nif = nir_cf_node_as_if(last_cf);
+   if (!exec_list_is_singular(&nif->then_list) ||
+       !exec_list_is_singular(&nif->else_list))
+      return false;
+   nir_block *then_blk = nir_if_first_then_block(nif);
+   nir_block *else_blk = nir_if_first_else_block(nif);
+   if (!exec_list_is_empty(&then_blk->instr_list) ||
+       !nir_block_ends_in_break(else_blk))
+      return false;
+   return true;
+}
+
+TEST(M5RuntimeLoops, BottomTestedRotateMainKeepsBottomTest)
+{
+   /* 1. exact_tail pure integer-ALU bottom-tested loop: rotate_main=true
+    * guards entry once and keeps the unrolled main loop bottom-tested
+    * (else-break latch), while rotate_main=false keeps a top-tested main loop.
+    * A memory-load loop (counted_loop) is NOT rotated. */
+   for (bool rotate_main : {false, true}) {
+      nir_builder b = compute_shader("rotate-main-int-exact");
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_intrinsic_set_range(nir_def_as_intrinsic(n), 32);
+      nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_int(&b, 1), 1);
+      nir_loop *loop = nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, iv);
+         nir_def *a = nir_load_var(&b, acc);
+         nir_def *m = nir_ixor(&b, nir_iadd(&b, a, i), nir_ishl_imm(&b, a, 7));
+         nir_store_var(&b, acc, m, 1);
+         nir_def *next = nir_iadd_imm(&b, i, 1);
+         nir_store_var(&b, iv, next, 1);
+         nir_break_if(&b, nir_uge(&b, next, n));
+      }
+      nir_pop_loop(&b, loop);
+      nir_intrinsic_set_align_mul(
+         nir_store_global(&b, nir_load_var(&b, acc),
+                          buffer_address(&b, nir_imm_int(&b, 0))),
+         4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_shader *s = b.shader;
+
+      EXPECT_TRUE(
+         agx_nir_unroll_runtime_loops_ex(s, 4, 256, NULL, rotate_main));
+      nir_validate_shader(s, "rotate-main exact-tail");
+      EXPECT_EQ(count_loops(s), 2u);
+      EXPECT_EQ(loops_inside_ifs(s), rotate_main ? 2u : 1u);
+
+      if (rotate_main) {
+         nir_function_impl *impl = nir_shader_get_entrypoint(s);
+         nir_loop *first_loop = NULL;
+         foreach_list_typed(nir_cf_node, n_cf, node, &impl->body) {
+            if (n_cf->type == nir_cf_node_if) {
+               nir_if *nif = nir_cf_node_as_if(n_cf);
+               foreach_list_typed(nir_cf_node, c, node, &nif->then_list) {
+                  if (c->type == nir_cf_node_loop) {
+                     first_loop = nir_cf_node_as_loop(c);
+                     break;
+                  }
+               }
+               if (first_loop)
+                  break;
+            }
+         }
+         ASSERT_NE(first_loop, nullptr);
+         EXPECT_TRUE(loop_has_bottom_exit_only(first_loop));
+      }
+
+      NIR_PASS(_, s, nir_opt_dce);
+      nir_validate_shader(s, "rotate-main exact-tail after dce");
+      ralloc_free(s);
+   }
+   /* Memory-load loop stays unrotated (only tail loop is inside if). */
+   {
+      nir_def *hi;
+      nir_shader *s = counted_loop(BOTTOM_TESTED, &hi, false, INT64_MAX);
+      EXPECT_TRUE(agx_nir_unroll_runtime_loops_ex(s, 4, 256, NULL, true));
+      nir_validate_shader(s, "rotate-main mem-skip");
+      EXPECT_EQ(loops_inside_ifs(s), 1u);
+      ralloc_free(s);
+   }
+
+   /* 2. Non-exact-tail bottom-tested loop with nonzero offset (step=2,
+    * test i+1 < n): rotate_main must keep the top-tested main loop rather
+    * than rotating a non-exact-tail loop. */
+   {
+      nir_builder b = compute_shader("rotate-main-offset-nonexact");
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_def *n = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_intrinsic_set_range(nir_def_as_intrinsic(n), 32);
+      nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_loop *loop = nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, iv);
+         nir_def *v = nir_load_global(
+            &b, 1, 32, buffer_address(&b, nir_ishl_imm(&b, i, 2)));
+         nir_intrinsic_set_access(
+            nir_def_as_intrinsic(v),
+            (gl_access_qualifier)(ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER));
+         nir_intrinsic_set_align_mul(nir_def_as_intrinsic(v), 4);
+         nir_store_var(&b, acc, nir_iadd(&b, nir_load_var(&b, acc), v), 1);
+         nir_def *next = nir_iadd_imm(&b, i, 2);
+         nir_store_var(&b, iv, next, 1);
+         nir_break_if(&b, nir_uge(&b, nir_iadd_imm(&b, i, 1), n));
+      }
+      nir_pop_loop(&b, loop);
+      nir_intrinsic_set_align_mul(
+         nir_store_global(&b, nir_load_var(&b, acc),
+                          buffer_address(&b, nir_imm_int(&b, 0))),
+         4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "rotate-main nonexact before");
+
+      EXPECT_TRUE(
+         agx_nir_unroll_runtime_loops_ex(b.shader, 4, 256, NULL, true));
+      nir_validate_shader(b.shader, "rotate-main nonexact after");
+      EXPECT_EQ(count_loops(b.shader), 2u);
+      EXPECT_EQ(loops_inside_ifs(b.shader), 0u);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "rotate-main nonexact after dce");
+      ralloc_free(b.shader);
+   }
+
+   /* 3. Countdown bottom-tested loop (REL_GT): validates cleanly under
+    * rotate_main=true. */
+   {
+      nir_builder b = compute_shader("rotate-main-countdown");
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_uint_type(), "acc");
+      nir_def *start = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 4));
+      nir_intrinsic_set_range(nir_def_as_intrinsic(start), 32);
+      nir_store_var(&b, iv, start, 1);
+      nir_store_var(&b, acc, nir_imm_int(&b, 0), 1);
+      nir_loop *loop = nir_push_loop(&b);
+      {
+         nir_def *i = nir_load_var(&b, iv);
+         nir_def *a = nir_load_var(&b, acc);
+         nir_store_var(&b, acc, nir_ixor(&b, nir_iadd(&b, a, i), nir_ushr_imm(&b, a, 9)), 1);
+         nir_def *next = nir_iadd_imm(&b, i, -1);
+         nir_store_var(&b, iv, next, 1);
+         nir_break_if(&b, nir_uge(&b, nir_imm_int(&b, 0), next));
+      }
+      nir_pop_loop(&b, loop);
+      nir_intrinsic_set_align_mul(
+         nir_store_global(&b, nir_load_var(&b, acc),
+                          buffer_address(&b, nir_imm_int(&b, 0))),
+         4);
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      NIR_PASS(_, b.shader, nir_opt_copy_prop);
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "rotate-main countdown before");
+
+      EXPECT_TRUE(
+         agx_nir_unroll_runtime_loops_ex(b.shader, 4, 256, NULL, true));
+      nir_validate_shader(b.shader, "rotate-main countdown after");
+      EXPECT_EQ(count_loops(b.shader), 2u);
+      EXPECT_EQ(loops_inside_ifs(b.shader), 2u);
+      {
+         nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+         nir_loop *first_loop = NULL;
+         foreach_list_typed(nir_cf_node, n, node, &impl->body) {
+            if (n->type == nir_cf_node_if) {
+               nir_if *nif = nir_cf_node_as_if(n);
+               foreach_list_typed(nir_cf_node, c, node, &nif->then_list) {
+                  if (c->type == nir_cf_node_loop) {
+                     first_loop = nir_cf_node_as_loop(c);
+                     break;
+                  }
+               }
+               if (first_loop)
+                  break;
+            }
+         }
+         ASSERT_NE(first_loop, nullptr);
+         EXPECT_TRUE(loop_has_bottom_exit_only(first_loop));
+      }
+      NIR_PASS(_, b.shader, nir_opt_dce);
+      nir_validate_shader(b.shader, "rotate-main countdown after dce");
+      ralloc_free(b.shader);
+   }
+
+   /* 4. Pure FP-ALU exact-tail loop: must NOT be rotated by rotate_main. */
+   {
+      nir_builder b = compute_shader("rotate-main-fp-skip");
+      nir_variable *iv = nir_local_variable_create(b.impl, glsl_uint_type(), "i");
+      nir_variable *acc = nir_local_variable_create(b.impl, glsl_float_type(), "a");
+      nir_def *n = nir_load_ubo(&b, 1, 32, nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+      nir_intrinsic_set_align_mul(nir_def_as_intrinsic(n), 4);
+      nir_intrinsic_set_range(nir_def_as_intrinsic(n), 4);
+      nir_store_var(&b, iv, nir_imm_int(&b, 0), 1);
+      nir_store_var(&b, acc, nir_imm_float(&b, 1.0f), 1);
+      nir_loop *loop = nir_push_loop(&b);
+      nir_def *i = nir_load_var(&b, iv);
+      nir_def *a = nir_load_var(&b, acc);
+      nir_store_var(&b, acc, nir_fadd(&b, a, nir_imm_float(&b, 0.5f)), 1);
+      nir_def *i1 = nir_iadd_imm(&b, i, 1);
+      nir_store_var(&b, iv, i1, 1);
+      nir_push_if(&b, nir_uge(&b, i1, n));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+      nir_pop_loop(&b, loop);
+      nir_store_ssbo(&b, nir_load_var(&b, acc), nir_imm_int(&b, 0), nir_imm_int(&b, 0));
+      NIR_PASS(_, b.shader, nir_lower_vars_to_ssa);
+      EXPECT_TRUE(
+         agx_nir_unroll_runtime_loops_ex(b.shader, 4, 256, NULL, true));
+      nir_validate_shader(b.shader, "rotate-main fp-skip after");
+      EXPECT_EQ(loops_inside_ifs(b.shader), 1u);
+      ralloc_free(b.shader);
+   }
+}

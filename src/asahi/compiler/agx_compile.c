@@ -12948,8 +12948,10 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
 
       bool unrolled = false;
-      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops, m5_unroll_factor,
-               320, m5_unroll_widest);
+      const bool rotate_main =
+         agx3b && nir->info.stage == MESA_SHADER_COMPUTE;
+      NIR_PASS(unrolled, nir, agx_nir_unroll_runtime_loops_ex, m5_unroll_factor,
+               320, m5_unroll_widest, rotate_main);
       if (unrolled)
          agx_optimize_loop_nir(nir, agx3b || m5, agx3b || m5, agx3b || m5);
       if (agx3_compute_opts && (jammed || unrolled)) {
