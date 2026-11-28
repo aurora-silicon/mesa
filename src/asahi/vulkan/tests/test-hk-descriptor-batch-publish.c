@@ -780,7 +780,8 @@ ref_8e288e5db_write_sampled_one(const struct hk_descriptor_set_layout *layout,
          uint8_t sp = MIN2(plane, sampler->plane_count - 1);
          desc[plane].sw.sampler_index = hk_sampler_descriptor_index(
             layout, sampler->planes[sp].hw->index);
-         if (generation == 9) {
+         /* Gen10 takes the G17P bias words too since aurora-wip 9b926517d. */
+         if (generation == 9 || generation == 10) {
             desc[plane].sw.g17p.unbiased_sampler_index =
                sampler->planes[sp].hw->index;
             desc[plane].sw.g17p.unbiased_clamp_0_sampler_index = 0;

@@ -188,7 +188,7 @@ test_agx3_cdm_launch(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    const uint8_t expected[AGX3_CDM_LAUNCH_SIZE] = {
       0x67, 0x45, 0x23, 0x01, 0xde, 0xbc, 0x0a, 0x01,
@@ -528,6 +528,46 @@ test_agx3_live_vdm_draw(void)
       exit(1);
    }
 
+   /* Legacy AGX2 INDEX_LIST_BUFFER_SIZE encodes 32-bit dword counts, so a full
+    * 4 GiB (0x40000000-index U32) draw must preserve all 0x40000000 dwords
+    * rather than clamping at UINT32_MAX bytes (0x3fffffff dwords). */
+   const struct agx_draw four_gib_u32 =
+      agx_draw_indexed(UINT32_C(0x40000000), 1, 0, 0, 0,
+                       UINT64_C(0x100000000), UINT64_C(1) << 32,
+                       AGX_INDEX_SIZE_U32, false);
+   memset(agx2_expected, 0, sizeof(agx2_expected));
+   memset(agx2_robust, 0, sizeof(agx2_robust));
+   agx_vdm_draw(agx2_expected, AGX_CHIP_G13G, four_gib_u32,
+                (enum agx_primitive)9, UINT32_MAX);
+   agx_vdm_draw_robust_index(agx2_robust, AGX_CHIP_G13G, four_gib_u32,
+                             (enum agx_primitive)9, UINT32_MAX, 0, false, 0);
+   CHECK_EQ(agx2_expected[5], UINT32_C(0x40000000));
+   CHECK_EQ(agx2_robust[5], UINT32_C(0x40000000));
+
+   /* A rewrite direct draw whose started window begins mid-dword (4 GiB + 2
+    * U16 binding with firstIndex = 0x7fffffff, indexCount = 2 -> ib & 3 == 2,
+    * range_B == 4) spans two dwords and must match agx_vdm_draw(). */
+   const struct agx_draw mid_dword_u16 =
+      agx_draw_indexed(2, 1, UINT32_C(0x7fffffff), 0, 0,
+                       UINT64_C(0x100000000), (UINT64_C(1) << 32) + 2,
+                       AGX_INDEX_SIZE_U16, false);
+   memset(agx2_expected, 0, sizeof(agx2_expected));
+   memset(agx2_robust, 0, sizeof(agx2_robust));
+   agx_vdm_draw(agx2_expected, AGX_CHIP_G13G, mid_dword_u16,
+                (enum agx_primitive)9, UINT32_MAX);
+   agx_vdm_draw_robust_index(agx2_robust, AGX_CHIP_G13G, mid_dword_u16,
+                             (enum agx_primitive)9, UINT32_MAX, 0, false, 0);
+   CHECK_EQ(agx2_expected[5], 2u);
+   CHECK_EQ(agx2_robust[5], 2u);
+
+   uint32_t g17c_direct[10] = {0}, g17c_robust[10] = {0};
+   agx_vdm_draw(g17c_direct, AGX_CHIP_G17C, mid_dword_u16,
+                (enum agx_primitive)9, UINT32_MAX);
+   agx_vdm_draw_robust_index(g17c_robust, AGX_CHIP_G17C, mid_dword_u16,
+                             (enum agx_primitive)9, UINT32_MAX, 0, false, 0);
+   CHECK_EQ(g17c_direct[6], 2u);
+   CHECK_EQ(g17c_robust[6], 2u);
+
    /* Indirect-count predication zeros every record above the runtime count.
     * A G17P direct indexed packet cannot encode either zero count, so the
     * device-side builder must skip its fixed reservation with the grounded
@@ -572,7 +612,7 @@ test_agx3_live_vdm_draw(void)
    static const uint32_t empty_jump_without_state[] = {
       UINT32_C(0x8000005a), UINT32_C(0x12345678),
    };
-   for (enum agx_chip chip = AGX_CHIP_G17G; chip <= AGX_CHIP_G17C; ++chip) {
+   for (enum agx_chip chip = AGX_CHIP_G17G; chip <= AGX_CHIP_G17D; ++chip) {
       uint64_t compact;
       CHECK_EQ(agx_m5_vdm_compact(UINT64_C(0x5a12345678), &compact), true);
       CHECK_EQ(compact, UINT64_C(0x4a12345678));
@@ -601,6 +641,90 @@ test_agx3_live_vdm_draw(void)
        robust_packed[2] != UINT32_C(0xcdcdcdcd)) {
       fprintf(stderr, "G17P reused-state empty indexed jump mismatch\n");
       exit(1);
+   }
+
+   /* Empty-draw stream-link coalescing for batched robust-index draws:
+    * contiguous empty runs jump in at most LIBAGX_ROBUST_INDEX_COALESCE_BLOCK
+    * strides so VDM never chases tens of thousands of consecutive links. */
+   {
+      const uint32_t n = LIBAGX_ROBUST_INDEX_COALESCE_BLOCK * 2u + 452u;
+      struct libagx_robust_index_draw *jobs = calloc(n, sizeof(*jobs));
+      uint32_t (*cmds)[5] = calloc(n, sizeof(*cmds));
+      CHECK_EQ(jobs != NULL && cmds != NULL, true);
+
+      for (uint32_t i = 0; i < n; ++i) {
+         /* Exercise count==0, instances==0, and both-zero empty shapes. */
+         cmds[i][0] = (i % 3u == 1u) ? 3u : 0u;
+         cmds[i][1] = (i % 3u == 2u) ? 1u : 0u;
+         jobs[i].command = (uintptr_t)cmds[i];
+         jobs[i].empty_draw_jump = UINT64_C(0x100000) + (uint64_t)(i + 1u) * 32u;
+      }
+
+      const enum agx_chip coalesce_chips[] = {
+         AGX_CHIP_G17P,
+         AGX_CHIP_G17G,
+         AGX_CHIP_G17D,
+      };
+      for (unsigned c = 0; c < ARRAY_SIZE(coalesce_chips); ++c) {
+         const enum agx_chip chip = coalesce_chips[c];
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 0, n, chip),
+                  jobs[LIBAGX_ROBUST_INDEX_COALESCE_BLOCK - 1u].empty_draw_jump);
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(
+                     jobs, LIBAGX_ROBUST_INDEX_COALESCE_BLOCK, n, chip),
+                  jobs[2u * LIBAGX_ROBUST_INDEX_COALESCE_BLOCK - 1u]
+                     .empty_draw_jump);
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(
+                     jobs, 2u * LIBAGX_ROBUST_INDEX_COALESCE_BLOCK, n, chip),
+                  jobs[n - 1u].empty_draw_jump);
+         /* Interior empty slots do not scan. */
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 1, n, chip),
+                  jobs[1].empty_draw_jump);
+         /* Single-draw batch is untouched. */
+         CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 0, 1, chip),
+                  jobs[0].empty_draw_jump);
+      }
+
+      /* AGX2 chips do not use empty-draw stream links and stay untouched. */
+      CHECK_EQ(libagx_robust_index_coalesce_empty_jump(jobs, 0, n,
+                                                       AGX_CHIP_G13G),
+               jobs[0].empty_draw_jump);
+
+      /* Mixed pattern: verify walking VDM jumps visits every non-empty draw in
+       * exact order while skipping contiguous empty runs in bounded hops. */
+      const uint32_t live[] = { 0u, 5u, 1023u, 1024u, 1030u, n - 1u };
+      for (unsigned k = 0; k < ARRAY_SIZE(live); ++k) {
+         cmds[live[k]][0] = 3u;
+         cmds[live[k]][1] = 1u;
+      }
+      uint32_t seen[ARRAY_SIZE(live)];
+      unsigned n_seen = 0;
+      uint32_t max_consec_links = 0, consec_links = 0;
+      uint32_t cur = 0;
+      while (cur < n) {
+         if (cmds[cur][0] != 0u && cmds[cur][1] != 0u) {
+            CHECK_EQ(n_seen < ARRAY_SIZE(live), true);
+            seen[n_seen++] = cur;
+            consec_links = 0;
+            ++cur;
+         } else {
+            uint64_t target = libagx_robust_index_coalesce_empty_jump(
+               jobs, cur, n, AGX_CHIP_G17D);
+            CHECK_EQ(target > UINT64_C(0x100000), true);
+            uint32_t next = (uint32_t)((target - UINT64_C(0x100000)) / 32u);
+            CHECK_EQ(next > cur && next <= n, true);
+            ++consec_links;
+            if (consec_links > max_consec_links)
+               max_consec_links = consec_links;
+            cur = next;
+         }
+      }
+      CHECK_EQ(n_seen, ARRAY_SIZE(live));
+      for (unsigned k = 0; k < ARRAY_SIZE(live); ++k)
+         CHECK_EQ(seen[k], live[k]);
+      CHECK_EQ(max_consec_links <= 3u, true);
+
+      free(cmds);
+      free(jobs);
    }
 
    /* The shadow-buffer calculation must never wrap either the 32-index
@@ -662,7 +786,7 @@ test_agx3_live_vdm_barrier(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
 
    for (unsigned admits = 0; admits < 2; ++admits) {
@@ -699,7 +823,7 @@ test_agx3_cdm_stream_link(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    const uint8_t expected[AGX3_CDM_STREAM_LINK_SIZE] = {
       0xbc, 0x9a, 0x00, 0x30, 0x78, 0x56, 0x34, 0x12,
@@ -768,7 +892,7 @@ test_agx3_cdm_link_padding(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
 
    for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
@@ -873,6 +997,7 @@ test_agx3_cdm_barrier(void)
       AGX_CHIP_G17G,
       AGX_CHIP_G17S,
       AGX_CHIP_G17C,
+      AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < sizeof(gen7) / sizeof(gen7[0]); ++i) {
       for (uint8_t flags = 0; flags < 16; ++flags) {
@@ -896,7 +1021,8 @@ test_agx3_cdm_barrier(void)
     * make writes visible through another virtual mapping of the same
     * memory. */
    const enum agx_chip memory_scope[] = {
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17P,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
+      AGX_CHIP_G17P,
    };
    for (unsigned i = 0; i < ARRAY_SIZE(memory_scope); ++i) {
       struct agx3_cdm_barrier_info full = {
@@ -909,9 +1035,26 @@ test_agx3_cdm_barrier(void)
       CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed), &decoded), true);
       CHECK_EQ(decoded.flush_memory, true);
       CHECK_EQ(decoded.flags, 5);
-      /* Only the strong record takes the memory scope. */
+      /* The ordering record takes the memory scope only where its scoped
+       * form is grounded (AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY). */
       full.flags = 0;
-      CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), false);
+      const bool scoped =
+         agx_chip_has_record(full.chip, AGX_RECORD_CDM_ORDERING_FLUSH_MEMORY);
+      CHECK_EQ(scoped, full.chip == AGX_CHIP_G17D);
+      CHECK_EQ(agx3_cdm_barrier_pack(&full, packed), scoped);
+      if (scoped) {
+         CHECK_EQ(agx3_cmdstream_load_le32(packed), 0x6000017c);
+         CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed),
+                                          &decoded),
+                  true);
+         CHECK_EQ(decoded.flush_memory, true);
+         CHECK_EQ(decoded.flags, 0);
+      } else {
+         agx3_cmdstream_store_le32(packed, 0x6000017c);
+         CHECK_EQ(agx3_cdm_barrier_unpack(full.chip, packed, sizeof(packed),
+                                          &decoded),
+                  false);
+      }
       /* A partial scope is not a grounded record. */
       agx3_cmdstream_store_le32(packed, 0x60001570);
       CHECK_EQ(agx3_cdm_barrier_unpack(memory_scope[i], packed, sizeof(packed), &decoded), false);
@@ -1006,13 +1149,14 @@ test_agx3_cdm_substream_barrier(void)
    const enum agx_chip targets[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
 
    for (unsigned i = 0; i < sizeof(targets) / sizeof(targets[0]); ++i) {
       const bool gen7 = targets[i] == AGX_CHIP_G17G ||
                         targets[i] == AGX_CHIP_G17S ||
-                        targets[i] == AGX_CHIP_G17C;
+                        targets[i] == AGX_CHIP_G17C ||
+                        targets[i] == AGX_CHIP_G17D;
       for (uint16_t substream = 0; substream < UINT8_MAX; ++substream) {
          for (uint8_t flags = 0; flags < 16; ++flags) {
             if (!gen7 && flags != 0 && flags != 5)
@@ -1071,6 +1215,7 @@ test_agx3_cdm_secondary_barrier(void)
       AGX_CHIP_G17G,
       AGX_CHIP_G17S,
       AGX_CHIP_G17C,
+      AGX_CHIP_G17D,
    };
    for (unsigned i = 0; i < sizeof(grounded) / sizeof(grounded[0]); ++i) {
       uint8_t packed[AGX3_CDM_SECONDARY_BARRIER_SIZE];
@@ -1108,7 +1253,7 @@ test_agx3_cdm_stream_terminate(void)
    const enum agx_chip grounded[] = {
       AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
       AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+      AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
    };
    const uint8_t expected[AGX3_CDM_STREAM_TERMINATE_SIZE] = {
       0x00, 0x00, 0x00, 0x40,
@@ -1162,6 +1307,39 @@ test_robust_index_shadow(void)
       CHECK_EQ(agx_robust_index_available(3, 3 * width, size), 0);
       CHECK_EQ(agx_robust_index_available(3, 4 * width - 1, size), 0);
       CHECK_EQ(agx_robust_index_available(3, 5 * width - 1, size), 1);
+
+      /* 4 GiB and 4 GiB + 4 bindings must preserve their full 64-bit byte
+       * range without wrapping to 0 or 4. */
+      const uint64_t four_gib = UINT64_C(1) << 32;
+      CHECK_EQ(agx_robust_index_available(0, four_gib, size),
+               size == AGX_INDEX_SIZE_U8 ? UINT32_MAX : (uint32_t)(four_gib >> size));
+      CHECK_EQ(agx_robust_index_available(0, four_gib + 4, size),
+               size == AGX_INDEX_SIZE_U8 ? UINT32_MAX : (uint32_t)((four_gib + 4) >> size));
+      if (size == AGX_INDEX_SIZE_U32) {
+         CHECK_EQ(agx_robust_index_available(0x40000000u, four_gib, size), 0);
+         CHECK_EQ(agx_robust_index_available(0x40000000u, four_gib + 4, size), 1);
+      }
+
+      struct agx_draw large_draw =
+         agx_draw_indexed(4, 1, 0, 0, 0, UINT64_C(0x10000), four_gib + 4, size, false);
+      CHECK_EQ(large_draw.index_buffer_range_B, four_gib + 4);
+      CHECK_EQ(agx_direct_draw_overreads_indices(large_draw), false);
+      uint32_t large_vdm[16] = {0};
+      uint32_t *large_end = agx_vdm_draw_robust_index(
+         large_vdm, AGX_CHIP_G17P, large_draw, AGX_PRIMITIVE_TRIANGLES,
+         0xffff, 0, false, UINT64_C(0x4000));
+      CHECK_EQ((size_t)(large_end - large_vdm) * 4,
+               libagx_draw_robust_index_vdm_size(AGX_CHIP_G17P, false));
+
+      /* 16 GiB direct binding clamps the 32-bit dword count instead of
+       * wrapping to 0. */
+      const uint64_t sixteen_gib = UINT64_C(1) << 34;
+      struct agx_draw huge_draw =
+         agx_draw_indexed(4, 1, 0, 0, 0, UINT64_C(0x10000), sixteen_gib, size, false);
+      CHECK_EQ(agx_draw_direct_index_buffer_size_dwords(huge_draw, UINT64_C(0x10000)),
+               UINT32_MAX);
+      CHECK_EQ(agx_vdm_draw_supported(AGX_CHIP_G17C, huge_draw, AGX_PRIMITIVE_TRIANGLES),
+               true);
 
       struct agx_draw wrapped =
          agx_draw_indexed(UINT32_MAX, 1, 1, 0, 0, 0x1000, 128, size, false);

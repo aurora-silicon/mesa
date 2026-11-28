@@ -12,7 +12,22 @@ enum agx3_matrix_input_type {
    AGX3_MATRIX_INPUT_F16 = 1,
    AGX3_MATRIX_INPUT_F32 = 2,
    AGX3_MATRIX_INPUT_BF16 = 4,
+   AGX3_MATRIX_INPUT_U8 = 8,
+   AGX3_MATRIX_INPUT_S8 = 9,
 };
+
+static inline bool
+agx3_matrix_input_is_int8(unsigned type)
+{
+   return type == AGX3_MATRIX_INPUT_U8 || type == AGX3_MATRIX_INPUT_S8;
+}
+
+/* matrix_type bit of an 8x8 matmad with an f16 accumulator and result */
+#define AGX3_MATRIX_ACCUM_F16 (1u << 8)
+/* matrix_type bit selecting zero-initialized accumulator (null src[2]) */
+#define AGX3_MATRIX_ZERO_ACCUM (1u << 9)
+/* matrix_type bit of a 16x16 integer GEMM with signed 32-bit saturation */
+#define AGX3_MATRIX_SATURATE (1u << 10)
 
 struct agx3_matrix_gemm16_desc {
    uint16_t dest;
@@ -29,6 +44,7 @@ struct agx3_matrix_gemm16_desc {
    bool preserve_b;
    uint8_t wait_mask;
    enum agx3_matrix_input_type b_input_type;
+   bool saturate;
 };
 
 bool agx3_matrix_encode_gemm16(enum agx_isa_encoding encoding,
@@ -46,6 +62,8 @@ struct agx3_matrix_mma8_desc {
    bool discard[3];
    uint8_t wait_mask;
    enum agx3_matrix_input_type input_type;
+   /* f16 C and result (f16matmad8x8, AGX3B), f16 A and B */
+   bool f16_accumulate;
 };
 
 bool agx3_matrix_encode_mma8(enum agx_isa_encoding encoding,

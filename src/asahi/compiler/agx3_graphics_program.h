@@ -88,6 +88,13 @@ struct agx3_g17p_graphics_program_desc {
    const struct agx3_cprog_inputs *cprog_inputs;
 
    const struct agx_ioto_preshader_desc *preshader;
+
+   /* M5: the cluster count the USC window's code-container lead was built
+    * for, the kernel's num_clusters_total (agx3_build_m5_container_lead()).
+    * The program's profile loader points at that lead's helper-table group
+    * (agx3_m5_container_group_offset()); an M5 program is refused without
+    * it. Other paths ignore it. */
+   unsigned usc_clusters;
 };
 
 struct agx3_g17p_graphics_program {
@@ -145,6 +152,14 @@ bool agx3_g18g_tile_program_generate(
    const struct agx3_g17p_graphics_program_desc *desc, bool store,
    struct agx3_g17p_graphics_program *program);
 
+/* G18G general HAL300 tile shaders (any admitted M5 imageblock shape), emitted
+ * as single-cluster G17G canonical GPU1 so agx3_transcode_agx3d_ioto() doubles
+ * the SR14 helper base from 0x100 to the witnessed G18G 0x200 base regardless
+ * of the host device's cluster count. */
+bool agx3_g18g_general_tile_program_generate(
+   const struct agx3_g17p_graphics_program_desc *desc, bool store,
+   struct agx3_g17p_graphics_program *program);
+
 struct agx3_g17p_graphics_program_template {
    struct agx3_g17p_graphics_program program;
    struct agx_ioto_load_relocation
@@ -157,6 +172,14 @@ struct agx3_g17p_graphics_program_template {
 
 bool agx3_g17g_graphics_program_template_generate(
    enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
+   struct agx3_g17p_graphics_program_template *program);
+
+/* G18G: agx3_g18g_graphics_program_generate(), or _tps() for a program with
+ * a static TPS frame, recording where it materializes each range's base as
+ * agx3_g17g_graphics_program_template_generate() does. Canonical GPU1 output
+ * for agx3d re-encoding (agx3_reencode_template_create()). */
+bool agx3_g18g_graphics_program_template_generate(
+   const struct agx3_g17p_graphics_program_desc *desc,
    struct agx3_g17p_graphics_program_template *program);
 
 /* Capture the exact address materializations of the normal M5 compute

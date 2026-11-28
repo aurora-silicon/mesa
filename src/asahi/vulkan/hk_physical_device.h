@@ -78,7 +78,13 @@ struct hk_physical_device {
    struct hk_queue_family queue_families[3];
    uint8_t queue_family_count;
 
+   /* Kernel queue limits with DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES, zero
+    * when the kernel does not report them. */
+   struct drm_asahi_queue_limits queue_limits;
+
    struct vk_sync_type syncobj_sync_type;
+   /* syncobj_sync_type's original operations, see hk_gpu_waits.h. */
+   struct vk_sync_type syncobj_base_type;
    const struct vk_sync_type *sync_types[2];
 
    simple_mtx_t debug_compile_lock;
@@ -95,6 +101,12 @@ struct hk_physical_device {
     * (hk_border_twin); the shader cache key carries it. Per physical device
     * because the cache key is computed from it (hk_hash_graphics_state). */
    uint32_t border_emulation;
+
+   /* Set once a device of this GPU creates an image view with a non-zero
+    * relative minLod (hk_image_view_init). Shaders compiled before then leave
+    * image-view minLod emulation out and are replaced by emulating twins when
+    * bound (hk_min_lod_twin); the shader cache key carries it. */
+   uint32_t min_lod_emulation;
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_physical_device, vk.base, VkPhysicalDevice,
@@ -114,8 +126,22 @@ void hk_physical_device_destroy(struct vk_physical_device *vk_device);
 
 uint64_t hk_codegen_env_hash(void);
 
+/* optimalTilingLayoutUUID: the device's generation contract only. */
+void hk_layout_identity(const struct agx_device *dev,
+                        uint8_t uuid[VK_UUID_SIZE]);
+
+/* pipelineCacheUUID (and shaderBinaryUUID) and the disk cache's driver flags:
+ * the build, the generation contract, the compiler flags, the codegen
+ * environment and the kernel's feature bits. */
+void hk_cache_identity(const uint8_t build_sha[32],
+                       const struct agx_device *dev, uint64_t compiler_flags,
+                       uint64_t env_hash, uint8_t uuid[VK_UUID_SIZE],
+                       uint64_t *disk_cache_id);
+
 void hk_border_emulation_recall(struct hk_physical_device *pdev);
 void hk_border_emulation_remember(struct hk_physical_device *pdev);
+void hk_min_lod_emulation_recall(struct hk_physical_device *pdev);
+void hk_min_lod_emulation_remember(struct hk_physical_device *pdev);
 
 uint64_t hk_get_sysmem_heap_size(struct hk_physical_device *pdev);
 

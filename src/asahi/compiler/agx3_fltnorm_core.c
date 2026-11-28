@@ -39,24 +39,30 @@ struct src_fields {
 };
 
 static bool
-append_src(struct agx3_field_kv *ov, unsigned *n,
+append_src(enum agx_isa_encoding enc, struct agx3_field_kv *ov, unsigned *n,
            const struct agx3_fltnorm_src *s, const struct src_fields *f)
 {
    uint8_t value_field;
+   uint8_t width = 2; /* 32-bit */
    switch (s->kind) {
    case AGX3_FLTNORM_SRC_IMMEDIATE:
       /* AGX minifloats are 8 bits. */
-      if (s->value > 0xff)
+      if (s->is_f16 || s->value > 0xff)
          return false;
       value_field = f->f_imm;
       break;
    case AGX3_FLTNORM_SRC_REGISTER:
-      if ((s->value & 1) || s->value >= 256)
+      if (s->is_f16) {
+         if (enc != AGX_ISA_ENCODING_AGX3C || s->value >= 256)
+            return false;
+         width = 1; /* 16-bit */
+      } else if ((s->value & 1) || s->value >= 256) {
          return false;
+      }
       value_field = f->f_reg;
       break;
    case AGX3_FLTNORM_SRC_UNIFORM:
-      if (s->value >= 512)
+      if (s->is_f16 || s->value >= 512)
          return false;
       value_field = f->f_uniform;
       break;
@@ -65,7 +71,7 @@ append_src(struct agx3_field_kv *ov, unsigned *n,
    }
 
    ov[(*n)++] = (struct agx3_field_kv)KV(f->f_kind, s->kind);
-   ov[(*n)++] = (struct agx3_field_kv)KV(f->f_width, 2); /* 32-bit */
+   ov[(*n)++] = (struct agx3_field_kv)KV(f->f_width, width);
    ov[(*n)++] = (struct agx3_field_kv)KV(value_field, s->value);
 
    /* Only a register source carries liveness and modifiers; the composer
@@ -182,11 +188,11 @@ agx3_fltnorm_encode(enum agx_isa_encoding enc,
    if (d->first_instruction)
       ov[n++] = (struct agx3_field_kv)KV(68, 1);
 
-   if (!append_src(ov, &n, &d->src[0], &s0))
+   if (!append_src(enc, ov, &n, &d->src[0], &s0))
       return false;
 
    if (d->two_lanes) {
-      if (!append_src(ov, &n, &d->src[1], &s1))
+      if (!append_src(enc, ov, &n, &d->src[1], &s1))
          return false;
    } else {
       /* The one-lane alternative: no second source, and the second operand's
@@ -437,7 +443,9 @@ agx3_normflt_encode(enum agx_isa_encoding enc,
    memset(out, 0, AGX3_FLTNORM_MAX_LENGTH);
    *len = 0;
 
-   if (!enc_ok(enc) || (d->dest & 1) || d->dest >= 256 || d->src >= 256)
+   if (!enc_ok(enc) || (enc == AGX_ISA_ENCODING_AGX3D && d->dest_16) ||
+       (!d->dest_16 && (d->dest & 1)) || d->dest >= 256 ||
+       d->src >= 256)
       return false;
    if ((d->wait_mask & ~wait_limit(enc)) != 0)
       return false;
@@ -453,7 +461,7 @@ agx3_normflt_encode(enum agx_isa_encoding enc,
    struct agx3_field_kv base[7];
    unsigned nbase = 0;
    base[nbase++] = (struct agx3_field_kv)KV(9, 2);
-   base[nbase++] = (struct agx3_field_kv)KV(10, 2);
+   base[nbase++] = (struct agx3_field_kv)KV(10, d->dest_16 ? 1 : 2);
    base[nbase++] = (struct agx3_field_kv)KV(25, 2);
    base[nbase++] =
       (struct agx3_field_kv)KV(26, d->is_16bit && d->two_lanes ? 2 : 1);
