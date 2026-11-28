@@ -2056,6 +2056,53 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    b->cursor = nir_before_instr(&intr->instr);
+   /* Keep a dynamically indexed vec4 array index in elements. Both the
+    * descriptor and the zero page address at most AGX_ZERO_PAGE_SIZE / 16
+    * such elements, so checking the full 32-bit index before masking avoids
+    * scaling before the bounds check and prevents 32-bit wraparound. */
+   nir_deref_instr *member = path.path[1];
+   if (!nir_scalar_is_const(root_bound) && member &&
+       member->deref_type == nir_deref_type_struct &&
+       glsl_get_struct_field_offset(root->type, member->strct.index) == 0 &&
+       path.path[2] == leaf && leaf->deref_type == nir_deref_type_array &&
+       nir_deref_instr_array_stride(leaf) == 16 &&
+       leaf->arr.index.ssa->bit_size == 32 &&
+       !nir_src_is_const(leaf->arr.index) && mul >= 16 && (disp % 16) == 0) {
+      STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT >= 16);
+      STATIC_ASSERT((AGX_ZERO_PAGE_SIZE & (AGX_ZERO_PAGE_SIZE - 1)) == 0);
+      STATIC_ASSERT(HK_MIN_UBO_ALIGNMENT <= AGX_ZERO_PAGE_SIZE);
+      const unsigned record_elems = HK_MIN_UBO_ALIGNMENT / 16;
+      nir_def *desc = root->parent.ssa;
+      nir_def *base = nir_pack_64_2x32_split(b, nir_channel(b, desc, 0),
+                                             nir_channel(b, desc, 1));
+      nir_def *bound = nir_channel(b, desc, 2);
+      nir_def *idx = leaf->arr.index.ssa;
+      /* Round the descriptor's size using the advertised HK_MIN_UBO_ALIGNMENT
+       * granule and cap at AGX_ZERO_PAGE_SIZE / 16 so oversized bindings
+       * cannot alias past the 64 KiB mask. */
+      nir_def *elements = nir_iadd(
+         b, nir_iand_imm(b, nir_ushr_imm(b, bound, 4), ~(record_elems - 1)),
+         nir_bcsel(
+            b,
+            nir_ine_imm(b, nir_iand_imm(b, bound, HK_MIN_UBO_ALIGNMENT - 1),
+                        0),
+            nir_imm_int(b, record_elems), nir_imm_int(b, 0)));
+      elements = nir_umin(b, elements, nir_imm_int(b, AGX_ZERO_PAGE_SIZE / 16));
+      nir_def *valid = nir_ult(b, idx, elements);
+      nir_def *safe = nir_bcsel(b, valid, base,
+                                nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      nir_def *element = nir_iand_imm(b, idx, AGX_ZERO_PAGE_SIZE / 16 - 1);
+      nir_def *byte = nir_ishl_imm(b, element, 4);
+      nir_def *value = nir_load_global_constant(
+         b, intr->num_components, 32, nir_iadd(b, safe, nir_u2u64(b, byte)),
+         .align_mul = 16, .align_offset = 0,
+         .access = nir_intrinsic_access(intr) | ACCESS_NON_WRITEABLE |
+                   ACCESS_CAN_REORDER);
+      nir_def_replace(&intr->def, value);
+      nir_deref_path_finish(&path);
+      return true;
+   }
+
    nir_def *addr = root->parent.ssa;
    for (unsigned i = 1; path.path[i]; ++i)
       addr = nir_explicit_io_address_from_deref(
@@ -2087,6 +2134,14 @@ hk_lower_aligned_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *data)
                 (can_speculate ? ACCESS_CAN_SPECULATE : 0));
    nir_def_replace(&intr->def, value);
    return true;
+}
+
+bool
+hk_nir_lower_aligned_ubo(nir_shader *nir, uint8_t static_set_mask)
+{
+   return nir_shader_intrinsics_pass(nir, hk_lower_aligned_ubo,
+                                     nir_metadata_control_flow,
+                                     &static_set_mask);
 }
 
 struct global_load_lowering {
@@ -3978,9 +4033,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
        VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT) {
       uint8_t static_set_mask =
          hk_static_set_mask(set_layout_count, set_layouts);
-      NIR_PASS(lowered_buf_io, nir, nir_shader_intrinsics_pass,
-               hk_lower_aligned_ubo, nir_metadata_control_flow,
-               &static_set_mask);
+      NIR_PASS(lowered_buf_io, nir, hk_nir_lower_aligned_ubo, static_set_mask);
    }
    NIR_PASS(lowered_buf_io, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             hk_ubo_addr_format(rs->uniform_buffers));

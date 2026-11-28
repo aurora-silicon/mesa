@@ -970,6 +970,12 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('brl_aligned_ubo', executable('brl_aligned_ubo_test',
+    files('tests/test-brl-aligned-ubo.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_host_image_copy', executable('hk_host_image_copy_test',
     files('tests/test-hk-host-image-copy.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
@@ -1525,6 +1531,15 @@ if with_tests
   hk_vulkan_explicit_plane_layout = executable(
     'hk-vulkan-explicit-plane-layout',
     files('tests/hk_vulkan_explicit_plane_layout.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  brl_vulkan_ubo_element_bounds = executable(
+    'brl-vulkan-ubo-element-bounds',
+    files('tests/brl_vulkan_ubo_element_bounds.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],

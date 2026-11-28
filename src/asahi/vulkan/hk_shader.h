@@ -1160,6 +1160,10 @@ bool hk_nir_lower_aligned_uadd_sat(nir_shader *nir);
 /* Merge adjacent reorderable 32-bit buffer word reads into vector loads. */
 bool hk_nir_merge_buffer_words(nir_shader *nir);
 
+/* Lower naturally aligned robustBufferAccess2 uniform buffer loads via a
+ * 64-byte record (or vec4 element) bounds check and zero-page base select. */
+bool hk_nir_lower_aligned_ubo(nir_shader *nir, uint8_t static_set_mask);
+
 /* Lazily compile and cache the 1-thread compute shader for a hoistable AGX3
  * vertex preamble. Returns NULL if the vertex shader has no hoistable preamble
  * or compilation fails. */
