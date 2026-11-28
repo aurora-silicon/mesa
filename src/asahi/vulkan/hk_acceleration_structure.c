@@ -2389,7 +2389,11 @@ hk_device_init_accel_struct_state(struct hk_device *dev)
       .morton_sort_kvs_per_thread = 2,
       .propagate_cull_flags = false,
       .has_update = dev->g17p_native_as,
-      .morton_phase_dispatch = dev->g17p_native_as,
+      /* One dispatch per sort pass. The single-dispatch sort has later
+       * workgroups wait on earlier ones' counts, and Apple GPUs do not
+       * guarantee a waiting workgroup lets an earlier one run: from about
+       * 16K leaves the build never finished on the M2 (software builder). */
+      .morton_phase_dispatch = true,
       /* On G17P the shuffle search is faster up to 4K leaves and slower
        * from 16K (gpubench rt.asbuild on the Neo). */
       .hploc_shuffle_max_leaves = dev->g17p_native_as ? 4096 : 0,
