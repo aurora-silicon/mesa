@@ -872,7 +872,7 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          if (agx3b_texture_lod) {
             float scaled = f * 64.0f;
             if (!(scaled >= -2048.0f && scaled <= 2047.0f) ||
-                fui((float)(int)scaled / 64.0f) != fui(f) ||
+                scaled != (float)(int16_t)scaled ||
                 (I->lod_mode == AGX_LOD_MODE_LOD_MIN && f < 0.0f))
                continue;
          }
