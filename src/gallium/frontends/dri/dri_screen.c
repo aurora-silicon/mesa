@@ -624,6 +624,10 @@ dri_init_screen(struct dri_screen *screen,
                 bool has_multibuffer)
 {
    screen->base.screen = pscreen;
+   /* EGL, GLX and GBM require a graphics-capable Gallium screen. */
+   if (!pscreen->caps.graphics)
+      return NULL;
+
    screen->base.get_egl_image = dri_get_egl_image;
    screen->base.get_param = dri_get_param;
    screen->base.set_background_context = dri_set_background_context;

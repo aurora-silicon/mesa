@@ -820,9 +820,15 @@ dri2_create_screen(_EGLDisplay *disp)
           * will not crash.
           */
          if (strcmp(dri2_dpy->driver_name, driver_name_display_gpu) == 0) {
+            const struct dri_config **display_configs = NULL;
             dri2_dpy->dri_screen_display_gpu = driCreateNewScreen3(
                0, dri2_dpy->fd_display_gpu, dri2_dpy->loader_extensions,
-               type, &dri2_dpy->driver_configs, false, dri2_dpy->multibuffers_available, disp);
+               type, &display_configs, false, dri2_dpy->multibuffers_available, disp);
+            if (display_configs) {
+               for (unsigned i = 0; display_configs[i]; i++)
+                  free((struct dri_config *)display_configs[i]);
+               free(display_configs);
+            }
          }
          free(driver_name_display_gpu);
       }
@@ -834,6 +840,8 @@ dri2_create_screen(_EGLDisplay *disp)
       &dri2_dpy->driver_configs, false, dri2_dpy->multibuffers_available, disp);
 
    if (dri2_dpy->dri_screen_render_gpu == NULL) {
+      driDestroyScreen(dri2_dpy->dri_screen_display_gpu);
+      dri2_dpy->dri_screen_display_gpu = NULL;
       _eglLog(_EGL_WARNING, "egl: failed to create dri2 screen");
       return EGL_FALSE;
    }

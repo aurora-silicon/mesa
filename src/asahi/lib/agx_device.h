@@ -548,6 +548,15 @@ agx_has_soft_fault(const struct agx_device *dev)
           !(dev->debug & AGX_DBG_NOSOFT);
 }
 
+/* The kernel refuses render commands on this device (for example G14 on GPU
+ * firmware 27.2). It must not be offered for graphics, only for compute.
+ */
+static inline bool
+agx_compute_only(const struct agx_device *dev)
+{
+   return dev->params.features & DRM_ASAHI_FEATURE_COMPUTE_ONLY;
+}
+
 /*
  * Whether every M5 compute barrier takes memory scope: every launch's ordering
  * record (0x6000017c) and every flush recorded for a dependency, whatever
