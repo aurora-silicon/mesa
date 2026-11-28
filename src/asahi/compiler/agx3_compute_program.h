@@ -9,7 +9,11 @@
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx3_compute_program_core.h"
 
-#define AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
+/* Software composer capacity, not a hardware limit: covers a full 512-half
+ * uniform layout plus up to 512 constant-program TPS input halves even when
+ * odd TPS alignment forces two 10-byte 16-bit COPYs per dword (~8.5 KiB real
+ * / ~10.2 KiB worst-case bound plus fixed tail and constant-program suffix). */
+#define AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 12288u
 #define AGX3_G17P_COMPUTE_MAX_LOAD_CHUNKS 128u
 /* Largest thread-private spill frame a G17P program publishes, in bytes.
  * applegpu_g17p holding 60 live uint4 temporaries publishes 1584. */
