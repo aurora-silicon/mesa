@@ -1971,10 +1971,11 @@ cached_root_snapshot_elision_correctness(struct fixture *f)
    const enum agx_chip saved_chip = f->dev.dev.chip;
    const unsigned saved_debug = f->dev.dev.debug;
 
-   /* G17P and M5 use the CPU-cached HK_CMD_BO_ROOT pool: identical roots reuse
-    * without a new allocation, and root_fragment_snapshot_publish() is skipped
-    * unless AGX_DBG_VERIFY is set. */
-   const enum agx_chip cached_chips[] = {AGX_CHIP_G17P, AGX_CHIP_G17C};
+   /* HAL200 (G16G, G17P) and M5 use the CPU-cached HK_CMD_BO_ROOT pool:
+    * identical roots reuse without a new allocation, and
+    * root_fragment_snapshot_publish() is skipped unless AGX_DBG_VERIFY is set. */
+   const enum agx_chip cached_chips[] = {AGX_CHIP_G16G, AGX_CHIP_G17P,
+                                         AGX_CHIP_G17C};
    for (unsigned i = 0; i < ARRAY_SIZE(cached_chips); ++i) {
       reset(f);
       f->dev.dev.chip = cached_chips[i];
@@ -2009,6 +2010,26 @@ cached_root_snapshot_elision_correctness(struct fixture *f)
       CHECK(r4 != 0 && r4 != r1);
       CHECK(cmd->state.gfx.root_fragment_snapshot_cpu ==
             cmd->state.gfx.root_cpu);
+   }
+
+   /* G15 also uses CPU-cached HK_CMD_BO_ROOT and reuses identical roots
+    * without a new allocation. */
+   const enum agx_chip shared_cached_chips[] = {AGX_CHIP_G15G};
+   for (unsigned i = 0; i < ARRAY_SIZE(shared_cached_chips); ++i) {
+      reset(f);
+      f->dev.dev.chip = shared_cached_chips[i];
+      f->dev.dev.debug = 0;
+      cmd->uploader.root.cpu_cached = true;
+
+      desc->root.sets[0] = 0x30000 + i * 0x100;
+      const uint64_t r1 =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(r1 != 0);
+      CHECK(desc->uploaded_root_cpu_cached);
+      CHECK(cmd->state.gfx.root_cpu_cached);
+      const uint64_t r2 =
+         hk_cmd_buffer_upload_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
+      CHECK(r2 == r1);
    }
 
    /* Uncached (WC) roots must never reuse via memcmp readback and must retain

@@ -374,11 +374,16 @@ hk_cdm_note_sparse_site(struct hk_cs *cs, uint32_t *word)
 static void
 hk_cmd_buffer_patch_sparse_sites(struct hk_cmd_buffer *cmd)
 {
-   util_dynarray_foreach(&cmd->sparse_sites, struct hk_sparse_site, site)
+   const bool cpu_cached =
+      hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev);
+   util_dynarray_foreach(&cmd->sparse_sites, struct hk_sparse_site, site) {
       __atomic_store_n(site->word, site->value, __ATOMIC_RELAXED);
+      if (cpu_cached)
+         util_flush_range_no_fence(site->word, sizeof(*site->word));
+   }
 
    __sync_synchronize();
-   if (util_has_cache_ops())
+   if (cpu_cached || util_has_cache_ops())
       util_post_flush_fence();
 }
 
