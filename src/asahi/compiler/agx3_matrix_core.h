@@ -24,8 +24,10 @@ agx3_matrix_input_is_int8(unsigned type)
 
 /* matrix_type bit of an 8x8 matmad with an f16 accumulator and result */
 #define AGX3_MATRIX_ACCUM_F16 (1u << 8)
+/* matrix_type bit selecting zero-initialized accumulator (null src[2]) */
+#define AGX3_MATRIX_ZERO_ACCUM (1u << 9)
 /* matrix_type bit of a 16x16 integer GEMM with signed 32-bit saturation */
-#define AGX3_MATRIX_SATURATE (1u << 9)
+#define AGX3_MATRIX_SATURATE (1u << 10)
 
 struct agx3_matrix_gemm16_desc {
    uint16_t dest;
