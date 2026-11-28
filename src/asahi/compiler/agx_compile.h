@@ -800,6 +800,8 @@ void agx_preprocess_nir_m5_defer_idiv(nir_shader *nir);
 /* For any M5 chip (agx_chip_g17_m5); per-chip capabilities check chip. */
 void agx_preprocess_nir_m5_chip(nir_shader *nir, enum agx_chip chip);
 void agx_preprocess_nir_m5_defer_idiv_chip(nir_shader *nir, enum agx_chip chip);
+bool agx_level_zero_is_explicit(const struct agx_device_key *dev,
+                                mesa_shader_stage stage, nir_texop op);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 /* TARGET/LIVE retain their normal semantics. This flag records the proof that

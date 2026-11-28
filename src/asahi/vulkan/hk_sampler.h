@@ -32,6 +32,11 @@ struct hk_sampler {
    struct vk_ycbcr_conversion_state ycbcr;
    VkFilter min_filter, mag_filter;
    float mip_lod_bias;
+   /* mip_lod_bias is strictly hk_d3d_nearest_mip's +1/64 over an API bias of
+    * 0, and every sampler property that could distinguish LOD 0 from +1/64
+    * (mag/min filter, anisotropy, comparison, unnormalized coordinates, YCbCr,
+    * reduction mode) makes +1/64 a no-op at explicit level 0. */
+   bool d3d_nearest_mip_noop_at_zero;
 
    uint8_t plane_count;
    uint16_t lod_bias_fp16;

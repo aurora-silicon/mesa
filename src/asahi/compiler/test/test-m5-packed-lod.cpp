@@ -8,6 +8,10 @@
 #include "agx3_pack.h"
 #include "agx3_tex_core.h"
 #include "agx_test.h"
+extern "C" {
+#include "agx3_compose/agx3_decode.h"
+#include "asahi/isa/disasm.h"
+}
 
 TEST(M5PackedLOD, NativeSharedAndLiveLoadWords)
 {
@@ -325,4 +329,104 @@ TEST(M5PackedLOD, PostCseMergedScalarLodPacks)
    EXPECT_TRUE(agx_is_equiv(samples[0]->src[1], samples[1]->src[1]));
    EXPECT_EQ(samples[0]->src[1].size, AGX_SIZE_32);
    ralloc_free(mem);
+}
+
+/* Instruction selection keeps a txl at level zero explicit wherever the native
+ * form is the immediate level. In AGX3 fragment shaders that is level(0.0):
+ * the implicit form would take the level from the derivatives. */
+TEST(M5PackedLOD, LevelZeroIsExplicitWhereNative)
+{
+   agx_device_key m5 = {};
+   m5.encoding = AGX_ISA_ENCODING_AGX3C;
+   m5.chip = AGX_CHIP_G17S;
+   agx_device_key g17p = {};
+   g17p.encoding = AGX_ISA_ENCODING_AGX3B;
+   g17p.chip = AGX_CHIP_G17P;
+   agx_device_key g13 = {};
+   g13.encoding = AGX_ISA_ENCODING_AGX2;
+   g13.chip = AGX_CHIP_G13G;
+
+   EXPECT_TRUE(agx_level_zero_is_explicit(&m5, MESA_SHADER_FRAGMENT, nir_texop_txl));
+   EXPECT_TRUE(agx_level_zero_is_explicit(&g17p, MESA_SHADER_FRAGMENT, nir_texop_txl));
+   EXPECT_TRUE(agx_level_zero_is_explicit(&m5, MESA_SHADER_VERTEX, nir_texop_txl));
+   EXPECT_TRUE(agx_level_zero_is_explicit(&g17p, MESA_SHADER_VERTEX, nir_texop_txl));
+   EXPECT_TRUE(agx_level_zero_is_explicit(&m5, MESA_SHADER_COMPUTE, nir_texop_txf));
+   /* Unchanged: fragment texel fetches on AGX3B/AGX3C, AGX2, and samples that
+    * have no explicit level. */
+   EXPECT_FALSE(agx_level_zero_is_explicit(&m5, MESA_SHADER_FRAGMENT, nir_texop_txf));
+   EXPECT_FALSE(agx_level_zero_is_explicit(&g17p, MESA_SHADER_FRAGMENT, nir_texop_txf));
+   EXPECT_FALSE(agx_level_zero_is_explicit(&g13, MESA_SHADER_FRAGMENT, nir_texop_txl));
+   EXPECT_FALSE(agx_level_zero_is_explicit(&g13, MESA_SHADER_VERTEX, nir_texop_txl));
+   EXPECT_FALSE(agx_level_zero_is_explicit(&m5, MESA_SHADER_FRAGMENT, nir_texop_tex));
+   EXPECT_FALSE(agx_level_zero_is_explicit(&m5, MESA_SHADER_FRAGMENT, nir_texop_txb));
+}
+
+/* An AGX3 fragment sample at explicit level 0 packs as the immediate-level
+ * form, f139 = 2 with a zero level in f29 (the native compiler's level(0.0));
+ * the implicit form it replaces is f139 = 0. Covers both colour and depth
+ * comparison samples on AGX3B and AGX3C. */
+TEST(M5PackedLOD, FragmentLevelZeroPacksAsTheImmediateLevel)
+{
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX3B, AGX_ISA_ENCODING_AGX3C}) {
+      for (bool shadow : {false, true}) {
+         for (bool explicit_level : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "enc=" << enc << " shadow=" << shadow
+                         << " explicit=" << explicit_level);
+            void *mem = ralloc_context(NULL);
+            agx_builder *b = agx_test_builder(mem);
+            agx_shader_key key = {};
+            key.dev.encoding = enc;
+            key.dev.chip = enc == AGX_ISA_ENCODING_AGX3C ? AGX_CHIP_G17S
+                                                         : AGX_CHIP_G17P;
+            key.fs.ignore_tib_dependencies = true;
+            b->shader->key = &key;
+            b->shader->stage = MESA_SHADER_FRAGMENT;
+            agx_index coords = agx_register(8, AGX_SIZE_32);
+            coords.channels_m1 = 1;
+            agx_index result = agx_register(16, AGX_SIZE_32);
+            result.channels_m1 = 3;
+            agx_index compare = shadow ? agx_register(12, AGX_SIZE_32)
+                                       : agx_null();
+            agx_instr *I = agx_texture_sample_to(
+               b, result, coords, agx_immediate(0), agx_zero(),
+               agx_immediate(0), agx_zero(), compare, AGX_DIM_2D,
+               explicit_level ? AGX_LOD_MODE_LOD_MIN : AGX_LOD_MODE_AUTO_LOD,
+               0, false, shadow, false, AGX_GATHER_NONE, false);
+            I->mask = shadow ? 1 : 15;
+            agx_stop(b);
+            util_dynarray bin;
+            util_dynarray_init(&bin, mem);
+            ASSERT_TRUE(agx3_pack_binary(b->shader, &bin));
+
+            const agx3_table *tbl =
+               enc == AGX_ISA_ENCODING_AGX3C ? &agx3c_table : &agx3b_table;
+            const uint8_t *code = (const uint8_t *)bin.data;
+            unsigned samples = 0;
+            for (size_t off = 0; off < bin.size;) {
+               const char *display = NULL;
+               const signed len = enc == AGX_ISA_ENCODING_AGX3C
+                                     ? agx3c_instr_length(code + off,
+                                                          bin.size - off,
+                                                          &display)
+                                     : agx3b_instr_length(code + off,
+                                                          bin.size - off,
+                                                          &display);
+               ASSERT_GT(len, 0);
+               uint64_t f[AGX3_MAX_FIELDS] = {};
+               if (agx3_decode(tbl, code + off, (unsigned)len, AGX3_MN_smp,
+                               f) >= 0) {
+                  EXPECT_EQ(f[139], explicit_level ? 2u : 0u);
+                  EXPECT_EQ(f[29], 0u);
+                  EXPECT_EQ(f[143], shadow ? 1u : 0u);
+                  samples++;
+               }
+               off += (unsigned)len;
+            }
+            EXPECT_EQ(samples, 1u);
+            ralloc_free(mem);
+         }
+      }
+   }
 }

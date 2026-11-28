@@ -10023,6 +10023,27 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
    }
 }
 
+/* Whether a txl or txf at level zero samples at the explicit immediate level
+ * 0 rather than in AGX's implicit-LOD form (AGX_LOD_MODE_AUTO_LOD).
+ *
+ * AGX2's AUTO_LOD encoding also covers txl(..., 0). AGX3's AUTO form is
+ * specifically the fragment derivative form, while Apple's compute and vertex
+ * witnesses use the explicit immediate-level encoding. G18G also keeps a
+ * fragment txl/txf at level zero explicit (j873). So does every AGX3 encoding
+ * for a fragment txl: the native compiler samples level(0.0) at the immediate
+ * level, where the implicit form would take the level from the derivatives. */
+bool
+agx_level_zero_is_explicit(const struct agx_device_key *dev,
+                           mesa_shader_stage stage, nir_texop op)
+{
+   if (op != nir_texop_txl && op != nir_texop_txf)
+      return false;
+   if (dev->encoding == AGX_ISA_ENCODING_AGX2)
+      return false;
+   return stage != MESA_SHADER_FRAGMENT || agx_is_g18g(dev) ||
+          op == nir_texop_txl;
+}
+
 static enum agx_lod_mode
 agx_lod_mode_for_nir(nir_texop op, bool biased, bool min_lod, bool lod_is_zero)
 {
@@ -10256,17 +10277,10 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
    enum agx_lod_mode lod_mode =
       agx_lod_mode_for_nir(instr->op, has_bias, has_min_lod, lod_is_zero);
 
-   /* AGX2's AUTO_LOD encoding also covers txl(..., 0). AGX3's AUTO form is
-    * specifically the fragment derivative form, while Apple's compute and
-    * vertex witnesses use the explicit immediate-level encoding. Keep every
-    * non-fragment txl at level zero explicit so the packer selects that
-    * native form. */
-   /* G18G also keeps a fragment txl/txf at level zero explicit (j873). */
-   if (((b->shader->key->dev.encoding != AGX_ISA_ENCODING_AGX2 &&
-         b->shader->stage != MESA_SHADER_FRAGMENT) ||
-        agx_is_g18g(&b->shader->key->dev)) &&
-       (instr->op == nir_texop_txl || instr->op == nir_texop_txf) &&
-       lod_is_zero) {
+   /* Keep level zero explicit where the native form is the immediate level
+    * (agx_level_zero_is_explicit()), so the packer selects that form. */
+   if (lod_is_zero && agx_level_zero_is_explicit(&b->shader->key->dev,
+                                                 b->shader->stage, instr->op)) {
       lod_mode = AGX_LOD_MODE_LOD_MIN;
       /* The native G17P vertex form carries level zero in the instruction.
        * Keeping NIR's fp32 zero SSA here made texture_sample source 1 two
