@@ -246,6 +246,19 @@ validate_block(agx_context *ctx, agx_block *block, struct regfile *blocks,
                unsigned idx = agx_predecessor_index(block, *pred);
                agx_index src = I->src[idx];
 
+               /* A spilled phi keeps its immediate and uniform sources.
+                * Parallel copy lowering writes them to the phi's slot on the
+                * edge through its scratch register (agx_spill.c,
+                * agx_lower_parallel_copy.c do_copy()). They name no register
+                * or memory variable, so they carry no variable to compare.
+                */
+               if (src.type == AGX_INDEX_IMMEDIATE ||
+                   src.type == AGX_INDEX_UNIFORM) {
+                  all_same = false;
+                  first = false;
+                  continue;
+               }
+
                assert(ra_class_for_index(src) == cls);
                if (!src.has_reg) {
                   all_same = false;
