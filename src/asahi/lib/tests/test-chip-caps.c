@@ -52,6 +52,7 @@ static const unsigned all_caps =
    AGX_CAP_SIGNED_ZERO_MINMAX_SELECT | AGX_CAP_CDM_OVERLAP_SPLIT |
    AGX_CAP_CACHED_CMD_MEMORY | AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED |
    AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_CDM_DEFER_FLUSH |
+   AGX_CAP_PREAMBLE_BASES_LOW |
    AGX_CAP_COMPUTE_SMART_WAITS | AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS |
    AGX_CAP_COMPUTE_COHERENT_STORE | AGX_CAP_PBE_QUEUED_BUFFER_COPY;
 #undef CAP_BIT
@@ -285,18 +286,20 @@ test_signed_zero_minmax_select(void)
    }
 }
 
-/* AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED and AGX_CAP_FOLD_SHARED_OFFSETS are
- * enabled on the measured G13 rows (G13G, G13X) only. */
+/* AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED is enabled on the measured G13 rows
+ * (G13G, G13X) only; AGX_CAP_FOLD_SHARED_OFFSETS also covers G14X. */
 static void
 test_g13_compute_codegen_caps(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
+      const bool expected_g13 = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
+      const bool expected_fold = expected_g13 || c == AGX_CHIP_G14X;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_COMPUTE_SKIP_PRESSURE_SCHED) ==
-                    expected,
+                    expected_g13,
                  c);
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_FOLD_SHARED_OFFSETS) == expected,
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_FOLD_SHARED_OFFSETS) ==
+                    expected_fold,
                  c);
    }
 }
@@ -309,6 +312,18 @@ test_cdm_defer_flush(void)
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G13G || c == AGX_CHIP_G13X;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_CDM_DEFER_FLUSH) == expected, c);
+   }
+}
+
+/* AGX_CAP_PREAMBLE_BASES_LOW is enabled on the measured G14X row only. */
+static void
+test_preamble_bases_low(void)
+{
+   for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
+      const enum agx_chip c = (enum agx_chip)i;
+      const bool expected = c == AGX_CHIP_G14X;
+      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_PREAMBLE_BASES_LOW) == expected,
+                 c);
    }
 }
 
@@ -365,6 +380,7 @@ main(void)
    test_signed_zero_minmax_select();
    test_g13_compute_codegen_caps();
    test_cdm_defer_flush();
+   test_preamble_bases_low();
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
       const bool expected = c == AGX_CHIP_G14X;

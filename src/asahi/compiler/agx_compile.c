@@ -20227,6 +20227,17 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
 #endif
 }
 
+bool
+agx_should_place_preamble_bases_low(const nir_shader *nir,
+                                    const struct agx_shader_key *key,
+                                    bool form_preamble, unsigned push_count)
+{
+   return form_preamble && nir->info.stage == MESA_SHADER_COMPUTE &&
+          key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+          agx_chip_has_cap(key->dev.chip, AGX_CAP_PREAMBLE_BASES_LOW) &&
+          push_count > key->reserved_preamble;
+}
+
 static bool
 agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                                 struct agx_shader_part *out,
@@ -20607,6 +20618,13 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
                &push_count, place_load_bases_low);
+      info->push_count = push_count;
+   } else if (!is_agx3 &&
+              agx_should_place_preamble_bases_low(nir, key, form_preamble,
+                                                  info->push_count)) {
+      unsigned push_count = info->push_count;
+      NIR_PASS(post_opt_progress, nir, agx_nir_place_preamble_bases_low,
+               key->reserved_preamble, push_count, &push_count);
       info->push_count = push_count;
    }
 

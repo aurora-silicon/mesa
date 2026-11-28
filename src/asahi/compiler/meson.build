@@ -834,6 +834,7 @@ if with_tests
          'test/test-preamble-speculative-buffer.cpp',
          'test/test-preamble-modifiers.cpp',
          'test/test-preamble-texture-policy.cpp',
+        'test/test-preamble-bases.cpp',
          'test/test-cprog-cleanup.cpp',
          'test/test-m5-packed-lod.cpp',
          'test/test-preamble-half-exports.cpp',
