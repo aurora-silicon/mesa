@@ -614,6 +614,73 @@ relocate_branches(struct util_dynarray *out, const struct util_dynarray *map,
    return true;
 }
 
+/* Whole-program template cache for branch-free Ioto programs: caches the
+ * transcoded agx3d output and patches 32-bit immediate payloads in 8-byte
+ * agx3c ldimm instructions that re-encode to 6- or 10-byte agx3d ldimm
+ * instructions, avoiding repeated decode/compose on identical layouts. */
+#define IOTO_PCACHE_SIZE 32
+#define IOTO_PCACHE_MAX_IN 512
+#define IOTO_PCACHE_MAX_OUT 768
+#define IOTO_PCACHE_MAX_PATCHES 32
+
+static const uint64_t agx3c_ldimm_long_imm_mask =
+   (UINT64_C(0x7f) << 8) |
+   (UINT64_C(0x7f) << 25) |
+   (UINT64_C(0xf) << 33) |
+   (UINT64_C(0x3) << 42) |
+   (UINT64_C(0xf) << 48) |
+   (UINT64_C(0xff) << 52);
+
+static inline uint32_t
+agx3c_ldimm_long_extract(const uint8_t *p)
+{
+   uint64_t w;
+   memcpy(&w, p, sizeof(w));
+   return (uint32_t)(((w >> 8) & 0x7fu) |
+                     (((w >> 33) & 0xfu) << 7) |
+                     (((w >> 42) & 0x3u) << 11) |
+                     (((w >> 48) & 0xfu) << 13) |
+                     (((w >> 52) & 0xffu) << 17) |
+                     (((w >> 25) & 0x7fu) << 25));
+}
+
+struct ioto_pcache_patch {
+   uint16_t in_off;
+   uint16_t out_off;
+};
+
+struct ioto_pcache_entry {
+   uint16_t in_len;
+   uint16_t out_len;
+   uint16_t shader_gprs;
+   uint8_t api_program;
+   uint8_t patch_count;
+   uint8_t in_mask[IOTO_PCACHE_MAX_IN];
+   uint8_t in_masked[IOTO_PCACHE_MAX_IN];
+   uint8_t out_bytes[IOTO_PCACHE_MAX_OUT];
+   struct ioto_pcache_patch patches[IOTO_PCACHE_MAX_PATCHES];
+};
+
+static bool
+ioto_pcache_match(const struct ioto_pcache_entry *e, const uint8_t *in,
+                  unsigned len)
+{
+   unsigned k = 0;
+   for (; k + 8 <= len; k += 8) {
+      uint64_t v, m, ref;
+      memcpy(&v, in + k, 8);
+      memcpy(&m, e->in_mask + k, 8);
+      memcpy(&ref, e->in_masked + k, 8);
+      if ((v & m) != ref)
+         return false;
+   }
+   for (; k < len; ++k) {
+      if ((in[k] & e->in_mask[k]) != e->in_masked[k])
+         return false;
+   }
+   return true;
+}
+
 static bool
 transcode(struct util_dynarray *binary, unsigned start,
           const struct agx3_transcode_ioto *ioto,
@@ -637,6 +704,48 @@ transcode(struct util_dynarray *binary, unsigned start,
 
    const unsigned len = binary->size - start;
    const uint8_t *in = (const uint8_t *)binary->data + start;
+
+   static _Thread_local struct ioto_pcache_entry ioto_pcache[IOTO_PCACHE_SIZE];
+   static _Thread_local unsigned ioto_pcache_next = 0;
+   const bool pcache_eligible = ioto && !offset_count && !long_tile_reads &&
+                                !fragment_stage && len > 0 &&
+                                len <= IOTO_PCACHE_MAX_IN;
+   if (pcache_eligible) {
+      for (unsigned e = 0; e < IOTO_PCACHE_SIZE; ++e) {
+         const struct ioto_pcache_entry *ce = &ioto_pcache[e];
+         if (ce->in_len != len ||
+             ce->api_program != (uint8_t)ioto->api_program ||
+             ce->shader_gprs != (uint16_t)ioto->shader_gprs)
+            continue;
+         if (!ioto_pcache_match(ce, in, len))
+            continue;
+         bool patches_ok = true;
+         uint32_t patch_imms[IOTO_PCACHE_MAX_PATCHES];
+         for (unsigned p = 0; p < ce->patch_count; ++p) {
+            uint32_t imm = agx3c_ldimm_long_extract(in + ce->patches[p].in_off);
+            if (imm <= 0xffffu) {
+               patches_ok = false;
+               break;
+            }
+            patch_imms[p] = imm;
+         }
+         if (!patches_ok)
+            continue;
+         binary->size = start;
+         uint8_t *dst = util_dynarray_grow_bytes(binary, 1, ce->out_len);
+         memcpy(dst, ce->out_bytes, ce->out_len);
+         for (unsigned p = 0; p < ce->patch_count; ++p)
+            memcpy(dst + ce->patches[p].out_off + 2, &patch_imms[p], 4);
+         return true;
+      }
+   }
+
+   struct ioto_pcache_patch pcache_patches[IOTO_PCACHE_MAX_PATCHES];
+   unsigned pcache_patch_count = 0;
+   uint8_t pcache_mask[IOTO_PCACHE_MAX_IN];
+   if (pcache_eligible)
+      memset(pcache_mask, 0xff, len);
+
    struct util_dynarray out, map, branches;
    util_dynarray_init(&out, NULL);
    util_dynarray_init(&map, NULL);
@@ -731,6 +840,24 @@ transcode(struct util_dynarray *binary, unsigned start,
          *why = "agx3d encoding disagrees with the agx3d length rule";
          goto fail;
       }
+      if (pcache_eligible && !branch && !helper_base_next &&
+          flags.pending < 0 && !flags.folded && n == 8 &&
+          name == AGX3_MN_ldimm && fields[14] > 0xffffu &&
+          ((size == 6 && (bytes[0] & 0x7fu) == 0x11u) ||
+           (size == 10 && (bytes[0] & 0x7fu) == 0x51u)) &&
+          pcache_patch_count < IOTO_PCACHE_MAX_PATCHES) {
+         uint32_t out_imm;
+         memcpy(&out_imm, bytes + 2, 4);
+         if (agx3c_ldimm_long_extract(in + i) == (uint32_t)fields[14] &&
+             out_imm == (uint32_t)fields[14]) {
+            uint64_t m = ~agx3c_ldimm_long_imm_mask;
+            memcpy(pcache_mask + i, &m, 8);
+            pcache_patches[pcache_patch_count++] = (struct ioto_pcache_patch){
+               .in_off = (uint16_t)i,
+               .out_off = (uint16_t)out.size,
+            };
+         }
+      }
       memcpy(util_dynarray_grow_bytes(&out, 1, size), bytes, size);
       i += n;
    }
@@ -767,6 +894,24 @@ transcode(struct util_dynarray *binary, unsigned start,
             break;
          }
       }
+   }
+
+   if (pcache_eligible && !branches.size && flags.pending < 0 &&
+       !flags.folded && out.size <= IOTO_PCACHE_MAX_OUT) {
+      struct ioto_pcache_entry *ce =
+         &ioto_pcache[ioto_pcache_next++ % IOTO_PCACHE_SIZE];
+      ce->in_len = (uint16_t)len;
+      ce->out_len = (uint16_t)out.size;
+      ce->shader_gprs = (uint16_t)ioto->shader_gprs;
+      ce->api_program = (uint8_t)ioto->api_program;
+      ce->patch_count = (uint8_t)pcache_patch_count;
+      memcpy(ce->in_mask, pcache_mask, len);
+      for (unsigned b = 0; b < len; ++b)
+         ce->in_masked[b] = in[b] & pcache_mask[b];
+      memcpy(ce->out_bytes, out.data, out.size);
+      if (pcache_patch_count)
+         memcpy(ce->patches, pcache_patches,
+                pcache_patch_count * sizeof(pcache_patches[0]));
    }
 
    binary->size = start;
