@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Data {
+   uint buf[];
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer Records {
+   uint count;
+   uint cond_mask;
+   uint rec_in[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer Out {
+   uvec4 out_val[];
+};
+
+void main() {
+   uint gid = gl_GlobalInvocationID.x;
+   if (gid >= count)
+      return;
+   uint rec = rec_in[gid] & ~7u;
+   uint f1 = buf[rec + 1u];
+   uint f3 = buf[rec + 3u];
+   uint f5 = 0x55aa55aau;
+   /* Keep f1 and f3 live in this block before the branch so robust store
+    * splitting cannot sink them into separate blocks before find_shared_fields.
+    * Neither valid test words (0xa5xxxxxx) nor zero-page reads equal 0xdeadbeef. */
+   if ((cond_mask & (1u << (gid & 31u))) != 0u &&
+       (f1 != 0xdeadbeefu || f3 != 0xdeadbeefu)) {
+      f5 = buf[rec + 5u];
+   }
+   uint f0 = buf[rec];
+   out_val[gid] = uvec4(f0, f1, f3, f5);
+}

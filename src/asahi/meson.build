@@ -563,4 +563,26 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
       suite : ['asahi'],
     )
   endforeach
+
+  # Strided SSBO word-field lowering: compile and submit across null,
+  # mid-word, mid-record, last-word, >= 2^30 wraparound and nonzero-offset
+  # storage-buffer bindings.
+  foreach chip : ['g13g', 'g14g']
+    test(
+      'brl-' + chip + '-ssbo-word-fields',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        brl_vulkan_ssbo_word_fields,
+        '--shim',
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
 endif

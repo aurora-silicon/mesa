@@ -1884,6 +1884,67 @@ ubo_root_always_valid(nir_def *desc_vec)
           (nir_intrinsic_access(desc) & ACCESS_BUFFER_DESCRIPTOR_AGX);
 }
 
+/* Match (record + field) * 4, including OR when the field bits are
+ * known zero in the record index. Addition and OR then agree, and the
+ * scaled field cannot carry into the record when added after the scaled
+ * 32-bit index, even if that index wrapped.
+ */
+static bool
+bounded_word_field_parts(nir_intrinsic_instr *intr, nir_scalar *out_record,
+                         unsigned *out_field)
+{
+   nir_scalar offset = nir_scalar_resolved(intr->src[1].ssa, 0);
+   if (intr->intrinsic != nir_intrinsic_load_global_bounded ||
+       intr->def.bit_size != 32 || intr->num_components != 1 ||
+       offset.def->bit_size != 32 || !is_op(offset, nir_op_amul))
+      return false;
+
+   nir_scalar left = nir_scalar_chase_alu_src(offset, 0);
+   nir_scalar right = nir_scalar_chase_alu_src(offset, 1);
+   nir_scalar scale = nir_scalar_is_const(left) ? left : right;
+   nir_scalar index = nir_scalar_is_const(left) ? right : left;
+   if (!nir_scalar_is_const(scale) || nir_scalar_as_uint(scale) != 4 ||
+       !(is_op(index, nir_op_iadd) || is_op(index, nir_op_ior)))
+      return false;
+
+   left = nir_scalar_chase_alu_src(index, 0);
+   right = nir_scalar_chase_alu_src(index, 1);
+   nir_scalar word = nir_scalar_is_const(left) ? left : right;
+   nir_scalar record = nir_scalar_is_const(left) ? right : left;
+   if (!nir_scalar_is_const(word) || nir_scalar_is_const(record))
+      return false;
+
+   uint32_t n = nir_scalar_as_uint(word);
+   if (!n || n >= AGX_ZERO_PAGE_SIZE / 4)
+      return false;
+
+   unsigned field = n * 4;
+   unsigned mul = nir_intrinsic_align_mul(intr);
+   if (mul > AGX_ZERO_PAGE_SIZE ||
+       field % mul != nir_intrinsic_align_offset(intr) ||
+       !m5_offset_aligned(record, BITFIELD_MASK(util_last_bit(n)), 12))
+      return false;
+
+   *out_record = record;
+   *out_field = field;
+   return true;
+}
+
+static nir_def *
+bounded_word_field_address(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_scalar record;
+   unsigned field;
+   if (!bounded_word_field_parts(intr, &record, &field))
+      return NULL;
+
+   nir_def *start = nir_ishl_imm(b, nir_mov_scalar(b, record), 2);
+   nir_def *base = nir_iadd(b, intr->src[0].ssa, nir_u2u64(b, start));
+   nir_def *safe = nir_bcsel(b, check_in_bounds(b, intr), base,
+                             nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+   return nir_iadd_imm(b, safe, field);
+}
+
 /* A bounded load of a field at a constant displacement from an indexed
  * record: offset = uadd_sat(index, field), with room in the zero page for an
  * out-of-bounds access of the whole field at its promised alignment.
@@ -1918,6 +1979,10 @@ bounded_field_parts(nir_intrinsic_instr *intr, nir_scalar *index,
 static nir_def *
 bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
 {
+   nir_def *word_address = bounded_word_field_address(b, intr);
+   if (word_address)
+      return word_address;
+
    nir_scalar index_s;
    unsigned field;
    if (!bounded_field_parts(intr, &index_s, &field))
@@ -2371,6 +2436,24 @@ struct bounded_record_key {
    unsigned index_comp;
 };
 
+struct word_record_key {
+   nir_def *base, *bound, *record;
+   unsigned record_comp;
+};
+
+struct word_field_use {
+   nir_intrinsic_instr *intr;
+   nir_block *block;
+};
+
+struct word_record_group {
+   nir_block *cur_block;
+   unsigned first_field;
+   bool cur_shared;
+   struct util_dynarray shared_blocks;
+   struct util_dynarray loads;
+};
+
 static uint32_t
 bounded_record_key_hash(const void *key)
 {
@@ -2383,8 +2466,22 @@ bounded_record_key_equal(const void *a, const void *b)
    return !memcmp(a, b, sizeof(struct bounded_record_key));
 }
 
+static uint32_t
+word_record_key_hash(const void *key)
+{
+   return _mesa_hash_data(key, sizeof(struct word_record_key));
+}
+
+static bool
+word_record_key_equal(const void *a, const void *b)
+{
+   return !memcmp(a, b, sizeof(struct word_record_key));
+}
+
 /* Collect the bounded field loads that share their record with another one
- * in the same block into state->shared_fields.
+ * in the same block into state->shared_fields. For strided word-field loads,
+ * require two distinct field displacements in the same block and also include
+ * loads of that record dominated by such a block.
  */
 static void
 find_shared_fields(nir_shader *nir, struct global_load_lowering *state)
@@ -2394,6 +2491,9 @@ find_shared_fields(nir_shader *nir, struct global_load_lowering *state)
       mem_ctx, bounded_record_key_hash, bounded_record_key_equal);
 
    nir_foreach_function_impl(impl, nir) {
+      struct hash_table *word_groups = NULL;
+      bool any_shared_word = false;
+
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
@@ -2401,8 +2501,55 @@ find_shared_fields(nir_shader *nir, struct global_load_lowering *state)
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
             nir_scalar index;
             unsigned field;
-            if (!takes_bounded_check(intr, state) ||
-                !bounded_field_parts(intr, &index, &field))
+            if (!takes_bounded_check(intr, state))
+               continue;
+
+            if (bounded_word_field_parts(intr, &index, &field)) {
+               if (!word_groups) {
+                  word_groups = _mesa_hash_table_create(
+                     mem_ctx, word_record_key_hash, word_record_key_equal);
+               }
+
+               struct word_record_key wkey;
+               memset(&wkey, 0, sizeof(wkey));
+               wkey.base = intr->src[0].ssa;
+               wkey.bound = intr->src[2].ssa;
+               wkey.record = index.def;
+               wkey.record_comp = index.comp;
+
+               struct hash_entry *wentry =
+                  _mesa_hash_table_search(word_groups, &wkey);
+               struct word_record_group *g;
+               if (!wentry) {
+                  g = rzalloc(mem_ctx, struct word_record_group);
+                  util_dynarray_init(&g->shared_blocks, mem_ctx);
+                  util_dynarray_init(&g->loads, mem_ctx);
+                  _mesa_hash_table_insert(
+                     word_groups, ralloc_memdup(mem_ctx, &wkey, sizeof(wkey)),
+                     g);
+               } else {
+                  g = wentry->data;
+               }
+
+               struct word_field_use use = {
+                  .intr = intr,
+                  .block = block,
+               };
+               util_dynarray_append(&g->loads, use);
+
+               if (g->cur_block != block) {
+                  g->cur_block = block;
+                  g->first_field = field;
+                  g->cur_shared = false;
+               } else if (!g->cur_shared && field != g->first_field) {
+                  g->cur_shared = true;
+                  util_dynarray_append(&g->shared_blocks, block);
+                  any_shared_word = true;
+               }
+               continue;
+            }
+
+            if (!bounded_field_parts(intr, &index, &field))
                continue;
 
             struct bounded_record_key key;
@@ -2420,6 +2567,24 @@ find_shared_fields(nir_shader *nir, struct global_load_lowering *state)
             } else {
                _mesa_set_add(state->shared_fields, entry->data);
                _mesa_set_add(state->shared_fields, intr);
+            }
+         }
+      }
+
+      if (any_shared_word) {
+         nir_metadata_require(impl, nir_metadata_dominance);
+         hash_table_foreach(word_groups, wentry) {
+            struct word_record_group *g = wentry->data;
+            if (!g->shared_blocks.size)
+               continue;
+
+            util_dynarray_foreach(&g->loads, struct word_field_use, u) {
+               util_dynarray_foreach(&g->shared_blocks, nir_block *, sb) {
+                  if (*sb == u->block || nir_block_dominates(*sb, u->block)) {
+                     _mesa_set_add(state->shared_fields, u->intr);
+                     break;
+                  }
+               }
             }
          }
       }

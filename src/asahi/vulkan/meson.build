@@ -1531,6 +1531,15 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  brl_vulkan_ssbo_word_fields = executable(
+    'brl-vulkan-ssbo-word-fields',
+    files('tests/brl_vulkan_ssbo_word_fields.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   g16s_vulkan_buffer_upload = executable(
     'g16s-vulkan-buffer-upload',
     files('tests/g16s_vulkan_buffer_upload.c'),
