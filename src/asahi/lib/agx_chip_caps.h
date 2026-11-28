@@ -198,15 +198,16 @@ enum agx_chip_cap {
 
    /* Partition AGX2 compute async scoreboard slots by first-use distance and
     * avoid premature AGX_MAX_PENDING=8 slot-0 overflow stalls when early-use
-    * loads mix with late-use loads (agx_insert_waits). Measured on G13G (M1)
-    * and G14X (M2 Max); other chips keep the stock pass until measured on
-    * aurora-wip. */
+    * loads mix with late-use loads (agx_insert_waits). Enabled on G13G (M1)
+    * and G14X (gen-14 Pro/Max/Ultra: G14S/G14C/G14D; measured on G14C / M2
+    * Max); other chips keep the stock pass until measured on aurora-wip. */
    AGX_CAP_COMPUTE_SMART_WAITS = 1u << 28,
 
    /* Hoist non-coherent AGX2 compute device_loads together with pure SSA
     * address-producer chains (depth <= 4) up to 64 instructions earlier
-    * (agx_hoist_loads). Measured on G14X (M2 Max); other chips keep
-    * the stock schedule until measured on aurora-wip. */
+    * (agx_hoist_loads). Enabled on G14X (gen-14 Pro/Max/Ultra: G14S/G14C/G14D;
+    * measured on G14C / M2 Max); other chips keep the stock schedule until
+    * measured on aurora-wip. */
    AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS = 1u << 29,
 
    /* Compute device stores (`AGX_OPCODE_DEVICE_STORE` in MESA_SHADER_COMPUTE)
