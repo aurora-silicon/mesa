@@ -23947,6 +23947,46 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             continue;
          }
 
+         /* 32-bit logical right shift with a register shift count: route
+          * through agx3_alu_srl_reg() so destination cache hints and source
+          * lifetime hints are preserved instead of falling through to the
+          * unhinted generic ALU composer. */
+         if ((enc == AGX_ISA_ENCODING_AGX3B ||
+              (enc == AGX_ISA_ENCODING_AGX3C && !agx_is_g18g(&ctx->key->dev))) &&
+             I->op == AGX_OPCODE_BFEIL &&
+             I->nr_dests == 1 && I->nr_srcs == 3 && I->imm == 0 &&
+             agx3_src_is_zero_imm(I->src[0]) &&
+             I->dest[0].size == AGX_SIZE_32 &&
+             I->src[1].size == AGX_SIZE_32 &&
+             agx3_src_is_register(I->src[2]) &&
+             I->src[2].size == AGX_SIZE_32) {
+            const agx_index dest = I->dest[0], value = I->src[1];
+            const agx_index shift = I->src[2], base = I->src[0];
+            if (I->saturate || base.memory || base.abs || base.neg ||
+                base.kill || base.cache || base.discard ||
+                !agx3_src_is_register(dest) || dest.memory ||
+                agx_channels(dest) != 1 || !agx3_src_is_register(value) ||
+                value.memory || agx_channels(value) != 1 ||
+                shift.memory || agx_channels(shift) != 1 ||
+                value.abs || value.neg || value.kill ||
+                shift.abs || shift.neg || shift.kill ||
+                (value.cache && value.discard) ||
+                (shift.cache && shift.discard))
+               AGX3_REFUSE(I);
+            const uint16_t src[2] = {value.value, shift.value};
+            const bool src_16[2] = {false, false};
+            const enum agx3_alu_hint hints[2] = {
+               agx3_post_ra_hint(value),
+               shift.cache ? AGX3_ALU_HINT_NONE : agx3_post_ra_hint(shift),
+            };
+            uint8_t bytes[AGX3_ALU_MAX_LENGTH], len = 0;
+            if (!agx3_alu_srl_reg(enc, dest.value, false, dest.cache, src,
+                                  src_16, hints, wait, bytes, &len) ||
+                !agx3_append(emission, bytes, len))
+               AGX3_REFUSE(I);
+            continue;
+         }
+
          if ((enc == AGX_ISA_ENCODING_AGX3B || enc == AGX_ISA_ENCODING_AGX3C) &&
              I->op == AGX_OPCODE_BFEIL &&
              I->nr_dests == 1 && I->nr_srcs == 3 && I->imm >= 1 && I->imm <= 31 &&
@@ -23971,11 +24011,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             };
             uint8_t bytes[AGX3_ALU_MAX_LENGTH], length;
             const bool encoded = enc == AGX_ISA_ENCODING_AGX3C
-               ? agx3_alu_bfeil_m5(dest->value,value->value,value->size == AGX_SIZE_16,
-                    shift->value,reg_shift,reg_shift && shift->size == AGX_SIZE_16,
-                    I->imm,hints,wait,bytes,&length)
-               : agx3_alu_bfeil(enc,dest->value,value->value,shift->value,reg_shift,
-                                I->imm,hints,wait,bytes,&length);
+               ? agx3_alu_bfeil_m5(dest->value,value->value,
+                    value->size == AGX_SIZE_16,shift->value,reg_shift,
+                    reg_shift && shift->size == AGX_SIZE_16,I->imm,hints,wait,
+                    bytes,&length)
+               : agx3_alu_bfeil_cached(enc,dest->value,
+                                       enc == AGX_ISA_ENCODING_AGX3B && dest->cache,
+                                       value->value,shift->value,reg_shift,
+                                       I->imm,hints,wait,bytes,&length);
             if (!encoded ||
                 !agx3_append(emission,bytes,length))
                AGX3_REFUSE(I);
