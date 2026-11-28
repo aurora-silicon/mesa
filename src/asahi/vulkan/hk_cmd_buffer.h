@@ -941,6 +941,11 @@ struct hk_render_registers {
 struct hk_rendering_state {
    VkRenderingFlagBits flags;
 
+   /* Reopened in-CB from a suspended instance (hk_agx3_resume_suspended_pass).
+    * Begin-time direct-resolve setup was skipped while suspended, so late EOT
+    * rebuilds must not switch into g17p_direct_color_resolve. */
+   bool resumed_in_cb;
+
    /* May have written storage memory/XFB anywhere in this API pass, including
     * before a physical render split. Used only for conservative barriers. */
    bool barrier_shader_writes;
@@ -1284,6 +1289,10 @@ struct hk_graphics_state {
    /* Stages bound to a shader compiled without custom-border emulation that
     * has an emulating twin to switch to once the device needs it. */
    uint32_t border_free_stages;
+
+   /* Stages bound to a shader compiled without image-view minLod emulation
+    * that has an emulating twin to switch to once the device needs it. */
+   uint32_t min_lod_free_stages;
 
    /* G17P: the twin of the bound fragment shader that reads its per-primitive
     * inputs from the bound mesh shader's records (hk_mesh_fs_twin()), or
@@ -1758,6 +1767,9 @@ struct hk_cs {
 
    /* A graphics program recorded in this stream writes external memory. */
    bool m5_shader_writes_memory;
+   /* A fragment shader recorded in this stream reads textures, images, input
+    * attachments, or external memory. */
+   bool fs_reads_images;
 
    /* Per-render-stream memo of hoisted AGX3 vertex preamble outputs already
     * computed by a PREGFX dispatch for a given (vertex shader, root VA). */
@@ -2064,6 +2076,7 @@ struct hk_cs {
 
    struct util_dynarray scissor, depth_bias;
    uint64_t uploaded_scissor, uploaded_zbias;
+   uint32_t uploaded_scissor_size, uploaded_zbias_size;
 
    /* G17P: the last uploaded draw-state selector record and the scissor /
     * depth-bias array sizes and viewport count it selects for. */
@@ -2335,8 +2348,19 @@ hk_cs_merge_cdm_until(struct hk_cs *a, const struct hk_cs *b, void *b_current)
       a->unordered_start_ts = b->unordered_start_ts;
    }
 
-   util_dynarray_append_array(&a->compute_resources, uint8_t,
-                             b->compute_resources.data, b->compute_resources.size);
+   util_dynarray_foreach(&b->compute_resources,
+                         const struct drm_asahi_compute_program, b_entry) {
+      bool seen = false;
+      util_dynarray_foreach(&a->compute_resources,
+                            const struct drm_asahi_compute_program, a_entry) {
+         if (!memcmp(a_entry, b_entry, sizeof(*b_entry))) {
+            seen = true;
+            break;
+         }
+      }
+      if (!seen)
+         util_dynarray_append(&a->compute_resources, *b_entry);
+   }
 
    a->g17p_timestamp_query |= b->g17p_timestamp_query;
 
@@ -2525,7 +2549,7 @@ struct hk_cmd_buffer {
       bool att_available;
       /* The render state the instance ended with. */
       struct hk_rendering_state render;
-   } pass_merge;
+   } pass_merge, suspended_pass;
 
    /* How the command buffer begins and ends, for submit-time render packing
     * (hk_render_pack.h). */
@@ -2561,6 +2585,13 @@ struct hk_cmd_buffer {
          VkImageAspectFlags aspects;
          VkClearValue value;
          bool from_gfx;
+         /* Finalized clear-only VDM stream kept alive when an empty clear
+          * pass is deferred on native AGX3 / M5. Dropped if every cleared
+          * attachment it owns is absorbed or superseded; left in
+          * control_streams when a later render pass flushes it, so the clear
+          * stays on VDM without a VDM->CDM->VDM crossing; dropped for a
+          * compute fill on any other flush. */
+         struct hk_cs *vdm_cs;
          struct hk_sync_dep gfx_dep[HK_SYNC_NUM_SQ];
       } deferred_clear[HK_MAX_DEFERRED_CLEARS];
       uint8_t deferred_clear_count;
@@ -2600,6 +2631,25 @@ struct hk_cmd_buffer {
          bool empty_tiles_z;
          bool empty_tiles_s;
       } pending_z_store;
+
+      /* AGX3: the last ended single-stream multisample render pass stored one
+       * active colour attachment without resolving it. An immediately following
+       * full-image vkCmdResolveImage2 of that attachment can fold into cs's
+       * end-of-tile program via store_and_resolve, avoiding a meta resolve pass. */
+      struct hk_pending_msaa_resolve {
+         struct hk_cs *cs;
+         const struct hk_image *src_image;
+         const struct hk_image *z_image;
+         const struct hk_image *s_image;
+         struct hk_native_pbe_descriptor src_eot_pbe;
+         struct agx_tilebuffer_layout tib;
+         VkFormat src_format;
+         VkAttachmentLoadOp src_load_op;
+         uint32_t src_mip_level;
+         uint32_t src_base_layer;
+         uint32_t next_seq;
+         bool fs_barrier_seen;
+      } pending_msaa_resolve;
 
       /* M5: the open render stream is an ordered continuation (hk_cs::
        * m5_ordered) and a command recorded since may read the instance's
@@ -3183,6 +3233,10 @@ uint64_t hk_default_sample_positions(unsigned nr_samples);
 void hk_flush_deferred_clears_why(struct hk_cmd_buffer *cmd, const char *why);
 #define hk_flush_deferred_clears(cmd) hk_flush_deferred_clears_why(cmd, __func__)
 
+/* As hk_flush_deferred_clears(), for the deferred clears a render pass that
+ * is being recorded did not absorb. */
+void hk_flush_deferred_clears_before_render(struct hk_cmd_buffer *cmd);
+
 /* Aspects of the depth/stencil image of the pending store are overwritten as a
  * whole before anything read them: drop those aspect stores (see
  * hk_take_pending_z_store()). */
@@ -3300,6 +3354,8 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
    if (unlikely(cmd->state.pending_z_store.cs) &&
        !cmd->state.deferred_clear_hold)
       cmd->state.pending_z_store.cs = NULL;
+   if (unlikely(cmd->state.pending_msaa_resolve.cs))
+      cmd->state.pending_msaa_resolve.cs = NULL;
    if (unlikely(cmd->state.oq_pending_render) &&
        (ptr == &cmd->current_cs.post_gfx ||
         cmd->current_cs.gfx != cmd->state.oq_pending_render))
@@ -3760,17 +3816,25 @@ hk_cmd_buffer_end_graphics(struct hk_cmd_buffer *cmd)
        * addresses, matching native's USC-window allocations; a main-heap
        * address has bit 39 set and incorrectly selects the upper root.
        */
-      cs->uploaded_scissor =
-         full_usc_state
-            ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
-            : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+      if (!cs->uploaded_scissor ||
+          cs->uploaded_scissor_size != cs->scissor.size) {
+         cs->uploaded_scissor =
+            full_usc_state
+               ? hk_pool_usc_upload(cmd, cs->scissor.data, cs->scissor.size, 64)
+               : hk_pool_upload(cmd, cs->scissor.data, cs->scissor.size, 64);
+         cs->uploaded_scissor_size = cs->scissor.size;
+      }
 
-      cs->uploaded_zbias =
-         full_usc_state
-            ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
-                                 cs->depth_bias.size, 64)
-            : hk_pool_upload(cmd, cs->depth_bias.data,
-                             cs->depth_bias.size, 64);
+      if (!cs->uploaded_zbias ||
+          cs->uploaded_zbias_size != cs->depth_bias.size) {
+         cs->uploaded_zbias =
+            full_usc_state
+               ? hk_pool_usc_upload(cmd, cs->depth_bias.data,
+                                    cs->depth_bias.size, 64)
+               : hk_pool_upload(cmd, cs->depth_bias.data,
+                                cs->depth_bias.size, 64);
+         cs->uploaded_zbias_size = cs->depth_bias.size;
+      }
 
       /* TODO: maybe free scissor/depth_bias now? */
       cs->current = hk_cmd_buffer_emit_vdm_terminate(cmd, cs->current);
@@ -3844,6 +3908,8 @@ void hk_render_pack_note_barrier(struct hk_cmd_buffer *cmd,
                                  const VkDependencyInfo *info);
 void hk_render_pack_barrier_done(struct hk_cmd_buffer *cmd);
 void hk_render_pack_end_cmd(struct hk_cmd_buffer *cmd);
+bool hk_try_fold_msaa_resolve(struct hk_cmd_buffer *cmd,
+                              const VkResolveImageInfo2 *info);
 
 /* An ordered continuation (hk_cs::m5_ordered) ends at a command that may
  * break its memory equivalence (reason names the command). */
@@ -3985,6 +4051,12 @@ hk_reserve_scratch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 {
    /* Not scratch but this is the most convenient place for this... */
    cs->uses_sampler_heap |= s->b.info.uses_sampler_heap;
+   if (s->info.stage == MESA_SHADER_FRAGMENT &&
+       (s->b.info.uses_txf || s->b.info.uses_sampler_heap ||
+        s->b.info.texture_state_count || s->b.info.sampler_state_count ||
+        s->info.fs.has_input_attachments || s->info.fs.writes_memory ||
+        s->info.writes_external_memory))
+      cs->fs_reads_images = true;
 
    /* G17P and M5 publish a shader's spill frame as thread-private storage in their
     * SPECTPR. There is no helper-program stack, and the kernel rejects a

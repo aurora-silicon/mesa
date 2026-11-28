@@ -379,17 +379,29 @@ agx3_slot_assign_core(const struct agx3_slot_instr *instrs, unsigned n,
                      slot = candidate;
                }
             }
+            /* Prefer an already-waited or unused slot before joining or
+             * reissuing a live generation, so independent instructions do not
+             * unnecessarily serialize onto a single scoreboard slot. */
             for (unsigned t = 0; t < nslots && !slot; ++t) {
                const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
                if (candidate > cap)
                   continue;
                if (slot_waited[candidate] ||
                    (slot_reg_count[candidate] == 0 &&
-                    slot_reader_count[candidate] == 0) ||
-                   (I->reissues_live_slot && slot_reissuable[candidate]) ||
-                   (I->join_class && slot_join_class[candidate] == I->join_class &&
-                    slot_join_count[candidate] < I->join_limit))
+                    slot_reader_count[candidate] == 0))
                   slot = candidate;
+            }
+            if (!slot && (I->reissues_live_slot || I->join_class)) {
+               for (unsigned t = 0; t < nslots && !slot; ++t) {
+                  const uint8_t candidate = (uint8_t)((next + t) % nslots + 1);
+                  if (candidate > cap)
+                     continue;
+                  if ((I->reissues_live_slot && slot_reissuable[candidate]) ||
+                      (I->join_class &&
+                       slot_join_class[candidate] == I->join_class &&
+                       slot_join_count[candidate] < I->join_limit))
+                     slot = candidate;
+               }
             }
             if (!slot) {
                slot = (uint8_t)(next + 1);

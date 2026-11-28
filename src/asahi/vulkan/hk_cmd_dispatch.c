@@ -587,6 +587,17 @@ hk_cmd_resolve_compute_border(struct hk_cmd_buffer *cmd)
    struct hk_api_shader *shader = cmd->state.cs.shader;
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
 
+   if (shader && unlikely(shader->min_lod_source) &&
+       p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)) {
+      struct hk_api_shader *twin = hk_min_lod_twin(dev, shader);
+      if (twin) {
+         cmd->state.cs.shader = twin;
+         shader = twin;
+      } else {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      }
+   }
+
    if (shader && unlikely(shader->border_source) &&
        p_atomic_read(&hk_device_physical(dev)->border_emulation)) {
       struct hk_api_shader *twin = hk_border_twin(dev, shader);
@@ -5210,9 +5221,9 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                            ? UINT64_MAX : cs->sib_threads + threads;
 
       uint64_t work = 0;
-      cs->pack_loops |= hk_pack_account_dispatch_work_eff(
-         threads, selected->b.info.stats.instrs,
-         selected->b.info.has_loops, loop_bound, &work);
+      cs->pack_loops |= hk_pack_account_dispatch_work_eff_limit(
+         threads, selected->b.info.stats.instrs, selected->b.info.has_loops,
+         loop_bound, hk_pack_max_static_work(hk_cmd_buffer_device(cmd)), &work);
       cs->pack_threads = threads > UINT64_MAX - cs->pack_threads
                             ? UINT64_MAX : cs->pack_threads + threads;
       cs->pack_static_work = work > UINT64_MAX - cs->pack_static_work
@@ -5221,10 +5232,15 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    }
    if (unlikely(hk_cmd_buffer_device(cmd)->frame_anatomy)) {
       hk_frame_anatomy_note_fs(cs, selected);
-      const uint64_t wg = agx_workgroup_threads(local_size);
       const uint64_t threads = agx_is_indirect(grid) ? 0 :
          (uint64_t)grid.count[0] * grid.count[1] * grid.count[2];
-      hk_frame_anatomy_note_grid(cs, selected, threads, wg ? threads / wg : 0,
+      const uint64_t wgs =
+         agx_is_indirect(grid) || !local_size.x || !local_size.y || !local_size.z
+            ? 0
+            : (uint64_t)DIV_ROUND_UP(grid.count[0], local_size.x) *
+                 DIV_ROUND_UP(grid.count[1], local_size.y) *
+                 DIV_ROUND_UP(grid.count[2], local_size.z);
+      hk_frame_anatomy_note_grid(cs, selected, threads, wgs,
                                  agx_is_indirect(grid));
    }
    cs->stats.calls++;

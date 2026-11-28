@@ -316,6 +316,30 @@ test_continues(void)
    T("a suspending instance refuses",
      hk_render_pack_continues(&a, &b, false, false, false));
    RESET();
+   a.flags = VK_RENDERING_SUSPENDING_BIT;
+   b.flags = VK_RENDERING_RESUMING_BIT | VK_RENDERING_SUSPENDING_BIT;
+   T("a resuming instance continues a suspending one",
+     !hk_render_pack_continues(&a, &b, false, false, false));
+   b.att[0].load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
+   T("and ignores loadOp when resuming",
+     !hk_render_pack_continues(&a, &b, false, false, false));
+   b.att[0].store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+   T("a resuming+suspending instance refuses STORE -> DONT_CARE",
+     hk_render_pack_continues(&a, &b, false, false, false));
+   b.att[0].resolve_mode = VK_RESOLVE_MODE_AVERAGE_BIT;
+   T("a resuming+suspending instance refuses resolve",
+     hk_render_pack_continues(&a, &b, false, false, false));
+   b.flags = VK_RENDERING_RESUMING_BIT;
+   T("a final resuming instance allows colour resolve locally",
+     !hk_render_pack_continues(&a, &b, false, false, false));
+   T("a final resuming instance refuses resolve after non-local src",
+     hk_render_pack_continues(&a, &b, false, true, false));
+   RESET();
+   a.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+   b.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+   T("inline-replayed secondary passes continue",
+     !hk_render_pack_continues(&a, &b, false, false, false));
+   RESET();
    for (unsigned s = 0; s < HK_RENDER_PACK_SLOTS; ++s)
       a.att[s].samples = b.att[s].samples = a.att[s].iview ? 4 : 0;
    b.att[0].layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -404,6 +428,44 @@ test_streams_match(void)
    T("other depth/stencil load or store refuses",
      hk_render_pack_streams_match(a, b));
    b->cr.zls_control = a->cr.zls_control;
+   agx_pack(&a->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = false;
+      cfg.z_store = true;
+      cfg.z_store_tiling = AGX_ZLS_TILING_TWIDDLED;
+      cfg.z_store_compress = true;
+   }
+   agx_pack(&b->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = true;
+      cfg.z_load_tiling = AGX_ZLS_TILING_TWIDDLED;
+      cfg.z_load_compress = true;
+      cfg.z_store = true;
+      cfg.z_store_tiling = AGX_ZLS_TILING_TWIDDLED;
+      cfg.z_store_compress = true;
+   }
+   a->cr.process_empty_tiles = true;
+   b->cr.process_empty_tiles = false;
+   a->cr.bg.main.rsrc_spec = 0x111;
+   b->cr.bg.main.rsrc_spec = 0x222;
+   T("clear-then-load continues across ZLS, empty tiles, and main BG",
+     !hk_render_pack_streams_match(a, b));
+   a->cr.process_empty_tiles = false;
+   b->cr.process_empty_tiles = true;
+   T("load-then-clear empty-tiles mismatch refuses",
+     hk_render_pack_streams_match(a, b));
+   b->cr.process_empty_tiles = false;
+   agx_pack(&a->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = true;
+      cfg.z_store = true;
+   }
+   agx_pack(&b->cr.zls_control, ZLS_CONTROL, cfg) {
+      cfg.z_load = false;
+      cfg.z_store = true;
+   }
+   T("load-then-clear ZLS mismatch refuses",
+     hk_render_pack_streams_match(a, b));
+   a->cr.bg.main.rsrc_spec = b->cr.bg.main.rsrc_spec = 0;
+   memset(&a->cr.zls_control, 0, sizeof(a->cr.zls_control));
+   b->cr.zls_control = a->cr.zls_control;
    b->cr.depth.buffer += 0x1000;
    T("another depth buffer refuses", hk_render_pack_streams_match(a, b));
    b->cr.depth = a->cr.depth;
@@ -486,6 +548,36 @@ test_member(void)
    T("a single-render command buffer is a member", hk_render_pack_member(c));
 
    T("a member has no refusal", !hk_render_pack_member_refusal(c));
+
+   c = split(4);
+   first_cs(c)->g17p_pass_ends = false;
+   T("a split pass without SUSPENDING_BIT is not a member",
+     !hk_render_pack_member(c));
+   c->render_pack.tail_pass.flags = VK_RENDERING_SUSPENDING_BIT;
+   T("a suspending pass is a member", hk_render_pack_member(c));
+   first_cs(c)->g17p_pass_begins = false;
+   T("without RESUMING_BIT it refuses", !hk_render_pack_member(c));
+   c->render_pack.head_pass.flags = VK_RENDERING_RESUMING_BIT;
+   T("a resuming+suspending pass is a member", hk_render_pack_member(c));
+
+   struct hk_cmd_buffer *fixup = new_cmd();
+   bool is_res = false, is_susp = false;
+   T("plain empty cmd is not a suspend/resume fixup",
+     !hk_render_pack_is_empty_fixup(fixup, &is_res, &is_susp));
+   fixup->render_pack.empty_resume = true;
+   gbuffer(&fixup->render_pack.empty_pass);
+   T("empty resume fixup is recognized",
+     hk_render_pack_is_empty_fixup(fixup, &is_res, &is_susp) && is_res && !is_susp);
+   T("matching fixup pass matches member",
+     hk_render_pack_fixup_matches(&fixup->render_pack.empty_pass,
+                                  &c->render_pack.tail_pass));
+   fixup->render_pack.empty_pass.att[0].iview = views[3];
+   T("mismatched fixup view refuses",
+     !hk_render_pack_fixup_matches(&fixup->render_pack.empty_pass,
+                                   &c->render_pack.tail_pass));
+   fixup->sync.req[0][HK_SYNC_VDM].prior = HK_SYNC_GFX;
+   T("empty fixup with barrier requirement refuses",
+     !hk_render_pack_is_empty_fixup(fixup, &is_res, &is_susp));
 
    c = split(4);
    first_cs(c)->stats.cmds = 0;
@@ -1202,34 +1294,89 @@ test_pregfx_and_union_elision(void)
    pre->stats.calls = 0;
 
    /* Hoisting refusal gate: must refuse hoisting pre_cs past an earlier
-    * member's post_cs, memory writes, or VDM->CDM ordering dependencies. */
+    * member's dependent/non-heap post_cs, same-slot heap reset, memory
+    * writes, or VDM->CDM ordering dependencies, while allowing driver
+    * pre-graphics on a disjoint heap slot past a pure heap-slot reset. */
    struct hk_render_pack_run_state hoist = {0};
    uint8_t tail_req[HK_SYNC_NUM_KINDS] = {0};
+   uint8_t post_tail_req[HK_SYNC_NUM_KINDS] = {0};
+   const uint8_t slot1_mask = BITFIELD_BIT(0);
+   const uint8_t slot2_mask = BITFIELD_BIT(1);
+   T("pure heap-reset post_cs recognized",
+     hk_render_pack_post_is_heap_reset(post));
+   post->query_access = true;
+   T("query-access post_cs is not a pure heap reset",
+     !hk_render_pack_post_is_heap_reset(post));
+   post->query_access = false;
+
    pre->stats.calls = 1;
    pre->sync.kind = HK_SYNC_COMPUTE;
+   pre->sync.heap_slot = 0;
    T("clean API pre_cs hoists when run_post == 0",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) == NULL);
-   T("API pre_cs refused when earlier member has post_cs",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) == NULL);
+   T("API pre_cs refused when earlier member has pure heap post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+
    pre->stats.calls = 0;
-   T("driver pre_cs refused when earlier member has post_cs",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, HK_SYNC_GFX, tail_req) != NULL);
+   pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   pre->sync.heap_slot = 2;
+   T("driver pre_cs on disjoint heap slot hoists past pure heap-reset post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) == NULL);
+   T("driver pre_cs on same heap slot refused after heap-reset post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot2_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   T("driver pre_cs refused after non-heap-reset post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, false,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   pre->sync.dep[HK_SYNC_CDM].prior = HK_SYNC_GFX;
+   T("driver pre_cs with CDM prior dependency refused after post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   pre->sync.dep[HK_SYNC_CDM].prior = 0;
+   post_tail_req[util_logbase2(HK_SYNC_GFX)] = HK_SYNC_GFX;
+   T("driver pre_cs refused when earlier tail barrier orders post_cs before pre_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   post_tail_req[util_logbase2(HK_SYNC_GFX)] = 0;
+   pre->sync.kind = HK_SYNC_XFER;
+   T("non-GFX driver pre_cs refused after post_cs",
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 1, slot1_mask, true,
+                                   HK_SYNC_GFX, tail_req,
+                                   post_tail_req) != NULL);
+   pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
    T("driver pre_cs allowed when run_post == 0",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) == NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) == NULL);
+
    pre->stats.calls = 1;
+   pre->sync.kind = HK_SYNC_COMPUTE;
+   pre->sync.heap_slot = 0;
    hoist.writes_memory = true;
    T("API pre_cs refused after memory-writing render",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) != NULL);
    hoist.writes_memory = false;
    pre->sync.dep[HK_SYNC_VDM].prior = HK_SYNC_GFX;
    T("API pre_cs refused when depending on earlier render",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) != NULL);
    pre->sync.dep[HK_SYNC_VDM].prior = 0;
    tail_req[util_logbase2(HK_SYNC_COMPUTE)] = HK_SYNC_GFX;
    T("API pre_cs refused when earlier tail barrier orders VDM->CDM",
-     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, HK_SYNC_GFX, tail_req) != NULL);
+     hk_render_pack_pre_cs_refusal(&hoist, pre, 0, 0, true, HK_SYNC_GFX,
+                                   tail_req, post_tail_req) != NULL);
    tail_req[util_logbase2(HK_SYNC_COMPUTE)] = 0;
    pre->sync.kind = HK_SYNC_GFX | HK_SYNC_GFX_MEM;
+   pre->sync.heap_slot = 2;
    pre->stats.calls = 0;
 
    post->stats.calls = 1;

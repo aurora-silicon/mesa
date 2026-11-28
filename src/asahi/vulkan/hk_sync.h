@@ -565,6 +565,11 @@ struct hk_sync_queue {
     * half after the serialized prefix. */
    bool stage_overlap;
    uint64_t submitted[HK_SYNC_NUM_SQ];
+   /* Exact priors: every command of the submission being resolved waits
+    * through these ordinals (same-queue semaphore waits, hk_gpu_waits.h).
+    * Set by the submitter around hk_sync_resolve_submit_ex() and
+    * hk_sync_host_flush_prefix(), zero otherwise. */
+   uint64_t wait_floor[HK_SYNC_NUM_SQ];
    uint64_t last_absolute[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t tail[HK_SYNC_NUM_KINDS][HK_SYNC_NUM_SQ];
    uint64_t last_heap_slot[HK_HEAP_SLOTS][HK_SYNC_NUM_SQ];
@@ -850,6 +855,15 @@ bool hk_sync_submit_has_unretired_priors(const struct hk_queue *queue);
 /* The driver's own resolve pass after a render: waits on the render. */
 void hk_sync_resolve_begin(struct hk_cmd_buffer *cmd);
 void hk_sync_resolve_end(struct hk_cmd_buffer *cmd);
+
+struct hk_image;
+/* Fold a trailing vkCmdResolveImage2 into cs's end-of-tile store_and_resolve:
+ * applies pending transfer waits to cs's fragment half, records dst_image's
+ * tile footprint and attachment bloom, and marks cs as transfer work for
+ * subsequent dependencies. */
+void hk_sync_fold_resolve(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                          const struct hk_image *dst_image, uint32_t level,
+                          uint32_t layer, uint32_t width, uint32_t height);
 
 /* Transfer entry points bracket their recording so the streams they create
  * belong to the transfer stage class. Defined in hk_cmd_buffer.h. */

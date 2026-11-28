@@ -156,6 +156,13 @@ struct hk_render_pack_edges {
    bool tail;
    struct hk_render_pack_pass tail_pass;
 
+   /* Empty suspend/resume fixup command buffer: no control streams, barriers,
+    * events, timestamps, or queries, holding only an empty RESUMING (closing)
+    * or empty SUSPENDING (opening) render pass. */
+   bool empty_resume;
+   bool empty_suspend;
+   struct hk_render_pack_pass empty_pass;
+
    /* Frame anatomy only: why the command buffer has no head or tail, and,
     * as of its latest submission with frame anatomy on, why its tail did
     * not pack with the next command buffer's head (next_who: 0 the boundary,
@@ -224,12 +231,17 @@ const char *hk_render_pack_boundary(const struct hk_render_pack_run_state *run,
                                     const struct hk_cs *bs,
                                     const struct hk_cs *first);
 
+/* Whether `post` is a pure driver geometry heap-slot reset stream (no API
+ * compute, no query/timestamp/OQ work, and bound to a non-zero heap slot). */
+bool hk_render_pack_post_is_heap_reset(const struct hk_cs *post);
+
 /* Whether a later member's leading CDM stream `bs_pre` may be hoisted ahead of
  * earlier members already in `state`. Returns NULL if safe, or a refusal reason. */
 const char *hk_render_pack_pre_cs_refusal(
    const struct hk_render_pack_run_state *state, const struct hk_cs *bs_pre,
-   unsigned run_post, uint8_t run_vdm_kinds,
-   const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS]);
+   unsigned run_post, uint8_t post_heap_slots, bool post_heap_only,
+   uint8_t run_vdm_kinds, const uint8_t run_vdm_tail_req[HK_SYNC_NUM_KINDS],
+   const uint8_t run_post_tail_req[HK_SYNC_NUM_KINDS]);
 
 /* `b` (stream `bs`) joins `run` after `a`, its boundary accepted. */
 void hk_render_pack_run_join(struct hk_render_pack_run_state *run,
@@ -278,6 +290,16 @@ unsigned hk_render_pack_stamp_slots(const struct hk_cs *cs);
 const char *hk_render_pack_member_refusal(const struct hk_cmd_buffer *cmd);
 const char *hk_render_pack_member_refusal_for(const struct hk_cmd_buffer *cmd,
                                               bool first);
+
+/* Whether `cmd` is an empty suspend/resume fixup command buffer with no
+ * streams or side effects. */
+bool hk_render_pack_is_empty_fixup(const struct hk_cmd_buffer *cmd,
+                                   bool *is_resume, bool *is_suspend);
+
+/* Whether an empty suspend/resume fixup pass matches `other`'s attachments
+ * and geometry. */
+bool hk_render_pack_fixup_matches(const struct hk_render_pack_pass *fixup,
+                                  const struct hk_render_pack_pass *other);
 
 /* Whether `cmd`'s tail may be written: recorded without SIMULTANEOUS_USE,
  * with room for a stream link at its terminate record. */
