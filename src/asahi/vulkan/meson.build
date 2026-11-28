@@ -89,6 +89,8 @@ hk_files = files(
   'hk_nir_lower_ray_queries.c',
   'hk_nir_lower_robust_image.c',
   'hk_nir_lower_robust_image.h',
+  'hk_nir_shared_zero_init.c',
+  'hk_nir_shared_zero_init.h',
   'hk_nir_ray_tracing.c',
   'hk_ray_tracing_core.c',
   'hk_rt_inlining.c',
@@ -276,6 +278,11 @@ if with_tests
 
   test('hk_image_store_forward', executable('hk_image_store_forward_test',
     files('tests/test-hk-image-store-forward.c', 'hk_nir_forward_image_stores.c'),
+    include_directories : [include_directories('.'), inc_include, inc_src],
+    dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
+
+  test('hk_shared_zero_init', executable('hk_shared_zero_init_test',
+    files('tests/test-hk-shared-zero-init.c', 'hk_nir_shared_zero_init.c'),
     include_directories : [include_directories('.'), inc_include, inc_src],
     dependencies : [idep_nir, idep_mesautil]), suite : ['asahi'])
 

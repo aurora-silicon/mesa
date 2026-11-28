@@ -496,6 +496,8 @@ lower_lea = [
 fold_pixel_coord = [
     (('f2u32', ('fadd', ('u2f32', 'a@16'), 0.5)), ('u2u32', a)),
     (('f2i32', ('fadd', ('u2f32', 'a@16'), 0.5)), ('u2u32', a)),
+    (('f2u32_sat', ('fadd', ('u2f32', 'a@16'), 0.5)), ('u2u32', a)),
+    (('f2i32_sat', ('fadd', ('u2f32', 'a@16'), 0.5)), ('u2u32', a)),
 ]
 
 # AGX_G17P_EXTRACT16_BFE: nir_opt_algebraic turns `x >> 16` into
