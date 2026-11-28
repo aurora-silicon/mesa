@@ -17634,6 +17634,7 @@ hk_agx3_arm_direct_draw_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    fast->root = gfx->root;
    fast->sync_epoch = cmd->sync.epoch;
    fast->border_free_stages = gfx->border_free_stages;
+   fast->min_lod_free_stages = gfx->min_lod_free_stages;
    fast->bind_tail_compact = is_hal200 ? cs->g17p_bind_tail.state_compact : 0;
    fast->draw_header_word = draw_header_word;
    fast->index_buffer = gfx->index.buffer;
@@ -17691,6 +17692,12 @@ hk_agx3_fast_direct_draw_begin(struct hk_cmd_buffer *cmd, bool indexed,
       return false;
 #endif
 
+   /* A stage bound without image-view minLod or custom-border emulation
+    * switches to its emulating twin in hk_draw_impl() once the device needs
+    * it; the cached draw stands for the old shader and must take that path. */
+   if (unlikely(fast->min_lod_free_stages &&
+                p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)))
+      return false;
    if (unlikely(fast->border_free_stages &&
                 p_atomic_read(&hk_device_physical(dev)->border_emulation)))
       return false;

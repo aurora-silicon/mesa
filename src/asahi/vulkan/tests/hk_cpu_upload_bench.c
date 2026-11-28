@@ -2435,6 +2435,53 @@ direct_draw_fast_path_correctness(struct fixture *f)
          free(base_vs);
       }
 
+      /* A cached draw armed while a stage was bound without image-view minLod
+       * emulation stands for that shader. Once the device creates a view with
+       * minLod > base, hk_draw_impl() switches the stage to its emulating
+       * twin, so the cached draw must decline and leave the draw to it. */
+      {
+         struct vk_dynamic_graphics_state *dyn =
+            &cmd->vk.dynamic_graphics_state;
+         vk_dynamic_graphics_state_clear_dirty(dyn);
+         cmd->state.gfx.dirty = 0;
+         cmd->state.gfx.shaders_dirty = 0;
+         cmd->state.gfx.linked_dirty = 0;
+         hk_root_mark_clean(desc);
+         cs.g17p_bind_tail.valid = true;
+         cs.g17p_bind_tail.state_compact = fast->bind_tail_compact;
+         cs.m5_ppp_emitted_valid = true;
+         fast->cs = &cs;
+         fast->cs_chunk_gpu = cs.chunk.gpu;
+         fast->dyn_generation = dyn->generation;
+         fast->non_push_generation = desc->non_push_generation;
+         fast->vertex_buffer_generation =
+            cmd->state.gfx.vertex_buffer_generation;
+         fast->root = cmd->state.gfx.root;
+         fast->sync_epoch = cmd->sync.epoch;
+         fast->min_lod_free_stages = BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+         fast->valid = true;
+         CHECK(!p_atomic_read(&f->pdev.min_lod_emulation));
+
+         /* Emulation not yet needed: the cached draw still records. */
+         const uint32_t calls_armed = cs.stats.calls;
+         hk_CmdDraw(cb, 6, 1, 0, 0);
+         CHECK(cs.stats.calls == calls_armed + 1);
+         CHECK(fast->valid);
+
+         /* The device needs emulation now: the cached draw declines and the
+          * general path records the draw, which drops the cached draw or
+          * re-arms it over the stages it bound. Without the guard the cached
+          * draw records and stays armed over the minLod-free stage. */
+         p_atomic_set(&f->pdev.min_lod_emulation, 1);
+         hk_CmdDraw(cb, 6, 1, 0, 0);
+         CHECK(!fast->valid || fast->min_lod_free_stages !=
+                                  BITFIELD_BIT(MESA_SHADER_FRAGMENT));
+         cmd->vk.record_result = VK_SUCCESS;
+
+         p_atomic_set(&f->pdev.min_lod_emulation, 0);
+         fast->min_lod_free_stages = 0;
+      }
+
       cmd->current_cs.gfx = NULL;
       hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
    }

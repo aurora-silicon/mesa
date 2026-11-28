@@ -1199,6 +1199,7 @@ struct hk_agx3_direct_draw_fast {
    uint64_t root;
    uint32_t sync_epoch;
    uint32_t border_free_stages;
+   uint32_t min_lod_free_stages;
    uint32_t bind_tail_compact;
    const struct hk_g17p_gfx_loader *loader;
    const struct hk_linked_shader *linked_vs;
