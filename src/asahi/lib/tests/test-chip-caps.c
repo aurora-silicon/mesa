@@ -231,37 +231,38 @@ test_native_mixed_epilog(void)
    }
 }
 
-/* AGX_CAP_HAL200_LOSSLESS_COMPRESSION is enabled across native HAL200 AGX3B
- * parts (G16G and G17P) and off on G15* (M3), M5 HAL300 (Gen10), G18G, AGX2,
- * and unadmitted parts. */
+/* AGX_CAP_HAL200_LOSSLESS_COMPRESSION is enabled on the native HAL200 AGX3B
+ * parts (G16G and G17P) and on G15S, whose GPU shares the Gen9 compression
+ * metadata on the G15 command-stream generation. Off on G15G and G15C, M5
+ * HAL300 (Gen10), G18G, AGX2, and unadmitted parts. */
 static void
 test_hal200_lossless_compression(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G16G || c == AGX_CHIP_G17P;
+      const bool expected =
+         c == AGX_CHIP_G16G || c == AGX_CHIP_G17P || c == AGX_CHIP_G15S;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ==
                     expected,
                  c);
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_LOSSLESS_COMPRESSION) ==
-                    agx_chip_native_hal200(c),
-                 c);
+      /* Every HAL200 command-stream chip compresses; G15S is the one G15
+       * command-stream chip that does. */
+      if (agx_chip_native_hal200(c))
+         CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_LOSSLESS_COMPRESSION), c);
    }
 }
 
-/* AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION is enabled across native HAL200 AGX3B
- * parts (G16G and G17P) and off on every chip without the base HAL200 cap. */
+/* AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION is enabled on G16G, G17P and G15S and
+ * off on every chip without the base HAL200 cap. */
 static void
 test_hal200_msaa_color_compression(void)
 {
    for (unsigned i = 0; i <= AGX_CHIP_UNKNOWN; ++i) {
       const enum agx_chip c = (enum agx_chip)i;
-      const bool expected = c == AGX_CHIP_G16G || c == AGX_CHIP_G17P;
+      const bool expected =
+         c == AGX_CHIP_G16G || c == AGX_CHIP_G17P || c == AGX_CHIP_G15S;
       CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION) ==
                     expected,
-                 c);
-      CHECK_CHIP(agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION) ==
-                    agx_chip_native_hal200(c),
                  c);
       /* MSAA colour never enables without the base HAL200 cap. */
       if (agx_chip_has_cap(c, AGX_CAP_HAL200_MSAA_COLOR_COMPRESSION))

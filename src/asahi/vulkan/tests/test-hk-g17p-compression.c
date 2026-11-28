@@ -1004,10 +1004,10 @@ check_g16g_hal200_compression(void)
       CHECK(hk_hal200_compression_eligible(AGX_CHIP_G16G, 0x8132, 0, &i) ==
             expect);
       CHECK(hk_g17p_compression_eligible(AGX_CHIP_G16G, 0, &i) == expect);
-      /* Non-HAL200 native AGX3 (M3 G15*), M5 (HAL300), G18G, and AGX2 never
-       * enter the HAL200 policy. */
+      /* G15S follows the same HAL200 policy. G15G and G15C (not measured),
+       * M5 (HAL300), G18G, and AGX2 never enter it. */
+      CHECK(hk_hal200_compression_eligible(AGX_CHIP_G15S, 0, 0, &i) == expect);
       CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15G, 0, 0, &i));
-      CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15S, 0, 0, &i));
       CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G15C, 0, 0, &i));
       CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G17G, 0, 0, &i));
       CHECK(!hk_hal200_compression_eligible(AGX_CHIP_G17S, 0, 0, &i));

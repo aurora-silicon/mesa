@@ -493,16 +493,16 @@ main(void)
    pdev->vk.properties.framebufferDepthSampleCounts = 1 | 2 | 4;
    pdev->vk.properties.framebufferStencilSampleCounts = 1 | 2 | 4;
 
-   /* Native HAL200 (G16G, G17P) and every M5 SKU compress normal 2D colour
-    * render targets and drop compression when
-    * ATTACHMENT_FEEDBACK_LOOP_BIT_EXT is present. G15* (M3) and G18G keep 2D
-    * colour render targets plain in both queries. */
+   /* G16G, G17P, G15S and every M5 SKU compress normal 2D colour render
+    * targets and drop compression when ATTACHMENT_FEEDBACK_LOOP_BIT_EXT is
+    * present. G15G, G15C and G18G keep 2D colour render targets plain in both
+    * queries. */
    const struct {
       enum agx_chip chip;
       bool expect_feedback_disables;
    } cases[] = {
       { AGX_CHIP_G15G, false },
-      { AGX_CHIP_G15S, false },
+      { AGX_CHIP_G15S, true },
       { AGX_CHIP_G15C, false },
       { AGX_CHIP_G16G, true },
       { AGX_CHIP_G17P, true },
