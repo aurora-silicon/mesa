@@ -316,7 +316,8 @@ agx_compile_bg_eot_shader(struct agx_bg_eot_cache *cache, nir_shader *shader,
 static nir_def *
 build_background_op(nir_builder *b, enum agx_bg_eot_op op, unsigned rt,
                     unsigned nr, bool source_msaa, bool layered,
-                    bool wide_coords, unsigned clear_base)
+                    bool wide_coords, unsigned clear_base,
+                    nir_alu_type dest_type)
 {
    if (op == AGX_BG_LOAD) {
       nir_def *coord = nir_load_pixel_coord(b);
@@ -341,7 +342,7 @@ build_background_op(nir_builder *b, enum agx_bg_eot_op op, unsigned rt,
          .is_array = layered,
 
          /* The type doesn't matter as long as it matches the store */
-         .dest_type = nir_type_uint32,
+         .dest_type = dest_type,
 
          /* Layer is necessarily already in-bounds so we do not want the
           * compiler to clamp it, which would require reading the descriptor
@@ -497,9 +498,60 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
          continue;
       }
 
+      if (agx_chip_g17_m5(cache->dev->chip) && key->op[rt] == AGX_BG_CLEAR &&
+          (key->packed_clear_mask & BITFIELD_BIT(rt)) && !msaa &&
+          !key->tib.spilled[rt] &&
+          agx_m5_packed_clear_format_ok(key->tib.logical_format[rt])) {
+         enum pipe_format fmt = key->tib.logical_format[rt];
+         unsigned comps = 1;
+         unsigned bit_size = 32;
+         enum pipe_format store_fmt = PIPE_FORMAT_R32_UINT;
+         if (fmt == PIPE_FORMAT_R16G16B16A16_FLOAT) {
+            comps = 2;
+         } else if (fmt == PIPE_FORMAT_R16_FLOAT) {
+            bit_size = 16;
+            store_fmt = PIPE_FORMAT_R16_FLOAT;
+         }
+         nir_def *packed =
+            nir_load_preamble(&b, comps, bit_size, clear_base + (rt * 8));
+         nir_store_local_pixel_agx(&b, packed,
+                                   nir_imm_intN_t(&b, 0xFF, 16),
+                                   nir_undef(&b, 2, 16),
+                                   .base = agx_tilebuffer_offset_B(&key->tib, rt),
+                                   .write_mask = BITFIELD_MASK(comps),
+                                   .format = store_fmt, .target = rt);
+         continue;
+      }
+
+      if (agx_chip_g17_m5(cache->dev->chip) && key->op[rt] == AGX_BG_LOAD &&
+          (key->raw32_load_mask & BITFIELD_BIT(rt)) && !msaa &&
+          !key->tib.spilled[rt] && !key->preserve_resolve_outside) {
+         nir_def *raw = build_background_op(
+            &b, AGX_BG_LOAD, rt, 1, false, layered, true, clear_base,
+            nir_type_uint32);
+         nir_store_local_pixel_agx(&b, raw,
+                                   nir_imm_intN_t(&b, 0xFF, 16),
+                                   nir_undef(&b, 2, 16),
+                                   .base = agx_tilebuffer_offset_B(&key->tib, rt),
+                                   .write_mask = 0x1,
+                                   .format = PIPE_FORMAT_R32_UINT, .target = rt);
+         continue;
+      }
+
+      enum pipe_format phys = agx_tilebuffer_physical_format(&key->tib, rt);
+      const bool load_f16 =
+         agx_chip_g17_m5(cache->dev->chip) && key->op[rt] == AGX_BG_LOAD &&
+         !key->tib.spilled[rt] &&
+         (phys == PIPE_FORMAT_R16_FLOAT ||
+          phys == (enum pipe_format)AIL_ISA_FORMAT_U8NORM ||
+          phys == (enum pipe_format)AIL_ISA_FORMAT_S8NORM ||
+          phys == (enum pipe_format)AIL_ISA_FORMAT_SRGBA8);
+      const nir_alu_type op_type =
+         load_f16 ? nir_type_float16 : nir_type_uint32;
+
       nir_def *color = build_background_op(
          &b, key->op[rt], rt, nr, source_msaa, layered,
-         agx_chip_agx3_path(cache->dev->chip), clear_base);
+         agx_chip_agx3_path(cache->dev->chip), clear_base, op_type);
       if (key->preserve_resolve_outside) {
          assert(rt == 0 && key->op[rt] == AGX_BG_LOAD);
          nir_def *xy = nir_u2u32(&b, nir_load_pixel_coord(&b));
@@ -508,14 +560,14 @@ agx_build_background_shader(struct agx_bg_eot_cache *cache,
             nir_ball(&b, nir_uge(&b, xy, nir_channels(&b, rect, 0x3))),
             nir_ball(&b, nir_ult(&b, xy, nir_channels(&b, rect, 0xc))));
          nir_def *saved = build_background_op(
-            &b, AGX_BG_LOAD, 1, nr, false, layered, true, clear_base);
+            &b, AGX_BG_LOAD, 1, nr, false, layered, true, clear_base, op_type);
          color = nir_bcsel(&b, inside, color, saved);
       }
 
       nir_store_output(
          &b, color,
          nir_imm_int(&b, 0), .write_mask = BITFIELD_MASK(nr),
-         .src_type = nir_type_uint32,
+         .src_type = op_type,
          .io_semantics.location = FRAG_RESULT_DATA0 + rt,
          .io_semantics.num_slots = 1);
 

@@ -86,7 +86,31 @@ struct agx_bg_eot_key {
     * floats with two FLTNORMs per pixel. Only agx_g17p_packed_clear_ok()
     * layouts set it. */
    bool packed_clear;
+   /* Per-RT bitmasks for M5 background shaders:
+    * - packed_clear_mask: clear values arrive pre-packed in each RT's clear
+    *   uniform slot (see agx_m5_packed_clear_format_ok()).
+    * - raw32_load_mask: uncompressed 32-bit targets (R11G11B10_FLOAT) bound
+    *   through a raw R32_UINT background texture descriptor, loaded directly as
+    *   one 32-bit word without float unpack/repack. */
+   uint8_t packed_clear_mask;
+   uint8_t raw32_load_mask;
 };
+
+static inline bool
+agx_m5_packed_clear_format_ok(enum pipe_format fmt)
+{
+   switch (fmt) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16_FLOAT:
+   case PIPE_FORMAT_R16_FLOAT:
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      return true;
+   default:
+      return false;
+   }
+}
 
 /* The layouts whose RT0 clear may be stored pre-packed: one single-sample,
  * unspilled R8G8B8A8_UNORM target at tile offset 0. Its tile word is the

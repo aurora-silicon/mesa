@@ -1829,6 +1829,39 @@ int main(void)
       free(part.binary);
       ralloc_free(b.shader);
    }
+   /* AGX3c fltnorm accepts 16-bit half-float register sources (even or odd
+    * half-registers) for 8-bit normalized outputs, while AGX3b/AGX3d and
+    * non-register operands refuse is_f16. */
+   {
+      uint8_t bytes[AGX3_FLTNORM_MAX_LENGTH];
+      uint8_t len = 0;
+      struct agx3_fltnorm_desc d = {
+         .dest = 4,
+         .src = {
+            {.kind = AGX3_FLTNORM_SRC_REGISTER, .value = 0, .is_f16 = true},
+            {.kind = AGX3_FLTNORM_SRC_REGISTER, .value = 1, .is_f16 = true},
+         },
+         .two_lanes = true,
+      };
+      bool f16_ok =
+         agx3_fltnorm_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &len) &&
+         len == 12;
+      d.src[0].value = 3;
+      d.src[1].value = 2;
+      d.srgb = AGX3_FLTNORM_SRGB_LANE0;
+      f16_ok &= agx3_fltnorm_encode(AGX_ISA_ENCODING_AGX3C, &d, bytes, &len) &&
+                len == 12;
+      f16_ok &= !agx3_fltnorm_encode(AGX_ISA_ENCODING_AGX3B, &d, bytes, &len);
+      f16_ok &= !agx3_fltnorm_encode(AGX_ISA_ENCODING_AGX3D, &d, bytes, &len);
+      struct agx3_fltnorm_desc bad_imm = d;
+      bad_imm.srgb = AGX3_FLTNORM_SRGB_NONE;
+      bad_imm.src[0].kind = AGX3_FLTNORM_SRC_IMMEDIATE;
+      bad_imm.src[0].value = 48;
+      f16_ok &=
+         !agx3_fltnorm_encode(AGX_ISA_ENCODING_AGX3C, &bad_imm, bytes, &len);
+      printf("M5_FLTNORM_F16_ENCODING_%s\n", f16_ok ? "PASS" : "FAIL");
+      ok &= f16_ok;
+   }
    glsl_type_singleton_decref();
    return !ok;
 }

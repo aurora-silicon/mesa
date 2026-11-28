@@ -5661,7 +5661,7 @@ agx3_norm_srgb_mode(const agx_instr *I, bool two_lanes, uint8_t *srgb)
 static bool
 agx3_emit_fltnorm(struct util_dynarray *emission, enum agx_isa_encoding enc,
                   const agx_instr *I, uint16_t wait_mask, bool first_instruction,
-                  struct agx3_fltnorm_desc *link_desc)
+                  bool allow_f16, struct agx3_fltnorm_desc *link_desc)
 {
    if (I->nr_dests != 1 || I->nr_srcs != 2)
       return false;
@@ -5703,8 +5703,13 @@ agx3_emit_fltnorm(struct util_dynarray *emission, enum agx_isa_encoding enc,
        * uniform (a colour read from a buffer). A register may also carry the
        * abs and neg modifiers. */
       if (agx3_src_is_register(src)) {
-         if (src.size != AGX_SIZE_32)
+         if (src.size == AGX_SIZE_16) {
+            if (!allow_f16 || norm16)
+               return false;
+            d.src[i].is_f16 = true;
+         } else if (src.size != AGX_SIZE_32) {
             return false;
+         }
          d.src[i].kind = AGX3_FLTNORM_SRC_REGISTER;
          d.src[i].abs = src.abs;
          d.src[i].neg = src.neg;
@@ -16840,7 +16845,10 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
             struct agx3_fltnorm_desc *link_desc =
                ctx->agx3_colour_link.opaque_pack ?
                   &ctx->agx3_colour_link.packs[g17p_link_packs_seen++] : NULL;
-            if (!agx3_emit_fltnorm(emission, enc, I, wait, first, link_desc))
+            if (!agx3_emit_fltnorm(emission, enc, I, wait, first,
+                                   enc == AGX_ISA_ENCODING_AGX3C &&
+                                      !ctx->key->dev.emit_agx3d,
+                                   link_desc))
                AGX3_REFUSE(I);
             ctx->agx3_fltnorm_start |= first;
             continue;

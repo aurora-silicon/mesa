@@ -21,6 +21,8 @@
 #include "hk_ppp_state.h"
 #include "hk_device_memory.h"
 #include "util/u_atomic.h"
+#include "util/half_float.h"
+#include "util/format_r11g11b10f.h"
 #include "agx_vdm_state_core.h"
 #include "agx_ppp_hal200_raster_core.h"
 #include "agx_ppp_hal300_depth_bias_scissor_core.h"
@@ -813,6 +815,36 @@ hk_pack_rgba8_clear_value(const VkClearColorValue *color)
                       (hk_g17p_unorm8(c[2]) << 16) |
                       (hk_g17p_unorm8(c[3]) << 24);
    return packed;
+}
+
+static inline VkClearColorValue
+hk_pack_m5_clear_value(enum pipe_format fmt, const VkClearColorValue *color)
+{
+   const float *c = color->float32;
+   VkClearColorValue packed = {0};
+   switch (fmt) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+      return hk_pack_rgba8_clear_value(color);
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      packed.uint32[0] = (uint32_t)_mesa_float_to_half(c[0]) |
+                         ((uint32_t)_mesa_float_to_half(c[1]) << 16);
+      packed.uint32[1] = (uint32_t)_mesa_float_to_half(c[2]) |
+                         ((uint32_t)_mesa_float_to_half(c[3]) << 16);
+      return packed;
+   case PIPE_FORMAT_R16G16_FLOAT:
+      packed.uint32[0] = (uint32_t)_mesa_float_to_half(c[0]) |
+                         ((uint32_t)_mesa_float_to_half(c[1]) << 16);
+      return packed;
+   case PIPE_FORMAT_R16_FLOAT:
+      packed.uint32[0] = (uint32_t)_mesa_float_to_half(c[0]);
+      return packed;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      packed.uint32[0] = float3_to_r11g11b10f(c);
+      return packed;
+   default:
+      UNREACHABLE("Unsupported M5 packed clear format");
+   }
 }
 
 /* frg-codegen v4 BG/EOT device cache.
@@ -2382,6 +2414,14 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
             goto unsupported;
          loads |= key->op[rt] == AGX_BG_LOAD;
          clears |= key->op[rt] == AGX_BG_CLEAR;
+         if (agx_chip_g17_m5(dev->dev.chip) && key->tib.nr_samples == 1) {
+            if (key->op[rt] == AGX_BG_CLEAR &&
+                agx_m5_packed_clear_format_ok(key->tib.logical_format[rt]))
+               key->packed_clear_mask |= BITFIELD_BIT(rt);
+            if (key->op[rt] == AGX_BG_LOAD &&
+                render->color_att[rt].iview->planes[0].background_raw32)
+               key->raw32_load_mask |= BITFIELD_BIT(rt);
+         }
       }
    }
    for (unsigned rt = count; rt < HK_MAX_RTS; ++rt) {
@@ -2461,8 +2501,12 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          VkClearColorValue colors[HK_MAX_RTS] = {0};
          for (unsigned rt = 0; rt < count; ++rt) {
             if (key->op[rt] == AGX_BG_CLEAR &&
-                info->pColorAttachments[rt].loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE)
-               colors[rt] = info->pColorAttachments[rt].clearValue.color;
+                info->pColorAttachments[rt].loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
+               colors[rt] = (key->packed_clear_mask & BITFIELD_BIT(rt))
+                  ? hk_pack_m5_clear_value(key->tib.logical_format[rt],
+                                           &info->pColorAttachments[rt].clearValue.color)
+                  : info->pColorAttachments[rt].clearValue.color;
+            }
          }
          uint64_t table = hk_pool_upload(cmd, colors, 16 * count, 16);
          if (!table)
@@ -2680,10 +2724,17 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (multisample)
       key->multisample_store = store && (!final_resolve || store_source);
    key->m5_store_and_resolve = final_resolve && store_source;
+   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   key->packed_clear_mask =
+      !store && op == AGX_BG_CLEAR && m5 && single_sample &&
+      agx_m5_packed_clear_format_ok(key->tib.logical_format[0]) ? 1u : 0u;
    key->packed_clear =
-      !store && op == AGX_BG_CLEAR &&
+      !store && op == AGX_BG_CLEAR && !m5 &&
       agx_chip_native_or_m5(dev->dev.chip) &&
       agx_g17p_packed_clear_ok(&key->tib);
+   key->raw32_load_mask =
+      !store && op == AGX_BG_LOAD && m5 && single_sample &&
+      view->planes[0].background_raw32 ? 1u : 0u;
    if (op == AGX_BG_CLEAR)
       key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
    shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
@@ -2733,8 +2784,13 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       VkClearColorValue clear_value =
          clear_dont_care ? (VkClearColorValue){0}
                          : info->pColorAttachments[0].clearValue.color;
-      if (key->packed_clear && !clear_dont_care)
-         clear_value = hk_pack_rgba8_clear_value(&clear_value);
+      if (!clear_dont_care) {
+         if (key->packed_clear_mask & 1u)
+            clear_value = hk_pack_m5_clear_value(key->tib.logical_format[0],
+                                                 &clear_value);
+         else if (key->packed_clear)
+            clear_value = hk_pack_rgba8_clear_value(&clear_value);
+      }
       uint64_t clear = hk_g17p_bg_eot_upload(cmd, dc, &clear_value,
                                              sizeof(clear_value), 16);
       if (!clear)
