@@ -71,10 +71,13 @@ enum agx_primitive { AGX_PRIMITIVE_POINTS, AGX_PRIMITIVE_LINES,
  AGX_PRIMITIVE_LINE_STRIP, AGX_PRIMITIVE_LINE_LOOP, AGX_PRIMITIVE_TRIANGLES,
  AGX_PRIMITIVE_TRIANGLE_STRIP, AGX_PRIMITIVE_TRIANGLE_FAN };
 enum agx_chip { AGX_CHIP_G13G, AGX_CHIP_G14G, AGX_CHIP_G17P };
+static inline bool agx_chip_native_hal200(enum agx_chip c) { return c == AGX_CHIP_G17P; }
+static inline bool agx_vdm_index_list_direct_is_hal300_inline(enum agx_chip c) { (void)c; return false; }
+#define LIBAGX_ROBUST_INDEX_COALESCE_BLOCK 1024u
 #define AGX_ZERO_PAGE_ADDRESS 0x1000ull
 struct agx_grid { uint count[3]; };
 struct agx_draw { struct agx_grid b; uint64_t index_buffer;
- uint index_buffer_range_B,start,index_bias,start_instance;
+ uint64_t index_buffer_range_B; uint start,index_bias,start_instance;
  bool restart; enum agx_index_size index_size; bool indexed; };
 struct poly_heap { uchar *base; uint bottom,size; };
 typedef struct {uint indexCount,instanceCount,firstIndex; int32_t vertexOffset;
@@ -106,16 +109,20 @@ OLD_STUB = (
 
 TESTS = r'''
 static uint status_words[4];
-static void repair(struct poly_heap *h, VkDrawIndexedIndirectCommand *cmd,
- uchar *in,uint range,uint width,uint topology,uint chip,bool batch) {
+static void repair_addr(struct poly_heap *h, VkDrawIndexedIndirectCommand *cmd,
+ uintptr_t in_addr,uint64_t range,uint width,uint topology,uint chip,bool batch) {
  struct libagx_robust_index_draw jobs[2] = {{0}, {.vdm=0,
   .command=(uintptr_t)cmd,.empty_draw_jump=64,.draw_state_offset=12,.render_state_emitted=1}};
  emissions=0; group=1;
  for(lane=0;lane<32;lane++) {
-  if(batch) libagx_draw_robust_index_batch(jobs,h,FAILURE_ARG (uintptr_t)in,range,true,0xffff,chip,topology,width);
-  else libagx_draw_robust_index(NULL,h,FAILURE_ARG cmd,(uintptr_t)in,range,true,0xffff,chip,topology,12,1,64,width);
+  if(batch) libagx_draw_robust_index_batch(jobs,h,FAILURE_ARG in_addr,range,true,0xffff,chip,topology,width,1u);
+  else libagx_draw_robust_index(NULL,h,FAILURE_ARG cmd,in_addr,range,true,0xffff,chip,topology,12,1,64,width);
  }
  assert(emissions==1);
+}
+static void repair(struct poly_heap *h, VkDrawIndexedIndirectCommand *cmd,
+ uchar *in,uint64_t range,uint width,uint topology,uint chip,bool batch) {
+ repair_addr(h,cmd,(uintptr_t)in,range,width,topology,chip,batch);
 }
 static void reset_status(void) {status_words[0]=8;status_words[1]=0;
  status_words[2]=0xaabbccdd;status_words[3]=0x11223344;}
@@ -185,6 +192,31 @@ static void matrix(bool old_or_mutation) {
   reset_status();h.bottom=UINT32_MAX-15;cmd.indexCount=64;
   repair(&h,&cmd,in,2*w,size,AGX_PRIMITIVE_POINTS,chip,batch);
   assert(status_words[1]==1 && h.bottom==UINT32_MAX-15);
+  // 4 GiB and 4 GiB + 4 bindings must keep full 64-bit ranges without
+  // wrapping to 0 (zero-page fast path) or 4 (truncated bounds).
+  reset_status();h.bottom=h.size=0;
+  cmd=(VkDrawIndexedIndirectCommand){64,3,1,-17,11};
+  repair(&h,&cmd,in,UINT64_C(0x100000000),size,topology,chip,batch);
+  assert(!status_words[1] && h.bottom==0);
+  assert(captured.index_buffer==(uintptr_t)in && captured.index_buffer_range_B==UINT64_C(0x100000000));
+  assert(captured.start==1 && captured.b.count[0]==64);
+  reset_status();h.bottom=h.size=0;
+  repair(&h,&cmd,in,UINT64_C(0x100000004),size,topology,chip,batch);
+  assert(!status_words[1] && h.bottom==0);
+  assert(captured.index_buffer==(uintptr_t)in && captured.index_buffer_range_B==UINT64_C(0x100000004));
+  assert(captured.start==1 && captured.b.count[0]==64);
+  // 4 GiB + 4 with U32 firstIndex=0x40000000 leaves 1 index available; requesting 2 shadows safely.
+  // Form the synthetic base in uintptr_t arithmetic so no out-of-bounds pointer subtraction occurs.
+  if(size==AGX_INDEX_SIZE_U32) {
+   reset_status();h.bottom=16;h.size=sizeof(storage);
+   cmd=(VkDrawIndexedIndirectCommand){2,1,0x40000000u,0,0};
+   uintptr_t synth_base=(uintptr_t)in-(uintptr_t)(UINT64_C(1)<<32);
+   repair_addr(&h,&cmd,synth_base,UINT64_C(0x100000004),size,topology,chip,batch);
+   assert(!status_words[1] && captured.start==0 && captured.index_buffer!=synth_base);
+   assert(captured.index_buffer_range_B==2*w);
+   for(uint i=0;i<w;i++) assert(storage[16+i]==in[i]);
+   for(uint i=w;i<2*w;i++) assert(storage[16+i]==0);
+  }
   cases++;
  }
  printf("PASS %u matrix cases (each includes pressure, success, sticky, 5 noalloc, boundaries and overflow)\n",cases);
@@ -260,6 +292,9 @@ def kernels(revision=None, mutation=None):
     for name, typ in [("available", "uint32_t"), ("copy", "void"),
                       ("clamped_count", "uint32_t"), ("shadow_sizes", "bool")]:
         code += block(h, f"static inline {typ}\nagx_robust_index_{name}(") + "\n"
+    if "libagx_robust_index_coalesce_empty_jump(" in h:
+        code += block(h, "static inline bool\nlibagx_robust_index_cmd_is_empty(") + "\n"
+        code += block(h, "static inline uint64_t\nlibagx_robust_index_coalesce_empty_jump(") + "\n"
     for marker in ["static void\nlibagx_draw_robust_index_impl(",
                    "KERNEL(32)\nlibagx_draw_robust_index(",
                    "KERNEL(32)\nlibagx_draw_robust_index_batch("]:
@@ -272,6 +307,8 @@ def kernels(revision=None, mutation=None):
         code = code.replace("if (topology == AGX_PRIMITIVE_POINTS)", "if (false)")
     code += "#define FAILURE_ARG " + ("status_words," if "printf_buffer" in cl else "") + "\n"
     tests = TESTS
+    if "uint32_t batch_count" not in cl:
+        tests = tests.replace("chip,topology,width,1u);", "chip,topology,width);")
     if "uint32_t restart_index" not in cl:
         # Kernels from before they took the custom primitive restart index.
         code = code.replace(OLD_STUB[0], OLD_STUB[1])
