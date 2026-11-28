@@ -373,6 +373,8 @@ agx_batch_init(struct agx_context *ctx,
    batch->g17p_bind_tail_latched = false;
    batch->g17p_have_latched_vs = false;
    batch->g17p_latched_vs_shader = NULL;
+   batch->repeat.valid = false;
+   batch->repeat.program_ok = false;
 
    agx_bo_reference(screen->rodata);
    agx_pool_init(&batch->pool, dev, "Batch pool", 0, true);

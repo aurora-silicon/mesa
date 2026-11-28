@@ -7,6 +7,7 @@
 #pragma once
 
 #include <xf86drm.h>
+#include "asahi/compiler/agx3_graphics_program.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/genxml/agx_pack.h"
 #include "asahi/layout/layout.h"
@@ -617,6 +618,8 @@ struct agx_encoder {
  * limit. */
 #define AGX_G17G_RENDER_PRIMS_PLAIN (512 * 1024)
 
+struct agx_g17p_graphics_template;
+
 struct agx_batch {
    struct agx_context *ctx;
    struct pipe_framebuffer_state key;
@@ -642,6 +645,34 @@ struct agx_batch {
    const struct agx_compiled_shader *g17p_latched_vs_shader;
    uint32_t g17p_latched_vs_word0;
    uint32_t g17p_latched_vs_outputs[2];
+
+   /* Native AGX3: the last direct draw, for agx_draw_vbo_repeat(). It may
+    * replay that draw when at most the vertex constant buffers changed. */
+   struct {
+      /* The VS program latched in the VDM stream came from a patch plan of
+       * the linked VS, with these uniform ranges. */
+      bool program_ok;
+      /* The recorded draw ended the VDM stream at vdm_end. */
+      bool valid;
+      uint8_t mode;
+      uint8_t index_size;
+      bool restart;
+      uint8_t range_count;
+      /* Ranges read from a system value table: range i reads
+       * tables[range_table[i]] + range_offset[i]. */
+      uint32_t table_mask;
+      uint32_t restart_index;
+      uint32_t templates_generated;
+      uint8_t *vdm_end;
+      const struct agx_compiled_shader *vs;
+      const struct agx_linked_shader *linked_vs;
+      const struct agx_compiled_shader *fs;
+      const struct agx_linked_shader *linked_fs;
+      const struct agx_g17p_graphics_template *plan;
+      uint8_t range_table[AGX3_G17P_GRAPHICS_MAX_RANGES];
+      uint32_t range_offset[AGX3_G17P_GRAPHICS_MAX_RANGES];
+      struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   } repeat;
 
    /* G17G: primitives drawn into this render (see AGX_G17G_RENDER_PRIMS) */
    uint64_t g17g_prims;
