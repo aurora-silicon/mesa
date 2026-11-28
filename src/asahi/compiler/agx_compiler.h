@@ -531,6 +531,10 @@ typedef struct {
     * coordinate vector has to be collected for the read. */
    bool agx3_split_coords : 1;
 
+   /* 32-bit right shift (BFEIL with zero base/mask, or ASR) whose dynamic
+    * shift amount was proven in NIR to be 0 or 16. */
+   bool shift_amount_zero_or_16 : 1;
+
 } agx_instr;
 
 static inline uint32_t
@@ -1339,6 +1343,9 @@ bool agx_eval_immediate_icond(agx_context *ctx, enum agx_icond icond,
 void agx_optimizer_backward(agx_context *ctx);
 void agx_lower_divergent_shuffle(agx_context *ctx);
 void agx_lower_pseudo(agx_context *ctx);
+bool agx_opt_select_shifted_half(agx_context *ctx);
+bool agx_compile_shader_nir_without_select_shifted_half(
+   nir_shader *nir, struct agx_shader_key *key, struct agx_shader_part *out);
 void agx_lower_spill(agx_context *ctx);
 void agx3_split_vector_stack_access(agx_context *ctx);
 bool agx3_lower_texture_publications(agx_context *ctx);
@@ -1454,6 +1461,7 @@ bool agx_lower_agx3_widening_int(agx_context *ctx);
 void agx_insert_waits(agx_context *ctx);
 void agx_opt_empty_else(agx_context *ctx);
 void agx_opt_register_cache(agx_context *ctx);
+void agx_compute_register_cache(agx_context *ctx);
 void agx_opt_break_if(agx_context *ctx);
 void agx_opt_jmp_none(agx_context *ctx);
 void agx_pack_binary(agx_context *ctx, struct util_dynarray *emission);

@@ -5,9 +5,12 @@
  */
 
 #include <stdlib.h>
+#include "asahi/isa/disasm.h"
 #include "util/bitset.h"
 #include "util/lut.h"
 #include "util/u_debug.h"
+#include "util/u_dynarray.h"
+#include "agx_builder.h"
 #include "agx_compiler.h"
 #include "agx_debug.h"
 #include "shader_enums.h"
@@ -475,19 +478,576 @@ agx_divergent_last_use(const agx_context *ctx)
    return agx_isa_is_agx3(ctx->key->dev.encoding) && !ctx->key->dev.emit_agx3d;
 }
 
-/*
- * Mark last-use sources to allow the hardware to discard from the register
- * cache. Last use information follows immediately from (post-RA) liveness
- * analysis: a register is dead immediately after its last use.
- *
- * Mark cache hints on sources/destinations to encourage the hardware to make
- * better use of the register cache. This is a simple local analysis.
- */
-void
-agx_opt_register_cache(agx_context *ctx)
+static bool
+reg_overlaps(unsigned a, unsigned an, unsigned b, unsigned bn)
 {
-   agx3_remove_redundant_physical_copies(ctx);
+   return a < b + bn && b < a + an;
+}
 
+static bool
+instr_reads_reg_range(const agx_instr *I, unsigned reg, unsigned count)
+{
+   agx_foreach_reg_src(I, s) {
+      if (I->src[s].memory)
+         continue;
+      if (reg_overlaps(I->src[s].value, agx_index_size_16(I->src[s]), reg, count))
+         return true;
+   }
+   return false;
+}
+
+static bool
+instr_writes_reg_range(const agx_instr *I, unsigned reg, unsigned count)
+{
+   agx_foreach_reg_dest(I, d) {
+      if (I->dest[d].memory)
+         continue;
+      if (reg_overlaps(I->dest[d].value, agx_index_size_16(I->dest[d]), reg, count))
+         return true;
+   }
+   return false;
+}
+
+static bool
+instr_is_half_reg_copy(const agx_instr *I, unsigned src_half)
+{
+   if (I->op != AGX_OPCODE_BITOP || I->truth_table != UTIL_LUT2(a) ||
+       I->nr_dests != 1 || I->nr_srcs != 2 || I->saturate || I->shift ||
+       I->invert_cond || I->agx3_tex_coord_stage)
+      return false;
+
+   const agx_index dst = I->dest[0], src = I->src[0], z = I->src[1];
+   return dst.type == AGX_INDEX_REGISTER && !dst.memory &&
+          dst.size == AGX_SIZE_16 && agx_channels(dst) == 1 && !dst.abs &&
+          !dst.neg && dst.value < 256 &&
+          src.type == AGX_INDEX_REGISTER && !src.memory &&
+          src.size == AGX_SIZE_16 && agx_channels(src) == 1 && !src.abs &&
+          !src.neg && src.value == src_half &&
+          z.type == AGX_INDEX_IMMEDIATE && z.value == 0;
+}
+
+static bool
+instr_blocks_shift_fold(const agx_instr *I)
+{
+   enum agx_schedule_class sc = agx_opcodes_info[I->op].schedule_class;
+   return sc != AGX_SCHEDULE_CLASS_NONE && sc != AGX_SCHEDULE_CLASS_LOAD &&
+          sc != AGX_SCHEDULE_CLASS_STORE && sc != AGX_SCHEDULE_CLASS_ATOMIC;
+}
+
+static bool
+reg_is_live_after(const agx_block *block, const agx_instr *after, unsigned half)
+{
+   list_for_each_entry_from(agx_instr, J, after->link.next, &block->instructions, link) {
+      if (instr_reads_reg_range(J, half, 1))
+         return true;
+      agx_block *target = fused_break_target(J);
+      if (target && BITSET_TEST(target->reg_live_in, half))
+         return true;
+      if (instr_writes_reg_range(J, half, 1))
+         return false;
+   }
+   return BITSET_TEST(block->reg_live_out, half);
+}
+
+/* Bound full-shader per-candidate fallback trials on AGX3B so large shaders
+ * never go quadratic when the batch trial does not commit. */
+#define AGX3B_MAX_PACK_TRIALS 16
+
+struct shift_fold_candidate {
+   agx_instr *S;
+   agx_instr *c1;
+   agx_instr *copies[8];
+   unsigned nr_copies;
+   agx_index dst;
+   agx_index cmp;
+   agx_index lo_half;
+   agx_index hi_half;
+   bool can_place_at_shift;
+   bool can_place_at_copy;
+};
+
+struct shift_fold_edit {
+   agx_instr *S;
+   agx_instr *c1;
+   agx_instr *isel;
+   struct list_head *s_after;
+   struct list_head *c1_after;
+   bool c1_adjacent;
+   agx_instr *copies[8];
+   agx_index saved_src0[8];
+   unsigned nr_copies;
+};
+
+static void
+agx_save_cache_hints(const agx_context *ctx, struct util_dynarray *hints)
+{
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_dest(I, d) {
+         uint8_t h = I->dest[d].cache ? 1 : 0;
+         util_dynarray_append(hints, h);
+      }
+      agx_foreach_src(I, s) {
+         uint8_t h = (I->src[s].cache ? 1 : 0) | (I->src[s].discard ? 2 : 0);
+         util_dynarray_append(hints, h);
+      }
+   }
+}
+
+static void
+agx_restore_cache_hints(agx_context *ctx, const struct util_dynarray *hints)
+{
+   const uint8_t *p = (const uint8_t *)hints->data;
+   const uint8_t *end = p + hints->size;
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_dest(I, d) {
+         assert(p < end);
+         I->dest[d].cache = (*p++ & 1) != 0;
+      }
+      agx_foreach_src(I, s) {
+         assert(p < end);
+         uint8_t h = *p++;
+         I->src[s].cache = (h & 1) != 0;
+         I->src[s].discard = (h & 2) != 0;
+      }
+   }
+   assert(p == end);
+}
+
+/* On AGX3B, an ICMPSEL waiting on more than one scoreboard slot expands into
+ * one extra carrier instruction per waited slot (agx3_pack_binary.c), and
+ * moving a wait can also perturb the 6-slot scoreboard allocator for later
+ * selects. Measure the actual packed AGX3B instruction and byte counts so a
+ * fold only commits when the real binary shrinks and never grows. */
+static bool
+agx3b_measure_packed(agx_context *ctx, bool recompute_cache,
+                     unsigned *instrs_out, unsigned *bytes_out)
+{
+   if (recompute_cache)
+      agx_compute_register_cache(ctx);
+
+   const unsigned saved_max_reg = ctx->max_reg;
+   const unsigned saved_staging_halfs = ctx->agx3_staging_halfs;
+   const bool saved_staging_known = ctx->agx3_staging_known;
+   const bool saved_fltnorm_start = ctx->agx3_fltnorm_start;
+   const bool saved_g18_mixed = ctx->agx3_g18_mixed_protocol;
+   const struct agx3_colour_link_info saved_colour_link = ctx->agx3_colour_link;
+   const struct util_dynarray saved_uvs_relocs = ctx->agx3_uvs_relocs;
+   const unsigned saved_uvs_reloc_count = ctx->agx3_uvs_reloc_count;
+   const bool saved_sampled_fragment =
+      ctx->out ? ctx->out->g17p_sampled_fragment : false;
+
+   /* Give the speculative pack a private relocation buffer and count so it
+    * never appends UVS relocation records to the live context. */
+   ctx->agx3_uvs_relocs = UTIL_DYNARRAY_INIT;
+   ctx->agx3_uvs_reloc_count = 0;
+
+   struct util_dynarray bin = UTIL_DYNARRAY_INIT;
+   const bool ok = agx3_pack_binary(ctx, &bin);
+
+   util_dynarray_fini(&ctx->agx3_uvs_relocs);
+   ctx->agx3_uvs_relocs = saved_uvs_relocs;
+   ctx->agx3_uvs_reloc_count = saved_uvs_reloc_count;
+   ctx->max_reg = saved_max_reg;
+   ctx->agx3_staging_halfs = saved_staging_halfs;
+   ctx->agx3_staging_known = saved_staging_known;
+   ctx->agx3_fltnorm_start = saved_fltnorm_start;
+   ctx->agx3_g18_mixed_protocol = saved_g18_mixed;
+   ctx->agx3_colour_link = saved_colour_link;
+   if (ctx->out)
+      ctx->out->g17p_sampled_fragment = saved_sampled_fragment;
+
+   if (!ok) {
+      util_dynarray_fini(&bin);
+      return false;
+   }
+
+   unsigned count = 0;
+   size_t off = 0;
+   const uint8_t *code = (const uint8_t *)bin.data;
+   while (off < bin.size) {
+      signed len = agx3b_instr_length(code + off, bin.size - off, NULL);
+      if (len <= 0) {
+         util_dynarray_fini(&bin);
+         return false;
+      }
+      off += (size_t)len;
+      ++count;
+   }
+
+   *instrs_out = count;
+   *bytes_out = bin.size;
+   util_dynarray_fini(&bin);
+   return true;
+}
+
+static bool
+agx_match_shift_fold_candidate(agx_block *block, agx_instr *S,
+                               struct shift_fold_candidate *out)
+{
+   if (!S->shift_amount_zero_or_16 || S->nr_dests != 1 || S->saturate ||
+       S->invert_cond || S->agx3_tex_coord_stage)
+      return false;
+
+   const agx_index sdst = S->dest[0];
+   if (sdst.type != AGX_INDEX_REGISTER || sdst.memory ||
+       sdst.size != AGX_SIZE_32 || agx_channels(sdst) != 1 ||
+       (sdst.value & 1) || sdst.value + 2 > 256)
+      return false;
+
+   agx_index word, amt;
+   if (S->op == AGX_OPCODE_BFEIL) {
+      if (S->nr_srcs != 3 || S->bfi_mask != 0 ||
+          S->src[0].type != AGX_INDEX_IMMEDIATE || S->src[0].value != 0 ||
+          S->src[0].abs || S->src[0].neg || S->src[0].memory)
+         return false;
+      word = S->src[1];
+      amt = S->src[2];
+   } else if (S->op == AGX_OPCODE_ASR) {
+      if (S->nr_srcs != 2)
+         return false;
+      word = S->src[0];
+      amt = S->src[1];
+   } else {
+      return false;
+   }
+
+   if (word.type != AGX_INDEX_REGISTER || word.memory ||
+       word.size != AGX_SIZE_32 || agx_channels(word) != 1 || word.abs ||
+       word.neg || (word.value & 1) || word.value + 2 > 256)
+      return false;
+
+   if (amt.type != AGX_INDEX_REGISTER || amt.memory || agx_channels(amt) != 1 ||
+       amt.abs || amt.neg)
+      return false;
+   if (amt.size == AGX_SIZE_32) {
+      if ((amt.value & 1) || amt.value + 2 > 256)
+         return false;
+   } else if (amt.size == AGX_SIZE_16) {
+      if (amt.value >= 256)
+         return false;
+   } else {
+      return false;
+   }
+
+   /* Avoid reading the same register across both comparand and select
+    * operands, where AGX2/AGX3B discard hints can conflict. */
+   const unsigned amt_n = agx_index_size_16(amt);
+   if (reg_overlaps(word.value, 2, amt.value, amt_n))
+      return false;
+
+   const unsigned lo = sdst.value;
+   const unsigned hi = sdst.value + 1;
+   unsigned nr_copies = 0;
+   bool hi_overwritten = false;
+   bool hi_overwritten_by_ck = false;
+   bool ok = true;
+
+   list_for_each_entry_from(agx_instr, J, S->link.next, &block->instructions,
+                            link) {
+      if (instr_blocks_shift_fold(J))
+         break;
+
+      if (!hi_overwritten && instr_reads_reg_range(J, hi, 1)) {
+         ok = false;
+         break;
+      }
+
+      if (instr_reads_reg_range(J, lo, 1)) {
+         if (!instr_is_half_reg_copy(J, lo) || J->dest[0].value == lo ||
+             nr_copies >= ARRAY_SIZE(out->copies)) {
+            ok = false;
+            break;
+         }
+         out->copies[nr_copies++] = J;
+         if (instr_writes_reg_range(J, hi, 1))
+            hi_overwritten = true;
+         hi_overwritten_by_ck = hi_overwritten;
+         continue;
+      }
+
+      if (instr_writes_reg_range(J, hi, 1))
+         hi_overwritten = true;
+      if (instr_writes_reg_range(J, lo, 1))
+         break;
+   }
+
+   if (!ok || nr_copies == 0)
+      return false;
+
+   agx_instr *c1 = out->copies[0];
+   agx_instr *ck = out->copies[nr_copies - 1];
+   const agx_index d1 = c1->dest[0];
+
+   if (reg_is_live_after(block, ck, lo))
+      return false;
+   if (!hi_overwritten_by_ck && reg_is_live_after(block, ck, hi))
+      return false;
+
+   if (nr_copies > 1) {
+      list_for_each_entry_from(agx_instr, J, c1->link.next,
+                               &block->instructions, link) {
+         if (instr_writes_reg_range(J, d1.value, 1))
+            return false;
+         if (J == ck)
+            break;
+      }
+   }
+
+   bool can_place_at_shift = true;
+   bool can_place_at_copy = true;
+   list_for_each_entry_from(agx_instr, J, S->link.next, &block->instructions,
+                            link) {
+      if (J == c1)
+         break;
+      if (instr_reads_reg_range(J, d1.value, 1) ||
+          instr_writes_reg_range(J, d1.value, 1))
+         can_place_at_shift = false;
+      if (instr_writes_reg_range(J, word.value, 2) ||
+          instr_writes_reg_range(J, amt.value, amt_n))
+         can_place_at_copy = false;
+   }
+
+   if (!can_place_at_shift && !can_place_at_copy)
+      return false;
+
+   out->S = S;
+   out->c1 = c1;
+   out->nr_copies = nr_copies;
+   out->dst = agx_register(d1.value, AGX_SIZE_16);
+   out->cmp = agx_register(amt.value, amt.size);
+   out->lo_half = agx_register(word.value, AGX_SIZE_16);
+   out->hi_half = agx_register(word.value + 1, AGX_SIZE_16);
+   out->can_place_at_shift = can_place_at_shift;
+   out->can_place_at_copy = can_place_at_copy;
+   return true;
+}
+
+static struct shift_fold_edit
+agx_apply_shift_fold(agx_context *ctx, const struct shift_fold_candidate *cand,
+                     agx_instr *pos)
+{
+   struct shift_fold_edit edit = {
+      .S = cand->S,
+      .c1 = cand->c1,
+      .s_after = cand->S->link.prev,
+      .c1_after = cand->c1->link.prev,
+      .c1_adjacent = cand->c1->link.prev == &cand->S->link,
+      .nr_copies = cand->nr_copies,
+   };
+   for (unsigned i = 1; i < cand->nr_copies; ++i) {
+      edit.copies[i] = cand->copies[i];
+      edit.saved_src0[i] = cand->copies[i]->src[0];
+   }
+
+   agx_builder b = agx_init_builder(ctx, agx_before_instr(pos));
+   edit.isel = agx_icmpsel_to(&b, cand->dst, cand->cmp, agx_zero(),
+                              cand->lo_half, cand->hi_half, AGX_ICOND_UEQ);
+
+   for (unsigned i = 1; i < cand->nr_copies; ++i)
+      cand->copies[i]->src[0] = cand->dst;
+
+   agx_remove_instruction(cand->S);
+   agx_remove_instruction(cand->c1);
+   return edit;
+}
+
+static void
+agx_undo_shift_fold(const struct shift_fold_edit *edit)
+{
+   agx_remove_instruction(edit->isel);
+   list_add(&edit->S->link, edit->s_after);
+   list_add(&edit->c1->link,
+            edit->c1_adjacent ? &edit->S->link : edit->c1_after);
+   for (unsigned i = 1; i < edit->nr_copies; ++i)
+      edit->copies[i]->src[0] = edit->saved_src0[i];
+}
+
+static bool
+agx3b_packed_improved(unsigned new_instrs, unsigned new_bytes,
+                      unsigned base_instrs, unsigned base_bytes)
+{
+   return new_instrs <= base_instrs && new_bytes <= base_bytes &&
+          (new_instrs < base_instrs || new_bytes < base_bytes);
+}
+
+static bool
+agx3b_try_fold(agx_context *ctx, const struct shift_fold_candidate *cand,
+               agx_instr *pos, unsigned *base_instrs, unsigned *base_bytes)
+{
+   struct shift_fold_edit edit = agx_apply_shift_fold(ctx, cand, pos);
+
+   unsigned new_instrs = 0, new_bytes = 0;
+   if (agx3b_measure_packed(ctx, true, &new_instrs, &new_bytes) &&
+       agx3b_packed_improved(new_instrs, new_bytes, *base_instrs,
+                             *base_bytes)) {
+      *base_instrs = new_instrs;
+      *base_bytes = new_bytes;
+      return true;
+   }
+
+   agx_undo_shift_fold(&edit);
+   postra_liveness(ctx);
+   return false;
+}
+
+/*
+ * Post-RA peephole: fold a 32-bit right shift by a dynamic amount proven in
+ * NIR to be 0 or 16, followed only by 16-bit register copy(s) of its low half
+ * while the shift destination dies, into a single 16-bit icmpsel reading the
+ * source word's two halves directly into the copy's destination. Because it
+ * replaces a shift and a copy with one select once register assignment is
+ * known, it reduces IR instruction count; only AGX3B checks packed binary size
+ * before accepting a fold, while zero packed growth on the other encodings
+ * (AGX2, AGX3C, AGX3D) was observed across the tested shapes.
+ */
+bool
+agx_opt_select_shifted_half(agx_context *ctx)
+{
+   bool any = false;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->shift_amount_zero_or_16) {
+         any = true;
+         break;
+      }
+   }
+   if (!any)
+      return false;
+
+   postra_liveness(ctx);
+   const bool agx3b =
+      ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+
+   if (!agx3b) {
+      bool any_folded = false;
+      agx_foreach_block(ctx, block) {
+         bool progress;
+         do {
+            progress = false;
+            agx_foreach_instr_in_block_safe_rev(block, S) {
+               struct shift_fold_candidate cand;
+               if (!agx_match_shift_fold_candidate(block, S, &cand))
+                  continue;
+               agx_apply_shift_fold(
+                  ctx, &cand, cand.can_place_at_shift ? cand.S : cand.c1);
+               progress = true;
+               any_folded = true;
+            }
+         } while (progress);
+      }
+      return any_folded;
+   }
+
+   /* On AGX3B, try committing all eligible folds in a single verified batch
+    * first (two packs total regardless of candidate count). Only if the batch
+    * fails or grows do we roll back and fall back to a bounded number of
+    * per-candidate trials. */
+   struct util_dynarray edits = UTIL_DYNARRAY_INIT;
+   struct util_dynarray saved_hints = UTIL_DYNARRAY_INIT;
+   bool have_base = false;
+   unsigned base_instrs = 0, base_bytes = 0;
+
+   agx_foreach_block(ctx, block) {
+      bool progress;
+      do {
+         progress = false;
+         agx_foreach_instr_in_block_safe_rev(block, S) {
+            struct shift_fold_candidate cand;
+            if (!agx_match_shift_fold_candidate(block, S, &cand))
+               continue;
+            if (!have_base) {
+               if (!agx3b_measure_packed(ctx, false, &base_instrs,
+                                         &base_bytes)) {
+                  util_dynarray_fini(&edits);
+                  util_dynarray_fini(&saved_hints);
+                  return false;
+               }
+               agx_save_cache_hints(ctx, &saved_hints);
+               have_base = true;
+            }
+            struct shift_fold_edit edit = agx_apply_shift_fold(
+               ctx, &cand, cand.can_place_at_shift ? cand.S : cand.c1);
+            util_dynarray_append(&edits, edit);
+            progress = true;
+         }
+      } while (progress);
+   }
+
+   const unsigned n_edits =
+      util_dynarray_num_elements(&edits, struct shift_fold_edit);
+   if (n_edits == 0) {
+      util_dynarray_fini(&edits);
+      util_dynarray_fini(&saved_hints);
+      return false;
+   }
+
+   unsigned batch_instrs = 0, batch_bytes = 0;
+   if (agx3b_measure_packed(ctx, true, &batch_instrs, &batch_bytes) &&
+       agx3b_packed_improved(batch_instrs, batch_bytes, base_instrs,
+                             base_bytes)) {
+      util_dynarray_fini(&edits);
+      util_dynarray_fini(&saved_hints);
+      return true;
+   }
+
+   /* Roll back the batch in LIFO order. */
+   const struct shift_fold_edit *edit_arr =
+      (const struct shift_fold_edit *)edits.data;
+   for (unsigned i = n_edits; i > 0; --i)
+      agx_undo_shift_fold(&edit_arr[i - 1]);
+   util_dynarray_fini(&edits);
+   postra_liveness(ctx);
+
+   unsigned trials = 0;
+   bool any_folded = false;
+   bool need_cache_refresh = false;
+
+   agx_foreach_block(ctx, block) {
+      if (trials >= AGX3B_MAX_PACK_TRIALS)
+         break;
+      bool progress;
+      do {
+         progress = false;
+         agx_foreach_instr_in_block_safe_rev(block, S) {
+            if (trials >= AGX3B_MAX_PACK_TRIALS)
+               break;
+            struct shift_fold_candidate cand;
+            if (!agx_match_shift_fold_candidate(block, S, &cand))
+               continue;
+            bool folded = false;
+            if (cand.can_place_at_shift && trials < AGX3B_MAX_PACK_TRIALS) {
+               trials++;
+               folded = agx3b_try_fold(ctx, &cand, cand.S, &base_instrs,
+                                       &base_bytes);
+            }
+            if (!folded && cand.can_place_at_copy &&
+                trials < AGX3B_MAX_PACK_TRIALS) {
+               trials++;
+               folded = agx3b_try_fold(ctx, &cand, cand.c1, &base_instrs,
+                                       &base_bytes);
+            }
+            if (!folded) {
+               need_cache_refresh = true;
+               continue;
+            }
+            progress = true;
+            any_folded = true;
+            need_cache_refresh = false;
+         }
+      } while (progress && trials < AGX3B_MAX_PACK_TRIALS);
+   }
+
+   if (!any_folded)
+      agx_restore_cache_hints(ctx, &saved_hints);
+   else if (need_cache_refresh)
+      agx_compute_register_cache(ctx);
+
+   util_dynarray_fini(&saved_hints);
+   return any_folded;
+}
+
+void
+agx_compute_register_cache(agx_context *ctx)
+{
    /* A last-use hint releases the register for the whole SIMD-group (a
     * wrong one destroys the value), so divergent blocks take their last uses
     * from physical liveness (physical_liveness()), which knows what
@@ -710,4 +1270,19 @@ agx_opt_register_cache(agx_context *ctx)
          }
       }
    }
+}
+
+/*
+ * Mark last-use sources to allow the hardware to discard from the register
+ * cache. Last use information follows immediately from (post-RA) liveness
+ * analysis: a register is dead immediately after its last use.
+ *
+ * Mark cache hints on sources/destinations to encourage the hardware to make
+ * better use of the register cache. This is a simple local analysis.
+ */
+void
+agx_opt_register_cache(agx_context *ctx)
+{
+   agx3_remove_redundant_physical_copies(ctx);
+   agx_compute_register_cache(ctx);
 }

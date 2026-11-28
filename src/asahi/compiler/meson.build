@@ -886,6 +886,7 @@ if with_tests
          'test/test-fold-narrowed-half.cpp',
          'test/test-m5-float-minmax-reduce.cpp',
          'test/test-lower-address-wide-shift.cpp',
+         'test/test-select-shifted-half.cpp',
          'test/test-m5-copy-schedule.cpp',
          'test/test-preamble-flag-branches.cpp',
          'test/test-factor-const-mul.cpp',
