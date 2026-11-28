@@ -261,10 +261,27 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
       if (integer != PIPE_FORMAT_NONE)
          p_format = integer;
    }
+   struct hk_3d denom = view_denominator(view);
+
+   /* On M5, uncompressed R11G11B10_FLOAT colour attachments have the same
+    * 32-bit element layout as R32_UINT and live as one raw 32-bit word in the
+    * tilebuffer. Reloading them through a raw R32_UINT descriptor avoids both
+    * float3 unpack in the texture unit and PACK_RGB10A2 repack in the shader,
+    * while preserving exact bit patterns. */
+   const bool raw32_bg =
+      (usage == HK_DESC_USAGE_BG_EOT ||
+       usage == HK_DESC_USAGE_LAYERED_BG_EOT) &&
+      agx_chip_g17_m5(dev->dev.chip) && !layout->compressed &&
+      view->vk.image->samples == 1 &&
+      p_format == PIPE_FORMAT_R11G11B10_FLOAT &&
+      denom.x == 1 && denom.y == 1;
+   if (raw32_bg) {
+      p_format = PIPE_FORMAT_R32_UINT;
+      view->planes[view_plane].background_raw32 = true;
+   }
+
    const struct util_format_description *desc =
       util_format_description(p_format);
-
-   struct hk_3d denom = view_denominator(view);
 
    uint8_t format_swizzle[4] = {
       desc->swizzle[0],
@@ -315,6 +332,12 @@ pack_texture(struct hk_device *dev, struct hk_image_view *view,
    }
 
    util_format_compose_swizzles(format_swizzle, view_swizzle, out_swizzle);
+   if (raw32_bg) {
+      out_swizzle[0] = PIPE_SWIZZLE_X;
+      out_swizzle[1] = PIPE_SWIZZLE_0;
+      out_swizzle[2] = PIPE_SWIZZLE_0;
+      out_swizzle[3] = PIPE_SWIZZLE_1;
+   }
 
    struct AGX_TEXTURE cfg = {AGX_TEXTURE_header};
    {

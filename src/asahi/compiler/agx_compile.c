@@ -1010,16 +1010,24 @@ agx_pack_normalized_agx3(agx_builder *b, const agx_index *channels,
    if (nr_channels < 1 || nr_channels > 4)
       return 0;
 
-   /* Every fltnorm witness takes 32-bit float sources. A linked fragment
-    * epilog may receive normalized colour through the 16-bit export ABI, so
-    * reproduce Apple's native half-to-float conversion before packing. */
+   /* On AGX3c (excluding G18G's agx3d transcoder), fltnorm natively consumes
+    * 16-bit half-float register sources for 8-bit normalized targets, avoiding
+    * explicit f16->f32 widening before packing. */
+   const bool native_f16_norm8 =
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      !agx_is_g18g(&b->shader->key->dev) && norm8;
+
    agx_index pack_sources[4];
    for (unsigned i = 0; i < nr_channels; ++i) {
       if (channels[i].size == AGX_SIZE_32) {
          pack_sources[i] = channels[i];
       } else if (channels[i].size == AGX_SIZE_16) {
-         pack_sources[i] = agx_temp(b->shader, AGX_SIZE_32);
-         agx_fmov_to(b, pack_sources[i], channels[i]);
+         if (native_f16_norm8) {
+            pack_sources[i] = channels[i];
+         } else {
+            pack_sources[i] = agx_temp(b->shader, AGX_SIZE_32);
+            agx_fmov_to(b, pack_sources[i], channels[i]);
+         }
       } else {
          return 0;
       }

@@ -672,7 +672,7 @@ void agx_get_device_uuid(const struct agx_device *dev, void *uuid);
 void agx_get_driver_uuid(void *uuid);
 unsigned agx_get_num_cores(const struct agx_device *dev);
 
-struct agx_device_key agx_gather_device_key(struct agx_device *dev);
+struct agx_device_key agx_gather_device_key(const struct agx_device *dev);
 
 /* This interface carries native sampler state in GPU records, not in the
  * firmware command's optional sampler-heap fields. */
