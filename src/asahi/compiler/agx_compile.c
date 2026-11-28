@@ -12379,13 +12379,17 @@ static bool agx3_nir_lower_uniform_dma(nir_shader *nir,
                                        struct agx_shader_info *info);
 
 /* G18 has no admitted native quad or integer min/max/bitwise prefix encoding.
- * Use the common activity-aware subgroup algorithms, then let the normal AGX
- * pass lower generated shuffles and ballots. Whole-subgroup native operations
- * stay intact. */
+ * Under DenormFlushToZero(32), G18G also preserves fp32 denormals in native
+ * whole-wave float reductions and scans, so lower fp32 fadd/fmul reduce and
+ * scan through the shuffle/ALU path where agx_nir_lower_g18_ftz flushes every
+ * input, intermediate, and result. Use the common activity-aware subgroup
+ * algorithms, then let the normal AGX pass lower generated shuffles and
+ * ballots. Other whole-subgroup native operations stay intact. */
 static bool
 agx_g18_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 {
-   (void)data;
+   const bool ftz32 = data && *(const bool *)data;
+
    switch (intr->intrinsic) {
    case nir_intrinsic_quad_broadcast:
    case nir_intrinsic_quad_swap_horizontal:
@@ -12394,13 +12398,25 @@ agx_g18_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
       return true;
    case nir_intrinsic_reduce: {
       unsigned cluster = nir_intrinsic_cluster_size(intr);
-      return cluster > 0 && cluster < 32;
+      if (cluster > 0 && cluster < 32)
+         return true;
+      if (ftz32 && intr->def.bit_size == 32) {
+         nir_op op = nir_intrinsic_reduction_op(intr);
+         return op == nir_op_fadd || op == nir_op_fmul;
+      }
+      return false;
    }
    case nir_intrinsic_inclusive_scan:
    case nir_intrinsic_exclusive_scan:
       break;
    default:
       return false;
+   }
+
+   if (ftz32 && intr->def.bit_size == 32) {
+      nir_op op = nir_intrinsic_reduction_op(intr);
+      if (op == nir_op_fadd || op == nir_op_fmul)
+         return true;
    }
 
    switch (nir_intrinsic_reduction_op(intr)) {
@@ -12418,10 +12434,47 @@ agx_g18_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
 }
 
 static bool
+agx_g18_val_is_flushed(nir_def *def)
+{
+   if (!nir_def_is_alu(def))
+      return false;
+   nir_alu_instr *alu = nir_def_as_alu(def);
+   if (alu->op == nir_op_fcanonicalize)
+      return true;
+   return alu->op == nir_op_fadd && nir_src_is_const(alu->src[1].src) &&
+          nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[0]) ==
+             0x80000000u;
+}
+
+static bool
+agx_g18_flush_subgroup_fp32_arith(nir_builder *b, nir_intrinsic_instr *intr,
+                                  UNUSED void *data)
+{
+   if ((intr->intrinsic != nir_intrinsic_reduce &&
+        intr->intrinsic != nir_intrinsic_inclusive_scan &&
+        intr->intrinsic != nir_intrinsic_exclusive_scan) ||
+       intr->def.bit_size != 32)
+      return false;
+
+   const nir_op op = nir_intrinsic_reduction_op(intr);
+   if ((op != nir_op_fadd && op != nir_op_fmul) ||
+       agx_g18_val_is_flushed(intr->src[0].ssa))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   b->fp_math_ctrl = nir_fp_no_fast_math;
+   nir_src_rewrite(&intr->src[0], nir_fadd_imm(b, intr->src[0].ssa, -0.0));
+   return true;
+}
+
+static bool
 agx_nir_lower_g18_subgroups(nir_shader *nir)
 {
+   const bool ftz32 =
+      nir_is_denorm_flush_to_zero(nir->info.float_controls_execution_mode, 32);
    const nir_lower_subgroups_options options = {
       .filter = agx_g18_subgroup_filter,
+      .filter_data = &ftz32,
       .lower_reduce = true,
       .lower_quad = true,
       .lower_to_scalar = true,
@@ -12431,6 +12484,11 @@ agx_nir_lower_g18_subgroups(nir_shader *nir)
       .subgroup_size = 32,
    };
    bool progress = agx_nir_flush_subgroup_minmax(nir);
+   if (ftz32) {
+      progress |= nir_shader_intrinsics_pass(
+         nir, agx_g18_flush_subgroup_fp32_arith, nir_metadata_control_flow,
+         NULL);
+   }
    while (nir_lower_subgroups(nir, &options))
       progress = true;
    return progress;
@@ -18098,7 +18156,9 @@ agx_assert_post_lower_invariants(const nir_shader *nir, bool g17p, bool m5,
             } else if (instr->type == nir_instr_type_intrinsic) {
                const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
                if (g18g) {
-                  assert(!agx_g18_subgroup_filter(intr, NULL) &&
+                  const bool ftz32 = nir_is_denorm_flush_to_zero(
+                     nir->info.float_controls_execution_mode, 32);
+                  assert(!agx_g18_subgroup_filter(intr, &ftz32) &&
                          "post_lower requires G18G subgroups already lowered");
                }
                assert(!agx_nir_subgroup_intrinsic_needs_lowering(

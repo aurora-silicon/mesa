@@ -4,6 +4,7 @@
 #include "agx_test.h"
 
 extern "C" {
+#include "agx_compile.h"
 #include "agx_nir.h"
 }
 
@@ -103,4 +104,110 @@ TEST(G18GFtz, LoadsKeepBitsAndFloatOperationsFlush)
    EXPECT_EQ(out[2].u32, 0u);
    EXPECT_EQ(out[3].u32, 0x80000000u);
    ralloc_free(b.shader);
+}
+
+static bool
+is_nir_flush(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   return alu->op == nir_op_fcanonicalize ||
+          (alu->op == nir_op_fadd && nir_src_is_const(alu->src[1].src) &&
+           nir_src_comp_as_uint(alu->src[1].src, alu->src[1].swizzle[0]) ==
+              0x80000000u);
+}
+
+static void
+check_g18g_subgroup_fp32_ftz(nir_intrinsic_op intr_op, nir_op red_op,
+                             unsigned mode, bool expect_lowered)
+{
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_COMPUTE,
+                                                  &agx_nir_options,
+                                                  "g18-ftz-subgroup");
+   b.shader->info.float_controls_execution_mode = mode;
+   b.shader->info.workgroup_size[0] = 32;
+   b.shader->info.workgroup_size[1] = 1;
+   b.shader->info.workgroup_size[2] = 1;
+
+   nir_def *p = agx_test_load_preamble(&b, 1, 64, 0);
+   nir_def *lane = nir_u2u64(&b, nir_ishl_imm(&b, nir_load_subgroup_invocation(&b), 2));
+   nir_def *x = nir_load_global(&b, 1, 32, nir_iadd(&b, p, lane), .align_mul = 4);
+   nir_def *r =
+      intr_op == nir_intrinsic_reduce
+         ? nir_reduce(&b, x, .reduction_op = red_op, .cluster_size = 0)
+      : intr_op == nir_intrinsic_inclusive_scan
+         ? nir_inclusive_scan(&b, x, .reduction_op = red_op)
+         : nir_exclusive_scan(&b, x, .reduction_op = red_op);
+   nir_store_global(&b, r, nir_iadd(&b, nir_iadd_imm(&b, p, 256), lane),
+                    .align_mul = 4);
+
+   agx_preprocess_nir_g18g(b.shader);
+   agx_preprocess_nir_post_lower(b.shader, AGX_CHIP_G18G);
+
+   bool saw_native = false;
+   bool saw_alu = false;
+   bool saw_load_use = false;
+   bool all_load_uses_flushed = true;
+
+   nir_foreach_block(block, nir_shader_get_entrypoint(b.shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_reduce ||
+                intr->intrinsic == nir_intrinsic_inclusive_scan ||
+                intr->intrinsic == nir_intrinsic_exclusive_scan)
+               saw_native = true;
+         } else if (instr->type == nir_instr_type_alu) {
+            if (nir_instr_as_alu(instr)->op == red_op)
+               saw_alu = true;
+         }
+      }
+   }
+
+   nir_foreach_use_including_if(src, x) {
+      saw_load_use = true;
+      if (nir_src_is_if(src) || !is_nir_flush(nir_src_use_instr(src)))
+         all_load_uses_flushed = false;
+   }
+
+   if (expect_lowered) {
+      EXPECT_FALSE(saw_native)
+         << "FTZ(32) must lower native fp32 subgroup op " << intr_op;
+      EXPECT_TRUE(saw_alu)
+         << "lowered fp32 subgroup op must emit ALU op " << red_op;
+      EXPECT_TRUE(saw_load_use && all_load_uses_flushed)
+         << "loaded input must be flushed before subgroup lowering";
+
+      EXPECT_TRUE(agx_nir_lower_g18_ftz(b.shader));
+      nir_validate_shader(b.shader, "g18-ftz-subgroup");
+   } else {
+      EXPECT_TRUE(saw_native)
+         << "without FTZ(32), whole-wave fp32 subgroup op stays native";
+   }
+
+   ralloc_free(b.shader);
+}
+
+TEST(G18GFtz, SubgroupFloatReduceLowersUnderFtz32)
+{
+   for (nir_op op : {nir_op_fadd, nir_op_fmul}) {
+      check_g18g_subgroup_fp32_ftz(nir_intrinsic_reduce, op,
+                                   FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32,
+                                   true);
+      check_g18g_subgroup_fp32_ftz(nir_intrinsic_reduce, op, 0, false);
+   }
+}
+
+TEST(G18GFtz, SubgroupFloatScanLowersUnderFtz32)
+{
+   for (nir_intrinsic_op intr :
+        {nir_intrinsic_inclusive_scan, nir_intrinsic_exclusive_scan}) {
+      for (nir_op op : {nir_op_fadd, nir_op_fmul}) {
+         check_g18g_subgroup_fp32_ftz(intr, op,
+                                      FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32,
+                                      true);
+         check_g18g_subgroup_fp32_ftz(intr, op, 0, false);
+      }
+   }
 }
