@@ -898,3 +898,16 @@ hk_g17p_linear_tiled_slice_addrs_valid(uint64_t dst_addr, uint64_t dst_off,
 
    return dst_addr + slice_B <= src_addr || src_addr + slice_B <= dst_addr;
 }
+
+bool
+hk_g17p_block_upload_row_pitch(uint32_t width, uint32_t buffer_row_length,
+                               uint32_t *pitch_B)
+{
+   const uint32_t row_texels = buffer_row_length ? buffer_row_length : width;
+   const uint64_t pitch = (uint64_t)row_texels * 4;
+   if (!width || row_texels < width || pitch > UINT32_MAX)
+      return false;
+
+   *pitch_B = (uint32_t)pitch;
+   return true;
+}

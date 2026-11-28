@@ -328,6 +328,16 @@ struct hk_agx3_compressed_buf2img_grid {
  * AGX3 Gen10 compressed buffer-to-image compute upload. */
 bool hk_agx3_compressed_buf2img_view_format_supported(VkFormat view_format);
 
+/* The byte pitch of one buffer row for a whole-level RGBA8 upload through the
+ * compressed PBE (hk_g17p_block_upload), given the level's width and the
+ * region's bufferRowLength (0: tightly packed). The upload shader takes the
+ * pitch as a 32-bit push constant and multiplies it by the row in 64 bits, so
+ * it addresses every row of any pitch that fits in 32 bits. Returns false for
+ * a row length below the width or a pitch that does not fit; such a copy keeps
+ * the render-pass upload. */
+bool hk_g17p_block_upload_row_pitch(uint32_t width, uint32_t buffer_row_length,
+                                    uint32_t *pitch_B);
+
 bool hk_agx3_compressed_buf2img_grid_init(
    uint32_t x0, uint32_t y0, uint32_t width, uint32_t height,
    uint32_t max_groups_x, uint32_t max_groups_y,
