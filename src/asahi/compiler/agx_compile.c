@@ -3719,15 +3719,23 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          return NULL;
       }
 
-      unsigned type = nir_intrinsic_src_type(instr) == nir_type_uint16
-         ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type(instr) == nir_type_float32
-         ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
-      unsigned type_b = nir_intrinsic_src_type2(instr) == nir_type_uint16
-         ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type2(instr) == nir_type_float32
-         ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
+      const nir_alu_type ta = nir_intrinsic_src_type(instr);
+      const nir_alu_type tb = nir_intrinsic_src_type2(instr);
+      unsigned type =
+         ta == nir_type_int8 ? AGX3_MATRIX_INPUT_S8 :
+         ta == nir_type_uint8 ? AGX3_MATRIX_INPUT_U8 :
+         ta == nir_type_uint16 ? AGX3_MATRIX_INPUT_BF16 :
+         ta == nir_type_float32 ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
+      unsigned type_b =
+         tb == nir_type_int8 ? AGX3_MATRIX_INPUT_S8 :
+         tb == nir_type_uint8 ? AGX3_MATRIX_INPUT_U8 :
+         tb == nir_type_uint16 ? AGX3_MATRIX_INPUT_BF16 :
+         tb == nir_type_float32 ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
       type |= type_b << 4;
       if (instr->def.bit_size == 16)
          type |= AGX3_MATRIX_ACCUM_F16;
+      if (nir_intrinsic_saturate(instr))
+         type |= AGX3_MATRIX_SATURATE;
       /* The 16x16 GEMM form is M5 (AGX3C) only; the 8x8 matmad also exists on
        * the AGX3B encoding (G15/G16/G17P), so the 2-component path is allowed
        * there too. */
