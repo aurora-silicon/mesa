@@ -3146,6 +3146,59 @@ test_compute_self_cut(void)
    }
 }
 
+/* An end stamp on a compute command follows earlier compute commands through
+ * the compute subqueue alone only while the kernel runs a queue's compute on
+ * one firmware channel. */
+static void
+test_multi_channel_stamp(void)
+{
+   for (unsigned multi = 0; multi < 2; ++multi) {
+      struct hk_queue *q = new_queue(true);
+      struct hk_cmd_buffer *first = timestamp_cmd(AGX_CHIP_G17S, true);
+      add(first, true)->stats.cmds = 1;
+      T("multi-channel stamp: first submission resolves", submit(q, first));
+
+      struct hk_cmd_buffer *cmd = timestamp_cmd(AGX_CHIP_G17S, true);
+      struct hk_device *dev = hk_cmd_buffer_device(cmd);
+      if (multi)
+         dev->dev.params.features |= DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL;
+      struct hk_cs *c1 = add(cmd, true);
+      c1->stats.cmds = 1;
+      struct hk_cs *c2 = add(cmd, true);
+      cmd->current_cs.cs = c2;
+      c2->stats.cmds = 1;
+      end_timestamp(cmd, 0);
+      T("multi-channel stamp: the stamp ends c2",
+        c2->timestamp.end.handle == 1 && !cmd->current_cs.cs);
+      T("multi-channel stamp: c2 waits for c1 only with several channels",
+        multi ? c2->sync.dep[HK_SYNC_CDM].cut == c1
+              : c2->sync.dep[HK_SYNC_CDM].cut == NULL);
+      T("multi-channel stamp: resolves", submit(q, cmd));
+      T("multi-channel stamp: c2 waits for the compute prefix through c1 "
+        "only with several channels",
+        multi ? c2->sync.barrier[HK_SYNC_CDM] == c1->sync.index
+              : c2->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+                   c2->sync.prior[HK_SYNC_CDM] == 0);
+
+      /* The stamp on the first compute command of a submission waits for
+       * the earlier submission's compute only with several channels. */
+      struct hk_cmd_buffer *next = timestamp_cmd(AGX_CHIP_G17S, true);
+      if (multi)
+         hk_cmd_buffer_device(next)->dev.params.features |=
+            DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL;
+      struct hk_cs *timed = add(next, true);
+      next->current_cs.cs = timed;
+      timed->stats.cmds = 1;
+      end_timestamp(next, 1);
+      T("multi-channel stamp: next submission resolves", submit(q, next));
+      T("multi-channel stamp: the first stamp of a submission waits for the "
+        "earlier one only with several channels",
+        timed->sync.barrier[HK_SYNC_CDM] == DRM_ASAHI_BARRIER_NONE &&
+        (multi ? timed->sync.prior[HK_SYNC_CDM] != 0
+               : timed->sync.prior[HK_SYNC_CDM] == 0));
+   }
+}
+
 int
 main(void)
 {
@@ -3181,6 +3234,7 @@ main(void)
    test_stamp_kind_isolation();
    test_cdm_overlap_splits();
    test_compute_self_cut();
+   test_multi_channel_stamp();
    {
       /* A submission longer than the 16-bit barrier field: a wait on a
        * command past it is named by its ordinal (that command went in an

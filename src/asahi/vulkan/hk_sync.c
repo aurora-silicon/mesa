@@ -1988,12 +1988,17 @@ hk_sync_merge(struct hk_cmd_buffer *cmd, struct hk_cs *into,
  */
 /* Whether a timestamp on a compute command is ordered against earlier compute
  * commands by the logical compute subqueue alone: exact-prior barriers on
- * native AGX3 and M5 parts. */
+ * native AGX3 and M5 parts, while the kernel runs a queue's compute commands
+ * on one firmware channel. With DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL an
+ * earlier compute command the stamp's command does not wait for may still be
+ * running on another channel when the stamp is written. */
 static inline bool
 cdm_stamp_queue_ordered(const struct hk_device *dev)
 {
+   const uint64_t features = dev->dev.params.features;
    return agx_chip_native_or_m5(dev->dev.chip) &&
-          (dev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS);
+          (features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) &&
+          !(features & DRM_ASAHI_FEATURE_COMPUTE_MULTI_CHANNEL);
 }
 
 /* An end stamp is written when a command completes, so ordering it after
