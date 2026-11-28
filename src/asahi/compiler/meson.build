@@ -1162,6 +1162,28 @@ if with_tests
     suite : ['asahi'],
   )
 
+  agx3_pso_compile_wave2_test = executable(
+    'agx3_pso_compile_wave2_test',
+    files('test/test-agx3-pso-compile-wave2.c'),
+    c_args : [c_msvc_compat_args, no_override_init_args],
+    gnu_symbol_visibility : 'hidden',
+    dependencies : [idep_nir, idep_mesautil],
+    link_with : [libasahi_compiler],
+  )
+
+  test(
+    'agx3_pso_compile_wave2',
+    agx3_pso_compile_wave2_test,
+    suite : ['asahi'],
+  )
+
+  test(
+    'agx_nir_licm_sparse_liveness',
+    agx3_pso_compile_wave2_test,
+    args : ['--licm-sparse-liveness'],
+    suite : ['asahi'],
+  )
+
   test(
     'agx_uniform_idiv',
     executable(

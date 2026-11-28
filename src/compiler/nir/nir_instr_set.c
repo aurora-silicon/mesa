@@ -192,7 +192,7 @@ hash_alu(uint64_t hash, const nir_alu_instr *instr)
    return hash_finalize(hash);
 }
 
-static uint32_t
+static ATTRIBUTE_NOINLINE uint32_t
 hash_deref(uint64_t hash, const nir_deref_instr *instr)
 {
    hash = hash_mix64(hash, ((uint64_t)instr->deref_type << 32) | instr->modes);
@@ -259,7 +259,7 @@ cmp_phi_src(const void *data1, const void *data2)
    return src1->pred > src2->pred ? 1 : (src1->pred == src2->pred ? 0 : -1);
 }
 
-static uint32_t
+static ATTRIBUTE_NOINLINE uint32_t
 hash_phi(uint64_t hash, const nir_phi_instr *instr)
 {
    hash = hash_mix64(hash, (uint64_t)(uintptr_t)instr->instr.block);
@@ -311,15 +311,11 @@ normalized_intrinsic_const_indices(const nir_intrinsic_instr *instr,
    return const_index;
 }
 
-static uint32_t
-hash_intrinsic(uint64_t hash, const nir_intrinsic_instr *instr)
+static ATTRIBUTE_NOINLINE uint64_t
+hash_intrinsic_const_indices_norm(uint64_t hash,
+                                  const nir_intrinsic_instr *instr,
+                                  const nir_intrinsic_info *info)
 {
-   const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
-   uint64_t hdr = (uint64_t)instr->intrinsic << 32;
-   if (info->has_dest)
-      hdr |= ((uint64_t)instr->def.bit_size << 8) | instr->def.num_components;
-   hash = hash_mix64(hash, hdr);
-
    int const_index[NIR_INTRINSIC_MAX_CONST_INDEX];
    const int *normalized =
       normalized_intrinsic_const_indices(instr, const_index);
@@ -332,6 +328,32 @@ hash_intrinsic(uint64_t hash, const nir_intrinsic_instr *instr)
    }
    if (i < nslots)
       hash = hash_mix64(hash, (uint32_t)normalized[i]);
+   return hash;
+}
+
+static ATTRIBUTE_NOINLINE uint32_t
+hash_intrinsic(uint64_t hash, const nir_intrinsic_instr *instr)
+{
+   const nir_intrinsic_info *info = &nir_intrinsic_infos[instr->intrinsic];
+   uint64_t hdr = (uint64_t)instr->intrinsic << 32;
+   if (info->has_dest)
+      hdr |= ((uint64_t)instr->def.bit_size << 8) | instr->def.num_components;
+   hash = hash_mix64(hash, hdr);
+
+   if (unlikely(nir_intrinsic_has_fp_math_ctrl(instr) ||
+                nir_intrinsic_has_io_semantics(instr))) {
+      hash = hash_intrinsic_const_indices_norm(hash, instr, info);
+   } else {
+      unsigned nslots = info->num_index_slots;
+      unsigned i = 0;
+      for (; i + 1 < nslots; i += 2) {
+         uint64_t pair = ((uint64_t)(uint32_t)instr->const_index[i] << 32) |
+                         (uint32_t)instr->const_index[i + 1];
+         hash = hash_mix64(hash, pair);
+      }
+      if (i < nslots)
+         hash = hash_mix64(hash, (uint32_t)instr->const_index[i]);
+   }
 
    for (unsigned s = 0; s < info->num_srcs; s++)
       hash = hash_src(hash, &instr->src[s]);
@@ -374,7 +396,7 @@ pack_tex(const nir_tex_instr *instr)
    return packed;
 }
 
-static uint32_t
+static ATTRIBUTE_NOINLINE uint32_t
 hash_tex(uint64_t hash, const nir_tex_instr *instr)
 {
    uint64_t tg4;
@@ -640,6 +662,54 @@ nir_alu_srcs_equal(const nir_alu_instr *alu1, const nir_alu_instr *alu2,
  * the same hash for (ignoring collisions, of course).
  */
 
+static ATTRIBUTE_NOINLINE bool
+intrinsic_const_indices_equal_norm(const nir_intrinsic_instr *intrinsic1,
+                                   const nir_intrinsic_instr *intrinsic2,
+                                   const nir_intrinsic_info *info)
+{
+   int const_index1[NIR_INTRINSIC_MAX_CONST_INDEX];
+   int const_index2[NIR_INTRINSIC_MAX_CONST_INDEX];
+   const int *normalized1 =
+      normalized_intrinsic_const_indices(intrinsic1, const_index1);
+   const int *normalized2 =
+      normalized_intrinsic_const_indices(intrinsic2, const_index2);
+
+   return memcmp(normalized1, normalized2,
+                 info->num_index_slots * sizeof(intrinsic1->const_index[0])) == 0;
+}
+
+static ATTRIBUTE_NOINLINE bool
+nir_instrs_equal_intrinsic(const nir_intrinsic_instr *intrinsic1,
+                           const nir_intrinsic_instr *intrinsic2)
+{
+   const nir_intrinsic_info *info =
+      &nir_intrinsic_infos[intrinsic1->intrinsic];
+
+   if (intrinsic1->intrinsic != intrinsic2->intrinsic ||
+       intrinsic1->num_components != intrinsic2->num_components)
+      return false;
+
+   if (info->has_dest && intrinsic1->def.num_components !=
+                            intrinsic2->def.num_components)
+      return false;
+
+   if (info->has_dest && intrinsic1->def.bit_size !=
+                            intrinsic2->def.bit_size)
+      return false;
+
+   for (unsigned i = 0; i < info->num_srcs; i++) {
+      if (!nir_srcs_equal(intrinsic1->src[i], intrinsic2->src[i]))
+         return false;
+   }
+
+   if (unlikely(nir_intrinsic_has_fp_math_ctrl(intrinsic1) ||
+                nir_intrinsic_has_io_semantics(intrinsic1)))
+      return intrinsic_const_indices_equal_norm(intrinsic1, intrinsic2, info);
+
+   return memcmp(intrinsic1->const_index, intrinsic2->const_index,
+                 info->num_index_slots * sizeof(intrinsic1->const_index[0])) == 0;
+}
+
 bool
 nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
 {
@@ -816,42 +886,9 @@ nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
 
       return true;
    }
-   case nir_instr_type_intrinsic: {
-      nir_intrinsic_instr *intrinsic1 = nir_instr_as_intrinsic(instr1);
-      nir_intrinsic_instr *intrinsic2 = nir_instr_as_intrinsic(instr2);
-      const nir_intrinsic_info *info =
-         &nir_intrinsic_infos[intrinsic1->intrinsic];
-
-      if (intrinsic1->intrinsic != intrinsic2->intrinsic ||
-          intrinsic1->num_components != intrinsic2->num_components)
-         return false;
-
-      if (info->has_dest && intrinsic1->def.num_components !=
-                               intrinsic2->def.num_components)
-         return false;
-
-      if (info->has_dest && intrinsic1->def.bit_size !=
-                               intrinsic2->def.bit_size)
-         return false;
-
-      for (unsigned i = 0; i < info->num_srcs; i++) {
-         if (!nir_srcs_equal(intrinsic1->src[i], intrinsic2->src[i]))
-            return false;
-      }
-
-      int const_index1[NIR_INTRINSIC_MAX_CONST_INDEX];
-      int const_index2[NIR_INTRINSIC_MAX_CONST_INDEX];
-      const int *normalized1 =
-         normalized_intrinsic_const_indices(intrinsic1, const_index1);
-      const int *normalized2 =
-         normalized_intrinsic_const_indices(intrinsic2, const_index2);
-
-      if (memcmp(normalized1, normalized2,
-                 info->num_index_slots * sizeof(intrinsic1->const_index[0])))
-         return false;
-
-      return true;
-   }
+   case nir_instr_type_intrinsic:
+      return nir_instrs_equal_intrinsic(nir_instr_as_intrinsic(instr1),
+                                        nir_instr_as_intrinsic(instr2));
    case nir_instr_type_call:
    case nir_instr_type_cmat_call:
    case nir_instr_type_jump:
@@ -961,7 +998,9 @@ nir_cse_instr_set_init(struct nir_cse_instr_set *set,
                        uint32_t expected_entries)
 {
    set->count = 0;
-   if (expected_entries <= NIR_CSE_INSTR_SET_INLINE_CAP) {
+   /* Size for the 2/3 load limit so expected_entries fit without rehashing. */
+   uint32_t needed = expected_entries + (expected_entries >> 1) + 1u;
+   if (needed <= NIR_CSE_INSTR_SET_INLINE_CAP) {
       set->capacity = NIR_CSE_INSTR_SET_INLINE_CAP;
       set->max_entries = nir_cse_instr_set_max_entries(set->capacity);
       set->hashes = set->inline_hashes;
@@ -970,7 +1009,7 @@ nir_cse_instr_set_init(struct nir_cse_instr_set *set,
       return;
    }
 
-   uint32_t cap = util_next_power_of_two(MAX2(256u, expected_entries));
+   uint32_t cap = util_next_power_of_two(MAX2(256u, needed));
    size_t hashes_bytes = (size_t)cap * sizeof(uint32_t);
    size_t instrs_bytes = (size_t)cap * sizeof(nir_instr *);
    void *buf = malloc(hashes_bytes + instrs_bytes);

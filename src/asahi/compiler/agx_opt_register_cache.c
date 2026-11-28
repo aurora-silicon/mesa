@@ -25,8 +25,14 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
       return;
 
    uint32_t serial = 0;
+   uint32_t epoch = 1;
+   uint32_t reg_epoch[AGX_NUM_REGS] = {0};
+   uint32_t value[AGX_NUM_REGS];
    agx_foreach_block(ctx, block) {
-      uint32_t value[AGX_NUM_REGS] = {0};
+      if (++epoch == 0) {
+         memset(reg_epoch, 0, sizeof(reg_epoch));
+         epoch = 1;
+      }
       agx_foreach_instr_in_block_safe(block, I) {
          const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
          /* Texture and image instructions can clobber undeclared physical
@@ -39,7 +45,10 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
              I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
              I->op == AGX_OPCODE_TEXTURE_LOAD ||
              I->op == AGX_OPCODE_IMAGE_LOAD) {
-            memset(value, 0, sizeof(value));
+            if (++epoch == 0) {
+               memset(reg_epoch, 0, sizeof(reg_epoch));
+               epoch = 1;
+            }
             continue;
          }
 
@@ -52,8 +61,10 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
             !I->invert_cond && !I->memory_is_packed &&
             count >= 1 && count <= 4 && dst.value + count <= AGX_NUM_REGS;
          if (plain_dst) {
-            for (unsigned c = 0; c < count; ++c)
-               old_value[c] = value[dst.value + c];
+            for (unsigned c = 0; c < count; ++c) {
+               unsigned r = dst.value + c;
+               old_value[c] = reg_epoch[r] == epoch ? value[r] : 0;
+            }
          }
          if (plain_dst && I->op == AGX_OPCODE_MOV_IMM && count <= 2) {
             for (unsigned c = 0; c < count; ++c)
@@ -68,9 +79,12 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
                if (src.type == AGX_INDEX_REGISTER &&
                    src.value + count <= AGX_NUM_REGS) {
                   for (unsigned c = 0; c < count; ++c) {
-                     if (!value[src.value + c])
-                        value[src.value + c] = ++serial;
-                     copied[c] = value[src.value + c];
+                     unsigned sr = src.value + c;
+                     if (reg_epoch[sr] != epoch || !value[sr]) {
+                        value[sr] = ++serial;
+                        reg_epoch[sr] = epoch;
+                     }
+                     copied[c] = value[sr];
                   }
                   copy = true;
                } else if (src.type == AGX_INDEX_UNIFORM &&
@@ -89,19 +103,28 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
                agx_remove_instruction(I);
                continue;
             }
-            for (unsigned c = 0; c < count; ++c)
-               value[dst.value + c] = copied[c];
+            for (unsigned c = 0; c < count; ++c) {
+               unsigned r = dst.value + c;
+               value[r] = copied[c];
+               reg_epoch[r] = epoch;
+            }
          } else {
             agx_foreach_dest(I, d) {
                const agx_index dest = I->dest[d];
                const unsigned n = agx_index_size_16(dest);
                if (dest.type != AGX_INDEX_REGISTER || dest.memory ||
                    dest.value + n > AGX_NUM_REGS) {
-                  memset(value, 0, sizeof(value));
+                  if (++epoch == 0) {
+                     memset(reg_epoch, 0, sizeof(reg_epoch));
+                     epoch = 1;
+                  }
                   break;
                }
-               for (unsigned c = 0; c < n; ++c)
-                  value[dest.value + c] = ++serial;
+               for (unsigned c = 0; c < n; ++c) {
+                  unsigned r = dest.value + c;
+                  value[r] = ++serial;
+                  reg_epoch[r] = epoch;
+               }
             }
          }
       }

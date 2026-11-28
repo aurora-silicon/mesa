@@ -190,6 +190,7 @@ struct ra_ctx {
    const struct g17p_coread_entry *g17p_coread;
    unsigned g17p_tier_cap;
    bool g17p_has_loop;
+   bool any_bank_constrained;
 };
 
 /*
@@ -681,8 +682,11 @@ static bool
 region_has_bank_constrained_value(const struct ra_ctx *rctx, unsigned base,
                                   unsigned size, bool binding_only)
 {
-   for (unsigned reg = reserved_size(rctx->shader);
-        reg < rctx->bound[RA_GPR];) {
+   if (!rctx->any_bank_constrained)
+      return false;
+
+   const unsigned end = MIN2(base + size, rctx->bound[RA_GPR]);
+   for (unsigned reg = reserved_size(rctx->shader); reg < end;) {
       if (!BITSET_TEST(rctx->used_regs[RA_GPR], reg)) {
          ++reg;
          continue;
@@ -691,7 +695,7 @@ region_has_bank_constrained_value(const struct ra_ctx *rctx, unsigned base,
       unsigned ssa = rctx->reg_to_ssa[reg];
       unsigned width = rctx->ncomps[ssa];
       assert(width && rctx->ssa_to_reg[ssa] == reg);
-      if (reg < base + size && reg + width > base &&
+      if (reg + width > base &&
           (binding_only ? ssa_has_binding_bank_constraint(rctx, ssa)
                         : ssa_has_bank_constraint(rctx, ssa)))
          return true;
@@ -752,6 +756,35 @@ find_best_region_to_evict_impl(struct ra_ctx *rctx, unsigned size,
       /* Do not evict the same register multiple times. It's not necessary since
        * we're just shuffling, there are enough free registers elsewhere.
        */
+      if (size <= BITSET_WORDBITS) {
+         const unsigned word_idx = base / BITSET_WORDBITS;
+         const unsigned shift = base % BITSET_WORDBITS;
+         const BITSET_WORD mask =
+            size == BITSET_WORDBITS ? ~((BITSET_WORD)0)
+                                    : (((BITSET_WORD)1 << size) - 1u);
+         if ((already_evicted[word_idx] >> shift) & mask)
+            continue;
+
+         /* Keep constrained values in their assigned bank across live-range
+          * splitting. Otherwise a later destination can relocate a valid TEX
+          * coordinate above the seven-bit COPY source range. */
+         if (honor_banks &&
+             region_has_bank_constrained_value(rctx, base, size, false))
+            continue;
+
+         const BITSET_WORD occ =
+            (rctx->used_regs[RA_GPR][word_idx] >> shift) & mask;
+         if (occ == mask)
+            continue;
+
+         unsigned moves = util_bitcount(occ);
+         if ((moves < best_moves) ^ invert) {
+            best_moves = moves;
+            best_base = base;
+         }
+         continue;
+      }
+
       if (BITSET_TEST_COUNT(already_evicted, base, size))
          continue;
 
@@ -4252,45 +4285,98 @@ agx_ra(agx_context *ctx)
     * accumulators): those phis are simultaneously live at block entry and must
     * not be merged into one web.
     */
-   struct phi_web_node *phi_web = calloc(ctx->alloc, sizeof(*phi_web));
-   for (unsigned i = 0; i < ctx->alloc; ++i) {
+   const unsigned alloc = ctx->alloc;
+   const unsigned alloc_words = BITSET_WORDS(alloc);
+   const size_t ra_slab_bytes =
+      ALIGN_POT((size_t)alloc * sizeof(struct phi_web_node), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(agx_instr *), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(enum ra_class), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(enum agx_size), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(unsigned), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(unsigned), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(uint16_t), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(uint8_t), 8) +
+      ALIGN_POT((size_t)alloc * sizeof(uint8_t), 8) +
+      8u * ALIGN_POT((size_t)alloc_words * sizeof(BITSET_WORD), 8);
+   uint64_t ra_stack_slab[16384 / sizeof(uint64_t)];
+   uint8_t *ra_slab = ra_slab_bytes <= sizeof(ra_stack_slab)
+                         ? (uint8_t *)ra_stack_slab
+                         : calloc(1, ra_slab_bytes ? ra_slab_bytes : 1);
+   if (ra_slab == (uint8_t *)ra_stack_slab)
+      memset(ra_slab, 0, ra_slab_bytes);
+   uint8_t *ra_cursor = ra_slab;
+#define RA_SLAB_TAKE(type, count)                                              \
+   ({                                                                          \
+      type *_p = (type *)ra_cursor;                                            \
+      ra_cursor += ALIGN_POT((size_t)(count) * sizeof(type), 8);               \
+      _p;                                                                      \
+   })
+   struct phi_web_node *phi_web = RA_SLAB_TAKE(struct phi_web_node, alloc);
+   agx_instr **src_to_collect_phi = RA_SLAB_TAKE(agx_instr *, alloc);
+   enum ra_class *classes = RA_SLAB_TAKE(enum ra_class, alloc);
+   enum agx_size *sizes = RA_SLAB_TAKE(enum agx_size, alloc);
+   unsigned *split_source = RA_SLAB_TAKE(unsigned, alloc);
+   unsigned *definition_order = RA_SLAB_TAKE(unsigned, alloc);
+   uint16_t *ssa_to_reg = RA_SLAB_TAKE(uint16_t, alloc);
+   uint8_t *ncomps = RA_SLAB_TAKE(uint8_t, alloc);
+   uint8_t *ncomps_unrounded = RA_SLAB_TAKE(uint8_t, alloc);
+   BITSET_WORD *visited = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *low_gpr = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *texture_gpr = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *log2_gpr = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *high_gpr = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *tex_low128 = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *early_scalar_export = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+   BITSET_WORD *effectful_use = RA_SLAB_TAKE(BITSET_WORD, alloc_words);
+#undef RA_SLAB_TAKE
+
+   for (unsigned i = 0; i < alloc; ++i) {
       phi_web[i].parent = i;
    }
 
-   uint32_t *phi_edge_owner = calloc(ctx->alloc, sizeof(*phi_edge_owner));
-   agx_foreach_block(ctx, block) {
-      unsigned max_srcs = 0;
-      agx_foreach_phi_in_block(block, phi)
-         max_srcs = MAX2(max_srcs, phi->nr_srcs);
+   if (!list_is_singular(&ctx->blocks)) {
+      uint32_t stack_phi_edge_owner[512];
+      uint32_t *phi_edge_owner =
+         alloc <= ARRAY_SIZE(stack_phi_edge_owner)
+            ? stack_phi_edge_owner
+            : calloc(alloc, sizeof(*phi_edge_owner));
+      if (phi_edge_owner == stack_phi_edge_owner)
+         memset(stack_phi_edge_owner, 0, alloc * sizeof(*phi_edge_owner));
+      agx_foreach_block(ctx, block) {
+         unsigned max_srcs = 0;
+         agx_foreach_phi_in_block(block, phi)
+            max_srcs = MAX2(max_srcs, phi->nr_srcs);
 
-      for (unsigned s = 0; s < max_srcs; ++s) {
-         agx_foreach_phi_in_block(block, phi) {
-            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
-               continue;
-            const uint32_t owner = phi->dest[0].value + 1;
-            const unsigned v = phi->src[s].value;
-            if (phi_edge_owner[v] == 0)
-               phi_edge_owner[v] = owner;
-            else if (phi_edge_owner[v] != owner)
-               phi_edge_owner[v] = UINT32_MAX;
-         }
+         for (unsigned s = 0; s < max_srcs; ++s) {
+            agx_foreach_phi_in_block(block, phi) {
+               if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+                  continue;
+               const uint32_t owner = phi->dest[0].value + 1;
+               const unsigned v = phi->src[s].value;
+               if (phi_edge_owner[v] == 0)
+                  phi_edge_owner[v] = owner;
+               else if (phi_edge_owner[v] != owner)
+                  phi_edge_owner[v] = UINT32_MAX;
+            }
 
-         agx_foreach_phi_in_block(block, phi) {
-            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
-               continue;
-            const unsigned v = phi->src[s].value;
-            if (phi_edge_owner[v] != UINT32_MAX)
-               phi_web_union(phi_web, phi->dest[0].value, v);
-         }
+            agx_foreach_phi_in_block(block, phi) {
+               if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+                  continue;
+               const unsigned v = phi->src[s].value;
+               if (phi_edge_owner[v] != UINT32_MAX)
+                  phi_web_union(phi_web, phi->dest[0].value, v);
+            }
 
-         agx_foreach_phi_in_block(block, phi) {
-            if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
-               continue;
-            phi_edge_owner[phi->src[s].value] = 0;
+            agx_foreach_phi_in_block(block, phi) {
+               if (s >= phi->nr_srcs || phi->src[s].type != AGX_INDEX_NORMAL)
+                  continue;
+               phi_edge_owner[phi->src[s].value] = 0;
+            }
          }
       }
+      if (phi_edge_owner != stack_phi_edge_owner)
+         free(phi_edge_owner);
    }
-   free(phi_edge_owner);
 
    /* Record single-use read-modify-write ALU accumulator chains inside loops
     * so intermediate results stay in their loop-header phi's register when
@@ -4586,22 +4672,7 @@ agx_ra(agx_context *ctx)
       free(defs);
    }
 
-   uint8_t *ncomps = calloc(ctx->alloc, sizeof(uint8_t));
-   uint8_t *ncomps_unrounded = calloc(ctx->alloc, sizeof(uint8_t));
-   enum ra_class *classes = calloc(ctx->alloc, sizeof(enum ra_class));
-   agx_instr **src_to_collect_phi = calloc(ctx->alloc, sizeof(agx_instr *));
-   enum agx_size *sizes = calloc(ctx->alloc, sizeof(enum agx_size));
-   BITSET_WORD *visited = BITSET_CALLOC(ctx->alloc);
-   BITSET_WORD *low_gpr = BITSET_CALLOC(ctx->alloc);
-   unsigned *split_source = calloc(ctx->alloc, sizeof(unsigned));
-   BITSET_WORD *texture_gpr = BITSET_CALLOC(ctx->alloc);
-   BITSET_WORD *log2_gpr = BITSET_CALLOC(ctx->alloc);
-   BITSET_WORD *high_gpr = BITSET_CALLOC(ctx->alloc);
-   BITSET_WORD *tex_low128 = BITSET_CALLOC(ctx->alloc);
    unsigned max_ncomps = 1;
-   unsigned *definition_order = calloc(ctx->alloc, sizeof(unsigned));
-   BITSET_WORD *early_scalar_export = BITSET_CALLOC(ctx->alloc);
-   BITSET_WORD *effectful_use = BITSET_CALLOC(ctx->alloc);
    unsigned instruction_order = 0;
    bool any_enter_query_m5 = false;
    bool any_mem = false;
@@ -4941,15 +5012,30 @@ agx_ra(agx_context *ctx)
     * to a NIR invariant, so we do not need special handling for this.
     */
    BITSET_WORD *dest_read = any_enter_query_m5 ? agx_values_read(ctx) : NULL;
-   uint16_t *ssa_to_reg = calloc(ctx->alloc, sizeof(uint16_t));
    uint16_t *pred_ssa_to_reg =
-      list_length(&ctx->blocks) > 1 ? malloc(ctx->alloc * sizeof(uint16_t))
-                                    : NULL;
+      !list_is_singular(&ctx->blocks) ? malloc(ctx->alloc * sizeof(uint16_t))
+                                      : NULL;
    BITSET_WORD *hdr_phi_targets =
       (any_loop_header && g17p_coread && loop_last && nr_blocks)
          ? calloc((size_t)nr_blocks * BITSET_WORDS(AGX_NUM_REGS),
                   sizeof(BITSET_WORD))
          : NULL;
+
+   BITSET_WORD low_any = 0, tex_any = 0, log2_any = 0, high_any = 0;
+   for (unsigned w = 0; w < alloc_words; ++w) {
+      low_any |= low_gpr[w];
+      tex_any |= texture_gpr[w];
+      log2_any |= log2_gpr[w];
+      high_any |= high_gpr[w];
+   }
+   const bool is_agx3 = agx_isa_is_agx3(ctx->key->dev.encoding);
+   const bool is_agx3b = ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+   const unsigned tex_limit = agx_is_g18g(&ctx->key->dev) ? 64 : 128;
+   const bool any_bank_constrained = is_agx3
+      ? ((is_agx3b && low_any && max_regs > tile_gpr_limit) ||
+         (tex_any && max_regs > tex_limit) ||
+         (is_agx3b && log2_any && max_regs > 192) || high_any != 0)
+      : (low_any || tex_any || log2_any || high_any);
 
    /* Everything assign_local reads below was allocated above, and nothing the
     * cleanup reads is changed after this point, so it survives a longjmp. */
@@ -5011,6 +5097,7 @@ agx_ra(agx_context *ctx)
          .g17p_coread = g17p_coread,
          .g17p_tier_cap = g17p_tier_cap,
          .g17p_has_loop = g17p_has_loop,
+         .any_bank_constrained = any_bank_constrained,
          .bound[RA_GPR] = max_regs,
          .bound[RA_MEM] = mem_bound,
          .count[RA_GPR] = &reg_count,
@@ -5172,28 +5259,13 @@ cleanup:
       }
    }
 
-   free(ssa_to_reg);
    free(pred_ssa_to_reg);
-   free(phi_web);
    free(rmw_phi);
    free(loop_last);
    free(hdr_phi_targets);
    free(g17p_coread);
    util_dynarray_fini(&matrix_groups);
    free(web_matrix_group);
-   free(low_gpr);
-   free(split_source);
-   free(texture_gpr);
-   free(log2_gpr);
-   free(high_gpr);
-   free(tex_low128);
-   free(src_to_collect_phi);
-   free(definition_order);
-   free(early_scalar_export);
-   free(effectful_use);
-   free(ncomps);
-   free(ncomps_unrounded);
-   free(sizes);
-   free(classes);
-   free(visited);
+   if (ra_slab != (uint8_t *)ra_stack_slab)
+      free(ra_slab);
 }

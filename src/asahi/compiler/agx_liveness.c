@@ -76,9 +76,7 @@ agx_compute_liveness(agx_context *ctx)
                liveness_ins_update_dense(dense_live, I);
          }
 
-         unsigned v;
-         BITSET_FOREACH_SET(v, dense_live, ctx->alloc)
-            u_sparse_bitset_set(&blk->live_in, v);
+         u_sparse_bitset_from_dense(&blk->live_in, dense_live, ctx->alloc);
 
          if (dense_live != stack_live)
             free(dense_live);
@@ -96,7 +94,12 @@ agx_compute_liveness(agx_context *ctx)
    if (ctx->num_blocks > 0 && ctx->alloc > 0 &&
        (uint64_t)ctx->num_blocks * words <= 262144) {
       bool valid_indices = true;
-      bool *seen = calloc(ctx->num_blocks, sizeof(bool));
+      bool stack_seen[64];
+      bool *seen = ctx->num_blocks <= ARRAY_SIZE(stack_seen)
+                      ? stack_seen
+                      : calloc(ctx->num_blocks, sizeof(bool));
+      if (seen == stack_seen)
+         memset(stack_seen, 0, ctx->num_blocks * sizeof(bool));
       if (seen) {
          agx_foreach_block(ctx, block) {
             if (block->index >= ctx->num_blocks || seen[block->index]) {
@@ -105,15 +108,27 @@ agx_compute_liveness(agx_context *ctx)
             }
             seen[block->index] = true;
          }
-         free(seen);
+         if (seen != stack_seen)
+            free(seen);
       } else {
          valid_indices = false;
       }
 
       if (valid_indices) {
          const size_t total = (size_t)ctx->num_blocks * words;
-         BITSET_WORD *slab = calloc(4 * total + words, sizeof(BITSET_WORD));
-         bool *has_phi = calloc(ctx->num_blocks, sizeof(bool));
+         const size_t slab_words = 4 * total + words;
+         BITSET_WORD stack_slab[4096];
+         bool stack_has_phi[64];
+         BITSET_WORD *slab = slab_words <= ARRAY_SIZE(stack_slab)
+                                ? stack_slab
+                                : calloc(slab_words, sizeof(BITSET_WORD));
+         bool *has_phi = ctx->num_blocks <= ARRAY_SIZE(stack_has_phi)
+                            ? stack_has_phi
+                            : calloc(ctx->num_blocks, sizeof(bool));
+         if (slab == stack_slab)
+            memset(stack_slab, 0, slab_words * sizeof(BITSET_WORD));
+         if (has_phi == stack_has_phi)
+            memset(stack_has_phi, 0, ctx->num_blocks * sizeof(bool));
          if (slab && has_phi) {
             BITSET_WORD *gen = slab;
             BITSET_WORD *kill = gen + total;
@@ -121,8 +136,29 @@ agx_compute_liveness(agx_context *ctx)
             BITSET_WORD *live_out = live_in + total;
             BITSET_WORD *tmp = live_out + total;
 
-            u_worklist worklist;
-            u_worklist_init(&worklist, ctx->num_blocks, NULL);
+            const unsigned wl_cap = ctx->num_blocks;
+            agx_block *stack_wl_entries[128];
+            BITSET_DECLARE(stack_wl_present, 128);
+            agx_block **wl_entries =
+               wl_cap <= ARRAY_SIZE(stack_wl_entries)
+                  ? stack_wl_entries
+                  : malloc(wl_cap * sizeof(agx_block *));
+            BITSET_WORD *wl_present =
+               wl_cap <= 128 ? stack_wl_present : BITSET_CALLOC(wl_cap);
+            if (!wl_entries || !wl_present) {
+               if (wl_entries != stack_wl_entries)
+                  free(wl_entries);
+               if (wl_present != stack_wl_present)
+                  free(wl_present);
+               if (slab != stack_slab)
+                  free(slab);
+               if (has_phi != stack_has_phi)
+                  free(has_phi);
+               goto slow_path;
+            }
+            if (wl_present == stack_wl_present)
+               memset(stack_wl_present, 0, BITSET_BYTES(wl_cap));
+            unsigned wl_count = 0, wl_start = 0;
 
             agx_foreach_block(ctx, block) {
                const unsigned b = block->index;
@@ -146,12 +182,20 @@ agx_compute_liveness(agx_context *ctx)
                   }
                }
 
-               agx_worklist_push_head(&worklist, block);
+               if (!BITSET_TEST(wl_present, b)) {
+                  wl_start = (wl_start + wl_cap - 1) % wl_cap;
+                  wl_entries[wl_start] = block;
+                  wl_count++;
+                  BITSET_SET(wl_present, b);
+               }
             }
 
-            while (!u_worklist_is_empty(&worklist)) {
-               agx_block *blk = agx_worklist_pop_head(&worklist);
+            while (wl_count > 0) {
+               agx_block *blk = wl_entries[wl_start];
+               wl_start = (wl_start + 1) % wl_cap;
+               wl_count--;
                const unsigned b = blk->index;
+               BITSET_CLEAR(wl_present, b);
                const BITSET_WORD *gb = gen + (size_t)b * words;
                const BITSET_WORD *kb = kill + (size_t)b * words;
                BITSET_WORD *in_b = live_in + (size_t)b * words;
@@ -197,8 +241,11 @@ agx_compute_liveness(agx_context *ctx)
                      }
                   }
 
-                  if (changed)
-                     agx_worklist_push_tail(&worklist, *pred);
+                  if (changed && !BITSET_TEST(wl_present, p)) {
+                     wl_entries[(wl_start + wl_count) % wl_cap] = *pred;
+                     wl_count++;
+                     BITSET_SET(wl_present, p);
+                  }
                }
             }
 
@@ -219,22 +266,28 @@ agx_compute_liveness(agx_context *ctx)
                }
                assert(memcmp(tmp, in_b, words * sizeof(BITSET_WORD)) == 0);
 
-               unsigned v;
-               BITSET_FOREACH_SET(v, in_b, ctx->alloc)
-                  u_sparse_bitset_set(&block->live_in, v);
-               BITSET_FOREACH_SET(v, out_b, ctx->alloc)
-                  u_sparse_bitset_set(&block->live_out, v);
+               u_sparse_bitset_from_dense(&block->live_in, in_b, ctx->alloc);
+               u_sparse_bitset_from_dense(&block->live_out, out_b, ctx->alloc);
             }
 
-            u_worklist_fini(&worklist);
-            free(slab);
-            free(has_phi);
+            if (wl_entries != stack_wl_entries)
+               free(wl_entries);
+            if (wl_present != stack_wl_present)
+               free(wl_present);
+            if (slab != stack_slab)
+               free(slab);
+            if (has_phi != stack_has_phi)
+               free(has_phi);
             return;
          }
-         free(slab);
-         free(has_phi);
+         if (slab != stack_slab)
+            free(slab);
+         if (has_phi != stack_has_phi)
+            free(has_phi);
       }
    }
+
+slow_path:;
 
    BITSET_DECLARE(stack_live, 4096);
    BITSET_WORD *dense_live =
@@ -271,9 +324,7 @@ agx_compute_liveness(agx_context *ctx)
 
       u_sparse_bitset_free(&blk->live_in);
       u_sparse_bitset_init(&blk->live_in, ctx->alloc, blk);
-      unsigned v;
-      BITSET_FOREACH_SET(v, dense_live, ctx->alloc)
-         u_sparse_bitset_set(&blk->live_in, v);
+      u_sparse_bitset_from_dense(&blk->live_in, dense_live, ctx->alloc);
 
       bool has_phi = false;
       agx_foreach_phi_in_block(blk, phi) {

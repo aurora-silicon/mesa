@@ -671,7 +671,8 @@ int main(void)
    {
       const uint16_t tokens[] = {
          0, AGX3_SLOT_GPR_TOKENS - 1, AGX3_SLOT_TPS_TOKEN_BASE,
-         AGX3_SLOT_TEX_COORD_TOKEN - 1, AGX3_SLOT_TEX_COORD_TOKEN,
+         AGX3_SLOT_TPS_TOKEN_BASE + AGX3_SLOT_TPS_HALF_TOKENS - 1,
+         AGX3_SLOT_TEX_COORD_TOKEN,
          AGX3_SLOT_DYNAMIC_TPS_TOKEN,
       };
       for (unsigned t = 0; t < sizeof(tokens) / sizeof(tokens[0]); ++t) {

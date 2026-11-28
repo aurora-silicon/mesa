@@ -64,6 +64,8 @@ mark_src_live(const nir_src *src, BITSET_WORD *defs_live)
 
 struct loop_state {
    bool header_phis_changed;
+   bool first_iter;
+   bool any_dead;
    nir_block *preheader;
 };
 
@@ -199,10 +201,16 @@ dce_block(nir_block *block, BITSET_WORD *defs_live, struct loop_state *loop,
    if (!loop->preheader)
       return dce_block_no_loop(block, defs_live, dead_instrs);
 
+   const bool first_iter = loop->first_iter;
    bool phis_changed = false;
+   bool any_dead = false;
    nir_foreach_instr_reverse_safe(instr, block) {
-      instr->pass_flags = is_live_and_mark_sources(defs_live, instr, loop,
-                                                   &phis_changed);
+      if (!first_iter && instr->pass_flags)
+         continue;
+      bool live = is_live_and_mark_sources(defs_live, instr, loop,
+                                           &phis_changed);
+      instr->pass_flags = live;
+      any_dead |= !live;
    }
 
    /* Because blocks are visited in reverse and this stomps header_phis_changed,
@@ -210,8 +218,107 @@ dce_block(nir_block *block, BITSET_WORD *defs_live, struct loop_state *loop,
     * setting header_phis_changed.
     */
    loop->header_phis_changed = phis_changed;
+   loop->any_dead |= any_dead;
 
    return false;
+}
+
+static bool
+cf_list_has_back_edge_loop(struct exec_list *cf_list)
+{
+   foreach_list_typed(nir_cf_node, cf_node, node, cf_list) {
+      if (cf_node->type == nir_cf_node_loop) {
+         nir_loop *loop = nir_cf_node_as_loop(cf_node);
+         if (nir_loop_has_back_edge(loop) ||
+             cf_list_has_back_edge_loop(&loop->body))
+            return true;
+      } else if (cf_node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(cf_node);
+         if (cf_list_has_back_edge_loop(&nif->then_list) ||
+             cf_list_has_back_edge_loop(&nif->else_list))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+dce_block_no_backedge(nir_block *block, struct exec_list *dead_instrs)
+{
+   bool progress = false;
+   nir_foreach_instr_reverse_safe(instr, block) {
+      bool live;
+      switch (instr->type) {
+      case nir_instr_type_alu:
+         live = !nir_def_is_unused(&nir_instr_as_alu(instr)->def);
+         break;
+      case nir_instr_type_load_const:
+         live = !nir_def_is_unused(&nir_instr_as_load_const(instr)->def);
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+         const nir_intrinsic_info *info =
+            &nir_intrinsic_infos[intrin->intrinsic];
+         live = !(info->flags & NIR_INTRINSIC_CAN_ELIMINATE) ||
+                (info->has_dest && !nir_def_is_unused(&intrin->def));
+         break;
+      }
+      case nir_instr_type_tex:
+         live = !nir_def_is_unused(&nir_instr_as_tex(instr)->def);
+         break;
+      case nir_instr_type_deref:
+         live = !nir_def_is_unused(&nir_instr_as_deref(instr)->def);
+         break;
+      case nir_instr_type_phi:
+         live = !nir_def_is_unused(&nir_instr_as_phi(instr)->def);
+         break;
+      case nir_instr_type_undef:
+         live = !nir_def_is_unused(&nir_instr_as_undef(instr)->def);
+         break;
+      case nir_instr_type_jump:
+      case nir_instr_type_call:
+      case nir_instr_type_cmat_call:
+         live = true;
+         break;
+      default:
+         UNREACHABLE("unexpected instr type");
+      }
+      if (!live) {
+         remove_instr(instr, dead_instrs);
+         progress = true;
+      }
+   }
+   return progress;
+}
+
+static bool
+dce_cf_list_no_backedge(struct exec_list *cf_list, struct exec_list *dead_instrs)
+{
+   bool progress = false;
+   foreach_list_typed_reverse(nir_cf_node, cf_node, node, cf_list) {
+      switch (cf_node->type) {
+      case nir_cf_node_block:
+         progress |=
+            dce_block_no_backedge(nir_cf_node_as_block(cf_node), dead_instrs);
+         break;
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(cf_node);
+         progress |= dce_cf_list_no_backedge(&nif->else_list, dead_instrs);
+         progress |= dce_cf_list_no_backedge(&nif->then_list, dead_instrs);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(cf_node);
+         assert(!nir_loop_has_continue_construct(loop));
+         assert(!nir_loop_has_back_edge(loop));
+         progress |= dce_cf_list_no_backedge(&loop->body, dead_instrs);
+         break;
+      }
+      case nir_cf_node_function:
+         UNREACHABLE("Invalid cf type");
+      }
+   }
+   return progress;
 }
 
 static bool
@@ -240,6 +347,7 @@ dce_cf_list(struct exec_list *cf_list, BITSET_WORD *defs_live,
          struct loop_state inner_state;
          inner_state.preheader = nir_cf_node_as_block(nir_cf_node_prev(cf_node));
          inner_state.header_phis_changed = false;
+         inner_state.first_iter = !parent_loop->preheader || parent_loop->first_iter;
 
          /* Fast path if the loop has no continues: we can remove instructions
           * as we mark the others live.
@@ -254,7 +362,9 @@ dce_cf_list(struct exec_list *cf_list, BITSET_WORD *defs_live,
             /* dce_cf_list() resets inner_state.header_phis_changed itself, so
              * it doesn't have to be done here.
              */
+            inner_state.any_dead = false;
             dce_cf_list(&loop->body, defs_live, &inner_state, dead_instrs);
+            inner_state.first_iter = false;
          } while (inner_state.header_phis_changed);
 
          /* We don't know how many times mark_cf_list() will repeat, so
@@ -263,7 +373,9 @@ dce_cf_list(struct exec_list *cf_list, BITSET_WORD *defs_live,
           * By checking parent_loop->preheader, we ensure that we only do this
           * walk for the outer-most loops so it only happens once.
           */
-         if (!parent_loop->preheader) {
+         if (parent_loop->preheader) {
+            parent_loop->any_dead |= inner_state.any_dead;
+         } else if (inner_state.any_dead) {
             nir_foreach_block_in_cf_node(block, cf_node) {
                nir_foreach_instr_safe(instr, block) {
                   if (!instr->pass_flags) {
@@ -288,26 +400,37 @@ nir_opt_dce_impl(nir_function_impl *impl)
 {
    assert(impl->structured);
 
-   BITSET_DECLARE(stack_live, 4096);
-   BITSET_WORD *defs_live;
-   if (impl->ssa_alloc <= 4096) {
-      memset(stack_live, 0, BITSET_BYTES(impl->ssa_alloc));
-      defs_live = stack_live;
-   } else {
-      defs_live = BITSET_RZALLOC(NULL, impl->ssa_alloc);
-   }
-
    struct exec_list dead_instrs;
    exec_list_make_empty(&dead_instrs);
 
-   struct loop_state loop;
-   loop.preheader = NULL;
-   bool progress = dce_cf_list(&impl->body, defs_live, &loop, &dead_instrs);
+   bool progress;
+   if (!cf_list_has_back_edge_loop(&impl->body)) {
+      /* Without back-edge loops the def-use graph is acyclic: walking in
+       * reverse CF order removes dead instructions via use-list emptiness
+       * directly, avoiding the liveness bitset and live source scans. */
+      progress = dce_cf_list_no_backedge(&impl->body, &dead_instrs);
+   } else {
+      BITSET_DECLARE(stack_live, 4096);
+      BITSET_WORD *defs_live;
+      if (impl->ssa_alloc <= 4096) {
+         memset(stack_live, 0, BITSET_BYTES(impl->ssa_alloc));
+         defs_live = stack_live;
+      } else {
+         defs_live = BITSET_RZALLOC(NULL, impl->ssa_alloc);
+      }
 
-   if (defs_live != stack_live)
-      ralloc_free(defs_live);
+      struct loop_state loop;
+      loop.preheader = NULL;
+      loop.first_iter = true;
+      loop.any_dead = false;
+      progress = dce_cf_list(&impl->body, defs_live, &loop, &dead_instrs);
 
-   nir_instr_free_list(&dead_instrs);
+      if (defs_live != stack_live)
+         ralloc_free(defs_live);
+   }
+
+   if (progress)
+      nir_instr_free_list(&dead_instrs);
 
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
