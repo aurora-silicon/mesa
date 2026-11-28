@@ -8,7 +8,6 @@
  * - Constant-bound inline uniform blocks (both <= 64 KiB and > 64 KiB) must
  *   stay on explicit I/O so byte-exact bounds checks are preserved.
  */
-#undef NDEBUG
 #include "hk_shader.h"
 #include "asahi/compiler/agx_compile.h"
 #include "asahi/lib/agx_abi.h"
