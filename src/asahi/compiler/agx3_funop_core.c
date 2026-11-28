@@ -158,8 +158,32 @@ agx3_funop_encode_impl(enum agx_isa_encoding enc, enum agx3_funop op, uint16_t d
         (op == AGX3_FUNOP_SQRT_STEP && (dest_16 || src_neg || saturate))))
       return false;
 
-   /* Native scalar half registers may be odd; float registers are pairs. */
-   if (dest >= 128 || src >= 128 || (!dest_16 && (dest & 1)) ||
+   /* Native scalar half registers may be odd; float registers are pairs,
+    * so a 32-bit h254 operand encodes as h254:h255 and a 32-bit h255 is
+    * refused.
+    *
+    * The runtime entry point (agx3_funop_encode_runtime() /
+    * agx3_funop_encode_g17g()) admits the full eight-bit half-index
+    * namespace (h0-h255) that the AGX3C packers, including
+    * agx3_alu_unary_m5(), already use. The encoder helper itself supports
+    * all five G17-class scalar register unary forms -- f32rint (including
+    * AGX3_FUNOP_RINT), f32log2, f32exp2, f32rsqrt and f32sqrtstep -- each
+    * of which deposits all of the destination and source index bits
+    * identically in the AGX3C and AGX3D (G18G) tables. In production,
+    * agx3_emit_funop() routes only G18G f32log2, f32exp2, f32rsqrt and
+    * f32sqrtstep here (all four rounding ops fall through to
+    * agx3_alu_unary_m5(), and SRSQRT and unsaturated RSQRT are caught
+    * earlier in agx3_pack_binary.c by separate ALU helpers). Encodable is not
+    * allocatable: RA caps AGX3C and AGX3D at 252 halves (AGX3C_NUM_REGS,
+    * AGX3D_NUM_REGS), so h252-h255 only occur in encoder tests.
+    *
+    * The legacy entry point, agx3_funop_encode_source_lifetime(), keeps its
+    * 128-half limit. It serves the fixed AGX3B/AGX3C replay forms and the
+    * remaining qualified production forms, and RA constrains the SSA webs of
+    * those forms to the low bank (texture_gpr in agx_register_allocate.c), so
+    * 128 is the contract those forms are allocated against. */
+   const unsigned nr_regs = runtime ? 256 : 128;
+   if (dest >= nr_regs || src >= nr_regs || (!dest_16 && (dest & 1)) ||
        (!src_16 && (src & 1)))
       return false;
 

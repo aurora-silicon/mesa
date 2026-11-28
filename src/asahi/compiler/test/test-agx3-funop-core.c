@@ -14,6 +14,7 @@
  */
 
 #include "agx3_funop_core.h"
+#include "agx3_compose/agx3_decode.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -313,6 +314,57 @@ main(void)
    expect_refused("register out of range",
                   agx3_funop_encode(AGX_ISA_ENCODING_AGX3B, AGX3_FUNOP_FLOOR,
                                     128, 0, false, false, false, 0, b, &len));
+
+   /* The runtime path (G17G, G18G) takes every half register. Decode each
+    * word with the G18G table and check the registers it names, so a field
+    * bit the AGX3D encoding places differently from AGX3C fails here. */
+   static const struct {
+      enum agx3_funop op;
+      enum agx3_mnemonic mnemonic;
+      bool half;
+   } high_ops[] = {
+      {AGX3_FUNOP_FLOOR, AGX3_MN_f32rint, false},
+      {AGX3_FUNOP_CEIL, AGX3_MN_f32rint, false},
+      {AGX3_FUNOP_TRUNC, AGX3_MN_f32rint, false},
+      {AGX3_FUNOP_LOG2, AGX3_MN_f32log2, false},
+      {AGX3_FUNOP_EXP2, AGX3_MN_f32exp2, false},
+      {AGX3_FUNOP_LOG2, AGX3_MN_f32log2, true},
+      {AGX3_FUNOP_EXP2, AGX3_MN_f32exp2, true},
+      {AGX3_FUNOP_RSQRT, AGX3_MN_f32rsqrt, false},
+      {AGX3_FUNOP_RSQRT, AGX3_MN_f32rsqrt, true},
+      {AGX3_FUNOP_SQRT_STEP, AGX3_MN_f32sqrtstep, false},
+   };
+   for (unsigned i = 0; i < sizeof(high_ops) / sizeof(high_ops[0]); ++i) {
+      const unsigned step = high_ops[i].half ? 1 : 2;
+      for (unsigned reg = 0; reg < 256; reg += step) {
+         const uint16_t dest = reg, src = (reg + 130 * step) % 256;
+         const struct agx3_funop_runtime runtime = {
+            .src_cache = reg & 4,
+            .dest_16 = high_ops[i].half,
+            .src_16 = high_ops[i].half,
+         };
+         checks++;
+         uint64_t fields[AGX3_MAX_FIELDS];
+         if (!agx3_funop_encode_g17g(high_ops[i].op, dest, src, false, false,
+                                     false, reg & 1 ? 0x80 : 0, &runtime, b,
+                                     &len) ||
+             agx3_decode(&agx3d_table, b, len, high_ops[i].mnemonic,
+                         fields) < 0 ||
+             fields[2] != dest || fields[18] != src) {
+            fprintf(stderr, "%s dest %u src %u: not encoded for G18G\n",
+                    agx3_mnemonic_name(high_ops[i].mnemonic), dest, src);
+            failures++;
+         }
+      }
+   }
+   expect_refused("runtime register out of range",
+                  agx3_funop_encode_g17g(AGX3_FUNOP_FLOOR, 256, 0, false,
+                    false, false, 0, &(struct agx3_funop_runtime){0}, b,
+                    &len));
+   expect_refused("runtime 32-bit register pair past h255",
+                  agx3_funop_encode_g17g(AGX3_FUNOP_FLOOR, 255, 0, false,
+                    false, false, 0, &(struct agx3_funop_runtime){0}, b,
+                    &len));
 
    if (failures) {
       fprintf(stderr, "agx3_funop_core: %u/%u checks failed\n", failures,
