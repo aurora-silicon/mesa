@@ -5174,11 +5174,18 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
             : 256u;
       const uint64_t min_wgs =
          MAX2(256ull, 4ull * agx_get_num_cores(&dev->dev));
+      /* Larger multi-row workgroups on HAL200 can save compute time while
+       * delaying the next render. Keep the launch granularity for tiled
+       * dispatches with a recorded dependency on an earlier render. */
+      const bool render_dependent =
+         agx_chip_native_hal200(dev->dev.chip) && local_size.y > 1 &&
+         cs->sync.dep[HK_SYNC_VDM].cut;
       uint16_t reshaped[3];
-      if (hk_coalesce_workgroup_size_ex(
-             selected->b.info.workgroup_size, grid.count,
-             dev->vk.physical->properties.maxComputeWorkGroupSize, max_wg,
-             target_wg, min_wgs, reshaped) ||
+      if ((!render_dependent &&
+           hk_coalesce_workgroup_size_ex(
+              selected->b.info.workgroup_size, grid.count,
+              dev->vk.physical->properties.maxComputeWorkGroupSize, max_wg,
+              target_wg, min_wgs, reshaped)) ||
           hk_split_workgroup_size_ex(
              selected->b.info.workgroup_size, grid.count,
              2ull * agx_get_num_cores(&dev->dev), reshaped)) {
