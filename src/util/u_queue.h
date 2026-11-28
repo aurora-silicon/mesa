@@ -51,6 +51,12 @@ extern "C" {
 #define UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY      (1 << 0)
 #define UTIL_QUEUE_INIT_RESIZE_IF_FULL            (1 << 1)
 #define UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY  (1 << 2)
+/* The thread that adds jobs waits for this queue's thread on the critical
+ * path (e.g. a driver thread that the application thread hands every draw
+ * to). On CPUs of different capacity, keep the queue's threads on the big
+ * ones.
+ */
+#define UTIL_QUEUE_INIT_PREFER_BIG_CPUS           (1 << 3)
 
 #if UTIL_FUTEX_SUPPORTED
 #define UTIL_QUEUE_FENCE_FUTEX

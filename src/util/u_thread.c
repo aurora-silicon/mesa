@@ -27,6 +27,14 @@
 #include <windows.h>
 #endif
 
+#if DETECT_OS_LINUX
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
+
 #ifdef __FreeBSD__
 #define cpu_set_t cpuset_t
 #endif
@@ -42,6 +50,100 @@ util_get_current_cpu(void)
 
 #else
    return -1;
+#endif
+}
+
+#if DETECT_OS_LINUX && defined(SYS_sched_getattr) && defined(SYS_sched_setattr)
+/* struct sched_attr of sched_setattr(2), up to the utilisation clamps. */
+struct util_sched_attr {
+   uint32_t size;
+   uint32_t sched_policy;
+   uint64_t sched_flags;
+   int32_t sched_nice;
+   uint32_t sched_priority;
+   uint64_t sched_runtime;
+   uint64_t sched_deadline;
+   uint64_t sched_period;
+   uint32_t sched_util_min;
+   uint32_t sched_util_max;
+};
+
+#define UTIL_SCHED_FLAG_RESET_ON_FORK  0x01
+#define UTIL_SCHED_FLAG_KEEP_POLICY    0x08
+#define UTIL_SCHED_FLAG_KEEP_PARAMS    0x10
+#define UTIL_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+
+/* Whether the calling thread is known to run without a seccomp filter.
+ *
+ * Seccomp filters are per thread, so this reads the thread's own status, not
+ * the process's (/proc/self is the main thread). When the status cannot be
+ * read (no /proc, or a sandbox that denies the open) the answer is no.
+ */
+static bool
+util_thread_has_no_seccomp(void)
+{
+   FILE *f = fopen("/proc/thread-self/status", "re");
+   bool none = false;
+   char line[128];
+
+   if (!f)
+      return false;
+
+   while (fgets(line, sizeof(line), f)) {
+      if (strncmp(line, "Seccomp:", 8) == 0) {
+         char *end;
+         long mode = strtol(line + 8, &end, 10);
+
+         none = end != line + 8 && mode == 0;
+         break;
+      }
+   }
+
+   fclose(f);
+   return none;
+}
+#endif
+
+bool
+util_thread_raise_min_util_clamp(unsigned util_min)
+{
+   if (!util_min)
+      return true;
+
+#if DETECT_OS_LINUX && defined(SYS_sched_getattr) && defined(SYS_sched_setattr)
+   /* Chromium's GPU process sends sched_getattr and sched_setattr to SIGSYS
+    * even for the calling thread, and a queue can create a thread after the
+    * sandbox is up.
+    */
+   if (!util_thread_has_no_seccomp())
+      return false;
+
+   struct util_sched_attr attr;
+   memset(&attr, 0, sizeof(attr));
+   if (syscall(SYS_sched_getattr, 0, &attr, sizeof(attr), 0) != 0)
+      return false;
+
+   if (attr.sched_util_min >= util_min)
+      return true;
+
+   /* Keep the policy and its parameters (the ones just read, so that an RT
+    * or deadline thread passes the parameter checks too) and only change the
+    * minimum clamp. With KEEP_POLICY the kernel also keeps the thread's
+    * reset-on-fork setting, so threads it creates later inherit what they
+    * did before. The kernel rejects a minimum above the thread's maximum
+    * clamp, which is then kept as well.
+    */
+   attr.size = sizeof(attr);
+   attr.sched_flags = (attr.sched_flags & UTIL_SCHED_FLAG_RESET_ON_FORK) |
+                      UTIL_SCHED_FLAG_KEEP_POLICY |
+                      UTIL_SCHED_FLAG_KEEP_PARAMS |
+                      UTIL_SCHED_FLAG_UTIL_CLAMP_MIN;
+   attr.sched_util_min = util_min;
+
+   /* Kernels without CONFIG_UCLAMP_TASK return EOPNOTSUPP. */
+   return syscall(SYS_sched_setattr, 0, &attr, 0) == 0;
+#else
+   return false;
 #endif
 }
 
