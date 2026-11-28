@@ -329,7 +329,8 @@ asahi_fill_vdm_command(struct hk_device *dev, struct hk_cs *cs,
    c->isp_bgobjdepth = cs->cr.isp_bgobjdepth;
    c->isp_bgobjvals = cs->cr.isp_bgobjvals;
 
-   static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control));
+   static_assert(sizeof(c->zls_ctrl) == sizeof(cs->cr.zls_control),
+                 "Queued and recorded ZLS control sizes must match");
    memcpy(&c->zls_ctrl, &cs->cr.zls_control, sizeof(cs->cr.zls_control));
 
    const bool g18g = dev->dev.chip == AGX_CHIP_G18G;
@@ -5311,6 +5312,7 @@ struct hk_pack_fuse_plan {
    struct hk_exp_dw_a_push exp_dw_a_push;
    struct hk_dual_gemm_dw_push gemm_dw_push;
    struct hk_dual_gemm_dw_proj_push gemm_dw_proj_push;
+   struct hk_sobel_nms_push sobel_nms_push;
 };
 
 static bool
@@ -5801,7 +5803,8 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             const struct hk_compute_pair_dispatch *p = members[i].cs->compute_pair;
             if ((p->info.role == HK_COMPUTE_PAIR_DEPTHWISE ||
                  p->info.role == HK_COMPUTE_PAIR_GEMM ||
-                 p->info.role == HK_COMPUTE_PAIR_FADD) &&
+                 p->info.role == HK_COMPUTE_PAIR_FADD ||
+                 p->info.role == HK_COMPUTE_PAIR_SOBEL3X3) &&
                 AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE > members[i].bytes) {
                members[i].bytes = AGX3_G17P_NATIVE_COMPUTE_DISPATCH_SIZE;
             }
@@ -5848,6 +5851,66 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
             const struct hk_compute_pair_dispatch *p = cs_i->compute_pair;
             if (p->info.role == HK_COMPUTE_PAIR_SELF_COPY) {
                plans[i].is_self_copy = true;
+               continue;
+            }
+            if (p->info.role == HK_COMPUTE_PAIR_SOBEL3X3) {
+               /* A Sobel and the Canny NMS right after it run as one
+                * dispatch (hk_nir_build_sobel_nms()). */
+               const unsigned k = i + 1;
+               struct hk_sobel_nms_push nms_push;
+               if (k >= end || planned_suppressed[k] || !members[k].cs ||
+                   !hk_compute_pair_stream_eligible(members[k].cs) ||
+                   !hk_compute_pair_canny_match(p, members[k].cs->compute_pair,
+                                                &nms_push))
+                  continue;
+
+               struct hk_shader *cand = p->producer->variants[0].shader;
+               if (!hk_fused_compute_shader_eligible(dev, cand, p))
+                  continue;
+
+               uint64_t replaced_work = 0;
+               unsigned replaced_loops = 0;
+               for (unsigned j = i; j <= k; ++j) {
+                  replaced_work =
+                     members[j].cs->pack_static_work > UINT64_MAX - replaced_work
+                        ? UINT64_MAX
+                        : replaced_work + members[j].cs->pack_static_work;
+                  if (members[j].cs->pack_loops && !members[j].obs_ns)
+                     replaced_loops++;
+               }
+               const uint64_t threads = (uint64_t)p->exec_threads[0] *
+                                        p->exec_threads[1] * p->exec_threads[2];
+               uint64_t fused_work = 0, new_run_work = 0;
+               unsigned new_run_loops = 0;
+               const bool fused_loops = hk_pack_account_dispatch_work_eff_limit(
+                  threads, cand->b.info.stats.instrs, cand->b.info.has_loops, 0,
+                  limits.max_static_work, &fused_work);
+               if (!hk_pack_fusion_fits_run_limit(run_work, run_loops, replaced_work,
+                                                  replaced_loops, fused_work,
+                                                  fused_loops, limits.max_static_work,
+                                                  &new_run_work, &new_run_loops))
+                  continue;
+
+               run_work = new_run_work;
+               run_loops = new_run_loops;
+               plans[i] = (struct hk_pack_fuse_plan){
+                  .shader = cand,
+                  .dual_write = HK_COMPUTE_PAIR_DUAL_CANNY_NMS,
+                  .span = 2,
+                  .dual_idx_off = 1,
+                  .orig_loops = (uint8_t)MIN2(replaced_loops, 255u),
+                  .fused_loops = fused_loops ? 1u : 0u,
+                  .ioto_bound = (uint16_t)MIN2(
+                     hk_fused_compute_ioto_bound(dev, cand, p), UINT16_MAX),
+                  .orig_work = replaced_work,
+                  .fused_work = fused_work,
+                  .sobel_nms_push = nms_push,
+               };
+               planned_suppressed[k] = true;
+               fused_cand_count++;
+               ioto_total_est += plans[i].ioto_bound;
+               root_cand_count++;
+               i = k;
                continue;
             }
             if ((p->info.role != HK_COMPUTE_PAIR_DEPTHWISE &&
@@ -7427,7 +7490,10 @@ hk_pack_runs(struct hk_device *dev, struct hk_queue *queue,
                         : p_disp->info.role == HK_COMPUTE_PAIR_FADD
                              ? p_disp->info.fadd.push_bytes
                              : p_disp->info.gemm.push_bytes;
-                  if (pl->dual_write != HK_COMPUTE_PAIR_DUAL_NONE) {
+                  if (pl->dual_write == HK_COMPUTE_PAIR_DUAL_CANNY_NMS) {
+                     memcpy(rt->push + HK_SOBEL_NMS_PUSH_OFFSET_B,
+                            &pl->sobel_nms_push, sizeof(pl->sobel_nms_push));
+                  } else if (pl->dual_write != HK_COMPUTE_PAIR_DUAL_NONE) {
                      const struct hk_cmd_buffer *d_src =
                         (const void *)submit->command_buffers[idx + pl->dual_idx_off];
                      const struct hk_cs *d_cs =

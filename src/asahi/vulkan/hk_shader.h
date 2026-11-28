@@ -547,6 +547,10 @@ struct hk_byte_stencil_variant {
 struct hk_2d_stencil_variant {
    struct hk_2d_stencil_plan plan;
    struct hk_shader shader;
+   /* For a Sobel plan, the fused Sobel + Canny NMS kernel
+    * (hk_nir_build_sobel_nms()) the queue may run in place of this Sobel
+    * and the NMS after it. */
+   struct hk_compute_pair_producer *sobel_nms;
 };
 
 struct hk_compute_opt_variant {

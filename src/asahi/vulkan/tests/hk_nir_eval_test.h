@@ -216,6 +216,11 @@ hk_eval_alu(struct hk_eval_env *env, const nir_alu_instr *alu)
          case nir_op_ushr:
             r = (bs == 64) ? (s0 >> (s1 & 63)) : ((uint32_t)s0 >> (s1 & 31));
             break;
+         case nir_op_ubitfield_extract: {
+            const uint32_t off = (uint32_t)s1 & 31, bits = (uint32_t)s2 & 31;
+            r = bits ? ((uint32_t)s0 >> off) & ((1u << bits) - 1u) : 0;
+            break;
+         }
          case nir_op_iand:
             r = (bs == 1) ? ((s0 & 1) & (s1 & 1)) : (s0 & s1);
             break;
@@ -478,9 +483,19 @@ hk_eval_block(struct hk_eval_env *env, nir_block *block, nir_block **prev_block)
             nir_deref_instr *parent = nir_deref_instr_parent(d);
             uint64_t base = hk_eval_read_ssa(env, d->parent.ssa, 0);
             int64_t idx = (int64_t)(int32_t)(uint32_t)hk_eval_read_ssa(env, d->arr.index.ssa, 0);
-            uint32_t stride = hk_eval_type_stride(parent->type);
+            /* An index into a vector picks a component. */
+            uint32_t stride = glsl_type_is_vector(parent->type)
+                                 ? glsl_get_bit_size(parent->type) / 8
+                                 : hk_eval_type_stride(parent->type);
             HK_EVAL_CHECK(idx >= 0);
             addr = base + (uint64_t)idx * stride;
+            break;
+         }
+         case nir_deref_type_ptr_as_array: {
+            uint64_t base = hk_eval_read_ssa(env, d->parent.ssa, 0);
+            int64_t idx = (int64_t)(int32_t)(uint32_t)hk_eval_read_ssa(env, d->arr.index.ssa, 0);
+            HK_EVAL_CHECK(idx >= 0);
+            addr = base + (uint64_t)idx * nir_deref_instr_array_stride(d);
             break;
          }
          default:
@@ -928,9 +943,19 @@ hk_wg_step_thread(struct hk_wg_thread *thr, uint8_t *shared_mem,
             nir_deref_instr *parent = nir_deref_instr_parent(d);
             uint64_t base = hk_eval_read_ssa(env, d->parent.ssa, 0);
             int64_t idx = (int64_t)(int32_t)(uint32_t)hk_eval_read_ssa(env, d->arr.index.ssa, 0);
-            uint32_t stride = hk_eval_type_stride(parent->type);
+            /* An index into a vector picks a component. */
+            uint32_t stride = glsl_type_is_vector(parent->type)
+                                 ? glsl_get_bit_size(parent->type) / 8
+                                 : hk_eval_type_stride(parent->type);
             HK_EVAL_CHECK(idx >= 0);
             addr = base + (uint64_t)idx * stride;
+            break;
+         }
+         case nir_deref_type_ptr_as_array: {
+            uint64_t base = hk_eval_read_ssa(env, d->parent.ssa, 0);
+            int64_t idx = (int64_t)(int32_t)(uint32_t)hk_eval_read_ssa(env, d->arr.index.ssa, 0);
+            HK_EVAL_CHECK(idx >= 0);
+            addr = base + (uint64_t)idx * nir_deref_instr_array_stride(d);
             break;
          }
          default:

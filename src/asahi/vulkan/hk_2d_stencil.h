@@ -111,4 +111,54 @@ bool hk_2d_stencil_validate_dispatch(
    uint32_t base_z, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
    uint32_t *out_groups_x, uint32_t *out_groups_y);
 
+/* Fused 3x3 Sobel + Canny non-maximum suppression.
+ *
+ * hk_nir_build_sobel_nms() builds, for a matched HK_2D_STENCIL_SOBEL_3X3_U8
+ * plan, one kernel that runs a Sobel dispatch and the Canny NMS dispatch that
+ * reads its dir and mag outputs (HK_COMPUTE_OPT_CANNY_NMS_U8). It keeps the
+ * Sobel tiling (128x8 pixels, 256 threads) and writes dir and mag exactly as
+ * the tiled Sobel does, so any later reader sees the same bytes. It also
+ * computes the magnitude of a one-pixel ring around the tile into workgroup
+ * memory and evaluates NMS from there, so mag and dir are never read back.
+ *
+ * The NMS inputs the Sobel's descriptors do not carry come in a
+ * struct hk_sobel_nms_push at HK_SOBEL_NMS_PUSH_OFFSET_B of the push
+ * constants. The queue writes it into a submission-owned root table when it
+ * replaces a Sobel command buffer and the NMS command buffer right after it
+ * (hk_compute_pair_canny_match()).
+ */
+struct hk_sobel_nms_push {
+   uint32_t dst_va_lo;
+   uint32_t dst_va_hi;
+   /* The NMS plan's direction tables and thresholds
+    * (hk_compute_opt_plan::params[0..3]). */
+   uint32_t dx_lut;
+   uint32_t dy_lut;
+   uint32_t low_bits;
+   uint32_t high_bits;
+};
+
+#define HK_SOBEL_NMS_PUSH_OFFSET_B 224u
+
+/* Whether hk_nir_build_sobel_nms() supports `plan`: a Sobel plan whose push
+ * constants all lie below HK_SOBEL_NMS_PUSH_OFFSET_B. */
+bool hk_2d_stencil_sobel_nms_supported(const struct hk_2d_stencil_plan *plan);
+
+nir_shader *hk_nir_build_sobel_nms(void *mem_ctx, const nir_shader *orig_nir,
+                                   const struct hk_2d_stencil_plan *plan,
+                                   nir_address_format ssbo_addr_format);
+
+/* Whether an NMS direction table entry is an offset in [-1, 1] for each of
+ * the 8 directions a Sobel writes, so the fused kernel's one-pixel ring
+ * covers every neighbor the NMS reads. */
+static inline bool
+hk_sobel_nms_lut_in_ring(uint32_t lut)
+{
+   for (unsigned d = 0; d < 8; ++d) {
+      if (((lut >> (2 * d)) & 3u) > 2u)
+         return false;
+   }
+   return true;
+}
+
 #endif /* HK_2D_STENCIL_H */

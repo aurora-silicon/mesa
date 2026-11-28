@@ -119,6 +119,10 @@ enum hk_compute_pair_role {
    HK_COMPUTE_PAIR_PAD4 = 6,
    HK_COMPUTE_PAIR_FADD = 7,
    HK_COMPUTE_PAIR_IM2COL = 8,
+   /* A tiled 3x3 Sobel (HK_2D_STENCIL_SOBEL_3X3_U8) with a fused Sobel +
+    * NMS variant, and a tiled Canny NMS (HK_COMPUTE_OPT_CANNY_NMS_U8). */
+   HK_COMPUTE_PAIR_SOBEL3X3 = 9,
+   HK_COMPUTE_PAIR_CANNY_NMS = 10,
 };
 
 enum hk_compute_pair_dual_write {
@@ -133,6 +137,9 @@ enum hk_compute_pair_dual_write {
    HK_COMPUTE_PAIR_DUAL_FADD_EP_COPY = 8,
    HK_COMPUTE_PAIR_DUAL_COPY2 = 9,
    HK_COMPUTE_PAIR_DUAL_GEMM_DW = 10,
+   /* A Sobel and the Canny NMS after it, as one hk_nir_build_sobel_nms()
+    * dispatch. */
+   HK_COMPUTE_PAIR_DUAL_CANNY_NMS = 11,
 };
 
 static inline bool

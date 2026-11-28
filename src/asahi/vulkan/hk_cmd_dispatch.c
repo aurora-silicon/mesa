@@ -3500,6 +3500,97 @@ hk_record_compute_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    *cs->compute_pair = record;
 }
 
+/* Records a tiled Sobel that has a fused Sobel + NMS variant, or a tiled
+ * Canny NMS, alone in its command buffer, so the queue may run the two as
+ * one dispatch when the NMS comes right after the Sobel in a submission
+ * (hk_compute_pair_canny_match()). */
+static void
+hk_record_canny_pair(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                     const struct hk_api_shader *api,
+                     const struct hk_shader *selected,
+                     const uint32_t orig_groups[3], struct agx_grid exec_grid,
+                     struct agx_workgroup local)
+{
+   if (!api || cs->compute_pair || cs->stats.cmds != 1 || cs->stream_linked ||
+       vk_command_buffer_has_error(&cmd->vk) || cmd->in_meta ||
+       exec_grid.mode != AGX_CDM_MODE_DIRECT ||
+       cmd->state.compute_pair_simultaneous ||
+       cmd->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY)
+      return;
+
+   const struct hk_descriptor_state *desc = &cmd->state.cs.descriptors;
+   if (!hk_nir_dispatch_zero_base(desc->root.cs.base_group) ||
+       !desc->uploaded_root.gpu)
+      return;
+
+   struct hk_compute_pair_dispatch record = {0};
+   struct hk_compute_pair_canny *canny = &record.extra.canny;
+   uint32_t sets[3], bindings[3];
+   uint16_t w_off, h_off;
+   if (api->stencil_2d && selected == &api->stencil_2d->shader &&
+       api->stencil_2d->plan.kind == HK_2D_STENCIL_SOBEL_3X3_U8 &&
+       api->stencil_2d->sobel_nms) {
+      /* The fused kernel takes the Sobel's grid and workgroup. */
+      if (selected->data_size != 0 ||
+          local.x != selected->b.info.workgroup_size[0] ||
+          local.y != selected->b.info.workgroup_size[1] ||
+          local.z != selected->b.info.workgroup_size[2])
+         return;
+      const struct hk_2d_stencil_plan *plan = &api->stencil_2d->plan;
+      record.info.role = HK_COMPUTE_PAIR_SOBEL3X3;
+      for (unsigned i = 0; i < 3; ++i) {
+         sets[i] = plan->bufs[i].set;
+         bindings[i] = plan->bufs[i].binding;
+      }
+      w_off = plan->width_pc_offset_B;
+      h_off = plan->height_pc_offset_B;
+      memcpy(&canny->stride, desc->root.push + plan->stride_pc_offset_B, 4);
+   } else if (api->compute_opt && selected == &api->compute_opt->shader &&
+              api->compute_opt->plan.kind == HK_COMPUTE_OPT_CANNY_NMS_U8) {
+      const struct hk_compute_opt_plan *plan = &api->compute_opt->plan;
+      record.info.role = HK_COMPUTE_PAIR_CANNY_NMS;
+      for (unsigned i = 0; i < 3; ++i) {
+         sets[i] = plan->bufs[i].set;
+         bindings[i] = plan->bufs[i].binding;
+      }
+      w_off = plan->pc_off[0];
+      h_off = plan->pc_off[1];
+      memcpy(canny->params, plan->params, sizeof(canny->params));
+   } else {
+      return;
+   }
+   memcpy(&canny->width, desc->root.push + w_off, 4);
+   memcpy(&canny->height, desc->root.push + h_off, 4);
+
+   for (unsigned i = 0; i < 3; ++i) {
+      if (sets[i] >= HK_MAX_SETS ||
+          ((desc->buffer_active | desc->push_active) & BITFIELD_BIT(sets[i])) ||
+          !hk_descriptor_set_storage_backing(desc->sets[sets[i]], bindings[i],
+                                             &record.bindings[i]))
+         return;
+   }
+
+   memcpy(record.groups, orig_groups, sizeof(record.groups));
+   memcpy(record.exec_threads, exec_grid.count, sizeof(record.exec_threads));
+   memcpy(record.exec_local, selected->b.info.workgroup_size,
+          sizeof(record.exec_local));
+   record.root_va = desc->uploaded_root.gpu;
+   memcpy(record.root_sets, desc->root.sets, sizeof(record.root_sets));
+   memcpy(record.push, desc->root.push, sizeof(record.push));
+   record.cs_group_count_addr = desc->root.cs.group_count_addr;
+   memcpy(record.cs_base_group, desc->root.cs.base_group,
+          sizeof(record.cs_base_group));
+   record.printf_buffer_address = desc->root.printf_buffer_address;
+   record.overlap_safe = hk_compute_shader_overlap_safe(selected, desc);
+
+   cs->compute_pair = malloc(sizeof(record));
+   if (!cs->compute_pair)
+      return;
+   if (record.info.role == HK_COMPUTE_PAIR_SOBEL3X3)
+      record.producer = hk_compute_pair_producer_ref(api->stencil_2d->sobel_nms);
+   *cs->compute_pair = record;
+}
+
 static bool
 hk_fused_compute_uniform_ranges(
    enum agx_chip chip, const struct hk_shader *s,
@@ -5210,6 +5301,10 @@ dispatch_grid_shader(struct hk_cmd_buffer *cmd, struct hk_shader *s,
             copy4_cert.role != HK_COMPUTE_PAIR_NONE)
       hk_record_copy4_pair(cmd, cs, api, selected, &copy4_cert, orig_groups,
                            grid);
+   else if (!in_threads && !invocation_stat && api && selected == s &&
+            (api->stencil_2d || api->compute_opt))
+      hk_record_canny_pair(cmd, cs, api, selected, orig_groups, grid,
+                           local_size);
    cs->uses_global_atomics |= selected->b.info.uses_global_atomics;
    if (agx_is_indirect(grid)) {
       cs->pack_loops |= selected->b.info.has_loops;

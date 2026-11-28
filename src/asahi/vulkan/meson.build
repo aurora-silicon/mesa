@@ -1762,6 +1762,12 @@ if with_tests
       inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
     dependencies : [hk_deps], link_with : [libhk, libasahi_compiler]),
     timeout : 30, suite : ['asahi'])
+  test('hk_canny_fuse', executable('hk_canny_fuse_test',
+    files('tests/test-hk-canny-fuse.c'),
+    include_directories : [include_directories('.'), inc_gallium, inc_gallium_aux,
+      inc_include, inc_src, inc_asahi, inc_virtio_gpu, inc_virtio_vdrm],
+    dependencies : [hk_deps], link_with : [libhk, libasahi_compiler]),
+    timeout : 120, suite : ['asahi'])
 endif
 
 if with_tests
