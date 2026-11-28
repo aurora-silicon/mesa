@@ -975,10 +975,13 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
       return;
    }
 
+   /* Draw-feeding GS/tess compute prepasses run on current_cs.pre_gfx and must
+    * never defer their trailing flush; cs == current_cs.cs enforces this. */
    const bool defer =
       allow_defer && cs == cs->cmd->current_cs.cs && !cs->cmd->in_meta &&
       !HK_PERF(dev, FULLCDMBARRIER) &&
       agx_chip_has_cap(dev->dev.chip, AGX_CAP_CDM_DEFER_FLUSH);
+   assert(!defer || cs != cs->cmd->current_cs.pre_gfx);
 
    if (cs == cs->cmd->current_cs.cs && !HK_PERF(dev, FULLCDMBARRIER) &&
        cs->cmd->state.cs.cdm_barrier_pending) {
@@ -2898,7 +2901,9 @@ hk_dispatch_g17p_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
     * its flags. This path passes 0, a barrier that orders the launches but
     * does not make the producer's writes visible to the consumer. Every other
     * compute path in the driver flushes: hk_dispatch_with_usc_launch() calls
-    * hk_cdm_cache_flush() after each AGX2 launch, and hk_dispatch_precomp_g17p()
+    * hk_cdm_cache_flush() after each AGX2 launch (or defers it until the next
+    * barrier, non-deferred launch, or stream close on AGX_CAP_CDM_DEFER_FLUSH
+    * chips), and hk_dispatch_precomp_g17p()
     * passes Apple's witnessed strong value 5 for AGX_BARRIER_ALL. So the
     * "flush after every launch" policy hk_cdm_cache_flush() documents is not
     * actually held on the one path every API dispatch and every vk_meta copy,
