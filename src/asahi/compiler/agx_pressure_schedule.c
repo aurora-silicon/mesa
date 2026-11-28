@@ -2278,6 +2278,8 @@ ilp_static_compute_cap(const agx_context *ctx)
 #define AGX_ILP_AGX3B_TILE_GRANULE_CAP   (AGX_ILP_AGX3B_GRANULE_HALVES - 10)
 #define AGX_ILP_AGX3B_TILE_FWD_FLOOR     (AGX_ILP_AGX3B_GRANULE_HALVES / 2)
 #define AGX_ILP_AGX3B_TILE_FWD_MIN       (AGX_ILP_AGX3B_TILE_FWD_FLOOR - 6)
+#define AGX_ILP_AGX3B_SAMPLE_GRANULE_CAP (AGX_ILP_AGX3B_GRANULE_HALVES - 4)
+#define AGX_ILP_AGX3B_SAMPLE_GRANULE_FWD (AGX_ILP_AGX3B_GRANULE_HALVES - 6)
 
 static int
 agx_ilp_agx3b_fragment_max_halves(const agx_context *ctx)
@@ -2772,7 +2774,8 @@ agx_ilp_schedule(agx_context *ctx)
                  ctx->stage == MESA_SHADER_FRAGMENT &&
                  (samples >= AGX_ILP_FS_MIN_SAMPLES ||
                   (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-                   samples >= 2 && !ilp_block_has_discard_or_zs(block) &&
+                   samples >= 2 && !ctx->any_interlock &&
+                   !ilp_block_has_discard_or_zs(block) &&
                    !ilp_block_has_wait_pix_before_sample(block) &&
                    ilp_block_sfu_ops(block, false) >= 3))) {
          /* The pressure schedule places each sample's consumers right after
@@ -2805,8 +2808,31 @@ agx_ilp_schedule(agx_context *ctx)
                slack = MAX2(slack, agx3b_frag_cap - peak);
             }
          }
+         const bool agx3b_wait_pix_interlock =
+            agx3b_fragment &&
+            (ctx->any_interlock || ilp_block_has_wait_pix_before_sample(block));
+         const bool agx3b_sfu_block =
+            agx3b_fragment && size16 && agx3b_frag_cap > 0 &&
+            samples >= AGX_ILP_FS_MIN_SAMPLES &&
+            !agx3b_wait_pix_interlock &&
+            !ilp_block_has_discard_or_zs(block) &&
+            ilp_block_sfu_ops(block, false) >= 3;
+         signed agx3b_cap = agx3b_frag_cap;
+         signed agx3b_fwd = AGX_ILP_FS_SAMPLE_HALVES;
+         if (agx3b_sfu_block && peak >= AGX_ILP_AGX3B_SAMPLE_GRANULE_CAP &&
+             peak <= AGX_ILP_AGX3B_GRANULE_HALVES) {
+            /* A 4+ sample SFU block already sitting in the top margin of the
+             * 48-half granule (44..48 halves) has no headroom left to hoist
+             * four samples inside 48 halves; cap #1293 and both retries at
+             * peak so RA stays inside the 48-half granule instead of jumping
+             * to 72 halves, while smaller blocks (peak < 44) keep #1293's
+             * occupancy-step hoisting. */
+            agx3b_cap = MIN2(agx3b_frag_cap, peak);
+            agx3b_fwd =
+               MIN2(AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_AGX3B_SAMPLE_GRANULE_FWD);
+         }
          const signed agx3b_strict_slack =
-            agx3b_frag_cap > peak ? MIN2(slack, agx3b_frag_cap - peak) : 0;
+            agx3b_cap > peak ? MIN2(slack, agx3b_cap - peak) : 0;
          bool scheduled = false;
          if (m5_fragment_ilp && !ilp_block_has_discard_or_zs(block)) {
             const signed tight_slack =
@@ -2827,25 +2853,41 @@ agx_ilp_schedule(agx_context *ctx)
                   AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
                   false, false, false, true, false, false, false, &dag_state);
             }
-         } else if (agx3b_fragment && !ilp_block_has_discard_or_zs(block) &&
-                    !ilp_block_has_wait_pix_before_sample(block)) {
+         } else if (agx3b_fragment && !agx3b_wait_pix_interlock &&
+                    !ilp_block_has_discard_or_zs(block)) {
             if (agx3b_strict_slack > 0) {
                scheduled = ilp_schedule_block(
                   ctx, block, memctx, native_uniforms, alu_latency,
-                  16 * alu_latency, agx3b_strict_slack, 0, NULL, false, true,
-                  AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
-                  false, false, false, true, false, false, false, &dag_state);
+                  16 * alu_latency, agx3b_strict_slack,
+                  size16 && agx3b_cap > 0 ? agx3b_cap : 0,
+                  size16 && agx3b_cap > 0 ? size16 : NULL, false, true,
+                  agx3b_fwd, AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
+                  false, true, false, false, false, &dag_state);
+            }
+            if (!scheduled && agx3b_sfu_block) {
+               /* When full ALU+sample interleaving exceeds the shader's
+                * register cap or has zero slack above peak (e.g. large
+                * multi-sample deferred lighting), fall back to unit ALU
+                * latency with hard cap agx3b_cap so post-sample SFU chains
+                * still interleave strictly inside the applicable bound. */
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, 1, 16,
+                  agx3b_strict_slack, agx3b_cap, size16, false, true, agx3b_fwd,
+                  AGX_ILP_FS_HOIST_SAMPLES, false, false, false, false, true,
+                  false, false, false, &dag_state);
             }
          }
-         if (!scheduled && !agx3b_sfu_only &&
-             !(agx3b_fragment && ilp_block_has_wait_pix_before_sample(block))) {
+         if (!scheduled && !agx3b_sfu_only && !agx3b_wait_pix_interlock) {
             const signed fallback_slack =
                agx3b_fragment ? agx3b_strict_slack : slack;
-            if (!agx3b_fragment || fallback_slack > 0) {
+            if (!agx3b_fragment ||
+                (size16 && agx3b_cap > 0 && fallback_slack > 0)) {
                ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                   alu_latency, 16 * alu_latency, fallback_slack,
-                                  0, NULL, false, true,
-                                  AGX_ILP_FS_SAMPLE_HALVES,
+                                  agx3b_fragment ? agx3b_cap : 0,
+                                  agx3b_fragment ? size16 : NULL, false, true,
+                                  agx3b_fragment ? agx3b_fwd
+                                                 : AGX_ILP_FS_SAMPLE_HALVES,
                                   AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
                                   false, false, false, false, false,
                                   &dag_state);

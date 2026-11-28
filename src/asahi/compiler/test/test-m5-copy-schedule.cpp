@@ -2299,13 +2299,35 @@ TEST(M5CopySchedule, AGX3BFragmentCapOver256HalvesNoAbort)
       acc = agx_fadd(b, acc, ex);
    }
    agx_st_tile(b, acc, mask, agx_null(), AGX_FORMAT_I32, 0x1, 0, false, 2);
+
+   agx_block *sample_blk = agx_test_block(b->shader);
+   agx_block_add_successor(tile_blk, sample_blk);
+   b->cursor = agx_after_block(sample_blk);
+
+   agx_index c2d = make_2d_coords(b, 2, 4);
+   agx_index sacc = agx_mov_imm(b, 32, 0);
+   for (unsigned i = 0; i < 4; ++i) {
+      agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_texture_load_to(b, tex, c2d, agx_immediate(0), agx_immediate(0),
+                          agx_immediate(i), agx_immediate(0), agx_null(),
+                          AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0xf, false, false);
+      agx_instr *sp = agx_split(b, 4, tex);
+      for (unsigned k = 0; k < 4; ++k)
+         sp->dest[k] = agx_temp(b->shader, AGX_SIZE_32);
+      agx_index lg = agx_log2(b, sp->dest[0]);
+      agx_index sc = agx_fmul(b, lg, sp->dest[1]);
+      agx_index ex = agx_exp2(b, sc);
+      sacc = agx_fadd(b, sacc, ex);
+   }
+   agx_st_tile(b, sacc, mask, agx_null(), AGX_FORMAT_I32, 0x1, 0, false, 0);
    agx_validate(b->shader, "agx3b over-256h pre-schedule");
 
    agx_ilp_schedule(b->shader);
    agx_validate(b->shader, "agx3b over-256h post-schedule");
 
-   /* With program_peak > 256 halves, cap returns 0 and tile_blk stays untouched. */
+   /* With program_peak > 256 halves, cap returns 0 and both blocks stay untouched. */
    EXPECT_EQ(count_hidden_sfus(tile_blk), 0u);
+   EXPECT_EQ(count_hidden_sfus(sample_blk), 0u);
    ralloc_free(s.mem);
 }
 
@@ -2374,6 +2396,402 @@ TEST(M5CopySchedule, AGX3BFragmentTileReadSfuKeeps48HalfGranule)
       agx_ra(b->shader);
       ASSERT_FALSE(b->shader->ra_failed);
       EXPECT_LE(b->shader->max_reg + 1, 48u);
+      ralloc_free(s.mem);
+   }
+}
+
+/* Straight-line AGX3B fragment blocks with >= 4 texture loads and >= 3 SFUs
+ * hoist the loads ahead of consumers, interleave post-sample SFU chains inside
+ * the register granule/step, and keep trailing epilog WAIT_PIX before ST_TILE.
+ * Discard blocks and AGX2 keep pressure order for post-sample SFUs. */
+TEST(M5CopySchedule, AGX3BFragmentMultiSampleInterleavesPostSampleSfu)
+{
+   struct cfg {
+      enum agx_isa_encoding enc;
+      enum agx_chip chip;
+      bool with_discard;
+      bool expect_hidden;
+   };
+   const cfg cases[] = {
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, true, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, false},
+   };
+
+   for (const cfg &c : cases) {
+      SCOPED_TRACE(c.enc * 10 + c.with_discard);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+      s.key.dev.encoding = c.enc;
+      s.key.dev.chip = c.chip;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+
+      agx_index c2d = make_2d_coords(b, 2, 4);
+
+      if (c.with_discard)
+         agx_sample_mask_agx3(b, agx_immediate(0xff), agx_immediate(1), 0);
+
+      agx_index acc = agx_mov_imm(b, 32, 0);
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         agx_texture_load_to(b, tex, c2d, agx_immediate(0), agx_immediate(0),
+                             agx_immediate(i), agx_immediate(0), agx_null(),
+                             AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0xf, false,
+                             false);
+         agx_instr *sp = agx_split(b, 4, tex);
+         for (unsigned k = 0; k < 4; ++k)
+            sp->dest[k] = agx_temp(b->shader, AGX_SIZE_32);
+         agx_index lg = agx_log2(b, sp->dest[0]);
+         agx_index sc = agx_fmul(b, lg, sp->dest[1]);
+         agx_index ex = agx_exp2(b, sc);
+         acc = agx_fadd(b, acc, ex);
+      }
+      agx_instr *blend_wait = agx_wait_pix(b, 0x8);
+      agx_index dst_tile = agx_temp(b->shader, AGX_SIZE_32);
+      agx_instr *ld_blend =
+         agx_ld_tile_to(b, dst_tile, agx_immediate(0xff), agx_null(),
+                        AGX_FORMAT_I32, 0x1, 0, false, 0);
+      agx_index blended = agx_fadd(b, acc, dst_tile);
+      agx_instr *trail_wait = agx_wait_pix(b, 0x4);
+      agx_instr *st = agx_st_tile(b, blended, agx_immediate(0xff), agx_null(),
+                                  AGX_FORMAT_I32, 0x1, 0, false, 0);
+      agx_validate(b->shader, "agx3b multi-sample sfu pre-schedule");
+
+      agx_ilp_schedule(b->shader);
+      agx_validate(b->shader, "agx3b multi-sample sfu post-schedule");
+
+      unsigned samples_before_first_sfu = 0;
+      unsigned blend_wait_pos = ~0u, ld_blend_pos = ~0u;
+      unsigned trail_wait_pos = ~0u, st_pos = ~0u, pos = 0;
+      bool saw_sfu = false;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (is_sfu_opcode(I->op))
+            saw_sfu = true;
+         if (!saw_sfu && I->op == AGX_OPCODE_TEXTURE_LOAD)
+            samples_before_first_sfu++;
+         if (I == blend_wait)
+            blend_wait_pos = pos;
+         else if (I == ld_blend)
+            ld_blend_pos = pos;
+         else if (I == trail_wait)
+            trail_wait_pos = pos;
+         else if (I == st)
+            st_pos = pos;
+         pos++;
+      }
+      if (c.enc == AGX_ISA_ENCODING_AGX3B) {
+         EXPECT_EQ(samples_before_first_sfu, 4u);
+      } else {
+         EXPECT_EQ(samples_before_first_sfu, 1u);
+      }
+      EXPECT_LT(blend_wait_pos, ld_blend_pos);
+      EXPECT_LT(ld_blend_pos, trail_wait_pos);
+      EXPECT_LT(trail_wait_pos, st_pos);
+
+      const unsigned hidden = count_hidden_sfus(s.body);
+      if (c.expect_hidden) {
+         EXPECT_GE(hidden, 4u);
+      } else {
+         EXPECT_EQ(hidden, 0u);
+      }
+      ralloc_free(s.mem);
+   }
+}
+
+/* Multi-sample AGX3B fragment blocks must never reorder texture/image loads
+ * across a preceding WAIT_PIX or sink WAIT_PIX past a non-relocatable 3D
+ * sample (fragment shader interlock safety). */
+TEST(M5CopySchedule, AGX3BFragmentMultiSampleWaitPixInterlockSafe)
+{
+   for (unsigned mode = 0; mode < 3; ++mode) {
+      SCOPED_TRACE(mode == 0   ? "mixed-2d-wait-3d"
+                   : mode == 1 ? "wait-before-4x-load"
+                               : "any-interlock-4x-image-load");
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G16G;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+
+      agx_index u = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index v = agx_preload(b, agx_register(4, AGX_SIZE_32));
+      agx_index w = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_index c2d = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_instr *col2d = agx_collect_to(b, c2d, 2);
+      col2d->src[0] = u;
+      col2d->src[1] = v;
+
+      agx_instr *interlock_wait = NULL;
+      agx_instr *smp3d = NULL;
+      if (mode == 1)
+         interlock_wait = agx_wait_pix(b, 0xC);
+      if (mode == 2)
+         b->shader->any_interlock = true;
+
+      agx_index acc = agx_mov_imm(b, 32, 0);
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         if (mode == 0) {
+            agx_texture_sample_to(
+               b, tex, c2d, agx_immediate(0), agx_immediate(0),
+               agx_immediate(i), agx_immediate(0), agx_null(), AGX_DIM_2D,
+               AGX_LOD_MODE_AUTO_LOD, 0xf, false, false, false,
+               AGX_GATHER_NONE, false);
+         } else if (mode == 1) {
+            agx_texture_load_to(
+               b, tex, c2d, agx_immediate(0), agx_immediate(0),
+               agx_immediate(i), agx_immediate(0), agx_null(), AGX_DIM_2D,
+               AGX_LOD_MODE_LOD_MIN, 0xf, false, false);
+         } else {
+            agx_instr *im = agx_image_load_to(
+               b, tex, c2d, agx_immediate(0), agx_immediate(0),
+               agx_immediate(i), agx_immediate(0), agx_null(), AGX_DIM_2D,
+               AGX_LOD_MODE_LOD_MIN, 0xf, false, false, false);
+            im->memory_can_reorder = true;
+         }
+         agx_instr *sp = agx_split(b, 4, tex);
+         for (unsigned k = 0; k < 4; ++k)
+            sp->dest[k] = agx_temp(b->shader, AGX_SIZE_32);
+         agx_index lg = agx_log2(b, sp->dest[0]);
+         agx_index sc = agx_fmul(b, lg, sp->dest[1]);
+         agx_index ex = agx_exp2(b, sc);
+         acc = agx_fadd(b, acc, ex);
+      }
+
+      if (mode == 0) {
+         interlock_wait = agx_wait_pix(b, 0xC);
+         agx_index c3d = agx_vec_temp(b->shader, AGX_SIZE_32, 3);
+         agx_instr *col3d = agx_collect_to(b, c3d, 3);
+         col3d->src[0] = u;
+         col3d->src[1] = v;
+         col3d->src[2] = w;
+         agx_index tex3d = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         smp3d = agx_texture_sample_to(
+            b, tex3d, c3d, agx_immediate(0), agx_immediate(0), agx_immediate(4),
+            agx_immediate(0), agx_null(), AGX_DIM_3D, AGX_LOD_MODE_AUTO_LOD,
+            0xf, false, false, false, AGX_GATHER_NONE, false);
+         agx_instr *sp3d = agx_split(b, 4, tex3d);
+         for (unsigned k = 0; k < 4; ++k)
+            sp3d->dest[k] = agx_temp(b->shader, AGX_SIZE_32);
+         acc = agx_fadd(b, acc, sp3d->dest[0]);
+      } else if (mode == 2) {
+         interlock_wait = agx_wait_pix(b, 0xC);
+      }
+
+      agx_instr *st = agx_st_tile(b, acc, agx_immediate(0xff), agx_null(),
+                                  AGX_FORMAT_I32, 0x1, 0, false, 0);
+      agx_validate(b->shader, "agx3b multi-sample wait_pix pre-schedule");
+
+      agx_ilp_schedule(b->shader);
+      agx_validate(b->shader, "agx3b multi-sample wait_pix post-schedule");
+
+      unsigned pos = 0, wait_pos = ~0u, first_load_pos = ~0u;
+      unsigned last_2d_pos = 0, smp3d_pos = ~0u, st_pos = ~0u;
+      unsigned loads_before_first_sfu = 0;
+      bool saw_sfu = false;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (is_sfu_opcode(I->op))
+            saw_sfu = true;
+         const bool is_read = I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+                              I->op == AGX_OPCODE_TEXTURE_LOAD ||
+                              I->op == AGX_OPCODE_IMAGE_LOAD;
+         if (is_read) {
+            if (first_load_pos == ~0u)
+               first_load_pos = pos;
+            if (!saw_sfu)
+               loads_before_first_sfu++;
+            if (I == smp3d)
+               smp3d_pos = pos;
+            else
+               last_2d_pos = pos;
+         }
+         if (I == interlock_wait)
+            wait_pos = pos;
+         else if (I == st)
+            st_pos = pos;
+         pos++;
+      }
+
+      EXPECT_LT(wait_pos, st_pos);
+      EXPECT_EQ(loads_before_first_sfu, 1u);
+      EXPECT_EQ(count_hidden_sfus(s.body), 0u);
+      if (mode == 0) {
+         EXPECT_GT(wait_pos, last_2d_pos);
+         EXPECT_LT(wait_pos, smp3d_pos);
+      } else if (mode == 1) {
+         EXPECT_LT(wait_pos, first_load_pos);
+      }
+      ralloc_free(s.mem);
+   }
+}
+
+/* Multi-sample AGX3B SFU fragment blocks sitting in the top margin of the
+ * 48-half granule (peaks 44, 46, and 48 halves) must keep the 48-half cap
+ * across #1293 and both retries instead of expanding to 72 halves. */
+TEST(M5CopySchedule, AGX3BFragmentMultiSampleFallbackKeeps48HalfGranule)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G15S, AGX_CHIP_G16G, AGX_CHIP_G17P}) {
+      for (unsigned extra_f32 : {15u, 16u, 17u}) {
+         SCOPED_TRACE(chip);
+         SCOPED_TRACE(extra_f32);
+         copy_shader s;
+         copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+         s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         s.key.dev.chip = chip;
+         agx_builder *b = s.b;
+
+         agx_block *entry = s.body;
+         agx_block *body = agx_test_block(b->shader);
+         agx_block *exit_blk = agx_test_block(b->shader);
+         agx_block_add_successor(entry, body);
+         agx_block_add_successor(body, exit_blk);
+
+         b->cursor = agx_after_block(entry);
+         agx_index u = agx_preload(b, agx_register(0, AGX_SIZE_32));
+         agx_index v = agx_preload(b, agx_register(2, AGX_SIZE_32));
+         agx_index held[17];
+         for (unsigned i = 0; i < extra_f32; ++i)
+            held[i] = agx_mov_imm(b, 32, 0x3f800000 + i);
+
+         b->cursor = agx_after_block(body);
+         agx_index c2d = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+         agx_instr *col2d = agx_collect_to(b, c2d, 2);
+         col2d->src[0] = u;
+         col2d->src[1] = v;
+
+         agx_index acc = agx_mov_imm(b, 32, 0);
+         for (unsigned i = 0; i < 4; ++i) {
+            agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+            agx_texture_load_to(b, tex, c2d, agx_immediate(0), agx_immediate(0),
+                                agx_immediate(i), agx_immediate(0), agx_null(),
+                                AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0xf, false,
+                                false);
+            agx_instr *sp = agx_split(b, 4, tex);
+            sp->dest[0] = agx_temp(b->shader, AGX_SIZE_32);
+            sp->dest[1] = agx_temp(b->shader, AGX_SIZE_32);
+            sp->dest[2] = agx_null();
+            sp->dest[3] = agx_null();
+            agx_index lg = agx_log2(b, sp->dest[0]);
+            agx_index sc = agx_fmul(b, lg, sp->dest[1]);
+            agx_index ex = agx_exp2(b, sc);
+            acc = agx_fadd(b, acc, ex);
+         }
+         agx_st_tile(b, acc, agx_immediate(0xff), agx_null(), AGX_FORMAT_I32,
+                     0x1, 0, false, 0);
+
+         b->cursor = agx_after_block(exit_blk);
+         agx_index psum = held[0];
+         for (unsigned i = 1; i < extra_f32; ++i)
+            psum = agx_fadd(b, psum, held[i]);
+         agx_unit_test(b, psum);
+
+         agx_validate(b->shader, "agx3b multi-sample sub48 pre-pressure");
+         agx_pressure_schedule(b->shader);
+         agx_validate(b->shader, "agx3b multi-sample sub48 post-pressure");
+
+         const unsigned pre_peak = block_peak_halves(b->shader, body);
+         EXPECT_EQ(pre_peak, 2u * extra_f32 + 14u);
+
+         agx_ilp_schedule(b->shader);
+         agx_validate(b->shader, "agx3b multi-sample sub48 post-ilp");
+
+         const unsigned post_peak = block_peak_halves(b->shader, body);
+         EXPECT_LE(post_peak, pre_peak);
+         EXPECT_LE(post_peak, 48u);
+
+         agx_ra(b->shader);
+         ASSERT_FALSE(b->shader->ra_failed);
+         EXPECT_LE(b->shader->max_reg + 1, 48u);
+         ralloc_free(s.mem);
+      }
+   }
+}
+
+/* When a 4+ sample SFU-heavy AGX3B fragment block sits tight against the
+ * shader's occupancy-step cap (so full ALU+sample interleaving exceeds
+ * agx3b_frag_cap), the unit-ALU fallback must still interleave post-sample SFU
+ * chains strictly inside the occupancy step (<= 104 halves -> 1024 threads). */
+TEST(M5CopySchedule, AGX3BFragmentMultiSampleTightOccupancyInterleavesSfu)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G15S, AGX_CHIP_G16G, AGX_CHIP_G17P}) {
+      SCOPED_TRACE(chip);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = chip;
+      agx_builder *b = s.b;
+
+      agx_block *entry = s.body;
+      agx_block *body = agx_test_block(b->shader);
+      agx_block *exit_blk = agx_test_block(b->shader);
+      agx_block_add_successor(entry, body);
+      agx_block_add_successor(body, exit_blk);
+
+      const unsigned extra_f32 = 34u;
+      b->cursor = agx_after_block(entry);
+      agx_index u = agx_preload(b, agx_register(0, AGX_SIZE_32));
+      agx_index v = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_index held[34];
+      for (unsigned i = 0; i < extra_f32; ++i)
+         held[i] = agx_mov_imm(b, 32, 0x3f800000 + i);
+
+      b->cursor = agx_after_block(body);
+      agx_index c2d = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+      agx_instr *col2d = agx_collect_to(b, c2d, 2);
+      col2d->src[0] = u;
+      col2d->src[1] = v;
+
+      agx_index acc = agx_mov_imm(b, 32, 0);
+      for (unsigned i = 0; i < 4; ++i) {
+         agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_16, 4);
+         agx_texture_load_to(b, tex, c2d, agx_immediate(0), agx_immediate(0),
+                             agx_immediate(i), agx_immediate(0), agx_null(),
+                             AGX_DIM_2D, AGX_LOD_MODE_LOD_MIN, 0xf, false,
+                             false);
+         agx_instr *sp = agx_split(b, 4, tex);
+         for (unsigned k = 0; k < 4; ++k)
+            sp->dest[k] = agx_temp(b->shader, AGX_SIZE_16);
+         agx_index t0 = agx_fadd(b, u, sp->dest[0]);
+         agx_index t1 = agx_fadd(b, v, sp->dest[1]);
+         agx_index t2 = agx_fadd(b, u, sp->dest[2]);
+         agx_index t3 = agx_fadd(b, v, sp->dest[3]);
+         agx_index a0 = agx_fmul(b, t0, t1);
+         agx_index a1 = agx_fadd(b, t1, t2);
+         agx_index a2 = agx_fmul(b, t2, t3);
+         agx_index a3 = agx_fadd(b, t3, t0);
+         agx_index b0 = agx_fmul(b, a0, a1);
+         agx_index b1 = agx_fadd(b, a2, a3);
+         agx_index c0 = agx_fmul(b, b0, b1);
+         agx_index lg = agx_log2(b, c0);
+         agx_index sc = agx_fmul(b, lg, u);
+         agx_index ex = agx_exp2(b, sc);
+         acc = agx_fadd(b, acc, ex);
+      }
+      agx_st_tile(b, acc, agx_immediate(0xff), agx_null(), AGX_FORMAT_I32, 0x1,
+                  0, false, 0);
+
+      b->cursor = agx_after_block(exit_blk);
+      agx_index psum = held[0];
+      for (unsigned i = 1; i < extra_f32; ++i)
+         psum = agx_fadd(b, psum, held[i]);
+      agx_unit_test(b, psum);
+
+      agx_validate(b->shader, "agx3b multi-sample tight-occ pre-pressure");
+      agx_pressure_schedule(b->shader);
+      agx_validate(b->shader, "agx3b multi-sample tight-occ post-pressure");
+
+      agx_ilp_schedule(b->shader);
+      agx_validate(b->shader, "agx3b multi-sample tight-occ post-ilp");
+
+      const unsigned post_peak = block_peak_halves(b->shader, body);
+      EXPECT_LE(post_peak, 96u);
+      EXPECT_GE(count_hidden_sfus(body), 4u);
+
+      agx_ra(b->shader);
+      ASSERT_FALSE(b->shader->ra_failed);
+      EXPECT_LE(b->shader->max_reg + 1, 104u);
       ralloc_free(s.mem);
    }
 }
