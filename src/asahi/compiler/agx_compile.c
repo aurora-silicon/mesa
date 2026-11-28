@@ -7316,6 +7316,62 @@ agx_agx3_bitop_immediate_ok(const agx_context *ctx, const agx_instr *I)
  * Matches the register/immediate operand guards in agx3_pack_binary.c so this
  * predicate cannot drift from the packer. Hardware readback on M5 Pro confirms
  * sel_integer=true zero-extends 8-bit select immediates 0x00..0xff to 16 bits. */
+/* Whether AGX3B's native 16-bit float select encodes a pair of 8-bit raw
+ * integer select immediates directly without mov_imm materialization. Matches
+ * the immediate-select guards in agx3_pack_binary.c (zero-compare, register-
+ * compare, and general agx3_alu_fcmp_select). */
+static bool
+agx3b_fsel16_imm_encodable(const agx_context *ctx, const agx_instr *I)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_FCMPSEL ||
+       I->nr_dests != 1 || I->nr_srcs != 4 || I->saturate ||
+       I->fcmpsel_minifloat_select ||
+       I->fcond == AGX_FCOND_LTN || I->fcond == AGX_FCOND_GTN ||
+       (I->dest[0].type != AGX_INDEX_NORMAL &&
+        I->dest[0].type != AGX_INDEX_REGISTER) ||
+       I->dest[0].size != AGX_SIZE_16 || agx_channels(I->dest[0]) != 1)
+      return false;
+
+   for (unsigned s = 2; s < 4; ++s) {
+      if (I->src[s].type != AGX_INDEX_IMMEDIATE ||
+          I->src[s].value > UINT8_MAX ||
+          I->src[s].abs || I->src[s].neg || I->src[s].memory ||
+          agx_channels(I->src[s]) != 1)
+         return false;
+   }
+
+   const bool c0_imm = I->src[0].type == AGX_INDEX_IMMEDIATE;
+   const bool c1_imm = I->src[1].type == AGX_INDEX_IMMEDIATE;
+   if (c0_imm && c1_imm)
+      return false;
+
+   for (unsigned s = 0; s < 2; ++s) {
+      if (I->src[s].memory || agx_channels(I->src[s]) != 1)
+         return false;
+      if (I->src[s].type == AGX_INDEX_IMMEDIATE) {
+         if (I->src[s].value > UINT8_MAX || I->src[s].abs || I->src[s].neg)
+            return false;
+      } else if (I->src[s].type == AGX_INDEX_UNIFORM) {
+         if (I->src[s].abs || I->src[s].neg)
+            return false;
+         const agx_index other = I->src[s ^ 1];
+         if (other.type == AGX_INDEX_UNIFORM)
+            return false;
+         if (s == 0 && (other.type != AGX_INDEX_IMMEDIATE || other.value != 0))
+            return false;
+      } else if (I->src[s].type == AGX_INDEX_NORMAL ||
+                 I->src[s].type == AGX_INDEX_REGISTER) {
+         if (I->src[s].size != AGX_SIZE_32 && I->src[s].size != AGX_SIZE_16)
+            return false;
+      } else {
+         return false;
+      }
+   }
+
+   return true;
+}
+
 static bool
 agx3c_fsel16_imm_encodable(const agx_context *ctx, const agx_instr *I)
 {
@@ -7975,7 +8031,8 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
          }
          if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
              I->op == AGX_OPCODE_FCMPSEL && I->dest[0].size == AGX_SIZE_16 &&
-             !agx3c_fsel16_imm_encodable(ctx, I)) {
+             !agx3c_fsel16_imm_encodable(ctx, I) &&
+             !agx3b_fsel16_imm_encodable(ctx, I)) {
             /* Select alternatives are raw bit patterns unless the optimizer
              * recorded that it folded a minifloat into the select slot
              * (fcmpsel_minifloat_select). Half-tied shapes such as
@@ -8077,11 +8134,39 @@ agx_materialize_agx3_alu_constants(agx_context *ctx)
                I->src[c] = wide;
             }
          }
+         /* AGX3B encodes .abs comparand modifiers directly on ordered F32
+          * register/zero/uniform FCMPSEL forms (matching G17P; a slot-0
+          * uniform beside a register is either exchanged into slot 1 or
+          * copied to a register by agx_lower_uniform_sources), so avoid
+          * stripping .abs into extra fadd moves on G15 and G16. */
+         const bool agx3b_native_abs =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+            I->op == AGX_OPCODE_FCMPSEL && I->nr_dests == 1 && I->nr_srcs == 4 &&
+            !I->saturate &&
+            I->fcond != AGX_FCOND_LTN && I->fcond != AGX_FCOND_GTN &&
+            !I->src[0].neg && !I->src[1].neg &&
+            !(I->src[0].type == AGX_INDEX_UNIFORM &&
+              I->src[1].type == AGX_INDEX_UNIFORM) &&
+            !(I->src[0].type == AGX_INDEX_IMMEDIATE &&
+              I->src[1].type == AGX_INDEX_IMMEDIATE) &&
+            (I->src[0].type != AGX_INDEX_IMMEDIATE ||
+             (I->src[0].value == 0 && !I->src[0].abs)) &&
+            (I->src[1].type != AGX_INDEX_IMMEDIATE ||
+             (I->src[1].value == 0 && !I->src[1].abs)) &&
+            (I->src[0].type == AGX_INDEX_IMMEDIATE ||
+             (I->src[0].type == AGX_INDEX_UNIFORM && !I->src[0].abs &&
+              !I->src[0].memory) ||
+             (!I->src[0].memory && I->src[0].size == AGX_SIZE_32)) &&
+            (I->src[1].type == AGX_INDEX_IMMEDIATE ||
+             (I->src[1].type == AGX_INDEX_UNIFORM && !I->src[1].abs &&
+              !I->src[1].memory) ||
+             (!I->src[1].memory && I->src[1].size == AGX_SIZE_32));
          const bool modified = I->src[0].abs || I->src[0].neg ||
                                I->src[1].abs || I->src[1].neg;
          for (unsigned s = 0; s < 2; ++s) {
             agx_index src = I->src[s];
-            if (src.type != AGX_INDEX_IMMEDIATE &&
+            if (!agx3b_native_abs &&
+                src.type != AGX_INDEX_IMMEDIATE &&
                 src.type != AGX_INDEX_UNIFORM && modified &&
                 (src.abs || src.neg || src.size == AGX_SIZE_16)) {
                agx_index plain = agx_temp(ctx, AGX_SIZE_32);
