@@ -2381,6 +2381,60 @@ direct_draw_fast_path_correctness(struct fixture *f)
          free(push_layout);
       }
 
+      /* Only the draw that armed the cached direct draw may leave it valid.
+       * A vertex shader bind followed by a draw that consumes the dirty bits
+       * without re-arming (an indirect draw) must not let a later direct
+       * draw reuse what the old shader published: the new one reads
+       * firstInstance. */
+      {
+         struct vk_dynamic_graphics_state *dyn =
+            &cmd->vk.dynamic_graphics_state;
+         struct hk_buffer args = {0};
+         args.vk.base.type = VK_OBJECT_TYPE_BUFFER;
+         args.vk.base.device = &f->dev.vk;
+         args.vk.device_address = 0xb00000;
+         args.vk.size = 4096;
+
+         /* Re-admit the cached draw over the current state. */
+         hk_root_mark_clean(desc);
+         fast->non_push_generation = desc->non_push_generation;
+         fast->valid = true;
+         hk_CmdDraw(cb, 6, 1, 0, 0);
+         CHECK(cs.stats.calls == 3);
+
+         struct hk_api_shader *base_vs =
+            calloc(1, hk_api_shader_size(MESA_SHADER_VERTEX, false));
+         CHECK(base_vs);
+         base_vs->vk.stage = MESA_SHADER_VERTEX;
+         base_vs->variants[HK_VS_VARIANT_HW] = *hw_vs;
+         base_vs->variants[HK_VS_VARIANT_HW].b.info.uses_base_param = true;
+
+         hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_VERTEX, base_vs);
+         CHECK(!fast->valid);
+
+         /* A dirty draw that does not re-arm leaves the cached draw dropped
+          * even if the cache was still standing when it started. */
+         fast->valid = true;
+         hk_CmdDrawIndirect(cb, hk_buffer_to_handle(&args), 0, 1, 16);
+         CHECK(!fast->valid);
+         cmd->vk.record_result = VK_SUCCESS;
+
+         /* The indirect draw consumed the dirty bits; the direct draw with a
+          * new firstInstance still takes the general path. */
+         vk_dynamic_graphics_state_clear_dirty(dyn);
+         cmd->state.gfx.dirty = 0;
+         cmd->state.gfx.shaders_dirty = 0;
+         cmd->state.gfx.linked_dirty = 0;
+         hk_root_mark_clean(desc);
+         const uint32_t calls_before = cs.stats.calls;
+         hk_CmdDraw(cb, 6, 1, 0, 7);
+         CHECK(cs.stats.calls == calls_before);
+         cmd->vk.record_result = VK_SUCCESS;
+
+         hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_VERTEX, f->vs_api);
+         free(base_vs);
+      }
+
       cmd->current_cs.gfx = NULL;
       hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
    }

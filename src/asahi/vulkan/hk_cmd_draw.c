@@ -7956,6 +7956,7 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
    }
    cmd->state.gfx.shaders_write_memory = writes;
    cmd->state.gfx.shaders_dirty |= BITFIELD_BIT(stage);
+   hk_agx3_direct_draw_fast_drop(&cmd->state.gfx);
    cmd->state.gfx.direct_draw_fast.unsupported_linked_vs = NULL;
 
    if (stage == MESA_SHADER_FRAGMENT)
@@ -15791,6 +15792,9 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
 
+   /* Consumes the dirty state the cached direct draw is checked against. */
+   hk_agx3_direct_draw_fast_drop(gfx);
+
    /* Every stage hk_flush_shaders() reads has to actually be bound.  Binding
     * VK_NULL_HANDLE for a stage is how CmdBindShadersEXT *unbinds* it, and it
     * is also what a client gets when we refuse to compile that stage's shader
@@ -17238,6 +17242,10 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
        (draw_.b.count[0] == 0 || draw_.b.count[1] == 0))
       return;
 
+   /* This draw consumes the dirty state the cached direct draw relies on
+    * seeing; it re-arms at the end if it is a plain direct draw. */
+   hk_agx3_direct_draw_fast_drop(&cmd->state.gfx);
+
    /* G17P: before anything is recorded for the draw, order a transfer the
     * application did not order before graphics work if the draw may access
     * what it wrote (hk_xfer_check_draw_slow()). */
@@ -18353,6 +18361,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   hk_agx3_direct_draw_fast_drop(gfx);
    struct hk_cs *cs = cmd->current_cs.gfx;
 
    /* An eligible multi-draw may emit even its first record here, so this

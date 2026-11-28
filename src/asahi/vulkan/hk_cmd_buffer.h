@@ -3489,6 +3489,15 @@ hk_cs_alloc_for_indirect(struct hk_cs *cs, size_t size_B)
    return addr;
 }
 
+/* The cached direct draw (hk_agx3_direct_draw_fast) stands for the state the
+ * draw that armed it published. Any other draw or bind that publishes or
+ * consumes graphics state drops it; only a re-arm makes it valid again. */
+static inline void
+hk_agx3_direct_draw_fast_drop(struct hk_graphics_state *gfx)
+{
+   gfx->direct_draw_fast.valid = false;
+}
+
 static void
 hk_cmd_buffer_dirty_all(struct hk_cmd_buffer *cmd)
 {
