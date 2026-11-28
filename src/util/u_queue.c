@@ -233,67 +233,6 @@ struct thread_input {
    int thread_index;
 };
 
-#if defined(__linux__) && defined(SYS_sched_setattr)
-/* struct sched_attr of sched_setattr(2), up to the utilisation clamps. */
-struct util_queue_sched_attr {
-   uint32_t size;
-   uint32_t sched_policy;
-   uint64_t sched_flags;
-   int32_t sched_nice;
-   uint32_t sched_priority;
-   uint64_t sched_runtime;
-   uint64_t sched_deadline;
-   uint64_t sched_period;
-   uint32_t sched_util_min;
-   uint32_t sched_util_max;
-};
-
-#ifndef SCHED_RESET_ON_FORK
-#define SCHED_RESET_ON_FORK 0x40000000
-#endif
-#define UTIL_QUEUE_SCHED_FLAG_RESET_ON_FORK  0x01
-#define UTIL_QUEUE_SCHED_FLAG_KEEP_PARAMS    0x10
-#define UTIL_QUEUE_SCHED_FLAG_UTIL_CLAMP_MIN 0x20
-
-/* Ask the scheduler to keep the calling thread on the big CPUs.
- *
- * Energy-aware scheduling places a task on the smallest CPU its utilisation
- * fits. A driver thread that the application thread waits on can fit a small
- * CPU exactly because it waits for the application thread part of the time,
- * and then the application thread waits for the small CPU. A minimum
- * utilisation clamp of the big CPU capacity makes the small CPUs a misfit for
- * this thread. Unlike an affinity mask it is a hint: the load balancer still
- * moves the thread when the big CPUs are busy, and the clamp only raises the
- * CPU frequency while the thread is runnable.
- *
- * The policy and its parameters are kept. Threads that this thread creates
- * later (a queue that grows from a job) do not inherit the clamp
- * (reset on fork).
- *
- * Errors are ignored: kernels without CONFIG_UCLAMP_TASK return EOPNOTSUPP.
- */
-static void
-util_queue_prefer_big_cpus(void)
-{
-   unsigned capacity = util_get_cpu_caps()->big_cpu_capacity;
-   int policy = sched_getscheduler(0);
-
-   if (!capacity || policy < 0)
-      return;
-
-   struct util_queue_sched_attr attr = {
-      .size = sizeof(attr),
-      .sched_policy = policy & ~SCHED_RESET_ON_FORK,
-      .sched_flags = UTIL_QUEUE_SCHED_FLAG_RESET_ON_FORK |
-                     UTIL_QUEUE_SCHED_FLAG_KEEP_PARAMS |
-                     UTIL_QUEUE_SCHED_FLAG_UTIL_CLAMP_MIN,
-      .sched_util_min = capacity,
-   };
-
-   syscall(SYS_sched_setattr, 0, &attr, 0);
-}
-#endif
-
 static int
 util_queue_thread_func(void *input)
 {
@@ -338,11 +277,20 @@ util_queue_thread_func(void *input)
       setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
    }
 
-#if defined(SYS_sched_setattr)
+#endif
+
+   /* Ask the scheduler to keep this thread on the big CPUs: a minimum
+    * utilisation clamp of the big CPU capacity makes the small CPUs a misfit
+    * for it. Energy-aware scheduling places a task on the smallest CPU its
+    * utilisation fits, and a driver thread that the application thread waits
+    * on can fit a small CPU exactly because it waits for the application
+    * thread part of the time, and then the application thread waits for the
+    * small CPU. Unlike an affinity mask it is a hint: the load balancer still
+    * moves the thread when the big CPUs are busy, and the clamp only raises
+    * the CPU frequency while the thread is runnable.
+    */
    if (queue->flags & UTIL_QUEUE_INIT_PREFER_BIG_CPUS)
-      util_queue_prefer_big_cpus();
-#endif
-#endif
+      util_thread_raise_min_util_clamp(util_get_cpu_caps()->big_cpu_capacity);
 
    if (strlen(queue->name) > 0) {
       char name[16];
