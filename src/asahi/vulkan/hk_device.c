@@ -97,10 +97,6 @@ static const struct debug_named_value hk_perf_options[] = {
    {"nobatch",   HK_PERF_NOBATCH,  "Disable submission batching"},
    {"norobust",  HK_PERF_NOROBUST, "Disable robustness"},
    {"weakbarrier", HK_PERF_WEAKBARRIER, "Keep ordering-only barriers between compute dispatches"},
-   {"alwayscdmbarrier", HK_PERF_ALWAYSCDMBARRIER,
-    "Unconditional per-launch CDM barrier (disable dependency tracking)"},
-   {"trackcdmbarrier", HK_PERF_TRACKCDMBARRIER,
-    "Opt into dependency-tracked per-launch CDM barriers"},
    {"fullcdmbarrier", HK_PERF_FULLCDMBARRIER,
     "Force the full CDM barrier word on every chip"},
    DEBUG_NAMED_VALUE_END
@@ -189,15 +185,16 @@ hk_upload_rodata(struct hk_device *dev)
     * own buffer object so the sampler table next to the texel-fetch sampler
     * never changes after device creation.
     */
-   dev->rodata.heap_bo = agx_bo_create(&dev->dev, sizeof(struct poly_heap), 0,
-                                       0, "Geometry heap descriptor");
+   dev->rodata.heap_bo = agx_bo_create(&dev->dev,
+                                       HK_HEAP_SLOTS * sizeof(struct poly_heap),
+                                       0, 0, "Geometry heap descriptor");
    if (!dev->rodata.heap_bo)
       goto fail;
 
    void *heap_map = agx_bo_map(dev->rodata.heap_bo);
    if (!heap_map)
       goto fail;
-   memset(heap_map, 0, sizeof(struct poly_heap));
+   memset(heap_map, 0, HK_HEAP_SLOTS * sizeof(struct poly_heap));
    dev->rodata.heap = dev->rodata.heap_bo->va->addr;
 
    return VK_SUCCESS;
@@ -534,7 +531,6 @@ hk_init_vm_status_mirror(struct hk_device *dev)
 }
 
 #define HK_CODE_CHUNK_SIZE (1024 * 1024)
-#define HK_CODE_ALIGNMENT  256
 
 struct agx_bo *
 hk_code_alloc(struct hk_device *dev, size_t size, uint32_t *offset)
@@ -1075,7 +1071,10 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    u_rwlock_init(&dev->host_alias.patch_lock);
    dev->host_alias.trace = agx_chip_g17_m5(pdev->dev.chip) &&
       debug_get_bool_option("ASAHI_M5_HOST_ALIAS_TRACE", false);
+   /* A device whose dependencies always take memory scope has none to
+    * decide per resource (agx_cdm_ordering_memory_scope()). */
    if (dev->may_alias_memory && agx_chip_g17_m5(pdev->dev.chip) &&
+       !agx_cdm_ordering_memory_scope(&pdev->dev) &&
        !debug_get_option_m5_host_alias_static()) {
       /* The word hk_cdm_flush() records for a memory-scoped strong flush. */
       const struct agx3_cdm_barrier_info info = {
@@ -1112,16 +1111,6 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
    }
 
    dev->perftest = debug_get_flags_option("HK_PERFTEST", hk_perf_options, 0);
-
-   /* Dependency-tracked per-launch CDM barriers default on the AGX2
-    * command-stream generation. Elsewhere the unconditional flush stays
-    * unless trackcdmbarrier opts in. */
-   const bool tracked_by_default =
-      agx_chip_command_stream_generation(pdev->dev.chip) ==
-      AGX_CS_GENERATION_AGX2;
-   if (!tracked_by_default && !HK_PERF(dev, TRACKCDMBARRIER))
-      dev->perftest |= HK_PERF_ALWAYSCDMBARRIER;
-
    dev->dev.compute_timeout_ms = instance->drirc.misc.compute_timeout_ms;
    /* Bounded poll before blocking syncobj waits (see vk_device.sync_wait_poll_us).
     * Off by default; pays CPU to skip wake-up latency on short submit->signal
@@ -1165,6 +1154,11 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
                          "Failed to get DRM device: %m");
       goto fail_fd;
    }
+
+   /* The kernel's feature word, read when the device was opened: queues copy
+    * this into their submission tracking when they are created. */
+   dev->load_hazard_frag = dev->dev.params.features &
+                           DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS;
 
    /* Splitting a long submission lets the GPU start work from the first ioctl
     * while the kernel validates later ioctls, so a profile may cap batch size. */
@@ -1349,6 +1343,7 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       list_inithead(&dev->vdm.full[class]);
    }
    simple_mtx_init(&dev->scratch.lock, mtx_plain);
+   simple_mtx_init(&dev->heap_lock, mtx_plain);
    simple_mtx_init(&dev->sparse_buffers.lock, mtx_plain);
    list_inithead(&dev->sparse_buffers.list);
    simple_mtx_init(&dev->shader_binary_cache.lock, mtx_plain);
@@ -1503,7 +1498,9 @@ hk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    agx_bo_unreference(&dev->dev, dev->rodata.heap_bo);
    agx_bo_unreference(&dev->dev, dev->rodata.indexed_heap_pointers_bo);
    agx_bo_unreference(&dev->dev, dev->rodata.bo);
-   agx_bo_unreference(&dev->dev, dev->heap);
+   for (unsigned s = 0; s < HK_HEAP_SLOTS; ++s)
+      agx_bo_unreference(&dev->dev, dev->heap_slots[s]);
+   simple_mtx_destroy(&dev->heap_lock);
    hk_g17p_bg_eot_dev_cache_finish(dev);
    agx_bg_eot_cleanup(&dev->bg_eot);
    hk_finish_vm_status_mirror(dev);

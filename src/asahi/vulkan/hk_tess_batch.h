@@ -55,15 +55,16 @@ struct hk_tess_batch {
  * tessellation immediately) or non-atomic pipeline/clipper/primitives-generated
  * counters may join the batch; indirect draws use a GPU setup kernel.
  * Admitted: native AGX3 (G15/G16/G17P), which share the direct CDM launch and
- * weak-barrier upgrade path. G17P measured on M4 Pro / T6040 (27 ms -> 1 ms
- * on 1024 draws, barrier elision verified by vulkan-tess-batch-order).
+ * weak-barrier upgrade path, and M5 HAL300 (AGX3C). G17P measured on M4 Pro /
+ * T6040 (27 ms -> 1 ms on 1024 draws, barrier elision verified by
+ * vulkan-tess-batch-order). Closed: AGX3D (untested).
  */
 static inline bool
 hk_tess_batchable(enum agx_chip chip, struct agx_draw draw, bool geometry,
                   bool counters)
 {
-   return agx_chip_native_agx3(chip) && !agx_is_indirect(draw.b) &&
-          !geometry && !counters;
+   return (agx_chip_native_agx3(chip) || agx_chip_g17_m5(chip)) &&
+          !agx_is_indirect(draw.b) && !geometry && !counters;
 }
 
 /* Create the side streams that are missing. False, with the command buffer

@@ -305,7 +305,8 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_external_memory_host = agx_has_host_import(dev),
-      .EXT_fragment_shader_interlock = agx_chip_native_or_m5(dev->chip),
+      .EXT_fragment_shader_interlock =
+         !agx_chip_hal300_path(dev->chip) || agx_chip_g17_m5(dev->chip),
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -411,7 +412,7 @@ hk_get_device_features(
       
       .taskShader = supported_extensions->EXT_mesh_shader &&
                     (dev->chip == AGX_CHIP_G17P ||
-                     (dev->chip == AGX_CHIP_G17S &&
+                     (agx_chip_g17_m5(dev->chip) &&
                       hk_m5_task_record(dev->params.features))),
       .meshShader = supported_extensions->EXT_mesh_shader,
       /* G17P replays a multiview mesh draw per view, as other draws. */
@@ -439,9 +440,7 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
-      .vertexPipelineStoresAndAtomics =
-         instance->drirc.misc.enable_vertex_pipeline_stores_atomics ||
-         agx_chip_g17_m5(dev->chip),
+      .vertexPipelineStoresAndAtomics = true,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -484,9 +483,11 @@ hk_get_device_features(
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
-      /* HAL200 interpolation is 32-bit, but the compiler performs matching
-       * type-correct widening at ST_VARY and narrowing after interpolation. */
-      .storageInputOutput16 = agx_chip_native_or_m5(dev->chip),
+      /* Interpolation uses 32-bit UVS slots; hk_nir_widen_16bit_varyings()
+       * and hk_widen_integer_io() perform matching type-correct widening on
+       * outputs and narrowing on inputs across AGX2, native AGX3, and M5. */
+      .storageInputOutput16 =
+         !agx_chip_hal300_path(dev->chip) || agx_chip_g17_m5(dev->chip),
       .multiview = true,
       /* ViewIndex is lowered into the layer output of the last
        * pre-rasterization stage and the draw is duplicated per view, so
@@ -1129,12 +1130,12 @@ hk_get_device_properties(const struct agx_device *dev,
 {
    const unsigned descriptor_generation =
       agx_chip_descriptor_generation(dev->chip);
-   /* AGX3 parts (G15/G16/G17P, M5, and G18G) view texel buffers through the
-    * 2D texture/PBE descriptor with the software alignment tail.
+   /* Both AGX2 and AGX3/M5/G18G view texel buffers through the 2D texture/PBE
+    * descriptor with a software alignment tail.
     */
-   const bool agx3_texel_buffer_tail = agx_chip_agx3_path(dev->chip);
    const bool texel_buffer_single_texel_alignment =
-      hk_descriptor_generation_is_agx2(descriptor_generation) || agx3_texel_buffer_tail;
+      hk_descriptor_generation_is_agx2(descriptor_generation) ||
+      agx_chip_agx3_path(dev->chip);
    /* G17P: what agx_nir_lower_gen1_mesh accepts and the CTS runs there
     * (misc.maximize_invocations_256); no larger mesh workgroup was run. */
    const uint32_t mesh_threads = dev->chip == AGX_CHIP_G17P ? 256 : 1024;
@@ -1197,13 +1198,13 @@ hk_get_device_properties(const struct agx_device *dev,
           agx_chip_g17_m5(dev->chip)) ? 2048 : 16384,
       .maxImageDimensionCube = 16384,
       .maxImageArrayLayers = 2048,
-      /* The native AGX3 and M5 texture/PBE includes the software alignment
-       * tail in its height. Reserve the worst-case 15 R8 texels so a
-       * maximally sized view at a single-texel offset still fits the native
-       * 2D descriptor.
+      /* Every 2D texel-buffer texture/PBE with single-texel alignment includes
+       * its software alignment tail in its height. Reserve the worst-case 15
+       * R8 texels so a maximally sized view at a single-texel offset still
+       * fits the 2D descriptor.
        */
       .maxTexelBufferElements = AGX_TEXTURE_BUFFER_MAX_SIZE -
-                               (agx3_texel_buffer_tail ? 15 : 0),
+                               (texel_buffer_single_texel_alignment ? 15 : 0),
       .maxUniformBufferRange = 65536,
 
       /* Storage buffers are lowered to global address arithmetic with a
@@ -1368,8 +1369,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxComputeSharedMemorySize = HK_MAX_SHARED_SIZE,
       .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
       .maxComputeWorkGroupInvocations = 1024,
-      .maxComputeWorkGroupSize = {
-         1024, 1024, agx_chip_g17_m5(dev->chip) ? 1024 : 64},
+      /* The CDM local size is three 32-bit words and local invocation IDs are
+       * three 16-bit components, so no axis is narrower than the invocation
+       * limit. */
+      .maxComputeWorkGroupSize = {1024, 1024, 1024},
       .subPixelPrecisionBits = 8,
       .subTexelPrecisionBits = 8,
       .mipmapPrecisionBits = 8,
@@ -1787,25 +1790,8 @@ hk_get_device_properties(const struct agx_device *dev,
       properties->sparseResidencyNonResidentStrict =
          instance->drirc.misc.sparse_strict_residency;
 
-   if (agx_chip_native_agx3(dev->chip)) {
-      /* Measured per operation under the G17P drm-shim:
-       *
-       *   BASIC             g22_subgroup_basic          encodes
-       *   VOTE              g21_subgroup_vote           encodes
-       *   BALLOT            g05_subgroup_ballot         encodes
-       *   ARITHMETIC        g06_subgroup_arith          encodes
-       *   SHUFFLE           g07_subgroup_shuffle        encodes
-       *   SHUFFLE_RELATIVE  g25_subgroup_shuffle_rel    encodes
-       *   CLUSTERED         g23_subgroup_clustered      encodes
-       *   QUAD              g08_subgroup_quad           encodes
-       *   ROTATE/CLUSTERED  g24_subgroup_rotate         encodes
-       *
-       * G17P uses the same lane instructions in native vertex/fragment
-       * programs and the compute programs implementing tessellation and
-       * geometry. Other AGX3 targets retain their stage restriction. */
-      properties->subgroupQuadOperationsInAllStages =
-         dev->chip == AGX_CHIP_G17P;
-   }
+   properties->subgroupQuadOperationsInAllStages =
+      agx_chip_has_shader_quad_control(dev->chip);
 
    snprintf(properties->deviceName, sizeof(properties->deviceName), "%s",
             (strlen(instance->drirc.debug.force_vk_devicename) > 0) ?
@@ -1978,6 +1964,54 @@ hk_border_emulation_remember(struct hk_physical_device *pdev)
 #endif
 }
 
+static bool
+hk_min_lod_emulation_key(struct hk_physical_device *pdev, cache_key key)
+{
+#ifdef ENABLE_SHADER_CACHE
+   if (!pdev->vk.disk_cache)
+      return false;
+   static const char tag[] = "hk min_lod emulation";
+   const char *process = util_get_process_name();
+   struct mesa_blake3 ctx;
+   blake3_hash hash;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   if (process)
+      _mesa_blake3_update(&ctx, process, strlen(process));
+   _mesa_blake3_final(&ctx, hash);
+   disk_cache_compute_key(pdev->vk.disk_cache, hash, sizeof(hash), key);
+   return true;
+#else
+   return false;
+#endif
+}
+
+void
+hk_min_lod_emulation_recall(struct hk_physical_device *pdev)
+{
+#ifdef ENABLE_SHADER_CACHE
+   cache_key key;
+   size_t size;
+   if (!hk_min_lod_emulation_key(pdev, key))
+      return;
+   void *seen = disk_cache_get(pdev->vk.disk_cache, key, &size);
+   if (seen)
+      p_atomic_set(&pdev->min_lod_emulation, 1);
+   free(seen);
+#endif
+}
+
+void
+hk_min_lod_emulation_remember(struct hk_physical_device *pdev)
+{
+#ifdef ENABLE_SHADER_CACHE
+   static const uint8_t seen = 1;
+   cache_key key;
+   if (hk_min_lod_emulation_key(pdev, key))
+      disk_cache_put(pdev->vk.disk_cache, key, &seen, sizeof(seen), NULL);
+#endif
+}
+
 static void
 hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 {
@@ -2012,6 +2046,7 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, disk_cache_id);
    if (pdev->vk.disk_cache != NULL) {
       hk_border_emulation_recall(pdev);
+      hk_min_lod_emulation_recall(pdev);
       pdev->vk.properties.pipelineBinaryInternalCache = true;
       pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
       pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;
@@ -2241,7 +2276,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
     * VK_KHR_cooperative_matrix does not advertise it. */
    supported_extensions.NV_cooperative_matrix2 = m5_cmat;
 
-   supported_extensions.EXT_mesh_shader = pdev->dev.chip == AGX_CHIP_G17S &&
+   supported_extensions.EXT_mesh_shader = agx_chip_g17_m5(pdev->dev.chip) &&
       (pdev->dev.params.features & DRM_ASAHI_FEATURE_RENDER_RESOURCES_V2);
 
    /* Gen5 adds native component-wise minimum/maximum sampler reduction. */
