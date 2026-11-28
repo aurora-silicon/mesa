@@ -824,6 +824,10 @@ struct hk_linked_shader {
     * patched with each draw's range addresses (struct hk_g17p_gfx_loader). */
    void *g17p_gfx_loaders;
 
+   /* Inline-immediate vertex Ioto programs for push-only vertex shaders
+    * (struct hk_g17p_inline_push_loader), published lock-free. */
+   void *g17p_inline_push_loaders;
+
    /* True if the VS prolog uses software indexing, either for geom/tess or
     * adjacency primitives.
     */

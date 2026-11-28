@@ -2156,7 +2156,7 @@ direct_draw_fast_path_correctness(struct fixture *f)
       .pointer = hw_vs->info.agx3_root_uniform,
       .offset_B = hk_root_descriptor_offset(push),
       .dest = 16,
-      .halfs = 8, /* 16 bytes of push constants */
+      .halfs = 10, /* 20 bytes (> 16B inline-imm cap): exercises uploader.main bypass */
    };
    hw_vs->agx3_vdm_state_update.source_layout =
       AGX_VDM_STATE_UPDATE_SOURCE_LAYOUT_AGX3_VERTEX_PROGRAM_VARIANT;
@@ -2211,8 +2211,8 @@ direct_draw_fast_path_correctness(struct fixture *f)
       CHECK(p0 != 0 && cmd->vk.record_result == VK_SUCCESS);
 
       /* First bypass draw via reference path establishes bypass_loader. */
-      const uint32_t push_a[4] = {0x101u, 0x202u, 0x303u, 0x404u};
-      hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, push_a);
+      const uint32_t push_a[5] = {0x101u, 0x202u, 0x303u, 0x404u, 0x505u};
+      hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 20, push_a);
       const uint64_t p_ref1 =
          hk_agx3_try_push_only_vs_program(cmd, hw_vs, &linked_vs);
       CHECK(p_ref1 != 0);
@@ -2222,15 +2222,17 @@ direct_draw_fast_path_correctness(struct fixture *f)
       struct hk_agx3_direct_draw_fast *fast = &cmd->state.gfx.direct_draw_fast;
       memset(fast, 0, sizeof(*fast));
       CHECK(hk_agx3_push_bypass_ioto_prepare(cmd, hw_vs, &linked_vs, fast));
-      CHECK(fast->push_min_B == 0 && fast->push_size_B == 16);
+      CHECK(!fast->push_inline_imm);
+      CHECK(fast->push_min_B == 0 && fast->push_size_B == 20);
       CHECK(fast->push_reloc_count >= 1);
       CHECK(fast->push_range_count == 1);
 
       /* Compare reference vs fast-path Ioto bytes for identical push VA. */
       const uint32_t saved_main_off = cmd->uploader.main.offset;
       const uint32_t saved_ioto_cur = cmd->ioto.cursor;
-      const uint32_t push_b[4] = {0xaaaa0001u, 0xbbbb0002u, 0xcccc0003u, 0xdddd0004u};
-      hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 16, push_b);
+      const uint32_t push_b[5] = {0xaaaa0001u, 0xbbbb0002u, 0xcccc0003u,
+                                  0xdddd0004u, 0xeeee0005u};
+      hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 20, push_b);
       const uint64_t p_ref2 =
          hk_agx3_try_push_only_vs_program(cmd, hw_vs, &linked_vs);
       CHECK(p_ref2 != 0);
@@ -2281,7 +2283,7 @@ direct_draw_fast_path_correctness(struct fixture *f)
       CHECK(memcmp(ioto_map + (p_ref2 - arena_va.addr), ref_ioto,
                    fast->ioto_length) == 0);
       CHECK(memcmp((uint8_t *)cmd->uploader.main.map + saved_main_off, push_b,
-                   16) == 0);
+                   20) == 0);
       const size_t after_push_draw = (uint8_t *)cs.current - vdm_buf;
       if (fast->is_hal200) {
          CHECK(after_push_draw == AGX_VDM_STATE_UPDATE_LENGTH + 16);
@@ -2505,6 +2507,147 @@ direct_draw_fast_path_correctness(struct fixture *f)
 
       cmd->current_cs.gfx = NULL;
       hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
+
+      /* 3. Push-only VS with 1..4 dwords (4B..16B) uses the zero-LDDEV inline
+       * immediate Ioto path: 0 uploader.main traffic, compact Ioto size, and
+       * byte-identical output between hk_agx3_try_push_only_vs_program() and
+       * armed hk_CmdDraw() on both HAL200 and M5. */
+      const unsigned imm_cases[] = {1, 4};
+      for (unsigned c = 0; c < ARRAY_SIZE(imm_cases); ++c) {
+         const unsigned dwords = imm_cases[c];
+         const unsigned push_B = dwords * 4u;
+         hw_vs->b.info.agx3_uniform_dma[0].dest = dwords == 1 ? 24 : 16;
+         hw_vs->b.info.agx3_uniform_dma[0].halfs = dwords * 2u;
+
+         reset(f);
+         cmd->vk.record_result = VK_SUCCESS;
+         cmd->ioto = (struct hk_ioto_arena){
+            .bo = &arena_bo,
+            .map = ioto_map,
+            .base = arena_va.addr,
+            .capacity = ioto_capacity,
+         };
+         cmd->state.gfx.root = 0x800000;
+         cmd->state.gfx.render.tilebuffer = (struct agx_tilebuffer_layout){
+            .tile_size = 32 * 32,
+            .sample_size_B = 8,
+            .nr_samples = 1,
+            .max_sample_size_B = 64,
+            .max_samples_per_tile = 2048,
+            .max_bytes_per_tile = 32768,
+         };
+
+         const uint64_t ip0 = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+         CHECK(ip0 != 0 && cmd->vk.record_result == VK_SUCCESS);
+
+         const uint32_t imm_a[4] = {0xdeadbeefu, 0x00000040u, 0x12345678u,
+                                    0x89abcdefu};
+         const uint32_t main_before = cmd->uploader.main.offset;
+         hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push_B,
+                             imm_a);
+         const uint64_t ip_ref1 =
+            hk_agx3_try_push_only_vs_program(cmd, hw_vs, &linked_vs);
+         CHECK(ip_ref1 != 0);
+         CHECK(cmd->uploader.main.offset == main_before);
+         hk_root_mark_bypass_launched(desc);
+
+         memset(fast, 0, sizeof(*fast));
+         CHECK(hk_agx3_push_bypass_ioto_prepare(cmd, hw_vs, &linked_vs, fast));
+         CHECK(fast->push_inline_imm);
+         CHECK(fast->push_inline_count == dwords);
+         CHECK(fast->push_reloc_count == 0);
+         const unsigned expected_len =
+            (agx_chip_native_hal200(chips[i].chip)
+                ? AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE
+                : AGX_IOTO_G17G_VERTEX_NO_RESOURCE_PROGRAM_SIZE) +
+            dwords * 12u;
+         CHECK(fast->ioto_length == expected_len);
+
+         const uint32_t imm_b[4] = {0x00000042u, 0xfeedfaceu, 0xcafebabeu,
+                                    0x76543210u};
+         const uint32_t cur_before = cmd->ioto.cursor;
+         hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push_B,
+                             imm_b);
+         const uint64_t ip_ref2 =
+            hk_agx3_try_push_only_vs_program(cmd, hw_vs, &linked_vs);
+         CHECK(ip_ref2 != 0);
+         CHECK(cmd->uploader.main.offset == main_before);
+         uint8_t imm_ref_bytes[256];
+         CHECK(fast->ioto_length <= sizeof(imm_ref_bytes));
+         memcpy(imm_ref_bytes, ioto_map + (ip_ref2 - arena_va.addr),
+                fast->ioto_length);
+         /* Verify each inline LDIMM carries the exact pushed dword. */
+         for (unsigned k = 0; k < dwords; ++k) {
+            uint8_t expected_ldimm[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+            agx_ioto_load_pack_ldimm_long(
+               AGX3_INLINE_IMM_TEMP_BASE_HALF +
+                  k * AGX3_INLINE_IMM_TEMP_STRIDE_HALFS,
+               imm_b[k], expected_ldimm);
+            CHECK(memcmp(imm_ref_bytes + 8u * k, expected_ldimm,
+                         sizeof(expected_ldimm)) == 0);
+         }
+
+         /* Rewind and execute armed fast-path hk_CmdDraw(). */
+         cmd->ioto.cursor = cur_before;
+         cmd->state.gfx.g17p_ioto[0].loader_program = ip_ref1;
+         memcpy(cmd->state.gfx.g17p_ioto[0].inline_push_values, imm_a, push_B);
+
+         struct hk_cs ics = {0};
+         ics.type = HK_CS_VDM;
+         ics.start = vdm_buf;
+         ics.current = vdm_buf;
+         ics.end = vdm_buf + 16384;
+         ics.chunk.cpu = vdm_buf;
+         ics.chunk.gpu = 0x900000;
+         ics.g17p_bind_tail.valid = true;
+         ics.g17p_bind_tail.state_compact = 0x12340;
+         ics.m5_ppp_emitted_valid = true;
+         ics.g17p_primitive_bound = 16;
+         cmd->current_cs.gfx = &ics;
+
+         fast->cs = &ics;
+         fast->cs_chunk_gpu = ics.chunk.gpu;
+         fast->dyn_generation = cmd->vk.dynamic_graphics_state.generation;
+         fast->non_push_generation = desc->non_push_generation;
+         fast->vertex_buffer_generation =
+            cmd->state.gfx.vertex_buffer_generation;
+         fast->root = cmd->state.gfx.root;
+         fast->sync_epoch = cmd->sync.epoch;
+         fast->bind_tail_compact = ics.g17p_bind_tail.state_compact;
+         fast->is_hal200 = agx_chip_native_hal200(chips[i].chip);
+         fast->topology = (uint8_t)AGX_PRIMITIVE_TRIANGLES;
+         fast->draw_header_word =
+            (AGX_VDM_HAL200_DIRECT_DRAW_OPCODE << 16) |
+            ((uint32_t)AGX_PRIMITIVE_TRIANGLES << 8);
+         fast->vdm_words[0] = AGX_VDM_STATE_UPDATE_HEADER;
+         fast->vdm_raw_template = 0;
+         fast->push_bypass_ready = true;
+         fast->valid = true;
+
+         hk_CmdDraw(cb, 6, 1, 0, 0);
+         CHECK(ics.stats.calls == 1 && ics.stats.cmds == 1);
+         CHECK(cmd->uploader.main.offset == main_before);
+         CHECK(cmd->state.gfx.g17p_ioto[0].loader == NULL);
+         CHECK(cmd->state.gfx.g17p_ioto[0].loader_program == ip_ref2);
+         CHECK(memcmp(ioto_map + (ip_ref2 - arena_va.addr), imm_ref_bytes,
+                      fast->ioto_length) == 0);
+
+         /* Launch replay after an inline draw deduplicates identical values
+          * and re-emits when push data changes. */
+         CHECK(hk_upload_usc_words(cmd, hw_vs, &linked_vs) == ip_ref2);
+         const uint32_t imm_c[4] = {0x99999999u, 0x88888888u, 0x77777777u,
+                                    0x66666666u};
+         hk_CmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push_B,
+                             imm_c);
+         const uint64_t ip_replay = hk_upload_usc_words(cmd, hw_vs, &linked_vs);
+         CHECK(ip_replay != 0 && ip_replay != ip_ref2);
+         CHECK(cmd->uploader.main.offset == main_before);
+
+         cmd->current_cs.gfx = NULL;
+         hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
+      }
+      hw_vs->b.info.agx3_uniform_dma[0].dest = 16;
+      hw_vs->b.info.agx3_uniform_dma[0].halfs = 10;
    }
 
    /* A remembered unsupported vertex program never outlives a full state

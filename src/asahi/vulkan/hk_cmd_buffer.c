@@ -587,6 +587,7 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
       for (unsigned stage = 0; stage < ARRAY_SIZE(cmd->state.gfx.g17p_ioto);
            ++stage) {
          cmd->state.gfx.g17p_ioto[stage].loader = NULL;
+         cmd->state.gfx.g17p_ioto[stage].inline_push_loader = NULL;
          cmd->state.gfx.g17p_ioto[stage].loader_linked = NULL;
          cmd->state.gfx.g17p_ioto[stage].loader_program = 0;
          cmd->state.gfx.g17p_ioto[stage].admit.s = NULL;
@@ -3806,6 +3807,188 @@ hk_g17p_graphics_program_desc_init(
    struct hk_linked_shader *linked, const struct agx3_ioto_uniform_range *ranges,
    size_t range_count, struct hk_agx3_g17p_graphics_program_desc *desc);
 
+struct hk_g17p_inline_push_loader {
+   struct hk_g17p_inline_push_loader *next;
+   const struct hk_shader *s;
+   uint16_t uniform_half[AGX3_INLINE_IMM_MAX_DWORDS];
+   uint32_t static_value[AGX3_INLINE_IMM_MAX_DWORDS];
+   uint8_t is_push_mask;
+   uint8_t total_dwords;
+   uint8_t push_count;
+   uint16_t push_byte_off[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   uint64_t ldimm_dest[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   uint16_t ldimm_offset[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   uint16_t length;
+   uint8_t bytes[];
+};
+
+static bool
+hk_g17p_inline_push_loader_matches(const struct hk_g17p_inline_push_loader *il,
+                                   const struct hk_shader *s,
+                                   const uint16_t *uniform_halfs,
+                                   const uint32_t *initial_values,
+                                   uint8_t is_push_mask,
+                                   unsigned total_dwords,
+                                   const uint16_t *push_byte_offs,
+                                   unsigned push_count)
+{
+   if (il->s != s || il->total_dwords != total_dwords ||
+       il->push_count != push_count || il->is_push_mask != is_push_mask)
+      return false;
+
+   for (unsigned i = 0; i < total_dwords; ++i) {
+      if (il->uniform_half[i] != uniform_halfs[i] ||
+          (!(is_push_mask & BITFIELD_BIT(i)) &&
+           il->static_value[i] != initial_values[i]))
+         return false;
+   }
+   for (unsigned i = 0; i < push_count; ++i) {
+      if (il->push_byte_off[i] != push_byte_offs[i])
+         return false;
+   }
+   return true;
+}
+
+static const struct hk_g17p_inline_push_loader *
+hk_g17p_inline_push_loader_get(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                               struct hk_linked_shader *linked,
+                               const uint16_t *uniform_halfs,
+                               const uint32_t *initial_values,
+                               uint8_t is_push_mask, unsigned total_dwords,
+                               const uint16_t *push_byte_offs,
+                               unsigned push_count)
+{
+   for (struct hk_g17p_inline_push_loader *it =
+           p_atomic_read(&linked->g17p_inline_push_loaders);
+        it; it = it->next) {
+      if (hk_g17p_inline_push_loader_matches(it, s, uniform_halfs,
+                                             initial_values, is_push_mask,
+                                             total_dwords, push_byte_offs,
+                                             push_count))
+         return it;
+   }
+
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_agx3_g17p_graphics_program_desc desc;
+   if (!hk_g17p_graphics_program_desc_init(cmd, s, linked, NULL, 0, &desc))
+      return NULL;
+   desc.program_va = dev->dev.shader_base + 0x10000;
+
+   struct agx3_inline_imm_program *gen = malloc(sizeof(*gen));
+   if (!gen)
+      return NULL;
+
+   struct hk_g17p_inline_push_loader *il = NULL;
+   if (!hk_agx3_vertex_inline_imm_program_generate(
+          dev->dev.chip, &desc, uniform_halfs, initial_values, total_dwords,
+          gen))
+      goto out;
+
+   il = calloc(1, sizeof(*il) + gen->program.length);
+   if (!il)
+      goto out;
+
+   il->s = s;
+   il->total_dwords = gen->dword_count;
+   il->push_count = (uint8_t)push_count;
+   il->is_push_mask = is_push_mask;
+   il->length = gen->program.length;
+   memcpy(il->bytes, gen->program.bytes, gen->program.length);
+   unsigned p = 0;
+   for (unsigned i = 0; i < total_dwords; ++i) {
+      il->uniform_half[i] = uniform_halfs[i];
+      il->static_value[i] = initial_values[i];
+      if (is_push_mask & BITFIELD_BIT(i)) {
+         assert(p < push_count);
+         il->push_byte_off[p] = push_byte_offs[p];
+         il->ldimm_offset[p] = gen->ldimm_offset[i];
+         il->ldimm_dest[p] =
+            agx_ioto_load_ldimm_long_dest(gen->ldimm_dest_half[i]);
+         p++;
+      }
+   }
+   assert(p == push_count);
+
+   while (true) {
+      struct hk_g17p_inline_push_loader *head =
+         p_atomic_read(&linked->g17p_inline_push_loaders);
+      il->next = head;
+      if (p_atomic_cmpxchg_ptr(&linked->g17p_inline_push_loaders, head, il) ==
+          head)
+         break;
+   }
+
+out:
+   free(gen);
+   return il;
+}
+
+static uint64_t
+hk_g17p_inline_push_loader_publish(
+   struct hk_cmd_buffer *cmd, struct hk_linked_shader *linked,
+   struct hk_g17p_graphics_ioto_cache_entry *cached,
+   const struct hk_g17p_inline_push_loader *il, const uint8_t *push_data)
+{
+   uint32_t values[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   for (unsigned i = 0; i < il->push_count; ++i)
+      memcpy(&values[i], push_data + il->push_byte_off[i], sizeof(values[i]));
+
+   if (cached->inline_push_loader == il && cached->loader_linked == linked &&
+       cached->loader_program &&
+       memcmp(cached->inline_push_values, values,
+              il->push_count * sizeof(values[0])) == 0)
+      return cached->loader_program;
+
+   struct hk_ioto_arena *arena = &cmd->ioto;
+   const uint32_t len = il->length;
+   const uint32_t mask = HK_IOTO_PROGRAM_ALIGNMENT - 1;
+   uint8_t *dst = NULL;
+   uint64_t published = 0;
+   struct hk_ioto_reservation r;
+   bool slow = false;
+
+   if (likely(len != 0 && arena->map && arena->cursor <= arena->capacity &&
+              arena->cursor <= UINT32_MAX - mask)) {
+      const uint32_t offset = (arena->cursor + mask) & ~mask;
+      if (likely(offset <= arena->capacity && len <= arena->capacity - offset)) {
+         dst = arena->map + offset;
+         published = arena->base + offset;
+         arena->cursor = offset + len;
+         arena->programs++;
+         arena->program_bytes += len;
+         if (unlikely(!hk_g17p_cached_cmd_memory(&hk_cmd_buffer_device(cmd)->dev)))
+            agx_bo_assert_range(arena->bo, offset, len);
+      }
+   }
+
+   if (unlikely(!dst)) {
+      if (!hk_cmd_reserve_ioto_program_slow(cmd, len,
+                                            "G17P inline push loader", &r))
+         return 0;
+      dst = r.map;
+      slow = true;
+   }
+
+   memcpy(dst, il->bytes, len);
+   for (unsigned i = 0; i < il->push_count; ++i)
+      hk_g17p_patch_ldimm(dst + il->ldimm_offset[i], false, il->ldimm_dest[i],
+                          values[i]);
+
+   if (unlikely(slow)) {
+      published = hk_cmd_publish_ioto_program(cmd, &r, len);
+      if (!published)
+         return 0;
+   }
+
+   cached->loader = NULL;
+   cached->inline_push_loader = il;
+   cached->loader_linked = linked;
+   cached->loader_program = published;
+   memcpy(cached->inline_push_values, values,
+          il->push_count * sizeof(values[0]));
+   return published;
+}
+
 static inline bool
 hk_g17p_gfx_loader_ranges_equal(const struct agx3_ioto_uniform_range *a,
                                 const struct agx3_ioto_uniform_range *b,
@@ -3845,6 +4028,7 @@ hk_g17p_gfx_loader_publish(struct hk_cmd_buffer *cmd,
       return 0;
 
    cached->loader = l;
+   cached->inline_push_loader = NULL;
    cached->loader_linked = linked;
    cached->loader_program = published;
    memcpy(cached->loader_ranges, ranges, range_count * sizeof(ranges[0]));
@@ -3881,18 +4065,19 @@ hk_g17p_launch_slot(struct hk_cmd_buffer *cmd, unsigned stage,
  * derive from the draw state. */
 static void
 hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
-                      const struct hk_shader *s,
-                      const struct hk_linked_shader *linked,
+                      struct hk_shader *s, struct hk_linked_shader *linked,
                       const struct hk_g17p_gfx_loader *l, uint8_t flags,
                       const struct hk_shader *hw_vs, uint64_t root,
                       const struct agx3_ioto_uniform_range *ranges,
                       size_t count, const uint8_t *sources)
 {
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
    const struct agx_tilebuffer_layout *tib = &gfx->render.tilebuffer;
 
    launch->valid = false;
    launch->bypass_loader = NULL;
+   launch->inline_push_loader = NULL;
    launch->root_bypass_ok = false;
    launch->has_general_root = false;
    launch->push_min_B = 0;
@@ -3904,6 +4089,18 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
    bool has_general_root = false;
    uint16_t push_min_B = HK_MAX_PUSH_SIZE;
    uint16_t push_max_B = 0;
+   bool all_inline_push =
+      (agx_chip_native_hal200(dev->dev.chip) ||
+       agx_chip_g17_m5(dev->dev.chip)) &&
+      s->info.stage == MESA_SHADER_VERTEX && !s->b.info.has_preamble &&
+      !s->info.agx3_gen1_fragment_rq && !gfx->g17p_hoisted_preamble_va &&
+      count > 0;
+   uint16_t inline_uniform_halfs[AGX3_INLINE_IMM_MAX_DWORDS];
+   uint32_t inline_init_vals[AGX3_INLINE_IMM_MAX_DWORDS];
+   uint16_t inline_push_offs[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   uint8_t inline_is_push_mask = 0;
+   unsigned inline_total_dwords = 0;
+   unsigned inline_push_dwords = 0;
 
    for (unsigned i = 0; i < count; ++i) {
       uint64_t offset = 0;
@@ -3912,6 +4109,35 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
       switch (sources[i]) {
       case HK_G17P_RANGE_SOURCE_CONSTANT:
          offset = ranges[i].address;
+         if (all_inline_push) {
+            const struct agx_rodata *rodata = &s->b.info.rodata;
+            const unsigned dwords = ranges[i].size_halfs / 2u;
+            if (rodata->size_16 != 0 && s->bo && s->bo->va && s->code_ptr &&
+                s->code_size == s->b.info.binary_size &&
+                ranges[i].address == hk_shader_code_va(s) + rodata->offset &&
+                ranges[i].start_halfs == rodata->base_uniform &&
+                (rodata->offset & 3u) == 0 &&
+                (ranges[i].start_halfs & 1u) == 0 &&
+                (ranges[i].size_halfs & 1u) == 0 && dwords >= 1 &&
+                dwords <= 4 &&
+                ranges[i].start_halfs + ranges[i].size_halfs <= 512u &&
+                rodata->offset <= s->code_size &&
+                2u * ranges[i].size_halfs <= s->code_size - rodata->offset &&
+                inline_total_dwords + dwords <= AGX3_INLINE_IMM_MAX_DWORDS) {
+               const uint8_t *ro_bytes =
+                  (const uint8_t *)s->code_ptr + rodata->offset;
+               for (unsigned d = 0; d < dwords; ++d) {
+                  uint32_t cval = 0;
+                  memcpy(&cval, ro_bytes + 4u * d, sizeof(cval));
+                  inline_uniform_halfs[inline_total_dwords] =
+                     (uint16_t)(ranges[i].start_halfs + 2u * d);
+                  inline_init_vals[inline_total_dwords] = cval;
+                  inline_total_dwords++;
+               }
+            } else {
+               all_inline_push = false;
+            }
+         }
          break;
       case HK_G17P_RANGE_SOURCE_ROOT: {
          offset = ranges[i].address - root;
@@ -3960,6 +4186,26 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
          push_min_B = MIN2(push_min_B, rel);
          push_max_B = MAX2(push_max_B, end);
          has_push = true;
+         if (all_inline_push) {
+            const unsigned dwords = ranges[i].size_halfs / 2u;
+            if ((rel & 3u) != 0 || (ranges[i].start_halfs & 1u) != 0 ||
+                (ranges[i].size_halfs & 1u) != 0 || dwords == 0 ||
+                ranges[i].start_halfs + ranges[i].size_halfs > 512u ||
+                inline_push_dwords + dwords > AGX3_INLINE_IMM_MAX_PUSH_DWORDS ||
+                inline_total_dwords + dwords > AGX3_INLINE_IMM_MAX_DWORDS) {
+               all_inline_push = false;
+            } else {
+               for (unsigned d = 0; d < dwords; ++d) {
+                  inline_uniform_halfs[inline_total_dwords] =
+                     (uint16_t)(ranges[i].start_halfs + 2u * d);
+                  inline_init_vals[inline_total_dwords] = 0u;
+                  inline_is_push_mask |= BITFIELD_BIT(inline_total_dwords);
+                  inline_push_offs[inline_push_dwords++] =
+                     (uint16_t)(rel + 4u * d);
+                  inline_total_dwords++;
+               }
+            }
+         }
          break;
       }
       case HK_G17P_RANGE_SOURCE_DRAW_PARAMS:
@@ -4002,6 +4248,9 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
          return;
       }
       launch->source[i] = sources[i];
+      if (sources[i] != HK_G17P_RANGE_SOURCE_PUSH &&
+          sources[i] != HK_G17P_RANGE_SOURCE_CONSTANT)
+         all_inline_push = false;
       launch->set[i] = set;
       launch->descriptor_B[i] = descriptor_B;
       launch->offset[i] = offset;
@@ -4027,6 +4276,12 @@ hk_g17p_launch_record(struct hk_cmd_buffer *cmd, struct hk_g17p_launch *launch,
    if (has_push && push_max_B > push_min_B) {
       launch->push_min_B = push_min_B;
       launch->push_size_B = (uint16_t)(push_max_B - push_min_B);
+   }
+   if (all_inline_push && inline_push_dwords > 0 && inline_total_dwords > 0) {
+      launch->inline_push_loader = hk_g17p_inline_push_loader_get(
+         cmd, s, linked, inline_uniform_halfs, inline_init_vals,
+         inline_is_push_mask, inline_total_dwords, inline_push_offs,
+         inline_push_dwords);
    }
    launch->valid = true;
 }
@@ -4070,6 +4325,11 @@ hk_g17p_launch_replay(struct hk_cmd_buffer *cmd,
                       uint64_t root)
 {
    const struct hk_graphics_state *gfx = &cmd->state.gfx;
+   if (launch->inline_push_loader) {
+      return hk_g17p_inline_push_loader_publish(
+         cmd, linked, cached, launch->inline_push_loader,
+         gfx->descriptors.root.push);
+   }
    const unsigned count = launch->count;
    struct agx3_ioto_uniform_range ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
    for (unsigned i = 0; i < count; ++i) {
@@ -4228,6 +4488,15 @@ hk_g17p_linked_graphics_cache_finish(struct hk_device *dev,
       loader = next;
    }
    linked->g17p_gfx_loaders = NULL;
+
+   struct hk_g17p_inline_push_loader *il =
+      p_atomic_read(&linked->g17p_inline_push_loaders);
+   while (il) {
+      struct hk_g17p_inline_push_loader *next = il->next;
+      free(il);
+      il = next;
+   }
+   linked->g17p_inline_push_loaders = NULL;
 }
 
 /* agx_usc_uniform() publishes at most 64 halves per record. */
@@ -4602,6 +4871,9 @@ hk_agx3_push_bypass_ioto_prepare(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
 
+   fast->push_inline_imm = false;
+   fast->inline_push_loader = NULL;
+
    s = hk_linked_shader_source(s, linked);
    if ((!agx_chip_native_hal200(dev->dev.chip) &&
         !agx_chip_g17_m5(dev->dev.chip)) ||
@@ -4619,6 +4891,32 @@ hk_agx3_push_bypass_ioto_prepare(struct hk_cmd_buffer *cmd, struct hk_shader *s,
    if (launch->has_general_root &&
        (s->info.agx3_root_reads & (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)))
       return false;
+
+   if (launch->inline_push_loader) {
+      const struct hk_g17p_inline_push_loader *il = launch->inline_push_loader;
+      if (!il->length || il->length > sizeof(fast->ioto_bytes) ||
+          cached->loader_linked != linked || !cached->loader_program)
+         return false;
+
+      memcpy(fast->ioto_bytes, il->bytes, il->length);
+      fast->loader = NULL;
+      fast->inline_push_loader = il;
+      fast->linked_vs = linked;
+      fast->ioto_length = il->length;
+      fast->push_min_B = launch->push_min_B;
+      fast->push_size_B = launch->push_size_B;
+      fast->push_reloc_count = 0;
+      fast->push_range_count = 0;
+      fast->push_inline_count = il->push_count;
+      for (unsigned i = 0; i < il->push_count; ++i) {
+         fast->push_inline_dest[i] = il->ldimm_dest[i];
+         fast->push_inline_offset[i] = il->ldimm_offset[i];
+         fast->push_inline_byte_off[i] = il->push_byte_off[i];
+      }
+      fast->cached_cmd_mem = hk_g17p_cached_cmd_memory(&dev->dev);
+      fast->push_inline_imm = true;
+      return true;
+   }
 
    const struct hk_g17p_gfx_loader *l =
       launch->bypass_loader ? launch->bypass_loader : launch->loader;
@@ -5211,6 +5509,12 @@ hk_agx3_try_push_only_vs_program(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                                    s->info.agx3_dynbuf_reads,
                                    s->info.agx3_push_read_dwords, desc))
       return 0;
+
+   if (launch->inline_push_loader) {
+      return hk_g17p_inline_push_loader_publish(
+         cmd, linked, &gfx->g17p_ioto[0], launch->inline_push_loader,
+         desc->root.push);
+   }
 
    const uint8_t dirty_mask = desc->root_change.dirty_mask;
    const unsigned count = launch->count;

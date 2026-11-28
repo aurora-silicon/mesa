@@ -1089,6 +1089,7 @@ enum hk_g17p_range_source {
 };
 
 struct hk_g17p_gfx_loader;
+struct hk_g17p_inline_push_loader;
 
 /* How a stage's uniform ranges derive from the draw state, recorded from a
  * collection by hk_g17p_graphics_uniform_ranges(), and the loader they were
@@ -1106,6 +1107,9 @@ struct hk_g17p_launch {
    /* Cached loader whose patch plan separates narrow bypass uploads (push or
     * VB slices) from gfx->root so steady-state bypass draws patch in O(1). */
    const struct hk_g17p_gfx_loader *bypass_loader;
+   /* Cached inline-immediate vertex loader when every uniform range is a push
+    * constant slice totaling 1..AGX3_INLINE_IMM_MAX_DWORDS dwords. */
+   const struct hk_g17p_inline_push_loader *inline_push_loader;
    const struct hk_shader *hw_vs;
    uint16_t tile_size_px;
    uint8_t sample_size_B;
@@ -1139,10 +1143,12 @@ struct hk_g17p_graphics_ioto_cache_entry {
    /* The loader of the last draw, the program published from it and the
     * range addresses written into it (hk_g17p_publish_gfx_loader()). */
    const struct hk_g17p_gfx_loader *loader;
+   const struct hk_g17p_inline_push_loader *inline_push_loader;
    const struct hk_linked_shader *loader_linked;
    uint64_t loader_program;
    struct agx3_ioto_uniform_range
       loader_ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint32_t inline_push_values[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
 
    /* Inputs of the last admitted program (hk_upload_usc_words_internal()). */
    struct {
@@ -1202,6 +1208,7 @@ struct hk_agx3_direct_draw_fast {
    uint32_t min_lod_free_stages;
    uint32_t bind_tail_compact;
    const struct hk_g17p_gfx_loader *loader;
+   const struct hk_g17p_inline_push_loader *inline_push_loader;
    const struct hk_linked_shader *linked_vs;
 
    /* The linked vertex program whose bound shaders can never take this path
@@ -1227,11 +1234,15 @@ struct hk_agx3_direct_draw_fast {
    uint8_t ioto_bytes[HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE];
    struct hk_agx3_push_ioto_reloc push_relocs[HK_G17P_PATCH_MAX_RELOCS];
    struct hk_agx3_push_range_sync push_ranges[HK_AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint64_t push_inline_dest[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   uint16_t push_inline_offset[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
+   uint16_t push_inline_byte_off[AGX3_INLINE_IMM_MAX_PUSH_DWORDS];
    uint16_t ioto_length;
    uint16_t push_min_B;
    uint16_t push_size_B;
    uint8_t push_reloc_count;
    uint8_t push_range_count;
+   uint8_t push_inline_count;
    uint8_t topology;
    bool valid;
    bool indexed;
@@ -1240,6 +1251,7 @@ struct hk_agx3_direct_draw_fast {
    bool is_hal200;
    bool cached_cmd_mem;
    bool push_bypass_ready;
+   bool push_inline_imm;
 };
 
 struct hk_graphics_state {
