@@ -20056,6 +20056,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
              (I->dest[0].size==AGX_SIZE_16 || I->dest[0].size==AGX_SIZE_32) &&
              I->src[2].type==AGX_INDEX_IMMEDIATE && I->src[3].type==AGX_INDEX_IMMEDIATE &&
              I->src[2].value<=255 && I->src[3].value<=255 &&
+             !I->src[0].abs && !I->src[1].abs &&
              ((I->src[0].type==AGX_INDEX_IMMEDIATE && I->src[0].value==0 && agx3_vary_reg32(I->src[1])) ||
               (I->src[1].type==AGX_INDEX_IMMEDIATE && I->src[1].value==0 && agx3_vary_reg32(I->src[0])))) {
             const bool zero_first=I->src[0].type==AGX_INDEX_IMMEDIATE;

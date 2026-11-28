@@ -8261,18 +8261,10 @@ TEST(NativeForms, Agx3HalfFcmpselUntiedImmediateNotDecodedAsMinifloat)
          agx_unit_test(b, sel->dest[0]);
          agx_optimizer_forward(b->shader);
          agx_materialize_agx3_alu_constants(b->shader);
-         if (target.encoding == AGX_ISA_ENCODING_AGX3C) {
-            EXPECT_EQ(sel->src[2].type, AGX_INDEX_IMMEDIATE);
-            EXPECT_EQ(sel->src[2].value, 0x0020u);
-            EXPECT_EQ(sel->src[3].type, AGX_INDEX_IMMEDIATE);
-            EXPECT_EQ(sel->src[3].value, 0u);
-         } else {
-            const agx_instr *def = find_mov_imm(b->shader, sel->src[2]);
-            ASSERT_NE(def, nullptr);
-            EXPECT_EQ(def->op, AGX_OPCODE_MOV_IMM);
-            EXPECT_EQ(def->dest[0].size, AGX_SIZE_16);
-            EXPECT_EQ(def->imm, 0x0020u);
-         }
+         EXPECT_EQ(sel->src[2].type, AGX_INDEX_IMMEDIATE);
+         EXPECT_EQ(sel->src[2].value, 0x0020u);
+         EXPECT_EQ(sel->src[3].type, AGX_INDEX_IMMEDIATE);
+         EXPECT_EQ(sel->src[3].value, 0u);
          ralloc_free(mem);
       }
 
@@ -8919,4 +8911,116 @@ TEST(NativeForms, M5MeshClipM1_1SplitPositionStores)
    }
    EXPECT_TRUE(found_clip_z_coeff);
    ralloc_free(s);
+}
+
+/* All AGX3B chips (G15G, G16G, G17P) share the native FCMPSEL encoders for
+ * ordered F32 .abs comparands and 16-bit immediate select pairs, so
+ * agx_materialize_agx3_alu_constants() must keep them inline on G15G/G16G
+ * without emitting fadd/mov_imm materializations, and the packer must route
+ * |r| ? 0 with immediate selects cleanly to general agx3_alu_fcmp_select(). */
+TEST(NativeForms, Agx3bFcmpselKeepsAbsAndImmediateSelectsOnG16G)
+{
+   for (enum agx_chip chip : {AGX_CHIP_G15G, AGX_CHIP_G16G, AGX_CHIP_G17P}) {
+      SCOPED_TRACE(chip);
+
+      /* 1. (|x| < 0.0f) ? #0 : #1 into a half destination + |x| < u10h ? u13 : #0. */
+      {
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         b->shader->key = &key;
+
+         agx_index x = agx_preload(b, agx_register(2, AGX_SIZE_32));
+         agx_index y = agx_preload(b, agx_register(4, AGX_SIZE_32));
+         agx_instr *sel1 = agx_fcmpsel_to(
+            b, agx_temp(b->shader, AGX_SIZE_16), agx_abs(x), agx_immediate(0),
+            agx_immediate(0), agx_immediate(1), AGX_FCOND_LT);
+         agx_instr *sel2 = agx_fcmpsel_to(
+            b, agx_temp(b->shader, AGX_SIZE_32), agx_abs(x),
+            agx_uniform(10, AGX_SIZE_16), agx_uniform(12, AGX_SIZE_32),
+            agx_immediate(0), AGX_FCOND_LT);
+         agx_instr *sel3 = agx_fcmpsel_to(
+            b, agx_temp(b->shader, AGX_SIZE_32), agx_uniform(14, AGX_SIZE_32),
+            agx_abs(x), y, x, AGX_FCOND_LT);
+         agx_unit_test(b, sel1->dest[0]);
+         agx_unit_test(b, sel2->dest[0]);
+         agx_unit_test(b, sel3->dest[0]);
+
+         agx_validate(b->shader, "before agx3b fcmpsel materialize");
+         agx_materialize_agx3_alu_constants(b->shader);
+         agx_lower_uniform_sources(b->shader);
+         agx_validate(b->shader, "after agx3b fcmpsel materialize");
+
+         EXPECT_TRUE(sel1->src[0].abs);
+         EXPECT_EQ(sel1->src[0].value, x.value);
+         EXPECT_EQ(sel1->src[2].type, AGX_INDEX_IMMEDIATE);
+         EXPECT_EQ(sel1->src[2].value, 0u);
+         EXPECT_EQ(sel1->src[3].type, AGX_INDEX_IMMEDIATE);
+         EXPECT_EQ(sel1->src[3].value, 1u);
+         EXPECT_TRUE(sel2->src[0].abs);
+         EXPECT_EQ(sel2->src[0].value, x.value);
+         EXPECT_TRUE(sel3->src[0].abs);
+         EXPECT_EQ(sel3->src[0].value, x.value);
+         EXPECT_EQ(sel3->src[1].type, AGX_INDEX_UNIFORM);
+         EXPECT_EQ(sel3->fcond, AGX_FCOND_GT);
+
+         unsigned fadds = 0, mov_imms = 0;
+         agx_foreach_instr_global(b->shader, I) {
+            fadds += I->op == AGX_OPCODE_FADD;
+            mov_imms += I->op == AGX_OPCODE_MOV_IMM;
+         }
+         EXPECT_EQ(fadds, 0u);
+         EXPECT_EQ(mov_imms, 0u);
+         ralloc_free(mem);
+      }
+
+      /* 2. Packing check: |r2| < 0.0f ? #0 : #1 and |r2| < u10h ? u12 : #0
+       *    must route cleanly to general agx3_alu_fcmp_select() on AGX3B. */
+      {
+         void *mem = ralloc_context(NULL);
+         agx_builder *b = agx_test_builder(mem);
+         agx_shader_key key = {};
+         key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+         key.dev.chip = chip;
+         b->shader->key = &key;
+         b->shader->max_reg = 8;
+
+         agx_fcmpsel_to(b, agx_register(0, AGX_SIZE_16),
+                        agx_abs(agx_register(2, AGX_SIZE_32)), agx_immediate(0),
+                        agx_immediate(0), agx_immediate(1), AGX_FCOND_LT);
+         agx_fcmpsel_to(b, agx_register(4, AGX_SIZE_32),
+                        agx_abs(agx_register(2, AGX_SIZE_32)),
+                        agx_uniform(10, AGX_SIZE_16),
+                        agx_uniform(12, AGX_SIZE_32),
+                        agx_immediate(0), AGX_FCOND_LT);
+         agx_stop(b);
+
+         util_dynarray bytes;
+         util_dynarray_init(&bytes, mem);
+         EXPECT_TRUE(agx3_pack_binary(b->shader, &bytes));
+         EXPECT_GT(bytes.size, 4u);
+         ralloc_free(mem);
+      }
+   }
+
+   /* 3. Negative control: AGX3C still materializes .abs on FCMPSEL comparands. */
+   {
+      void *mem = ralloc_context(NULL);
+      agx_builder *b = agx_test_builder(mem);
+      agx_shader_key key = {};
+      key.dev.encoding = AGX_ISA_ENCODING_AGX3C;
+      key.dev.chip = AGX_CHIP_G17S;
+      b->shader->key = &key;
+
+      agx_index x = agx_preload(b, agx_register(2, AGX_SIZE_32));
+      agx_instr *sel = agx_fcmpsel_to(
+         b, agx_temp(b->shader, AGX_SIZE_16), agx_abs(x), agx_immediate(0),
+         agx_immediate(0), agx_immediate(1), AGX_FCOND_LT);
+      agx_unit_test(b, sel->dest[0]);
+      agx_materialize_agx3_alu_constants(b->shader);
+      EXPECT_FALSE(sel->src[0].abs);
+      ralloc_free(mem);
+   }
 }
