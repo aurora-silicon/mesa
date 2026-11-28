@@ -25,6 +25,9 @@ struct hk_buffer {
    /** Reserved VA for sparse buffers, NULL otherwise. */
    struct agx_va *va;
 
+   /** Capture/replay address the application asked for, 0 for none. */
+   uint64_t opaque_capture_address;
+
    /** Bytes of that VA counted in hk_device::sparse_scratch_B. */
    uint64_t sparse_scratch_B;
 

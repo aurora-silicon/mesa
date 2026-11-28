@@ -227,25 +227,8 @@ hk_cmd_buffer_move_sparse_sites(struct hk_cmd_buffer *cmd, const void *from,
    }
 }
 
-void
-hk_cmd_buffer_move_alias_sites(struct hk_cmd_buffer *cmd, const void *from,
-                               const void *from_end, uint8_t *to, size_t skip)
-{
-   util_dynarray_foreach(&cmd->alias_sites, struct hk_alias_site, site) {
-      const uint8_t *word = (const uint8_t *)site->word;
-      if (word < (const uint8_t *)from || word >= (const uint8_t *)from_end)
-         continue;
-
-      /* A site in the folded leading record moves to the trailing record
-       * that absorbed it. */
-      const size_t offset = word - (const uint8_t *)from;
-      site->word = (uint32_t *)(offset < skip ? to - AGX3_CDM_BARRIER_SIZE
-                                              : to + offset - skip);
-   }
-}
-
 /* At vkEndCommandBuffer, once nothing moves the streams any more: a command
- * buffer that uses events gets memory scope throughout
+ * buffer that waits for a host-set event gets memory scope throughout
  * (hk_cmd_alias_scope()), one recorded while a resource may alias by now is
  * written at once, and any other waits in host_alias.cmd_buffers for
  * hk_device_patch_alias_sites(), besides the check at submission. */
@@ -255,7 +238,7 @@ hk_cmd_buffer_end_alias_sites(struct hk_cmd_buffer *cmd)
    if (!cmd->alias_sites.size)
       return;
 
-   if (cmd->state.uses_events) {
+   if (cmd->state.alias_host_wait) {
       hk_cmd_buffer_patch_alias_sites(cmd);
       return;
    }
@@ -1292,8 +1275,8 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
        * with ENOTSUPP ("G18 compute admission rejected ... stream_bytes=52").
        */
       if (cs->type == HK_CS_CDM && !cs->g18_dispatch_sealed) {
-         /* With host_alias.dynamic, every stream holding work ends with the
-          * memory-scoped strong flush, also where its last record is an
+         /* M5 with host_alias.dynamic: every stream holding work ends with
+          * the memory-scoped strong flush, also where its last record is an
           * application barrier recorded without memory scope. Each command
           * then writes back what it wrote by its end, as the memory scope of
           * each barrier did under the per-device rule, so a later command
@@ -1303,8 +1286,11 @@ hk_EndCommandBuffer(VkCommandBuffer commandBuffer)
           * another device's, process's or API's mapping of the same pages,
           * which Vulkan orders after this work only at a submission
           * boundary. Submit packing keeps the scope only at a packet's end
-          * while no resource may alias. */
-         if (dev->host_alias.dynamic &&
+          * while no resource may alias. The end of a G17P command already
+          * publishes its writes to every address (bt xsub with the second
+          * address created while the writer runs reads exact), so G17P
+          * streams end with their own records. */
+         if (dev->host_alias.dynamic && agx_chip_g17_m5(dev->dev.chip) &&
              hk_cdm_visibility_flush_needed(dev, cs, true)) {
             if (cs->current != cs->weak_barrier_end &&
                 cs->current != cs->strong_flush_end)

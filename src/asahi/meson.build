@@ -544,6 +544,43 @@ if with_tools.contains('drm-shim') and with_asahi_vk and with_tests
     timeout : 120,
   )
 
+  # Buffer device address capture/replay through capture/replay memory alone.
+  foreach chip : ['g13g', 'g17p']
+    test(
+      'brl-' + chip + '-capture-replay',
+      prog_python,
+      args : [
+        files('../gallium/drivers/asahi/tests/run-shim.py'),
+        libasahi_noop_drm_shim,
+        hk_vulkan_capture_replay,
+      ],
+      env : [
+        'ASAHI_SHIM_CHIP=' + chip,
+        'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+      ],
+      depends : [_dev_icd, libvulkan_asahi],
+      suite : ['asahi'],
+    )
+  endforeach
+
+  # A wait for a host-set event, also one without barriers, gives its
+  # command buffer memory scope at its end, before memory first aliases.
+  test(
+    'brl-g17p-event-alias',
+    prog_python,
+    args : [
+      files('../gallium/drivers/asahi/tests/run-shim.py'),
+      libasahi_noop_drm_shim,
+      hk_vulkan_event_alias,
+    ],
+    env : [
+      'ASAHI_SHIM_CHIP=g17p',
+      'VK_DRIVER_FILES=' + _dev_icd.full_path(),
+    ],
+    depends : [_dev_icd, libvulkan_asahi],
+    suite : ['asahi'],
+  )
+
   # Explicit DRM plane layouts: placement, requirements, subresource layouts
   # and validation, without executing on the GPU.
   foreach chip : ['g13g', 'g17p']

@@ -1483,6 +1483,24 @@ if with_tests
     gnu_symbol_visibility : 'hidden',
   )
 
+  hk_vulkan_capture_replay = executable(
+    'brl-vulkan-capture-replay',
+    files('tests/hk_vulkan_capture_replay.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  hk_vulkan_event_alias = executable(
+    'brl-vulkan-event-alias',
+    files('tests/hk_vulkan_event_alias.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
   # Submit-time render packing on reusable command buffers: packed, replayed,
   # alone and regrouped submissions, each pixel-exact (hk_render_pack.h).
   hk_vulkan_render_pack_replay = executable(

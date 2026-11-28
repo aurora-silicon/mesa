@@ -307,8 +307,8 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
 }
 
 /* Enter a host import into the device's set so va_alias_resources (and
- * alias_live on M5 with host_alias.dynamic) only counts imports that may
- * alias another GPU virtual address (hk_host_import_aliases()). A
+ * alias_live with host_alias.dynamic) only counts imports that may alias
+ * another GPU virtual address (hk_host_import_aliases()). A
  * GPU-writable import of pages that are all private anonymous memory of this
  * process (/proc/self/maps), and that no other live import overlaps, has its
  * pages at no other GPU address. A read-only one needs only private mappings:
@@ -323,7 +323,8 @@ hk_host_maps_classify_self(const void *pointer, uint64_t size)
  *
  * Costs two reads of /proc/self/maps up to the lines that cover the range.
  * The imports that began to alias count in va_alias_resources (and
- * alias_live via hk_device_alias_add() on M5) before the import is returned. */
+ * alias_live via hk_device_alias_add() with host_alias.dynamic) before the
+ * import is returned. */
 static VkResult
 hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
                      const void *pointer, uint64_t size,
@@ -397,19 +398,6 @@ hk_host_import_untrack(struct hk_device *dev, struct hk_device_memory *mem)
    if (dev->host_alias.trace)
       fprintf(stderr, "M5_HOST_ALIAS free %p stopped=%u live=%u\n",
               (void *)mem, stopped, p_atomic_read(&dev->alias_live));
-}
-
-/* Memory mapped again in the capture/replay region (replay_va) counts from
- * its mapping to its release (hk_device_va_alias_get()). */
-static void
-hk_memory_release_replay_va(struct hk_device *dev,
-                            struct hk_device_memory *mem)
-{
-   if (!mem->replay_va)
-      return;
-   agx_va_free(&dev->dev, mem->replay_va, true);
-   mem->replay_va = NULL;
-   hk_device_va_alias_put(dev);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -585,16 +573,56 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
 
+      /* Capture/replay memory is never cached (agx_bo_create_at()). */
+      const bool capture_replay =
+         mem->vk.alloc_flags &
+         VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT;
+
       /* A BO from the cache allocates nothing new. Fetch from the cache once
        * and run hk_system_memory_fits() only on a real miss (including after
        * discarding purged entries), avoiding both a duplicate cache-lock walk
-       * and per-allocation /proc/meminfo reads. */
+       * and per-allocation /proc/meminfo reads. Capture/replay memory always
+       * allocates. */
       bool mem_rejected = false;
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */
-      mem->bo = agx_bo_create_checked(&dev->dev, aligned_size, 64 * 1024, flags,
-                                      "App memory", hk_allow_bo_alloc,
-                                      &mem_rejected);
+      if (capture_replay) {
+         /* Not from the cache, but as in agx_bo_create_checked(), idle cached
+          * BOs must not be why it fails: evict them and ask once more. */
+         if (!hk_system_memory_fits(aligned_size)) {
+            agx_bo_cache_evict_all(&dev->dev);
+            mem_rejected = !hk_system_memory_fits(aligned_size);
+         }
+      } else {
+         mem->bo = agx_bo_create_checked(&dev->dev, aligned_size, 64 * 1024,
+                                         flags, "App memory", hk_allow_bo_alloc,
+                                         &mem_rejected);
+      }
+
+      if (capture_replay && !mem_rejected) {
+         /* Capture/replay memory has one address, in the capture/replay
+          * region and the captured one on replay. Buffers and images bound
+          * to it take it plus their offset, so they replay with it. */
+         const uint64_t fixed_addr =
+            capture_info ? capture_info->opaqueCaptureAddress : 0;
+         enum agx_va_flags va_flags = fixed_addr ? AGX_VA_FIXED : 0;
+         if (dev->dev.replay_heap_initialized)
+            va_flags |= AGX_VA_CAPTURE_REPLAY;
+         struct agx_va *va = agx_va_alloc(&dev->dev, aligned_size, 64 * 1024,
+                                          va_flags, fixed_addr);
+         if (!va) {
+            /* A replay address that is already taken is the application's
+             * error to handle, not an out-of-memory condition. */
+            result = fixed_addr
+                        ? vk_errorf(dev, VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS,
+                                    "Capture/replay address %#llx is in use",
+                                    (unsigned long long)fixed_addr)
+                        : vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            goto fail_alloc;
+         }
+         mem->bo = agx_bo_create_at(&dev->dev, aligned_size, flags, va,
+                                    "App memory");
+      }
       if (!mem->bo) {
          if (mem_rejected) {
             result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
@@ -607,64 +635,12 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
    }
 
-   /* VK_EXT_descriptor_buffer capture/replay: image descriptors embed the
-    * address of the image's memory, so memory allocated for capture/replay
-    * also maps at an address in the capture/replay region, the captured one
-    * on replay when that is one. Buffers and images bound to it take that
-    * address (hk_device_memory_addr()); buffers with a capture/replay address
-    * of their own keep it. */
-   if ((mem->vk.alloc_flags &
-        VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) &&
-       dev->vk.enabled_features.descriptorBufferCaptureReplay &&
-       dev->dev.replay_heap_initialized) {
-      const uint64_t fixed_addr =
-         capture_info ? capture_info->opaqueCaptureAddress : 0;
-      /* The range follows the requested size, not the BO's: a BO from the
-       * cache can be up to twice as large, so its size differs between
-       * capture and replay, and a larger replayed range would cover the next
-       * captured address. Bindings only reach offsets below that size. */
-      mem->replay_va = agx_va_alloc(
-         &dev->dev, aligned_size, 64 * 1024,
-         AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
-      if (mem->replay_va &&
-          (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
-                       aligned_size, 0,
-                       DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
-           agx_bo_bind(&dev->dev, mem->bo,
-                       agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
-                       aligned_size, 0, DRM_ASAHI_BIND_READ))) {
-         agx_va_free(&dev->dev, mem->replay_va, true);
-         mem->replay_va = NULL;
-         agx_bo_unreference(&dev->dev, mem->bo);
-         mem->bo = NULL;
-         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
-         goto fail_alloc;
-      }
-      /* An address this region cannot take was not captured with the
-       * feature (on a device without it, it is the BO's own address): keep
-       * buffer device address replay as it was, through the buffers' own
-       * capture/replay addresses. */
-      /* The memory is reached through two read-write addresses now. */
-      if (mem->replay_va)
-         hk_device_va_alias_get(dev, HK_ALIAS_CAUSE_CAPTURE_REPLAY);
-   }
-
-   if (mem->vk.alloc_flags &
-       VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT) {
-      mem->opaque_capture_address =
-         mem->replay_va ? mem->replay_va->addr
-         : capture_info && capture_info->opaqueCaptureAddress
-            ? capture_info->opaqueCaptureAddress
-            : mem->bo->va->addr;
-   }
-
    /* Shadow map in case this is used for a sparse resident buffer. The mapping
     * persists with the BO across userspace cache reuse, so cached allocations
     * skip the redundant VM_BIND ioctl. */
    int ret = agx_bo_ensure_ro_shadow(&dev->dev, mem->bo);
    if (ret) {
       /* The bind fails once the VM carries a sticky error. */
-      hk_memory_release_replay_va(dev, mem);
       agx_bo_unreference(&dev->dev, mem->bo);
       mem->bo = NULL;
       vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
@@ -675,7 +651,6 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       result = hk_host_import_track(dev, mem, host_info->pHostPointer,
                                     mem->bo->size, host_maps_before_pin);
       if (result != VK_SUCCESS) {
-         hk_memory_release_replay_va(dev, mem);
          agx_bo_unreference(&dev->dev, mem->bo);
          mem->bo = NULL;
          vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
@@ -802,8 +777,6 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
 
    /* The BO may outlive this object in the BO cache. */
    hk_set_memory_priority(dev, mem, 0.5f);
-
-   hk_memory_release_replay_va(dev, mem);
 
    if (mem->alias_import)
       p_atomic_dec(&dev->va_alias_resources);
@@ -1022,5 +995,5 @@ hk_GetDeviceMemoryOpaqueCaptureAddress(
 {
    VK_FROM_HANDLE(hk_device_memory, memory, pInfo->memory);
 
-   return memory->opaque_capture_address;
+   return hk_device_memory_addr(memory);
 }

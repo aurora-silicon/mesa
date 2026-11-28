@@ -209,6 +209,14 @@ hk_cmd_alias_scope(struct hk_cmd_buffer *cmd)
    return false;
 }
 
+/* No memory aliases here, so no barrier needs a patch site. */
+void
+hk_cdm_note_alias_site(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
+{
+   (void)cmd;
+   (void)cs;
+}
+
 bool
 hk_cdm_visibility_flush_needed(const struct hk_device *dev,
                                const struct hk_cs *cs, bool memory)

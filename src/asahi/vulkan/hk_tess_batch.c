@@ -51,7 +51,8 @@ hk_tess_batch_stage(struct hk_cmd_buffer *cmd, enum hk_tess_stage stage)
 
    /* Before the tail goes: a chunk link must still follow a barrier. */
    hk_ensure_cs_has_space(cmd, cs, 0x2000);
-   if (cs->stats.cmds && cs->current == cs->weak_barrier_end) {
+   if (cs->stats.cmds && cs->current == cs->weak_barrier_end &&
+       cs->current != cs->alias_pin) {
       batch->dropped[stage] = cs->current;
       cs->current = (uint8_t *)cs->current - AGX3_CDM_BARRIER_SIZE;
       cs->weak_barrier_end = NULL;
