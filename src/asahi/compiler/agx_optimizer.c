@@ -756,12 +756,12 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
        * minifloat.  agx_is_float_src() reports the whole instruction, which
        * is integer-typed, so name this one source explicitly rather than
        * folding a float bit pattern in as an integer. */
-      bool float_src =
-         agx_is_float_src(I, s) ||
-         (ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-          I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 &&
-          (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
-           I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS));
+      bool agx3b_texture_lod =
+         ctx->key && ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         I->op == AGX_OPCODE_TEXTURE_SAMPLE && s == 1 &&
+         (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
+          I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS);
+      bool float_src = agx_is_float_src(I, s) || agx3b_texture_lod;
 
       if (I->op == AGX_OPCODE_ST_TILE && s == 0)
          continue;
@@ -783,10 +783,7 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
       /* G17P names an explicit level and an implicit-LOD bias in the same
        * 12-bit immediate operand, so both fold; every other sample source
        * has to stay a register. */
-      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s != 4 &&
-          !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B && s == 1 &&
-            (I->lod_mode == AGX_LOD_MODE_LOD_MIN ||
-             I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS)))
+      if (I->op == AGX_OPCODE_TEXTURE_SAMPLE && s != 4 && !agx3b_texture_lod)
          continue;
       /* An AGX3B array comparison without an offset stages its level or bias
        * beside the layer from a register; an immediate would share SMP's
@@ -869,6 +866,16 @@ agx_optimizer_inline_imm(agx_context *ctx, agx_instr **defs, agx_instr *I)
          float f = fp16 ? _mesa_half_to_float(def->imm) : uif(def->imm);
          if (!agx_minifloat_exact(f))
             continue;
+
+         /* The texture packer converts this minifloat to 12-bit fixed point.
+          * Keep a register when the value or its sign cannot be represented. */
+         if (agx3b_texture_lod) {
+            float scaled = f * 64.0f;
+            if (!(scaled >= -2048.0f && scaled <= 2047.0f) ||
+                fui((float)(int)scaled / 64.0f) != fui(f) ||
+                (I->lod_mode == AGX_LOD_MODE_LOD_MIN && f < 0.0f))
+               continue;
+         }
 
          /* Both halves of a tied minimum/maximum, or neither. Record that the
           * select slot now holds a minifloat rather than raw integer bits. */

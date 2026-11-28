@@ -3791,6 +3791,57 @@ test_g17p_explicit_texture_transactions(bool red_only)
 }
 
 static bool
+test_g17p_folded_explicit_lod(void)
+{
+   static const float operands[][2] = {
+      {1.0f, -2.0f},
+      {1.0f / 64.0f, -1.0f / 128.0f},
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(operands); ++i) {
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &agx_nir_options, "G17P folded explicit LOD");
+      nir_def *lod = nir_fadd_imm(&b, nir_imm_float(&b, operands[i][0]),
+                                 operands[i][1]);
+      nir_tex_instr *tex = nir_tex_instr_create(b.shader, 2);
+      tex->op = nir_texop_txl;
+      tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      tex->dest_type = nir_type_float32;
+      tex->coord_components = 2;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                        nir_imm_vec2(&b, 0.25f, 0.75f));
+      tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(&b, &tex->instr);
+      fs_store_colour(&b, &tex->def);
+      b.shader->info.outputs_written = BITFIELD64_BIT(FRAG_RESULT_DATA0);
+
+      NIR_PASS(_, b.shader, agx_nir_lower_texture_early, false);
+      NIR_PASS(_, b.shader, agx_nir_lower_texture_for_generation,
+               AGX_DESCRIPTOR_GENERATION_9);
+      agx_preprocess_nir(b.shader);
+      fs_lower(b.shader);
+
+      struct agx_shader_key key = {
+         .dev = {.encoding = AGX_ISA_ENCODING_AGX3B, .chip = AGX_CHIP_G17P},
+         .no_preamble = true,
+      };
+      struct agx_shader_part part = {0};
+      const bool compiled =
+         agx_compile_shader_nir(b.shader, &key, &part) && part.binary;
+      free(part.binary);
+      ralloc_free(b.shader);
+
+      if (!compiled) {
+         fprintf(stderr, "G17P folded explicit LOD %g + %g failed to compile\n",
+                 operands[i][0], operands[i][1]);
+         return false;
+      }
+   }
+   return true;
+}
+
+static bool
 test_g17p_array_shadow_register_lod(bool bias)
 {
    nir_builder b = nir_builder_init_simple_shader(
@@ -10046,6 +10097,9 @@ main(int argc, char **argv)
       fputs("explicit texture transaction compile failed\n", stderr);
       return 1;
    }
+   if (!test_g17p_folded_explicit_lod())
+      return 1;
+
    if (!test_g17p_compute_form_vertex_shader()) {
       fputs("compute-form vertex shader compile failed\n", stderr);
       return 1;
