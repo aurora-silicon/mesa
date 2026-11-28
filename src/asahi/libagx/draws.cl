@@ -43,6 +43,101 @@ libagx_build_indirect_vdm(constant struct libagx_indirect_vdm_desc *desc)
    libagx_build_indirect_vdm_sublane(desc, cl_global_id.x);
 }
 
+static inline uint32_t
+libagx_wg_scan_exclusive_u32(uint32_t val, local uint32_t *sh_sg_sums,
+                             local uint32_t *sh_total, uint32_t *total_out)
+{
+   const uint32_t sg_id = get_sub_group_id();
+   const uint32_t sg_lid = get_sub_group_local_id();
+   const uint32_t sg_size = get_sub_group_size();
+   const uint32_t sg_count = get_num_sub_groups();
+
+   const uint32_t sg_off = sub_group_scan_exclusive_add(val);
+   if (sg_lid == sg_size - 1u)
+      sh_sg_sums[sg_id] = sg_off + val;
+   barrier(CLK_LOCAL_MEM_FENCE);
+
+   if (sg_id == 0u) {
+      const uint32_t v = sg_lid < sg_count ? sh_sg_sums[sg_lid] : 0u;
+      const uint32_t off = sub_group_scan_exclusive_add(v);
+      if (sg_lid < sg_count)
+         sh_sg_sums[sg_lid] = off;
+      if (sg_lid == sg_count - 1u)
+         *sh_total = off + v;
+   }
+   barrier(CLK_LOCAL_MEM_FENCE);
+
+   *total_out = *sh_total;
+   return sh_sg_sums[sg_id] + sg_off;
+}
+
+/*
+ * Multi-workgroup parallel chunked coalescing indirect VDM builder: each
+ * 256-thread workgroup handles one 256-draw chunk (1 draw/lane), compacts
+ * non-empty draws, merges contiguous runs in O(1) subgroup+shared scans,
+ * stamps its chunk VDM slice and per-run Ioto vertex programs, and appends a
+ * VDM Stream Link to the next active chunk (or directly to return_link_compact
+ * on the last active chunk). Tail workgroups past `count` exit immediately.
+ */
+KERNEL(256)
+libagx_build_indirect_vdm_coalesce(
+   constant struct libagx_indirect_vdm_coalesce_desc *desc)
+{
+   local struct libagx_indirect_cmd_u32 sh_cmd[LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE];
+   local uint16_t sh_run_start[LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE];
+   local uint16_t sh_run_end[LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE];
+   local uint32_t sh_sg_sums[LIBAGX_INDIRECT_VDM_COALESCE_MAX_SUBGROUPS];
+   local uint32_t sh_total;
+
+   const uint32_t lid = cl_local_id.x;
+   const uint32_t wg = cl_group_id.x;
+   const uint32_t count = libagx_indirect_vdm_coalesce_count(desc);
+   const uint32_t wg_start = wg * LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE;
+
+   if (wg_start >= count) {
+      if (wg == 0u && lid == 0u) {
+         global uint32_t *vdm_out = (global uint32_t *)(uintptr_t)desc->base.sub_vdm;
+         const uint64_t target = desc->base.return_link_compact;
+         vdm_out[0] = 0x80000000u | (uint32_t)(target >> 32);
+         vdm_out[1] = (uint32_t)target;
+      }
+      return;
+   }
+
+   struct libagx_indirect_cmd_u32 cmd = {0};
+   const uint32_t nonempty =
+      libagx_indirect_vdm_coalesce_chunk_load(desc, wg, lid, count, &cmd);
+   uint32_t num_nonempty = 0u;
+   const uint32_t compact_idx =
+      libagx_wg_scan_exclusive_u32(nonempty, sh_sg_sums, &sh_total, &num_nonempty);
+
+   if (num_nonempty == 0u) {
+      libagx_indirect_vdm_coalesce_chunk_emit(desc, wg, lid, count, 0u, sh_cmd,
+                                              sh_run_start, sh_run_end);
+      return;
+   }
+
+   if (nonempty)
+      sh_cmd[compact_idx] = cmd;
+   barrier(CLK_LOCAL_MEM_FENCE);
+
+   uint32_t is_start = 0u, is_end = 0u;
+   libagx_indirect_vdm_coalesce_chunk_classify(sh_cmd, lid, num_nonempty,
+                                               &is_start, &is_end);
+   uint32_t num_runs = 0u;
+   const uint32_t run_id =
+      libagx_wg_scan_exclusive_u32(is_start, sh_sg_sums, &sh_total, &num_runs);
+
+   if (is_start)
+      sh_run_start[run_id] = (uint16_t)lid;
+   if (is_end)
+      sh_run_end[(run_id + is_start) - 1u] = (uint16_t)lid;
+   barrier(CLK_LOCAL_MEM_FENCE);
+
+   libagx_indirect_vdm_coalesce_chunk_emit(desc, wg, lid, count, num_runs,
+                                           sh_cmd, sh_run_start, sh_run_end);
+}
+
 /*
  * Fast path for drawIndirectCount: instead of copying and predicating every
  * indirect command and letting VDM execute all maxDrawCount records, patch a

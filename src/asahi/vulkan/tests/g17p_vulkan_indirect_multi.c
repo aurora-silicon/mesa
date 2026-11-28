@@ -372,9 +372,12 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
           bool shim, bool non_indexed_only)
 {
    /* The static stream check follows VDM links, but the no-op shim cannot
-    * execute the compute kernel that fills their targets for count draws.
+    * execute the compute kernel that fills their targets for GPU-built
+    * indirect sub-streams (count draws and large coalesced multi-draws).
     */
    const bool test_non_indexed_count = !(shim && non_indexed_only);
+   const uint32_t coalesce_safe_draw_count =
+      test_non_indexed_count ? DRAW_COUNT : 15u;
    float prio = 1.0f;
    VkDeviceQueueCreateInfo qci = {
       .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -571,7 +574,7 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
          .index_buf = idx_buf.buf,
          .indirect_buf = ind_buf.buf,
          .count_buf = count_buf.buf,
-         .draw_count = DRAW_COUNT,
+         .draw_count = coalesce_safe_draw_count,
          .stride = stride,
          .indexed = false,
       };
@@ -615,7 +618,7 @@ run_suite(VkPhysicalDevice pdev, uint32_t qf, bool robust_buffer_access,
          .pipe = pipe_base,
          .index_buf = idx_buf.buf,
          .indirect_buf = ind_buf.buf,
-         .draw_count = DRAW_COUNT,
+         .draw_count = coalesce_safe_draw_count,
          .stride = stride,
          .indexed = false,
       };

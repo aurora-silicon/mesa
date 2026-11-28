@@ -1288,17 +1288,11 @@ libagx_store_u32x4(GLOBAL uint32_t *dst, const uint32_t w[4])
 }
 
 static inline void
-libagx_build_indirect_vdm_sublane(CONST struct libagx_indirect_vdm_desc *desc,
-                                  uint32_t tid)
+libagx_build_indirect_vdm_sublane_slice(
+   CONST struct libagx_indirect_vdm_desc *desc, uint32_t tid, uint32_t count,
+   uint64_t sub_vdm_base, uint64_t ioto_out_base, uint64_t src_buffer,
+   uint32_t src_stride_B, uint64_t end_link_compact)
 {
-   uint32_t count = desc->max_draw_count;
-   if (desc->count_buffer) {
-      uint32_t raw_count =
-         *(const GLOBAL uint32_t *)(uintptr_t)desc->count_buffer;
-      if (raw_count < count)
-         count = raw_count;
-   }
-
    const uint32_t draw = tid / LIBAGX_INDIRECT_VDM_LANES_PER_DRAW;
    const uint32_t sublane = tid % LIBAGX_INDIRECT_VDM_LANES_PER_DRAW;
 
@@ -1306,28 +1300,28 @@ libagx_build_indirect_vdm_sublane(CONST struct libagx_indirect_vdm_desc *desc,
       return;
 
    GLOBAL uint32_t *vdm_out = (GLOBAL uint32_t *)(uintptr_t)(
-      desc->sub_vdm + (uint64_t)draw * desc->vdm_record_dwords * 4u);
+      sub_vdm_base + (uint64_t)draw * desc->vdm_record_dwords * 4u);
 
    if (draw == count) {
       if (sublane == 0) {
-         uint64_t target = desc->return_link_compact;
+         uint64_t target = end_link_compact;
          vdm_out[0] = 0x80000000u | (uint32_t)(target >> 32);
          vdm_out[1] = (uint32_t)target;
       }
       return;
    }
 
-   const uint64_t draw_va = desc->in_buffer + (uint64_t)draw * desc->in_stride_B;
+   const uint64_t draw_va = src_buffer + (uint64_t)draw * src_stride_B;
    uint64_t prog_va = 0;
 
-   if (desc->ioto_out) {
+   if (ioto_out_base) {
       if (desc->draw_ids_out && sublane == 0) {
          GLOBAL uint32_t *draw_ids =
             (GLOBAL uint32_t *)(uintptr_t)desc->draw_ids_out;
          draw_ids[draw] = draw;
       }
 
-      prog_va = desc->ioto_out + (uint64_t)draw * desc->ioto_stride_B;
+      prog_va = ioto_out_base + (uint64_t)draw * desc->ioto_stride_B;
       GLOBAL uint32_t *ioto_dst = (GLOBAL uint32_t *)(uintptr_t)prog_va;
       CONST uint32_t *ioto_src =
          (CONST uint32_t *)(uintptr_t)desc->ioto_template;
@@ -1461,6 +1455,238 @@ libagx_build_indirect_vdm_sublane(CONST struct libagx_indirect_vdm_desc *desc,
             w = ind_w1;
          vdm_out[k] = w;
       }
+   }
+}
+
+static inline void
+libagx_build_indirect_vdm_sublane(CONST struct libagx_indirect_vdm_desc *desc,
+                                  uint32_t tid)
+{
+   uint32_t count = desc->max_draw_count;
+   if (desc->count_buffer) {
+      uint32_t raw_count =
+         *(const GLOBAL uint32_t *)(uintptr_t)desc->count_buffer;
+      if (raw_count < count)
+         count = raw_count;
+   }
+
+   libagx_build_indirect_vdm_sublane_slice(
+      desc, tid, count, desc->sub_vdm, desc->ioto_out, desc->in_buffer,
+      desc->in_stride_B, desc->return_link_compact);
+}
+
+/*
+ * Multi-workgroup parallel chunked GPU indirect-draw run coalescer: each
+ * 256-thread workgroup handles one 256-draw chunk (1 draw/lane), drops empty
+ * draws (vertexCount/indexCount == 0 or instanceCount == 0), merges
+ * consecutive draws sharing vertex/index parameters and contiguous
+ * firstInstance into instanced draw commands, stamps its chunk VDM slice and
+ * per-run Ioto vertex programs, and terminates with a VDM Stream Link to the
+ * next active chunk (or directly to return_link_compact on the last active
+ * chunk).
+ */
+#define LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE       256u
+#define LIBAGX_INDIRECT_VDM_COALESCE_MAX_DRAWS     65536u
+#define LIBAGX_INDIRECT_VDM_COALESCE_MAX_SUBGROUPS 32u
+
+#ifdef __OPENCL_VERSION__
+#define LIBAGX_LOCAL local
+#else
+#define LIBAGX_LOCAL
+#endif
+
+struct libagx_indirect_vdm_coalesce_desc {
+   struct libagx_indirect_vdm_desc base;
+   /* Dense output buffer for coalesced VkDrawIndirectCommand (16B) or
+    * VkDrawIndexedIndirectCommand (20B) records, sized for max_draw_count. */
+   uint64_t coalesced_cmds_out;
+   /* Compact VDM stream target corresponding to base.sub_vdm (chunk 0). */
+   uint64_t sub_vdm_compact;
+   /* Byte stride between consecutive 256-draw chunk slices inside base.sub_vdm. */
+   uint32_t chunk_vdm_stride_B;
+   uint32_t indexed;
+};
+static_assert(sizeof(struct libagx_indirect_vdm_coalesce_desc) == 320,
+              "coalesced indirect VDM builder host/device ABI");
+
+struct libagx_indirect_cmd_u32 {
+   uint32_t count;          /* vertexCount or indexCount */
+   uint32_t instance_count; /* instanceCount */
+   uint32_t first;          /* firstVertex or firstIndex */
+   uint32_t bias;           /* 0 (non-indexed) or vertexOffset (indexed) */
+   uint32_t first_instance; /* firstInstance */
+};
+
+static inline struct libagx_indirect_cmd_u32
+libagx_indirect_cmd_load(uint64_t in_buffer, uint32_t stride_B, uint32_t idx,
+                         bool indexed)
+{
+   const GLOBAL uint32_t *src =
+      (const GLOBAL uint32_t *)(uintptr_t)(in_buffer + (uint64_t)idx * stride_B);
+   struct libagx_indirect_cmd_u32 cmd;
+   cmd.count = src[0];
+   cmd.instance_count = src[1];
+   cmd.first = src[2];
+   if (indexed) {
+      cmd.bias = src[3];
+      cmd.first_instance = src[4];
+   } else {
+      cmd.bias = 0u;
+      cmd.first_instance = src[3];
+   }
+   return cmd;
+}
+
+static inline void
+libagx_indirect_cmd_store(uint64_t out_buffer, uint32_t idx, bool indexed,
+                          struct libagx_indirect_cmd_u32 cmd)
+{
+   const uint32_t stride_B = indexed ? 20u : 16u;
+   GLOBAL uint32_t *dst =
+      (GLOBAL uint32_t *)(uintptr_t)(out_buffer + (uint64_t)idx * stride_B);
+   dst[0] = cmd.count;
+   dst[1] = cmd.instance_count;
+   dst[2] = cmd.first;
+   if (indexed) {
+      dst[3] = cmd.bias;
+      dst[4] = cmd.first_instance;
+   } else {
+      dst[3] = cmd.first_instance;
+   }
+}
+
+static inline bool
+libagx_indirect_cmd_nonempty(struct libagx_indirect_cmd_u32 cmd)
+{
+   return cmd.count != 0u && cmd.instance_count != 0u;
+}
+
+static inline bool
+libagx_indirect_cmd_can_merge(struct libagx_indirect_cmd_u32 a,
+                              struct libagx_indirect_cmd_u32 b)
+{
+   const uint64_t a_end = (uint64_t)a.first_instance + (uint64_t)a.instance_count;
+   return a.count == b.count && a.first == b.first && a.bias == b.bias &&
+          a_end == (uint64_t)b.first_instance &&
+          a_end + (uint64_t)b.instance_count <= UINT32_MAX;
+}
+
+static inline uint32_t
+libagx_indirect_vdm_coalesce_count(
+   CONST struct libagx_indirect_vdm_coalesce_desc *desc)
+{
+   uint32_t count = desc->base.max_draw_count;
+   if (desc->base.count_buffer) {
+      uint32_t raw_count =
+         *(const GLOBAL uint32_t *)(uintptr_t)desc->base.count_buffer;
+      if (raw_count < count)
+         count = raw_count;
+   }
+   return count;
+}
+
+static inline uint64_t
+libagx_indirect_vdm_coalesce_chunk_next_link(
+   CONST struct libagx_indirect_vdm_coalesce_desc *desc, uint32_t wg,
+   uint32_t count)
+{
+   const uint64_t chunk_end =
+      (uint64_t)(wg + 1u) * LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE;
+   if (chunk_end >= count)
+      return desc->base.return_link_compact;
+   return desc->sub_vdm_compact +
+          (uint64_t)(wg + 1u) * desc->chunk_vdm_stride_B;
+}
+
+/* Step 1: load one indirect draw per lane for workgroup `wg` and report
+ * whether it is non-empty (1) or empty/out-of-range (0). */
+static inline uint32_t
+libagx_indirect_vdm_coalesce_chunk_load(
+   CONST struct libagx_indirect_vdm_coalesce_desc *desc, uint32_t wg,
+   uint32_t lid, uint32_t count, struct libagx_indirect_cmd_u32 *cmd_out)
+{
+   const uint32_t idx = wg * LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE + lid;
+   if (idx >= count)
+      return 0u;
+   *cmd_out = libagx_indirect_cmd_load(
+      desc->base.in_buffer, desc->base.in_stride_B, idx, desc->indexed != 0u);
+   return libagx_indirect_cmd_nonempty(*cmd_out) ? 1u : 0u;
+}
+
+/* Step 2: classify each compacted non-empty draw as a run start and/or run end.
+ * Contiguity in firstInstance makes adjacency mergeability both necessary and
+ * sufficient for multi-draw run mergeability without 32-bit overflow:
+ *   first_instance[k] + sum_{j=k..m} instance_count[j]
+ *     == first_instance[m] + instance_count[m] <= UINT32_MAX. */
+static inline void
+libagx_indirect_vdm_coalesce_chunk_classify(
+   LIBAGX_LOCAL const struct libagx_indirect_cmd_u32 *sh_cmd, uint32_t lid,
+   uint32_t num_nonempty, uint32_t *is_start_out, uint32_t *is_end_out)
+{
+   if (lid >= num_nonempty) {
+      *is_start_out = 0u;
+      *is_end_out = 0u;
+      return;
+   }
+   const struct libagx_indirect_cmd_u32 c = sh_cmd[lid];
+   *is_start_out =
+      (lid == 0u || !libagx_indirect_cmd_can_merge(sh_cmd[lid - 1u], c)) ? 1u
+                                                                         : 0u;
+   *is_end_out =
+      (lid + 1u == num_nonempty ||
+       !libagx_indirect_cmd_can_merge(c, sh_cmd[lid + 1u]))
+         ? 1u
+         : 0u;
+}
+
+/* Step 3: emit coalesced indirect commands for workgroup `wg` into its slice of
+ * coalesced_cmds_out and stamp its VDM chunk + per-run Ioto vertex programs,
+ * terminating with a VDM Stream Link to the next active chunk or return target.
+ * Works identically for num_runs == 0 (writes a single VDM Stream Link at
+ * offset 0 of the chunk slice). */
+static inline void
+libagx_indirect_vdm_coalesce_chunk_emit(
+   CONST struct libagx_indirect_vdm_coalesce_desc *desc, uint32_t wg,
+   uint32_t lid, uint32_t count, uint32_t num_runs,
+   LIBAGX_LOCAL const struct libagx_indirect_cmd_u32 *sh_cmd,
+   LIBAGX_LOCAL const uint16_t *sh_run_start,
+   LIBAGX_LOCAL const uint16_t *sh_run_end)
+{
+   const bool indexed = desc->indexed != 0u;
+   const uint32_t cmd_stride_B = indexed ? 20u : 16u;
+   const uint32_t wg_start = wg * LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE;
+
+   if (lid < num_runs) {
+      const uint32_t s = sh_run_start[lid];
+      const uint32_t e = sh_run_end[lid];
+      struct libagx_indirect_cmd_u32 merged = sh_cmd[s];
+      if (e != s) {
+         merged.instance_count =
+            (sh_cmd[e].first_instance - merged.first_instance) +
+            sh_cmd[e].instance_count;
+      }
+      libagx_indirect_cmd_store(desc->coalesced_cmds_out, wg_start + lid,
+                                indexed, merged);
+   }
+
+   const uint64_t wg_sub_vdm =
+      desc->base.sub_vdm + (uint64_t)wg * desc->chunk_vdm_stride_B;
+   const uint64_t wg_ioto_out =
+      desc->base.ioto_out
+         ? (desc->base.ioto_out + (uint64_t)wg_start * desc->base.ioto_stride_B)
+         : 0u;
+   const uint64_t wg_cmds_va =
+      desc->coalesced_cmds_out + (uint64_t)wg_start * cmd_stride_B;
+   const uint64_t end_link =
+      libagx_indirect_vdm_coalesce_chunk_next_link(desc, wg, count);
+   const uint32_t total_lanes =
+      (num_runs + 1u) * LIBAGX_INDIRECT_VDM_LANES_PER_DRAW;
+
+   for (uint32_t tid = lid; tid < total_lanes;
+        tid += LIBAGX_INDIRECT_VDM_COALESCE_WG_SIZE) {
+      libagx_build_indirect_vdm_sublane_slice(
+         &desc->base, tid, num_runs, wg_sub_vdm, wg_ioto_out, wg_cmds_va,
+         cmd_stride_B, end_link);
    }
 }
 
