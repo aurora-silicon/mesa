@@ -421,26 +421,27 @@ agx_pbe_agx3_2d_multisample_pack(
     * sits at word0[57:56] (Gen9) or word0[59:58] (Gen10, supporting 2x/4x/8x).
     * Compressed MSAA packets reuse the single-sample compressed layout with
     * the multisample dimension/selector and Gen10 sRGB bit at word1[61]. */
-   const bool compressed_r32_uint = fields &&
+   const bool compressed_gen10_msaa = fields &&
       generation == AGX_PBE_AGX3_GENERATION_10 &&
       fields->layout == AGX_PBE_LAYOUT_GPU &&
-      fields->channels == 0x21 /* R32 */ && fields->type == 2 /* UINT */ &&
-      !fields->srgb && (samples == 2 || samples == 4);
-   const bool compressed_rgba16 = fields &&
-      generation == AGX_PBE_AGX3_GENERATION_10 &&
-      fields->layout == AGX_PBE_LAYOUT_GPU &&
-      fields->channels == 0x32 /* R16G16B16A16 */ &&
-      (fields->type == 4 /* FLOAT */ || fields->type == 2 /* UINT */) &&
-      !fields->srgb && (samples == 2 || samples == 4);
-   const bool compressed_rgba8 = fields &&
-      generation == AGX_PBE_AGX3_GENERATION_10 &&
-      fields->layout == AGX_PBE_LAYOUT_GPU &&
-      fields->channels == 0x28 /* R8G8B8A8 */ && fields->type == 0 /* UNORM */ &&
-      (samples == 2 || samples == 4);
+      (samples == 2 || samples == 4) &&
+      ((fields->channels == 0x21 /* R32 */ &&
+        (fields->type == 2 /* UINT */ || fields->type == 4 /* FLOAT */) &&
+        !fields->srgb) ||
+       (fields->channels == 0x23 /* R16G16 */ &&
+        fields->type == 4 /* FLOAT */ && !fields->srgb) ||
+       (fields->channels == 0x26 /* R10G10B10A2 */ &&
+        fields->type == 0 /* UNORM */ && !fields->srgb) ||
+       (fields->channels == 0x28 /* R8G8B8A8 */ &&
+        (fields->type == 0 /* UNORM */ ||
+         (fields->type == 1 /* SNORM */ && !fields->srgb))) ||
+       (fields->channels == 0x32 /* R16G16B16A16 */ &&
+        (fields->type == 0 /* UNORM */ || fields->type == 1 /* SNORM */ ||
+         fields->type == 2 /* UINT */ || fields->type == 4 /* FLOAT */) &&
+        !fields->srgb));
    if ((generation != AGX_PBE_AGX3_GENERATION_9 &&
         generation != AGX_PBE_AGX3_GENERATION_10) || !fields ||
-       (fields->compressed && !compressed_r32_uint && !compressed_rgba16 &&
-        !compressed_rgba8 &&
+       (fields->compressed && !compressed_gen10_msaa &&
         !(generation == AGX_PBE_AGX3_GENERATION_9 &&
           fields->layout == AGX_PBE_LAYOUT_GPU)) ||
        (samples != 2 && samples != 4 &&

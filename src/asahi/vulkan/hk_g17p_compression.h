@@ -569,26 +569,36 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
 }
 
 /* Multisample colour formats with a qualified compressed metadata shape:
- * RGBA16F, and the 4-byte RGBA8/BGRA8 UNORM and sRGB formats, which share the
- * R32_UINT texel size of the witnessed raw copy packet. */
+ * 8-byte RGBA16 (SFLOAT/UNORM/SNORM) and 4-byte RGBA8/BGRA8/A2B10G10R10/
+ * R16G16F/R32F formats (excluding B10G11R11_UFLOAT, whose compressed tiles
+ * corrupt NaN payloads). */
 static inline bool
 hk_m5_msaa_color_compression_format(VkFormat format)
 {
    switch (format) {
    case VK_FORMAT_R16G16B16A16_SFLOAT:
+   case VK_FORMAT_R16G16B16A16_UNORM:
+   case VK_FORMAT_R16G16B16A16_SNORM:
    case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SNORM:
    case VK_FORMAT_R8G8B8A8_SRGB:
    case VK_FORMAT_B8G8R8A8_UNORM:
    case VK_FORMAT_B8G8R8A8_SRGB:
+   case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+   case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
+   case VK_FORMAT_R16G16_SFLOAT:
+   case VK_FORMAT_R32_SFLOAT:
       return true;
    default:
       return false;
    }
 }
 
-/* Qualified multisample metadata shapes. Sharing and aliasing flags are not
- * admitted; a mutable format is, and hk_can_compress() then requires a format
- * list of compression-compatible views.
+/* Qualified multisample metadata shapes. Placed aliasing (ALIAS_BIT, used by
+ * vkd3d-proton on every placed resource) maps identical creation parameters to
+ * identical layout and metadata, just as single-sample M5 colour does; a
+ * mutable format is admitted and hk_can_compress() then requires a format list
+ * of compression-compatible views.
  *
  * INPUT_ATTACHMENT_BIT is safe on M5 (unlike G17P): M5's 64 KiB tilebuffer
  * holds 64 B/sample at 4x MSAA (all 8 max targets x <= 8 B fit without
@@ -603,6 +613,7 @@ hk_m5_msaa_color_compression_eligible(enum agx_chip chip, unsigned plane,
                                      const VkImageCreateInfo *info)
 {
    const VkImageCreateFlags allowed_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT |
       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    const VkImageUsageFlags allowed_usage =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
