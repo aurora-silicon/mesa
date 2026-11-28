@@ -13533,6 +13533,12 @@ pre_preamble:
       }
    } while (progress);
 
+   /* After fusion has formed the bitfield extracts. Exact, and built from
+    * and/or/fadd that every generation has: see agx_nir_lower_bitfield_u2f.c
+    * for what it was measured on.
+    */
+   NIR_PASS(late_progress, nir, agx_nir_lower_bitfield_u2f);
+
    /* Before optimizing bounds checks, we need to clean up and index defs so
     * optimize_bounds does the right thing.
     */
