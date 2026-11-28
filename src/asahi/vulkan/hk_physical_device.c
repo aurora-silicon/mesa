@@ -27,6 +27,7 @@
 #include "hk_entrypoints.h"
 #include "hk_image.h"
 #include "hk_instance.h"
+#include "hk_agx3_as_format.h"
 #include "hk_m5_acceleration_structure.h"
 #include "hk_agx3_vdm_decode.h"
 #include "hk_native_descriptor.h"
@@ -154,19 +155,22 @@ hk_get_device_extensions(const struct agx_device *dev,
                             agx_chip_g17_m5(dev->chip);
 
    /*
-    * VK_KHR_ray_query and everything it depends on.  Software traversal:
-    * grounded end to end in shader ALU and global loads, with no dependence
-    * on the partially mapped AGX3 intersect_ray SCS ABI -- but it has never
-    * executed on hardware, and an extension bit is a promise.  It stays off
-    * until the exact-result oracle passes on a real G17P.
+    * VK_KHR_ray_query and everything it depends on, through the software
+    * traversal (hk_nir_lower_ray_queries.c) and the software BVH builder
+    * (hk_as_build_ops): shader ALU and global loads only, no RT unit, no
+    * kernel feature. It serves every GPU that has no native ray tracing.
+    * Devices with the native GEN1 format (hk_gen1_as_enabled) or the native
+    * M5 builder use their own AS layout, which the software traversal cannot
+    * read, so they keep the native exposure set in hk_create_drm_physical_device.
     */
-   const bool ray_query = false;
+   const bool ray_query = !hk_gen1_as_enabled(dev) &&
+                          hk_agx3_as_format_for_chip(dev->chip) !=
+                             HK_AGX3_AS_FORMAT_M5;
 
    /*
     * VK_KHR_ray_tracing_pipeline.  The whole pipeline compiles to one compute
     * megakernel over the same software traversal ray_query uses, so it needs
-    * exactly what ray_query needs and nothing more -- but it has never
-    * executed on hardware either, and an extension bit is a promise.
+    * exactly what ray_query needs and nothing more.
     */
    const bool ray_tracing_pipeline = ray_query;
 
