@@ -27,6 +27,7 @@
 #include "libagx_shaders.h"
 #include "vk_alloc.h"
 #include "vk_common_entrypoints.h"
+#include "vk_enum_to_str.h"
 
 #include "asahi/lib/agx_bo.h"
 #include "asahi/libagx/libagx.h"
@@ -698,6 +699,18 @@ hk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    bool timestamp = pCreateInfo->queryType == VK_QUERY_TYPE_TIMESTAMP;
    unsigned occlusion_queries = occlusion ? pCreateInfo->queryCount : 0;
 
+   /* Counters are assigned on first use (hk_ensure_occlusion_query()), and
+    * every pool of the device shares AGX_MAX_OCCLUSION_QUERIES of them. A
+    * pool with more queries than that can never have all of them in use:
+    * refuse it here, as an eager allocation would, rather than let a later
+    * recording fail once its queries have taken the rest. */
+   if (occlusion_queries > AGX_MAX_OCCLUSION_QUERIES) {
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "occlusion query pool of %u queries: the device "
+                       "has %u counters",
+                       occlusion_queries, AGX_MAX_OCCLUSION_QUERIES);
+   }
+
    pool =
       vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));
    if (!pool)
@@ -978,8 +991,16 @@ hk_ensure_occlusion_query(struct hk_device *dev, struct hk_query_pool *pool,
    unsigned index;
    VkResult result = hk_descriptor_table_add(
       dev, &dev->occlusion_queries, &zero, sizeof(zero), &index);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      /* The recording fails with it (vk_command_buffer_set_error()), and an
+       * application that submits it anyway loses the device. vk_errorf()
+       * reaches only debug messengers in release builds: say why here. */
+      mesa_loge_once("occlusion queries: all %u counters are assigned to "
+                     "queries of live pools; a recording that begins one "
+                     "more fails with %s",
+                     AGX_MAX_OCCLUSION_QUERIES, vk_Result_to_str(result));
       return result;
+   }
 
    /* Different command buffers may record the same query concurrently. Publish
     * one initialized counter and return any redundant allocation to the heap. */
