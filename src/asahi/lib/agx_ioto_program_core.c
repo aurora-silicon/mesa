@@ -8,6 +8,7 @@
 
 #include "agx_ioto_core.h"
 #include "agx_ioto_load_core.h"
+#include "agx3_code_container_core.h"
 
 
 #include <string.h>
@@ -200,19 +201,7 @@ static const uint8_t g17s_minimal_compute_copies[] = {
 static bool
 agx_ioto_program_target_gpu0(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_ioto_generation(chip) == AGX_IOTO_GENERATION_GPU0;
 }
 
 /* GPU0 EslBuilder appends the AGX3b LDDEV instruction directly rather than
@@ -1120,7 +1109,8 @@ agx_ioto_program_first_copy_offset(enum agx_chip chip, const void *body,
 
 static bool
 m5_no_resource_program_compose(
-   enum agx_chip chip, uint64_t program_va, const struct agx_ioto_state_tail_output *packed_tail,
+   unsigned usc_clusters, uint64_t program_va,
+   const struct agx_ioto_state_tail_output *packed_tail,
    bool fragment, void *output, size_t capacity, size_t *written)
 {
    const size_t size = fragment
@@ -1145,11 +1135,22 @@ m5_no_resource_program_compose(
                                                 sizeof(staged) - offset))
       return false;
 
-   /* G17C takes the G17S value; scaling it with the cluster count (x4)
-    * drops trailing draws of multi-draw passes. */
-   staged[offset + 20] =
-      (fragment ? 4 : 8) *
-      ((chip == AGX_CHIP_G17S || chip == AGX_CHIP_G17C) ? 2 : 1);
+   /* The loader's LDIMM at +16 loads the byte offset of the helper-table
+    * group the stage calls, in its scattered immediate fields; the loader
+    * then calls window + offset + 16 * SR14 (SR14 = 16 * cluster + core
+    * slot). The group is where the USC window's lead puts it for the
+    * device's cluster count (agx3_m5_container_group_offset()). Written
+    * through the immediate encoder, keeping the LDIMM's destination: the
+    * template's raw byte at +20 is that encoding only up to 0x400, and 0x800
+    * or 0x1000 written as a raw byte (32, 64) decodes to 0. */
+   const uint32_t group =
+      agx3_m5_container_group_offset(usc_clusters, !fragment);
+   if (!group)
+      return false;
+   uint8_t *ldimm = staged + offset + 16;
+   agx_store_le64(ldimm, (agx_load_le64(ldimm) &
+                          ~agx_ioto_load_ldimm_long_immediate(UINT32_MAX)) |
+                            agx_ioto_load_ldimm_long_immediate(group));
    offset += AGX_IOTO_G17S_MINIMAL_PROFILE_LOADER_SIZE;
    if (fragment) {
       static const uint8_t pixrel[] = {0x9f, 0x17, 0x00, 0x04, 0x00, 0x00};
@@ -1168,7 +1169,8 @@ m5_no_resource_program_compose(
 
 bool
 agx_ioto_m5_resource_program_compose_classes(
-   enum agx_chip chip, uint64_t program_va, const void *body, size_t body_size,
+   enum agx_chip chip, unsigned usc_clusters, uint64_t program_va,
+   const void *body, size_t body_size,
    const struct agx_ioto_state_tail_output *packed_tail,
    enum agx_ioto_g17g_program_stage stage, unsigned colour_classes,
    void *output, size_t capacity, size_t *written)
@@ -1193,7 +1195,8 @@ agx_ioto_m5_resource_program_compose_classes(
    uint8_t base[AGX_IOTO_G17G_FRAGMENT_NO_RESOURCE_PROGRAM_SIZE];
    size_t base_size;
    if (!m5_no_resource_program_compose(
-          chip, program_va, packed_tail, stage != AGX_IOTO_G17G_PROGRAM_VERTEX,
+          usc_clusters, program_va, packed_tail,
+          stage != AGX_IOTO_G17G_PROGRAM_VERTEX,
           base, sizeof(base), &base_size))
       return false;
 

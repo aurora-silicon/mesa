@@ -119,29 +119,22 @@ struct agx_vdm_index_list_indirect_words {
 static inline bool
 agx_vdm_index_list_direct_target_supported_inline(enum agx_chip chip)
 {
-   switch (chip) {
-   case AGX_CHIP_G15G:
-   case AGX_CHIP_G15S:
-   case AGX_CHIP_G15C:
-   case AGX_CHIP_G15D:
-   case AGX_CHIP_G16G:
-   case AGX_CHIP_G16S:
-   case AGX_CHIP_G16C:
-   case AGX_CHIP_G17P:
-   case AGX_CHIP_G17G:
-   case AGX_CHIP_G17S:
-   case AGX_CHIP_G17C:
-      return true;
-   default:
-      return false;
-   }
+   return agx_chip_has_record(chip, AGX_RECORD_VDM_INDEX_LIST);
 }
+
+/* The HAL300 Index List form, with its Unk 2 word: the chips on the HAL300
+ * path that take this record (agx_vdm_index_list_record_chip() gives G18G
+ * G17G's). An expansion of the chip table, so the precompiled kernels can
+ * call it (AGX_CHIP_ROW_TEST). */
+#define AGX_VDM_INDEX_LIST_ROW_HAL300(path, records, unused)                   \
+   ((path) == AGX_CHIP_PATH_HAL300 &&                                          \
+    ((records) & AGX_RECORD_VDM_INDEX_LIST) != 0)
 
 static inline bool
 agx_vdm_index_list_direct_is_hal300_inline(enum agx_chip chip)
 {
-   return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+   return false AGX_CHIPS(AGX_CHIP_ROW_TEST, chip,
+                          AGX_VDM_INDEX_LIST_ROW_HAL300, 0);
 }
 
 static inline bool

@@ -18,6 +18,9 @@
  * fails if something was.
  *
  * usage: aurora-packtest ITERATIONS [CASE...]
+ *
+ * submit_to_fence_us times the iterations after the first two, which warm up;
+ * a run of two or fewer iterations reports it untimed.
  */
 #include <errno.h>
 #include <inttypes.h>
@@ -34,11 +37,14 @@
 
 #include "aurora_packtest_shaders.h"
 
+#define WARMUP_ITERATIONS 2u
+
 #define LANES 1024u
 #define GUARD 64u
 #define MAX_SLOTS 1024u
 #define MAX_OPS 160u
 #define MAX_CBS 512u
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 static void
 die(const char *fmt, ...)
@@ -764,7 +770,7 @@ run_case(const char *name, unsigned iterations)
       }
       CHECK(vkWaitForFences(g.dev, 1, &fence, VK_TRUE, 10000000000ull));
       const uint64_t dt = now_ns() - t0;
-      if (it >= 2) {
+      if (it >= WARMUP_ITERATIONS) {
          best = dt < best ? dt : best;
          sum += dt;
          timed++;
@@ -780,9 +786,11 @@ run_case(const char *name, unsigned iterations)
          }
       }
    }
-   printf("%s %s cbs=%u iterations=%u submit_to_fence_us best=%.1f mean=%.1f\n",
-          bad ? "FAIL" : "PASS", name, T.ncb, iterations, best / 1e3,
-          timed ? sum / 1e3 / timed : 0.0);
+   printf("%s %s cbs=%u iterations=%u ", bad ? "FAIL" : "PASS", name, T.ncb, iterations);
+   if (timed)
+      printf("submit_to_fence_us best=%.1f mean=%.1f\n", best / 1e3, sum / 1e3 / timed);
+   else
+      printf("submit_to_fence_us untimed (iterations <= %u)\n", WARMUP_ITERATIONS);
    vkDestroyFence(g.dev, fence, NULL);
    if (sem)
       vkDestroySemaphore(g.dev, sem, NULL);
@@ -804,8 +812,14 @@ static struct {
    pthread_t thread;
    int real_stderr, read_end;
    unsigned packed, synced, requested;
+   /* What the driver's trace says of strong-flush tails: -1 not seen yet,
+    * also with a driver older than the strong_tails= field (#558), where the
+    * barrier-ended cases stay must-pack. A line without the field keeps the
+    * value of the last one that had it. */
+   int strong_tails;
    bool on;
 } tr = {
+   .strong_tails = -1,
    .lock = PTHREAD_MUTEX_INITIALIZER,
    .cond = PTHREAD_COND_INITIALIZER,
    .real_stderr = -1,
@@ -826,10 +840,16 @@ trace_line(const char *line, size_t n)
       /* The pass-through is best effort. */
    }
    unsigned runs, members;
-   if (n > 13 && !memcmp(line, "HK_PACK runs=", 13) &&
-       sscanf(line, "HK_PACK runs=%u members=%u", &runs, &members) == 2) {
+   if (n > 13 && !memcmp(line, "HK_PACK runs=", 13)) {
+      const bool counted =
+         sscanf(line, "HK_PACK runs=%u members=%u", &runs, &members) == 2;
+      const char *st = memmem(line, n, "strong_tails=", 13);
       pthread_mutex_lock(&tr.lock);
-      tr.packed += members;
+      if (counted)
+         tr.packed += members;
+      /* Only a driver with the field (#558 and later) relaxes must-pack. */
+      if (st && st + 13 < line + n)
+         tr.strong_tails = st[13] == '1';
       pthread_mutex_unlock(&tr.lock);
    }
 }
@@ -925,23 +945,41 @@ trace_begin(void)
 /* Whether a case submitted a render on the queue. */
 static bool rendered;
 
-/* Cases whose command buffers are all plain compute work that packs. Every
- * command buffer of chain-all ends with an ALL -> ALL barrier, whose tail is
- * a render wait once the queue ran a render (split-render): it must pack
- * only before that. */
 static bool
-must_pack(const char *name)
+listed(const char *name, const char *const *list, unsigned count)
 {
-   static const char *const cases[] = {"chain242", "chain300", "loops",
-                                       "chain-all", "multi", "multi-tail",
-                                       "disjoint"};
-   if (!strcmp(name, "chain-all") && rendered)
-      return false;
-   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
-      if (!strcmp(name, cases[i]))
+   for (unsigned i = 0; i < count; ++i) {
+      if (!strcmp(name, list[i]))
          return true;
    }
    return false;
+}
+
+/* Cases whose command buffers are all plain compute work that packs. Those
+ * ending with a dispatch pack wherever packing is on. Those ending with a
+ * barrier end with a strong flush without memory scope, which packs only
+ * where the driver admits such tails (the trace's strong_tails=, see
+ * hk_pack_admits_strong_tail()). A driver older than that field (#558) never
+ * relaxes them: on M5 without mesa#506 those cases then FAIL as must-pack.
+ * Every command buffer of chain-all ends with
+ * an ALL -> ALL barrier, whose tail is a render wait once the queue ran a
+ * render (split-render): it must pack only before that. */
+static bool
+must_pack(const char *name)
+{
+   static const char *const dispatch_ended[] = {"multi-tail", "disjoint"};
+   static const char *const barrier_ended[] = {"chain242", "chain300", "loops",
+                                               "chain-all", "multi"};
+   if (listed(name, dispatch_ended, ARRAY_LEN(dispatch_ended)))
+      return true;
+   if (!listed(name, barrier_ended, ARRAY_LEN(barrier_ended)))
+      return false;
+   if (!strcmp(name, "chain-all") && rendered)
+      return false;
+   pthread_mutex_lock(&tr.lock);
+   const int strong_tails = tr.strong_tails;
+   pthread_mutex_unlock(&tr.lock);
+   return strong_tails != 0;
 }
 
 static bool
@@ -966,8 +1004,9 @@ check_case(const char *name, unsigned iterations)
    const bool on = mode && mode[0] == '1', off = mode && mode[0] == '0';
    if (!tr.on) {
       /* Nothing to count: a must-pack check cannot pass. */
-      printf("%s %s trace unavailable\n", on ? "FAIL" : "WARN", name);
-      return bad + on;
+      const bool fail = on && must;
+      printf("%s %s trace unavailable\n", fail ? "FAIL" : "WARN", name);
+      return bad + fail;
    }
    const bool wrong = (on && must && !packed) || (off && packed);
    printf("%s %s packed_cbs=%u%s\n", wrong ? "FAIL" : "PACKED", name, packed,

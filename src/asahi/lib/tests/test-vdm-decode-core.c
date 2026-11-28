@@ -27,7 +27,7 @@ static unsigned checks;
 static const enum agx_chip supported_targets[] = {
    AGX_CHIP_G15G, AGX_CHIP_G15S, AGX_CHIP_G15C, AGX_CHIP_G15D,
    AGX_CHIP_G16G, AGX_CHIP_G16S, AGX_CHIP_G16C, AGX_CHIP_G17P,
-   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C,
+   AGX_CHIP_G17G, AGX_CHIP_G17S, AGX_CHIP_G17C, AGX_CHIP_G17D,
 };
 
 static const enum agx_chip unsupported_targets[] = {
@@ -39,7 +39,8 @@ static bool
 is_hal300(enum agx_chip chip)
 {
    return chip == AGX_CHIP_G17G || chip == AGX_CHIP_G17S ||
-          chip == AGX_CHIP_G17C;
+          chip == AGX_CHIP_G17C ||
+          chip == AGX_CHIP_G17D;
 }
 
 static bool
@@ -100,7 +101,7 @@ test_barrier(void)
         t < sizeof(supported_targets) / sizeof(supported_targets[0]); ++t) {
       const enum agx_chip chip = supported_targets[t];
       struct agx_vdm_barrier_core packed;
-      CHECK(agx_vdm_barrier_core_pack(chip, &packed));
+      CHECK(agx_vdm_barrier_core_pack(chip, false, &packed));
 
       uint8_t stream[AGX_VDM_BARRIER_CORE_LENGTH + 4];
       memcpy(stream, packed.bytes, packed.length);
@@ -576,7 +577,7 @@ test_rejection(void)
    };
 
    CHECK(agx_vdm_ppp_state_core_pack(chip, UINT64_C(0x123456780), 7, &ppp));
-   CHECK(agx_vdm_barrier_core_pack(chip, &barrier));
+   CHECK(agx_vdm_barrier_core_pack(chip, false, &barrier));
    CHECK(agx_vdm_state_update_pack(chip, &state_info, &state));
    CHECK(agx_vdm_index_list_direct_nonindexed_pack(chip, &nonindexed_info,
                                                    &nonindexed));

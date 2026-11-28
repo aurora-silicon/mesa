@@ -15,7 +15,6 @@
 
 #include "asahi/lib/agx_bo.h"
 #include "util/u_atomic.h"
-#include "util/u_debug.h"
 #include "vk_common_entrypoints.h"
 
 #include "asahi/lib/agx_device.h"
@@ -23,9 +22,11 @@
 #include "util/os_misc.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 /* GPU memory is system memory that the kernel cannot evict or swap, and
  * heapBudget is only advisory, so the heap limit alone lets a process (or
@@ -56,6 +57,17 @@ hk_system_memory_fits(uint64_t size)
       reserve = MAX2(reserve, total / 50);
 
    return available >= size + reserve;
+}
+
+static bool
+hk_allow_bo_alloc(size_t size, void *data)
+{
+   bool *mem_rejected = data;
+
+   /* agx_bo_create_checked() asks again after evicting the BO cache, so
+    * record only the latest answer. */
+   *mem_rejected = !hk_system_memory_fits(size);
+   return !*mem_rejected;
 }
 
 /* Supports opaque fd only */
@@ -246,7 +258,7 @@ hk_GetMemoryHostPointerPropertiesEXT(
    struct hk_physical_device *pdev = hk_device_physical(dev);
 
    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
-       !agx_has_userptr(&dev->dev))
+       !agx_has_host_import(&dev->dev))
       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
    const uint64_t alignment =
@@ -266,6 +278,140 @@ hk_GetMemoryHostPointerPropertiesEXT(
    return VK_SUCCESS;
 }
 
+/* Track host-pointer imports per import on every chip except M5 when the
+ * static per-device rule is active (ASAHI_M5_HOST_ALIAS_STATIC=1 or no
+ * aliasing-capable features). */
+static inline bool
+hk_host_import_tracks_alias(const struct hk_device *dev)
+{
+   return !agx_chip_g17_m5(dev->dev.chip) || dev->host_alias.dynamic;
+}
+
+/* The class of the mappings over [pointer, pointer + size) in
+ * /proc/self/maps (hk_host_maps_classify_fd()); HK_HOST_MAP_OTHER when the
+ * file cannot be read. */
+static enum hk_host_map_class
+hk_host_maps_classify_self(const void *pointer, uint64_t size)
+{
+   const uintptr_t start = (uintptr_t)pointer;
+   if (size == 0 || size > UINTPTR_MAX - start)
+      return HK_HOST_MAP_OTHER;
+
+   const int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return HK_HOST_MAP_OTHER;
+   const enum hk_host_map_class cls =
+      hk_host_maps_classify_fd(fd, start, start + (uintptr_t)size);
+   close(fd);
+   return cls;
+}
+
+/* Enter a host import into the device's set so va_alias_resources (and
+ * alias_live on M5 with host_alias.dynamic) only counts imports that may
+ * alias another GPU virtual address (hk_host_import_aliases()). A
+ * GPU-writable import of pages that are all private anonymous memory of this
+ * process (/proc/self/maps), and that no other live import overlaps, has its
+ * pages at no other GPU address. A read-only one needs only private mappings:
+ * the GPU writes none of its pages through it, and writes them through
+ * another address only through a writable import of a shared mapping, which
+ * aliases itself, or of the same pages, which overlaps it. An import whose
+ * maps cannot be read aliases. The mappings are read before the kernel pins
+ * the pages (before_pin) and again now, and the worse of the two counts, so
+ * an application that replaces the mapping meanwhile is not taken at its
+ * word. What the maps cannot show: pages a private mapping holds that are
+ * pinned already, see hk_host_alias.h on mremap.
+ *
+ * Costs two reads of /proc/self/maps up to the lines that cover the range.
+ * The imports that began to alias count in va_alias_resources (and
+ * alias_live via hk_device_alias_add() on M5) before the import is returned. */
+static VkResult
+hk_host_import_track(struct hk_device *dev, struct hk_device_memory *mem,
+                     const void *pointer, uint64_t size,
+                     enum hk_host_map_class before_pin)
+{
+   if (!hk_host_import_tracks_alias(dev)) {
+      /* Under the per-device rule nothing is tracked; say the import
+       * happened, so a trace shows whether an application imports at all. */
+      if (dev->host_alias.trace)
+         fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " (per-device rule)\n",
+                 pointer, size);
+      return VK_SUCCESS;
+   }
+
+   const uintptr_t start = (uintptr_t)pointer;
+   const uintptr_t end =
+      size <= UINTPTR_MAX - start ? start + (uintptr_t)size : UINTPTR_MAX;
+   const enum hk_host_map_class cls =
+      MAX2(before_pin, hk_host_maps_classify_self(pointer, size));
+
+   const bool gpu_writes = !(mem->bo->flags & AGX_BO_READONLY);
+   const struct hk_host_import import = {
+      .start = start,
+      .end = end,
+      .owner = mem,
+      .gpu_writes = gpu_writes,
+      .maps_alias = hk_host_import_maps_alias(gpu_writes, cls),
+   };
+
+   /* The counts change with the set, under its lock, so a free of an
+    * overlapping import never subtracts ahead of this add
+    * (hk_device_alias_add()). The patch runs after the lock is released. */
+   simple_mtx_lock(&dev->host_alias.lock);
+   const int began = hk_host_imports_add(&dev->host_alias.imports, &import);
+   bool first = false;
+   if (began > 0) {
+      p_atomic_add(&dev->va_alias_resources, (int32_t)began);
+      first = hk_device_alias_add(dev, (uint32_t)began);
+   }
+   simple_mtx_unlock(&dev->host_alias.lock);
+   if (began < 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   mem->host_alias_tracked = true;
+   if (first)
+      hk_device_alias_began(dev, HK_ALIAS_CAUSE_IMPORT);
+
+   if (dev->host_alias.trace)
+      fprintf(stderr, "M5_HOST_ALIAS import %p+%#" PRIx64 " writes=%u maps=%u "
+              "began=%d live=%u\n", pointer, size, gpu_writes, (unsigned)cls,
+              began, p_atomic_read(&dev->alias_live));
+   return VK_SUCCESS;
+}
+
+static void
+hk_host_import_untrack(struct hk_device *dev, struct hk_device_memory *mem)
+{
+   if (!mem->host_alias_tracked)
+      return;
+
+   simple_mtx_lock(&dev->host_alias.lock);
+   const unsigned stopped =
+      hk_host_imports_remove(&dev->host_alias.imports, mem);
+   if (stopped > 0) {
+      p_atomic_add(&dev->va_alias_resources, -(int32_t)stopped);
+      hk_device_alias_put(dev, stopped);
+   }
+   simple_mtx_unlock(&dev->host_alias.lock);
+   mem->host_alias_tracked = false;
+
+   if (dev->host_alias.trace)
+      fprintf(stderr, "M5_HOST_ALIAS free %p stopped=%u live=%u\n",
+              (void *)mem, stopped, p_atomic_read(&dev->alias_live));
+}
+
+/* Memory mapped again in the capture/replay region (replay_va) counts from
+ * its mapping to its release (hk_device_va_alias_get()). */
+static void
+hk_memory_release_replay_va(struct hk_device *dev,
+                            struct hk_device_memory *mem)
+{
+   if (!mem->replay_va)
+      return;
+   agx_va_free(&dev->dev, mem->replay_va, true);
+   mem->replay_va = NULL;
+   hk_device_va_alias_put(dev);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
@@ -275,19 +421,48 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
    struct hk_device_memory *mem;
    VkResult result = VK_SUCCESS;
 
-   const VkImportMemoryFdInfoKHR *fd_info =
-      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
-   const VkExportMemoryAllocateInfo *export_info =
-      vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
-   const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info =
-      vk_find_struct_const(pAllocateInfo->pNext,
-                           MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO);
-   const VkImportMemoryHostPointerInfoEXT *host_info = vk_find_struct_const(
-      pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
-   const VkMemoryPriorityAllocateInfoEXT *priority_info =
-      vk_find_struct_const(pAllocateInfo->pNext,
-                           MEMORY_PRIORITY_ALLOCATE_INFO_EXT);
+   const VkImportMemoryFdInfoKHR *fd_info = NULL;
+   const VkExportMemoryAllocateInfo *export_info = NULL;
+   const VkMemoryOpaqueCaptureAddressAllocateInfo *capture_info = NULL;
+   const VkImportMemoryHostPointerInfoEXT *host_info = NULL;
+   const VkMemoryPriorityAllocateInfoEXT *priority_info = NULL;
+   bool wsi_alloc = false;
+
+   if (unlikely(pAllocateInfo->pNext != NULL)) {
+      vk_foreach_struct_const(sType, ext, pAllocateInfo->pNext) {
+         switch ((uint32_t)sType) {
+         case VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR:
+            if (!fd_info)
+               fd_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
+            if (!export_info)
+               export_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO:
+            if (!capture_info)
+               capture_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
+            if (!host_info)
+               host_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT:
+            if (!priority_info)
+               priority_info = ext;
+            break;
+         case VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA:
+            wsi_alloc = true;
+            break;
+         default:
+            break;
+         }
+      }
+   }
    const VkMemoryType *type = &pdev->mem_types[pAllocateInfo->memoryTypeIndex];
+   /* The mappings over a host import before its pages are pinned
+    * (hk_host_import_track()). */
+   enum hk_host_map_class host_maps_before_pin = HK_HOST_MAP_OTHER;
 
    VkExternalMemoryHandleTypeFlagBits handle_types = 0;
    if (export_info != NULL)
@@ -343,6 +518,21 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
          result = vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
          goto fail_alloc;
       }
+
+      /* Every byte of allocationSize must be backed by the imported object.
+       * An image bound to the memory is checked against the BO
+       * (hk_image_plane_bind()), but a buffer may use the whole of
+       * allocationSize, which would then run past the BO. */
+      if (mem->bo->size < pAllocateInfo->allocationSize) {
+         result = vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                            "allocationSize %" PRIu64 " exceeds the imported "
+                            "object (%" PRIu64 " bytes)",
+                            (uint64_t)pAllocateInfo->allocationSize,
+                            (uint64_t)mem->bo->size);
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         goto fail_alloc;
+      }
       assert(!(flags & ~mem->bo->flags));
       mem->alias_import = true;
    } else if (host_info && host_info->handleType) {
@@ -356,7 +546,8 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * hk_host_memory_read_only. With hk_host_memory_import_read_only only
        * such a range is taken, and a range the kernel can pin for writing is
        * refused, also with hk_host_memory_read_only: the GPU then writes
-       * through no host import (hk_cdm_alias_scope()).
+       * through no host import (hk_cdm_alias_scope()). Otherwise,
+       * hk_host_import_track() decides below whether this import may alias.
        */
       assert(host_info->handleType ==
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
@@ -366,6 +557,9 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             ? AGX_HOST_PTR_READ_ONLY
          : instance->drirc.misc.host_memory_read_only ? AGX_HOST_PTR_ANY
                                                        : AGX_HOST_PTR_WRITABLE;
+      if (hk_host_import_tracks_alias(dev))
+         host_maps_before_pin = hk_host_maps_classify_self(
+            host_info->pHostPointer, pAllocateInfo->allocationSize);
       mem->bo = agx_bo_import_host_ptr(&dev->dev, host_info->pHostPointer,
                                        pAllocateInfo->allocationSize, access);
       if (mem->bo == NULL) {
@@ -378,35 +572,37 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
                             host_info->pHostPointer, strerror(err));
          goto fail_alloc;
       }
-      mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
+      if (!hk_host_import_tracks_alias(dev))
+         mem->alias_import = access != AGX_HOST_PTR_READ_ONLY;
    } else {
       enum agx_bo_flags flags = 0;
       if (handle_types)
          flags |= AGX_BO_SHAREABLE;
       /* A failed WSI export must not leave pinned backing in the BO cache.
        * Successful exports already acquire AGX_BO_SHARED. */
-      if (dev->dev.chip == AGX_CHIP_G17P &&
-          vk_find_struct_const(pAllocateInfo->pNext, WSI_MEMORY_ALLOCATE_INFO_MESA))
+      if (!dev->dev.is_virtio && wsi_alloc)
          flags |= AGX_BO_NO_CACHE;
       if (type->propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
          flags |= AGX_BO_WRITEBACK;
 
-      /* A BO from the cache allocates nothing new. If the kernel purged it
-       * meanwhile, one allocation can still pass the check. */
-      if (!hk_system_memory_fits(aligned_size) &&
-          !agx_bo_cache_has(&dev->dev, aligned_size, 64 * 1024, flags)) {
-         result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                            "Not enough free system memory for %" PRIu64
-                            " MiB", aligned_size >> 20);
-         goto fail_alloc;
-      }
-
+      /* A BO from the cache allocates nothing new. Fetch from the cache once
+       * and run hk_system_memory_fits() only on a real miss (including after
+       * discarding purged entries), avoiding both a duplicate cache-lock walk
+       * and per-allocation /proc/meminfo reads. */
+      bool mem_rejected = false;
       /* D3D12 promises 64 KiB alignment for heap addresses, and this costs
        * only virtual address space. */
-      mem->bo = agx_bo_create(&dev->dev, aligned_size, 64 * 1024, flags,
-                              "App memory");
+      mem->bo = agx_bo_create_checked(&dev->dev, aligned_size, 64 * 1024, flags,
+                                      "App memory", hk_allow_bo_alloc,
+                                      &mem_rejected);
       if (!mem->bo) {
-         result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         if (mem_rejected) {
+            result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                               "Not enough free system memory for %" PRIu64
+                               " MiB", aligned_size >> 20);
+         } else {
+            result = vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
          goto fail_alloc;
       }
    }
@@ -423,16 +619,20 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        dev->dev.replay_heap_initialized) {
       const uint64_t fixed_addr =
          capture_info ? capture_info->opaqueCaptureAddress : 0;
+      /* The range follows the requested size, not the BO's: a BO from the
+       * cache can be up to twice as large, so its size differs between
+       * capture and replay, and a larger replayed range would cover the next
+       * captured address. Bindings only reach offsets below that size. */
       mem->replay_va = agx_va_alloc(
-         &dev->dev, mem->bo->size, 64 * 1024,
+         &dev->dev, aligned_size, 64 * 1024,
          AGX_VA_CAPTURE_REPLAY | (fixed_addr ? AGX_VA_FIXED : 0), fixed_addr);
       if (mem->replay_va &&
           (agx_bo_bind(&dev->dev, mem->bo, mem->replay_va->addr,
-                       mem->bo->size, 0,
+                       aligned_size, 0,
                        DRM_ASAHI_BIND_READ | DRM_ASAHI_BIND_WRITE) ||
            agx_bo_bind(&dev->dev, mem->bo,
                        agx_rw_addr_to_ro(&dev->dev, mem->replay_va->addr),
-                       mem->bo->size, 0, DRM_ASAHI_BIND_READ))) {
+                       aligned_size, 0, DRM_ASAHI_BIND_READ))) {
          agx_va_free(&dev->dev, mem->replay_va, true);
          mem->replay_va = NULL;
          agx_bo_unreference(&dev->dev, mem->bo);
@@ -446,7 +646,7 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
        * capture/replay addresses. */
       /* The memory is reached through two read-write addresses now. */
       if (mem->replay_va)
-         p_atomic_inc(&dev->va_alias_resources);
+         hk_device_va_alias_get(dev, HK_ALIAS_CAUSE_CAPTURE_REPLAY);
    }
 
    if (mem->vk.alloc_flags &
@@ -458,16 +658,40 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
             : mem->bo->va->addr;
    }
 
-   /* Shadow map in case this is used for a sparse resident buffer */
-   int ret = agx_bo_bind(&dev->dev, mem->bo,
-                         agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
-                         mem->bo->size, 0, DRM_ASAHI_BIND_READ);
+   /* Shadow map in case this is used for a sparse resident buffer. The mapping
+    * persists with the BO across userspace cache reuse, so cached allocations
+    * skip the redundant VM_BIND ioctl. */
+   int ret = agx_bo_ensure_ro_shadow(&dev->dev, mem->bo);
    if (ret) {
       /* The bind fails once the VM carries a sticky error. */
+      hk_memory_release_replay_va(dev, mem);
       agx_bo_unreference(&dev->dev, mem->bo);
       mem->bo = NULL;
       vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   if (host_info && host_info->handleType) {
+      result = hk_host_import_track(dev, mem, host_info->pHostPointer,
+                                    mem->bo->size, host_maps_before_pin);
+      if (result != VK_SUCCESS) {
+         hk_memory_release_replay_va(dev, mem);
+         agx_bo_unreference(&dev->dev, mem->bo);
+         mem->bo = NULL;
+         vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+         return result;
+      }
+   }
+
+   /* An fd or dma-buf import has an address of its own, and another import,
+    * of this device or of another device or process, may map the same pages:
+    * it counts for its lifetime (hk_cdm_alias_scope()). An export reaches
+    * other devices and processes only across a submission boundary, after
+    * the memory-scoped flush that ends every command; brought back into this
+    * device it is an import, which counts here. */
+   if (fd_info && fd_info->handleType) {
+      mem->alias_fd = true;
+      hk_device_alias_get(dev, 1, HK_ALIAS_CAUSE_FD);
    }
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
@@ -509,6 +733,46 @@ fail_alloc:
    return result;
 }
 
+/* The CPU mapping that host image copies of this memory go through.
+ *
+ * It is this object's own mapping of the whole BO (agx_bo_map_owned()), made
+ * at the first copy and kept until vkFreeMemory. The application's
+ * vkMapMemory2 and vkUnmapMemory2 of the memory, which may run on other
+ * threads while copies do, map, move and unmap only the BO's shared mapping
+ * or their own, so they never touch the one a copy is using.
+ *
+ * Host image copies need no external synchronization on the memory, so two
+ * threads can make the mapping at once: the first one installed is kept and
+ * the other is unmapped. Host memory stays where the application put it, and
+ * a backend that cannot map a BO twice has only the shared mapping; copies
+ * use the BO's shared mapping there. NULL if the BO cannot be mapped.
+ */
+void *
+hk_device_memory_copy_map(struct hk_device_memory *mem)
+{
+   void *map = p_atomic_read(&mem->copy_map);
+   if (map)
+      return map;
+
+   if (!mem->bo->dev->ops.bo_mmap_independent ||
+       (mem->bo->flags & AGX_BO_HOST_PTR)) {
+      map = agx_bo_map(mem->bo);
+   } else {
+      size_t size;
+      map = agx_bo_map_owned(mem->bo, NULL, 0, &size);
+      if (map == NULL)
+         return NULL;
+
+      void *installed = p_atomic_cmpxchg(&mem->copy_map, NULL, map);
+      if (installed != NULL) {
+         agx_bo_unmap_owned(mem->bo, map, size);
+         return installed;
+      }
+   }
+
+   return map;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
               const VkAllocationCallbacks *pAllocator)
@@ -533,17 +797,21 @@ hk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
     * the BO; an owned one belongs to this object alone. */
    if (mem->map_owned)
       agx_bo_unmap_owned(mem->bo, mem->map, mem->map_size);
+   if (mem->copy_map)
+      agx_bo_unmap_owned(mem->bo, mem->copy_map, mem->bo->size);
 
    /* The BO may outlive this object in the BO cache. */
    hk_set_memory_priority(dev, mem, 0.5f);
 
-   if (mem->replay_va) {
-      agx_va_free(&dev->dev, mem->replay_va, true);
-      p_atomic_dec(&dev->va_alias_resources);
-   }
+   hk_memory_release_replay_va(dev, mem);
 
    if (mem->alias_import)
       p_atomic_dec(&dev->va_alias_resources);
+
+   /* No work that may still run reaches this memory any more. */
+   hk_host_import_untrack(dev, mem);
+   if (mem->alias_fd)
+      hk_device_alias_put(dev, 1);
 
    agx_bo_unreference(&dev->dev, mem->bo);
 
@@ -679,14 +947,16 @@ hk_UnmapMemory2KHR(VkDevice device,
        * PROT_NONE'ing the difference lands on address space the application
        * reserved for itself -- the guard pages dEQP-VK.memory.map_placed.*
        * fills and reads back. */
-      void *err = mmap(mem->bo->_map, agx_bo_map_size(mem->bo), PROT_NONE,
-                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-      if (err == MAP_FAILED) {
-         return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
-                          "Failed to map over original mapping");
+      if (mem->bo->_map) {
+         void *err = mmap(mem->bo->_map, agx_bo_map_size(mem->bo), PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+         if (err == MAP_FAILED) {
+            return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
+                             "Failed to map over original mapping");
+         }
+         mem->bo->_map = NULL;
+         mem->bo->_map_size = 0;
       }
-      mem->bo->_map = NULL;
-      mem->bo->_map_size = 0;
    } else {
       if (mem->bo->_map) {
          munmap(mem->bo->_map, agx_bo_map_size(mem->bo));
@@ -734,7 +1004,7 @@ hk_GetMemoryFdKHR(VkDevice device, const VkMemoryGetFdInfoKHR *pGetFdInfo,
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT:
    case VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT:
       *pFD = agx_bo_export(&dev->dev, memory->bo);
-      if (*pFD < 0 && dev->dev.chip == AGX_CHIP_G17P)
+      if (*pFD < 0)
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       return VK_SUCCESS;
    default:

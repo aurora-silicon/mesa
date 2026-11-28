@@ -23,43 +23,59 @@ struct agx_subgroup_lower_options {
    bool optimize_ballot_count;
    bool g17p_clustered_float;
    bool native_shuffle_xor;
+   bool m5_float_minmax;
 };
 
-/* M5 shuffles a 32-bit value across the subgroup by a constant lane XOR in
- * one instruction (simd_shuffle_xor with an immediate), where the general
- * shuffle is four broadcasts and three selects. The mask is usually a
- * constant only once loops are unrolled, so such shuffles are kept through
- * the early lowering and agx_nir_lower_dynamic_shuffle_xor() lowers the ones
- * that are left with any other mask.
+/* AGX3B (G17P) and AGX3C (M5) shuffle a 32-bit value across the subgroup by a
+ * constant lane XOR or up/down shift in one instruction (simd_shuffle_{xor,up,down}
+ * with an immediate 1..31), where the general shuffle is four broadcasts and
+ * three selects. The mask/delta is usually a constant only once loops are
+ * unrolled, so such shuffles are kept through the early lowering and
+ * agx_nir_lower_dynamic_shuffle_xor() lowers the ones that are left with any
+ * other operand.
  */
 static bool
-is_native_shuffle_xor(const nir_intrinsic_instr *intr)
+is_native_relative_shuffle(const nir_intrinsic_instr *intr)
 {
-   return intr->intrinsic == nir_intrinsic_shuffle_xor &&
+   return (intr->intrinsic == nir_intrinsic_shuffle_xor ||
+           intr->intrinsic == nir_intrinsic_shuffle_up ||
+           intr->intrinsic == nir_intrinsic_shuffle_down) &&
           intr->def.num_components == 1 && intr->def.bit_size == 32;
 }
 
 static bool
-has_native_shuffle_xor_mask(const nir_intrinsic_instr *intr)
+has_native_relative_shuffle_delta(const nir_intrinsic_instr *intr)
 {
    return nir_src_is_const(intr->src[1]) &&
           nir_src_as_uint(intr->src[1]) >= 1 &&
           nir_src_as_uint(intr->src[1]) <= 31;
 }
 
+/* Single-source dispatch for AGX's custom subgroup lowerings.
+ * When `b == NULL`, reports whether `lower()` would rewrite `intr` as a
+ * required legalization (excluding the optional popcount(ballot(true))
+ * peephole, which leaves a legal native 1x32 ballot if unlowered).
+ */
 static bool
-lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+lower_custom_subgroup_intrinsic(
+   nir_builder *b, nir_intrinsic_instr *intr,
+   const struct agx_subgroup_lower_options *agx_options)
 {
-   b->cursor = nir_before_instr(&intr->instr);
+   if (b)
+      b->cursor = nir_before_instr(&intr->instr);
 
    switch (intr->intrinsic) {
    case nir_intrinsic_quad_vote_any: {
+      if (!b)
+         return true;
       nir_def *ballot = nir_quad_ballot_agx(b, 16, intr->src[0].ssa);
       nir_def_rewrite_uses(&intr->def, nir_ine_imm(b, ballot, 0));
       return true;
    }
 
    case nir_intrinsic_quad_vote_all: {
+      if (!b)
+         return true;
       nir_def *ballot =
          nir_quad_ballot_agx(b, 16, nir_inot(b, intr->src[0].ssa));
       nir_def_rewrite_uses(&intr->def, nir_ieq_imm(b, ballot, 0));
@@ -67,12 +83,16 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_elect: {
+      if (!b)
+         return true;
       nir_def *active_id = nir_load_active_subgroup_invocation_agx(b, 16);
       nir_def_rewrite_uses(&intr->def, nir_ieq_imm(b, active_id, 0));
       return true;
    }
 
    case nir_intrinsic_first_invocation: {
+      if (!b)
+         return true;
       nir_def *active_id = nir_load_active_subgroup_invocation_agx(b, 16);
       nir_def *is_first = nir_ieq_imm(b, active_id, 0);
       nir_def *first_bit = nir_ballot(b, 1, 32, is_first);
@@ -81,6 +101,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_last_invocation: {
+      if (!b)
+         return true;
       nir_def *active_mask = nir_ballot(b, 1, 32, nir_imm_true(b));
       nir_def_rewrite_uses(&intr->def, nir_ufind_msb(b, active_mask));
       return true;
@@ -88,6 +110,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    case nir_intrinsic_vote_ieq:
    case nir_intrinsic_vote_feq: {
+      if (!b)
+         return true;
       /* The common lowering does:
        *
        *    vote_all(x == read_first(x))
@@ -118,6 +142,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_load_num_subgroups: {
+      if (!b)
+         return true;
       nir_def *workgroup_size = nir_load_workgroup_size(b);
       workgroup_size = nir_imul(b,
                                 nir_imul(b, nir_channel(b, workgroup_size, 0),
@@ -131,6 +157,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_shuffle: {
+      if (!b)
+         return true;
       nir_def *data = intr->src[0].ssa;
       nir_def *target = intr->src[1].ssa;
 
@@ -157,6 +185,8 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_inclusive_scan: {
+      if (!b)
+         return true;
       /* If we got here, we support the corresponding exclusive scan in
        * hardware, so just handle the last element.
        */
@@ -171,13 +201,14 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_ballot: {
+      if (!b)
+         return false;
       /* Optimize popcount(ballot(true)) to load_active_subgroup_count_agx().
        *
        * Preserve ballot membership on G17P and in M5 fragment shaders. M5
        * lowers the active count to a reduction, which also counts helper
        * invocations after fragment termination.
        */
-      const struct agx_subgroup_lower_options *agx_options = data;
       if (!agx_options->optimize_ballot_count || !nir_src_is_const(intr->src[0]) ||
           !nir_src_as_bool(intr->src[0]) ||
           !list_is_singular(&intr->def.uses))
@@ -202,6 +233,12 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 }
 
+static bool
+lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   return lower_custom_subgroup_intrinsic(b, intr, data);
+}
+
 
 
 static bool
@@ -210,7 +247,7 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
    const struct agx_subgroup_lower_options *agx_options = data;
    unsigned cluster = 0;
 
-   if (agx_options->native_shuffle_xor && is_native_shuffle_xor(intr))
+   if (agx_options->native_shuffle_xor && is_native_relative_shuffle(intr))
       return false;
 
    /* Use default behaviour for everything but scans */
@@ -240,6 +277,19 @@ lower_subgroup_filter(const nir_intrinsic_instr *intr, const void *data)
        * lowering path. */
       if (agx_options->g17p_clustered_float && cluster == 4 &&
           intr->def.bit_size == 32)
+         return false;
+      /* M5's subgroup reduce takes float minimum and maximum: keep a
+       * reduction over whole subgroups (no cluster, or one of 32 or more)
+       * for it, in place of a shuffle tree of five shuffles and compares.
+       * It reduces the active lanes only. The tree it replaces is built
+       * from fmin/fmax with the builder's default float controls, which do
+       * not preserve signed zeros or NaNs, and the instruction matches
+       * it: NaN lanes are ignored unless every active lane is NaN, either
+       * zero may come back for a group with zeros of both signs, and
+       * denormals compare as zeros of their sign (the result may be a
+       * denormal operand). */
+      if (agx_options->m5_float_minmax && (cluster == 0 || cluster >= 32) &&
+          intr->intrinsic == nir_intrinsic_reduce && intr->def.bit_size == 32)
          return false;
       return true;
 
@@ -307,17 +357,53 @@ agx_nir_flush_subgroup_minmax(nir_shader *s)
                                      nir_metadata_control_flow, NULL);
 }
 
-static bool
-agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
-                                bool optimize_ballot_count,
-                                bool native_shuffle_xor)
+static struct agx_subgroup_lower_options
+agx_subgroup_options_for_target(const nir_shader *s, bool g17p, bool m5,
+                                bool g18g)
 {
-   const struct agx_subgroup_lower_options agx_options = {
-      .optimize_ballot_count = optimize_ballot_count,
-      .g17p_clustered_float = g17p_clustered_float,
-      .native_shuffle_xor = native_shuffle_xor,
-   };
+   const bool compute = s->info.stage == MESA_SHADER_COMPUTE;
 
+   /* The native float reduce treats denormals as zeros of their sign and does
+    * not preserve them. Under DenormFlushToZero 32,
+    * agx_nir_flush_subgroup_minmax() flushes every lane's FP32 input to zero
+    * before the reduction, so M5's 1-instruction native simd_reduce produces
+    * exact flushed results while DenormPreserve 32 keeps the shuffle tree.
+    * Both native_shuffle_xor and m5_float_minmax encode identically across
+    * compute and graphics stages on AGX3C. */
+   const bool preserve32 =
+      nir_is_denorm_preserve(s->info.float_controls_execution_mode, 32);
+   const bool denorm32_exact =
+      nir_is_denorm_flush_to_zero(s->info.float_controls_execution_mode, 32) ||
+      preserve32;
+
+   if (g17p) {
+      return (struct agx_subgroup_lower_options){
+         .optimize_ballot_count = false,
+         .g17p_clustered_float = true,
+         .native_shuffle_xor = compute,
+         .m5_float_minmax = compute && !denorm32_exact,
+      };
+   } else if (m5) {
+      return (struct agx_subgroup_lower_options){
+         .optimize_ballot_count = s->info.stage != MESA_SHADER_FRAGMENT,
+         .g17p_clustered_float = false,
+         .native_shuffle_xor = !g18g,
+         .m5_float_minmax = !g18g && !preserve32,
+      };
+   } else {
+      return (struct agx_subgroup_lower_options){
+         .optimize_ballot_count = true,
+         .g17p_clustered_float = false,
+         .native_shuffle_xor = false,
+         .m5_float_minmax = false,
+      };
+   }
+}
+
+static bool
+agx_nir_lower_subgroups_internal(nir_shader *s,
+                                 struct agx_subgroup_lower_options agx_options)
+{
    /* First, do as much common lowering as we can */
    nir_lower_subgroups_options opts = {
       .filter = lower_subgroup_filter,
@@ -347,29 +433,40 @@ agx_nir_lower_subgroups_internal(nir_shader *s, bool g17p_clustered_float,
 }
 
 bool
+agx_nir_lower_subgroups_for_target(nir_shader *s, bool g17p, bool m5, bool g18g)
+{
+   return agx_nir_lower_subgroups_internal(
+      s, agx_subgroup_options_for_target(s, g17p, m5, g18g));
+}
+
+bool
 agx_nir_lower_subgroups(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, false, true, false);
+   return agx_nir_lower_subgroups_for_target(s, false, false, false);
 }
 
 bool
 agx_nir_lower_subgroups_g17p(nir_shader *s)
 {
-   return agx_nir_lower_subgroups_internal(s, true, false, false);
+   return agx_nir_lower_subgroups_for_target(s, true, false, false);
 }
 
 bool
-agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor)
+agx_nir_lower_subgroups_m5(nir_shader *s, bool native_shuffle_xor,
+                           bool native_float_minmax)
 {
-   return agx_nir_lower_subgroups_internal(
-      s, false, s->info.stage != MESA_SHADER_FRAGMENT,
-      native_shuffle_xor && s->info.stage == MESA_SHADER_COMPUTE);
+   struct agx_subgroup_lower_options agx_options =
+      agx_subgroup_options_for_target(s, false, true, false);
+   agx_options.native_shuffle_xor &= native_shuffle_xor;
+   agx_options.m5_float_minmax &= native_float_minmax;
+   return agx_nir_lower_subgroups_internal(s, agx_options);
 }
 
 static bool
 dynamic_shuffle_xor_filter(const nir_intrinsic_instr *intr, const void *data)
 {
-   return is_native_shuffle_xor(intr) && !has_native_shuffle_xor_mask(intr);
+   return is_native_relative_shuffle(intr) &&
+          !has_native_relative_shuffle_delta(intr);
 }
 
 /*
@@ -395,3 +492,75 @@ agx_nir_lower_dynamic_shuffle_xor(nir_shader *s)
                               (void *)&agx_options);
    return true;
 }
+
+#ifndef NDEBUG
+/* Report whether agx_nir_lower_subgroups_for_target() would lower `intr` as a
+ * required legalization (excluding the optional popcount(ballot(true))
+ * peephole). Used by agx_assert_post_lower_invariants() so the post-lower fast
+ * path asserts against the lowering's own options and filter instead of a
+ * hand-written intrinsic list that falsely rejects native 1x32 ballot / scalar
+ * quad ops.
+ */
+bool
+agx_nir_subgroup_intrinsic_needs_lowering(const nir_shader *s,
+                                          const nir_intrinsic_instr *intr,
+                                          bool g17p, bool m5, bool g18g)
+{
+   const struct agx_subgroup_lower_options agx_options =
+      agx_subgroup_options_for_target(s, g17p, m5, g18g);
+
+   /* Intrinsics lowered by AGX's own lower() pass (shared single switch). */
+   if (lower_custom_subgroup_intrinsic(NULL, (nir_intrinsic_instr *)intr,
+                                       &agx_options))
+      return true;
+
+   /* Common nir_lower_subgroups() only touches intrinsics accepted by
+    * lower_subgroup_filter(). */
+   if (!lower_subgroup_filter(intr, &agx_options))
+      return false;
+
+   /* Keep in sync with nir_lower_subgroups_options in
+    * agx_nir_lower_subgroups_internal() above (verified by the debug
+    * self-check test in test-agx3-pso-compile-fastpath.c). */
+   switch (intr->intrinsic) {
+   case nir_intrinsic_vote_any:
+   case nir_intrinsic_vote_all:
+   case nir_intrinsic_load_subgroup_size:
+   case nir_intrinsic_read_first_invocation:
+   case nir_intrinsic_load_subgroup_eq_mask:
+   case nir_intrinsic_load_subgroup_ge_mask:
+   case nir_intrinsic_load_subgroup_gt_mask:
+   case nir_intrinsic_load_subgroup_le_mask:
+   case nir_intrinsic_load_subgroup_lt_mask:
+   case nir_intrinsic_inverse_ballot:
+   case nir_intrinsic_ballot_bitfield_extract:
+   case nir_intrinsic_ballot_bit_count_reduce:
+   case nir_intrinsic_ballot_find_lsb:
+   case nir_intrinsic_ballot_find_msb:
+   case nir_intrinsic_ballot_bit_count_exclusive:
+   case nir_intrinsic_ballot_bit_count_inclusive:
+   case nir_intrinsic_shuffle_xor:
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down:
+   case nir_intrinsic_shuffle_up_intel:
+   case nir_intrinsic_shuffle_down_intel:
+   case nir_intrinsic_reduce:
+   case nir_intrinsic_exclusive_scan:
+   case nir_intrinsic_rotate:
+      return true;
+
+   case nir_intrinsic_ballot:
+      return intr->def.num_components != 1 || intr->def.bit_size != 32;
+
+   case nir_intrinsic_read_invocation:
+   case nir_intrinsic_quad_broadcast:
+   case nir_intrinsic_quad_swap_horizontal:
+   case nir_intrinsic_quad_swap_vertical:
+   case nir_intrinsic_quad_swap_diagonal:
+      return intr->num_components > 1;
+
+   default:
+      return false;
+   }
+}
+#endif
