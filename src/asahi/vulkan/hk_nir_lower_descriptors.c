@@ -61,6 +61,10 @@ struct lower_descriptors_ctx {
     * lower fragment array/cube nir_texop_lod from derivatives and sampler
     * descriptor fields. */
    bool lower_array_cube_lod_query;
+   /* Lower Gen5/Gen10 custom-border depth-compare gathers by probing raw depth
+    * with clamp-to-0/clamp-to-1 and evaluating the sampler compare op against
+    * the custom border directly in the shader. */
+   bool gen5_shadow_gather_border;
    mesa_shader_stage stage;
 };
 
@@ -1481,9 +1485,148 @@ lower_gen4_biased_lod_query(nir_builder *b, nir_tex_instr *tex,
 }
 
 static bool
-lower_tex(nir_builder *b, nir_tex_instr *tex,
-          const struct lower_descriptors_ctx *ctx)
+lower_tex_impl(nir_builder *b, nir_tex_instr *tex,
+               const struct lower_descriptors_ctx *ctx,
+               bool allow_shadow_gather_border);
+
+static nir_tex_instr *
+clone_shadow_gather_tex(nir_builder *b, nir_tex_instr *tex, bool compare)
 {
+   nir_tex_instr *clone =
+      nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+   nir_builder_instr_insert(b, &clone->instr);
+   if (!compare) {
+      nir_tex_instr_remove_src(
+         clone, nir_tex_instr_src_index(clone, nir_tex_src_comparator));
+      clone->is_shadow = false;
+      clone->is_new_style_shadow = false;
+      clone->component = 0;
+      clone->def.bit_size = 32;
+      clone->dest_type = nir_type_float32;
+   }
+   return clone;
+}
+
+/* Gen5 samplers (M5 and G18G) carry no hardware custom border colour: the API
+ * sampler borders with opaque white (1.0) and the clamp-to-0 twin borders with
+ * transparent black (0.0). Because Gen5 leaves depth comparison to the texture
+ * instruction, two raw non-comparing gathers return bit-identical depths for
+ * interior texels (including interior NaNs) and 0.0 vs 1.0 for border texels.
+ * For border texels, compare Dref directly against the custom border using the
+ * sampler's compare_func from the embedded Gen5 sampler word at
+ * native.sampler, clamping both for fixed-point depth formats (Texture Gen10
+ * Type != FLOAT) per Vulkan 16.3.6. */
+static bool
+lower_gen5_custom_border_shadow_gather(nir_builder *b, nir_tex_instr *tex,
+                                       const struct lower_descriptors_ctx *ctx)
+{
+   const int comparator =
+      nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   const int tex_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int samp_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (comparator < 0 || tex_idx < 0 || samp_idx < 0 ||
+       tex->def.num_components != 4)
+      return false;
+
+   nir_deref_instr *texture = nir_src_as_deref(tex->src[tex_idx].src);
+   nir_deref_instr *sampler = nir_src_as_deref(tex->src[samp_idx].src);
+   const int plane_idx = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   const uint32_t plane =
+      plane_idx >= 0 ? nir_src_as_uint(tex->src[plane_idx].src) : 0;
+   const struct hk_sampled_image_descriptor_layout native =
+      hk_sampled_image_descriptor_layout(ctx->descriptor_generation);
+   assert(native.stride);
+   const uint64_t plane_offset_B = plane * native.stride;
+
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *clamp_0 = load_resource_deref_desc(
+      b, 1, 16, sampler, plane_offset_B + native.clamp_0_sampler_index, ctx);
+   nir_def *has_custom = nir_ige_imm(b, clamp_0, 0);
+
+   nir_tex_instr *ordinary_tex = clone_shadow_gather_tex(b, tex, true);
+   lower_tex_impl(b, ordinary_tex, ctx, false);
+   b->cursor = nir_after_instr(&ordinary_tex->instr);
+
+   nir_push_if(b, has_custom);
+   nir_def *replaced;
+   {
+      nir_tex_instr *raw_one = clone_shadow_gather_tex(b, tex, false);
+      lower_tex_impl(b, raw_one, ctx, false);
+      b->cursor = nir_after_instr(&raw_one->instr);
+
+      nir_tex_instr *raw_zero = clone_shadow_gather_tex(b, tex, false);
+      raw_zero->backend_flags |= AGX_TEXTURE_FLAG_CLAMP_TO_0;
+      lower_tex_impl(b, raw_zero, ctx, false);
+      b->cursor = nir_after_instr(&raw_zero->instr);
+
+      nir_def *border = load_resource_deref_desc(
+         b, 1, 32, sampler, plane_offset_B + native.border, ctx);
+      nir_def *tex_word0 = load_resource_deref_desc(
+         b, 1, 32, texture, plane_offset_B + native.texture, ctx);
+      nir_def *tex_type = nir_iand_imm(b, nir_ushr_imm(b, tex_word0, 13), 7);
+      nir_def *is_fixed = nir_ine_imm(b, tex_type, AGX_TEXTURE_TYPE_FLOAT);
+
+      static_assert(
+         offsetof(struct hk_sampled_image_descriptor_sw, sampler) == 0 &&
+            sizeof(((struct hk_sampled_image_descriptor_sw *)0)->sampler) == 8,
+         "Gen5 sampler word sits at native.sampler[0..7]");
+      nir_def *samp_word1 = load_resource_deref_desc(
+         b, 1, 32, sampler, plane_offset_B + native.sampler + 4, ctx);
+      nir_def *func = nir_iand_imm(b, nir_ushr_imm(b, samp_word1, 7), 7);
+
+      nir_def *ref = nir_f2f32(b, tex->src[comparator].src.ssa);
+      ref = nir_bcsel(b, is_fixed, nir_fsat(b, ref), ref);
+      border = nir_bcsel(b, is_fixed, nir_fsat(b, border), border);
+
+      nir_def *compared = nir_ieq_imm(b, func, AGX_COMPARE_FUNC_ALWAYS);
+      compared = nir_ior(
+         b, compared,
+         nir_iand(b, nir_ieq_imm(b, func, AGX_COMPARE_FUNC_LEQUAL),
+                  nir_fge(b, border, ref)));
+      compared = nir_ior(
+         b, compared,
+         nir_iand(b, nir_ieq_imm(b, func, AGX_COMPARE_FUNC_GEQUAL),
+                  nir_fge(b, ref, border)));
+      compared = nir_ior(
+         b, compared,
+         nir_iand(b, nir_ieq_imm(b, func, AGX_COMPARE_FUNC_LESS),
+                  nir_flt(b, ref, border)));
+      compared = nir_ior(
+         b, compared,
+         nir_iand(b, nir_ieq_imm(b, func, AGX_COMPARE_FUNC_GREATER),
+                  nir_flt(b, border, ref)));
+      compared = nir_ior(
+         b, compared,
+         nir_iand(b, nir_ieq_imm(b, func, AGX_COMPARE_FUNC_EQUAL),
+                  nir_feq(b, ref, border)));
+      compared = nir_ior(
+         b, compared,
+         nir_iand(b, nir_ieq_imm(b, func, AGX_COMPARE_FUNC_NOT_EQUAL),
+                  nir_fneu(b, ref, border)));
+
+      nir_def *border_val = nir_b2fN(b, compared, tex->def.bit_size);
+      nir_def *is_interior = nir_ieq(b, &raw_zero->def, &raw_one->def);
+      replaced = nir_bcsel(b, is_interior, &ordinary_tex->def,
+                           nir_replicate(b, border_val, 4));
+   }
+   nir_pop_if(b, NULL);
+
+   nir_def *result = nir_if_phi(b, replaced, &ordinary_tex->def);
+   nir_def_replace(&tex->def, result);
+   return true;
+}
+
+static bool
+lower_tex_impl(nir_builder *b, nir_tex_instr *tex,
+               const struct lower_descriptors_ctx *ctx,
+               bool allow_shadow_gather_border)
+{
+   if (allow_shadow_gather_border && ctx->gen5_shadow_gather_border &&
+       ctx->descriptor_generation == 10 && tex->is_shadow &&
+       tex->op == nir_texop_tg4 &&
+       lower_gen5_custom_border_shadow_gather(b, tex, ctx))
+      return true;
+
    if (lower_compute_lod_query(b, tex, ctx))
       return true;
 
@@ -1714,6 +1857,13 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
     * into shared native texture-shape validation. */
    tex->backend_flags &= ~HK_TEXTURE_FLAG_COMBINED_BIAS;
    return true;
+}
+
+static bool
+lower_tex(nir_builder *b, nir_tex_instr *tex,
+          const struct lower_descriptors_ctx *ctx)
+{
+   return lower_tex_impl(b, tex, ctx, true);
 }
 
 static bool
@@ -2196,13 +2346,15 @@ hk_nir_lower_descriptors(nir_shader *nir,
                          bool sampler_has_lod_bias, bool d3d_nearest_mip,
                          bool coherent_images_in_memory,
                          bool m5_store_window,
-                         bool lower_array_cube_lod_query)
+                         bool lower_array_cube_lod_query,
+                         bool gen5_shadow_gather_border)
 {
    struct lower_descriptors_ctx ctx = {
       .stage = nir->info.stage,
       .coherent_images_in_memory = coherent_images_in_memory,
       .m5_store_window = m5_store_window,
       .lower_array_cube_lod_query = lower_array_cube_lod_query,
+      .gen5_shadow_gather_border = gen5_shadow_gather_border,
       .scaled_sampling = scaled_sampling,
       .sampler_has_lod_bias = sampler_has_lod_bias,
       .d3d_nearest_mip = d3d_nearest_mip,
@@ -2245,7 +2397,8 @@ hk_nir_lower_descriptors(nir_shader *nir,
     * Apple. This is inherited from NVK.
     */
    const nir_metadata preserved =
-      ctx.coherent_images_in_memory || ctx.m5_store_window
+      ctx.coherent_images_in_memory || ctx.m5_store_window ||
+      ctx.gen5_shadow_gather_border
          ? nir_metadata_none : nir_metadata_control_flow;
    const bool lower_sparse =
       ctx.sparse_buffer_residency &&

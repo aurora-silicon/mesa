@@ -3035,7 +3035,9 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
    if (!nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex))
       return false;
 
-   /* XXX: this is a really weird edge case, is this even well-defined? */
+   /* XXX: this is a really weird edge case, is this even well-defined?
+    * Gen5/Gen10 shadow gathers are lowered in hk_nir_lower_descriptors() where
+    * the sampler compare op and texture format type are directly accessible. */
    if (tex->is_shadow)
       return false;
 
@@ -4005,9 +4007,11 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(lowered_complex, nir, hk_nir_lower_image_view_min_lod);
    }
 
-   if (((features & HK_FEAT_CUSTOM_BORDER) ||
-        agx_chip_native_agx3(dev->dev.chip)) &&
-       !HK_PERF(dev, NOBORDER)) {
+   const bool lower_custom_border =
+      ((features & HK_FEAT_CUSTOM_BORDER) ||
+       agx_chip_native_agx3(dev->dev.chip)) &&
+      !HK_PERF(dev, NOBORDER);
+   if (lower_custom_border) {
       NIR_PASS(lowered_complex, nir, agx_nir_lower_custom_border);
    }
 
@@ -4024,6 +4028,10 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
       dev->vk.enabled_features.sparseResidencyBuffer &&
       hk_sparse_buffer_unmapped(&dev->dev);
 
+   const bool gen5_shadow_gather_border =
+      lower_custom_border &&
+      agx_chip_sampler_generation(dev->dev.chip) == AGX_SAMPLER_GENERATION_GEN5;
+
    bool lowered_desc = false;
    NIR_PASS(lowered_desc, nir, hk_nir_lower_descriptors, rs, set_layout_count,
             set_layouts, sparse_store_guards, sparse_store_guards,
@@ -4033,7 +4041,8 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
             instance->drirc.misc.d3d_nearest_mip,
             hk_coherent_images_in_memory(&dev->dev),
             agx_chip_g17_m5(dev->dev.chip),
-            agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3D);
+            agx_chip_isa_encoding(dev->dev.chip) == AGX_ISA_ENCODING_AGX3D,
+            gen5_shadow_gather_border);
    bool lowered_global_io = false;
    NIR_PASS(lowered_global_io, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
