@@ -4761,6 +4761,27 @@ agx_ra(agx_context *ctx)
           I->op == AGX_OPCODE_LOG2 && I->src[0].type == AGX_INDEX_NORMAL)
          BITSET_SET(log2_gpr, I->src[0].value);
 
+      /* AGX3B narrow int2flt (agx3_alu_narrow_int_to_float) encodes both its
+       * destination and half source in halves 0..191. Bound them in RA so high
+       * register pressure cannot refuse after native U8/S8/U16/S16 converts. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_CONVERT && I->nr_dests == 1 && I->nr_srcs == 2 &&
+          I->src[0].type == AGX_INDEX_IMMEDIATE &&
+          I->src[1].size == AGX_SIZE_16 &&
+          (I->src[0].value == AGX_CONVERT_U8_TO_F ||
+           I->src[0].value == AGX_CONVERT_S8_TO_F ||
+           (I->dest[0].size == AGX_SIZE_16 &&
+            (I->src[0].value == AGX_CONVERT_U16_TO_F ||
+             I->src[0].value == AGX_CONVERT_S16_TO_F)))) {
+         if (I->dest[0].type == AGX_INDEX_NORMAL)
+            BITSET_SET(log2_gpr, I->dest[0].value);
+         if (I->src[1].type == AGX_INDEX_NORMAL) {
+            BITSET_SET(log2_gpr, I->src[1].value);
+            if (split_source[I->src[1].value])
+               BITSET_SET(log2_gpr, split_source[I->src[1].value] - 1);
+         }
+      }
+
       /* agx3_tex_stage_cube_array_lod encodes the layer register (coords + 6
        * halves) in seven bits; keep such coordinate vectors below half 128. */
       if (agx_isa_is_agx3(ctx->key->dev.encoding) &&

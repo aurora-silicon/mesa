@@ -2456,3 +2456,32 @@ TEST(AGX3UniformALU, Agx3bTwoImmFmaHalfSource)
    EXPECT_FALSE(agx3_falu_fma_two_imm_half(AGX_ISA_ENCODING_AGX3C, 0, 1,
                                            0x40, 0x30, &rt, bytes, &len));
 }
+
+TEST(AGX3UniformALU, Agx3bIselImmComparandKeepsUniformSelects)
+{
+   void *mem_ctx = ralloc_context(NULL);
+   agx_builder *bp = agx_test_builder(mem_ctx);
+   agx_context *ctx = bp->shader;
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   ctx->key = &key;
+   agx_builder b = *bp;
+
+   agx_index cond = agx_preload(&b, agx_register(0, AGX_SIZE_32));
+   agx_index dst = agx_temp(ctx, AGX_SIZE_32);
+   agx_icmpsel_to(&b, dst, cond, agx_immediate(0), agx_uniform(4, AGX_SIZE_32),
+                  agx_uniform(6, AGX_SIZE_32), AGX_ICOND_UEQ);
+   agx_unit_test(&b, dst);
+
+   agx_lower_uniform_sources(ctx);
+
+   agx_instr *isel = NULL;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_ICMPSEL)
+         isel = I;
+   }
+   ASSERT_NE(isel, nullptr);
+   EXPECT_EQ(isel->src[2].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(isel->src[3].type, AGX_INDEX_UNIFORM);
+   ralloc_free(mem_ctx);
+}

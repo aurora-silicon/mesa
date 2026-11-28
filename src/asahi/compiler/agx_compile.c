@@ -1113,9 +1113,7 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    if (agx3b || (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
                  !b->shader->key->dev.emit_agx3d)) {
-      const agx_index count = agx3b && nr_channels > 1
-                                 ? agx_g17p_shift_boundary(b, 8)
-                                 : agx_immediate(8);
+      const agx_index count = agx_immediate(8);
       for (unsigned i = 0; i < nr_channels; ++i) {
          channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], count)
                                : agx_and(b, halfs[i / 2], agx_immediate(0xff));
@@ -5330,7 +5328,8 @@ agx_lower_agx3_half_converts(agx_context *ctx)
           !I->src[1].memory)
          continue;
 
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) && !is_g18g &&
           I->src[0].value == AGX_CONVERT_U8_TO_F && I->round == AGX_ROUND_RTE &&
           I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16 &&
           !I->src[1].abs && !I->src[1].neg && !I->src[1].memory)
@@ -9689,9 +9688,14 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
        * is the low byte of its low or high half: no mask or shift. Bytes 1 and
        * 3 take a 16-bit shift of their half. All four read only the halves, so
        * the word dies at its split and needs no copy. */
-      if (instr->op == nir_op_u2f32 && (src_sz == 32 || src_sz == 8) &&
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          !b->shader->key->dev.emit_agx3d) {
+      const bool u2f32_byte_agx3b =
+         b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         src_sz == 32;
+      const bool u2f32_byte_agx3c =
+         b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         !b->shader->key->dev.emit_agx3d && (src_sz == 32 || src_sz == 8);
+      if (instr->op == nir_op_u2f32 &&
+          (u2f32_byte_agx3b || u2f32_byte_agx3c)) {
          nir_scalar x = nir_scalar_chase_movs(
             nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
          nir_scalar word = {0};
@@ -9809,7 +9813,8 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                high_byte = nir_scalar_as_uint(idx) & 1;
             }
          }
-         if (half >= 0 && word.def->bit_size == 32 && !nir_scalar_is_const(word)) {
+         if (half >= 0 && word.def->bit_size == 32 && !nir_scalar_is_const(word) &&
+             (!high_byte || u2f32_byte_agx3c)) {
             agx_index h;
             nir_scalar narrow = {0};
             if (nir_scalar_is_alu(word) &&

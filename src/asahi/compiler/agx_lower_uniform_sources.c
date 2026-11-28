@@ -769,7 +769,13 @@ agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
        ctx->is_preamble || I->op != AGX_OPCODE_ICMPSEL ||
        I->nr_dests != 1 || I->nr_srcs != 4 ||
        I->dest[0].size != AGX_SIZE_32 || agx_channels(I->dest[0]) != 1 ||
-       I->src[0].size != AGX_SIZE_32 || I->src[1].size != AGX_SIZE_32)
+       I->src[0].size != AGX_SIZE_32)
+      return;
+
+   const bool imm1_ok =
+      I->src[1].type == AGX_INDEX_IMMEDIATE && I->src[1].value <= UINT8_MAX &&
+      !I->src[1].abs && !I->src[1].neg && !I->src[1].memory;
+   if (!imm1_ok && I->src[1].size != AGX_SIZE_32)
       return;
 
    bool uniform_ok[4], reg32[4];
@@ -781,12 +787,12 @@ agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
       reg32[j] = x.type == AGX_INDEX_NORMAL && x.size == AGX_SIZE_32 &&
                  !x.abs && !x.neg && agx_channels(x) == 1;
    }
-   if (uniform_ok[2] || uniform_ok[3]) {
+   if ((uniform_ok[2] || uniform_ok[3]) && (!imm1_ok || reg32[0])) {
       keep[2] = uniform_ok[2];
       keep[3] = uniform_ok[3];
-   } else if (uniform_ok[0] && reg32[1] && reg32[2] && reg32[3]) {
+   } else if (!imm1_ok && uniform_ok[0] && reg32[1] && reg32[2] && reg32[3]) {
       keep[0] = true;
-   } else if (uniform_ok[1] && reg32[0] && reg32[2] && reg32[3]) {
+   } else if (!imm1_ok && uniform_ok[1] && reg32[0] && reg32[2] && reg32[3]) {
       keep[1] = true;
    }
 }

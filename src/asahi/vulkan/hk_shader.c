@@ -135,6 +135,11 @@ struct hk_fs_key {
     */
    bool static_tests : 1;
 
+   /** Native AGX3: static pipeline state proves draws cannot be first-provoking
+    * triangle fans, so flat varying loads select coefficient C directly.
+    */
+   bool static_non_first_fan : 1;
+
    /** G17P: complete pipeline state proves that no colour output can be
     * consumed (no colour attachment, alpha-to-coverage statically off), so
     * colour stores are pruned before varying linking.
@@ -764,6 +769,16 @@ hk_populate_fs_key(struct hk_fs_key *key,
        !state->ms->alpha_to_coverage_enable &&
        hk_g17p_static_no_early_reject(state))
       key->static_tests = true;
+
+   if (agx_chip_native_agx3(chip) &&
+       ((state->ia != NULL &&
+         !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) &&
+         state->ia->primitive_topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) ||
+        (state->rs != NULL &&
+         !BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_PROVOKING_VERTEX) &&
+         state->rs->provoking_vertex ==
+            VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT)))
+      key->static_non_first_fan = true;
 
    if (chip == AGX_CHIP_G17P && state->ms != NULL &&
        !BITSET_TEST(state->dynamic,
@@ -4558,12 +4573,16 @@ hk_g17p_lower_storage_records(nir_builder *b, nir_intrinsic_instr *intr,
  * publishes the root pointer through the normal native uniform contract. */
 static bool
 hk_g17p_lower_is_first_fan(nir_builder *b, nir_intrinsic_instr *intr,
-                           UNUSED void *data)
+                           void *data)
 {
    if (intr->intrinsic != nir_intrinsic_load_is_first_fan_agx)
       return false;
 
    b->cursor = nir_before_instr(&intr->instr);
+   if (data) {
+      nir_def_replace(&intr->def, nir_imm_false(b));
+      return true;
+   }
    const unsigned offset = hk_root_descriptor_offset(draw.provoking);
    nir_def *addr = nir_iadd(
       b, nir_load_root_agx(b), nir_imm_int64(b, offset));
@@ -6346,7 +6365,8 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (agx_chip_native_agx3(dev->dev.chip)) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass,
                   hk_g17p_lower_is_first_fan,
-                  nir_metadata_control_flow, NULL);
+                  nir_metadata_control_flow,
+                  (void *)(uintptr_t)(key && key->fs.static_non_first_fan));
       }
    } else if (sw_stage == MESA_SHADER_TESS_EVAL ||
               sw_stage == MESA_SHADER_TESS_CTRL) {
@@ -7728,7 +7748,8 @@ hk_prepare_local_read_nir(struct hk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, agx_nir_lower_interpolation, true);
    if (agx_chip_native_agx3(dev->dev.chip)) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, hk_g17p_lower_is_first_fan,
-               nir_metadata_control_flow, NULL);
+               nir_metadata_control_flow,
+               (void *)(uintptr_t)(key && key->fs.static_non_first_fan));
    }
 
    unsigned root = AGX_ABI_FUNI_ROOT;
