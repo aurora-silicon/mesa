@@ -7579,6 +7579,259 @@ hk_agx3_copy_identical_image(struct hk_cmd_buffer *cmd, struct hk_image *src,
 }
 
 static void
+hk_m5_r11_staged_barrier(struct hk_cmd_buffer *cmd,
+                         VkPipelineStageFlags2 src_stage,
+                         VkAccessFlags2 src_access,
+                         VkPipelineStageFlags2 dst_stage,
+                         VkAccessFlags2 dst_access)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   const VkMemoryBarrier2 barrier = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = src_stage,
+      .srcAccessMask = src_access,
+      .dstStageMask = dst_stage,
+      .dstAccessMask = dst_access,
+   };
+   const VkDependencyInfo dep = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1,
+      .pMemoryBarriers = &barrier,
+   };
+   dev->vk.dispatch_table.CmdPipelineBarrier2(
+      vk_command_buffer_to_handle(&cmd->vk), &dep);
+}
+
+/*
+ * Packed-word staging fallback for compressed M5 B10G11R11 image copies that
+ * hk_m5_copy_compressed_r11_image() declines (for example, a compressed
+ * B10G11R11 2D array copied into a size-compatible compressed 3D RGBA8 image,
+ * which cannot be decompressed in place). Staging raw 32-bit words through a
+ * command-local temporary buffer reuses the bit-exact ImageToBuffer and
+ * BufferToImage paths and avoids the graphics meta fallback that samples
+ * B10G11R11 as float and repacks with a NaN-dropping clamp.
+ */
+static bool
+hk_m5_copy_compressed_r11_image_staged(struct hk_cmd_buffer *cmd,
+                                       struct hk_image *src,
+                                       struct hk_image *dst,
+                                       const VkCopyImageInfo2 *info)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   if (!(hk_m5_is_compressed_r11(src) || hk_m5_is_compressed_r11(dst)) ||
+       info->regionCount == 0 || src->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       dst->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       !hk_g17p_transfer_src_layout_supported(info->srcImageLayout) ||
+       !hk_g17p_transfer_dst_layout_supported(info->dstImageLayout))
+      return false;
+
+   const uint64_t max_stage_B = 4u << 20;
+   const uint32_t max_batch_slices = 64;
+   uint64_t buf_size = 0;
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkImageCopy2 *region = &info->pRegions[r];
+      if (!util_is_power_of_two_nonzero(region->srcSubresource.aspectMask) ||
+          !util_is_power_of_two_nonzero(region->dstSubresource.aspectMask) ||
+          region->srcSubresource.mipLevel >= src->vk.mip_levels ||
+          region->dstSubresource.mipLevel >= dst->vk.mip_levels ||
+          region->extent.width == 0 || region->extent.height == 0)
+         return false;
+
+      const VkFormat src_fmt =
+         aspect_format(src->vk.format, region->srcSubresource.aspectMask);
+      const VkFormat dst_fmt =
+         aspect_format(dst->vk.format, region->dstSubresource.aspectMask);
+      if (src_fmt == VK_FORMAT_UNDEFINED || dst_fmt == VK_FORMAT_UNDEFINED ||
+          vk_format_get_blocksize(src_fmt) != 4 ||
+          vk_format_get_blocksize(dst_fmt) != 4 ||
+          vk_format_get_blockwidth(src_fmt) != 1 ||
+          vk_format_get_blockheight(src_fmt) != 1 ||
+          vk_format_get_blockwidth(dst_fmt) != 1 ||
+          vk_format_get_blockheight(dst_fmt) != 1)
+         return false;
+
+      const uint32_t src_slices =
+         src->vk.image_type == VK_IMAGE_TYPE_3D
+            ? region->extent.depth
+            : vk_image_subresource_layer_count(&src->vk,
+                                               &region->srcSubresource);
+      const uint32_t dst_slices =
+         dst->vk.image_type == VK_IMAGE_TYPE_3D
+            ? region->extent.depth
+            : vk_image_subresource_layer_count(&dst->vk,
+                                               &region->dstSubresource);
+      VkImageCopy2 last;
+      if (!src_slices ||
+          !hk_g17p_image_copy_slice(dev->dev.chip, src->vk.image_type,
+                                    dst->vk.image_type, src_slices, dst_slices,
+                                    region, src_slices - 1, &last))
+         return false;
+
+      const uint64_t row_B = (uint64_t)region->extent.width * 4u;
+      if (row_B == 0 || row_B > UINT32_MAX)
+         return false;
+
+      uint32_t strip_h = region->extent.height;
+      uint32_t batch_slices = 1;
+      if (row_B <= max_stage_B / region->extent.height) {
+         const uint64_t slice_B = align64(row_B * region->extent.height, 16);
+         batch_slices = MIN2(
+            MIN2(src_slices, max_batch_slices),
+            (uint32_t)MAX2(1ull, max_stage_B / slice_B));
+      } else {
+         uint32_t rows = (uint32_t)MAX2(1ull, max_stage_B / row_B);
+         if (rows >= 16)
+            rows &= ~15u;
+         strip_h = MIN2(region->extent.height, rows);
+      }
+
+      const uint64_t strip_stride_B = align64(row_B * strip_h, 16);
+      const uint64_t need_B = (uint64_t)batch_slices * strip_stride_B;
+      if (need_B > UINT32_MAX)
+         return false;
+      buf_size = MAX2(buf_size, need_B);
+   }
+
+   if (buf_size == 0)
+      return false;
+
+   const VkBufferCreateInfo tmp_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+      .size = buf_size,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      .queueFamilyIndexCount = 1,
+      .pQueueFamilyIndices = &cmd->vk.pool->queue_family_index,
+   };
+   VkBuffer tmp_buf;
+   VkResult result =
+      vk_meta_create_buffer(&cmd->vk, &dev->meta, &tmp_info, &tmp_buf);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return true;
+   }
+   void *tmp_map;
+   result = dev->meta.cmd_bind_map_buffer(&cmd->vk, &dev->meta, tmp_buf,
+                                          &tmp_map);
+   if (unlikely(result != VK_SUCCESS)) {
+      vk_command_buffer_set_error(&cmd->vk, result);
+      return true;
+   }
+   (void)tmp_map;
+
+   VkCommandBuffer handle = vk_command_buffer_to_handle(&cmd->vk);
+   bool used_buf = false;
+
+   for (uint32_t r = 0; r < info->regionCount; ++r) {
+      const VkImageCopy2 *region = &info->pRegions[r];
+      const uint32_t src_slices =
+         src->vk.image_type == VK_IMAGE_TYPE_3D
+            ? region->extent.depth
+            : vk_image_subresource_layer_count(&src->vk,
+                                               &region->srcSubresource);
+      const uint32_t dst_slices =
+         dst->vk.image_type == VK_IMAGE_TYPE_3D
+            ? region->extent.depth
+            : vk_image_subresource_layer_count(&dst->vk,
+                                               &region->dstSubresource);
+      const uint64_t row_B = (uint64_t)region->extent.width * 4u;
+      uint32_t chunk_h = region->extent.height;
+      uint32_t batch_slices = 1;
+      if (row_B <= max_stage_B / region->extent.height) {
+         const uint64_t slice_B = align64(row_B * region->extent.height, 16);
+         batch_slices = MIN2(
+            MIN2(src_slices, max_batch_slices),
+            (uint32_t)MAX2(1ull, max_stage_B / slice_B));
+      } else {
+         uint32_t rows = (uint32_t)MAX2(1ull, max_stage_B / row_B);
+         if (rows >= 16)
+            rows &= ~15u;
+         chunk_h = MIN2(region->extent.height, rows);
+      }
+
+      for (uint32_t s = 0; s < src_slices; s += batch_slices) {
+         const uint32_t cur_batch = MIN2(batch_slices, src_slices - s);
+         for (uint32_t y = 0; y < region->extent.height; y += chunk_h) {
+            const uint32_t strip_h = MIN2(chunk_h, region->extent.height - y);
+            const uint64_t strip_B = align64(row_B * strip_h, 16);
+
+            if (used_buf) {
+               hk_m5_r11_staged_barrier(
+                  cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                  VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+            }
+
+            VkBufferImageCopy2 src_copies[64];
+            VkBufferImageCopy2 dst_copies[64];
+            for (uint32_t b = 0; b < cur_batch; ++b) {
+               VkImageCopy2 one;
+               ASSERTED const bool sliced = hk_g17p_image_copy_slice(
+                  dev->dev.chip, src->vk.image_type, dst->vk.image_type,
+                  src_slices, dst_slices, region, s + b, &one);
+               assert(sliced);
+
+               src_copies[b] = (VkBufferImageCopy2){
+                  .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+                  .bufferOffset = (uint64_t)b * strip_B,
+                  .imageSubresource = one.srcSubresource,
+                  .imageOffset = {one.srcOffset.x,
+                                  one.srcOffset.y + (int32_t)y,
+                                  one.srcOffset.z},
+                  .imageExtent = {one.extent.width, strip_h, 1},
+               };
+               dst_copies[b] = (VkBufferImageCopy2){
+                  .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+                  .bufferOffset = (uint64_t)b * strip_B,
+                  .imageSubresource = one.dstSubresource,
+                  .imageOffset = {one.dstOffset.x,
+                                  one.dstOffset.y + (int32_t)y,
+                                  one.dstOffset.z},
+                  .imageExtent = {one.extent.width, strip_h, 1},
+               };
+            }
+
+            const VkCopyImageToBufferInfo2 c2b = {
+               .sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2,
+               .srcImage = info->srcImage,
+               .srcImageLayout = info->srcImageLayout,
+               .dstBuffer = tmp_buf,
+               .regionCount = cur_batch,
+               .pRegions = src_copies,
+            };
+            hk_xfer_copyimagetobuffer2(handle, &c2b);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               return true;
+
+            hk_m5_r11_staged_barrier(
+               cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+               VK_ACCESS_2_MEMORY_WRITE_BIT,
+               VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+               VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+            const VkCopyBufferToImageInfo2 b2i = {
+               .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
+               .srcBuffer = tmp_buf,
+               .dstImage = info->dstImage,
+               .dstImageLayout = info->dstImageLayout,
+               .regionCount = cur_batch,
+               .pRegions = dst_copies,
+            };
+            hk_xfer_copybuffertoimage2(handle, &b2i);
+            if (vk_command_buffer_has_error(&cmd->vk))
+               return true;
+
+            used_buf = true;
+         }
+      }
+   }
+
+   return true;
+}
+
+static void
 hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
                  const VkCopyImageInfo2 *pCopyImageInfo)
 {
@@ -7591,8 +7844,10 @@ hk_xfer_copyimage2(VkCommandBuffer commandBuffer,
       return;
 
    if (agx_chip_hal300_path(dev->dev.chip) &&
-       hk_m5_copy_compressed_r11_image(cmd, src_image, dst_image,
-                                       pCopyImageInfo))
+       (hk_m5_copy_compressed_r11_image(cmd, src_image, dst_image,
+                                        pCopyImageInfo) ||
+        hk_m5_copy_compressed_r11_image_staged(cmd, src_image, dst_image,
+                                               pCopyImageInfo)))
       return;
 
    /* VkCmdCopyImage preserves the source bits; compatible source and

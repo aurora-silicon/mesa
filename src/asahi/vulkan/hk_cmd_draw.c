@@ -5143,19 +5143,7 @@ hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
 
    const bool msaa = layout->sample_count_sa > 1;
    const bool layered = layer_count > 1;
-   const enum agx_texture_type tex_type =
-      channels == AGX_CHANNELS_R5G6B5     ? AGX_TEXTURE_TYPE_UNORM
-      : channels == AGX_CHANNELS_R11G11B10 ? AGX_TEXTURE_TYPE_FLOAT
-                                           : AGX_TEXTURE_TYPE_UINT;
-   const bool has_g =
-      channels != AGX_CHANNELS_R8 && channels != AGX_CHANNELS_R16 &&
-      channels != AGX_CHANNELS_R32;
-   const bool has_b =
-      has_g && channels != AGX_CHANNELS_R8G8 &&
-      channels != AGX_CHANNELS_R16G16 && channels != AGX_CHANNELS_R32G32;
-   const bool has_a =
-      has_b && channels != AGX_CHANNELS_R5G6B5 &&
-      channels != AGX_CHANNELS_R11G11B10;
+   const unsigned desc_gen = agx_chip_descriptor_generation(dev->dev.chip);
    struct AGX_TEXTURE cfg = {
       AGX_TEXTURE_header,
       .dimension = msaa
@@ -5165,11 +5153,6 @@ hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
                                  : AGX_TEXTURE_DIMENSION_2D),
       .layout = AGX_LAYOUT_GPU,
       .channels = channels,
-      .type = tex_type,
-      .swizzle_r = AGX_CHANNEL_R,
-      .swizzle_g = has_g ? AGX_CHANNEL_G : AGX_CHANNEL_0,
-      .swizzle_b = has_b ? AGX_CHANNEL_B : AGX_CHANNEL_0,
-      .swizzle_a = has_a ? AGX_CHANNEL_A : AGX_CHANNEL_1,
       .address = base + ail_get_layer_offset_B(layout, layer),
       .width = layout->width_px,
       .height = layout->height_px,
@@ -5184,12 +5167,12 @@ hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
       .depth = layered ? layer_count : 1,
       .page_aligned_layers = layout->page_aligned_layers,
    };
+   hk_agx3_decompress_texture_format(desc_gen, channels, &cfg);
    if (msaa)
       cfg.samples = agx_translate_sample_count(layout->sample_count_sa);
 
    struct hk_native_texture_descriptor tex_desc;
-   if (!hk_pack_native_texture(agx_chip_descriptor_generation(dev->dev.chip),
-                               &tex_desc, &cfg))
+   if (!hk_pack_native_texture(desc_gen, &tex_desc, &cfg))
       return false;
 
    const uint64_t desc_va =

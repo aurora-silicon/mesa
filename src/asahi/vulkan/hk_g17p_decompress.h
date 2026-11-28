@@ -63,3 +63,41 @@ hk_g17p_decompress_pack_mode(enum agx_channels channels, uint32_t *out)
       return false;
    }
 }
+
+static inline void
+hk_agx3_decompress_texture_format(unsigned desc_gen,
+                                  enum agx_channels channels,
+                                  struct AGX_TEXTURE *cfg)
+{
+   if (desc_gen < 10) {
+      /* Preserve the exact HAL200 (G16G/G17P) decompressor descriptor. */
+      cfg->type = channels == AGX_CHANNELS_R5G6B5 ? AGX_TEXTURE_TYPE_UNORM
+                                                  : AGX_TEXTURE_TYPE_UINT;
+      cfg->swizzle_r = AGX_CHANNEL_R;
+      cfg->swizzle_g = AGX_CHANNEL_G;
+      cfg->swizzle_b = AGX_CHANNEL_B;
+      cfg->swizzle_a = AGX_CHANNEL_A;
+      return;
+   }
+
+   /* On Gen10 (M5), match swizzles to the format's channels (swizzling
+    * absent channels faults on compressed 1-/2-channel targets) and decode
+    * R11G11B10 as float. */
+   cfg->type =
+      channels == AGX_CHANNELS_R5G6B5     ? AGX_TEXTURE_TYPE_UNORM
+      : channels == AGX_CHANNELS_R11G11B10 ? AGX_TEXTURE_TYPE_FLOAT
+                                           : AGX_TEXTURE_TYPE_UINT;
+   const bool has_g =
+      channels != AGX_CHANNELS_R8 && channels != AGX_CHANNELS_R16 &&
+      channels != AGX_CHANNELS_R32;
+   const bool has_b =
+      has_g && channels != AGX_CHANNELS_R8G8 &&
+      channels != AGX_CHANNELS_R16G16 && channels != AGX_CHANNELS_R32G32;
+   const bool has_a =
+      has_b && channels != AGX_CHANNELS_R5G6B5 &&
+      channels != AGX_CHANNELS_R11G11B10;
+   cfg->swizzle_r = AGX_CHANNEL_R;
+   cfg->swizzle_g = has_g ? AGX_CHANNEL_G : AGX_CHANNEL_0;
+   cfg->swizzle_b = has_b ? AGX_CHANNEL_B : AGX_CHANNEL_0;
+   cfg->swizzle_a = has_a ? AGX_CHANNEL_A : AGX_CHANNEL_1;
+}

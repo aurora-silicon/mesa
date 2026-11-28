@@ -816,6 +816,319 @@ run_bitexact_copies(int kind)
    return fails;
 }
 
+static uint32_t
+guard_3d_word(uint32_t x, uint32_t y, uint32_t z)
+{
+   return 0xa5000000u | ((z & 0xfu) << 20) | ((y & 0xffu) << 8) | (x & 0xffu);
+}
+
+static uint32_t
+payload_layer_word(uint32_t x, uint32_t y, uint32_t layer)
+{
+   /* Put 0x000007c1 and other non-canonical NaNs at both (0,0) and inside the
+    * partial-copy source window (5,7) so both full and partial slice copies
+    * check exact packed bits, while varying normal/guard words per layer. */
+   if (x == 0 && y == 0) return 0x000007c1u;
+   if (x == 5 && y == 7) return 0x000007c1u;
+   if (x == 6 && y == 7) return 0x000007ffu;
+   if (x == 7 && y == 7) return 0x003e0800u;
+   if (x == 8 && y == 7) return 0xf8400000u;
+   if (x == 9 && y == 7) return 0xffffffffu;
+   return pack_expected_payload((x + layer * 3u) % W, (y + layer * 5u) % H);
+}
+
+/* Regression for slice-mapped transfers from a genuinely compressed-eligible
+ * B10G11R11 2D array into a genuinely compressed, size-compatible RGBA8 3D
+ * destination, read back through its native byte format:
+ *   1. multi-slice copy at nonzero src layer and dst Z offset, guard slices
+ *      preserved, non-canonical NaN payloads (including 0x000007c1) exact;
+ *   2. partial non-16-aligned subrect multi-slice copy preserving guard texels
+ *      in untouched slices and shared border tiles;
+ *   3. rendered (compressed-tile) B10G11R11 layer copied to 3D RGBA8 preserving
+ *      NaN/+inf/normal texels and untouched guard slices. */
+static unsigned
+run_r11_array_to_rgba8_3d(void)
+{
+   const uint32_t LAYERS = 4;
+   const VkImageUsageFlags usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   VkImage src_arr, dst_3d;
+   VkDeviceMemory m_src, m_dst;
+   CHECK(vkCreateImage(dev, &(VkImageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+      .extent = {W, H, 1}, .mipLevels = 1, .arrayLayers = LAYERS,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &src_arr));
+   VkMemoryRequirements mr_src;
+   vkGetImageMemoryRequirements(dev, src_arr, &mr_src);
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr_src.size,
+      .memoryTypeIndex = mem_type(mr_src.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)},
+      NULL, &m_src));
+   CHECK(vkBindImageMemory(dev, src_arr, m_src, 0));
+
+   CHECK(vkCreateImage(dev, &(VkImageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_3D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .extent = {W, H, LAYERS}, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = usage, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED}, NULL, &dst_3d));
+   VkMemoryRequirements mr_dst;
+   vkGetImageMemoryRequirements(dev, dst_3d, &mr_dst);
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = mr_dst.size,
+      .memoryTypeIndex = mem_type(mr_dst.memoryTypeBits,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)},
+      NULL, &m_dst));
+   CHECK(vkBindImageMemory(dev, dst_3d, m_dst, 0));
+
+   VkImageView v_src_l3;
+   CHECK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = src_arr,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = VK_FORMAT_B10G11R11_UFLOAT_PACK32,
+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 3, 1}},
+      NULL, &v_src_l3));
+
+   const VkDeviceSize slice_B = (VkDeviceSize)W * H * 4;
+   const VkDeviceSize vol_B = slice_B * LAYERS;
+   const VkDeviceSize hsz = 3 * vol_B; /* [src_arr | dst_guard | dst_readback] */
+   VkBuffer hb;
+   CHECK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = hsz,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+               VK_BUFFER_USAGE_TRANSFER_DST_BIT}, NULL, &hb));
+   VkMemoryRequirements hr;
+   vkGetBufferMemoryRequirements(dev, hb, &hr);
+   VkDeviceMemory hm;
+   CHECK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = hr.size,
+      .memoryTypeIndex = mem_type(hr.memoryTypeBits,
+         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)}, NULL, &hm));
+   CHECK(vkBindBufferMemory(dev, hb, hm, 0));
+   uint32_t *hp;
+   CHECK(vkMapMemory(dev, hm, 0, VK_WHOLE_SIZE, 0, (void **)&hp));
+   memset(hp, 0, hsz);
+
+   const uint32_t slice_px = W * H;
+   uint32_t *src_data = hp;
+   uint32_t *guard_data = hp + LAYERS * slice_px;
+   uint32_t *rb_data = hp + 2 * LAYERS * slice_px;
+   for (uint32_t z = 0; z < LAYERS; ++z) {
+      for (uint32_t y = 0; y < H; ++y) {
+         for (uint32_t x = 0; x < W; ++x) {
+            src_data[z * slice_px + y * W + x] = payload_layer_word(x, y, z);
+            guard_data[z * slice_px + y * W + x] = guard_3d_word(x, y, z);
+         }
+      }
+   }
+
+   unsigned fails = 0;
+   VkImageMemoryBarrier2 init_bar[2] = {
+      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+       .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = 0,
+       .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+       .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .image = src_arr, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, LAYERS}},
+      {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+       .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = 0,
+       .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+       .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+       .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+       .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+       .image = dst_3d, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}},
+   };
+
+   /* 1. Multi-slice copy at nonzero src layer (1..2) -> nonzero dst Z (1..2) */
+   VkCommandBuffer cb = begin();
+   vkCmdPipelineBarrier2(cb, &(VkDependencyInfo){
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = init_bar});
+   vkCmdCopyBufferToImage(cb, hb, src_arr, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 0,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS},
+         .imageExtent = {W, H, 1}});
+   vkCmdCopyBufferToImage(cb, hb, dst_3d, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = vol_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {W, H, LAYERS}});
+   barrier(cb);
+   vkCmdCopyImage(cb, src_arr, VK_IMAGE_LAYOUT_GENERAL, dst_3d,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 2},
+                     .srcOffset = {0, 0, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {0, 0, 1},
+                     .extent = {W, H, 2},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, dst_3d, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 2 * vol_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {W, H, LAYERS}});
+   submit(cb);
+
+   {
+      unsigned ok = 0, total = LAYERS * slice_px;
+      char first[160] = {0};
+      for (uint32_t z = 0; z < LAYERS; ++z) {
+         for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+               uint32_t got = rb_data[z * slice_px + y * W + x];
+               uint32_t want = (z == 1 || z == 2)
+                  ? src_data[z * slice_px + y * W + x]
+                  : guard_data[z * slice_px + y * W + x];
+               if (got == want) ok++;
+               else if (!first[0])
+                  snprintf(first, sizeof(first), "%u,%u,z%u got=0x%08x want=0x%08x",
+                           x, y, z, got, want);
+            }
+         }
+      }
+      bool pass = ok == total;
+      printf("RESULT %-21s exact=%u/%u %s%s%s\n", "array2d->3d/multi",
+             ok, total, pass ? "PASS" : "FAIL", first[0] ? " first " : "", first);
+      if (!pass) fails++;
+   }
+
+   /* 2. Partial non-16-aligned multi-slice copy preserving guard texels */
+   const uint32_t sx = 5, sy = 7, dx = 3, dy = 5, rw = 37, rh = 29;
+   memset(rb_data, 0, vol_B);
+   cb = begin();
+   vkCmdCopyBufferToImage(cb, hb, dst_3d, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = vol_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {W, H, LAYERS}});
+   barrier(cb);
+   vkCmdCopyImage(cb, src_arr, VK_IMAGE_LAYOUT_GENERAL, dst_3d,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 2, 2},
+                     .srcOffset = {(int32_t)sx, (int32_t)sy, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {(int32_t)dx, (int32_t)dy, 1},
+                     .extent = {rw, rh, 2},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, dst_3d, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 2 * vol_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {W, H, LAYERS}});
+   submit(cb);
+
+   {
+      unsigned ok = 0, total = LAYERS * slice_px;
+      char first[160] = {0};
+      for (uint32_t z = 0; z < LAYERS; ++z) {
+         for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+               uint32_t got = rb_data[z * slice_px + y * W + x];
+               bool in = (z == 1 || z == 2) &&
+                         x >= dx && x < dx + rw && y >= dy && y < dy + rh;
+               uint32_t want = in
+                  ? src_data[(z + 1) * slice_px + (sy + (y - dy)) * W + (sx + (x - dx))]
+                  : guard_data[z * slice_px + y * W + x];
+               if (got == want) ok++;
+               else if (!first[0])
+                  snprintf(first, sizeof(first), "%u,%u,z%u(%s) got=0x%08x want=0x%08x",
+                           x, y, z, in ? "in" : "guard", got, want);
+            }
+         }
+      }
+      bool pass = ok == total;
+      printf("RESULT %-21s exact=%u/%u %s%s%s\n", "array2d->3d/partial",
+             ok, total, pass ? "PASS" : "FAIL", first[0] ? " first " : "", first);
+      if (!pass) fails++;
+   }
+
+   /* 3. Rendered (compressed tiles) B10G11R11 layer 3 -> 3D RGBA8 slice 2 */
+   memset(rb_data, 0, vol_B);
+   cb = begin();
+   vkCmdCopyBufferToImage(cb, hb, dst_3d, VK_IMAGE_LAYOUT_GENERAL, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = vol_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {W, H, LAYERS}});
+   draw(cb, v_src_l3, false, (VkRect2D){{0, 0}, {W, H}});
+   barrier(cb);
+   vkCmdCopyImage(cb, src_arr, VK_IMAGE_LAYOUT_GENERAL, dst_3d,
+                  VK_IMAGE_LAYOUT_GENERAL, 1,
+                  &(VkImageCopy){
+                     .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 3, 1},
+                     .srcOffset = {0, 0, 0},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .dstOffset = {0, 0, 2},
+                     .extent = {W, H, 1},
+                  });
+   barrier(cb);
+   vkCmdCopyImageToBuffer(cb, dst_3d, VK_IMAGE_LAYOUT_GENERAL, hb, 1,
+      &(VkBufferImageCopy){
+         .bufferOffset = 2 * vol_B,
+         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .imageExtent = {W, H, LAYERS}});
+   submit(cb);
+
+   {
+      struct tally tr = {0};
+      unsigned guard_ok = 0, guard_n = 0;
+      char first_g[160] = {0};
+      for (uint32_t z = 0; z < LAYERS; ++z) {
+         for (uint32_t y = 0; y < H; ++y) {
+            for (uint32_t x = 0; x < W; ++x) {
+               uint32_t got = rb_data[z * slice_px + y * W + x];
+               if (z == 2) {
+                  check_word(&tr, x, y, got);
+               } else {
+                  guard_n++;
+                  uint32_t want = guard_data[z * slice_px + y * W + x];
+                  if (got == want) guard_ok++;
+                  else if (!first_g[0])
+                     snprintf(first_g, sizeof(first_g), "%u,%u,z%u got=0x%08x want=0x%08x",
+                              x, y, z, got, want);
+               }
+            }
+         }
+      }
+      bool ok_r = tr.nan_ok == tr.nan_n && tr.inf_ok == tr.inf_n &&
+                  tr.oth_ok == tr.oth_n;
+      bool ok_g = guard_ok == guard_n;
+      printf("RESULT %-21s nan=%u/%u inf=%u/%u guard=%u/%u %s%s%s%s%s\n",
+             "array2d->3d/render", tr.nan_ok, tr.nan_n, tr.inf_ok, tr.inf_n,
+             guard_ok, guard_n, (ok_r && ok_g) ? "PASS" : "FAIL",
+             tr.first[0] ? " r:" : "", tr.first,
+             first_g[0] ? " g:" : "", first_g);
+      if (!ok_r || !ok_g) fails++;
+   }
+
+   vkUnmapMemory(dev, hm);
+   vkDestroyBuffer(dev, hb, NULL);
+   vkFreeMemory(dev, hm, NULL);
+   vkDestroyImageView(dev, v_src_l3, NULL);
+   vkDestroyImage(dev, src_arr, NULL);
+   vkDestroyImage(dev, dst_3d, NULL);
+   vkFreeMemory(dev, m_src, NULL);
+   vkFreeMemory(dev, m_dst, NULL);
+   return fails;
+}
+
 int
 main(void)
 {
@@ -888,6 +1201,8 @@ main(void)
       fails += run_bitexact_copies(kind);
       cases += kind ? 7 : 8;
    }
+   fails += run_r11_array_to_rgba8_3d();
+   cases += 3;
    printf("SUMMARY %u/%u cases pass\n", cases - fails, cases);
    return fails ? 1 : 0;
 }
