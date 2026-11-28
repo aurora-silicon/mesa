@@ -2294,6 +2294,93 @@ direct_draw_fast_path_correctness(struct fixture *f)
       CHECK(cs.current == cur_before_zero);
       CHECK(cs.stats.calls == 2);
 
+      /* A pushed UBO changed between cached draws is uploaded only by the
+       * general path's push-descriptor flush, so the cached draw must not
+       * record over the stale set. */
+      {
+         struct hk_descriptor_set_layout *push_layout = calloc(
+            1, sizeof(*push_layout) + sizeof(push_layout->binding[0]));
+         struct hk_push_descriptor_set *push_set =
+            calloc(1, sizeof(*push_set));
+         CHECK(push_layout && push_set);
+         push_layout->vk.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT;
+         push_layout->vk.flags =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+         push_layout->non_variable_descriptor_buffer_size = 64;
+         push_layout->max_buffer_size = 64;
+         push_layout->binding_count = 1;
+         push_layout->binding[0] = (struct hk_descriptor_set_binding_layout){
+            .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .array_size = 1,
+            .offset = 0,
+            .stride = sizeof(struct hk_buffer_address),
+         };
+         struct vk_pipeline_layout push_pl = {0};
+         push_pl.base.type = VK_OBJECT_TYPE_PIPELINE_LAYOUT;
+         push_pl.set_layouts[0] = &push_layout->vk;
+
+         struct hk_buffer ubo = {0};
+         ubo.vk.base.type = VK_OBJECT_TYPE_BUFFER;
+         ubo.vk.base.device = &f->dev.vk;
+         ubo.vk.device_address = 0xa00000;
+         ubo.vk.size = 4096;
+
+         desc->push[0] = push_set;
+         VkDescriptorBufferInfo bi = {
+            .buffer = hk_buffer_to_handle(&ubo),
+            .offset = 256,
+            .range = 64,
+         };
+         VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .pBufferInfo = &bi,
+         };
+         VkPushDescriptorSetInfoKHR push_info = {
+            .sType = VK_STRUCTURE_TYPE_PUSH_DESCRIPTOR_SET_INFO_KHR,
+            .stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS,
+            .layout = vk_pipeline_layout_to_handle(&push_pl),
+            .set = 0,
+            .descriptorWriteCount = 1,
+            .pDescriptorWrites = &write,
+         };
+
+         const uint64_t root_set0 = desc->root.sets[0];
+         const uint64_t npg = desc->non_push_generation;
+         hk_CmdPushDescriptorSet2KHR(cb, &push_info);
+         CHECK(desc->push_dirty == BITFIELD_BIT(0));
+         CHECK(desc->non_push_generation == npg);
+         CHECK(desc->root.sets[0] == root_set0);
+         CHECK(fast->valid);
+
+         /* With the push pending the cached draw declines and the general
+          * path flushes the new set; without the guard the cached draw
+          * records here over the old root.sets[0]. The general path cannot
+          * finish the draw in this fixture, so no command is counted. */
+         const void *cur_before_push = cs.current;
+         hk_CmdDraw(cb, 6, 1, 0, 0);
+         CHECK(cs.current == cur_before_push);
+         CHECK(cs.stats.calls == 2);
+         CHECK(desc->push_dirty == 0);
+         CHECK(desc->root.sets[0] != root_set0);
+         CHECK(desc->non_push_generation != npg);
+         cmd->vk.record_result = VK_SUCCESS;
+
+         /* The flushed set invalidated the cached draw until it re-arms. */
+         hk_CmdDraw(cb, 6, 1, 0, 0);
+         CHECK(cs.current == cur_before_push);
+         CHECK(cs.stats.calls == 2);
+         cmd->vk.record_result = VK_SUCCESS;
+
+         hk_push_descriptor_set_reset_upload(push_set);
+         desc->push[0] = NULL;
+         desc->push_active = 0;
+         free(push_set);
+         free(push_layout);
+      }
+
       cmd->current_cs.gfx = NULL;
       hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
    }

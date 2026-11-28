@@ -16797,6 +16797,7 @@ hk_agx3_arm_direct_draw_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        gfx->occlusion.mode != AGX_VISIBILITY_MODE_NONE ||
        !gfx->render.first_draw_seen ||
        gfx->dirty || gfx->shaders_dirty || gfx->linked_dirty ||
+       desc->push_dirty ||
        vk_dynamic_graphics_state_any_dirty(dyn) ||
        hk_sync_xfer_pending(&cmd->sync) ||
        vk_command_buffer_has_error(&cmd->vk))
@@ -16936,10 +16937,14 @@ hk_agx3_fast_direct_draw_begin(struct hk_cmd_buffer *cmd, bool indexed,
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
 
+   /* Pushed descriptor sets are uploaded, and non_push_generation advanced,
+    * only when hk_draw_impl() flushes them. A pending push must take that
+    * path, or the draw reads the previously uploaded set. */
    if (unlikely(cs != fast->cs || cs->chunk.gpu != fast->cs_chunk_gpu ||
                 dyn->generation != fast->dyn_generation ||
                 vk_dynamic_graphics_state_any_dirty(dyn) ||
                 desc->non_push_generation != fast->non_push_generation ||
+                desc->push_dirty != 0 ||
                 gfx->vertex_buffer_generation != fast->vertex_buffer_generation ||
                 gfx->root != fast->root ||
                 cmd->sync.epoch != fast->sync_epoch ||
