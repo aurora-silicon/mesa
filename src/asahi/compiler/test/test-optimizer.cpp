@@ -2995,3 +2995,79 @@ TEST_F(Optimizer, Agx3AsrImmediateRange)
       EXPECT_EQ(asr->src[1].type == AGX_INDEX_IMMEDIATE, c.expect_imm) << c.name;
    }
 }
+
+TEST_F(Optimizer, NestedBitAnd32)
+{
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+
+   /* Redundant outer mask: (wx & 15) & 31 -> wx & 15. */
+   {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      actual->shader->key = &key;
+      expected->shader->key = &key;
+
+      agx_index inner = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_and_to(actual, inner, wx, agx_immediate(15));
+      agx_index outer = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_and_to(actual, outer, inner, agx_immediate(31));
+      agx_unit_test(actual, outer);
+
+      inner = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_and_to(expected, inner, wx, agx_immediate(15));
+      agx_temp(expected->shader, AGX_SIZE_32);
+      agx_unit_test(expected, inner);
+
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+
+   /* Intersected masks: (wx & 0x3f) & 0x0f -> wx & 0x0f. */
+   {
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      actual->shader->key = &key;
+      expected->shader->key = &key;
+
+      agx_index inner = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_and_to(actual, inner, wx, agx_immediate(0x3f));
+      agx_index outer = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_and_to(actual, outer, inner, agx_immediate(0x0f));
+      agx_unit_test(actual, outer);
+
+      agx_temp(expected->shader, AGX_SIZE_32);
+      outer = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_and_to(expected, outer, wx, agx_immediate(0x0f));
+      agx_unit_test(expected, outer);
+
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+
+   /* Strictly AGX3B: AGX2 and AGX3C leave nested 32-bit bit-ANDs unchanged. */
+   for (enum agx_isa_encoding enc :
+        {AGX_ISA_ENCODING_AGX2, AGX_ISA_ENCODING_AGX3C}) {
+      struct agx_shader_key neg_key = {};
+      neg_key.dev.encoding = enc;
+      agx_builder *actual = agx_test_builder(mem_ctx);
+      agx_builder *expected = agx_test_builder(mem_ctx);
+      actual->shader->key = &neg_key;
+      expected->shader->key = &neg_key;
+
+      agx_index inner = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_and_to(actual, inner, wx, agx_immediate(0x3f));
+      agx_index outer = agx_temp(actual->shader, AGX_SIZE_32);
+      agx_and_to(actual, outer, inner, agx_immediate(0x0f));
+      agx_unit_test(actual, outer);
+
+      agx_index einner = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_and_to(expected, einner, wx, agx_immediate(0x3f));
+      agx_index eouter = agx_temp(expected->shader, AGX_SIZE_32);
+      agx_and_to(expected, eouter, einner, agx_immediate(0x0f));
+      agx_unit_test(expected, eouter);
+
+      agx_optimize_and_dce(actual->shader);
+      ASSERT_SHADER_EQUAL(actual->shader, expected->shader);
+   }
+}

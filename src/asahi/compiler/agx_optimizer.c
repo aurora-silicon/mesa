@@ -399,6 +399,72 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * bits of their 16-bit source register. When an unpacked byte lane masks with
  * 0xff before converting to float, drop the mask and convert directly from the
  * raw packed half register. */
+/* Fold nested immediate bit-ANDs: (x & m1) & m2 -> x & (m1 & m2), or alias
+ * the inner AND directly when m1 is already a subset of m2 (e.g. a 32-bit
+ * shift-count mask & 31 following an explicit & 15). */
+static void
+agx_optimizer_bitop_and(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_BITOP || I->truth_table != UTIL_LUT2(a & b) ||
+       I->saturate || I->nr_dests != 1 || I->nr_srcs != 2 ||
+       I->dest[0].size != AGX_SIZE_32 || I->dest[0].memory ||
+       agx_channels(I->dest[0]) != 1)
+      return;
+
+   unsigned imm_idx;
+   if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+       I->src[1].type == AGX_INDEX_NORMAL)
+      imm_idx = 0;
+   else if (I->src[1].type == AGX_INDEX_IMMEDIATE &&
+            I->src[0].type == AGX_INDEX_NORMAL)
+      imm_idx = 1;
+   else
+      return;
+
+   const agx_index m2 = I->src[imm_idx];
+   const agx_index v = I->src[1 - imm_idx];
+   if (m2.abs || m2.neg || v.abs || v.neg || v.memory ||
+       v.size != I->dest[0].size || agx_channels(v) != 1)
+      return;
+
+   agx_instr *def = defs[v.value];
+   if (!def || def->op != AGX_OPCODE_BITOP ||
+       def->truth_table != UTIL_LUT2(a & b) || def->saturate ||
+       def->nr_dests != 1 || def->nr_srcs != 2 ||
+       def->dest[0].size != v.size)
+      return;
+
+   unsigned inner_imm_idx;
+   if (def->src[0].type == AGX_INDEX_IMMEDIATE &&
+       (def->src[1].type == AGX_INDEX_NORMAL ||
+        def->src[1].type == AGX_INDEX_REGISTER))
+      inner_imm_idx = 0;
+   else if (def->src[1].type == AGX_INDEX_IMMEDIATE &&
+            (def->src[0].type == AGX_INDEX_NORMAL ||
+             def->src[0].type == AGX_INDEX_REGISTER))
+      inner_imm_idx = 1;
+   else
+      return;
+
+   const agx_index m1 = def->src[inner_imm_idx];
+   const agx_index inner = def->src[1 - inner_imm_idx];
+   if (m1.abs || m1.neg || inner.abs || inner.neg || inner.memory ||
+       inner.size != v.size || agx_channels(inner) != 1)
+      return;
+
+   const uint32_t combined = m1.value & m2.value;
+   if (combined == m1.value) {
+      I->op = AGX_OPCODE_MOV;
+      I->nr_srcs = 1;
+      I->src[0] = v;
+      I->truth_table = 0;
+   } else {
+      I->src[1 - imm_idx] = inner;
+      I->src[imm_idx] = agx_immediate(combined);
+   }
+}
+
 static void
 agx_optimizer_convert_u8(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
@@ -2174,6 +2240,7 @@ agx_optimizer_forward(agx_context *ctx)
           I->op != AGX_OPCODE_UNIFORM_STORE && I->op != AGX_OPCODE_EXPORT)
          agx_optimizer_inline_imm(ctx, defs, I);
 
+      agx_optimizer_bitop_and(ctx, defs, I);
       agx_optimizer_convert_u8(ctx, defs, I);
       agx_optimizer_minifloat_select(ctx, defs, I);
 

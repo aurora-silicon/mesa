@@ -9414,18 +9414,15 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
             return agx_mov_to(b, dst, s0);
          return agx_ushr_to(b, dst, s0, agx_immediate(shift));
       }
-      /* G17P's register `srl` takes the ordinary positive count, as
-       * applegpu_g17p's `ushort(a >> s)` (a710540002080000d0130500, after
-       * its own `s & 31`) does. This used to build `0 - count`, but the
-       * G17P iadd packer read NEG as a sign extension and emitted `0 +
-       * count`; every hardware-proven program therefore already carries
-       * the positive count through this add, which is kept. */
+      /* G17P's register `srl` takes the ordinary positive 32-bit count.
+       * Only narrow or modified counts need widening via `0 + count`; a plain
+       * 32-bit register count feeds `srl` directly. */
       if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
          if (s1.type == AGX_INDEX_IMMEDIATE) {
             /* The immediate SRL form consumes the positive literal itself. */
             if (!(sz == 32 && s1.value >= 1 && s1.value <= 31))
                s1 = agx_g17p_shift_boundary(b, s1.value);
-         } else {
+         } else if (s1.size != AGX_SIZE_32 || s1.abs || s1.neg || s1.memory) {
             agx_index boundary = agx_temp(b->shader, AGX_SIZE_32);
             agx_iadd_to(b, boundary, i0, s1, 0);
             s1 = boundary;
