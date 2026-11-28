@@ -387,6 +387,26 @@ hk_agx3_g17p_graphics_program_template_relocate(
 }
 
 bool
+hk_agx3_vertex_inline_imm_program_generate(
+   enum agx_chip chip,
+   const struct hk_agx3_g17p_graphics_program_desc *desc,
+   const uint16_t *uniform_halfs, const uint32_t *initial_values,
+   unsigned dword_count, struct agx3_inline_imm_program *program)
+{
+   if (!desc)
+      return false;
+   const struct agx3_g17p_graphics_program_desc shared_desc =
+      hk_agx3_g17p_shared_graphics_desc(desc);
+   return agx_chip_g17_m5(chip)
+      ? agx3_g17g_vertex_inline_imm_program_generate(
+           chip, &shared_desc, uniform_halfs, initial_values, dword_count,
+           program)
+      : agx3_g17p_vertex_inline_imm_program_generate(
+           chip, &shared_desc, uniform_halfs, initial_values, dword_count,
+           program);
+}
+
+bool
 hk_agx3_g17p_combined_sampler_pointers(
    const struct hk_agx3_g17p_combined_sampler_heap *heap,
    uint64_t pointers[2])

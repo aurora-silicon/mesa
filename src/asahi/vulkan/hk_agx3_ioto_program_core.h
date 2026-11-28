@@ -129,6 +129,12 @@ bool hk_agx3_g17p_graphics_program_template_relocate(
    const struct agx3_g17p_graphics_program_template *program,
    void *output, size_t capacity, uint16_t *written);
 
+bool hk_agx3_vertex_inline_imm_program_generate(
+   enum agx_chip chip,
+   const struct hk_agx3_g17p_graphics_program_desc *desc,
+   const uint16_t *uniform_halfs, const uint32_t *initial_values,
+   unsigned dword_count, struct agx3_inline_imm_program *program);
+
 struct hk_agx3_g17p_combined_sampler_heap {
    uint64_t descriptor_set_va;
    uint64_t sampler_heap_va;

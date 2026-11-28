@@ -500,10 +500,185 @@ test_preamble_programs(void)
    return 0;
 }
 
+static int
+test_vertex_inline_imm_programs(void)
+{
+   const struct {
+      enum agx_chip chip;
+      unsigned clusters;
+      unsigned base_size;
+      unsigned copy_ext_delta;
+   } targets[] = {
+      {AGX_CHIP_G16G, 1, AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE, 6},
+      {AGX_CHIP_G17P, 1, AGX_IOTO_G17P_NO_RESOURCE_PROGRAM_SIZE, 6},
+      {AGX_CHIP_G17S, 2, AGX_IOTO_G17G_VERTEX_NO_RESOURCE_PROGRAM_SIZE, 4},
+   };
+   const uint32_t test_vals[AGX3_INLINE_IMM_MAX_DWORDS] = {
+      0xdeadbeefu, 0x00000040u, 0x12345678u, 0xffffffffu,
+      0x3b000000u, 0x00000001u, 0xabcdef01u, 0x80000000u,
+   };
+
+   for (unsigned t = 0; t < ARRAY_SIZE(targets); ++t) {
+      const enum agx_chip chip = targets[t].chip;
+      const bool is_m5 = agx_chip_g17_m5(chip);
+      struct agx3_g17p_graphics_program_desc desc = {
+         .program_va = UINT64_C(0x10000100000),
+         .shader_va = UINT64_C(0x100002003c0),
+         .shader_binary_size = 256,
+         .nr_gprs = 16,
+         .compiler_d_valid = true,
+         .compiler_d = 32,
+         .usc_clusters = targets[t].clusters,
+      };
+
+      for (unsigned n = 1; n <= AGX3_INLINE_IMM_MAX_DWORDS; ++n) {
+         const uint16_t low_halfs[AGX3_INLINE_IMM_MAX_DWORDS] = {
+            24, 26, 28, 30, 32, 34, 36, 38,
+         };
+         const uint16_t high_halfs[AGX3_INLINE_IMM_MAX_DWORDS] = {
+            24, 128, 256, 510, 40, 130, 258, 508,
+         };
+
+         for (unsigned hi = 0; hi < 2; ++hi) {
+            const uint16_t *halfs = hi ? high_halfs : low_halfs;
+            struct agx3_inline_imm_program prog;
+            const bool ok = is_m5
+               ? agx3_g17g_vertex_inline_imm_program_generate(
+                    chip, &desc, halfs, test_vals, n, &prog)
+               : agx3_g17p_vertex_inline_imm_program_generate(
+                    chip, &desc, halfs, test_vals, n, &prog);
+            CHECK(ok);
+            CHECK(prog.dword_count == n);
+
+            unsigned ext_count = 0;
+            for (unsigned i = 0; i < n; ++i) {
+               CHECK(prog.ldimm_offset[i] == 8u * i);
+               CHECK(prog.ldimm_dest_half[i] ==
+                     AGX3_INLINE_IMM_TEMP_BASE_HALF +
+                        i * AGX3_INLINE_IMM_TEMP_STRIDE_HALFS);
+               if (halfs[i] >= 128)
+                  ext_count++;
+               uint8_t seeded_ldimm[AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+               agx_ioto_load_pack_ldimm_long(prog.ldimm_dest_half[i],
+                                             test_vals[i], seeded_ldimm);
+               CHECK(memcmp(prog.program.bytes + prog.ldimm_offset[i],
+                            seeded_ldimm, sizeof(seeded_ldimm)) == 0);
+            }
+            CHECK(prog.program.length ==
+                  targets[t].base_size + n * (8u + 4u) +
+                     ext_count * targets[t].copy_ext_delta);
+
+            /* Walk every record in the composed program: expect n LDIMMs, the
+             * vertex state tail, profile helper, n COPYs, and TERMINATE, with
+             * zero LDDEV or NOP instructions. */
+            size_t cursor = 0;
+            unsigned ldimm_before_tail = 0;
+            unsigned copy_count = 0;
+            bool seen_tail = false;
+            bool seen_term = false;
+            while (cursor < prog.program.length) {
+               struct agx_ioto_program_record rec;
+               size_t consumed = 0;
+               CHECK(agx_ioto_decode_program_record(
+                  chip, prog.program.bytes + cursor,
+                  prog.program.length - cursor, &rec, &consumed));
+               CHECK(consumed > 0 && consumed <= prog.program.length - cursor);
+               if (rec.kind == AGX_IOTO_PROGRAM_RECORD_TERMINATE) {
+                  seen_term = true;
+                  cursor += consumed;
+                  break;
+               }
+               CHECK(rec.kind != AGX_IOTO_PROGRAM_RECORD_GPU0_INLINE_LDDEV);
+               if (rec.kind == AGX_IOTO_PROGRAM_RECORD_IOTO) {
+                  CHECK(rec.ioto.kind != AGX_IOTO_KIND_NOP_EP0);
+                  CHECK(rec.ioto.kind != AGX_IOTO_KIND_LDDEV_EP0 &&
+                        rec.ioto.kind != AGX_IOTO_KIND_LDDEV_EP1 &&
+                        rec.ioto.kind != AGX_IOTO_KIND_LDDEV_EP2 &&
+                        rec.ioto.kind != AGX_IOTO_KIND_LDDEV_EP3 &&
+                        rec.ioto.kind != AGX_IOTO_KIND_LDDEV_EP4 &&
+                        rec.ioto.kind != AGX_IOTO_KIND_LDDEV_EP5);
+                  if (!seen_tail &&
+                      (rec.ioto.kind == AGX_IOTO_KIND_LDIMM_EP1 ||
+                       rec.ioto.kind == AGX_IOTO_KIND_LDIMM_EP2))
+                     ldimm_before_tail++;
+                  if (rec.ioto.kind == AGX_IOTO_KIND_SPECTPR_EP0)
+                     seen_tail = true;
+                  if (rec.ioto.kind == AGX_IOTO_KIND_COPY_EP0 ||
+                      rec.ioto.kind == AGX_IOTO_KIND_COPY_EP1)
+                     copy_count++;
+               }
+               cursor += consumed;
+            }
+            CHECK(seen_tail && seen_term && cursor == prog.program.length);
+            CHECK(ldimm_before_tail == n);
+            /* HAL200 vertex default profile suffix adds one terminal COPY_EP1. */
+            CHECK(copy_count == n + (is_m5 ? 0u : 1u));
+         }
+      }
+
+      /* Reject invalid counts, odd/out-of-range halves, fragment, preamble, and
+       * unsupported chips fail-closed. */
+      const uint16_t valid_half[1] = {24};
+      const uint16_t odd_half[1] = {25};
+      const uint16_t oob_half[1] = {512};
+      const uint16_t nine_halfs[9] = {0, 2, 4, 6, 8, 10, 12, 14, 16};
+      struct agx3_inline_imm_program bad_prog;
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &desc, valid_half, NULL, 0, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &desc, valid_half, NULL, 0, &bad_prog)));
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &desc, nine_halfs, NULL, 9, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &desc, nine_halfs, NULL, 9, &bad_prog)));
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &desc, odd_half, NULL, 1, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &desc, odd_half, NULL, 1, &bad_prog)));
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &desc, oob_half, NULL, 1, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &desc, oob_half, NULL, 1, &bad_prog)));
+
+      struct agx3_g17p_graphics_program_desc bad_desc = desc;
+      bad_desc.fragment = true;
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &bad_desc, valid_half, NULL, 1, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &bad_desc, valid_half, NULL, 1, &bad_prog)));
+      bad_desc = desc;
+      bad_desc.constant_program.code_size = 8;
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &bad_desc, valid_half, NULL, 1, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &bad_desc, valid_half, NULL, 1, &bad_prog)));
+      bad_desc = desc;
+      bad_desc.preloaded_root = true;
+      CHECK(!(is_m5
+                 ? agx3_g17g_vertex_inline_imm_program_generate(
+                      chip, &bad_desc, valid_half, NULL, 1, &bad_prog)
+                 : agx3_g17p_vertex_inline_imm_program_generate(
+                      chip, &bad_desc, valid_half, NULL, 1, &bad_prog)));
+      CHECK(!agx3_g17p_vertex_inline_imm_program_generate(
+         AGX_CHIP_G13G, &desc, valid_half, NULL, 1, &bad_prog));
+      CHECK(!agx3_g17g_vertex_inline_imm_program_generate(
+         AGX_CHIP_G17P, &desc, valid_half, NULL, 1, &bad_prog));
+   }
+
+   return 0;
+}
+
 int
 main(void)
 {
    CHECK(test_g17g_programs() == 0);
+   CHECK(test_vertex_inline_imm_programs() == 0);
    /* Glamor's instanced rectangle needs six independent VS ranges: VBO
     * bases, clamps, draw parameters, UBO pointer, provoking vertex and clip
     * coefficient. The old five-range limit silently left its pipeline zero. */

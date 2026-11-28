@@ -307,6 +307,38 @@ bool agx3_g17p_graphics_program_template_relocate(
    const struct agx3_g17p_graphics_program_template *program,
    void *output, size_t capacity, uint16_t *written);
 
+/* Maximum 32-bit uniform dwords materialized directly by LDIMM + COPY without
+ * an intermediate device-memory upload or LDDEV load. Each dword occupies a
+ * non-consecutive temp GPR (halves 8, 12, ..., 36) so profile helpers (halves
+ * 0..7) never clobber them and consecutive-GPR address detectors never treat
+ * arbitrary uniform values as 64-bit pointers. */
+#define AGX3_INLINE_IMM_MAX_DWORDS 8u
+#define AGX3_INLINE_IMM_MAX_PUSH_DWORDS 4u
+#define AGX3_INLINE_IMM_TEMP_BASE_HALF 8u
+#define AGX3_INLINE_IMM_TEMP_STRIDE_HALFS 4u
+
+struct agx3_inline_imm_program {
+   struct agx3_g17p_graphics_program program;
+   uint16_t ldimm_offset[AGX3_INLINE_IMM_MAX_DWORDS];
+   uint16_t ldimm_dest_half[AGX3_INLINE_IMM_MAX_DWORDS];
+   uint8_t dword_count;
+};
+
+/* Build a vertex Ioto program whose uniform inputs are 1..8 32-bit immediates
+ * loaded directly into non-consecutive temp GPRs with fixed 8-byte LDIMMs and
+ * copied into the requested even uniform halves. `initial_values`, when
+ * non-NULL, seeds each LDIMM (for immutable rodata constants); patching any
+ * ldimm_offset[i] updates that uniform dword without any device-memory load. */
+bool agx3_g17p_vertex_inline_imm_program_generate(
+   enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
+   const uint16_t *uniform_halfs, const uint32_t *initial_values,
+   unsigned dword_count, struct agx3_inline_imm_program *program);
+
+bool agx3_g17g_vertex_inline_imm_program_generate(
+   enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
+   const uint16_t *uniform_halfs, const uint32_t *initial_values,
+   unsigned dword_count, struct agx3_inline_imm_program *program);
+
 /* Write directly into command-buffer-private, unpublished storage. Unlike the
  * transactional object API above, output may be modified when this returns
  * false; `written` is unchanged. The caller must not publish the storage until

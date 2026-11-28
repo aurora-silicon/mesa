@@ -609,6 +609,69 @@ agx3_g17p_graphics_program_template_generate(
    return true;
 }
 
+bool
+agx3_g17p_vertex_inline_imm_program_generate(
+   enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
+   const uint16_t *uniform_halfs, const uint32_t *initial_values,
+   unsigned dword_count, struct agx3_inline_imm_program *program)
+{
+   if (!agx_chip_native_hal200(chip) || !desc || !uniform_halfs || !program ||
+       dword_count == 0 || dword_count > AGX3_INLINE_IMM_MAX_DWORDS ||
+       desc->fragment || desc->writes_sample_mask || desc->colour_classes ||
+       desc->preloaded_root || desc->constant_program.code_size ||
+       desc->preshader || desc->threadgroup_memory_size_B ||
+       !desc->nr_gprs || desc->nr_gprs > 256)
+      return false;
+
+   struct agx_ioto_state_tail_output tail;
+   if (!graphics_state_tail(desc, &tail))
+      return false;
+
+   uint8_t pre_copy[AGX3_INLINE_IMM_MAX_DWORDS * AGX_IOTO_LOAD_LDIMM_MAX_SIZE];
+   uint8_t copies[AGX3_INLINE_IMM_MAX_DWORDS * AGX3_COPY_MAX_LENGTH];
+   size_t copies_size = 0;
+
+   struct agx3_inline_imm_program staged = {0};
+   for (unsigned i = 0; i < dword_count; ++i) {
+      const uint16_t dst_half = uniform_halfs[i];
+      if ((dst_half & 1) != 0 || dst_half + 2u > 512u)
+         return false;
+
+      const uint16_t temp_half = (uint16_t)(AGX3_INLINE_IMM_TEMP_BASE_HALF +
+                                            i * AGX3_INLINE_IMM_TEMP_STRIDE_HALFS);
+      const size_t ldimm_off = (size_t)i * AGX_IOTO_LOAD_LDIMM_MAX_SIZE;
+      agx_ioto_load_pack_ldimm_long(temp_half,
+                                    initial_values ? initial_values[i] : 0u,
+                                    pre_copy + ldimm_off);
+      staged.ldimm_offset[i] = (uint16_t)ldimm_off;
+      staged.ldimm_dest_half[i] = temp_half;
+
+      uint8_t copy_bytes[AGX3_COPY_MAX_LENGTH];
+      uint8_t copy_len = 0;
+      if (!agx3_copy_encode_reg_to_uniform(AGX_ISA_ENCODING_AGX3B, dst_half,
+                                           temp_half, false, 0, copy_bytes,
+                                           &copy_len) ||
+          copy_len == 0 || copy_len > sizeof(copies) - copies_size)
+         return false;
+      memcpy(copies + copies_size, copy_bytes, copy_len);
+      copies_size += copy_len;
+   }
+
+   const size_t pre_copy_size =
+      (size_t)dword_count * AGX_IOTO_LOAD_LDIMM_MAX_SIZE;
+   size_t written = 0;
+   if (!agx_ioto_g17p_resource_program_compose_trusted(
+          desc->program_va, pre_copy, pre_copy_size, copies, copies_size, &tail,
+          staged.program.bytes, sizeof(staged.program.bytes), &written) ||
+       written > sizeof(staged.program.bytes) || written > UINT16_MAX)
+      return false;
+
+   staged.program.length = (uint16_t)written;
+   staged.dword_count = (uint8_t)dword_count;
+   *program = staged;
+   return true;
+}
+
 static bool
 graphics_range_end(const struct agx3_ioto_uniform_range *range,
                    uint64_t *end)

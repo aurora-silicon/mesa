@@ -17566,6 +17566,8 @@ hk_agx3_arm_direct_draw_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
 
    fast->valid = false;
    fast->push_bypass_ready = false;
+   fast->push_inline_imm = false;
+   fast->inline_push_loader = NULL;
 
    const enum agx_chip chip = dev->dev.chip;
    const bool is_hal200 = agx_chip_native_hal200(chip);
@@ -17786,17 +17788,8 @@ hk_agx3_fast_direct_draw_begin(struct hk_cmd_buffer *cmd, bool indexed,
    if (need_push) {
       struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
       if (unlikely(!fast->push_bypass_ready ||
-                   cached->loader != fast->loader ||
+                   (!fast->push_inline_imm && cached->loader != fast->loader) ||
                    cached->loader_linked != fast->linked_vs))
-         return false;
-
-      /* Validate both bump uploaders before advancing either cursor so an
-       * arena/BO roll falls back cleanly to hk_draw_impl(). */
-      struct hk_uploader *up = &cmd->uploader.main;
-      const uint32_t push_size = fast->push_size_B;
-      const uint32_t up_off = align(up->offset, 4);
-      if (unlikely(!up->map || up_off > up->capacity ||
-                   push_size > up->capacity - up_off))
          return false;
 
       struct hk_ioto_arena *arena = &cmd->ioto;
@@ -17814,57 +17807,92 @@ hk_agx3_fast_direct_draw_begin(struct hk_cmd_buffer *cmd, bool indexed,
                    (ioto_va & UINT64_C(0x3f)) != 0))
          return false;
 
-      const uint64_t push_va = up->base + up_off;
-      for (unsigned r = 0; r < fast->push_reloc_count; ++r) {
-         const struct hk_agx3_push_ioto_reloc *rel = &fast->push_relocs[r];
-         if (unlikely(rel->short_mask)) {
-            const uint64_t base = push_va + rel->delta;
-            if (((rel->short_mask & 1) && (uint32_t)base >= 128) ||
-                ((rel->short_mask & 2) && (base >> 32) >= 128))
-               return false;
+      if (fast->push_inline_imm) {
+         /* Materialize 1..4 push-constant dwords directly as LDIMM immediates
+          * inside the Ioto program with zero main-uploader traffic or LDDEV. */
+         uint8_t *ioto_cpu = arena->map + ioto_off;
+         arena->cursor = ioto_off + ioto_len;
+         arena->programs++;
+         arena->program_bytes += ioto_len;
+         if (unlikely(!fast->cached_cmd_mem))
+            agx_bo_assert_range(arena->bo, ioto_off, ioto_len);
+
+         hk_copy_small_inline(ioto_cpu, fast->ioto_bytes, ioto_len);
+         for (unsigned i = 0; i < fast->push_inline_count; ++i) {
+            uint32_t imm;
+            memcpy(&imm, desc->root.push + fast->push_inline_byte_off[i],
+                   sizeof(imm));
+            hk_g17p_patch_ldimm(ioto_cpu + fast->push_inline_offset[i], false,
+                                fast->push_inline_dest[i], imm);
+            cached->inline_push_values[i] = imm;
          }
-      }
 
-      /* Upload push-constant slice. */
-      uint8_t *push_cpu = up->map + up_off;
-      up->offset = up_off + push_size;
-      const uint8_t *push_src = desc->root.push + fast->push_min_B;
-      if (push_size == 16) {
-         uint64_t p0, p1;
-         memcpy(&p0, push_src, 8);
-         memcpy(&p1, push_src + 8, 8);
-         memcpy(push_cpu, &p0, 8);
-         memcpy(push_cpu + 8, &p1, 8);
+         cached->loader = NULL;
+         cached->inline_push_loader = fast->inline_push_loader;
+         cached->loader_program = ioto_va;
       } else {
-         hk_copy_small_inline(push_cpu, push_src, push_size);
-      }
+         /* Validate both bump uploaders before advancing either cursor so an
+          * arena/BO roll falls back cleanly to hk_draw_impl(). */
+         struct hk_uploader *up = &cmd->uploader.main;
+         const uint32_t push_size = fast->push_size_B;
+         const uint32_t up_off = align(up->offset, 4);
+         if (unlikely(!up->map || up_off > up->capacity ||
+                      push_size > up->capacity - up_off))
+            return false;
 
-      /* Copy pre-baked Ioto loader and patch only push-constant relocations. */
-      uint8_t *ioto_cpu = arena->map + ioto_off;
-      arena->cursor = ioto_off + ioto_len;
-      arena->programs++;
-      arena->program_bytes += ioto_len;
-      if (unlikely(!fast->cached_cmd_mem))
-         agx_bo_assert_range(arena->bo, ioto_off, ioto_len);
+         const uint64_t push_va = up->base + up_off;
+         for (unsigned r = 0; r < fast->push_reloc_count; ++r) {
+            const struct hk_agx3_push_ioto_reloc *rel = &fast->push_relocs[r];
+            if (unlikely(rel->short_mask)) {
+               const uint64_t base = push_va + rel->delta;
+               if (((rel->short_mask & 1) && (uint32_t)base >= 128) ||
+                   ((rel->short_mask & 2) && (base >> 32) >= 128))
+                  return false;
+            }
+         }
 
-      hk_copy_small_inline(ioto_cpu, fast->ioto_bytes, ioto_len);
-      for (unsigned r = 0; r < fast->push_reloc_count; ++r) {
-         const struct hk_agx3_push_ioto_reloc *rel = &fast->push_relocs[r];
-         const uint64_t base = push_va + rel->delta;
-         uint8_t *patch_out = ioto_cpu + rel->offset;
-         const bool low_short = (rel->short_mask & 1) != 0;
-         hk_g17p_patch_ldimm(patch_out, low_short, rel->dest[0],
-                             (uint32_t)base);
-         hk_g17p_patch_ldimm(patch_out + (low_short ? 2 : 8),
-                             (rel->short_mask & 2) != 0, rel->dest[1],
-                             (uint32_t)(base >> 32));
-      }
+         /* Upload push-constant slice. */
+         uint8_t *push_cpu = up->map + up_off;
+         up->offset = up_off + push_size;
+         const uint8_t *push_src = desc->root.push + fast->push_min_B;
+         if (push_size == 16) {
+            uint64_t p0, p1;
+            memcpy(&p0, push_src, 8);
+            memcpy(&p1, push_src + 8, 8);
+            memcpy(push_cpu, &p0, 8);
+            memcpy(push_cpu + 8, &p1, 8);
+         } else {
+            hk_copy_small_inline(push_cpu, push_src, push_size);
+         }
 
-      /* Keep the stage Ioto cache in sync for any subsequent non-fast draw. */
-      cached->loader_program = ioto_va;
-      for (unsigned i = 0; i < fast->push_range_count; ++i) {
-         cached->loader_ranges[fast->push_ranges[i].range].address =
-            push_va + fast->push_ranges[i].rel_offset;
+         /* Copy pre-baked Ioto loader and patch only push-constant relocations. */
+         uint8_t *ioto_cpu = arena->map + ioto_off;
+         arena->cursor = ioto_off + ioto_len;
+         arena->programs++;
+         arena->program_bytes += ioto_len;
+         if (unlikely(!fast->cached_cmd_mem))
+            agx_bo_assert_range(arena->bo, ioto_off, ioto_len);
+
+         hk_copy_small_inline(ioto_cpu, fast->ioto_bytes, ioto_len);
+         for (unsigned r = 0; r < fast->push_reloc_count; ++r) {
+            const struct hk_agx3_push_ioto_reloc *rel = &fast->push_relocs[r];
+            const uint64_t base = push_va + rel->delta;
+            uint8_t *patch_out = ioto_cpu + rel->offset;
+            const bool low_short = (rel->short_mask & 1) != 0;
+            hk_g17p_patch_ldimm(patch_out, low_short, rel->dest[0],
+                                (uint32_t)base);
+            hk_g17p_patch_ldimm(patch_out + (low_short ? 2 : 8),
+                                (rel->short_mask & 2) != 0, rel->dest[1],
+                                (uint32_t)(base >> 32));
+         }
+
+         /* Keep the stage Ioto cache in sync for any subsequent non-fast draw. */
+         cached->inline_push_loader = NULL;
+         cached->loader_program = ioto_va;
+         for (unsigned i = 0; i < fast->push_range_count; ++i) {
+            cached->loader_ranges[fast->push_ranges[i].range].address =
+               push_va + fast->push_ranges[i].rel_offset;
+         }
       }
 
       /* Emit the 28-byte VDM State Update with inline pipeline pair patch. */

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* M5 program composition over the shared uniform-load scheduler. */
 #include "agx3_graphics_program.h"
+#include "agx3_copy_core.h"
 #include "agx3_ioto_load_packer.h"
 #include "asahi/lib/agx_ioto_state_core.h"
 #include "asahi/lib/agx_ioto_preshader_core.h"
@@ -354,4 +355,96 @@ agx3_g17g_tile_program_template_generate(
           g17g_graphics_program_generate(chip, desc,
              store ? AGX_IOTO_G17G_PROGRAM_EOT : AGX_IOTO_G17G_PROGRAM_BACKGROUND,
              &program->program, program);
+}
+
+bool
+agx3_g17g_vertex_inline_imm_program_generate(
+   enum agx_chip chip, const struct agx3_g17p_graphics_program_desc *desc,
+   const uint16_t *uniform_halfs, const uint32_t *initial_values,
+   unsigned dword_count, struct agx3_inline_imm_program *program)
+{
+   if (!agx_chip_g17_m5(chip) || !desc || !uniform_halfs || !program ||
+       dword_count == 0 || dword_count > AGX3_INLINE_IMM_MAX_DWORDS ||
+       desc->fragment || desc->writes_sample_mask || desc->colour_classes ||
+       desc->preloaded_root || desc->constant_program.code_size ||
+       desc->preshader || desc->threadgroup_memory_size_B ||
+       !desc->shader_binary_size || !desc->nr_gprs || desc->nr_gprs > 256 ||
+       desc->scratch_size > UINT16_MAX * 4u || !desc->compiler_d_valid ||
+       desc->compiler_d > 512)
+      return false;
+
+   static const uint8_t vertex_speclm[AGX_IOTO_SPECLM_SIZE] = {
+      0x07, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00,
+   };
+   struct agx_ioto_state ldshdr = {0}, spectpr = {0};
+   ldshdr.f[0] = desc->shader_va;
+   const uint64_t span =
+      (((uint64_t)desc->shader_binary_size + 63) & ~UINT64_C(63)) >> 7;
+   ldshdr.f[1] = MIN2(span, 3);
+   ldshdr.f[5] = 3;
+   ldshdr.f[6] = 107;
+   ldshdr.f[23] = 1;
+   spectpr.f[0] = 3;
+   spectpr.f[1] = 166;
+   spectpr.f[20] = DIV_ROUND_UP(desc->scratch_size, 4);
+   spectpr.f[21] = spectpr.f[20];
+   spectpr.f[22] = (((desc->compiler_d + 3) >> 2) + 1) & ~1u;
+
+   struct agx_ioto_state_tail_output tail = {
+      .length = AGX_IOTO_STATE_TAIL_TYPE0_SIZE,
+   };
+   memcpy(tail.bytes, vertex_speclm, AGX_IOTO_SPECLM_SIZE);
+   if (!agx_ioto_state_pack_ldshdr(chip, &ldshdr,
+                                   tail.bytes + AGX_IOTO_SPECLM_SIZE,
+                                   AGX_IOTO_LDSHDR_SIZE) ||
+       !agx_ioto_state_pack_spectpr(
+          chip, &spectpr,
+          tail.bytes + AGX_IOTO_SPECLM_SIZE + AGX_IOTO_LDSHDR_SIZE,
+          AGX_IOTO_SPECTPR_SIZE))
+      return false;
+
+   uint8_t body[AGX3_INLINE_IMM_MAX_DWORDS *
+                (AGX_IOTO_LOAD_LDIMM_MAX_SIZE + AGX3_COPY_MAX_LENGTH)];
+   const size_t pre_copy_size =
+      (size_t)dword_count * AGX_IOTO_LOAD_LDIMM_MAX_SIZE;
+   size_t copy_pos = pre_copy_size;
+
+   struct agx3_inline_imm_program staged = {0};
+   for (unsigned i = 0; i < dword_count; ++i) {
+      const uint16_t dst_half = uniform_halfs[i];
+      if ((dst_half & 1) != 0 || dst_half + 2u > 512u)
+         return false;
+
+      const uint16_t temp_half = (uint16_t)(AGX3_INLINE_IMM_TEMP_BASE_HALF +
+                                            i * AGX3_INLINE_IMM_TEMP_STRIDE_HALFS);
+      const size_t ldimm_off = (size_t)i * AGX_IOTO_LOAD_LDIMM_MAX_SIZE;
+      agx_ioto_load_pack_ldimm_long(temp_half,
+                                    initial_values ? initial_values[i] : 0u,
+                                    body + ldimm_off);
+      staged.ldimm_offset[i] = (uint16_t)ldimm_off;
+      staged.ldimm_dest_half[i] = temp_half;
+
+      uint8_t copy_bytes[AGX3_COPY_MAX_LENGTH];
+      uint8_t copy_len = 0;
+      if (!agx3_copy_encode_reg_to_uniform(AGX_ISA_ENCODING_AGX3C, dst_half,
+                                           temp_half, false, 0, copy_bytes,
+                                           &copy_len) ||
+          copy_len == 0 || copy_len > sizeof(body) - copy_pos)
+         return false;
+      memcpy(body + copy_pos, copy_bytes, copy_len);
+      copy_pos += copy_len;
+   }
+
+   size_t written = 0;
+   if (!agx_ioto_m5_resource_program_compose_classes(
+          chip, desc->usc_clusters, desc->program_va, body, copy_pos, &tail,
+          AGX_IOTO_G17G_PROGRAM_VERTEX, 1, staged.program.bytes,
+          sizeof(staged.program.bytes), &written) ||
+       written > sizeof(staged.program.bytes) || written > UINT16_MAX)
+      return false;
+
+   staged.program.length = (uint16_t)written;
+   staged.dword_count = (uint8_t)dword_count;
+   *program = staged;
+   return true;
 }
