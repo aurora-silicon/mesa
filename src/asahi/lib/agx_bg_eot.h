@@ -112,6 +112,25 @@ agx_m5_packed_clear_format_ok(enum pipe_format fmt)
    }
 }
 
+/* Whether RT @rt may use an M5 pre-packed background clear. R16_FLOAT stores a
+ * 16-bit lane (2-byte aligned); every other packed-clear format stores one or
+ * two raw 32-bit R32_UINT words, which require a 4-byte-aligned tilebuffer
+ * offset so hardware word alignment does not overwrite a neighbouring target. */
+static inline bool
+agx_m5_packed_clear_rt_ok(const struct agx_tilebuffer_layout *tib, unsigned rt)
+{
+   if (tib->nr_samples != 1 || tib->spilled[rt])
+      return false;
+
+   enum pipe_format fmt = tib->logical_format[rt];
+   if (!agx_m5_packed_clear_format_ok(fmt))
+      return false;
+
+   unsigned align_B = fmt == PIPE_FORMAT_R16_FLOAT ? 2 : 4;
+   return (agx_tilebuffer_offset_B((struct agx_tilebuffer_layout *)tib, rt) &
+           (align_B - 1)) == 0;
+}
+
 /* The layouts whose RT0 clear may be stored pre-packed: one single-sample,
  * unspilled R8G8B8A8_UNORM target at tile offset 0. Its tile word is the
  * byte image FLTNORM would produce (R, G, B, A in byte order), and the
@@ -181,8 +200,14 @@ agx_g17g_rt0_eot_physical_format_supported(enum pipe_format physical)
    }
 }
 
+struct agx_shader_part;
+
 struct agx_bg_eot_shader *agx_get_bg_eot_shader(struct agx_bg_eot_cache *cache,
                                                 struct agx_bg_eot_key *key);
+
+bool agx_compile_background_shader(const struct agx_device *dev,
+                                   struct agx_bg_eot_key *key,
+                                   struct agx_shader_part *out);
 
 void agx_bg_eot_init(struct agx_bg_eot_cache *cache, struct agx_device *dev);
 void agx_bg_eot_cleanup(struct agx_bg_eot_cache *cache);

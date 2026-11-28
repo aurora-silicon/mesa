@@ -2416,10 +2416,11 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          clears |= key->op[rt] == AGX_BG_CLEAR;
          if (agx_chip_g17_m5(dev->dev.chip) && key->tib.nr_samples == 1) {
             if (key->op[rt] == AGX_BG_CLEAR &&
-                agx_m5_packed_clear_format_ok(key->tib.logical_format[rt]))
+                agx_m5_packed_clear_rt_ok(&key->tib, rt))
                key->packed_clear_mask |= BITFIELD_BIT(rt);
             if (key->op[rt] == AGX_BG_LOAD &&
-                render->color_att[rt].iview->planes[0].background_raw32)
+                render->color_att[rt].iview->planes[0].background_raw32 &&
+                (agx_tilebuffer_offset_B(&key->tib, rt) & 3) == 0)
                key->raw32_load_mask |= BITFIELD_BIT(rt);
          }
       }
@@ -2727,14 +2728,15 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    const bool m5 = agx_chip_g17_m5(dev->dev.chip);
    key->packed_clear_mask =
       !store && op == AGX_BG_CLEAR && m5 && single_sample &&
-      agx_m5_packed_clear_format_ok(key->tib.logical_format[0]) ? 1u : 0u;
+      agx_m5_packed_clear_rt_ok(&key->tib, 0) ? 1u : 0u;
    key->packed_clear =
       !store && op == AGX_BG_CLEAR && !m5 &&
       agx_chip_native_or_m5(dev->dev.chip) &&
       agx_g17p_packed_clear_ok(&key->tib);
    key->raw32_load_mask =
       !store && op == AGX_BG_LOAD && m5 && single_sample &&
-      view->planes[0].background_raw32 ? 1u : 0u;
+      view->planes[0].background_raw32 &&
+      (agx_tilebuffer_offset_B(&key->tib, 0) & 3) == 0 ? 1u : 0u;
    if (op == AGX_BG_CLEAR)
       key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
    shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
