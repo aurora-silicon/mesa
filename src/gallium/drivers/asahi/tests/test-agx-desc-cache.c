@@ -372,7 +372,7 @@ check_sampler_cache(struct pipe_screen *screen, unsigned ctx_flags)
    } else {
       const uint8_t expected_std =
          AGX_NATIVE_SAMPLER_DESC |
-         (has_lod_bias ? AGX_NATIVE_SAMPLER_QUERY_LOD : 0);
+         (native && has_lod_bias ? AGX_NATIVE_SAMPLER_QUERY_LOD : 0);
       const uint8_t expected_custom =
          expected_std | AGX_NATIVE_SAMPLER_CLAMP |
          (native && shadow_gather ? AGX_NATIVE_SAMPLER_PROBE : 0);
