@@ -190,6 +190,63 @@ check_gen9_astc_4x4_texture(void)
 }
 
 static void
+check_gen10_astc_hdr_textures(void)
+{
+   static const enum agx_channels astc_channels[] = {
+      AGX_CHANNELS_ASTC_4X4,   AGX_CHANNELS_ASTC_5X4,
+      AGX_CHANNELS_ASTC_5X5,   AGX_CHANNELS_ASTC_6X5,
+      AGX_CHANNELS_ASTC_6X6,   AGX_CHANNELS_ASTC_8X5,
+      AGX_CHANNELS_ASTC_8X6,   AGX_CHANNELS_ASTC_8X8,
+      AGX_CHANNELS_ASTC_10X5,  AGX_CHANNELS_ASTC_10X6,
+      AGX_CHANNELS_ASTC_10X8,  AGX_CHANNELS_ASTC_10X10,
+      AGX_CHANNELS_ASTC_12X10, AGX_CHANNELS_ASTC_12X12,
+   };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(astc_channels); ++i) {
+      const struct AGX_TEXTURE semantic = {
+         AGX_TEXTURE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_GPU,
+         .channels = astc_channels[i],
+         .type = AGX_TEXTURE_TYPE_FLOAT,
+         .swizzle_r = AGX_CHANNEL_R,
+         .swizzle_g = AGX_CHANNEL_G,
+         .swizzle_b = AGX_CHANNEL_B,
+         .swizzle_a = AGX_CHANNEL_A,
+         .width = 32,
+         .height = 32,
+         .depth = 1,
+         .address = UINT64_C(0x1000001c500),
+      };
+      struct hk_native_texture_descriptor packed;
+      assert(hk_pack_native_texture(10, &packed, &semantic));
+
+      char *log = NULL;
+      size_t log_size = 0;
+      FILE *fp = open_memstream(&log, &log_size);
+      assert(fp);
+      struct AGX_TEXTURE_GEN10 gen10;
+      const bool valid =
+         AGX_TEXTURE_GEN10_unpack(fp, (const uint8_t *)packed.opaque, &gen10);
+      fclose(fp);
+      assert(valid && log_size == 0);
+      free(log);
+
+      assert(gen10.dimension == AGX_TEXTURE_DIMENSION_2D);
+      assert(gen10.layout == AGX_LAYOUT_GPU);
+      assert(gen10.channels == astc_channels[i]);
+      assert(gen10.type == AGX_TEXTURE_TYPE_FLOAT);
+      assert(!gen10.srgb);
+      assert(gen10.width == 32 && gen10.height == 32);
+      assert(gen10.address == semantic.address);
+
+      uint32_t repacked[8];
+      AGX_TEXTURE_GEN10_pack(repacked, &gen10);
+      assert(memcmp(repacked, packed.opaque, sizeof(repacked)) == 0);
+   }
+}
+
+static void
 check_gen9_cube_textures(void)
 {
    /* EXP-0017/EXP-M4-07 prove that an uncompressed cube is six consecutive
@@ -780,7 +837,24 @@ check_lossless_layered_packets(void)
       if (layered) {
          REFUSE(p.layers = 0);
          REFUSE(p.layers = 65537);
-         REFUSE(p.levels = 2);
+         if (cases[i].dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY) {
+            p = original;
+            p.level = 1;
+            p.levels = 4;
+            p.unk_mipmapped = true;
+            assert(hk_pack_native_pbe(9, &packed, &p));
+            uint64_t mw[4];
+            memcpy(mw, packed.opaque, sizeof(mw));
+            assert(((mw[0] >> 58) & 1) == 1);
+            assert(((mw[0] >> 59) & 1) == 1);
+            assert((mw[2] & ((UINT64_C(1) << 44) - 1)) ==
+                   (p.acceleration_buffer >> 4));
+            assert(((mw[2] >> 44) & 0xf) == 1);
+            assert(((mw[2] >> 48) & 0xf) == 3);
+            REFUSE(p.levels = 17);
+         } else {
+            REFUSE(p.levels = 2);
+         }
       }
 #undef REFUSE
    }
@@ -847,6 +921,129 @@ check_lossless_layered_packets(void)
    }
 }
 
+static void
+check_gen9_interchange_descriptors(void)
+{
+   static const struct {
+      enum agx_channels channels;
+      enum agx_channel swizzle_r, swizzle_g, swizzle_b, swizzle_a;
+      uint8_t expected_pbe_byte1;
+      uint8_t expected_pbe_byte2;
+   } cases[] = {
+      /* 8-bit BGRA / RGBA */
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0x0a, 0xc6},
+      {AGX_CHANNELS_R8G8B8A8, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0x0a, 0xe4},
+      /* 10-bit BGR10A2 (MTL94 channels 0x26, swizzle 0xc6) and RGB10A2 (0xe4) */
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_B, AGX_CHANNEL_G, AGX_CHANNEL_R,
+       AGX_CHANNEL_A, 0x09, 0xc6},
+      {AGX_CHANNELS_R10G10B10A2, AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B,
+       AGX_CHANNEL_A, 0x09, 0xe4},
+   };
+
+   const unsigned width = 3456, height = 2234;
+   const unsigned tiles_x = (width + 15u) / 16u;
+   const uint64_t base_va = UINT64_C(0x1000080000);
+   const uint64_t meta_va = UINT64_C(0x1001ec0000);
+
+   for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+      struct AGX_PBE pbe = {
+         AGX_PBE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_INTERCHANGE,
+         .channels = cases[i].channels,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = cases[i].swizzle_r,
+         .swizzle_g = cases[i].swizzle_g,
+         .swizzle_b = cases[i].swizzle_b,
+         .swizzle_a = cases[i].swizzle_a,
+         .width = width,
+         .height = height,
+         .layers = 1,
+         .levels = 1,
+         .buffer = base_va,
+         .compressed = true,
+         .extended = true,
+         .acceleration_buffer = meta_va,
+         .stride = tiles_x * 16u - 4u,
+      };
+      struct hk_native_pbe_descriptor packed_pbe;
+      assert(hk_pack_native_pbe(9, &packed_pbe, &pbe));
+      const uint8_t *bytes = (const uint8_t *)packed_pbe.opaque;
+      assert((bytes[0] & 0x3fu) == 0x32u);
+      assert(bytes[1] == cases[i].expected_pbe_byte1);
+      assert(bytes[2] == cases[i].expected_pbe_byte2);
+
+      struct agx_pbe_agx3_2d_fields decoded_pbe;
+      assert(agx_pbe_agx3_2d_unpack(9, &packed_pbe, sizeof(packed_pbe),
+                                    &decoded_pbe));
+      assert(decoded_pbe.layout == AGX_LAYOUT_INTERCHANGE);
+      assert(decoded_pbe.channels == cases[i].channels);
+      assert(decoded_pbe.type == AGX_TEXTURE_TYPE_UNORM);
+      assert(decoded_pbe.swizzle_r == cases[i].swizzle_r &&
+             decoded_pbe.swizzle_g == cases[i].swizzle_g &&
+             decoded_pbe.swizzle_b == cases[i].swizzle_b &&
+             decoded_pbe.swizzle_a == cases[i].swizzle_a);
+      assert(decoded_pbe.compressed);
+      assert(decoded_pbe.buffer == base_va);
+      assert(decoded_pbe.acceleration_buffer == meta_va);
+      assert(decoded_pbe.stride_B == tiles_x * 16u);
+
+      /* Gen10, uncompressed, mipmapped, and layered Interchange PBEs reject. */
+      assert(!hk_pack_native_pbe(10, &packed_pbe, &pbe));
+      struct AGX_PBE bad = pbe;
+      bad.compressed = false;
+      bad.extended = false;
+      bad.acceleration_buffer = 0;
+      assert(!hk_pack_native_pbe(9, &packed_pbe, &bad));
+      bad = pbe;
+      bad.levels = 2;
+      assert(!hk_pack_native_pbe(9, &packed_pbe, &bad));
+      bad = pbe;
+      bad.dimension = AGX_TEXTURE_DIMENSION_2D_ARRAY;
+      bad.layers = 2;
+      assert(!hk_pack_native_pbe(9, &packed_pbe, &bad));
+
+      struct AGX_TEXTURE tex = {
+         AGX_TEXTURE_header,
+         .dimension = AGX_TEXTURE_DIMENSION_2D,
+         .layout = AGX_LAYOUT_INTERCHANGE,
+         .channels = cases[i].channels,
+         .type = AGX_TEXTURE_TYPE_UNORM,
+         .swizzle_r = cases[i].swizzle_r,
+         .swizzle_g = cases[i].swizzle_g,
+         .swizzle_b = cases[i].swizzle_b,
+         .swizzle_a = cases[i].swizzle_a,
+         .width = width,
+         .height = height,
+         .depth = 1,
+         .address = base_va,
+         .compressed = true,
+         .extended = true,
+         .acceleration_buffer = meta_va,
+         .stride = (tiles_x - 1u) << 4,
+      };
+      struct hk_native_texture_descriptor packed_tex;
+      assert(hk_pack_native_texture(9, &packed_tex, &tex));
+      struct AGX_TEXTURE_GEN9 decoded_tex = {0};
+      assert(AGX_TEXTURE_GEN9_unpack(NULL, (const uint8_t *)packed_tex.opaque,
+                                     &decoded_tex));
+      assert(decoded_tex.layout == AGX_LAYOUT_INTERCHANGE);
+      assert(decoded_tex.channels == cases[i].channels);
+      assert(decoded_tex.type == AGX_TEXTURE_TYPE_UNORM);
+      assert(decoded_tex.swizzle_r == cases[i].swizzle_r &&
+             decoded_tex.swizzle_g == cases[i].swizzle_g &&
+             decoded_tex.swizzle_b == cases[i].swizzle_b &&
+             decoded_tex.swizzle_a == cases[i].swizzle_a);
+      assert(decoded_tex.compressed && decoded_tex.extended);
+      assert(decoded_tex.address == base_va);
+      assert(decoded_tex.acceleration_buffer == meta_va);
+      assert(decoded_tex.stride == ((tiles_x - 1u) << 4));
+      assert(!hk_pack_native_texture(10, &packed_tex, &tex));
+   }
+}
+
 int
 main(void)
 {
@@ -874,6 +1071,7 @@ main(void)
    check_gen9_bc1_rgba_texture();
    check_gen9_etc2_rgba8_texture();
    check_gen9_astc_4x4_texture();
+   check_gen10_astc_hdr_textures();
    check_gen9_cube_textures();
    check_gen9_cube_array_texture();
    check_gen9_bc_textures();
@@ -2010,13 +2208,20 @@ main(void)
       array_expected[0] |= 1;
       assert(!memcmp(&packed, array_expected, sizeof(array_expected)));
       semantic.layers = 2;
-      assert(!hk_pack_native_pbe(10, &packed, &semantic));
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
       semantic.layers = 1;
+      semantic.levels = 2;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
+      semantic.dimension = AGX_TEXTURE_DIMENSION_3D;
+      semantic.layers = 4;
+      semantic.levels = 1;
+      assert(hk_pack_native_pbe(10, &packed, &semantic));
       semantic.levels = 2;
       assert(!hk_pack_native_pbe(10, &packed, &semantic));
    }
    check_compressed_msaa_pbe();
    check_captured_rgba8_lossless_pbe();
+   check_gen9_interchange_descriptors();
    puts("honeykrisp native descriptor geometry/policy: passed");
    return 0;
 }

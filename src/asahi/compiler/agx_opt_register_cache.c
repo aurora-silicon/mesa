@@ -18,8 +18,10 @@
 static void
 agx3_remove_redundant_physical_copies(agx_context *ctx)
 {
-   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3C ||
-       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) || ctx->is_preamble)
+      return;
+   if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+       ctx->stage != MESA_SHADER_FRAGMENT)
       return;
 
    uint32_t serial = 0;
@@ -27,9 +29,16 @@ agx3_remove_redundant_physical_copies(agx_context *ctx)
       uint32_t value[AGX_NUM_REGS] = {0};
       agx_foreach_instr_in_block_safe(block, I) {
          const struct agx_opcode_info *info = &agx_opcodes_info[I->op];
+         /* Texture and image instructions can clobber undeclared physical
+          * scratch GPRs during packing (for example AGX3B cube CEM scratch in
+          * src[6]/+4/+6 and fixed r0/r7/r2 on immediate-descriptor cubes), so
+          * always reset the physical-copy table across them. */
          if (!info->can_eliminate || !info->can_reorder ||
              info->schedule_class != AGX_SCHEDULE_CLASS_NONE ||
-             !I->nr_dests) {
+             !I->nr_dests ||
+             I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+             I->op == AGX_OPCODE_TEXTURE_LOAD ||
+             I->op == AGX_OPCODE_IMAGE_LOAD) {
             memset(value, 0, sizeof(value));
             continue;
          }
@@ -522,9 +531,17 @@ agx_opt_register_cache(agx_context *ctx)
       }
 
       /* Set of registers read "soon" by an ALU instruction. These are
-       * candidates for the .cache bit.
+       * candidates for the .cache bit. On AGX3B, bound the lookahead window to
+       * 16 ALU instructions so long basic blocks do not evict hot short-lived
+       * temporaries from the register cache for cold state read dozens or
+       * hundreds of instructions later.
        */
+      const bool bound_agx3b_cache =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+      const uint32_t agx3b_cache_window = 16;
       BITSET_DECLARE(alu_reads, AGX_NUM_REGS) = {0};
+      uint32_t next_alu_read[AGX_NUM_REGS] = {0};
+      uint32_t alu_pos = 1;
 
       agx_foreach_instr_in_block_rev(block, I) {
          agx_block *target = fused_break_target(I);
@@ -540,26 +557,47 @@ agx_opt_register_cache(agx_context *ctx)
             uint64_t reg = I->dest[d].value;
             unsigned nr = agx_index_size_16(I->dest[d]);
 
-            I->dest[d].cache = BITSET_TEST(alu_reads, I->dest[d].value);
+            if (bound_agx3b_cache) {
+               uint32_t next = next_alu_read[reg];
+               I->dest[d].cache = next != 0 && (alu_pos - next) <= agx3b_cache_window;
+               for (unsigned c = 0; c < nr; ++c)
+                  next_alu_read[reg + c] = 0;
+            } else {
+               I->dest[d].cache = BITSET_TEST(alu_reads, I->dest[d].value);
+            }
             BITSET_CLEAR_COUNT(alu_reads, reg, nr);
          }
 
          agx_foreach_reg_src(I, s) {
-            I->src[s].cache = BITSET_TEST(alu_reads, I->src[s].value);
+            uint64_t reg = I->src[s].value;
+            if (bound_agx3b_cache) {
+               uint32_t next = next_alu_read[reg];
+               I->src[s].cache = next != 0 && (alu_pos - next) <= agx3b_cache_window;
+            } else {
+               I->src[s].cache = BITSET_TEST(alu_reads, reg);
+            }
          }
 
+         const bool is_alu = agx_is_alu(I);
          agx_foreach_reg_src(I, s) {
             uint64_t reg = I->src[s].value;
             unsigned nr = agx_index_size_16(I->src[s]);
 
-            /* If the register dead after this instruction, it's the last use.
-             * That includes if the register is overwritten this cycle, but that
-             * won't show up in the liveness analysis, unless masked-off
-             * threads still need the register (its inactive set).
+            /* If every half of the register is dead after this instruction,
+             * it's the last use. That includes halves overwritten this cycle
+             * (which won't show up in liveness analysis), unless masked-off
+             * threads still need them (the inactive set).
              */
-            bool lu = !BITSET_TEST_COUNT(live, reg, nr) ||
-                      (writes_reg(I, reg) &&
-                       !(inactive && BITSET_TEST_COUNT(inactive, reg, nr)));
+            bool lu = true;
+            for (unsigned c = 0; c < nr; ++c) {
+               const unsigned r = reg + c;
+               if (BITSET_TEST(live, r) &&
+                   (!writes_reg(I, r) ||
+                    (inactive && BITSET_TEST(inactive, r)))) {
+                  lu = false;
+                  break;
+               }
+            }
 
             if (keep_scratch && reg <= scratch_hi && reg + nr > scratch_lo)
                lu = false;
@@ -573,17 +611,20 @@ agx_opt_register_cache(agx_context *ctx)
             I->src[s].discard = lu && (!block->cf_divergent || physical);
 
             /* Mark any source read by an ALU instruction in the same block as
-             * wanting a .cache hint. This is better than just marking
-             * everything, although it overly hints for very long blocks and
-             * underhints for registers used across block boundaries. It's
-             * probably good enough, though, and it's not clear how to do much
-             * better given our limited understanding of the hardware.
+             * wanting a .cache hint.
              */
-            if (agx_is_alu(I))
+            if (is_alu) {
                BITSET_SET_COUNT(alu_reads, reg, nr);
+               if (bound_agx3b_cache) {
+                  for (unsigned c = 0; c < nr; ++c)
+                     next_alu_read[reg + c] = alu_pos;
+               }
+            }
 
             assert(!(I->src[s].discard && I->src[s].cache));
          }
+         if (is_alu)
+            alu_pos++;
 
          /* M5 (AGX3C): a register read by more than one source of the same
           * instruction is not discarded by any of them. With both sources
@@ -659,7 +700,10 @@ agx_opt_register_cache(agx_context *ctx)
                   read = agx_is_alu(H);
                   break;
                }
-               if (writes_reg(H, reg))
+               bool overwrites = true;
+               for (unsigned c = 0; c < nr; ++c)
+                  overwrites &= writes_reg(H, reg + c);
+               if (overwrites)
                   break;
             }
             I->src[s].cache = read;

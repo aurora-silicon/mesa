@@ -10,8 +10,8 @@ extern "C" {
 #include "agx_nir.h"
 }
 
-/* Compute shaders hoist loop invariants on every generation, bounded by that
- * generation's register file. A K loop that reads shared memory at a uniform
+/* Loop invariants are hoisted on every AGX3 stage and, their integer terms, in
+ * AGX2 compute shaders; reassociation puts invariant terms first there. A K loop that reads shared memory at a uniform
  * base plus per-lane terms plus the counter, as llama.cpp's coopmat mul_mm
  * does, compiles on each encoding.
  */

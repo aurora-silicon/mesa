@@ -520,6 +520,12 @@ if with_tests
     )
   endif
 
+  if host_machine.system() == 'linux'
+    files_util_tests += files(
+      'tests/u_thread_util_clamp_test.cpp',
+    )
+  endif
+
   test(
     'util_tests',
     executable(

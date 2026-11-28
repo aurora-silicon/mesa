@@ -276,7 +276,21 @@ util_queue_thread_func(void *input)
       /* The nice() function can only set a maximum of 19. */
       setpriority(PRIO_PROCESS, syscall(SYS_gettid), 19);
    }
+
 #endif
+
+   /* Ask the scheduler to keep this thread on the big CPUs: a minimum
+    * utilisation clamp of the big CPU capacity makes the small CPUs a misfit
+    * for it. Energy-aware scheduling places a task on the smallest CPU its
+    * utilisation fits, and a driver thread that the application thread waits
+    * on can fit a small CPU exactly because it waits for the application
+    * thread part of the time, and then the application thread waits for the
+    * small CPU. Unlike an affinity mask it is a hint: the load balancer still
+    * moves the thread when the big CPUs are busy, and the clamp only raises
+    * the CPU frequency while the thread is runnable.
+    */
+   if (queue->flags & UTIL_QUEUE_INIT_PREFER_BIG_CPUS)
+      util_thread_raise_min_util_clamp(util_get_cpu_caps()->big_cpu_capacity);
 
    if (strlen(queue->name) > 0) {
       char name[16];

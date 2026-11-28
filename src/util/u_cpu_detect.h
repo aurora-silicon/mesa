@@ -130,6 +130,14 @@ struct util_cpu_caps_t {
     * A value of zero indicates that CPUs are homogeneous.
     */
    int16_t nr_big_cpus;
+
+   /**
+    * The capacity a CPU needs to count as "big" (half the capacity of the
+    * largest CPU, as for nr_big_cpus), or zero when every CPU is big or the
+    * capacities are unknown. A thread asking the scheduler for at least this
+    * much utilisation does not fit any of the other CPUs.
+    */
+   uint16_t big_cpu_capacity;
 };
 
 struct _util_cpu_caps_state_t {
