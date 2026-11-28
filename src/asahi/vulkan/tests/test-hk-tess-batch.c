@@ -520,6 +520,9 @@ main(void)
    struct agx_draw indirect = {.b = agx_grid_indirect(0x10000)};
    T("batchable: direct (HAL200)",
      hk_tess_batchable(AGX_CHIP_G17P, direct, false, false));
+   T("batchable: native AGX3 G15/G16",
+     hk_tess_batchable(AGX_CHIP_G15G, direct, false, false) &&
+        hk_tess_batchable(AGX_CHIP_G16G, direct, false, false));
    T("batchable: direct (M5 G17S)",
      hk_tess_batchable(AGX_CHIP_G17S, direct, false, false));
    T("batchable: direct (M5 G17G)",
@@ -533,7 +536,7 @@ main(void)
    T("batchable: not with queries counting",
      !hk_tess_batchable(AGX_CHIP_G17P, direct, false, true) &&
      !hk_tess_batchable(AGX_CHIP_G17S, direct, false, true));
-   T("batchable: not on other chips",
+   T("batchable: not on AGX2 or AGX3D",
      !hk_tess_batchable(AGX_CHIP_G13G, direct, false, false) &&
      !hk_tess_batchable(AGX_CHIP_G18G, direct, false, false));
 
