@@ -2498,6 +2498,61 @@ tex_ycbcr_sampler(nir_tex_instr *tex, const void *state)
                                var->data.binding, index);
 }
 
+/* The LOD bias of a sample's immutable sampler, for
+ * hk_lower_g17p_sampler_bias(): the value hk_CreateSampler() stored in the
+ * sampler descriptor, and its filters, all of which
+ * hk_descriptor_set_layout_hash() keys the shader cache on. A dynamically
+ * indexed, non-immutable or YCbCr sampler is not known. */
+static bool
+hk_immutable_sampler_bias(const nir_tex_instr *tex, const void *_state,
+                          struct hk_known_sampler_bias *out)
+{
+   const struct lower_ycbcr_state *state = _state;
+   const int src = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (src < 0)
+      return false;
+
+   nir_deref_instr *deref = nir_src_as_deref(tex->src[src].src);
+   if (!deref)
+      return false;
+   unsigned index = 0;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return false;
+      index = nir_src_as_uint(deref->arr.index);
+      deref = nir_deref_instr_parent(deref);
+   }
+   if (!deref || deref->deref_type != nir_deref_type_var)
+      return false;
+
+   const nir_variable *var = deref->var;
+   const uint32_t set = var->data.descriptor_set;
+   if (set >= state->set_layout_count || state->set_layouts[set] == NULL)
+      return false;
+
+   const struct hk_descriptor_set_layout *set_layout =
+      vk_to_hk_descriptor_set_layout(state->set_layouts[set]);
+   if (var->data.binding >= set_layout->binding_count)
+      return false;
+
+   const struct hk_descriptor_set_binding_layout *bind_layout =
+      &set_layout->binding[var->data.binding];
+   if (bind_layout->immutable_samplers == NULL ||
+       index >= bind_layout->array_size ||
+       bind_layout->immutable_samplers[index] == NULL)
+      return false;
+
+   const struct hk_sampler *sampler = bind_layout->immutable_samplers[index];
+   if (sampler->vk.ycbcr_conversion != NULL)
+      return false;
+
+   *out = (struct hk_known_sampler_bias){
+      .bias = sampler->mip_lod_bias,
+      .nearest_mip_adjustment_only = sampler->d3d_nearest_mip_noop_at_zero,
+   };
+   return true;
+}
+
 static const struct hk_sampler *
 lookup_packed_ycbcr_sampler(nir_tex_instr *tex, const void *state)
 {
@@ -4091,9 +4146,19 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
                support_lod_bias);
 
    if (agx_chip_native_or_m5(dev->dev.chip) &&
-       agx_chip_sampler_has_lod_bias(dev->dev.chip))
+       agx_chip_sampler_has_lod_bias(dev->dev.chip)) {
+      const struct lower_ycbcr_state layouts = {
+         .set_layout_count = set_layout_count,
+         .set_layouts = set_layouts,
+      };
+      const struct hk_sampler_bias_lookup lookup = {
+         .known = hk_immutable_sampler_bias,
+         .state = &layouts,
+      };
       NIR_PASS(lowered_complex, nir, nir_shader_tex_pass,
-               hk_lower_g17p_sampler_bias, nir_metadata_control_flow, NULL);
+               hk_lower_g17p_sampler_bias, nir_metadata_control_flow,
+               (void *)&lookup);
+   }
 
    struct hk_instance *instance = hk_physical_device_instance(
       (struct hk_physical_device *)dev->vk.physical);

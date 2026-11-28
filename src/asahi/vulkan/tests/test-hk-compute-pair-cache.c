@@ -312,6 +312,43 @@ check_chip(enum agx_chip chip)
    assert(blob.size == 0);
    blob_finish(&blob);
 
+   /* Non-YCbCr immutable sampler properties that affect shader codegen (bias
+    * folding and hk_d3d_nearest_mip no-op dropping) must move the layout hash,
+    * as must replacing an immutable sampler with a mutable one. */
+   const VkDescriptorSetLayoutBinding mutable_sampler[] = {
+      {0, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, NULL},
+   };
+   struct hk_descriptor_set_layout *mut =
+      create_layout(dev, 0, mutable_sampler, 1);
+   assert(memcmp(sampled->vk.blake3, mut->vk.blake3,
+                 sizeof(sampled->vk.blake3)));
+   vk_descriptor_set_layout_unref(&dev->vk, &mut->vk);
+
+   struct hk_sampler biased_sampler = sampler;
+   biased_sampler.mip_lod_bias = 1.0f / 64.0f;
+   const VkSampler biased_handle = hk_sampler_to_handle(&biased_sampler);
+   const VkDescriptorSetLayoutBinding biased_imm[] = {
+      {0, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, &biased_handle},
+   };
+   struct hk_descriptor_set_layout *biased =
+      create_layout(dev, 0, biased_imm, 1);
+   assert(memcmp(sampled->vk.blake3, biased->vk.blake3,
+                 sizeof(sampled->vk.blake3)));
+
+   struct hk_sampler noop_sampler = biased_sampler;
+   noop_sampler.d3d_nearest_mip_noop_at_zero = true;
+   const VkSampler noop_handle = hk_sampler_to_handle(&noop_sampler);
+   const VkDescriptorSetLayoutBinding noop_imm[] = {
+      {0, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_ALL, &noop_handle},
+   };
+   struct hk_descriptor_set_layout *noop = create_layout(dev, 0, noop_imm, 1);
+   assert(memcmp(biased->vk.blake3, noop->vk.blake3, sizeof(biased->vk.blake3)));
+   assert(memcmp(sampled->vk.blake3, noop->vk.blake3,
+                 sizeof(sampled->vk.blake3)));
+
+   vk_descriptor_set_layout_unref(&dev->vk, &noop->vk);
+   vk_descriptor_set_layout_unref(&dev->vk, &biased->vk);
+
    check_producer(dev, set0, set2, sampled);
 
    vk_descriptor_set_layout_unref(&dev->vk, &sampled->vk);

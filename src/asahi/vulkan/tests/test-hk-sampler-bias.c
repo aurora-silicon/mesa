@@ -46,6 +46,73 @@ texture(nir_builder *b, nir_texop op, bool shadow)
    return tex;
 }
 
+static unsigned
+bias_queries(nir_shader *shader)
+{
+   unsigned queries = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            queries += instr->type == nir_instr_type_tex &&
+                       nir_instr_as_tex(instr)->op == nir_texop_lod_bias;
+         }
+      }
+   }
+   return queries;
+}
+
+/* An immutable sampler of the test's pipeline layout. */
+static bool
+known_bias(const nir_tex_instr *tex, const void *state,
+           struct hk_known_sampler_bias *out)
+{
+   (void)tex;
+   *out = *(const struct hk_known_sampler_bias *)state;
+   return true;
+}
+
+/* The constant level or bias a known sampler leaves a sample with. */
+static float
+folded_lod(nir_texop op, float level, struct hk_known_sampler_bias sampler)
+{
+   const struct hk_sampler_bias_lookup lookup = {
+      .known = known_bias,
+      .state = &sampler,
+   };
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_FRAGMENT, &options, "immutable sampler bias");
+   nir_tex_instr *tex = texture(&b, op, false);
+   if (op == nir_texop_txl)
+      nir_src_rewrite(&tex->src[nir_tex_instr_src_index(tex, nir_tex_src_lod)].src,
+                      nir_imm_float(&b, level));
+   assert(nir_shader_tex_pass(b.shader, hk_lower_g17p_sampler_bias,
+                              nir_metadata_control_flow, (void *)&lookup));
+   assert(!nir_shader_tex_pass(b.shader, hk_lower_g17p_sampler_bias,
+                               nir_metadata_control_flow, (void *)&lookup));
+   assert(tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS);
+   assert(bias_queries(b.shader) == 0);
+
+   nir_opt_constant_folding(b.shader);
+   const int src = nir_tex_instr_src_index(
+      tex, op == nir_texop_txl ? nir_tex_src_lod : nir_tex_src_bias);
+   assert(nir_src_is_const(tex->src[src].src));
+   const float value = nir_src_as_float(tex->src[src].src);
+   ralloc_free(b.shader);
+   return value;
+}
+
+
+/* An immutable sampler lookup that reports the sampler as unknown. */
+static bool
+unknown_bias(const nir_tex_instr *tex, const void *state,
+             struct hk_known_sampler_bias *out)
+{
+   (void)tex;
+   (void)state;
+   (void)out;
+   return false;
+}
+
 int main(void)
 {
    glsl_type_singleton_init_or_ref();
@@ -99,6 +166,64 @@ int main(void)
          checks++;
       }
    }
+
+   /* A known (immutable) sampler bias is added as a constant: no descriptor
+    * query, the zero-bias sampler is still selected, and a constant level or
+    * bias folds to the one constant the instruction takes as an immediate. */
+   const struct hk_known_sampler_bias api_bias = {.bias = -1.0f};
+   const struct hk_known_sampler_bias zero_bias = {.bias = 0.0f};
+   assert(folded_lod(nir_texop_txl, 1.0f, api_bias) == 0.0f);
+   assert(folded_lod(nir_texop_txl, 0.0f, zero_bias) == 0.0f);
+   assert(folded_lod(nir_texop_txb, 0.0f, api_bias) == .590551f - 1.0f);
+   assert(folded_lod(nir_texop_txb, 0.0f, zero_bias) == .590551f);
+   checks += 4;
+
+   /* hk_d3d_nearest_mip's +1/64 is dropped only where it is provably a no-op:
+    * an explicit level of exactly 0 on an eligible nearest-mip sampler. At
+    * 0.5 (the D3D tie-break boundary) or any other nonzero level, +1/64 stays. */
+   const float d3d = 1.0f / 64.0f;
+   const struct hk_known_sampler_bias nearest_only = {
+      .bias = d3d,
+      .nearest_mip_adjustment_only = true,
+   };
+   const struct hk_known_sampler_bias nearest = {.bias = d3d};
+   assert(folded_lod(nir_texop_txl, 0.0f, nearest_only) == 0.0f);
+   assert(folded_lod(nir_texop_txl, -0.0f, nearest_only) == 0.0f);
+   assert(folded_lod(nir_texop_txl, 0.5f, nearest_only) == 0.5f + d3d);
+   assert(folded_lod(nir_texop_txl, 1.0f, nearest_only) == 1.0f + d3d);
+   assert(folded_lod(nir_texop_txl, -1.0f, nearest_only) == -1.0f + d3d);
+   assert(folded_lod(nir_texop_txb, 0.0f, nearest_only) == .590551f + d3d);
+   assert(folded_lod(nir_texop_txl, 0.0f, nearest) == d3d);
+   checks += 7;
+
+   /* Unknown samplers fall back to the descriptor query; shadow samples stay
+    * untouched even when a lookup callback is provided. */
+   {
+      const struct hk_sampler_bias_lookup miss = {.known = unknown_bias};
+      nir_builder b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "unknown sampler bias");
+      nir_tex_instr *tex = texture(&b, nir_texop_txl, false);
+      assert(nir_shader_tex_pass(b.shader, hk_lower_g17p_sampler_bias,
+                                 nir_metadata_control_flow, (void *)&miss));
+      assert(bias_queries(b.shader) == 1);
+      assert(tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS);
+      ralloc_free(b.shader);
+
+      const struct hk_sampler_bias_lookup hit = {
+         .known = known_bias,
+         .state = &nearest_only,
+      };
+      b = nir_builder_init_simple_shader(
+         MESA_SHADER_FRAGMENT, &options, "shadow immutable sampler");
+      tex = texture(&b, nir_texop_txl, true);
+      assert(!nir_shader_tex_pass(b.shader, hk_lower_g17p_sampler_bias,
+                                  nir_metadata_control_flow, (void *)&hit));
+      assert(bias_queries(b.shader) == 0);
+      assert(!(tex->backend_flags & HK_TEXTURE_FLAG_COMBINED_BIAS));
+      ralloc_free(b.shader);
+      checks += 2;
+   }
+
    glsl_type_singleton_decref();
    printf("%u sampler bias scope/idempotence/handle checks passed\n", checks);
    return 0;

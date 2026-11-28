@@ -262,8 +262,11 @@ hk_CreateSampler(VkDevice device,
    VkResult result;
 
    VkSamplerCreateInfo d3d_info;
-   if (hk_physical_device_instance(pdev)->drirc.misc.d3d_nearest_mip &&
-       info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST) {
+   const float api_mip_lod_bias = info->mipLodBias;
+   const bool d3d_nearest_mip =
+      hk_physical_device_instance(pdev)->drirc.misc.d3d_nearest_mip &&
+      info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST;
+   if (d3d_nearest_mip) {
       d3d_info = *info;
       d3d_info.mipLodBias += HK_D3D_NEAREST_MIP_BIAS;
       info = &d3d_info;
@@ -289,6 +292,20 @@ hk_CreateSampler(VkDevice device,
    sampler->min_filter = info->minFilter;
    sampler->mag_filter = info->magFilter;
    sampler->mip_lod_bias = info->mipLodBias;
+   /* With nearest-mip filtering and zero API bias, hk_d3d_nearest_mip's +1/64
+    * moves explicit level 0 to +1/64. Under any sampler [minLod, maxLod] and
+    * view minLod clamp, both clamp either to the same value or into [0, 1/64],
+    * which always selects mip level 0. When magnification and minification
+    * share one isotropic, non-comparison, normalized, weighted-average filter
+    * without YCbCr conversion, sampling at 0 and +1/64 is identical. */
+   sampler->d3d_nearest_mip_noop_at_zero =
+      d3d_nearest_mip && api_mip_lod_bias == 0.0f &&
+      info->magFilter == info->minFilter &&
+      !info->anisotropyEnable &&
+      !info->compareEnable &&
+      !info->unnormalizedCoordinates &&
+      sampler->vk.ycbcr_conversion == NULL &&
+      sampler->vk.reduction_mode == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
    if (sampler->vk.ycbcr_conversion) {
       sampler->ycbcr = sampler->vk.ycbcr_conversion->state;
       /* Packed 4:2:2 views on native AGX3 and M5 are backed by plain RGBA word

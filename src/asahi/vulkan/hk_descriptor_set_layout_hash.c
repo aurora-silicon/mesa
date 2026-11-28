@@ -46,12 +46,21 @@ hk_descriptor_set_layout_hash(struct hk_descriptor_set_layout *layout)
          for (uint32_t i = 0; i < layout->binding[b].array_size; i++) {
             const struct hk_sampler *sampler =
                layout->binding[b].immutable_samplers[i];
-            /* These shader-visible values were initialized with the sampler. */
-            if (sampler != NULL && sampler->vk.ycbcr_conversion != NULL) {
-               BLAKE3_UPDATE_VALUE(sampler->ycbcr);
+            const bool has_sampler = sampler != NULL;
+            BLAKE3_UPDATE_VALUE(has_sampler);
+            /* These shader-visible values were initialized with the sampler.
+             * Explicit and biased samples add an immutable sampler's LOD bias
+             * as a shader constant, or drop hk_d3d_nearest_mip's no-op
+             * adjustment at explicit level 0 (hk_lower_g17p_sampler_bias()). */
+            if (sampler != NULL) {
+               BLAKE3_UPDATE_VALUE(sampler->mip_lod_bias);
+               BLAKE3_UPDATE_VALUE(sampler->d3d_nearest_mip_noop_at_zero);
                BLAKE3_UPDATE_VALUE(sampler->min_filter);
                BLAKE3_UPDATE_VALUE(sampler->mag_filter);
-               BLAKE3_UPDATE_VALUE(sampler->mip_lod_bias);
+               const bool has_ycbcr = sampler->vk.ycbcr_conversion != NULL;
+               BLAKE3_UPDATE_VALUE(has_ycbcr);
+               if (has_ycbcr)
+                  BLAKE3_UPDATE_VALUE(sampler->ycbcr);
             }
          }
       }
