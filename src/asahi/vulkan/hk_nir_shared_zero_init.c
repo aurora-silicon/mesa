@@ -7,6 +7,7 @@
 #include "nir.h"
 #include "util/bitscan.h"
 #include "util/macros.h"
+#include "util/u_math.h"
 
 #define HK_SHARED_ZERO_INIT_MAX_BYTES   (64u * 1024u)
 #define HK_SHARED_ZERO_INIT_MAX_DWORDS  (HK_SHARED_ZERO_INIT_MAX_BYTES / 4u)
@@ -24,7 +25,9 @@ struct count_loop {
 
 /* Evaluate a pure workgroup-local integer expression for thread (x, y, z, idx)
  * and optional counting-loop induction variable iv_val, matching exact 32-bit
- * GPU wrap-around semantics. Returns false on any non-local or unsupported op. */
+ * GPU wrap-around semantics. The result is the value zero-extended from
+ * def->bit_size. Arithmetic is only evaluated at 32 bits. Returns false on any
+ * non-local or unsupported op. */
 static bool
 eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
          uint32_t z, uint32_t idx, uint32_t iv_val, unsigned depth,
@@ -44,7 +47,7 @@ eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
    switch (instr->type) {
    case nir_instr_type_load_const: {
       nir_load_const_instr *lc = nir_instr_as_load_const(instr);
-      if (swiz >= def->num_components)
+      if (swiz >= def->num_components || def->bit_size > 32)
          return false;
       *out = (uint32_t)nir_const_value_as_uint(lc->value[swiz], def->bit_size);
       return true;
@@ -52,6 +55,9 @@ eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
 
    case nir_instr_type_intrinsic: {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      /* Local IDs and indices are below 1024, so 16 and 32 bits are exact. */
+      if (def->bit_size != 16 && def->bit_size != 32)
+         return false;
       if (intr->intrinsic == nir_intrinsic_load_local_invocation_index) {
          if (swiz != 0)
             return false;
@@ -94,15 +100,36 @@ eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
             return false;
       }
 
+      /* Conversions extend from the source width. Everything else is only
+       * evaluated at 32 bits, where uint32_t arithmetic matches the GPU. */
+      const unsigned src_bits = alu->src[0].src.ssa->bit_size;
       switch (alu->op) {
       case nir_op_mov:
-      case nir_op_u2u32:
-      case nir_op_i2i32:
          *out = s[0];
          return true;
+      case nir_op_u2u32:
+         if (src_bits > 32)
+            return false;
+         *out = s[0];
+         return true;
+      case nir_op_i2i32:
+         if (src_bits > 32)
+            return false;
+         *out = (uint32_t)util_sign_extend(s[0], src_bits);
+         return true;
       case nir_op_u2u16:
+         if (src_bits > 32)
+            return false;
          *out = s[0] & 0xffffu;
          return true;
+      default:
+         break;
+      }
+
+      if (alu->def.bit_size != 32)
+         return false;
+
+      switch (alu->op) {
       case nir_op_iadd:
          *out = s[0] + s[1];
          return true;
@@ -195,9 +222,9 @@ chase_mov(nir_def *def)
       if (instr->type != nir_instr_type_alu)
          break;
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      if ((alu->op == nir_op_mov || alu->op == nir_op_u2u32 ||
-           alu->op == nir_op_i2i32) &&
-          alu->src[0].swizzle[0] == 0) {
+      /* Only plain moves: a conversion would change the width or signedness
+       * the caller reads a constant at. */
+      if (alu->op == nir_op_mov && alu->src[0].swizzle[0] == 0) {
          def = alu->src[0].src.ssa;
          continue;
       }

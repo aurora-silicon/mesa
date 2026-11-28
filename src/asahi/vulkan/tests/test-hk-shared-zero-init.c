@@ -273,6 +273,103 @@ test_negative_cases(void)
    }
 }
 
+/* Store idx-strided dwords at ishl(idx, 2) + extra over a 256 B tile, so the
+ * tile is covered exactly when the evaluator reads extra as 0. */
+static bool
+dword_fill_with_offset(nir_def *(*extra)(nir_builder *b, nir_def *base))
+{
+   nir_builder b = new_cs(64, 1, 1, 256);
+   nir_def *idx = nir_load_local_invocation_index(&b);
+   nir_def *off = extra(&b, nir_ishl_imm(&b, idx, 2));
+   nir_store_shared(&b, nir_imm_int(&b, 0), off, .write_mask = 0x1,
+                    .align_mul = 4);
+   emit_wg_shared_barrier(&b);
+   bool full = hk_nir_shared_memory_fully_initialized(b.shader);
+   ralloc_free(b.shader);
+   return full;
+}
+
+/* base + 4 + i2i32(-4 as i16): sign-extended this is base. */
+static nir_def *
+add_i2i32_minus4(nir_builder *b, nir_def *base)
+{
+   nir_def *m4 = nir_i2i32(b, nir_imm_intN_t(b, 0xfffc, 16));
+   return nir_iadd(b, nir_iadd_imm(b, base, 4), m4);
+}
+
+/* base + i2i32(0xffff as i16) + 0xffff0001: sign-extended this is
+ * base + 0xffff0000, out of range. Zero-extended it would wrap to base. */
+static nir_def *
+add_i2i32_minus1_wrap(nir_builder *b, nir_def *base)
+{
+   nir_def *m1 = nir_i2i32(b, nir_imm_intN_t(b, 0xffff, 16));
+   return nir_iadd(b, base, nir_iadd_imm(b, m1, 0xffff0001u));
+}
+
+/* u2u32(iadd16(u2u16(base), 0xff80)) - 0xff80: 16-bit wrap-around makes this
+ * base - 0x10000 for base >= 0x80. Evaluated at 32 bits it would be base. */
+static nir_def *
+add_16bit_iadd_wrap(nir_builder *b, nir_def *base)
+{
+   nir_def *sum16 = nir_iadd(b, nir_u2u16(b, base),
+                             nir_imm_intN_t(b, 0xff80, 16));
+   return nir_isub(b, nir_u2u32(b, sum16), nir_imm_int(b, 0xff80));
+}
+
+/* base + u2u32(0x100000000 as u64): 64-bit constants are not evaluated. */
+static nir_def *
+add_u2u32_64bit_const(nir_builder *b, nir_def *base)
+{
+   return nir_iadd(b, base, nir_u2u32(b, nir_imm_int64(b, 0x100000000ll)));
+}
+
+static void
+test_eval_widths(void)
+{
+   T("i2i32 of a negative i16 sign-extends",
+     dword_fill_with_offset(add_i2i32_minus4));
+   T("i2i32 of 0xffff_i16 is -1, not 65535",
+     !dword_fill_with_offset(add_i2i32_minus1_wrap));
+   T("16-bit iadd is not evaluated as 32-bit",
+     !dword_fill_with_offset(add_16bit_iadd_wrap));
+   T("64-bit constant is rejected",
+     !dword_fill_with_offset(add_u2u32_64bit_const));
+}
+
+/* Loop bound uge(k, i2i32(0xffff_i16)) is 0xffffffff, not 65535. Read as
+ * 65535, k = 0xffdf + lx, k += 16 would be two iterations covering 2048 B. */
+static void
+test_loop_bound_through_i2i32(void)
+{
+   nir_builder b = new_cs(16, 16, 1, 2048);
+   nir_def *lid = nir_load_local_invocation_id(&b);
+   nir_def *lx = nir_channel(&b, lid, 0);
+   nir_def *ly = nir_channel(&b, lid, 1);
+
+   nir_variable *k_var = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+   nir_store_var(&b, k_var, nir_iadd_imm(&b, lx, 0xffdf), 0x1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *k = nir_load_var(&b, k_var);
+      nir_def *lim = nir_i2i32(&b, nir_imm_intN_t(&b, 0xffff, 16));
+      nir_break_if(&b, nir_uge(&b, k, lim));
+      nir_def *col = nir_iadd_imm(&b, k, -0xffdf);
+      nir_def *off =
+         nir_ishl_imm(&b, nir_iadd(&b, nir_ishl_imm(&b, ly, 5), col), 2);
+      nir_store_shared(&b, nir_imm_int(&b, 5), off, .write_mask = 0x1,
+                       .align_mul = 4);
+      nir_store_var(&b, k_var, nir_iadd_imm(&b, k, 16), 0x1);
+   }
+   nir_pop_loop(&b, loop);
+   emit_wg_shared_barrier(&b);
+
+   nir_lower_vars_to_ssa(b.shader);
+   T("loop bound behind i2i32 keeps zero-init",
+     !hk_nir_shared_memory_fully_initialized(b.shader));
+   ralloc_free(b.shader);
+}
+
 int
 main(void)
 {
@@ -282,6 +379,8 @@ main(void)
    test_conv2d_dxvk_amul();
    test_direct_vec4_init();
    test_negative_cases();
+   test_eval_widths();
+   test_loop_bound_through_i2i32();
    glsl_type_singleton_decref();
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;
