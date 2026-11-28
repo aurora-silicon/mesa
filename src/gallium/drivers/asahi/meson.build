@@ -692,4 +692,30 @@ if with_tests and with_tools.contains('drm-shim')
       suite : ['asahi'],
     )
   endforeach
+
+  asahi_repeat_draw_test = executable(
+    'asahi-repeat-draw',
+    files('tests/test-agx-repeat-draw.c'),
+    include_directories : [
+      inc_gallium_aux, inc_gallium, inc_include, inc_src, inc_asahi,
+      inc_virtio_gpu, inc_virtio_vdrm,
+    ],
+    dependencies : [
+      idep_nir, idep_mesautil, idep_agx_pack, dep_libdrm, idep_libagx,
+      idep_libagx_shaders_h, idep_xmlconfig,
+    ],
+    link_with : [
+      libasahi, libasahiwinsys, libasahi_compiler, libasahi_lib,
+      libasahi_layout, libasahi_decode, libgallium, libgalliumvl_stub,
+    ],
+  )
+  foreach chip : ['g13g', 'g15g', 'g16g', 'g17p']
+    test(
+      'asahi-' + chip + '-repeat-draw',
+      prog_python,
+      args : [files('tests/run-shim.py'), libasahi_noop_drm_shim, asahi_repeat_draw_test],
+      env : ['ASAHI_SHIM_CHIP=' + chip, 'MESA_SHADER_CACHE_DISABLE=true'],
+      suite : ['asahi'],
+    )
+  endforeach
 endif

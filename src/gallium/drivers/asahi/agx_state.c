@@ -7756,6 +7756,9 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
    batch->samplers[stage] = T.gpu;
 }
 
+static void agx_upload_stage_table(struct agx_batch *batch,
+                                   const struct agx_compiled_shader *cs);
+
 static void
 agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
 {
@@ -7782,6 +7785,16 @@ agx_update_descriptors(struct agx_batch *batch, struct agx_compiled_shader *cs)
    if (ctx->stage[stage].dirty & AGX_STAGE_DIRTY_SAMPLER)
       agx_upload_samplers(batch, cs, stage);
 
+   agx_upload_stage_table(batch, cs);
+}
+
+/* Upload the stage table of cs's stage, the part of it cs reads. */
+static void
+agx_upload_stage_table(struct agx_batch *batch,
+                       const struct agx_compiled_shader *cs)
+{
+   struct agx_context *ctx = batch->ctx;
+   const mesa_shader_stage stage = cs->stage;
    struct agx_stage_uniforms *unif = &batch->stage_uniforms[stage];
    const size_t full_size =
       agx_stage_uniforms_size(agx_device(ctx->base.screen)->chip);
@@ -8096,6 +8109,10 @@ agx_graphics_tps_frame(const struct agx_device *dev,
    return dev->chip == AGX_CHIP_G18G ? ALIGN_POT(frame, 16) : frame;
 }
 
+/* A uniform range that agx_g17p_collect_graphics_uniform_ranges() did not
+ * read from a system value table. */
+#define AGX_G17P_RANGE_NO_TABLE 0xff
+
 struct agx_g17p_uniform_range_locs {
    int draw_id_range;
    uint16_t draw_id_offset;
@@ -8109,7 +8126,8 @@ agx_g17p_collect_graphics_uniform_ranges(
    struct agx_batch *batch, struct agx_compiled_shader *cs,
    struct agx_linked_shader *linked,
    struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES],
-   size_t *count_out, struct agx_g17p_uniform_range_locs *locs)
+   size_t *count_out, struct agx_g17p_uniform_range_locs *locs,
+   uint8_t *range_table)
 {
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
@@ -8148,6 +8166,8 @@ agx_g17p_collect_graphics_uniform_ranges(
          &batch->pool, pointers, sizeof(pointers), 8);
       if (!pointer_va)
          return false;
+      if (range_table)
+         range_table[count] = AGX_G17P_RANGE_NO_TABLE;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = 0,
          .size_halfs = 8,
@@ -8229,6 +8249,8 @@ agx_g17p_collect_graphics_uniform_ranges(
          }
       }
 
+      if (range_table)
+         range_table[count] = push->table;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = start,
          .size_halfs = length,
@@ -8244,6 +8266,8 @@ agx_g17p_collect_graphics_uniform_ranges(
           rodata->offset > cs->bo->size ||
           size_B > cs->bo->size - rodata->offset)
          return false;
+      if (range_table)
+         range_table[count] = AGX_G17P_RANGE_NO_TABLE;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = rodata->base_uniform,
          .size_halfs = rodata->size_16,
@@ -8254,6 +8278,8 @@ agx_g17p_collect_graphics_uniform_ranges(
    if (stage == MESA_SHADER_FRAGMENT && linked->g17p_emrt_heap_base) {
       if (!batch->g17p_emrt_heap || count == AGX3_G17P_GRAPHICS_MAX_RANGES)
          return false;
+      if (range_table)
+         range_table[count] = AGX_G17P_RANGE_NO_TABLE;
       ranges[count++] = (struct agx3_ioto_uniform_range){
          .start_halfs = linked->g17p_emrt_heap_base,
          .size_halfs = 4,
@@ -8263,6 +8289,52 @@ agx_g17p_collect_graphics_uniform_ranges(
 
    *count_out = count;
    return true;
+}
+
+/* Record the uniform ranges of a vertex program made from a patch plan, so
+ * agx_draw_vbo_repeat() can patch the same plan again. A range read from a
+ * system value table is kept relative to that table: the replay reads the
+ * table addresses current at that draw, as agx_build_g17p_graphics_program()
+ * itself would. */
+static void
+agx_draw_repeat_record_program(struct agx_batch *batch,
+                               const struct agx_compiled_shader *cs,
+                               const struct agx_linked_shader *linked,
+                               const struct agx_g17p_graphics_template *plan,
+                               const struct agx3_ioto_uniform_range *ranges,
+                               const uint8_t *range_table, size_t count)
+{
+   __typeof__(batch->repeat) *r = &batch->repeat;
+   uint32_t table_mask = 0;
+
+   for (unsigned i = 0; i < count; ++i) {
+      const unsigned table = range_table[i];
+      if (table == AGX_G17P_RANGE_NO_TABLE)
+         continue;
+
+      /* Draw parameters come and go with the draw; replay only ranges of
+       * tables a replayed draw leaves in place or uploads itself. */
+      if (table != AGX_SYSVAL_TABLE_ROOT &&
+          table != AGX_SYSVAL_STAGE(MESA_SHADER_VERTEX))
+         return;
+
+      const uint64_t offset = ranges[i].address - batch->uniforms.tables[table];
+      if ((offset & 3) || offset > UINT32_MAX)
+         return;
+
+      table_mask |= BITFIELD_BIT(i);
+      r->range_table[i] = table;
+      r->range_offset[i] = (uint32_t)offset;
+   }
+
+   memcpy(r->ranges, ranges, count * sizeof(ranges[0]));
+   r->range_count = count;
+   r->table_mask = table_mask;
+   r->plan = plan;
+   r->templates_generated = linked->g17p_graphics_templates_generated;
+   r->vs = cs;
+   r->linked_vs = linked;
+   r->program_ok = true;
 }
 
 static uint32_t
@@ -8306,11 +8378,17 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
       return agx_usc_addr(dev, batch->g17p_fragment_program);
    }
 
+   const bool vertex = cs->stage == MESA_SHADER_VERTEX;
+   if (vertex)
+      batch->repeat.program_ok = false;
+
    struct agx3_ioto_uniform_range
       ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+   uint8_t range_table[AGX3_G17P_GRAPHICS_MAX_RANGES];
    size_t count = 0;
    if (!agx_g17p_collect_graphics_uniform_ranges(batch, cs, linked, ranges,
-                                                 &count, NULL))
+                                                 &count, NULL,
+                                                 vertex ? range_table : NULL))
       return 0;
 
    if (!agx_va_in_usc_window(dev, linked->bo->va->addr + linked->entry_offset))
@@ -8365,6 +8443,9 @@ agx_build_g17p_graphics_program(struct agx_batch *batch,
                                                    &program_length))
             return 0;
          relocated = true;
+         if (vertex)
+            agx_draw_repeat_record_program(batch, cs, linked, plan, ranges,
+                                           range_table, count);
       }
    }
 
@@ -18507,7 +18588,7 @@ agx_draw_multi_indirect(struct pipe_context *pctx,
                                       linked->bo->va->addr +
                                          linked->entry_offset) ||
                 !agx_g17p_collect_graphics_uniform_ranges(
-                   clean, vs, linked, ranges, &range_count, &locs) ||
+                   clean, vs, linked, ranges, &range_count, &locs, NULL) ||
                 (uses_draw_id && locs.uses_indirect_root) ||
                 !agx3_g17p_graphics_program_bound(dev->chip, ranges,
                                                   range_count, &vs_capacity)) {
@@ -18681,6 +18762,233 @@ agx_try_elide_color_reload(struct agx_context *ctx, struct agx_batch *batch,
       batch->g17p_resolve_reload = false;
 }
 
+/* Native AGX3 direct draws that change nothing but vertex constant buffers
+ * between them, the classic loop of a uniform update (glUniform* or a UBO
+ * range rebind) and a draw, spend most of their CPU time in agx_draw_vbo()
+ * re-deriving state that cannot have changed. Such a draw encodes as a vertex
+ * state update with a newly patched vertex program and a draw body; with
+ * nothing changed at all, as the draw body alone. agx_draw_vbo_repeat() emits
+ * exactly that for a draw that follows a recorded draw in the same batch,
+ * with nothing emitted in between.
+ */
+
+/* Whether the vertex shader may read its stage table pointer from the root
+ * table, which a replayed draw changes without uploading a new root table. */
+static bool
+agx_vs_reads_stage_table_pointer(const struct agx_compiled_shader *vs)
+{
+   if (vs->root_uniforms_upload_size == UINT16_MAX ||
+       vs->stage_uniforms_upload_size == UINT16_MAX)
+      return true;
+
+   const unsigned start = offsetof(struct agx_draw_uniforms,
+                                   tables[AGX_SYSVAL_STAGE(MESA_SHADER_VERTEX)]);
+   const unsigned end = start + sizeof(uint64_t);
+   for (unsigned i = 0; i < vs->push_range_count; ++i) {
+      const struct agx_push_range *push = &vs->push[i];
+      if (push->table == AGX_SYSVAL_TABLE_ROOT && push->offset < end &&
+          push->offset + push->length * 2 > start)
+         return true;
+   }
+
+   return false;
+}
+
+/* Whether a query observes draws: replayed draws count nothing. */
+static bool
+agx_draw_queries_bound(const struct agx_context *ctx)
+{
+   if (ctx->occlusion_query || ctx->time_elapsed || ctx->tf_any_overflow)
+      return true;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->prims_generated); ++i) {
+      if (ctx->prims_generated[i] || ctx->tf_prims_generated[i] ||
+          ctx->tf_overflow[i])
+         return true;
+   }
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->pipeline_statistics); ++i) {
+      if (ctx->pipeline_statistics[i])
+         return true;
+   }
+
+   return false;
+}
+
+/* After a direct draw on the full path: record it if a draw that only
+ * rebinds vertex constant buffers may replay it. */
+static void
+agx_draw_repeat_record(struct agx_context *ctx, struct agx_batch *batch,
+                       const struct pipe_draw_info *info)
+{
+   __typeof__(batch->repeat) *r = &batch->repeat;
+
+   if (!r->program_ok || r->vs != ctx->vs || r->linked_vs != ctx->linked.vs ||
+       !ctx->fs || !ctx->linked.fs || ctx->gs || ctx->in_tess ||
+       ctx->stage[MESA_SHADER_GEOMETRY].shader ||
+       ctx->stage[MESA_SHADER_TESS_EVAL].shader ||
+       ctx->streamout.num_targets || agx_draw_queries_bound(ctx) ||
+       ctx->cond_query || ctx->swtnl_inner ||
+       ctx->active_draw_without_restart || info->has_user_indices ||
+       info->mode == MESA_PRIM_PATCHES || ctx->vs->b.info.uses_draw_id ||
+       ctx->linked.vs->uses_base_param ||
+       (ctx->vs->so && ctx->vs->so->info.writes_memory) ||
+       !batch->g17p_bind_tail_latched || !batch->g17p_have_latched_vs ||
+       batch->g17p_latched_vs_shader != ctx->vs ||
+       batch->g17p_fragment_shader != agx_fs_launch_shader(ctx) ||
+       batch->g17p_fragment_linked != ctx->linked.fs ||
+       agx_vs_reads_stage_table_pointer(ctx->vs))
+      return;
+
+   r->fs = ctx->fs;
+   r->linked_fs = ctx->linked.fs;
+   r->mode = info->mode;
+   r->index_size = info->index_size;
+   r->restart = info->index_size && info->primitive_restart;
+   r->restart_index = info->restart_index;
+   r->vdm_end = batch->vdm.current;
+   r->valid = true;
+}
+
+static bool
+agx_draw_vbo_repeat(struct agx_context *ctx, const struct pipe_draw_info *info,
+                    const struct pipe_draw_start_count_bias *draw)
+{
+   struct agx_batch *batch = ctx->batch;
+   if (!batch || !batch->repeat.valid ||
+       batch->repeat.vdm_end != batch->vdm.current || ctx->dirty)
+      return false;
+
+#ifndef NDEBUG
+   /* agx_draw_vbo() dirties everything for every draw */
+   if (unlikely(agx_device(ctx->base.screen)->debug & AGX_DBG_DIRTY))
+      return false;
+#endif
+
+   __typeof__(batch->repeat) *r = &batch->repeat;
+   const unsigned vs_dirty = ctx->stage[MESA_SHADER_VERTEX].dirty;
+   if (vs_dirty & ~AGX_STAGE_DIRTY_CONST)
+      return false;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->stage); ++i) {
+      if (i != MESA_SHADER_VERTEX && i != MESA_SHADER_COMPUTE &&
+          ctx->stage[i].dirty)
+         return false;
+   }
+
+   /* The draw itself: the same primitive and index format, and indices the
+    * index list can address in place. */
+   if (info->mode != r->mode || info->index_size != r->index_size ||
+       info->has_user_indices)
+      return false;
+
+   if (info->index_size &&
+       (info->primitive_restart != r->restart ||
+        (r->restart && info->restart_index != r->restart_index) ||
+        (((uint64_t)draw->start * info->index_size) & 3)))
+      return false;
+
+   /* State without a dirty bit of its own. Beginning or ending a query
+    * dirties AGX_DIRTY_QUERY. */
+   if (ctx->vs != r->vs || ctx->linked.vs != r->linked_vs ||
+       ctx->fs != r->fs || ctx->linked.fs != r->linked_fs ||
+       ctx->cond_query || ctx->streamout.num_targets)
+      return false;
+
+   /* As agx_ensure_cmdbuf_has_space(), without linking a new chunk: that
+    * resets the latched bind tail, which only the full path emits. */
+   const size_t space =
+      AGX_VDM_STATE_UPDATE_LENGTH + AGX_VDM_HAL200_INDEXED_DRAW_BODY_LENGTH +
+      AGX_VDM_STREAM_LINK_LENGTH + 0x800;
+   if ((size_t)(batch->vdm.end - batch->vdm.current) < space)
+      return false;
+
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   uint8_t *out = batch->vdm.current;
+
+   if (vs_dirty) {
+      /* A new template may have evicted the recorded one */
+      if (r->linked_vs->g17p_graphics_templates_generated !=
+          r->templates_generated)
+         return false;
+
+      /* What agx_update_descriptors() does for this stage. Returning to the
+       * full path after this point is safe: it does the same again. */
+      agx_set_cbuf_uniforms(batch, MESA_SHADER_VERTEX);
+      agx_upload_stage_table(batch, ctx->vs);
+
+      struct agx3_ioto_uniform_range ranges[AGX3_G17P_GRAPHICS_MAX_RANGES];
+      memcpy(ranges, r->ranges, r->range_count * sizeof(ranges[0]));
+      /* The recorded ranges were valid for the plan. Moved to new tables
+       * with the same alignment, only the address-dependent part of
+       * agx_g17p_graphics_template_ranges_valid() needs a check. */
+      u_foreach_bit(i, r->table_mask) {
+         const uint64_t table = batch->uniforms.tables[r->range_table[i]];
+         if (!table || (table & 3))
+            return false;
+         ranges[i].address = table + r->range_offset[i];
+      }
+
+      if (!hk_g17p_patch_plan_fits(&r->plan->plan, ranges))
+         return false;
+
+      const size_t len = r->plan->program.program.length;
+      struct agx_bo *program_bo = NULL;
+      struct agx_ptr t = agx_pool_alloc_aligned_with_bo(
+         &batch->pipeline_pool, len, AGX_IOTO_PROGRAM_ALIGNMENT, &program_bo);
+      size_t program_length = 0;
+      if (!t.cpu || !program_bo || !agx_va_in_usc_window(dev, t.gpu) ||
+          !agx_g17p_graphics_template_emit_plan(r->plan, ranges, t.cpu, len,
+                                                &program_length))
+         return false;
+
+      agx_bo_assert_range(program_bo, t.gpu - program_bo->va->addr,
+                          program_length);
+
+      out = agx_g17p_emit_vs_state_update(batch, out, ctx->vs,
+                                          batch->g17p_latched_vs_word0, t.gpu,
+                                          NULL);
+      if (!out)
+         return false;
+
+      memcpy(r->ranges, ranges, r->range_count * sizeof(ranges[0]));
+
+      if (unlikely(dev->debug & AGX_DBG_PERF))
+         ctx->perf.vs_emits++;
+   }
+
+   struct agx_draw d = {0};
+   if (info->index_size) {
+      size_t ib_extent = 0;
+      d.index_buffer = agx_index_buffer_ptr(batch, info, draw, &ib_extent);
+      d.index_size = agx_translate_index_size(info->index_size);
+      d.index_buffer_range_B = ib_extent;
+      d.restart = info->primitive_restart;
+      d.indexed = true;
+      d.index_bias = draw->index_bias;
+   } else {
+      d.start = draw->start;
+   }
+   d.b = agx_3d(draw->count, info->instance_count, 1);
+
+   out = agx_g17p_emit_draw_body(dev->chip, out, &d,
+                                 agx_primitive_for_pipe(info->mode),
+                                 info->restart_index, 0);
+
+   batch->vdm.current = out;
+   r->vdm_end = out;
+   agx_dirty_reset_graphics(ctx);
+   batch->draws++;
+
+   if (unlikely(dev->debug & AGX_DBG_PERF))
+      ctx->perf.draws++;
+
+   if (unlikely(batch->draws > 100000))
+      agx_flush_batch_for_reason(ctx, batch, "Absurd number of draws");
+
+   return true;
+}
+
 static void
 agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
              unsigned drawid_offset,
@@ -18733,6 +19041,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
     * indirect draws intact: their counts are supplied by the GPU buffer.
     */
    if (!indirect && (!draws->count || !info->instance_count))
+      return;
+
+   if (!indirect && agx_draw_vbo_repeat(ctx, info, draws))
       return;
 
    /* G17P's index fetch starts at a dword boundary even for U8/U16
@@ -18974,6 +19285,12 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    struct agx_batch *batch = agx_get_batch(ctx);
    batch->g17g_prims += prims;
+
+   /* Whatever this draw encodes ends a recorded draw. The vertex program it
+    * latched stays recorded while nothing came after it. */
+   batch->repeat.program_ok = batch->repeat.program_ok && batch->repeat.valid &&
+                              batch->repeat.vdm_end == batch->vdm.current;
+   batch->repeat.valid = false;
    batch->g17g_small_budget |= g17g_budget && g17g_small;
    uint64_t ib = 0;
    size_t ib_extent = 0;
@@ -19446,6 +19763,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_dirty_reset_graphics(ctx);
 
    assert(batch == agx_get_batch(ctx) && "batch should not change under us");
+
+   if (!indirect && agx_chip_native_agx3(dev->chip))
+      agx_draw_repeat_record(ctx, batch, info);
 
    if (first_draw)
       agx_try_elide_color_reload(ctx, batch, info, indirect, draws);
