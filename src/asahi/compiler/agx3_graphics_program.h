@@ -9,7 +9,9 @@
 #include "asahi/lib/agx_ioto_preshader_core.h"
 #include "asahi/lib/agx_ioto_state_core.h"
 
-#define AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE 6144u
+/* Software composer capacity, not a hardware limit: matches compute so a full
+ * 512-half uniform layout with odd-aligned constant-program TPS inputs fits. */
+#define AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE 12288u
 /* Software composer capacity, not a hardware field: the Ioto loader bounds a
  * program by its total load chunks and body size, never by how many ranges
  * produced them. So this only has to cover every range the driver's collector

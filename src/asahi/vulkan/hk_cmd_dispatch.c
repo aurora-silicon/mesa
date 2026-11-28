@@ -3650,10 +3650,19 @@ hk_fused_compute_ioto_bound(const struct hk_device *dev, struct hk_shader *s,
       return fallback;
 
    size_t body_bound = 0, chunk_count = 0;
-   if (range_count &&
-       !agx3_ioto_uniform_program_body_bound(dev->dev.chip, ranges, range_count,
-                                             &body_bound, &chunk_count))
-      return fallback;
+   if (range_count) {
+      const struct agx3_ioto_uniform_program_desc bound_desc = {
+         .ranges = ranges,
+         .range_count = range_count,
+         .cprog_inputs =
+            s->b.info.has_preamble && s->b.info.agx3_preamble_tps_inputs
+               ? &s->b.info.agx3_preamble_inputs
+               : NULL,
+      };
+      if (!agx3_ioto_uniform_program_desc_body_bound(
+             dev->dev.chip, &bound_desc, &body_bound, &chunk_count))
+         return fallback;
+   }
 
    /* Include state tail, profile suffix, external constant-program branch,
     * and potential independent-base relocation overhead. */

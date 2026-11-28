@@ -229,6 +229,7 @@ test_g17p_fused_cprog_emit_matches_program(void)
    CHECK(hk_agx3_g17p_compute_program_generate(AGX_CHIP_G17P, &expected_desc,
                                                expected));
    CHECK(ioto_used == expected->length);
+   CHECK(hk_fused_compute_ioto_bound(&dev, &s, &p) >= ioto_used);
    CHECK(memcmp(ioto_buf, expected->bytes, ioto_used) == 0);
 
    /* Confirm that omitting the constant program produces different bytes, so

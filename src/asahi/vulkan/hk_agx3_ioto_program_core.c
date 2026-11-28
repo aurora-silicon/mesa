@@ -14,6 +14,13 @@
 
 #include <string.h>
 
+static_assert(HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE ==
+                 AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE,
+              "graphics Ioto program buffer size mismatch");
+static_assert(HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE ==
+                 AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE,
+              "compute Ioto program buffer size mismatch");
+
 bool
 hk_agx3_g17p_constant_program_from_binary(
    const void *binary, size_t binary_size, size_t offset, size_t size,

@@ -75,7 +75,7 @@ struct hk_agx3_g17p_graphics_program_desc {
    unsigned usc_clusters;
 };
 
-#define HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE 6144u
+#define HK_AGX3_G17P_GRAPHICS_PROGRAM_MAX_SIZE 12288u
 
 /*
  * The number of independently addressed uniform ranges a single graphics
@@ -311,7 +311,7 @@ bool hk_agx3_g17p_store_and_resolve_supported(
    const struct agx_tilebuffer_layout *tib,
    const struct hk_agx3_g17p_store_and_resolve_target *target);
 
-#define HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 6144u
+#define HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE 12288u
 
 #define HK_AGX3_G17P_MAX_ROOT_SETS            16u
 

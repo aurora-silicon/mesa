@@ -2749,6 +2749,112 @@ test_g17p_store_and_resolve(void)
    return 0;
 }
 
+/* Regression coverage for compute loaders publishing large odd-aligned
+ * constant-program input sets (as in dEQP-VK.ubo.random.16bit and 8bit
+ * compute cases): odd TPS compact offsets split paired uniform halves into
+ * two 10-byte extended 16-bit COPYs on GPU0 (G16G/G17P), exceeding the
+ * earlier 6 KiB software buffer even though the hardware stream is valid. */
+static int
+test_g17p_compute_large_cprog_inputs(void)
+{
+   static const struct agx3_ioto_uniform_range case1_ranges[] = {
+      { .start_halfs = 0, .size_halfs = 8, .address = UINT64_C(0x5bf2850000) },
+      { .start_halfs = 20, .size_halfs = 128, .address = UINT64_C(0x5bf28a0000) },
+      { .start_halfs = 148, .size_halfs = 128, .address = UINT64_C(0x5bf2890000) },
+      { .start_halfs = 276, .size_halfs = 128, .address = UINT64_C(0x5bf2880000) },
+      { .start_halfs = 404, .size_halfs = 56, .address = UINT64_C(0x5bf28a0100) },
+      { .start_halfs = 460, .size_halfs = 4, .address = UINT64_C(0x5bf2850098) },
+   };
+   static const uint64_t case1_words[AGX3_CPROG_INPUT_WORDS] = {
+      UINT64_C(0xfffffffff07000f0), UINT64_C(0xffffffffffffffff),
+      UINT64_C(0xfffffffff07fffff), UINT64_C(0xffffffffffffffff),
+      UINT64_C(0xfffffffff07fffff), UINT64_C(0xffffffffffffffff),
+      UINT64_C(0xffffffffffffffff), UINT64_C(0x0000000000000fff),
+   };
+
+   static const struct agx3_ioto_uniform_range case2_ranges[] = {
+      { .start_halfs = 0, .size_halfs = 8, .address = UINT64_C(0x5bf2870000) },
+      { .start_halfs = 24, .size_halfs = 128, .address = UINT64_C(0x5bf2890000) },
+      { .start_halfs = 152, .size_halfs = 126, .address = UINT64_C(0x5bf2890120) },
+      { .start_halfs = 280, .size_halfs = 64, .address = UINT64_C(0x5bf2880000) },
+      { .start_halfs = 344, .size_halfs = 28, .address = UINT64_C(0x5bf28b0000) },
+      { .start_halfs = 372, .size_halfs = 30, .address = UINT64_C(0x5bf28a0000) },
+      { .start_halfs = 404, .size_halfs = 32, .address = UINT64_C(0x5bf2890220) },
+   };
+   static const uint64_t case2_words[AGX3_CPROG_INPUT_WORDS] = {
+      UINT64_C(0xffffffff0d0000ff), UINT64_C(0xffffffffffffffff),
+      UINT64_C(0xffffffffffffffff), UINT64_C(0xffffffffffffffff),
+      UINT64_C(0x3fffffff3f3fffff), UINT64_C(0xf3ff0f0f0fff03ff),
+      UINT64_C(0x000ffffffff3f3f3), UINT64_C(0x0000000000000000),
+   };
+
+   struct agx3_ioto_uniform_range worst_ranges[16];
+   for (unsigned i = 0; i < ARRAY_SIZE(worst_ranges); ++i) {
+      worst_ranges[i] = (struct agx3_ioto_uniform_range){
+         .start_halfs = i * 32u,
+         .size_halfs = 32u,
+         .address = UINT64_C(0x5bf2800000) + (uint64_t)i * 0x100000u,
+      };
+   }
+   uint64_t worst_words[AGX3_CPROG_INPUT_WORDS];
+   memset(worst_words, 0xff, sizeof(worst_words));
+   worst_words[0] &= ~UINT64_C(1); /* 511 halves -> odd compact TPS alignment */
+
+   const struct {
+      const struct agx3_ioto_uniform_range *ranges;
+      size_t range_count;
+      const uint64_t *words;
+   } cases[] = {
+      { case1_ranges, ARRAY_SIZE(case1_ranges), case1_words },
+      { case2_ranges, ARRAY_SIZE(case2_ranges), case2_words },
+      { worst_ranges, ARRAY_SIZE(worst_ranges), worst_words },
+   };
+   const enum agx_chip chips[] = { AGX_CHIP_G16G, AGX_CHIP_G17P };
+
+   static const uint8_t dummy_cprog[8] = { 0 };
+   struct agx_ioto_constant_program cprog = {0};
+   CHECK(hk_agx3_g17p_constant_program_from_binary(
+      dummy_cprog, sizeof(dummy_cprog), 0, 6,
+      UINT64_C(0x10000000400), sizeof(dummy_cprog), &cprog));
+   cprog.force_external = true;
+   cprog.absolute_branch = true;
+   cprog.request_prelude = true;
+
+   struct agx3_cdm_direct_template_sources sources;
+   CHECK(agx3_cdm_direct_template_sources_compute(false, false, false, &sources));
+
+   struct hk_agx3_g17p_compute_program *program = calloc(1, sizeof(*program));
+   CHECK(program != NULL);
+
+   for (unsigned ci = 0; ci < ARRAY_SIZE(chips); ++ci) {
+      for (unsigned k = 0; k < ARRAY_SIZE(cases); ++k) {
+         struct agx3_cprog_inputs inputs;
+         CHECK(agx3_cprog_inputs_init(cases[k].words, &inputs));
+         struct hk_agx3_g17p_compute_program_desc desc = {
+            .program_va = UINT64_C(0x100000b0000),
+            .shader_va = UINT64_C(0x100000003c0),
+            .uniform_ranges = cases[k].ranges,
+            .uniform_range_count = cases[k].range_count,
+            .shader_binary_size = 64,
+            .nr_gprs = 32,
+            .compiler_d_valid = true,
+            .compiler_d = 32,
+            .launch_sources = sources,
+            .ldshdr_f1 = AGX_IOTO_G17P_COMPUTE_LDSHDR_F1_DIRECT_ADD3,
+            .constant_program = cprog,
+            .cprog_inputs = &inputs,
+         };
+         memset(program, 0, sizeof(*program));
+         CHECK(hk_agx3_g17p_compute_program_generate(chips[ci], &desc, program));
+         CHECK(program->length > 6144u);
+         CHECK(program->length <= HK_AGX3_G17P_COMPUTE_PROGRAM_MAX_SIZE);
+      }
+   }
+
+   free(program);
+   return 0;
+}
+
 int
 main(void)
 {
@@ -2757,6 +2863,7 @@ main(void)
        test_g17p_precompiled_data_layout() ||
        test_g17p_graphics_root_requirement() ||
        test_g17p_compute_program_va_independent() ||
+       test_g17p_compute_large_cprog_inputs() ||
        test_coverage_initial_pixel_dependencies() ||
        test_g17p_precompiled_fill_program() || test_exact_target_order() || test_terminal_suffix_modes() ||
        test_fail_closed() || test_g17s_minimal_compute_admission() ||
