@@ -4061,6 +4061,31 @@ agx_ra(agx_context *ctx)
       max_possible_regs = MIN2(max_possible_regs, AGX_M5_RT_REGISTER_BUDGET);
    }
 
+   /* Keep more threads resident in ordinary compute programs with several
+    * texture reads (agx_sampled_compute_register_cap() derives the budget).
+    * Helpers and unspillable programs keep their hardware budget. The cap
+    * only trades spills for occupancy, so a retry after a failed allocation
+    * (including RA_MEM exhaustion) drops it and compiles from the whole
+    * file rather than refusing a program that fits there.
+    */
+   const unsigned sampled_cap =
+      agx_sampled_compute_register_cap(&ctx->key->dev);
+   if (sampled_cap && !ctx->ra_budget_cut && !ctx->disable_sampled_cap &&
+       ctx->stage == MESA_SHADER_COMPUTE && !ctx->is_preamble &&
+       !ctx->key->is_helper && ctx->key->has_scratch &&
+       ctx->key->optional_spills &&
+       !(ctx->out && ctx->out->uses_ray_traversal)) {
+      unsigned samples = 0;
+      agx_foreach_instr_global(ctx, I) {
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE || I->op == AGX_OPCODE_TEXTURE_LOAD)
+            samples++;
+      }
+      if (samples >= 4 && sampled_cap < max_possible_regs) {
+         max_possible_regs = sampled_cap;
+         ctx->sampled_cap_applied = true;
+      }
+   }
+
    if (force_spilling) {
       /* Even when testing spilling, we need enough room for preloaded/exported
        * regs.
@@ -5170,4 +5195,111 @@ cleanup:
    free(sizes);
    free(classes);
    free(visited);
+}
+
+/* Optional occupancy-cap spill cost guard.
+ *
+ * Capping a sampled compute shader to 160 halves only pays when the extra
+ * resident threads hide texture-fetch latency faster than the added static TPS
+ * spills cost. Measured on G17C (AGX3C):
+ *  - Texture-bound shaders with <= 33 scalar spills/fills and <= 128 B spill
+ *    frames gain -7.0% to -14.5% (and Cyberpunk 2077 T2 hot shaders at 29/33
+ *    spills gain frame rate).
+ *  - Heavy-spill texture shaders (54–78 spills, 216–312 B) flatten to 0%.
+ *  - ALU-heavy shaders with few texture reads (8 fetches, 82–290 spills)
+ *    regress +8.7% to +47.9% even on G17C.
+ *
+ * Reject the optional cap (falling back to the whole register file) when the
+ * RA spill footprint or scalar spill/fill count exceeds a bounded budget, or
+ * when loop-weighted spill/fill traffic outpaces loop-weighted texture ops.
+ */
+#define AGX_SAMPLED_CAP_MAX_SPILL_B        192u
+#define AGX_SAMPLED_CAP_MAX_SCALAR_SPILLS  48u
+#define AGX_SAMPLED_CAP_MAX_SCALAR_FILLS   48u
+#define AGX_SAMPLED_CAP_MAX_OPS_PER_SAMPLE 8u
+
+bool
+agx_sampled_cap_spills_excessive(const agx_context *ctx)
+{
+   assert(ctx->scratch_size_B >= ctx->spill_base_B);
+   const unsigned spill_bytes = ctx->scratch_size_B - ctx->spill_base_B;
+   if (!spill_bytes)
+      return false;
+
+   if (spill_bytes > AGX_SAMPLED_CAP_MAX_SPILL_B)
+      return true;
+
+   unsigned nr_blocks = 0;
+   agx_foreach_block(ctx, block)
+      nr_blocks = MAX2(nr_blocks, block->index + 1);
+
+   uint8_t *loop_depth = nr_blocks ? calloc(nr_blocks, sizeof(*loop_depth))
+                                   : NULL;
+   if (loop_depth) {
+      /* In structured AGX control flow each loop spans [header, last backedge].
+       * Iterate per loop header so multiple continue backedges to the same
+       * header count as a single loop nesting level. */
+      agx_foreach_block(ctx, header) {
+         if (!header->loop_header)
+            continue;
+         unsigned last = header->index;
+         bool has_backedge = false;
+         agx_foreach_predecessor(header, pred) {
+            if ((*pred)->index >= header->index) {
+               last = MAX2(last, (*pred)->index);
+               has_backedge = true;
+            }
+         }
+         if (!has_backedge)
+            continue;
+         for (unsigned i = header->index; i <= last && i < nr_blocks; ++i) {
+            if (loop_depth[i] < 4)
+               loop_depth[i]++;
+         }
+      }
+   }
+
+   unsigned scalar_spills = 0;
+   unsigned scalar_fills = 0;
+   uint64_t weighted_spill_ops = 0;
+   uint64_t weighted_samples = 0;
+
+   agx_foreach_block(ctx, block) {
+      const unsigned depth =
+         (loop_depth && block->index < nr_blocks) ? loop_depth[block->index] : 0;
+      const uint64_t weight = UINT64_C(1) << (3u * depth);
+
+      agx_foreach_instr_in_block(block, I) {
+         if (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+             I->op == AGX_OPCODE_TEXTURE_LOAD) {
+            weighted_samples += weight;
+         } else if (I->op == AGX_OPCODE_STACK_STORE ||
+                    I->op == AGX_OPCODE_STACK_LOAD) {
+            const bool is_store = I->op == AGX_OPCODE_STACK_STORE;
+            const agx_index off = I->src[is_store ? 1 : 0];
+            if (off.type != AGX_INDEX_IMMEDIATE ||
+                off.value < ctx->spill_base_B)
+               continue;
+
+            const unsigned comps = util_bitcount(I->mask);
+            if (is_store)
+               scalar_spills += comps;
+            else
+               scalar_fills += comps;
+            weighted_spill_ops += (uint64_t)comps * weight;
+         }
+      }
+   }
+
+   free(loop_depth);
+
+   if (scalar_spills > AGX_SAMPLED_CAP_MAX_SCALAR_SPILLS ||
+       scalar_fills > AGX_SAMPLED_CAP_MAX_SCALAR_FILLS)
+      return true;
+
+   if (weighted_spill_ops >
+       weighted_samples * AGX_SAMPLED_CAP_MAX_OPS_PER_SAMPLE)
+      return true;
+
+   return false;
 }

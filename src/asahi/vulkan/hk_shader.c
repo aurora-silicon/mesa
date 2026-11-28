@@ -6648,6 +6648,9 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       .no_stop = nir->info.stage == MESA_SHADER_FRAGMENT,
       .has_scratch = !nir->info.internal,
       .max_scratch_B = max_scratch_B,
+      .optional_spills =
+         !nir->info.internal && sw_stage == MESA_SHADER_COMPUTE &&
+         hk_compute_launch_takes_scratch(&dev->dev),
       .promote_constants = true,
       .promote_textures = true,
       /* hk_buffer_addr_format() and hk_ubo_addr_format() bound robust

@@ -15942,7 +15942,8 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                          struct agx_shader_key *key,
                          struct util_dynarray *binary,
                          struct agx_shader_info *out, unsigned *offset_out,
-                         unsigned ra_budget_cut, bool agx3_reg_float_consts)
+                         unsigned ra_budget_cut, bool agx3_reg_float_consts,
+                         bool disable_sampled_cap)
 {
    const unsigned initial_binary_size = binary->size;
    const struct agx_shader_info initial_out = *out;
@@ -15963,6 +15964,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
    agx_context *ctx = rzalloc(NULL, agx_context);
    ctx->nir = nir;
    ctx->ra_budget_cut = ra_budget_cut;
+   ctx->disable_sampled_cap = disable_sampled_cap;
    ctx->is_preamble = impl->function->is_preamble;
    ctx->agx3_reg_float_consts = agx3_reg_float_consts;
    if (ctx->is_preamble)
@@ -16324,6 +16326,19 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
       agx_validate(ctx, "agx_ra");
 
    if (ctx->ra_failed) {
+      /* If the optional sampled-compute occupancy cap tightened the file,
+       * drop it first and retry from the whole register file before giving
+       * up (including on RA_MEM exhaustion) or cutting the GPR budget. */
+      if (ctx->sampled_cap_applied) {
+         assert(!disable_sampled_cap && !ra_budget_cut);
+         ralloc_free(ctx);
+         binary->size = initial_binary_size;
+         *out = initial_out;
+         return agx_compile_function_nir(
+            nir, impl, key, binary, out, offset_out, 0,
+            agx3_reg_float_consts, true);
+      }
+
       /* Spilling only targets total demand; pinned values can still leave the
        * shuffle no room. Recompile with an ever smaller spill budget unless
        * RA_MEM itself was exhausted, where cutting the GPR budget only forces
@@ -16336,12 +16351,27 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
          *out = initial_out;
          return agx_compile_function_nir(
             nir, impl, key, binary, out, offset_out,
-            ra_budget_cut ? ra_budget_cut * 2 : 16, agx3_reg_float_consts);
+            ra_budget_cut ? ra_budget_cut * 2 : 16, agx3_reg_float_consts,
+            disable_sampled_cap);
       }
       agx_set_refusal(ctx, "register allocation found no legal placement",
                       __LINE__);
       ralloc_free(ctx);
       return false;
+   }
+
+   /* The sampled-compute cap trades moderate static TPS spills for extra
+    * resident threads. If it caused a spill storm (too large a spill frame,
+    * too many scalar spills/fills, or loop-weighted spill traffic outpacing
+    * texture reads), drop the optional cap and retry from the whole file. */
+   if (ctx->sampled_cap_applied && agx_sampled_cap_spills_excessive(ctx)) {
+      assert(!disable_sampled_cap && !ra_budget_cut);
+      ralloc_free(ctx);
+      binary->size = initial_binary_size;
+      *out = initial_out;
+      return agx_compile_function_nir(
+         nir, impl, key, binary, out, offset_out, 0,
+         agx3_reg_float_consts, true);
    }
 
    /* Apple's G17P compiler publishes a 16-byte scratch footprint for compute,
@@ -16431,6 +16461,15 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
                                   : AGX3_G17P_MAX_SPILL_B;
 
       if (frame_B > limit_B) {
+         if (ctx->sampled_cap_applied) {
+            assert(!disable_sampled_cap && !ra_budget_cut);
+            ralloc_free(ctx);
+            binary->size = initial_binary_size;
+            *out = initial_out;
+            return agx_compile_function_nir(
+               nir, impl, key, binary, out, offset_out, 0,
+               agx3_reg_float_consts, true);
+         }
          agx_set_refusal(ctx, "AGX3 scratch frame exceeds target limit",
                          __LINE__);
          binary->size = initial_binary_size;
@@ -21050,7 +21089,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
       const struct agx_shader_key saved_key = *key;
       const unsigned saved_size = binary.size;
       bool compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                               &out->info, &offset, 0, false);
+                                               &out->info, &offset, 0, false,
+                                               false);
 
       /* The G17G packer refuses shapes it has no grounded encoding for and
        * rolls the binary back. Most refusals in real clients (Skia/ANGLE)
@@ -21063,7 +21103,8 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
          *key = saved_key;
          binary.size = saved_size;
          compiled = agx_compile_function_nir(nir, impl, key, &binary,
-                                             &out->info, &offset, 0, true);
+                                             &out->info, &offset, 0, true,
+                                             false);
       }
 
       if (!compiled) {

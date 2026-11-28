@@ -2214,7 +2214,7 @@ hk_dispatch_m5_native(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        /* Static TPS addresses are 15-bit halfword offsets. */
        !hk_g17p_compute_shader_supported(dev->dev.chip, s, linked, 1u << 16) ||
        ((s->b.info.scratch_size || linked->b.scratch_size) &&
-        !(dev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_RESOURCES)) ||
+        !hk_compute_launch_takes_scratch(&dev->dev)) ||
        s->b.info.uses_ray_traversal || s->info.agx3_txf_texture_valid ||
        s->info.agx3_storage_image_valid || s->info.agx3_sampled_storage_valid ||
        s->info.agx3_indexed_storage_valid ||
