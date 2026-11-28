@@ -206,13 +206,75 @@ main(void)
 
             struct hk_native_texture_descriptor packed;
             assert(hk_pack_native_texture(9, &packed, &cfg));
+
+            /* Verify hk_agx3_decompress_texture_format() preserves exact prior
+             * HAL200 (Gen9) descriptors for every admitted format, including
+             * 1-/2-channel and RGB565 swizzles. */
+            struct AGX_TEXTURE cfg_gen9 = cfg;
+            cfg_gen9.type = AGX_TEXTURE_TYPE_FLOAT;
+            cfg_gen9.swizzle_r = AGX_CHANNEL_0;
+            cfg_gen9.swizzle_g = AGX_CHANNEL_0;
+            cfg_gen9.swizzle_b = AGX_CHANNEL_0;
+            cfg_gen9.swizzle_a = AGX_CHANNEL_0;
+            hk_agx3_decompress_texture_format(9, channels, &cfg_gen9);
+            assert(cfg_gen9.type == type);
+            assert(cfg_gen9.swizzle_r == AGX_CHANNEL_R);
+            assert(cfg_gen9.swizzle_g == AGX_CHANNEL_G);
+            assert(cfg_gen9.swizzle_b == AGX_CHANNEL_B);
+            assert(cfg_gen9.swizzle_a == AGX_CHANNEL_A);
+            struct hk_native_texture_descriptor packed_gen9;
+            assert(hk_pack_native_texture(9, &packed_gen9, &cfg_gen9));
+            assert(memcmp(&packed_gen9, &packed, sizeof(packed)) == 0);
          }
       }
    }
    assert(format_count == 49);
    assert(pack_mode_mask == ((1u << (LIBAGX_AGX3_DECOMPRESS_R32G32B32A32 + 1)) - 1u));
+   uint32_t r11_mode = UINT32_MAX;
+   assert(hk_g17p_decompress_pack_mode(AGX_CHANNELS_R11G11B10, &r11_mode));
+   assert(r11_mode == LIBAGX_AGX3_DECOMPRESS_R11G11B10);
+   /* Verify Gen10 (M5) channel-matched swizzles and R11G11B10 float type. */
+   static const struct {
+      enum agx_channels channels;
+      enum agx_texture_type type;
+      enum agx_channel swizzle[4];
+   } gen10_cases[] = {
+      {AGX_CHANNELS_R8, AGX_TEXTURE_TYPE_UINT,
+       {AGX_CHANNEL_R, AGX_CHANNEL_0, AGX_CHANNEL_0, AGX_CHANNEL_1}},
+      {AGX_CHANNELS_R32, AGX_TEXTURE_TYPE_UINT,
+       {AGX_CHANNEL_R, AGX_CHANNEL_0, AGX_CHANNEL_0, AGX_CHANNEL_1}},
+      {AGX_CHANNELS_R16G16, AGX_TEXTURE_TYPE_UINT,
+       {AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_0, AGX_CHANNEL_1}},
+      {AGX_CHANNELS_R5G6B5, AGX_TEXTURE_TYPE_UNORM,
+       {AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B, AGX_CHANNEL_1}},
+      {AGX_CHANNELS_R11G11B10, AGX_TEXTURE_TYPE_FLOAT,
+       {AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B, AGX_CHANNEL_1}},
+      {AGX_CHANNELS_R8G8B8A8, AGX_TEXTURE_TYPE_UINT,
+       {AGX_CHANNEL_R, AGX_CHANNEL_G, AGX_CHANNEL_B, AGX_CHANNEL_A}},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(gen10_cases); ++i) {
+      struct AGX_TEXTURE cfg = texture_header();
+      cfg.dimension = AGX_TEXTURE_DIMENSION_2D;
+      cfg.layout = AGX_LAYOUT_GPU;
+      cfg.channels = gen10_cases[i].channels;
+      hk_agx3_decompress_texture_format(10, gen10_cases[i].channels, &cfg);
+      assert(cfg.type == gen10_cases[i].type);
+      assert(cfg.swizzle_r == gen10_cases[i].swizzle[0]);
+      assert(cfg.swizzle_g == gen10_cases[i].swizzle[1]);
+      assert(cfg.swizzle_b == gen10_cases[i].swizzle[2]);
+      assert(cfg.swizzle_a == gen10_cases[i].swizzle[3]);
+      cfg.address = 0x100000;
+      cfg.width = 256;
+      cfg.height = 128;
+      cfg.compressed = true;
+      cfg.extended = true;
+      cfg.acceleration_buffer = 0x200000;
+      cfg.depth = 1;
+      struct hk_native_texture_descriptor packed;
+      assert(hk_pack_native_texture(10, &packed, &cfg));
+   }
    uint32_t bad_mode = 0;
-   assert(!hk_g17p_decompress_pack_mode(AGX_CHANNELS_R11G11B10, &bad_mode));
+   assert(!hk_g17p_decompress_pack_mode(AGX_CHANNELS_R9G9B9E5, &bad_mode));
    assert(hk_g17p_decompress_image_type_supported(VK_IMAGE_TYPE_2D));
    assert(!hk_g17p_decompress_image_type_supported(VK_IMAGE_TYPE_3D));
 

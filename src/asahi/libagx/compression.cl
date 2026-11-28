@@ -286,6 +286,40 @@ libagx_m5_decompress_rgba16f(global void *texture_heap,
       metadata[index_tl] = ~(uint64_t)0;
 }
 
+/* Exact pack of a promoted R11G11B10 float channel back to its 11- or 10-bit
+ * unsigned float encoding, keeping NaN, +inf, subnormals and zero intact. */
+static uint
+libagx_pack_uf11_uf10(uint value, uint mant_bits)
+{
+   const uint abs_val = value & 0x7fffffffu;
+   if (abs_val > 0x7f800000u) {
+      const uint mant = (value >> (23u - mant_bits)) & ((1u << mant_bits) - 1u);
+      return (31u << mant_bits) | (mant ? mant : (1u << (mant_bits - 1u)));
+   }
+   if (value & 0x80000000u)
+      return 0u;
+   const uint exponent = (value >> 23) & 0xffu;
+   const uint fraction = value & 0x7fffffu;
+   if (exponent == 255u)
+      return 31u << mant_bits;
+   const uint drop = 10u - mant_bits;
+   if (exponent < 103u + drop)
+      return 0u;
+   if (exponent < 113u)
+      return (fraction | 0x800000u) >> (126u + drop - exponent);
+   if (exponent > 142u)
+      return (31u << mant_bits) - 1u;
+   return ((exponent - 112u) << mant_bits) | (fraction >> (23u - mant_bits));
+}
+
+static uint
+libagx_pack_r11g11b10f(uint3 v)
+{
+   return libagx_pack_uf11_uf10(v.x, 6u) |
+          (libagx_pack_uf11_uf10(v.y, 6u) << 11) |
+          (libagx_pack_uf11_uf10(v.z, 5u) << 22);
+}
+
 /*
  * AGX3 in-place decompression for spilled compressed colour attachments.
  * Reads each compression tile (16 x tile_height_sa samples; 16x16 on HAL200)
@@ -427,6 +461,9 @@ libagx_agx3_decompress(global void *texture_heap, global void *sampler_heap,
             break;
          case LIBAGX_AGX3_DECOMPRESS_R32G32B32A32:
             ((global uint4 *)layer_body)[elem] = v;
+            break;
+         case LIBAGX_AGX3_DECOMPRESS_R11G11B10:
+            ((global uint *)layer_body)[elem] = libagx_pack_r11g11b10f(v.xyz);
             break;
          }
       }

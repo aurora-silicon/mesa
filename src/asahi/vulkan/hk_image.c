@@ -540,8 +540,7 @@ hk_can_compress(const struct agx_device *dev, VkFormat format, unsigned plane,
  * the one- and two-channel 8-bit formats (vkd3d-proton's swapchain and
  * typeless R8/RG8 UAV targets); bit 14 selects the RG32 and RGBA32 integer
  * formats, whose image atomics would need 64-bit image atomics that the
- * device does not expose. Zero retains the uncompressed diagnostic control. B10G11R11 is not compressed whatever the bit says: a compressed
- * tile of its class reads a NaN field back as zero. */
+ * device does not expose. Zero retains the uncompressed diagnostic control. */
 DEBUG_GET_ONCE_NUM_OPTION(m5_storage_compression,
                          "ASAHI_M5_STORAGE_COMPRESSION", 32767)
 
@@ -673,6 +672,7 @@ hk_m5_storage_compression_eligible(const struct agx_device *dev, unsigned plane,
    case VK_FORMAT_R32G32_SINT:
    case VK_FORMAT_R32G32B32A32_UINT:
    case VK_FORMAT_R32G32B32A32_SINT: bit = 16384; break;
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32: bit = 2048; break;
    default: return false;
    }
    /* A mutable image's views may be FLOAT when the image is not: the list

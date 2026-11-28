@@ -4456,3 +4456,9 @@ bool hk_attachmentless_render(const struct hk_cs *cs);
 
 void hk_attachmentless_vdm_bounds(const struct hk_cs *cs, uint32_t *width_px,
                                   uint32_t *height_px, uint32_t *layers);
+
+bool hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
+                                    const struct hk_image *image,
+                                    unsigned plane, unsigned level,
+                                    unsigned layer, uint32_t layer_count,
+                                    bool reset_only, unsigned barrier);

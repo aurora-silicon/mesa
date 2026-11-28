@@ -1,0 +1,16 @@
+/* Copyright 2026 Aurora Silicon
+ * SPDX-License-Identifier: MIT
+ */
+#version 450
+// texelFetch only, for images without storage usage
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 1) uniform sampler2D tex;
+layout(set = 0, binding = 2) buffer Out { uvec4 v[]; } o;
+layout(push_constant) uniform PC { uint w; uint h; uint mode; uint nanbits; } pc;
+void main()
+{
+   uvec2 p = gl_GlobalInvocationID.xy;
+   if (p.x >= pc.w || p.y >= pc.h)
+      return;
+   o.v[p.y * pc.w + p.x] = floatBitsToUint(texelFetch(tex, ivec2(p), 0));
+}

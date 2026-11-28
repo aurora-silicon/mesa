@@ -1623,6 +1623,15 @@ if with_tests
   )
 
   executable(
+    'vulkan-b10g11r11-nan',
+    files('tests/vulkan_b10g11r11_nan.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan'), dep_m],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
     'vulkan-dynamic-offset-draws',
     files('tests/vulkan_dynamic_offset_draws.c'),
     include_directories : [inc_include],

@@ -525,15 +525,23 @@ hk_m5_color_compression_eligible(enum agx_chip chip, unsigned plane,
       next = following;
    }
 
-   /* Not B10G11R11_UFLOAT_PACK32, just like G17P: compressed tiles of its
-    * class corrupt NaN payloads on M5 hardware too. */
-   const bool color_1_8b = hk_g17p_compression_color_format(info->format);
+   /* B10G11R11_UFLOAT_PACK32 too, unlike G17P: M5 keeps the tile word as a
+    * packed float and stores it through the format's own class
+    * (agx_rg11b10_tile_is_packed_float()), the configuration Metal compresses
+    * it in, with NaN and infinity intact. */
+   const bool color_1_8b = hk_g17p_compression_color_format(info->format) ||
+                           info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
    const bool color_16b = hk_g17p_compression_color_format_16b(info->format);
    if (!color_1_8b && !color_16b)
       return false;
 
    const bool three_d = info->imageType == VK_IMAGE_TYPE_3D;
-   if (color_16b && (three_d || info->arrayLayers != 1))
+   /* 3D images cannot use libagx_agx3_decompress / per-slice metadata reset,
+    * which B10G11R11 requires to keep bit-exact copy semantics for NaN
+    * payloads. */
+   if (three_d && (color_16b || info->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32))
+      return false;
+   if (color_16b && info->arrayLayers != 1)
       return false;
 
    VkImageCreateFlags allowed_flags =
