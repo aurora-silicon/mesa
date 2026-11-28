@@ -2294,16 +2294,20 @@ direct_draw_fast_path_correctness(struct fixture *f)
       CHECK(cs.current == cur_before_zero);
       CHECK(cs.stats.calls == 2);
 
-      /* A remembered unsupported vertex program never outlives a full state
-       * invalidation. */
-      fast->unsupported_linked_vs = &linked_vs;
-      hk_cmd_buffer_dirty_all(cmd);
-      CHECK(fast->unsupported_linked_vs == NULL);
-      CHECK(!fast->valid);
-
       cmd->current_cs.gfx = NULL;
       hk_g17p_linked_graphics_cache_finish(&f->dev, &linked_vs);
    }
+
+   /* A remembered unsupported vertex program never outlives a full state
+    * invalidation. */
+   static const struct hk_linked_shader unsupported_vs;
+   struct hk_agx3_direct_draw_fast *fast = &cmd->state.gfx.direct_draw_fast;
+   fast->valid = true;
+   fast->unsupported_linked_vs = &unsupported_vs;
+   hk_cmd_buffer_dirty_all(cmd);
+   CHECK(fast->unsupported_linked_vs == NULL);
+   CHECK(!fast->valid);
+   vk_dynamic_graphics_state_clear_dirty(&cmd->vk.dynamic_graphics_state);
 
    util_dynarray_fini(&cmd->large_bos);
    free(cmd->retained_set);
