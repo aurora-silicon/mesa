@@ -116,6 +116,8 @@ hk_files = files(
   'hk_drm_render_core.c',
   'hk_drm_render_core.h',
   'hk_execution_allowance.h',
+  'hk_gpu_waits.c',
+  'hk_gpu_waits.h',
   'hk_pack.c',
   'hk_pack.h',
   'hk_render_pack.c',
@@ -1314,6 +1316,15 @@ if with_tests
   executable(
     'vulkan-border-emulation-cache',
     files('tests/vulkan_border_emulation_cache.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
+    'vulkan-min-lod-emulation-cache',
+    files('tests/vulkan_min_lod_emulation_cache.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],

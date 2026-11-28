@@ -1983,6 +1983,206 @@ test_loop_work_scaling(void)
    }
 }
 
+static struct hk_cmd_buffer *
+query_reset_cmd(unsigned dispatches, uint64_t queries)
+{
+   struct hk_cmd_buffer *c = new_cmd();
+   c->sync.kind_override = HK_SYNC_ALL;
+   struct hk_cs *s = add_plain(c, 0);
+   c->sync.kind_override = 0;
+   c->sync.has_gpu_query_reset = true;
+   s->stats.cmds = dispatches;
+   s->stats.calls = 0;
+   s->stats.query_reset_dispatches = dispatches;
+   s->stats.query_reset_queries = queries;
+   s->pack_dispatches = 0;
+   s->pack_threads = 0;
+   s->pack_static_work = 0;
+   s->query_access = true;
+   s->query_reset_pending = false;
+   s->g17p_timestamp_query = agx_chip_native_or_m5(chip);
+   hk_sync_after_stream(c, s, HK_SYNC_ALL);
+   return c;
+}
+
+static struct hk_cmd_buffer *
+timestamp_query_reset_cmd(unsigned dispatches, uint64_t queries)
+{
+   struct hk_cmd_buffer *c = new_cmd();
+   c->sync.kind_override = HK_SYNC_QRESET;
+   struct hk_cs *s = add_plain(c, 0);
+   c->sync.kind_override = 0;
+   c->sync.has_gpu_query_reset = true;
+   s->sync.dep[HK_SYNC_VDM].prior = HK_SYNC_QRESET_SCOPE;
+   s->sync.dep[HK_SYNC_CDM].prior = HK_SYNC_QRESET_SCOPE;
+   s->stats.cmds = dispatches;
+   s->stats.calls = 0;
+   s->stats.query_reset_dispatches = dispatches;
+   s->stats.query_reset_queries = queries;
+   s->pack_dispatches = 0;
+   s->pack_threads = 0;
+   s->pack_static_work = 0;
+   s->query_access = true;
+   s->query_reset_pending = false;
+   s->g17p_timestamp_query = agx_chip_native_or_m5(chip);
+   hk_sync_query_reset_done(c, s);
+   return c;
+}
+
+static void
+test_query_reset_packing(void)
+{
+   const enum agx_chip saved_chip = chip;
+   struct hk_pack_run runs[16];
+   unsigned count;
+
+   static const struct {
+      enum agx_chip chip;
+      const char *name;
+   } chips[] = {
+      {AGX_CHIP_G16G, "G16G"},
+      {AGX_CHIP_G17P, "G17P"},
+      {AGX_CHIP_G17S, "G17S"},
+   };
+
+   for (unsigned ci = 0; ci < ARRAY_SIZE(chips); ++ci) {
+      char name[160];
+#define Q(text) (snprintf(name, sizeof(name), "%s: %s", chips[ci].name, text), name)
+      chip = chips[ci].chip;
+
+      struct hk_cmd_buffer *qr = query_reset_cmd(2, 4);
+      struct hk_cs *s = first_cs(qr);
+      T(Q("pure query-reset CB is a member"), member(qr, false) == s);
+
+      s->query_reset_pending = true;
+      T(Q("unflushed query-reset CB is rejected"), !member(qr, false));
+      s->query_reset_pending = false;
+
+      s->stats.cmds = 3;
+      T(Q("query-reset CB with extra non-reset dispatch is rejected"),
+        !member(qr, false));
+      s->stats.cmds = 2;
+
+      s->stats.query_reset_queries = 0;
+      T(Q("zero-query reset CB is rejected"), !member(qr, false));
+      s->stats.query_reset_queries = 4;
+
+      s->stats.calls = 1;
+      T(Q("query-reset CB with API dispatch is rejected"), !member(qr, false));
+      s->stats.calls = 0;
+
+      /* Six consecutive vkCmdResetQueryPool CBs after prior render work
+       * (same shape as frame-start query resets) pack into one CDM command. */
+      struct hk_cmd_buffer *six[6] = {
+         query_reset_cmd(2, 2), query_reset_cmd(2, 2),
+         query_reset_cmd(2, 2), query_reset_cmd(2, 2),
+         query_reset_cmd(1, 7), query_reset_cmd(1, 1),
+      };
+      plan_on(six, 6, HK_SYNC_GFX, false, runs, &count);
+      T(Q("six consecutive query-reset CBs form one packet"),
+        runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){6}));
+
+      /* Query-reset CBs never mix with plain compute CBs so plain packets
+       * keep NO_QUERY_ACCESS and do not inherit HK_SYNC_ALL. */
+      struct hk_cmd_buffer *qr_then_plain[] = {
+         query_reset_cmd(1, 2), plain(1),
+      };
+      plan_on(qr_then_plain, 2, HK_SYNC_GFX, false, runs, &count);
+      T(Q("query-reset CB does not pack with following plain compute CB"),
+        count == 0);
+
+      struct hk_cmd_buffer *plain_then_qr[] = {
+         plain(1), query_reset_cmd(1, 2),
+      };
+      plan_on(plain_then_qr, 2, HK_SYNC_GFX, false, runs, &count);
+      T(Q("plain compute CB does not pack with following query-reset CB"),
+        count == 0);
+
+      struct hk_cmd_buffer *two_each[] = {
+         query_reset_cmd(1, 2), query_reset_cmd(1, 2),
+         plain(1), plain(1),
+      };
+      plan_on(two_each, 4, HK_SYNC_GFX, false, runs, &count);
+      T(Q("adjacent query-reset and plain compute runs pack separately"),
+        runs_are(runs, count, 2, (unsigned[]){0, 2}, (unsigned[]){2, 2}));
+
+      /* Packing folds has_gpu_query_reset and preserves HK_SYNC_ALL tail cuts. */
+      struct hk_cs *pcs = NULL;
+      struct hk_cmd_buffer *pkt = pack(six, 6, &pcs);
+      T(Q("packed query-reset packet propagates has_gpu_query_reset"),
+        pkt->sync.has_gpu_query_reset);
+      bool all_cuts = true;
+      u_foreach_bit(k, HK_SYNC_ALL) {
+         if (pkt->sync.req[k][HK_SYNC_CDM].cut != pcs)
+            all_cuts = false;
+      }
+      T(Q("packed query-reset packet keeps HK_SYNC_ALL CDM tail cuts"),
+        all_cuts);
+
+      /* Oversized query counts respect HK_PACK_MAX_THREADS. */
+      struct hk_cmd_buffer *huge[] = {
+         query_reset_cmd(1, HK_PACK_MAX_THREADS / 2 + 1),
+         query_reset_cmd(1, HK_PACK_MAX_THREADS / 2 + 1),
+      };
+      plan(huge, 2, runs, &count);
+      T(Q("query-reset thread bound splits oversized run"), count == 0);
+
+      /* Timestamp query resets (HK_SYNC_QRESET) also pack with each other,
+       * including when an interior member carries an application render->compute
+       * barrier tail, while staying isolated from HK_SYNC_ALL resets and plain
+       * compute CBs. */
+      struct hk_cmd_buffer *ts_qr = timestamp_query_reset_cmd(2, 2);
+      struct hk_cs *ts_s = first_cs(ts_qr);
+      T(Q("pure timestamp query-reset CB (HK_SYNC_QRESET) is a member"),
+        member(ts_qr, false) == ts_s);
+
+      struct hk_cmd_buffer *bad_qreset = new_cmd();
+      bad_qreset->sync.kind_override = HK_SYNC_QRESET;
+      add_plain(bad_qreset, 1);
+      bad_qreset->sync.kind_override = 0;
+      T(Q("non-reset HK_SYNC_QRESET compute CB is rejected"),
+        !member(bad_qreset, false));
+
+      struct hk_cmd_buffer *six_ts[6] = {
+         timestamp_query_reset_cmd(2, 2), timestamp_query_reset_cmd(2, 2),
+         timestamp_query_reset_cmd(2, 2), timestamp_query_reset_cmd(2, 2),
+         timestamp_query_reset_cmd(1, 7), timestamp_query_reset_cmd(1, 1),
+      };
+      hk_sync_barrier(six_ts[2], HK_SYNC_GFX,
+                      HK_SYNC_COMPUTE | HK_SYNC_GFX_FRAG);
+      plan_on(six_ts, 6, HK_SYNC_GFX, false, runs, &count);
+      T(Q("six consecutive timestamp query-reset CBs form one packet"),
+        runs_are(runs, count, 1, (unsigned[]){0}, (unsigned[]){6}));
+
+      struct hk_cs *ts_pcs = NULL;
+      struct hk_cmd_buffer *ts_pkt = pack(six_ts, 6, &ts_pcs);
+      T(Q("packed timestamp query-reset packet keeps HK_SYNC_QRESET and has_gpu_query_reset"),
+        (ts_pcs->sync.kind & ~HK_SYNC_GFX_MEM) == HK_SYNC_QRESET &&
+           ts_pkt->sync.has_gpu_query_reset &&
+           ts_pkt->sync.last[__builtin_ctz(HK_SYNC_QRESET)][HK_SYNC_CDM] ==
+              ts_pcs &&
+           (ts_pkt->sync.req[__builtin_ctz(HK_SYNC_COMPUTE)][HK_SYNC_VDM].prior &
+            HK_SYNC_GFX));
+
+      struct hk_cmd_buffer *ts_and_all[] = {
+         timestamp_query_reset_cmd(1, 2), query_reset_cmd(1, 2),
+      };
+      plan(ts_and_all, 2, runs, &count);
+      T(Q("HK_SYNC_QRESET and HK_SYNC_ALL query-reset CBs do not mix"),
+        count == 0);
+
+      struct hk_cmd_buffer *ts_and_plain[] = {
+         timestamp_query_reset_cmd(1, 2), plain(1),
+      };
+      plan(ts_and_plain, 2, runs, &count);
+      T(Q("HK_SYNC_QRESET query-reset CB does not mix with plain compute"),
+        count == 0);
+#undef Q
+   }
+
+   chip = saved_chip;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2112,6 +2312,51 @@ main(int argc, char **argv)
       plan_on(cbs, 2, 0, false, runs, &rc);
       T("two bounded looping members pack into one packet",
         rc == 1 && runs[0].count == 2);
+
+      /* Core-count-scaled static-work budget (1x at <=20, 2x at 40, 4x at >=80). */
+      T("work budget stays 1x for <=20 cores",
+        hk_pack_max_static_work_for_cores(10) == HK_PACK_MAX_STATIC_WORK &&
+        hk_pack_max_static_work_for_cores(16) == HK_PACK_MAX_STATIC_WORK &&
+        hk_pack_max_static_work_for_cores(20) == HK_PACK_MAX_STATIC_WORK);
+      T("work budget scales cleanly on 32/40/80+ cores",
+        hk_pack_max_static_work_for_cores(32) ==
+           (HK_PACK_MAX_STATIC_WORK / 4u) * 32ull / 5u &&
+        hk_pack_max_static_work_for_cores(40) == HK_PACK_MAX_STATIC_WORK * 2ull &&
+        hk_pack_max_static_work_for_cores(80) == HK_PACK_MAX_STATIC_WORK * 4ull &&
+        hk_pack_max_static_work_for_cores(160) == HK_PACK_MAX_STATIC_WORK * 4ull);
+      const uint64_t max40 = hk_pack_max_static_work_for_cores(40);
+      T("scaled limit accepts bounded loop between 1x and 2x budget",
+        hk_pack_account_dispatch_work_eff_limit(
+           1ull << 24, 256, true, 3072, HK_PACK_MAX_STATIC_WORK, &w) &&
+        !hk_pack_account_dispatch_work_eff_limit(
+           1ull << 24, 256, true, 3072, max40, &w) &&
+        w == (1ull << 24) * 3072ull);
+      T("scaled fusion budget accepts run between 1x and 2x budget",
+        !hk_pack_fusion_fits_run_limit(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                       5000, false, HK_PACK_MAX_STATIC_WORK,
+                                       &nw, &nl) &&
+        hk_pack_fusion_fits_run_limit(HK_PACK_MAX_STATIC_WORK - 1000, 0, 500, 0,
+                                      5000, false, max40, &nw, &nl) &&
+        nw == HK_PACK_MAX_STATIC_WORK + 3500 && nl == 0);
+      /* Two 24G thread-instruction members exceed 2^35 (34.4G) on 20 cores
+       * but pack into one packet under the 40-core 2^36 (68.7G) budget. */
+      struct hk_cmd_buffer *wide_cbs[2] = { plain(1), plain(1) };
+      for (unsigned i = 0; i < 2; ++i)
+         first_cs(wide_cbs[i])->pack_static_work = UINT64_C(24) << 30;
+      struct hk_pack_member wm[2];
+      struct hk_device *d40 = device();
+      struct hk_sync_queue sq0 = {0};
+      hk_pack_describe_submit(wm, d40, &sq0, wide_cbs, 2, terminate, false);
+      struct hk_pack_limits lim20 = { .max_attachments = 64, .overhead = 64 };
+      struct hk_pack_limits lim40 = {
+         .max_attachments = 64, .overhead = 64, .max_static_work = max40,
+      };
+      unsigned pm = 0;
+      size_t tot = 0;
+      T("24G + 24G splits under 20-core 1x budget",
+        hk_pack_plan(wm, 2, &lim20, runs, &pm, &tot) == 0);
+      T("24G + 24G packs under 40-core 2x budget",
+        hk_pack_plan(wm, 2, &lim40, runs, &pm, &tot) == 1 && runs[0].count == 2);
 
       /* Observed-duration looping budget (HK_PACK_MAX_OBS_NS). */
       struct hk_pack_member obs_m[4] = {0};
@@ -2252,6 +2497,7 @@ main(int argc, char **argv)
 
    test_packet_reuse(false);
    test_span_pool_policy();
+   test_query_reset_packing();
    printf("%u tests, %u failures\n", tests, failures);
    ralloc_free(test_context);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

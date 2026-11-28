@@ -4,6 +4,7 @@
  * Copyright 2022-2023 Collabora Ltd. and Red Hat Inc.
  * SPDX-License-Identifier: MIT
  */
+#include "hk_gpu_waits.h"
 #include "hk_physical_device.h"
 
 #include "asahi/compiler/agx_compile.h"
@@ -169,7 +170,11 @@ hk_get_device_extensions(const struct agx_device *dev,
     */
    const bool ray_tracing_pipeline = ray_query;
 
+   const bool has_shader_cores = agx_get_num_cores(dev) > 0;
+
    *ext = (struct vk_device_extension_table){
+      .AMD_shader_core_properties = has_shader_cores,
+      .AMD_shader_core_properties2 = has_shader_cores,
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_acceleration_structure = ray_query,
@@ -370,9 +375,10 @@ hk_get_device_extensions(const struct agx_device *dev,
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
-      /* Hardware ASTC HDR decode is supported across AGX2 and native AGX3
-       * (G13-G17P); keep HAL300 off until qualified on M5 hardware. */
-      .EXT_texture_compression_astc_hdr = !agx_chip_hal300_path(dev->chip),
+      /* Hardware ASTC HDR decode is supported across AGX2, native AGX3, and
+       * AGX3C/HAL300 (M5: G17G/G17S/G17C). Other HAL300 encodings such as
+       * AGX3D (G18G) stay off until qualified on their hardware. */
+      .EXT_texture_compression_astc_hdr = agx_chip_has_astc_hdr(dev->chip),
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
       
@@ -440,9 +446,7 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
-      .vertexPipelineStoresAndAtomics =
-         instance->drirc.misc.enable_vertex_pipeline_stores_atomics ||
-         agx_chip_g17_m5(dev->chip),
+      .vertexPipelineStoresAndAtomics = true,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -518,7 +522,7 @@ hk_get_device_features(
 
       /* VK_NV_cooperative_matrix2: each feature is enabled where it is
        * implemented. */
-      .cooperativeMatrixWorkgroupScope = false,
+      .cooperativeMatrixWorkgroupScope = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixFlexibleDimensions = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixReductionsNV = supported_extensions->NV_cooperative_matrix2,
       .cooperativeMatrixConversionsNV = supported_extensions->NV_cooperative_matrix2,
@@ -1181,6 +1185,11 @@ hk_get_device_properties(const struct agx_device *dev,
    *properties = (struct vk_properties){
       .cooperativeMatrixSupportedStages = features->cooperativeMatrix
          ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+      /* Keep max flexible dimension at 256: AGX3 has 256 16-bit GPRs/thread
+       * (128 32-bit GPRs/thread), and advertising >= 512 causes clients such
+       * as ggml-vulkan to select 128x256 f32 workgroup tiles across 256
+       * threads (128 f32 accumulators/lane = 100% of the register file),
+       * triggering severe register spilling. */
       .cooperativeMatrixFlexibleDimensionsMaxDimension =
          features->cooperativeMatrixFlexibleDimensions ? 256 : 0,
       .apiVersion = hk_get_vk_version(),
@@ -1371,8 +1380,10 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxComputeSharedMemorySize = HK_MAX_SHARED_SIZE,
       .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
       .maxComputeWorkGroupInvocations = 1024,
-      .maxComputeWorkGroupSize = {
-         1024, 1024, agx_chip_g17_m5(dev->chip) ? 1024 : 64},
+      /* The CDM local size is three 32-bit words and local invocation IDs are
+       * three 16-bit components, so no axis is narrower than the invocation
+       * limit. */
+      .maxComputeWorkGroupSize = {1024, 1024, 1024},
       .subPixelPrecisionBits = 8,
       .subTexelPrecisionBits = 8,
       .mipmapPrecisionBits = 8,
@@ -1766,6 +1777,26 @@ hk_get_device_properties(const struct agx_device *dev,
       .advancedBlendNonPremultipliedDstColor = true,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
+
+      /* VK_AMD_shader_core_properties */
+      .shaderEngineCount = MAX2(dev->params.num_clusters_total, 1u),
+      .shaderArraysPerEngineCount = 1,
+      .computeUnitsPerShaderArray = MAX2(dev->params.num_cores_per_cluster, 1u),
+      .simdPerComputeUnit = 1,
+      .wavefrontsPerSimd = 1024 / 32,
+      .wavefrontSize = 32,
+      .sgprsPerSimd = 256,
+      .minSgprAllocation = 0,
+      .maxSgprAllocation = 256,
+      .sgprAllocationGranularity = 1,
+      .vgprsPerSimd = 128,
+      .minVgprAllocation = 4,
+      .maxVgprAllocation = 128,
+      .vgprAllocationGranularity = 4,
+
+      /* VK_AMD_shader_core_properties2 */
+      .shaderCoreFeatures = 0,
+      .activeComputeUnitCount = agx_get_num_cores(dev),
    };
 
    /* Strict residency on M5 relies on soft faults; see
@@ -1964,6 +1995,54 @@ hk_border_emulation_remember(struct hk_physical_device *pdev)
 #endif
 }
 
+static bool
+hk_min_lod_emulation_key(struct hk_physical_device *pdev, cache_key key)
+{
+#ifdef ENABLE_SHADER_CACHE
+   if (!pdev->vk.disk_cache)
+      return false;
+   static const char tag[] = "hk min_lod emulation";
+   const char *process = util_get_process_name();
+   struct mesa_blake3 ctx;
+   blake3_hash hash;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, tag, sizeof(tag));
+   if (process)
+      _mesa_blake3_update(&ctx, process, strlen(process));
+   _mesa_blake3_final(&ctx, hash);
+   disk_cache_compute_key(pdev->vk.disk_cache, hash, sizeof(hash), key);
+   return true;
+#else
+   return false;
+#endif
+}
+
+void
+hk_min_lod_emulation_recall(struct hk_physical_device *pdev)
+{
+#ifdef ENABLE_SHADER_CACHE
+   cache_key key;
+   size_t size;
+   if (!hk_min_lod_emulation_key(pdev, key))
+      return;
+   void *seen = disk_cache_get(pdev->vk.disk_cache, key, &size);
+   if (seen)
+      p_atomic_set(&pdev->min_lod_emulation, 1);
+   free(seen);
+#endif
+}
+
+void
+hk_min_lod_emulation_remember(struct hk_physical_device *pdev)
+{
+#ifdef ENABLE_SHADER_CACHE
+   static const uint8_t seen = 1;
+   cache_key key;
+   if (hk_min_lod_emulation_key(pdev, key))
+      disk_cache_put(pdev->vk.disk_cache, key, &seen, sizeof(seen), NULL);
+#endif
+}
+
 static void
 hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 {
@@ -1998,6 +2077,7 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, disk_cache_id);
    if (pdev->vk.disk_cache != NULL) {
       hk_border_emulation_recall(pdev);
+      hk_min_lod_emulation_recall(pdev);
       pdev->vk.properties.pipelineBinaryInternalCache = true;
       pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
       pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;
@@ -2417,6 +2497,21 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    unsigned st_idx = 0;
    pdev->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
+   /* Same-queue binary semaphore waits ordered on the GPU (hk_gpu_waits.h)
+    * need to see every change of a payload. */
+   pdev->syncobj_base_type = pdev->syncobj_sync_type;
+   if ((pdev->dev.params.features & DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS) &&
+       !pdev->dev.is_virtio && pdev->syncobj_sync_type.features) {
+      hk_gpu_waits_wrap_type(&pdev->syncobj_sync_type,
+                             &pdev->syncobj_base_type);
+      /* Everything that handles a drm_syncobj payload directly recognises
+       * the type with vk_sync_type_is_drm_syncobj(). Should the wrapper ever
+       * break that, keep the original type (hk_gpu_waits then stays off). */
+      if (!vk_sync_type_is_drm_syncobj(&pdev->syncobj_sync_type)) {
+         assert(!"wrapped sync type lost its drm_syncobj identity");
+         pdev->syncobj_sync_type = pdev->syncobj_base_type;
+      }
+   }
    pdev->sync_types[st_idx++] = &pdev->syncobj_sync_type;
    pdev->sync_types[st_idx++] = NULL;
    assert(st_idx <= ARRAY_SIZE(pdev->sync_types));
@@ -2713,6 +2808,7 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
       VkComponentTypeKHR a, b, c;
    } configs[] = {
       {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR},
       {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
@@ -2732,6 +2828,35 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
             .scope = VK_SCOPE_SUBGROUP_KHR,
             .workgroupInvocations = 0,
          };
+      }
+   }
+   if (pdev->vk.supported_features.cooperativeMatrixWorkgroupScope) {
+      const struct {
+         uint32_t wg_invocations;
+         uint32_t m_gran, n_gran, k_gran;
+      } wg_shapes[] = {
+         {128, 32, 16, 16},
+         {256, 32, 32, 16},
+      };
+      for (unsigned w = 0; w < ARRAY_SIZE(wg_shapes); ++w) {
+         for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
+            if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
+                          configs[i].b == VK_COMPONENT_TYPE_BFLOAT16_KHR))
+               continue;
+            vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p) {
+               *p = (VkCooperativeMatrixFlexibleDimensionsPropertiesNV) {
+                  .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_FLEXIBLE_DIMENSIONS_PROPERTIES_NV,
+                  .MGranularity = wg_shapes[w].m_gran,
+                  .NGranularity = wg_shapes[w].n_gran,
+                  .KGranularity = wg_shapes[w].k_gran,
+                  .AType = configs[i].a, .BType = configs[i].b,
+                  .CType = configs[i].c, .ResultType = configs[i].c,
+                  .saturatingAccumulation = VK_FALSE,
+                  .scope = VK_SCOPE_WORKGROUP_KHR,
+                  .workgroupInvocations = wg_shapes[w].wg_invocations,
+               };
+            }
+         }
       }
    }
    return vk_outarray_status(&out);
