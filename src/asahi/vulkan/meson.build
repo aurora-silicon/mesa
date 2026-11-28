@@ -116,6 +116,8 @@ hk_files = files(
   'hk_drm_render_core.c',
   'hk_drm_render_core.h',
   'hk_execution_allowance.h',
+  'hk_gpu_waits.c',
+  'hk_gpu_waits.h',
   'hk_pack.c',
   'hk_pack.h',
   'hk_render_pack.c',
@@ -1019,6 +1021,12 @@ if with_tests
       inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
     dependencies : [hk_deps], link_with : [libhk],
     link_args : [ld_args_gc_sections]), suite : ['asahi'])
+  test('hk_aligned_ubo', executable('hk_aligned_ubo_test',
+    files('tests/test-hk-aligned-ubo.c'),
+    include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
+      inc_asahi, inc_virtio_gpu, inc_virtio_vdrm, include_directories('.')],
+    dependencies : [hk_deps], link_with : [libhk],
+    link_args : [ld_args_gc_sections]), suite : ['asahi'])
   test('hk_m5_vs_cprog', executable('hk_m5_vs_cprog_test',
     files('tests/test-hk-m5-vs-cprog.c'),
     include_directories : [inc_gallium, inc_gallium_aux, inc_include, inc_src,
@@ -1407,6 +1415,15 @@ if with_tests
     files('tests/aurora_packtest.c'),
     include_directories : [inc_include],
     dependencies : [cc.find_library('vulkan'), dep_thread],
+    c_args : [c_msvc_compat_args],
+    gnu_symbol_visibility : 'hidden',
+  )
+
+  executable(
+    'aurora-uniform-select',
+    files('tests/aurora_uniform_select.c'),
+    include_directories : [inc_include],
+    dependencies : [cc.find_library('vulkan')],
     c_args : [c_msvc_compat_args],
     gnu_symbol_visibility : 'hidden',
   )
