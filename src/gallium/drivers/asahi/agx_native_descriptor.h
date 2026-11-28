@@ -6,6 +6,7 @@
 #pragma once
 
 #include "asahi/lib/agx_native_descriptor.h"
+#include "drm-uapi/drm_fourcc.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -193,6 +194,31 @@ agx_gallium_pack_g17p_txf_sampler(enum agx_chip chip,
 
    return agx_pack_native_txf_sampler(chip, out);
 }
+/* Whether an imported dma-buf with `modifier` is restricted to
+ * GL_TEXTURE_EXTERNAL_OES (sample-only) on this descriptor generation.
+ *
+ * AGX3 has no in-place decompression kernel, so imported GPU_TILED_COMPRESSED
+ * images (which Gallium never allocates as shared on AGX3 and only imports
+ * from Borealis/Vulkan clients to sample) stay external-only there.
+ *
+ * DRM_FORMAT_MOD_APPLE_INTERCHANGE intentionally stays renderable
+ * (external_only = false): Wayland compositors (wlroots, Aquamarine/Hyprland,
+ * KWin, Smithay) exclude external-only modifiers from their scanout
+ * render-target lists and render their desktop into GBM scanout BOs imported
+ * as EGLImage FBOs. A single-sample 4-byte interchange target cannot spill
+ * on G17P, and Gallium refuses to reallocate shared compressed Interchange
+ * resources in agx_decompress(), failing closed on feedback loops,
+ * incompatible views, and writable shader images instead of swapping the
+ * shared BO.
+ */
+static inline bool
+agx_gallium_dmabuf_modifier_external_only(
+   enum agx_descriptor_generation generation, uint64_t modifier)
+{
+   return modifier == DRM_FORMAT_MOD_APPLE_GPU_TILED_COMPRESSED &&
+          !agx_gallium_shared_compression_supported(generation);
+}
+
 
 /* Convert a Gallium API sampler slot to the index in the per-stage HAL200
  * table. This is deliberately not the legacy global-heap 28+index handle. */

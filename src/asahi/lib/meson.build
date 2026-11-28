@@ -37,6 +37,7 @@ libasahi_lib_files = files(
   'agx_linker.c',
   'agx_bg_eot.c',
   'agx_bg_eot_key.c',
+  'agx_tile_mip.h',
   'agx_tilebuffer.c',
   'agx_nir_lower_msaa.c',
   'agx_nir_lower_sample_intrinsics.c',
@@ -203,6 +204,34 @@ if with_tests
     )
   endforeach
   test(
+    'asahi-agx-bo-cache',
+    executable(
+      'asahi-agx-bo-cache',
+      files('tests/test-agx-bo-cache.c'),
+      include_directories : [
+        inc_include, inc_src, inc_asahi, libasahi_lib_includes,
+        include_directories('../libagx'),
+      ],
+      dependencies : [
+        idep_nir, idep_agx_pack, idep_mesautil, idep_libagx_shaders_h,
+      ],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+      c_args : [c_msvc_compat_args, '-UNDEBUG'],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'asahi-userptr-limits',
+    executable(
+      'asahi-userptr-limits',
+      files('tests/test-userptr-limits.c'),
+      include_directories : include_directories('.'),
+      c_args : ['-UNDEBUG'],
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-chip-admission',
     executable(
       'asahi-chip-admission',
@@ -324,6 +353,30 @@ if with_tests
     ),
     suite : ['asahi'],
   )
+  test(
+    'asahi-agx-cdm-barrier-word',
+    executable(
+      'asahi-agx-cdm-barrier-word',
+      files('tests/test-agx-cdm-barrier-word.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
+    'asahi-agx-chip-caps',
+    executable(
+      'asahi-agx-chip-caps',
+      files('tests/test-chip-caps.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
 
   test(
     'asahi-agx-g17g-tile-format-gate',
@@ -384,6 +437,18 @@ if with_tests
     executable(
       'asahi-g17p-mrt-epilog',
       files('tests/test-agx-g17p-mrt-epilog.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      dependencies : [idep_nir, idep_mesautil],
+      link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'asahi-inline-fs-epilog',
+    executable(
+      'asahi-inline-fs-epilog',
+      files('tests/test-agx-inline-fs-epilog.c'),
       include_directories : [inc_include, inc_src, inc_asahi],
       dependencies : [idep_nir, idep_mesautil],
       link_with : [libasahi_lib, libasahi_compiler, libasahi_layout],
@@ -465,6 +530,21 @@ if with_tests
         'tests/test-agx-ioto-preshader-core.c',
       ),
       include_directories : [inc_include, inc_src, inc_asahi],
+    ),
+    suite : ['asahi'],
+  )
+
+  test(
+    'asahi-agx-ioto-state-core',
+    executable(
+      'asahi-agx-ioto-state-core',
+      files(
+        'agx_ioto_core.c',
+        'agx_ioto_state_core.c',
+        'tests/test-agx-ioto-state-core.c',
+      ),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      c_args : ['-UNDEBUG'],
     ),
     suite : ['asahi'],
   )
@@ -740,9 +820,15 @@ endif
 if with_tests
   test('agx3_m5_instructions', executable('agx3_m5_instructions',
     '../compiler/test/test-agx3-m5-instructions.c',
-    include_directories: [inc_include, inc_src, inc_asahi],
-    dependencies: [idep_mesautil, idep_nir, idep_agx_opcodes_h],
-    link_with: [libasahi_compiler, libasahi_lib]), suite: ['asahi'])
+    include_directories: [
+      inc_include, inc_src, inc_asahi, libasahi_lib_includes,
+      include_directories('../libagx'),
+    ],
+    dependencies: [
+      idep_mesautil, idep_nir, idep_agx_opcodes_h, idep_libagx_shaders_h,
+      idep_agx_pack,
+    ],
+    link_with: [libasahi_compiler, libasahi_lib, libasahi_layout]), suite: ['asahi'])
 endif
 
 if with_tests

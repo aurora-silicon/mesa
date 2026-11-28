@@ -104,6 +104,8 @@ agx_gallium_pack_native_pbe(enum agx_descriptor_generation generation,
       return false;
 
    const bool gen9 = agx3_generation == AGX_PBE_AGX3_GENERATION_9;
+   /* G18G takes agx_gallium_pack_g18_native_pbe(): Gen10 here is M5. */
+   const bool gen10 = agx3_generation == AGX_PBE_AGX3_GENERATION_10;
    const bool gen10_layered =
       agx3_generation == AGX_PBE_AGX3_GENERATION_10 &&
       (legacy->dimension == AGX_TEXTURE_DIMENSION_2D_ARRAY ||
@@ -121,38 +123,50 @@ agx_gallium_pack_native_pbe(enum agx_descriptor_generation generation,
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED ||
       array_multisample;
    const bool compressed_2d =
-      legacy->compressed && gen9 &&
+      legacy->compressed && (gen9 || gen10) &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D &&
-      legacy->layout == AGX_LAYOUT_GPU && !multisample;
+      (legacy->layout == AGX_LAYOUT_GPU ||
+       legacy->layout == AGX_LAYOUT_INTERCHANGE) && !multisample;
    const bool compressed_2d_ms =
-      legacy->compressed && gen9 &&
+      legacy->compressed && (gen9 || gen10) &&
       legacy->dimension == AGX_TEXTURE_DIMENSION_2D_MULTISAMPLED &&
       legacy->layout == AGX_LAYOUT_GPU;
+   const bool compressed_layered =
+      legacy->compressed && gen9 && (array || three_d) &&
+      legacy->layout == AGX_LAYOUT_GPU &&
+      legacy->level == 0 && legacy->levels == 1 && !legacy->unk_mipmapped;
+   const bool strided = legacy->layout == AGX_LAYOUT_LINEAR ||
+                        legacy->layout == AGX_LAYOUT_INTERCHANGE;
 
    if ((!layered && !multisample &&
         legacy->dimension != AGX_TEXTURE_DIMENSION_2D) ||
-       (legacy->layout == AGX_LAYOUT_LINEAR &&
+       (strided &&
         (legacy->level != 0 || legacy->levels != 1 ||
          legacy->unk_mipmapped)) ||
+       (legacy->layout == AGX_LAYOUT_INTERCHANGE &&
+        (!gen9 || layered || multisample || !legacy->compressed)) ||
        (legacy->layout != AGX_LAYOUT_LINEAR &&
         legacy->layout != AGX_LAYOUT_TWIDDLED &&
-        legacy->layout != AGX_LAYOUT_GPU) ||
+        legacy->layout != AGX_LAYOUT_GPU &&
+        legacy->layout != AGX_LAYOUT_INTERCHANGE) ||
        legacy->unk_52 || legacy->rotate_90 || legacy->flip_vertical ||
        (multisample ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
                        legacy->samples != AGX_SAMPLE_COUNT_4)
                     : legacy->samples != AGX_SAMPLE_COUNT_2) ||
-       (legacy->compressed && !compressed_2d && !compressed_2d_ms) ||
+       (legacy->compressed && !compressed_2d && !compressed_2d_ms &&
+        !compressed_layered) ||
        legacy->mode != AGX_IMAGE_MODE_NORMAL ||
        (!layered && legacy->layers != 1) ||
        (multisample && (legacy->layout == AGX_LAYOUT_LINEAR ||
                         legacy->level != 0 || legacy->levels != 1 ||
                         legacy->unk_mipmapped ||
-                        (gen9 && legacy->compressed && !compressed_2d_ms))) ||
+                        ((gen9 || gen10) && legacy->compressed &&
+                         !compressed_2d_ms))) ||
        (!gen9 && (legacy->level != 0 || legacy->levels != 1 ||
                   legacy->unk_mipmapped)) ||
-       (!gen9 && legacy->srgb) ||
+       (!(gen9 || gen10) && legacy->srgb) ||
        (legacy->extended != legacy->compressed) ||
-       (legacy->layout == AGX_LAYOUT_LINEAR
+       (strided
            ? legacy->stride < 12 || legacy->stride > UINT32_MAX - 4
            : legacy->stride != 0) ||
        (!legacy->compressed && legacy->acceleration_buffer) ||
@@ -176,9 +190,9 @@ agx_gallium_pack_native_pbe(enum agx_descriptor_generation generation,
       .buffer = legacy->buffer,
       .compressed = legacy->compressed,
       .acceleration_buffer = legacy->acceleration_buffer,
-      .stride_B =
-         legacy->layout == AGX_LAYOUT_LINEAR ? legacy->stride + 4 : 0,
-      .page_aligned_layers = legacy->page_aligned_layers,
+      .stride_B = strided ? legacy->stride + 4 : 0,
+      .page_aligned_layers =
+         (legacy->compressed && !layered) ? false : legacy->page_aligned_layers,
       .srgb = legacy->srgb,
    };
 

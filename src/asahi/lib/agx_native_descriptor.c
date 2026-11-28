@@ -201,6 +201,8 @@ agx_pack_native_texture(enum agx_descriptor_generation generation,
    }
 
    if (generation == AGX_DESCRIPTOR_GENERATION_10) {
+      if (semantic->layout == AGX_LAYOUT_INTERCHANGE)
+         return false;
       if (!semantic->width || semantic->width > 32768 || !semantic->height ||
           semantic->height > 32768)
          return false;
@@ -355,8 +357,8 @@ agx_pack_native_pbe(enum agx_descriptor_generation generation,
     * sideband. Both Gen9 and Gen10 admit 2D (linear, twiddled, GPU, and on
     * Gen9 single-level Interchange), 2D array, 3D, 2D multisample, and 2D
     * array multisample, plus lossless GPU-tiled compression (2D/layered/2x-4x
-    * MSAA on Gen9; 2D, 1-layer array, and qualified 2x-4x MSAA formats on
-    * Gen10).
+    * MSAA on Gen9; 2D, 2D array, single-level 3D, and qualified 2x-4x MSAA
+    * formats on Gen10).
     */
    const bool gen9 = agx3_generation == AGX_PBE_AGX3_GENERATION_9;
    const bool gen10 = agx3_generation == AGX_PBE_AGX3_GENERATION_10;
@@ -375,9 +377,8 @@ agx_pack_native_pbe(enum agx_descriptor_generation generation,
        (interchange && !layered && !multisample));
    const bool compressed_2d =
       legacy->compressed &&
-      (legacy->dimension == AGX_TEXTURE_DIMENSION_2D ||
-       (gen10 && array && legacy->layers == 1 && legacy->level == 0 &&
-        legacy->levels == 1)) &&
+      (legacy->dimension == AGX_TEXTURE_DIMENSION_2D || (gen10 && array) ||
+       (gen10 && three_d && legacy->level == 0 && legacy->levels == 1)) &&
       (legacy->layout == AGX_LAYOUT_GPU || (gen9 && interchange)) &&
       !multisample;
    /* Gen10 compressed 2x/4x MSAA is admitted only for the verified single-layer
@@ -423,7 +424,7 @@ agx_pack_native_pbe(enum agx_descriptor_generation generation,
         legacy->layout != AGX_LAYOUT_TWIDDLED &&
         legacy->layout != AGX_LAYOUT_GPU &&
         !(interchange && gen9 && !layered && !multisample &&
-          legacy->level == 0 && legacy->levels == 1)) ||
+          legacy->compressed && legacy->level == 0 && legacy->levels == 1)) ||
        legacy->unk_52 || legacy->rotate_90 || legacy->flip_vertical ||
        (multisample
            ? (legacy->samples != AGX_SAMPLE_COUNT_2 &&
