@@ -21,6 +21,30 @@
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
 
+/* Each 32-lane group of libagx_fill_uint4_blocks fills one 4 KiB block,
+ * launching an eighth of the groups of libagx_fill_uint4. Require at least
+ * 128 4 KiB blocks (512 KiB) and at least four 4 KiB blocks per GPU core so
+ * small clears keep enough total workgroups and per-core parallelism to hide
+ * store latency without under-filling wide devices.
+ */
+#define HK_CLEAR_BLOCK_FILL_MIN_GROUPS      128u
+#define HK_CLEAR_BLOCK_FILL_GROUPS_PER_CORE 4u
+
+static inline bool
+hk_clear_use_block_fill(const struct agx_device *dev, uint32_t size,
+                        uint32_t layer_count)
+{
+   if (size % 4096 != 0)
+      return false;
+
+   const uint64_t min_groups =
+      MAX2((uint64_t)HK_CLEAR_BLOCK_FILL_MIN_GROUPS,
+           (uint64_t)HK_CLEAR_BLOCK_FILL_GROUPS_PER_CORE *
+              MAX2(1u, agx_get_num_cores(dev)));
+
+   return (uint64_t)(size / 4096) * layer_count >= min_groups;
+}
+
 void
 hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                enum pipe_format view_format, const uint32_t *clear_value,
@@ -159,6 +183,11 @@ hk_clear_image(struct hk_cmd_buffer *cmd, struct hk_image *image,
                               util_logbase2(blocksize_B),
                               util_logbase2(layout->sample_count_sa), c[0],
                               c[1], c[2], c[3], word);
+         } else if (hk_clear_use_block_fill(&hk_cmd_buffer_device(cmd)->dev, size,
+                                            layer_count)) {
+            libagx_fill_uint4_blocks(cmd, agx_2d(size / 128, layer_count),
+                                     AGX_BARRIER_ALL, address, layer_stride_uint4,
+                                     c[0], c[1], c[2], c[3]);
          } else {
             libagx_fill_uint4(cmd, agx_2d(DIV_ROUND_UP(size, 16), layer_count),
                               AGX_BARRIER_ALL, address, layer_stride_uint4,
