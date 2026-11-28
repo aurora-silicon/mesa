@@ -722,9 +722,13 @@ agx3_try_uniform_float(struct util_dynarray *emission,
    struct agx3_uniform_float_src src[3] = {0};
    for (unsigned s = 0; s < count; ++s) {
       const agx_index v = I->src[s];
+      const bool allow_agx3b_half_reg =
+         enc == AGX_ISA_ENCODING_AGX3B && !half && fma && !I->saturate &&
+         agx3_src_is_register(v) && v.size == AGX_SIZE_16 && !v.abs && !v.neg;
       if (v.memory || v.kill || agx_channels(v) != 1 ||
           (v.type != AGX_INDEX_IMMEDIATE && v.size != size &&
-           !(!half && v.type == AGX_INDEX_UNIFORM && v.size == AGX_SIZE_16)))
+           !(!half && v.type == AGX_INDEX_UNIFORM && v.size == AGX_SIZE_16) &&
+           !allow_agx3b_half_reg))
          return -1;
       src[s] = (struct agx3_uniform_float_src){
          .kind = v.type == AGX_INDEX_UNIFORM     ? AGX3_FLOAT_UNIFORM
@@ -736,7 +740,8 @@ agx3_try_uniform_float(struct util_dynarray *emission,
          .neg = v.neg,
          .cache = v.cache,
          .discard = v.discard,
-         .half = v.size == AGX_SIZE_16 && v.type == AGX_INDEX_UNIFORM,
+         .half = v.size == AGX_SIZE_16 &&
+                 (v.type == AGX_INDEX_UNIFORM || allow_agx3b_half_reg),
       };
    }
    const enum agx3_uniform_float_op op = fma ? AGX3_UNIFORM_FMA :
@@ -23270,10 +23275,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                                   ctx->key->dev.emit_agx3d && reg.neg;
             agx_index reg_plain = reg;
             reg_plain.neg = false;
+            const bool agx3b_half_reg =
+               enc == AGX_ISA_ENCODING_AGX3B && !reg.neg && !reg.abs &&
+               agx3_src_is_register(reg_plain) && !reg_plain.memory &&
+               reg_plain.size == AGX_SIZE_16 && reg_plain.value < 256;
             if (imm.type == AGX_INDEX_IMMEDIATE && imm.value <= 255 &&
                 !imm.abs && !imm.neg && !imm.memory &&
                 (!reg.neg || fold_neg) &&
-                agx3_vary_reg32(reg_plain) && agx_channels(reg) == 1) {
+                (agx3_vary_reg32(reg_plain) || agx3b_half_reg) &&
+                agx_channels(reg) == 1) {
                if (reg.kill)
                   AGX3_REFUSE(I);
                const struct agx3_falu_runtime runtime = {
@@ -23283,10 +23293,14 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                const uint8_t multiplier =
                   (uint8_t)(fold_neg ? imm.value ^ 0x80 : imm.value);
                uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], length;
-               if (!agx3_falu_fma_two_imm(enc, I->dest[0].value,
-                       reg.value, multiplier, I->src[2].value,
-                       &runtime, bytes, &length) ||
-                   !agx3_append(emission, bytes, length))
+               const bool ok = agx3b_half_reg
+                  ? agx3_falu_fma_two_imm_half(enc, I->dest[0].value,
+                        reg.value, multiplier, I->src[2].value,
+                        &runtime, bytes, &length)
+                  : agx3_falu_fma_two_imm(enc, I->dest[0].value,
+                        reg.value, multiplier, I->src[2].value,
+                        &runtime, bytes, &length);
+               if (!ok || !agx3_append(emission, bytes, length))
                   AGX3_REFUSE(I);
                continue;
             }

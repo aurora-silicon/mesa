@@ -5864,7 +5864,7 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
           I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
           agx_channels(I->dest[0]) == 1) {
          bool all_scalar_regs = true;
-         bool has_half_reg = false;
+         unsigned half_regs = 0;
          agx_foreach_src(I, s) {
             const bool is_reg = (I->src[s].type == AGX_INDEX_NORMAL ||
                                  I->src[s].type == AGX_INDEX_REGISTER) &&
@@ -5873,9 +5873,9 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
             if (!is_reg)
                all_scalar_regs = false;
             else if (I->src[s].size == AGX_SIZE_16)
-               has_half_reg = true;
+               half_regs++;
          }
-         if (has_half_reg && !all_scalar_regs) {
+         if (half_regs && !all_scalar_regs) {
             agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
             agx_foreach_src(I, s) {
                if ((I->src[s].type == AGX_INDEX_NORMAL ||
@@ -5892,6 +5892,18 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
                   I->src[s] = widened;
                }
             }
+         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                    I->op == AGX_OPCODE_FMUL && half_regs > 1) {
+            /* AGX3B f32mul accepts at most one f16 GPR alongside an f32 GPR. */
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_index raw = I->src[1];
+            raw.abs = false;
+            raw.neg = false;
+            agx_index widened = agx_temp(ctx, AGX_SIZE_32);
+            agx_fmov_to(&b, widened, raw);
+            widened.abs = I->src[1].abs;
+            widened.neg = I->src[1].neg;
+            I->src[1] = widened;
          }
       }
 
@@ -5927,16 +5939,34 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
       bool has_full_gpr = false, src_modifier = false, full_modifier = false;
       unsigned half_uniforms = 0;
+      const bool f32_scalar_dest =
+         I->nr_dests == 1 && !I->dest[0].memory &&
+         I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
       bool all_scalar_regs =
          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !g18g &&
            mesa_shader_stage_is_compute(ctx->stage))) &&
-         I->nr_dests == 1 && !I->dest[0].memory &&
-         I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
+         f32_scalar_dest;
+      bool agx3b_uniform_half_gpr =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         !ctx->is_preamble && f32_scalar_dest;
+      bool has_any_gpr = false;
+      unsigned half_gprs = 0;
+      bool has_eligible_uniform = false;
       agx_foreach_src(I, s) {
-         has_full_gpr |= (I->src[s].type == AGX_INDEX_NORMAL ||
-                          I->src[s].type == AGX_INDEX_REGISTER) &&
-                         I->src[s].size == AGX_SIZE_32;
+         const bool is_scalar_gpr =
+            (I->src[s].type == AGX_INDEX_NORMAL ||
+             I->src[s].type == AGX_INDEX_REGISTER) &&
+            !I->src[s].memory && agx_channels(I->src[s]) == 1;
+         const bool is_eligible_u32 =
+            I->src[s].type == AGX_INDEX_UNIFORM &&
+            I->src[s].size == AGX_SIZE_32 && !I->src[s].memory &&
+            !(I->src[s].value & 1) && I->src[s].value < 512 &&
+            agx_channels(I->src[s]) == 1;
+         has_any_gpr |= is_scalar_gpr;
+         half_gprs += is_scalar_gpr && I->src[s].size == AGX_SIZE_16;
+         has_eligible_uniform |= is_eligible_u32;
+         has_full_gpr |= is_scalar_gpr && I->src[s].size == AGX_SIZE_32;
          const bool has_mod = I->src[s].type != AGX_INDEX_IMMEDIATE &&
                               I->src[s].type != AGX_INDEX_NULL &&
                               (I->src[s].abs || I->src[s].neg);
@@ -5945,12 +5975,37 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
          full_modifier |= has_mod && I->src[s].size == AGX_SIZE_32;
          half_uniforms += I->src[s].type == AGX_INDEX_UNIFORM &&
                           I->src[s].size == AGX_SIZE_16;
-         if ((I->src[s].type != AGX_INDEX_NORMAL &&
-              I->src[s].type != AGX_INDEX_REGISTER) ||
-             I->src[s].memory || agx_channels(I->src[s]) != 1)
+         if (!is_scalar_gpr)
             all_scalar_regs = false;
+         if (!is_scalar_gpr && !is_eligible_u32)
+            agx3b_uniform_half_gpr = false;
       }
-      const bool native_scalar_half_gpr = all_scalar_regs && !src_modifier;
+      agx3b_uniform_half_gpr &=
+         has_any_gpr && has_eligible_uniform && !src_modifier &&
+         half_uniforms == 0 && half_gprs <= 1;
+      bool agx3b_two_imm_half_gpr = false;
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          f32_scalar_dest && !src_modifier &&
+          I->src[2].type == AGX_INDEX_IMMEDIATE && I->src[2].value <= 255 &&
+          !I->src[2].abs && !I->src[2].neg && !I->src[2].memory) {
+         const bool imm0 = I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                           I->src[0].value <= 255 && !I->src[0].abs &&
+                           !I->src[0].neg && !I->src[0].memory;
+         const bool imm1 = I->src[1].type == AGX_INDEX_IMMEDIATE &&
+                           I->src[1].value <= 255 && !I->src[1].abs &&
+                           !I->src[1].neg && !I->src[1].memory;
+         if (imm0 != imm1) {
+            const agx_index reg = I->src[imm0 ? 1 : 0];
+            agx3b_two_imm_half_gpr =
+               (reg.type == AGX_INDEX_NORMAL ||
+                reg.type == AGX_INDEX_REGISTER) &&
+               !reg.memory && agx_channels(reg) == 1 &&
+               reg.size == AGX_SIZE_16;
+         }
+      }
+      const bool native_scalar_half_gpr =
+         (all_scalar_regs && !src_modifier) || agx3b_uniform_half_gpr ||
+         agx3b_two_imm_half_gpr;
       /* An AGX3C FFMA reads a half register in its own typed operand slot and
        * widens it exactly, for either destination size. Keep a half value
        * that several FFMAs read in its half register: its widened copy would

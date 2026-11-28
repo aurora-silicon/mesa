@@ -940,16 +940,31 @@ agx_lower_uniform_sources(agx_context *ctx)
          copy_float_uniforms = I->nr_dests != 1 ||
                                I->dest[0].size != size || (half_float && I->saturate);
          bool has_gpr = false;
+         unsigned half_gprs = 0;
+         bool any_mod = false;
          unsigned half_uniforms = 0;
+         agx_foreach_src(I, s) {
+            if (I->src[s].type != AGX_INDEX_IMMEDIATE)
+               any_mod |= I->src[s].abs || I->src[s].neg;
+         }
          agx_foreach_src(I, s) {
             const bool native_half_uniform =
                full_float && I->src[s].type == AGX_INDEX_UNIFORM &&
                I->src[s].size == AGX_SIZE_16 && !I->src[s].abs &&
                !I->src[s].neg;
+            const bool native_half_gpr =
+               full_float && I->op == AGX_OPCODE_FFMA && !I->saturate &&
+               !any_mod &&
+               (I->src[s].type == AGX_INDEX_NORMAL ||
+                I->src[s].type == AGX_INDEX_REGISTER) &&
+               !I->src[s].memory && agx_channels(I->src[s]) == 1 &&
+               I->src[s].size == AGX_SIZE_16;
             half_uniforms += native_half_uniform;
+            half_gprs += native_half_gpr;
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                copy_float_uniforms |=
-                  I->src[s].size != size && !native_half_uniform;
+                  I->src[s].size != size && !native_half_uniform &&
+                  !native_half_gpr;
             if (half_float)
                copy_float_uniforms |= I->src[s].abs || I->src[s].neg;
             has_gpr |= I->src[s].type != AGX_INDEX_UNIFORM &&
@@ -962,7 +977,8 @@ agx_lower_uniform_sources(agx_context *ctx)
          else if (half_uniforms)
             copy_float_uniforms = true;
          copy_float_uniforms |=
-            half_uniforms > 1 || (half_uniforms && I->saturate);
+            half_uniforms > 1 || half_gprs > 1 ||
+            (half_uniforms && (I->saturate || half_gprs));
       }
 
       bool keep_isel_uniform[4];

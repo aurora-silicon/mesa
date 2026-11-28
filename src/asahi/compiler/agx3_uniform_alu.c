@@ -111,12 +111,24 @@ uniform_float_encode(enum agx_isa_encoding encoding,
    const unsigned count = op == AGX3_UNIFORM_FMA ? 3 : 2;
    bool uniform = false, reg = false;
    unsigned half_uniforms = 0;
+   unsigned half_regs = 0;
    for (unsigned i = 0; i < count; ++i) {
       const bool source_half = half || src[i].half;
-      if (src[i].half && !half && src[i].kind != AGX3_FLOAT_UNIFORM)
+      const bool allow_agx3b_half_reg =
+         !m5 && !half && !uniform_dest && op == AGX3_UNIFORM_FMA &&
+         !saturate && src[i].kind == AGX3_FLOAT_REGISTER &&
+         !src[i].abs && !src[i].neg;
+      if (src[i].half && !half && src[i].kind != AGX3_FLOAT_UNIFORM &&
+          !allow_agx3b_half_reg)
          return false;
-      if (src[i].half && !half && (++half_uniforms > 1 || saturate))
-         return false;
+      if (src[i].half && !half) {
+         if (src[i].kind == AGX3_FLOAT_UNIFORM) {
+            if (++half_uniforms > 1 || saturate)
+               return false;
+         } else if (++half_regs > 1) {
+            return false;
+         }
+      }
       if (uniform_dest && (src[i].kind == AGX3_FLOAT_UNIFORM ||
                            src[i].abs || src[i].neg))
          return false;
@@ -134,7 +146,7 @@ uniform_float_encode(enum agx_isa_encoding encoding,
          break;
       case AGX3_FLOAT_REGISTER:
          reg = true;
-         if (src[i].value >= 256 || (!half && (src[i].value & 1)) ||
+         if (src[i].value >= 256 || (!source_half && (src[i].value & 1)) ||
              (src[i].cache && src[i].discard))
             return false;
          break;
@@ -152,7 +164,7 @@ uniform_float_encode(enum agx_isa_encoding encoding,
    /* Native main-program witnesses all retain at least one GPR operand.
     * All-uniform/immediate expressions keep one materialized input until
     * their port and constant-program contracts have their own witness. */
-   if (!reg || (!uniform_dest && !uniform))
+   if (!reg || (!uniform_dest && !uniform) || (half_uniforms && half_regs))
       return false;
 
    /* Apple G17P/G16G uniform_repeat: 09010e0d210e02c2. Domain 3 selects
