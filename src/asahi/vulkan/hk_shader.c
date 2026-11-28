@@ -5079,6 +5079,104 @@ hk_g17p_saturate_layer_viewport(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static bool
+hk_nir_is_base_instance_load(const nir_intrinsic_instr *intr,
+                             unsigned base_instance_uniform)
+{
+   return intr->intrinsic == nir_intrinsic_load_base_instance ||
+          (intr->intrinsic == nir_intrinsic_load_preamble &&
+           nir_intrinsic_base(intr) == base_instance_uniform &&
+           intr->def.num_components == 1 && intr->def.bit_size == 32);
+}
+
+static bool
+hk_nir_is_instance_index_add(nir_def *def, bool expect_instance_id,
+                             unsigned base_instance_uniform)
+{
+   nir_foreach_use_including_if(src, def) {
+      if (nir_src_is_if(src))
+         return false;
+
+      const nir_instr *parent = nir_src_use_instr(src);
+      if (parent->type != nir_instr_type_alu)
+         return false;
+
+      const nir_alu_instr *alu = nir_instr_as_alu(parent);
+      if (alu->op != nir_op_iadd || alu->def.num_components != 1 ||
+          alu->def.bit_size != 32)
+         return false;
+
+      const unsigned idx =
+         src == &alu->src[0].src ? 0u : (src == &alu->src[1].src ? 1u : 2u);
+      if (idx >= 2u)
+         return false;
+
+      const nir_alu_src *other = &alu->src[1u - idx];
+      const nir_instr *other_parent = nir_def_instr(other->src.ssa);
+      if (other_parent->type != nir_instr_type_intrinsic)
+         return false;
+
+      const nir_intrinsic_instr *other_intr =
+         nir_instr_as_intrinsic(other_parent);
+      if (expect_instance_id) {
+         if (other_intr->intrinsic != nir_intrinsic_load_instance_id)
+            return false;
+      } else {
+         if (!hk_nir_is_base_instance_load(other_intr, base_instance_uniform))
+            return false;
+      }
+   }
+
+   return true;
+}
+
+static bool
+hk_nir_vs_instance_index_only(nir_shader *nir, unsigned base_instance_uniform,
+                              unsigned draw_id_uniform)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_draw_id:
+            return false;
+         case nir_intrinsic_load_base_instance:
+            if (!hk_nir_is_instance_index_add(&intr->def, true,
+                                              base_instance_uniform))
+               return false;
+            break;
+         case nir_intrinsic_load_instance_id:
+            if (!hk_nir_is_instance_index_add(&intr->def, false,
+                                              base_instance_uniform))
+               return false;
+            break;
+         case nir_intrinsic_load_preamble: {
+            const unsigned start = nir_intrinsic_base(intr);
+            const unsigned halves =
+               (intr->def.num_components * intr->def.bit_size + 15u) / 16u;
+            const unsigned end = start + halves;
+            if (start < draw_id_uniform + 2u && end > draw_id_uniform)
+               return false;
+            if (start < base_instance_uniform + 2u &&
+                end > base_instance_uniform) {
+               if (!hk_nir_is_base_instance_load(intr, base_instance_uniform) ||
+                   !hk_nir_is_instance_index_add(&intr->def, true,
+                                                 base_instance_uniform))
+                  return false;
+            }
+            break;
+         }
+         default:
+            break;
+         }
+      }
+   }
+   return true;
+}
+
 static void
 hk_lower_hw_vs(struct hk_device *dev, nir_shader *nir, struct hk_shader *shader,
                bool kill_psiz, bool layer_as_varying, bool default_layer,
@@ -6611,6 +6709,11 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    /* XXX: rename */
    NIR_PASS(_, nir, hk_lower_uvs_index, sw_stage, nr_vbos,
             vertex_uniform_base);
+   if (sw_stage == MESA_SHADER_VERTEX && hw) {
+      shader->info.vs.instance_index_only = hk_nir_vs_instance_index_only(
+         nir, vertex_uniform_base + AGX_ABI_VUNI_BASE_INSTANCE(nr_vbos),
+         vertex_uniform_base + AGX_ABI_VUNI_DRAW_ID(nr_vbos));
+   }
    /* Stage lowering can introduce driver sysvals (for example discard's
     * no_epilog_discard mask). hk_lower_uvs_index turns those into root
     * accesses, so gather the resource requirement after that pass and before

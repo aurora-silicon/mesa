@@ -405,6 +405,7 @@ target_supports_program(const char *target, const nir_function *func)
           !strcmp(func->name, "libagx_resolve_unorm8x4") ||
           !strcmp(func->name, "libagx_predicate_indirect") ||
           !strcmp(func->name, "libagx_build_indirect_vdm") ||
+          !strcmp(func->name, "libagx_build_indirect_vdm_coalesce") ||
           /* Runtime VDM stream truncation for drawIndirectCount: one
            * invocation, binary search over constant spans, save/restore of one
            * 8-byte VDM record header with a pre-packed VDM_STREAM_LINK. */

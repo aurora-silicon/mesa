@@ -97,7 +97,14 @@ struct hk_shader_info {
           * device features. */
          uint8_t vertex_robustness;
          bool has_vertex_robustness;
-         uint8_t _pad[4];
+         /* The vertex shader reads neither gl_DrawID nor gl_BaseInstance or
+          * gl_InstanceID separately: any instance read enters solely through
+          * gl_InstanceIndex (base_instance + instance_id). Consecutive
+          * indirect draws with identical vertex/index parameters and
+          * contiguous firstInstance can then coalesce into one instanced draw
+          * when no vertex binding uses VK_VERTEX_INPUT_RATE_INSTANCE. */
+         bool instance_index_only;
+         uint8_t _pad[3];
       } vs;
 
       struct {
