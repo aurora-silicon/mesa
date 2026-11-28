@@ -1911,20 +1911,82 @@ ubo_root_always_valid(nir_def *desc_vec)
           (nir_intrinsic_access(desc) & ACCESS_BUFFER_DESCRIPTOR_AGX);
 }
 
+/* A bounded load of a field at a constant displacement from an indexed
+ * record: offset = uadd_sat(index, field), with room in the zero page for an
+ * out-of-bounds access of the whole field at its promised alignment.
+ */
+static bool
+bounded_field_parts(nir_intrinsic_instr *intr, nir_scalar *index,
+                    unsigned *field)
+{
+   nir_scalar offset = nir_scalar_resolved(intr->src[1].ssa, 0);
+   nir_def *bound = intr->src[2].ssa;
+   unsigned bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   unsigned align_offset = nir_intrinsic_align_offset(intr);
+
+   if (!is_op(offset, nir_op_uadd_sat) || offset.def->bit_size != 32 ||
+       bound->bit_size != 32 || align_offset > AGX_ZERO_PAGE_SIZE - bytes ||
+       nir_intrinsic_align_mul(intr) > AGX_ZERO_PAGE_SIZE)
+      return false;
+
+   nir_scalar x = nir_scalar_chase_alu_src(offset, 0);
+   nir_scalar y = nir_scalar_chase_alu_src(offset, 1);
+   if (!nir_scalar_is_const(x) && !nir_scalar_is_const(y))
+      return false;
+
+   *field = nir_scalar_as_uint(nir_scalar_is_const(x) ? x : y);
+   *index = nir_scalar_is_const(x) ? y : x;
+   return *field <= AGX_ZERO_PAGE_SIZE - bytes;
+}
+
+/* Fold the constant field displacement into the bounds check so adjacent
+ * fields can share their base-plus-index address.
+ */
+static nir_def *
+bounded_field_address(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   nir_scalar index_s;
+   unsigned field;
+   if (!bounded_field_parts(intr, &index_s, &field))
+      return NULL;
+
+   nir_def *bound = intr->src[2].ssa;
+   unsigned bytes = intr->def.num_components * (intr->def.bit_size / 8);
+   unsigned align_offset = nir_intrinsic_align_offset(intr);
+
+   /* index + field + bytes <= bound, including when the offset saturates. */
+   nir_def *index = nir_mov_scalar(b, index_s);
+   nir_def *limit = nir_usub_sat(b, bound, nir_imm_int(b, field + bytes - 1));
+   nir_def *record = nir_iadd(b, intr->src[0].ssa, nir_u2u64(b, index));
+
+   /* Adding the displacement must land at the promised alignment even for
+    * an out-of-bounds access.
+    */
+   nir_def *zero = nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS +
+                                    (uint64_t)align_offset - field);
+   return nir_iadd_imm(b, nir_bcsel(b, nir_ult(b, index, limit), record, zero),
+                       field);
+}
+
 static void
-lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
+lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr,
+                          bool fold_field)
 {
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *orig_base = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
    nir_def *orig_bound = intr->src[2].ssa;
    unsigned load_size = (intr->def.bit_size / 8) * intr->num_components;
+   nir_def *address = fold_field ? bounded_field_address(b, intr) : NULL;
 
-   /* Bounds check compatibly with the hardware address mode */
-   nir_def *valid = check_in_bounds(b, intr);
-   nir_def *base =
-      nir_bcsel(b, valid, orig_base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
-   offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0), load_size);
+   if (!address) {
+      /* Bounds check compatibly with the hardware address mode */
+      nir_def *valid = check_in_bounds(b, intr);
+      nir_def *base =
+         nir_bcsel(b, valid, orig_base, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      offset = bound_offset(b, valid, nir_scalar_resolved(offset, 0), load_size);
+      address = nir_iadd(b, base, nir_u2u64(b, offset));
+   }
 
    enum gl_access_qualifier access = nir_intrinsic_access(intr);
 
@@ -1938,8 +2000,6 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
        bounded_descriptor_always_valid(orig_base, orig_bound)) {
       access |= ACCESS_CAN_SPECULATE;
    }
-
-   nir_def *address = nir_iadd(b, base, nir_u2u64(b, offset));
    nir_def *val =
       intr->intrinsic == nir_intrinsic_load_global_constant_bounded
          ? nir_load_global_constant(
@@ -2190,6 +2250,17 @@ hk_lower_aligned_ubo_nir(nir_shader *nir, uint8_t static_set_mask)
 }
 
 struct global_load_lowering {
+   /* Share the record address where the unfolded check pays a 64-bit add
+    * per load anyway. On AGX3B the compiler gives device loads an unscaled
+    * 32-bit byte index register (agx_optimize_nir()'s byte_indices), so the
+    * unfolded check needs no 64-bit add and a folded record address would
+    * add one (low add, carry, high add) for every record. */
+   bool fold_field;
+   /* The bounded field loads to fold: those whose record (base, index and
+    * bound) at least one other bounded field load in the same block also
+    * reads. A record read by one field load has no address to share, and
+    * folding it alone costs an instruction more than the unfolded check. */
+   struct set *shared_fields;
    bool soft_fault;
    /* With soft faults, storage-buffer loads use the soft-fault form as well:
     * load, then zero the value when the access is out of bounds. */
@@ -2376,17 +2447,95 @@ lower_sparse_texel_buffer_residency(nir_builder *b, nir_instr *instr,
    return true;
 }
 
+/* Whether lower_load_global_bounded() lowers this load: the hard-fault form
+ * of a bounded load.
+ */
+static bool
+takes_bounded_check(const nir_intrinsic_instr *intrin,
+                    const struct global_load_lowering *state)
+{
+   return (intrin->intrinsic == nir_intrinsic_load_global_bounded &&
+           !(state->soft_fault && state->storage_result_select)) ||
+          (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
+           !state->soft_fault);
+}
+
+/* The record of a bounded field load, within one block: loads of one record
+ * in one block can share the record address, which the block's first load
+ * computes. Base and bound are compared by SSA def, so this expects the
+ * shader to be CSE'd first.
+ */
+struct bounded_record_key {
+   nir_block *block;
+   nir_def *base, *bound, *index;
+   unsigned index_comp;
+};
+
+static uint32_t
+bounded_record_key_hash(const void *key)
+{
+   return _mesa_hash_data(key, sizeof(struct bounded_record_key));
+}
+
+static bool
+bounded_record_key_equal(const void *a, const void *b)
+{
+   return !memcmp(a, b, sizeof(struct bounded_record_key));
+}
+
+/* Collect the bounded field loads that share their record with another one
+ * in the same block into state->shared_fields.
+ */
+static void
+find_shared_fields(nir_shader *nir, struct global_load_lowering *state)
+{
+   void *mem_ctx = ralloc_context(NULL);
+   struct hash_table *records = _mesa_hash_table_create(
+      mem_ctx, bounded_record_key_hash, bounded_record_key_equal);
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            nir_scalar index;
+            unsigned field;
+            if (!takes_bounded_check(intr, state) ||
+                !bounded_field_parts(intr, &index, &field))
+               continue;
+
+            struct bounded_record_key key;
+            memset(&key, 0, sizeof(key));
+            key.block = block;
+            key.base = intr->src[0].ssa;
+            key.bound = intr->src[2].ssa;
+            key.index = index.def;
+            key.index_comp = index.comp;
+
+            struct hash_entry *entry = _mesa_hash_table_search(records, &key);
+            if (!entry) {
+               _mesa_hash_table_insert(
+                  records, ralloc_memdup(mem_ctx, &key, sizeof(key)), intr);
+            } else {
+               _mesa_set_add(state->shared_fields, entry->data);
+               _mesa_set_add(state->shared_fields, intr);
+            }
+         }
+      }
+   }
+   ralloc_free(mem_ctx);
+}
+
 static bool
 lower_load_global_constant_offset_instr(nir_builder *b,
                                         nir_intrinsic_instr *intrin, void *data)
 {
    const struct global_load_lowering *state = data;
-   if ((intrin->intrinsic == nir_intrinsic_load_global_bounded &&
-        !(state->soft_fault && state->storage_result_select)) ||
-       (intrin->intrinsic == nir_intrinsic_load_global_constant_bounded &&
-        !state->soft_fault)) {
-
-      lower_load_global_bounded(b, intrin);
+   if (takes_bounded_check(intrin, state)) {
+      lower_load_global_bounded(
+         b, intrin,
+         state->fold_field && _mesa_set_search(state->shared_fields, intrin));
       return true;
    }
 
@@ -4231,9 +4380,17 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
     * lower_load_global_constant_offset_instr has special optimizations for
     * constant offsets, so we want as many offsets to be constant as possible.
     */
+   const bool soft_fault = agx_has_soft_fault(&dev->dev);
+   const enum agx_isa_encoding isa_enc = agx_chip_isa_encoding(dev->dev.chip);
    struct global_load_lowering global_loads = {
-      .soft_fault = agx_has_soft_fault(&dev->dev),
-      .storage_result_select = agx_has_soft_fault(&dev->dev),
+      /* On soft-fault targets, takes_bounded_check() rejects both bounded load
+       * forms, so keep fold_field off to skip pre-bounds CSE and scanning. */
+      .fold_field = !soft_fault &&
+                    (isa_enc == AGX_ISA_ENCODING_AGX2 ||
+                     isa_enc == AGX_ISA_ENCODING_AGX3C ||
+                     isa_enc == AGX_ISA_ENCODING_AGX3D),
+      .soft_fault = soft_fault,
+      .storage_result_select = soft_fault,
    };
    const bool need_pre_bounds_opt =
       !already_preprocessed || lowered_desc || lowered_global_io ||
@@ -4266,24 +4423,35 @@ hk_lower_nir_ex(struct hk_device *dev, nir_shader *nir,
       NIR_PASS(_, nir, nir_opt_sink, sink_opts);
       NIR_PASS(_, nir, nir_opt_move, opts);
 
-      if (global_loads.storage_result_select && global_loads.soft_fault &&
-          m5_has_mergeable_buffer_words(nir)) {
+      const bool merge_words =
+         global_loads.storage_result_select && global_loads.soft_fault &&
+         m5_has_mergeable_buffer_words(nir);
+      if (merge_words) {
          /* Lower provably non-overflowing uadd_sat(aligned, k) before CSE
           * and word merging so robust structured-buffer fields coalesce. */
          NIR_PASS(_, nir, hk_nir_lower_aligned_uadd_sat);
+      }
+      if (merge_words || global_loads.fold_field) {
          /* Reads of one descriptor share its base and size only after CSE. */
          NIR_PASS(_, nir, nir_opt_cse);
-         NIR_PASS(_, nir, hk_nir_merge_buffer_words);
       }
+      if (merge_words)
+         NIR_PASS(_, nir, hk_nir_merge_buffer_words);
    } else if (lowered_push_const) {
       NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
+   if (global_loads.fold_field) {
+      global_loads.shared_fields = _mesa_pointer_set_create(NULL);
+      find_shared_fields(nir, &global_loads);
+   }
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             lower_load_global_constant_offset_instr, nir_metadata_none,
             &global_loads);
+   if (global_loads.shared_fields)
+      _mesa_set_destroy(global_loads.shared_fields, NULL);
 
    if (global_loads.soft_fault) {
       NIR_PASS(_, nir, hk_nir_lower_aligned_uadd_sat);
