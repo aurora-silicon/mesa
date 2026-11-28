@@ -352,7 +352,7 @@ agx_read_registers(const agx_context *ctx, const agx_instr *I, unsigned s)
    case AGX_OPCODE_MATMAD16_AGX3:
       if (s == 2 && (I->matrix_type & AGX3_MATRIX_ZERO_ACCUM))
          return 0;
-      return s == 2 ? 16 : 8;
+      return s == 2 ? 16 : (agx3_matrix_input_is_int8(I->matrix_type & 15) ? 4 : 8);
    case AGX_OPCODE_MATMAD8_AGX3:
       if (s == 2 && (I->matrix_type & AGX3_MATRIX_ZERO_ACCUM))
          return 0;

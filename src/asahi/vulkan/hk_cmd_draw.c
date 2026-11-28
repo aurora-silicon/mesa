@@ -21,6 +21,8 @@
 #include "hk_ppp_state.h"
 #include "hk_device_memory.h"
 #include "util/u_atomic.h"
+#include "util/half_float.h"
+#include "util/format_r11g11b10f.h"
 #include "agx_vdm_state_core.h"
 #include "agx_ppp_hal200_raster_core.h"
 #include "agx_ppp_hal300_depth_bias_scissor_core.h"
@@ -813,6 +815,36 @@ hk_pack_rgba8_clear_value(const VkClearColorValue *color)
                       (hk_g17p_unorm8(c[2]) << 16) |
                       (hk_g17p_unorm8(c[3]) << 24);
    return packed;
+}
+
+static inline VkClearColorValue
+hk_pack_m5_clear_value(enum pipe_format fmt, const VkClearColorValue *color)
+{
+   const float *c = color->float32;
+   VkClearColorValue packed = {0};
+   switch (fmt) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+      return hk_pack_rgba8_clear_value(color);
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+      packed.uint32[0] = (uint32_t)_mesa_float_to_half(c[0]) |
+                         ((uint32_t)_mesa_float_to_half(c[1]) << 16);
+      packed.uint32[1] = (uint32_t)_mesa_float_to_half(c[2]) |
+                         ((uint32_t)_mesa_float_to_half(c[3]) << 16);
+      return packed;
+   case PIPE_FORMAT_R16G16_FLOAT:
+      packed.uint32[0] = (uint32_t)_mesa_float_to_half(c[0]) |
+                         ((uint32_t)_mesa_float_to_half(c[1]) << 16);
+      return packed;
+   case PIPE_FORMAT_R16_FLOAT:
+      packed.uint32[0] = (uint32_t)_mesa_float_to_half(c[0]);
+      return packed;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      packed.uint32[0] = float3_to_r11g11b10f(c);
+      return packed;
+   default:
+      UNREACHABLE("Unsupported M5 packed clear format");
+   }
 }
 
 /* frg-codegen v4 BG/EOT device cache.
@@ -2382,6 +2414,15 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
             goto unsupported;
          loads |= key->op[rt] == AGX_BG_LOAD;
          clears |= key->op[rt] == AGX_BG_CLEAR;
+         if (agx_chip_g17_m5(dev->dev.chip) && key->tib.nr_samples == 1) {
+            if (key->op[rt] == AGX_BG_CLEAR &&
+                agx_m5_packed_clear_rt_ok(&key->tib, rt))
+               key->packed_clear_mask |= BITFIELD_BIT(rt);
+            if (key->op[rt] == AGX_BG_LOAD &&
+                render->color_att[rt].iview->planes[0].background_raw32 &&
+                (agx_tilebuffer_offset_B(&key->tib, rt) & 3) == 0)
+               key->raw32_load_mask |= BITFIELD_BIT(rt);
+         }
       }
    }
    for (unsigned rt = count; rt < HK_MAX_RTS; ++rt) {
@@ -2461,8 +2502,12 @@ hk_build_m5_mrt_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
          VkClearColorValue colors[HK_MAX_RTS] = {0};
          for (unsigned rt = 0; rt < count; ++rt) {
             if (key->op[rt] == AGX_BG_CLEAR &&
-                info->pColorAttachments[rt].loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE)
-               colors[rt] = info->pColorAttachments[rt].clearValue.color;
+                info->pColorAttachments[rt].loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE) {
+               colors[rt] = (key->packed_clear_mask & BITFIELD_BIT(rt))
+                  ? hk_pack_m5_clear_value(key->tib.logical_format[rt],
+                                           &info->pColorAttachments[rt].clearValue.color)
+                  : info->pColorAttachments[rt].clearValue.color;
+            }
          }
          uint64_t table = hk_pool_upload(cmd, colors, 16 * count, 16);
          if (!table)
@@ -2680,10 +2725,18 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
    if (multisample)
       key->multisample_store = store && (!final_resolve || store_source);
    key->m5_store_and_resolve = final_resolve && store_source;
+   const bool m5 = agx_chip_g17_m5(dev->dev.chip);
+   key->packed_clear_mask =
+      !store && op == AGX_BG_CLEAR && m5 && single_sample &&
+      agx_m5_packed_clear_rt_ok(&key->tib, 0) ? 1u : 0u;
    key->packed_clear =
-      !store && op == AGX_BG_CLEAR &&
+      !store && op == AGX_BG_CLEAR && !m5 &&
       agx_chip_native_or_m5(dev->dev.chip) &&
       agx_g17p_packed_clear_ok(&key->tib);
+   key->raw32_load_mask =
+      !store && op == AGX_BG_LOAD && m5 && single_sample &&
+      view->planes[0].background_raw32 &&
+      (agx_tilebuffer_offset_B(&key->tib, 0) & 3) == 0 ? 1u : 0u;
    if (op == AGX_BG_CLEAR)
       key->reserved_preamble = AGX3_G17P_RT0_CLEAR_PUSH_HALFS;
    shader = agx_get_bg_eot_shader(&dev->bg_eot, key);
@@ -2733,8 +2786,13 @@ hk_build_m5_bg_eot(struct hk_cmd_buffer *cmd, struct agx_bg_eot_key *key,
       VkClearColorValue clear_value =
          clear_dont_care ? (VkClearColorValue){0}
                          : info->pColorAttachments[0].clearValue.color;
-      if (key->packed_clear && !clear_dont_care)
-         clear_value = hk_pack_rgba8_clear_value(&clear_value);
+      if (!clear_dont_care) {
+         if (key->packed_clear_mask & 1u)
+            clear_value = hk_pack_m5_clear_value(key->tib.logical_format[0],
+                                                 &clear_value);
+         else if (key->packed_clear)
+            clear_value = hk_pack_rgba8_clear_value(&clear_value);
+      }
       uint64_t clear = hk_g17p_bg_eot_upload(cmd, dc, &clear_value,
                                              sizeof(clear_value), 16);
       if (!clear)
@@ -8553,6 +8611,8 @@ hk_cmd_bind_graphics_shader(struct hk_cmd_buffer *cmd,
    }
    cmd->state.gfx.shaders_write_memory = writes;
    cmd->state.gfx.shaders_dirty |= BITFIELD_BIT(stage);
+   hk_agx3_direct_draw_fast_drop(&cmd->state.gfx);
+   cmd->state.gfx.direct_draw_fast.unsupported_linked_vs = NULL;
 
    if (stage == MESA_SHADER_FRAGMENT)
       BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_MS_RASTERIZATION_SAMPLES);
@@ -16480,6 +16540,9 @@ hk_flush_gfx_state(struct hk_cmd_buffer *cmd, uint32_t draw_id,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
 
+   /* Consumes the dirty state the cached direct draw is checked against. */
+   hk_agx3_direct_draw_fast_drop(gfx);
+
    /* Every stage hk_flush_shaders() reads has to actually be bound.  Binding
     * VK_NULL_HANDLE for a stage is how CmdBindShadersEXT *unbinds* it, and it
     * is also what a client gets when we refuse to compile that stage's shader
@@ -17004,6 +17067,27 @@ hk_g17p_draw_primitive_supported(enum agx_primitive topology)
    return topology < 16 && (UINT32_C(0xea6b) >> topology) & 1;
 }
 
+/* The restart State Update policy for HAL200 indexed direct draws. G17P keeps
+ * the VDM stream's restart index across draws, so it re-emits the record only
+ * when hk_g17p_restart_state_needed(); the other native chips carry the record
+ * on every indexed draw. Shared by hk_g17p_emit_draw() and the cached
+ * direct-draw emitter (hk_agx3_arm_direct_draw_fast()), so both emit the same
+ * record sequence. */
+static inline bool
+hk_hal200_restart_record_every_draw(enum agx_chip chip)
+{
+   return chip != AGX_CHIP_G17P;
+}
+
+static inline bool
+hk_hal200_indexed_restart_record(enum agx_chip chip, bool tail_emitted,
+                                 const struct hk_cs *cs, uint32_t restart_index)
+{
+   return hk_hal200_restart_record_every_draw(chip) ||
+          hk_g17p_restart_state_needed(tail_emitted, cs->restart_index_set,
+                                       cs->restart_index, restart_index);
+}
+
 /* The G17P draw record after any state publication: the context-relative
  * draw-state selector record when a fresh bind tail precedes it, then the
  * HAL200 draw body (indirect, indexed or direct).  Shared by hk_draw_impl()
@@ -17099,10 +17183,8 @@ hk_g17p_emit_draw(struct hk_cmd_buffer *cmd, struct hk_cs *cs, uint8_t *out,
             ? (uint64_t)UINT32_MAX
             : (rem_B + (ib & 3) + 3) >> 2;
       restart_index = hk_draw_restart_index(cmd, draw);
-      restart_record =
-         dev->dev.chip != AGX_CHIP_G17P ||
-         hk_g17p_restart_state_needed(tail_emitted, cs->restart_index_set,
-                                      cs->restart_index, restart_index);
+      restart_record = hk_hal200_indexed_restart_record(
+         dev->dev.chip, tail_emitted, cs, restart_index);
       if (restart_record) {
          w[n++] = UINT32_C(0x40000001);
          w[n++] = restart_index;
@@ -17418,6 +17500,526 @@ hk_note_pre_raster_images(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    hk_sync_vertex_images_bloom(cmd, cs, draw_bloom);
 }
 
+static inline void
+hk_copy_small_inline(void *dst_v, const void *src_v, uint32_t size)
+{
+   uint8_t *dst = dst_v;
+   const uint8_t *src = src_v;
+   uint32_t off = 0;
+
+   while (off + 16 <= size) {
+      uint64_t a, b;
+      memcpy(&a, src + off, 8);
+      memcpy(&b, src + off + 8, 8);
+      memcpy(dst + off, &a, 8);
+      memcpy(dst + off + 8, &b, 8);
+      off += 16;
+   }
+   if (off + 8 <= size) {
+      uint64_t a;
+      memcpy(&a, src + off, 8);
+      memcpy(dst + off, &a, 8);
+      off += 8;
+   }
+   if (off + 4 <= size) {
+      uint32_t a;
+      memcpy(&a, src + off, 4);
+      memcpy(dst + off, &a, 4);
+      off += 4;
+   }
+   while (off < size) {
+      dst[off] = src[off];
+      off++;
+   }
+}
+
+/* Whether the bound vertex shaders and their linked program can take the cached
+ * direct-draw emitter at all. Depends only on the bound shaders and the linked
+ * program, so a failure is remembered per linked program
+ * (hk_agx3_direct_draw_fast::unsupported_linked_vs). */
+static inline bool
+hk_agx3_direct_draw_fast_shaders_supported(const struct hk_shader *hw_vs,
+                                           const struct hk_shader *sw_vs,
+                                           const struct hk_linked_shader *linked_vs)
+{
+   return hw_vs && hw_vs == sw_vs && linked_vs && !linked_vs->sw_indexing &&
+          !hw_vs->b.info.has_preamble && !hw_vs->b.info.uses_draw_id &&
+          !sw_vs->b.info.uses_base_param && !linked_vs->b.uses_base_param;
+}
+
+/* Arm the cached steady-state direct-draw emitter after a standard direct draw
+ * completes cleanly. Every key snapshotted here is re-verified in O(1) before
+ * any fast-path draw emits bytes, so state mutations outside push constants
+ * always fall back to hk_draw_impl(). */
+static ATTRIBUTE_NOINLINE void
+hk_agx3_arm_direct_draw_fast(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                             uint16_t draw_id, struct agx_draw draw,
+                             bool needs_idx_robust, bool geom, bool tess,
+                             bool adj)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+   struct hk_agx3_direct_draw_fast *fast = &gfx->direct_draw_fast;
+
+   fast->valid = false;
+   fast->push_bypass_ready = false;
+
+   const enum agx_chip chip = dev->dev.chip;
+   const bool is_hal200 = agx_chip_native_hal200(chip);
+   const bool is_m5 = agx_chip_g17_m5(chip);
+   if ((!is_hal200 && !is_m5) || cmd->in_meta || dev->frame_anatomy ||
+       draw_id != 0 || agx_is_indirect(draw.b) || needs_idx_robust ||
+       geom || tess || adj ||
+       gfx->shaders[MESA_SHADER_TESS_CTRL] || gfx->shaders[MESA_SHADER_MESH] ||
+       gfx->render.view_mask || hk_attachmentless_render(cs) ||
+       hk_conditional_render_is_active(&cmd->state.conditional, cmd->in_meta,
+                                       cmd->conditional_meta) ||
+       desc->root.draw.pipeline_stats_flags || hk_prims_generated_active(cmd) ||
+       gfx->xfb_enabled || dyn->rs.depth_bias.enable ||
+       cs->m5_continued_pass || cs->m5_ordered ||
+       gfx->occlusion.pending_pool ||
+       gfx->occlusion.mode != AGX_VISIBILITY_MODE_NONE ||
+       !gfx->render.first_draw_seen ||
+       gfx->dirty || gfx->shaders_dirty || gfx->linked_dirty ||
+       desc->push_dirty ||
+       vk_dynamic_graphics_state_any_dirty(dyn) ||
+       hk_sync_xfer_pending(&cmd->sync) ||
+       vk_command_buffer_has_error(&cmd->vk))
+      return;
+
+#ifndef NDEBUG
+   if (dev->dev.debug & AGX_DBG_DIRTY)
+      return;
+#endif
+
+   struct hk_linked_shader *linked_vs = gfx->linked[MESA_SHADER_VERTEX];
+   struct hk_linked_shader *linked_fs = gfx->linked[MESA_SHADER_FRAGMENT];
+   struct hk_shader *hw_vs = hk_bound_hw_vs(gfx);
+   struct hk_shader *sw_vs = hk_bound_sw_vs(gfx);
+   struct hk_shader *fs = hk_bound_fs(cmd);
+   if (!hk_agx3_direct_draw_fast_shaders_supported(hw_vs, sw_vs, linked_vs)) {
+      fast->unsupported_linked_vs = linked_vs;
+      return;
+   }
+   if (!fs || !linked_fs || gfx->g17p_hoisted_preamble_va ||
+       !gfx->fast_link_vs.valid || !gfx->fast_link_fs.valid ||
+       !gfx->fast_link_vs.key.prolog.hw ||
+       gfx->fast_link_vs.key.prolog.adjacency ||
+       hk_fast_link_vs_uvs_stale(cmd, sw_vs))
+      return;
+
+   if (is_hal200) {
+      if (!cs->g17p_bind_tail.valid ||
+          !hk_g17p_draw_primitive_supported(gfx->topology))
+         return;
+   } else {
+      if (!cs->m5_ppp_emitted_valid)
+         return;
+      if (!is_hal200 &&
+          !agx_vdm_draw_supported(agx_vdm_index_list_record_chip(chip), draw,
+                                  gfx->topology))
+         return;
+   }
+
+   if (!gfx->g17p_vdm_update_memo.valid ||
+       gfx->g17p_vdm_update_memo.encoded.length != AGX_VDM_STATE_UPDATE_LENGTH)
+      return;
+
+   uint32_t draw_header_word = 0;
+   uint32_t restart_index = 0;
+   bool emit_restart_record = false;
+   if (draw.indexed) {
+      const unsigned index_size_B = agx_index_size_to_B(draw.index_size);
+      const uint64_t limit = UINT64_C(1) << 48;
+      if (draw.index_size > AGX_INDEX_SIZE_U32 || !draw.index_buffer ||
+          draw.index_buffer == AGX_ZERO_PAGE_ADDRESS ||
+          (draw.index_buffer & (index_size_B - 1)) ||
+          draw.index_buffer >= limit || !draw.index_buffer_range_B ||
+          draw.index_buffer_range_B > limit - draw.index_buffer)
+         return;
+      restart_index = hk_draw_restart_index(cmd, draw);
+      if (is_hal200) {
+         /* Cache only draws whose record need does not depend on the stream:
+          * a record on every draw, or none while the stream holds the index.
+          * No bind tail precedes a cached draw. */
+         emit_restart_record = hk_hal200_restart_record_every_draw(chip);
+         if (!emit_restart_record &&
+             hk_hal200_indexed_restart_record(chip, false, cs, restart_index))
+            return;
+         draw_header_word =
+            UINT32_C(0x61f00000) | ((uint32_t)gfx->topology << 8) |
+            ((uint32_t)draw.index_size << 17) |
+            (draw.restart ? UINT32_C(1) << 16 : 0);
+      } else if (draw.restart &&
+                 (!cs->restart_index_set || cs->restart_index != restart_index)) {
+         return;
+      }
+   } else if (is_hal200) {
+      draw_header_word = (AGX_VDM_HAL200_DIRECT_DRAW_OPCODE << 16) |
+                         ((uint32_t)gfx->topology << 8);
+   }
+
+   static_assert(sizeof(fast->vdm_words) == AGX_VDM_STATE_UPDATE_LENGTH,
+                 "VDM state update is 7 words");
+   memcpy(fast->vdm_words, gfx->g17p_vdm_update_memo.encoded.bytes,
+          sizeof(fast->vdm_words));
+   const struct agx_vdm_state_update_program_info *program =
+      hk_hw_vs_vdm_state_update(hw_vs, false);
+   fast->vdm_raw_template = program->template_info.raw_state_load_count_18 << 3;
+   if (fast->vdm_raw_template & ~AGX_VDM_STATE_VERTEX_PIPELINE_TEMPLATE_MASK)
+      return;
+
+   struct hk_shader *fs_src =
+      linked_fs->g17p_layout ? linked_fs->g17p_layout : fs;
+   fs_src = hk_linked_shader_source(fs_src, linked_fs);
+   const size_t gfx_root_size = hk_gfx_root_size_from_stages(
+      hw_vs->root_descriptor_size, true, fs->root_descriptor_size,
+      sizeof(struct hk_root_descriptor_table));
+   const bool fs_ignores_push =
+      !(fs_src->info.agx3_root_reads &
+        (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)) &&
+      !hk_root_upload_needs_growth(desc->uploaded_root_size, gfx_root_size);
+
+   fast->push_bypass_ready =
+      fs_ignores_push &&
+      hk_agx3_push_bypass_ioto_prepare(cmd, hw_vs, linked_vs, fast);
+
+   fast->cs = cs;
+   fast->cs_chunk_gpu = cs->chunk.gpu;
+   fast->dyn_generation = dyn->generation;
+   fast->non_push_generation = desc->non_push_generation;
+   fast->vertex_buffer_generation = gfx->vertex_buffer_generation;
+   fast->root = gfx->root;
+   fast->sync_epoch = cmd->sync.epoch;
+   fast->border_free_stages = gfx->border_free_stages;
+   fast->min_lod_free_stages = gfx->min_lod_free_stages;
+   fast->bind_tail_compact = is_hal200 ? cs->g17p_bind_tail.state_compact : 0;
+   fast->draw_header_word = draw_header_word;
+   fast->index_buffer = gfx->index.buffer;
+   fast->index_size = draw.index_size;
+   fast->restart_index = restart_index;
+   fast->restart_enable = draw.restart;
+   fast->emit_restart_record = emit_restart_record;
+   fast->topology = (uint8_t)gfx->topology;
+   fast->indexed = draw.indexed;
+   fast->is_hal200 = is_hal200;
+   fast->valid = true;
+}
+
+static inline bool
+hk_agx3_fast_direct_draw_begin(struct hk_cmd_buffer *cmd, bool indexed,
+                               size_t draw_bytes, uint8_t **out_p)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_agx3_direct_draw_fast *fast = &gfx->direct_draw_fast;
+
+   if (unlikely(!fast->valid || fast->indexed != indexed))
+      return false;
+
+   struct hk_cs *cs = cmd->current_cs.gfx;
+   struct hk_descriptor_state *desc = &gfx->descriptors;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+
+   /* Pushed descriptor sets are uploaded, and non_push_generation advanced,
+    * only when hk_draw_impl() flushes them. A pending push must take that
+    * path, or the draw reads the previously uploaded set. */
+   if (unlikely(cs != fast->cs || cs->chunk.gpu != fast->cs_chunk_gpu ||
+                dyn->generation != fast->dyn_generation ||
+                vk_dynamic_graphics_state_any_dirty(dyn) ||
+                desc->non_push_generation != fast->non_push_generation ||
+                desc->push_dirty != 0 ||
+                gfx->vertex_buffer_generation != fast->vertex_buffer_generation ||
+                gfx->root != fast->root ||
+                cmd->sync.epoch != fast->sync_epoch ||
+                hk_sync_xfer_pending(&cmd->sync) ||
+                (gfx->dirty | gfx->shaders_dirty | gfx->linked_dirty) != 0 ||
+                (desc->root_change.dirty_mask & ~HK_ROOT_DIRTY_PUSH) != 0 ||
+                cmd->in_meta || cmd->state.conditional.active ||
+                gfx->occlusion.pending_pool != NULL ||
+                gfx->occlusion.mode != AGX_VISIBILITY_MODE_NONE ||
+                gfx->xfb_enabled || desc->root.draw.pipeline_stats_flags != 0 ||
+                gfx->prims_generated_query[0] != 0 || cs->m5_ordered ||
+                cs->m5_continued_pass || dev->frame_anatomy ||
+                vk_command_buffer_has_error(&cmd->vk)))
+      return false;
+
+#ifndef NDEBUG
+   if (unlikely(dev->dev.debug & AGX_DBG_DIRTY))
+      return false;
+#endif
+
+   /* A stage bound without image-view minLod or custom-border emulation
+    * switches to its emulating twin in hk_draw_impl() once the device needs
+    * it; the cached draw stands for the old shader and must take that path. */
+   if (unlikely(fast->min_lod_free_stages &&
+                p_atomic_read(&hk_device_physical(dev)->min_lod_emulation)))
+      return false;
+   if (unlikely(fast->border_free_stages &&
+                p_atomic_read(&hk_device_physical(dev)->border_emulation)))
+      return false;
+
+   if (fast->is_hal200) {
+      if (unlikely(!cs->g17p_bind_tail.valid ||
+                   cs->g17p_bind_tail.state_compact != fast->bind_tail_compact))
+         return false;
+   } else {
+      if (unlikely(!cs->m5_ppp_emitted_valid))
+         return false;
+   }
+
+   const bool need_push =
+      desc->root_change.dirty_mask == HK_ROOT_DIRTY_PUSH &&
+      !desc->root_change.bypass_launched;
+   const size_t total_bytes =
+      draw_bytes + (need_push ? AGX_VDM_STATE_UPDATE_LENGTH : 0);
+   if (unlikely(!hk_cs_space_fits(
+          (size_t)((uint8_t *)cs->end - (uint8_t *)cs->current), total_bytes,
+          AGX_VDM_STREAM_LINK_LENGTH)))
+      return false;
+
+   uint8_t *out = cs->current;
+   if (need_push) {
+      struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+      if (unlikely(!fast->push_bypass_ready ||
+                   cached->loader != fast->loader ||
+                   cached->loader_linked != fast->linked_vs))
+         return false;
+
+      /* Validate both bump uploaders before advancing either cursor so an
+       * arena/BO roll falls back cleanly to hk_draw_impl(). */
+      struct hk_uploader *up = &cmd->uploader.main;
+      const uint32_t push_size = fast->push_size_B;
+      const uint32_t up_off = align(up->offset, 4);
+      if (unlikely(!up->map || up_off > up->capacity ||
+                   push_size > up->capacity - up_off))
+         return false;
+
+      struct hk_ioto_arena *arena = &cmd->ioto;
+      const uint32_t ioto_len = fast->ioto_length;
+      const uint32_t mask = HK_IOTO_PROGRAM_ALIGNMENT - 1;
+      if (unlikely(!arena->map || arena->cursor > arena->capacity ||
+                   arena->cursor > UINT32_MAX - mask))
+         return false;
+      const uint32_t ioto_off = (arena->cursor + mask) & ~mask;
+      if (unlikely(ioto_off > arena->capacity ||
+                   ioto_len > arena->capacity - ioto_off))
+         return false;
+      const uint64_t ioto_va = arena->base + ioto_off;
+      if (unlikely(!ioto_va || ioto_va >= (UINT64_C(1) << 48) ||
+                   (ioto_va & UINT64_C(0x3f)) != 0))
+         return false;
+
+      const uint64_t push_va = up->base + up_off;
+      for (unsigned r = 0; r < fast->push_reloc_count; ++r) {
+         const struct hk_agx3_push_ioto_reloc *rel = &fast->push_relocs[r];
+         if (unlikely(rel->short_mask)) {
+            const uint64_t base = push_va + rel->delta;
+            if (((rel->short_mask & 1) && (uint32_t)base >= 128) ||
+                ((rel->short_mask & 2) && (base >> 32) >= 128))
+               return false;
+         }
+      }
+
+      /* Upload push-constant slice. */
+      uint8_t *push_cpu = up->map + up_off;
+      up->offset = up_off + push_size;
+      const uint8_t *push_src = desc->root.push + fast->push_min_B;
+      if (push_size == 16) {
+         uint64_t p0, p1;
+         memcpy(&p0, push_src, 8);
+         memcpy(&p1, push_src + 8, 8);
+         memcpy(push_cpu, &p0, 8);
+         memcpy(push_cpu + 8, &p1, 8);
+      } else {
+         hk_copy_small_inline(push_cpu, push_src, push_size);
+      }
+
+      /* Copy pre-baked Ioto loader and patch only push-constant relocations. */
+      uint8_t *ioto_cpu = arena->map + ioto_off;
+      arena->cursor = ioto_off + ioto_len;
+      arena->programs++;
+      arena->program_bytes += ioto_len;
+      if (unlikely(!fast->cached_cmd_mem))
+         agx_bo_assert_range(arena->bo, ioto_off, ioto_len);
+
+      hk_copy_small_inline(ioto_cpu, fast->ioto_bytes, ioto_len);
+      for (unsigned r = 0; r < fast->push_reloc_count; ++r) {
+         const struct hk_agx3_push_ioto_reloc *rel = &fast->push_relocs[r];
+         const uint64_t base = push_va + rel->delta;
+         uint8_t *patch_out = ioto_cpu + rel->offset;
+         const bool low_short = (rel->short_mask & 1) != 0;
+         hk_g17p_patch_ldimm(patch_out, low_short, rel->dest[0],
+                             (uint32_t)base);
+         hk_g17p_patch_ldimm(patch_out + (low_short ? 2 : 8),
+                             (rel->short_mask & 2) != 0, rel->dest[1],
+                             (uint32_t)(base >> 32));
+      }
+
+      /* Keep the stage Ioto cache in sync for any subsequent non-fast draw. */
+      cached->loader_program = ioto_va;
+      for (unsigned i = 0; i < fast->push_range_count; ++i) {
+         cached->loader_ranges[fast->push_ranges[i].range].address =
+            push_va + fast->push_ranges[i].rel_offset;
+      }
+
+      /* Emit the 28-byte VDM State Update with inline pipeline pair patch. */
+      uint32_t vdm[7];
+      memcpy(vdm, fast->vdm_words, sizeof(vdm));
+      vdm[2] = util_cpu_to_le32(
+         fast->vdm_raw_template |
+         (uint32_t)(((ioto_va >> 38) & UINT64_C(0x3ff)) << 22));
+      vdm[3] = util_cpu_to_le32((uint32_t)(ioto_va >> 6));
+      memcpy(out, vdm, sizeof(vdm));
+      out += AGX_VDM_STATE_UPDATE_LENGTH;
+
+      hk_root_mark_bypass_launched(desc);
+   }
+
+   *out_p = out;
+   return true;
+}
+
+static inline void
+hk_agx3_fast_direct_draw_finish(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
+                                uint8_t *out, uint32_t count0, uint32_t count1)
+{
+   cs->current = out;
+   if (unlikely(cs->g17p_primitive_bound <= 4)) {
+      struct agx_draw tmp = {.b = agx_3d(count0, count1, 1)};
+      const uint64_t bound = hk_draw_primitive_bound(cmd, &tmp);
+      cs->g17p_primitive_bound =
+         bound > UINT64_MAX - cs->g17p_primitive_bound
+            ? UINT64_MAX
+            : cs->g17p_primitive_bound + bound;
+   }
+   cs->stats.calls++;
+   cs->stats.cmds++;
+   hk_upload_stat(cmd, draws, 1);
+}
+
+static __attribute__((hot)) bool
+hk_agx3_try_fast_direct_draw(struct hk_cmd_buffer *cmd, uint32_t vertexCount,
+                             uint32_t instanceCount, uint32_t firstVertex)
+{
+   if (unlikely(vertexCount == 0 || instanceCount == 0))
+      return true;
+
+   struct hk_agx3_direct_draw_fast *fast = &cmd->state.gfx.direct_draw_fast;
+   uint8_t *out;
+   if (!hk_agx3_fast_direct_draw_begin(cmd, false, 32, &out))
+      return false;
+
+   if (fast->is_hal200) {
+      uint32_t w[4] = {
+         fast->draw_header_word,
+         vertexCount,
+         instanceCount,
+         firstVertex,
+      };
+      memcpy(out, w, sizeof(w));
+      out += sizeof(w);
+   } else {
+      struct agx_draw draw = {
+         .b = agx_3d(vertexCount, instanceCount, 1),
+         .start = firstVertex,
+      };
+      out = (uint8_t *)agx_vdm_draw(
+         (uint32_t *)out,
+         agx_vdm_index_list_record_chip(hk_cmd_buffer_device(cmd)->dev.chip),
+         draw, (enum agx_primitive)fast->topology, 0);
+   }
+
+   hk_agx3_fast_direct_draw_finish(cmd, fast->cs, out, vertexCount,
+                                   instanceCount);
+   return true;
+}
+
+static ATTRIBUTE_NOINLINE __attribute__((hot)) bool
+hk_agx3_try_fast_direct_draw_indexed(struct hk_cmd_buffer *cmd,
+                                     uint32_t indexCount,
+                                     uint32_t instanceCount,
+                                     uint32_t firstIndex, int32_t vertexOffset)
+{
+   if (unlikely(indexCount == 0 || instanceCount == 0))
+      return true;
+
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_agx3_direct_draw_fast *fast = &gfx->direct_draw_fast;
+   if (unlikely(!fast->valid || !fast->indexed ||
+                gfx->index.buffer.addr != fast->index_buffer.addr ||
+                gfx->index.buffer.range != fast->index_buffer.range ||
+                gfx->index.size != fast->index_size))
+      return false;
+
+   const unsigned index_size_B = agx_index_size_to_B(fast->index_size);
+   const uint64_t range_B = fast->index_buffer.range;
+   const uint64_t offset_B = (uint64_t)firstIndex * index_size_B;
+   const uint64_t count_B = (uint64_t)indexCount * index_size_B;
+   if (unlikely(offset_B >= range_B || count_B > range_B - offset_B))
+      return false;
+
+   struct hk_cs *cs = cmd->current_cs.gfx;
+   if (unlikely(cs != fast->cs))
+      return false;
+   if (fast->is_hal200) {
+      if (unlikely(!fast->emit_restart_record &&
+                   hk_g17p_restart_state_needed(false, cs->restart_index_set,
+                                                cs->restart_index,
+                                                fast->restart_index)))
+         return false;
+   } else if (unlikely(fast->restart_enable &&
+                       (!cs->restart_index_set ||
+                        cs->restart_index != fast->restart_index))) {
+      return false;
+   }
+
+   uint8_t *out;
+   if (!hk_agx3_fast_direct_draw_begin(cmd, true, 48, &out))
+      return false;
+
+   if (fast->is_hal200) {
+      const uint64_t ib = fast->index_buffer.addr + offset_B;
+      const uint64_t rem_B = range_B - offset_B;
+      const uint64_t max_dwords_B = (uint64_t)UINT32_MAX * 4;
+      const uint64_t dwords =
+         rem_B >= max_dwords_B ? (uint64_t)UINT32_MAX
+                               : (rem_B + (ib & 3) + 3) >> 2;
+      uint32_t w[9];
+      unsigned n = 0;
+      if (unlikely(fast->emit_restart_record)) {
+         w[n++] = UINT32_C(0x40000001);
+         w[n++] = fast->restart_index;
+      }
+      w[n++] = fast->draw_header_word | (uint32_t)((ib >> 32) & 0xff);
+      w[n++] = (uint32_t)ib;
+      w[n++] = indexCount;
+      w[n++] = instanceCount;
+      w[n++] = (uint32_t)vertexOffset;
+      w[n++] = (uint32_t)((dwords > UINT32_MAX ? UINT32_MAX : dwords) - 1);
+      w[n++] = (uint32_t)((ib >> 40) & 0xff);
+      memcpy(out, w, n * sizeof(uint32_t));
+      out += n * sizeof(uint32_t);
+   } else {
+      struct agx_draw draw = agx_draw_indexed(
+         indexCount, instanceCount, firstIndex, vertexOffset, 0,
+         fast->index_buffer.addr, fast->index_buffer.range, fast->index_size,
+         fast->restart_enable);
+      out = (uint8_t *)agx_vdm_draw(
+         (uint32_t *)out,
+         agx_vdm_index_list_record_chip(hk_cmd_buffer_device(cmd)->dev.chip),
+         draw, (enum agx_primitive)fast->topology, fast->restart_index);
+   }
+
+   hk_agx3_fast_direct_draw_finish(cmd, fast->cs, out, indexCount,
+                                   instanceCount);
+   return true;
+}
+
 static __attribute__((hot)) void
 hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
              struct hk_robust_index_batch *batch)
@@ -17429,6 +18031,10 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
    if (!agx_is_indirect(draw_.b) &&
        (draw_.b.count[0] == 0 || draw_.b.count[1] == 0))
       return;
+
+   /* This draw consumes the dirty state the cached direct draw relies on
+    * seeing; it re-arms at the end if it is a plain direct draw. */
+   hk_agx3_direct_draw_fast_drop(&cmd->state.gfx);
 
    /* G17P: before anything is recorded for the draw, order a transfer the
     * application did not order before graphics work if the draw may access
@@ -17838,6 +18444,12 @@ hk_draw_impl(struct hk_cmd_buffer *cmd, uint16_t draw_id, struct agx_draw draw_,
          hk_frame_anatomy_note_m5_fragment(cs);
       }
       cs->stats.cmds++;
+
+      if (draw_id == 0 && !agx_is_indirect(draw.b) &&
+          cmd->state.gfx.linked[MESA_SHADER_VERTEX] !=
+             cmd->state.gfx.direct_draw_fast.unsupported_linked_vs)
+         hk_agx3_arm_direct_draw_fast(cmd, cs, draw_id, draw, needs_idx_robust,
+                                      geom, tess, adj);
    }
 }
 
@@ -18301,6 +18913,12 @@ hk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
            uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (likely(!HK_TEST_INDIRECTS &&
+              hk_agx3_try_fast_direct_draw(cmd, vertexCount, instanceCount,
+                                           firstVertex)))
+      return;
+
    struct agx_draw draw;
 
    if (HK_TEST_INDIRECTS) {
@@ -18374,6 +18992,17 @@ hk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                   uint32_t instanceCount, uint32_t firstIndex,
                   int32_t vertexOffset, uint32_t firstInstance)
 {
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+   const struct hk_agx3_direct_draw_fast *fast =
+      &cmd->state.gfx.direct_draw_fast;
+
+   /* Only an armed indexed emitter pays for the attempt; every other draw
+    * keeps hk_draw_indexed()'s plain path. */
+   if (!HK_TEST_INDIRECTS && fast->valid && fast->indexed &&
+       hk_agx3_try_fast_direct_draw_indexed(cmd, indexCount, instanceCount,
+                                            firstIndex, vertexOffset))
+      return;
+
    hk_draw_indexed(commandBuffer, 0, indexCount, instanceCount, firstIndex,
                    vertexOffset, firstInstance);
 }
@@ -18523,6 +19152,7 @@ hk_g17p_emit_indirect_record(struct hk_cmd_buffer *cmd, uint16_t draw_id,
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_descriptor_state *desc = &gfx->descriptors;
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   hk_agx3_direct_draw_fast_drop(gfx);
    struct hk_cs *cs = cmd->current_cs.gfx;
 
    /* An eligible multi-draw may emit even its first record here, so this

@@ -2738,6 +2738,36 @@ hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
       unsigned max_size =
          ((pdev->dev.params.features & DRM_ASAHI_FEATURE_COMPUTE_MATRIX) &&
           agx_chip_isa_encoding(pdev->dev.chip) == AGX_ISA_ENCODING_AGX3C) ? 16 : 8;
+      if (max_size == 16) {
+         const struct {
+            VkComponentTypeKHR a, b, c;
+            VkBool32 sat;
+         } int8_configs[] = {
+            {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+            {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+            {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT32_KHR, VK_FALSE},
+            {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+            {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+            {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+            {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+            {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+            {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+         };
+         for (unsigned i = 0; i < ARRAY_SIZE(int8_configs); ++i) {
+            vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
+               *p = (VkCooperativeMatrixPropertiesKHR) {
+                  .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+                  .MSize = 16, .NSize = 16, .KSize = 16,
+                  .AType = int8_configs[i].a,
+                  .BType = int8_configs[i].b,
+                  .CType = int8_configs[i].c,
+                  .ResultType = int8_configs[i].c,
+                  .saturatingAccumulation = int8_configs[i].sat,
+                  .scope = VK_SCOPE_SUBGROUP_KHR,
+               };
+            }
+         }
+      }
       for (unsigned size = max_size; size >= 8; size /= 2) {
          const VkComponentTypeKHR types[] = {VK_COMPONENT_TYPE_FLOAT16_KHR,
             VK_COMPONENT_TYPE_BFLOAT16_KHR};
@@ -2806,13 +2836,23 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
    const bool bf16 = pdev->vk.supported_features.shaderBFloat16CooperativeMatrix;
    const struct {
       VkComponentTypeKHR a, b, c;
+      VkBool32 sat;
    } configs[] = {
-      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
-      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR},
-      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
-      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR},
-      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
-      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_FLOAT16_KHR, VK_COMPONENT_TYPE_BFLOAT16_KHR, VK_COMPONENT_TYPE_FLOAT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+      {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+      {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
+      {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_FALSE},
+      {VK_COMPONENT_TYPE_UINT8_KHR, VK_COMPONENT_TYPE_SINT8_KHR, VK_COMPONENT_TYPE_SINT32_KHR, VK_TRUE},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
       if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
@@ -2824,7 +2864,7 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
             .MGranularity = 16, .NGranularity = 16, .KGranularity = 16,
             .AType = configs[i].a, .BType = configs[i].b,
             .CType = configs[i].c, .ResultType = configs[i].c,
-            .saturatingAccumulation = VK_FALSE,
+            .saturatingAccumulation = configs[i].sat,
             .scope = VK_SCOPE_SUBGROUP_KHR,
             .workgroupInvocations = 0,
          };
@@ -2842,6 +2882,10 @@ hk_GetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV(
          for (unsigned i = 0; i < ARRAY_SIZE(configs); ++i) {
             if (!bf16 && (configs[i].a == VK_COMPONENT_TYPE_BFLOAT16_KHR ||
                           configs[i].b == VK_COMPONENT_TYPE_BFLOAT16_KHR))
+               continue;
+            /* 32x16@128 and 32x32@256 split to 8x8 subgroup tiles; iGeMM16x16x16 is 16x16 only. */
+            if (configs[i].a == VK_COMPONENT_TYPE_SINT8_KHR ||
+                configs[i].a == VK_COMPONENT_TYPE_UINT8_KHR)
                continue;
             vk_outarray_append_typed(VkCooperativeMatrixFlexibleDimensionsPropertiesNV, &out, p) {
                *p = (VkCooperativeMatrixFlexibleDimensionsPropertiesNV) {

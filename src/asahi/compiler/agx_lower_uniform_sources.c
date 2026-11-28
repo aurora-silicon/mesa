@@ -770,7 +770,13 @@ agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
        ctx->is_preamble || I->op != AGX_OPCODE_ICMPSEL ||
        I->nr_dests != 1 || I->nr_srcs != 4 ||
        I->dest[0].size != AGX_SIZE_32 || agx_channels(I->dest[0]) != 1 ||
-       I->src[0].size != AGX_SIZE_32 || I->src[1].size != AGX_SIZE_32)
+       I->src[0].size != AGX_SIZE_32)
+      return;
+
+   const bool imm1_ok =
+      I->src[1].type == AGX_INDEX_IMMEDIATE && I->src[1].value <= UINT8_MAX &&
+      !I->src[1].abs && !I->src[1].neg && !I->src[1].memory;
+   if (!imm1_ok && I->src[1].size != AGX_SIZE_32)
       return;
 
    bool uniform_ok[4], reg32[4];
@@ -782,12 +788,12 @@ agx3_isel_uniforms_kept(const agx_context *ctx, const agx_instr *I,
       reg32[j] = x.type == AGX_INDEX_NORMAL && x.size == AGX_SIZE_32 &&
                  !x.abs && !x.neg && agx_channels(x) == 1;
    }
-   if (uniform_ok[2] || uniform_ok[3]) {
+   if ((uniform_ok[2] || uniform_ok[3]) && (!imm1_ok || reg32[0])) {
       keep[2] = uniform_ok[2];
       keep[3] = uniform_ok[3];
-   } else if (uniform_ok[0] && reg32[1] && reg32[2] && reg32[3]) {
+   } else if (!imm1_ok && uniform_ok[0] && reg32[1] && reg32[2] && reg32[3]) {
       keep[0] = true;
-   } else if (uniform_ok[1] && reg32[0] && reg32[2] && reg32[3]) {
+   } else if (!imm1_ok && uniform_ok[1] && reg32[0] && reg32[2] && reg32[3]) {
       keep[1] = true;
    }
 }
@@ -1005,16 +1011,31 @@ agx_lower_uniform_sources(agx_context *ctx)
          copy_float_uniforms = I->nr_dests != 1 ||
                                I->dest[0].size != size || (half_float && I->saturate);
          bool has_gpr = false;
+         unsigned half_gprs = 0;
+         bool any_mod = false;
          unsigned half_uniforms = 0;
+         agx_foreach_src(I, s) {
+            if (I->src[s].type != AGX_INDEX_IMMEDIATE)
+               any_mod |= I->src[s].abs || I->src[s].neg;
+         }
          agx_foreach_src(I, s) {
             const bool native_half_uniform =
                full_float && I->src[s].type == AGX_INDEX_UNIFORM &&
                I->src[s].size == AGX_SIZE_16 && !I->src[s].abs &&
                !I->src[s].neg;
+            const bool native_half_gpr =
+               full_float && I->op == AGX_OPCODE_FFMA && !I->saturate &&
+               !any_mod &&
+               (I->src[s].type == AGX_INDEX_NORMAL ||
+                I->src[s].type == AGX_INDEX_REGISTER) &&
+               !I->src[s].memory && agx_channels(I->src[s]) == 1 &&
+               I->src[s].size == AGX_SIZE_16;
             half_uniforms += native_half_uniform;
+            half_gprs += native_half_gpr;
             if (I->src[s].type != AGX_INDEX_IMMEDIATE)
                copy_float_uniforms |=
-                  I->src[s].size != size && !native_half_uniform;
+                  I->src[s].size != size && !native_half_uniform &&
+                  !native_half_gpr;
             if (half_float)
                copy_float_uniforms |= I->src[s].abs || I->src[s].neg;
             has_gpr |= I->src[s].type != AGX_INDEX_UNIFORM &&
@@ -1027,7 +1048,8 @@ agx_lower_uniform_sources(agx_context *ctx)
          else if (half_uniforms)
             copy_float_uniforms = true;
          copy_float_uniforms |=
-            half_uniforms > 1 || (half_uniforms && I->saturate);
+            half_uniforms > 1 || half_gprs > 1 ||
+            (half_uniforms && (I->saturate || half_gprs));
       }
 
       bool keep_isel_uniform[4];

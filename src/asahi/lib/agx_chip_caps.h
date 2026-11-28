@@ -178,7 +178,7 @@ enum agx_chip_cap {
 
    /* Constant deltas between a block's shared-memory accesses fold into the
     * lload/lstore index immediate (4 elements of the access type per unit).
-    * Measured on G13G and G13X; other generations keep the unfolded
+    * Measured on G13G, G13X, and G14X; other variants keep the unfolded
     * addresses until they are measured. */
    AGX_CAP_FOLD_SHARED_OFFSETS = 1u << 24,
 
@@ -188,6 +188,13 @@ enum agx_chip_cap {
     * independent dispatches. Measured on G13G and G13X (0 regressions on
     * synchronization/memory_model/compute CTS). */
    AGX_CAP_CDM_DEFER_FLUSH = 1u << 25,
+
+   /* Pack 64-bit AGX2 preamble memory base pointers (load_agx,
+    * load_constant_agx, store_agx, global_atomic_agx) into low uniform slots
+    * (< 256 halfwords) so memory instructions read them directly without
+    * per-load mov1 copies. Measured on G14X (Apple M2 Max); other chips keep
+    * stock preamble order until measured on aurora-wip. */
+   AGX_CAP_PREAMBLE_BASES_LOW = 1u << 30,
 
    /* Partition AGX2 compute async scoreboard slots by first-use distance and
     * avoid premature AGX_MAX_PENDING=8 slot-0 overflow stalls when early-use
@@ -303,8 +310,8 @@ enum agx_chip_cap {
    X(G13X, AGX_CAPS_G13, __VA_ARGS__)                                          \
    X(G14G, AGX_CAPS_AGX2, __VA_ARGS__)                                         \
    X(G14X,                                                                     \
-     AGX_CAPS_AGX2 | AGX_CAP_COMPUTE_SMART_WAITS |                             \
-        AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS,                                      \
+     AGX_CAPS_AGX2 | AGX_CAP_FOLD_SHARED_OFFSETS | AGX_CAP_PREAMBLE_BASES_LOW | \
+        AGX_CAP_COMPUTE_SMART_WAITS | AGX_CAP_COMPUTE_HOIST_LOAD_ADDRS,        \
      __VA_ARGS__)                                                              \
    X(G15P, 0, __VA_ARGS__)                                                     \
    X(G15G, AGX_CAPS_NATIVE, __VA_ARGS__)                                       \

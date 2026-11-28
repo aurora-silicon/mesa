@@ -1010,16 +1010,24 @@ agx_pack_normalized_agx3(agx_builder *b, const agx_index *channels,
    if (nr_channels < 1 || nr_channels > 4)
       return 0;
 
-   /* Every fltnorm witness takes 32-bit float sources. A linked fragment
-    * epilog may receive normalized colour through the 16-bit export ABI, so
-    * reproduce Apple's native half-to-float conversion before packing. */
+   /* On AGX3c (excluding G18G's agx3d transcoder), fltnorm natively consumes
+    * 16-bit half-float register sources for 8-bit normalized targets, avoiding
+    * explicit f16->f32 widening before packing. */
+   const bool native_f16_norm8 =
+      b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      !agx_is_g18g(&b->shader->key->dev) && norm8;
+
    agx_index pack_sources[4];
    for (unsigned i = 0; i < nr_channels; ++i) {
       if (channels[i].size == AGX_SIZE_32) {
          pack_sources[i] = channels[i];
       } else if (channels[i].size == AGX_SIZE_16) {
-         pack_sources[i] = agx_temp(b->shader, AGX_SIZE_32);
-         agx_fmov_to(b, pack_sources[i], channels[i]);
+         if (native_f16_norm8) {
+            pack_sources[i] = channels[i];
+         } else {
+            pack_sources[i] = agx_temp(b->shader, AGX_SIZE_32);
+            agx_fmov_to(b, pack_sources[i], channels[i]);
+         }
       } else {
          return 0;
       }
@@ -1113,9 +1121,7 @@ agx_unpack_integer_8_agx3(agx_builder *b, agx_index dest,
       b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
    if (agx3b || (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
                  !b->shader->key->dev.emit_agx3d)) {
-      const agx_index count = agx3b && nr_channels > 1
-                                 ? agx_g17p_shift_boundary(b, 8)
-                                 : agx_immediate(8);
+      const agx_index count = agx_immediate(8);
       for (unsigned i = 0; i < nr_channels; ++i) {
          channels[i] = (i & 1) ? agx_ushr(b, halfs[i / 2], count)
                                : agx_and(b, halfs[i / 2], agx_immediate(0xff));
@@ -3719,15 +3725,23 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
          return NULL;
       }
 
-      unsigned type = nir_intrinsic_src_type(instr) == nir_type_uint16
-         ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type(instr) == nir_type_float32
-         ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
-      unsigned type_b = nir_intrinsic_src_type2(instr) == nir_type_uint16
-         ? AGX3_MATRIX_INPUT_BF16 : nir_intrinsic_src_type2(instr) == nir_type_float32
-         ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
+      const nir_alu_type ta = nir_intrinsic_src_type(instr);
+      const nir_alu_type tb = nir_intrinsic_src_type2(instr);
+      unsigned type =
+         ta == nir_type_int8 ? AGX3_MATRIX_INPUT_S8 :
+         ta == nir_type_uint8 ? AGX3_MATRIX_INPUT_U8 :
+         ta == nir_type_uint16 ? AGX3_MATRIX_INPUT_BF16 :
+         ta == nir_type_float32 ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
+      unsigned type_b =
+         tb == nir_type_int8 ? AGX3_MATRIX_INPUT_S8 :
+         tb == nir_type_uint8 ? AGX3_MATRIX_INPUT_U8 :
+         tb == nir_type_uint16 ? AGX3_MATRIX_INPUT_BF16 :
+         tb == nir_type_float32 ? AGX3_MATRIX_INPUT_F32 : AGX3_MATRIX_INPUT_F16;
       type |= type_b << 4;
       if (instr->def.bit_size == 16)
          type |= AGX3_MATRIX_ACCUM_F16;
+      if (nir_intrinsic_saturate(instr))
+         type |= AGX3_MATRIX_SATURATE;
       /* The 16x16 GEMM form is M5 (AGX3C) only; the 8x8 matmad also exists on
        * the AGX3B encoding (G15/G16/G17P), so the 2-component path is allowed
        * there too. */
@@ -5330,7 +5344,8 @@ agx_lower_agx3_half_converts(agx_context *ctx)
           !I->src[1].memory)
          continue;
 
-      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !is_g18g &&
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
+           ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C) && !is_g18g &&
           I->src[0].value == AGX_CONVERT_U8_TO_F && I->round == AGX_ROUND_RTE &&
           I->dest[0].size == AGX_SIZE_32 && I->src[1].size == AGX_SIZE_16 &&
           !I->src[1].abs && !I->src[1].neg && !I->src[1].memory)
@@ -5864,7 +5879,7 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
           I->nr_dests == 1 && I->dest[0].size == AGX_SIZE_32 &&
           agx_channels(I->dest[0]) == 1) {
          bool all_scalar_regs = true;
-         bool has_half_reg = false;
+         unsigned half_regs = 0;
          agx_foreach_src(I, s) {
             const bool is_reg = (I->src[s].type == AGX_INDEX_NORMAL ||
                                  I->src[s].type == AGX_INDEX_REGISTER) &&
@@ -5873,9 +5888,9 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
             if (!is_reg)
                all_scalar_regs = false;
             else if (I->src[s].size == AGX_SIZE_16)
-               has_half_reg = true;
+               half_regs++;
          }
-         if (has_half_reg && !all_scalar_regs) {
+         if (half_regs && !all_scalar_regs) {
             agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
             agx_foreach_src(I, s) {
                if ((I->src[s].type == AGX_INDEX_NORMAL ||
@@ -5892,6 +5907,18 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
                   I->src[s] = widened;
                }
             }
+         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                    I->op == AGX_OPCODE_FMUL && half_regs > 1) {
+            /* AGX3B f32mul accepts at most one f16 GPR alongside an f32 GPR. */
+            agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
+            agx_index raw = I->src[1];
+            raw.abs = false;
+            raw.neg = false;
+            agx_index widened = agx_temp(ctx, AGX_SIZE_32);
+            agx_fmov_to(&b, widened, raw);
+            widened.abs = I->src[1].abs;
+            widened.neg = I->src[1].neg;
+            I->src[1] = widened;
          }
       }
 
@@ -5927,16 +5954,34 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
       agx_builder b = agx_init_builder(ctx, agx_before_instr(I));
       bool has_full_gpr = false, src_modifier = false, full_modifier = false;
       unsigned half_uniforms = 0;
+      const bool f32_scalar_dest =
+         I->nr_dests == 1 && !I->dest[0].memory &&
+         I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
       bool all_scalar_regs =
          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B ||
           (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C && !g18g &&
            mesa_shader_stage_is_compute(ctx->stage))) &&
-         I->nr_dests == 1 && !I->dest[0].memory &&
-         I->dest[0].size == AGX_SIZE_32 && agx_channels(I->dest[0]) == 1;
+         f32_scalar_dest;
+      bool agx3b_uniform_half_gpr =
+         ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         !ctx->is_preamble && f32_scalar_dest;
+      bool has_any_gpr = false;
+      unsigned half_gprs = 0;
+      bool has_eligible_uniform = false;
       agx_foreach_src(I, s) {
-         has_full_gpr |= (I->src[s].type == AGX_INDEX_NORMAL ||
-                          I->src[s].type == AGX_INDEX_REGISTER) &&
-                         I->src[s].size == AGX_SIZE_32;
+         const bool is_scalar_gpr =
+            (I->src[s].type == AGX_INDEX_NORMAL ||
+             I->src[s].type == AGX_INDEX_REGISTER) &&
+            !I->src[s].memory && agx_channels(I->src[s]) == 1;
+         const bool is_eligible_u32 =
+            I->src[s].type == AGX_INDEX_UNIFORM &&
+            I->src[s].size == AGX_SIZE_32 && !I->src[s].memory &&
+            !(I->src[s].value & 1) && I->src[s].value < 512 &&
+            agx_channels(I->src[s]) == 1;
+         has_any_gpr |= is_scalar_gpr;
+         half_gprs += is_scalar_gpr && I->src[s].size == AGX_SIZE_16;
+         has_eligible_uniform |= is_eligible_u32;
+         has_full_gpr |= is_scalar_gpr && I->src[s].size == AGX_SIZE_32;
          const bool has_mod = I->src[s].type != AGX_INDEX_IMMEDIATE &&
                               I->src[s].type != AGX_INDEX_NULL &&
                               (I->src[s].abs || I->src[s].neg);
@@ -5945,12 +5990,37 @@ agx_lower_agx3_fma_sources(agx_context *ctx)
          full_modifier |= has_mod && I->src[s].size == AGX_SIZE_32;
          half_uniforms += I->src[s].type == AGX_INDEX_UNIFORM &&
                           I->src[s].size == AGX_SIZE_16;
-         if ((I->src[s].type != AGX_INDEX_NORMAL &&
-              I->src[s].type != AGX_INDEX_REGISTER) ||
-             I->src[s].memory || agx_channels(I->src[s]) != 1)
+         if (!is_scalar_gpr)
             all_scalar_regs = false;
+         if (!is_scalar_gpr && !is_eligible_u32)
+            agx3b_uniform_half_gpr = false;
       }
-      const bool native_scalar_half_gpr = all_scalar_regs && !src_modifier;
+      agx3b_uniform_half_gpr &=
+         has_any_gpr && has_eligible_uniform && !src_modifier &&
+         half_uniforms == 0 && half_gprs <= 1;
+      bool agx3b_two_imm_half_gpr = false;
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          f32_scalar_dest && !src_modifier &&
+          I->src[2].type == AGX_INDEX_IMMEDIATE && I->src[2].value <= 255 &&
+          !I->src[2].abs && !I->src[2].neg && !I->src[2].memory) {
+         const bool imm0 = I->src[0].type == AGX_INDEX_IMMEDIATE &&
+                           I->src[0].value <= 255 && !I->src[0].abs &&
+                           !I->src[0].neg && !I->src[0].memory;
+         const bool imm1 = I->src[1].type == AGX_INDEX_IMMEDIATE &&
+                           I->src[1].value <= 255 && !I->src[1].abs &&
+                           !I->src[1].neg && !I->src[1].memory;
+         if (imm0 != imm1) {
+            const agx_index reg = I->src[imm0 ? 1 : 0];
+            agx3b_two_imm_half_gpr =
+               (reg.type == AGX_INDEX_NORMAL ||
+                reg.type == AGX_INDEX_REGISTER) &&
+               !reg.memory && agx_channels(reg) == 1 &&
+               reg.size == AGX_SIZE_16;
+         }
+      }
+      const bool native_scalar_half_gpr =
+         (all_scalar_regs && !src_modifier) || agx3b_uniform_half_gpr ||
+         agx3b_two_imm_half_gpr;
       /* An AGX3C FFMA reads a half register in its own typed operand slot and
        * widens it exactly, for either destination size. Keep a half value
        * that several FFMAs read in its half register: its widened copy would
@@ -9414,18 +9484,15 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
             return agx_mov_to(b, dst, s0);
          return agx_ushr_to(b, dst, s0, agx_immediate(shift));
       }
-      /* G17P's register `srl` takes the ordinary positive count, as
-       * applegpu_g17p's `ushort(a >> s)` (a710540002080000d0130500, after
-       * its own `s & 31`) does. This used to build `0 - count`, but the
-       * G17P iadd packer read NEG as a sign extension and emitted `0 +
-       * count`; every hardware-proven program therefore already carries
-       * the positive count through this add, which is kept. */
+      /* G17P's register `srl` takes the ordinary positive 32-bit count.
+       * Only narrow or modified counts need widening via `0 + count`; a plain
+       * 32-bit register count feeds `srl` directly. */
       if (b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
          if (s1.type == AGX_INDEX_IMMEDIATE) {
             /* The immediate SRL form consumes the positive literal itself. */
             if (!(sz == 32 && s1.value >= 1 && s1.value <= 31))
                s1 = agx_g17p_shift_boundary(b, s1.value);
-         } else {
+         } else if (s1.size != AGX_SIZE_32 || s1.abs || s1.neg || s1.memory) {
             agx_index boundary = agx_temp(b->shader, AGX_SIZE_32);
             agx_iadd_to(b, boundary, i0, s1, 0);
             s1 = boundary;
@@ -9637,9 +9704,14 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
        * is the low byte of its low or high half: no mask or shift. Bytes 1 and
        * 3 take a 16-bit shift of their half. All four read only the halves, so
        * the word dies at its split and needs no copy. */
-      if (instr->op == nir_op_u2f32 && (src_sz == 32 || src_sz == 8) &&
-          b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
-          !b->shader->key->dev.emit_agx3d) {
+      const bool u2f32_byte_agx3b =
+         b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+         src_sz == 32;
+      const bool u2f32_byte_agx3c =
+         b->shader->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+         !b->shader->key->dev.emit_agx3d && (src_sz == 32 || src_sz == 8);
+      if (instr->op == nir_op_u2f32 &&
+          (u2f32_byte_agx3b || u2f32_byte_agx3c)) {
          nir_scalar x = nir_scalar_chase_movs(
             nir_get_scalar(instr->src[0].src.ssa, instr->src[0].swizzle[0]));
          nir_scalar word = {0};
@@ -9757,7 +9829,8 @@ agx_emit_alu(agx_builder *b, nir_alu_instr *instr)
                high_byte = nir_scalar_as_uint(idx) & 1;
             }
          }
-         if (half >= 0 && word.def->bit_size == 32 && !nir_scalar_is_const(word)) {
+         if (half >= 0 && word.def->bit_size == 32 && !nir_scalar_is_const(word) &&
+             (!high_byte || u2f32_byte_agx3c)) {
             agx_index h;
             nir_scalar narrow = {0};
             if (nir_scalar_is_alu(word) &&
@@ -20227,6 +20300,17 @@ agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
 #endif
 }
 
+bool
+agx_should_place_preamble_bases_low(const nir_shader *nir,
+                                    const struct agx_shader_key *key,
+                                    bool form_preamble, unsigned push_count)
+{
+   return form_preamble && nir->info.stage == MESA_SHADER_COMPUTE &&
+          key->dev.encoding == AGX_ISA_ENCODING_AGX2 &&
+          agx_chip_has_cap(key->dev.chip, AGX_CAP_PREAMBLE_BASES_LOW) &&
+          push_count > key->reserved_preamble;
+}
+
 static bool
 agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                                 struct agx_shader_part *out,
@@ -20607,6 +20691,13 @@ agx_compile_shader_nir_internal(nir_shader *nir, struct agx_shader_key *key,
                info->agx3_uniform_dma_count ? info->agx3_uniform_dma[0].dest
                                             : push_count,
                &push_count, place_load_bases_low);
+      info->push_count = push_count;
+   } else if (!is_agx3 &&
+              agx_should_place_preamble_bases_low(nir, key, form_preamble,
+                                                  info->push_count)) {
+      unsigned push_count = info->push_count;
+      NIR_PASS(post_opt_progress, nir, agx_nir_place_preamble_bases_low,
+               key->reserved_preamble, push_count, &push_count);
       info->push_count = push_count;
    }
 

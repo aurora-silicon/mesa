@@ -1463,3 +1463,497 @@ TEST(M5CopySchedule, NonLoopMergePhisKeepOriginalFwdCap)
    EXPECT_EQ(loads_before_first_add(merge), 1u);
    ralloc_free(s.mem);
 }
+
+static agx_index
+make_2d_coords(agx_builder *b, unsigned reg_x, unsigned reg_y)
+{
+   agx_index x = agx_preload(b, agx_register(reg_x, AGX_SIZE_32));
+   agx_index y = agx_preload(b, agx_register(reg_y, AGX_SIZE_32));
+   agx_index coords = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_instr *collect = agx_collect_to(b, coords, 2);
+   collect->src[0] = x;
+   collect->src[1] = y;
+   return coords;
+}
+
+static unsigned
+block_peak_halves(agx_context *ctx, agx_block *block)
+{
+   agx_compute_liveness(ctx);
+   std::vector<uint8_t> size16(MAX2(ctx->alloc, 1u), 0);
+   agx_foreach_instr_global(ctx, I) {
+      agx_foreach_ssa_dest(I, d)
+         size16[I->dest[d].value] = agx_index_size_16(I->dest[d]);
+   }
+   std::vector<bool> live(MAX2(ctx->alloc, 1u), false);
+   unsigned pressure = 0;
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v) {
+      live[v] = true;
+      pressure += size16[v];
+   }
+   unsigned peak = pressure;
+   agx_foreach_instr_in_block_rev(block, I) {
+      unsigned dead_dest = 0;
+      agx_foreach_ssa_dest(I, d) {
+         unsigned v = I->dest[d].value;
+         if (live[v]) {
+            live[v] = false;
+            pressure -= size16[v];
+         } else {
+            dead_dest += size16[v];
+         }
+      }
+      if (dead_dest)
+         peak = MAX2(peak, pressure + dead_dest);
+      agx_foreach_ssa_src(I, s) {
+         unsigned v = I->src[s].value;
+         if (!live[v]) {
+            live[v] = true;
+            pressure += size16[v];
+         }
+      }
+      peak = MAX2(peak, pressure);
+   }
+   return peak;
+}
+
+/* AGX3B straight-line fragment blocks with >= 2 relocatable samples and >= 3
+ * SFU ops hoist texture samples ahead of independent pre-sample ALU and
+ * interleave independent SFU chains across channels inside the occupancy step;
+ * AGX2 (G13G) stays unchanged. */
+TEST(M5CopySchedule, Agx3bFragmentTwoSamplesSfuHoistAndInterleave)
+{
+   for (unsigned enc_idx = 0; enc_idx < 2; ++enc_idx) {
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+      s.key.dev.encoding =
+         enc_idx == 0 ? AGX_ISA_ENCODING_AGX3B : AGX_ISA_ENCODING_AGX2;
+      s.key.dev.chip = enc_idx == 0 ? AGX_CHIP_G16G : AGX_CHIP_G13G;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+      agx_index vig_in = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_index coords = make_2d_coords(b, 2, 4);
+
+      /* Independent vignette ALU placed before texture samples in IR order. */
+      agx_index vig = agx_fmul(b, vig_in, vig_in);
+      vig = agx_fadd(b, vig, vig_in);
+      vig = agx_fmul(b, vig, vig_in);
+
+      agx_index tex0 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *smp0 = agx_texture_sample_to(
+         b, tex0, coords, agx_zero(), agx_zero(), agx_immediate(0),
+         agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      smp0->mask = 0x7;
+      agx_instr *sp0 = agx_split(b, 4, tex0);
+      for (unsigned c = 0; c < 4; ++c)
+         sp0->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+      agx_index tex1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+      agx_instr *smp1 = agx_texture_sample_to(
+         b, tex1, coords, agx_zero(), agx_zero(), agx_immediate(1),
+         agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+         false, false, false, AGX_GATHER_NONE, false);
+      smp1->mask = 0x7;
+      agx_instr *sp1 = agx_split(b, 4, tex1);
+      for (unsigned c = 0; c < 4; ++c)
+         sp1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+      /* Serialized per-channel tone-map / gamma SFU chains in IR order. */
+      agx_index out[3];
+      for (unsigned c = 0; c < 3; ++c) {
+         agx_index v = agx_fadd(b, sp0->dest[c], sp1->dest[c]);
+         v = agx_fmul(b, v, vig);
+         agx_index inv = agx_rcp(b, agx_fadd(b, v, agx_mov_imm(b, 32, 0x3f800000)));
+         agx_index tm = agx_fmul(b, v, inv);
+         agx_index l = agx_log2(b, tm);
+         out[c] = agx_exp2(b, agx_fmul(b, l, vig_in));
+      }
+      /* Trailing blend-epilog WAIT_PIX after all samples must not suppress
+       * AGX3B SFU hoisting or interleaving. */
+      agx_wait_pix(b, 0xC);
+      agx_unit_test(b, agx_fadd(b, agx_fadd(b, out[0], out[1]), out[2]));
+
+      agx_validate(b->shader, "before");
+      agx_ilp_schedule(b->shader);
+      agx_validate(b->shader, "after");
+
+      unsigned samples_before_first_fmul = 0;
+      unsigned rcps_before_first_log2 = 0;
+      bool saw_fmul = false;
+      agx_foreach_instr_in_block(s.body, I) {
+         if (I->op == AGX_OPCODE_FMUL)
+            saw_fmul = true;
+         if (!saw_fmul)
+            samples_before_first_fmul += I->op == AGX_OPCODE_TEXTURE_SAMPLE;
+         if (I->op == AGX_OPCODE_LOG2)
+            break;
+         rcps_before_first_log2 += I->op == AGX_OPCODE_RCP;
+      }
+      if (enc_idx == 0) {
+         EXPECT_EQ(samples_before_first_fmul, 2u);
+         EXPECT_EQ(rcps_before_first_log2, 3u);
+      } else {
+         EXPECT_EQ(samples_before_first_fmul, 0u);
+         EXPECT_EQ(rcps_before_first_log2, 1u);
+      }
+      ralloc_free(s.mem);
+   }
+}
+
+/* Fragment interlock (class-12 WAIT_PIX) must prevent AGX3B SFU sample
+ * hoisting from moving texture samples ahead of the critical section. */
+TEST(M5CopySchedule, Agx3bFragmentWaitPixBlocksSampleHoist)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.chip = AGX_CHIP_G16G;
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+   agx_index vig_in = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index coords = make_2d_coords(b, 2, 4);
+
+   agx_index vig = agx_fmul(b, vig_in, vig_in);
+   vig = agx_fadd(b, vig, vig_in);
+   agx_wait_pix(b, 0xC);
+
+   agx_index tex0 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *smp0 = agx_texture_sample_to(
+      b, tex0, coords, agx_zero(), agx_zero(), agx_immediate(0),
+      agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+      false, false, false, AGX_GATHER_NONE, false);
+   smp0->mask = 0x7;
+   agx_instr *sp0 = agx_split(b, 4, tex0);
+   for (unsigned c = 0; c < 4; ++c)
+      sp0->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+   agx_index tex1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *smp1 = agx_texture_sample_to(
+      b, tex1, coords, agx_zero(), agx_zero(), agx_immediate(1),
+      agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+      false, false, false, AGX_GATHER_NONE, false);
+   smp1->mask = 0x7;
+   agx_instr *sp1 = agx_split(b, 4, tex1);
+   for (unsigned c = 0; c < 4; ++c)
+      sp1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+   agx_index out[3];
+   for (unsigned c = 0; c < 3; ++c) {
+      agx_index v = agx_fmul(b, agx_fadd(b, sp0->dest[c], sp1->dest[c]), vig);
+      agx_index inv = agx_rcp(b, agx_fadd(b, v, agx_mov_imm(b, 32, 0x3f800000)));
+      out[c] = agx_exp2(b, agx_log2(b, agx_fmul(b, v, inv)));
+   }
+   agx_unit_test(b, agx_fadd(b, agx_fadd(b, out[0], out[1]), out[2]));
+
+   agx_validate(b->shader, "before");
+   agx_ilp_schedule(b->shader);
+   agx_validate(b->shader, "after");
+
+   unsigned samples_before_wait_pix = 0;
+   bool saw_wait_pix = false;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_WAIT_PIX) {
+         saw_wait_pix = true;
+         break;
+      }
+      samples_before_wait_pix += I->op == AGX_OPCODE_TEXTURE_SAMPLE;
+   }
+   EXPECT_TRUE(saw_wait_pix);
+   EXPECT_EQ(samples_before_wait_pix, 0u);
+   ralloc_free(s.mem);
+}
+
+/* At the 112-half occupancy boundary (45 extra live f32 values), neither the
+ * 2-sample nor the 4-sample AGX3B fragment path may cross into the 120-half
+ * occupancy step. */
+TEST(M5CopySchedule, Agx3bFragmentOccupancyBoundaryNoStepCross)
+{
+   for (unsigned nr_samples : {2u, 4u}) {
+      SCOPED_TRACE(nr_samples);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G16G;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+
+      agx_index vig_in = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_index coords = make_2d_coords(b, 2, 4);
+
+      /* 45 extra live f32 values (90 halves) live across the sample + SFU region
+       * place the unscheduled shader inside the 112-half occupancy step with
+       * less than AGX_ILP_M5_OCCUPANCY_MARGIN headroom. */
+      agx_index live[45];
+      for (unsigned i = 0; i < 45; ++i)
+         live[i] = agx_mov_imm(b, 32, 0x3f800000u + i);
+
+      agx_index vig = agx_fmul(b, vig_in, vig_in);
+      vig = agx_fadd(b, vig, vig_in);
+
+      agx_index acc[3] = {agx_mov_imm(b, 32, 0), agx_mov_imm(b, 32, 0),
+                          agx_mov_imm(b, 32, 0)};
+      for (unsigned k = 0; k < nr_samples; ++k) {
+         agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         agx_instr *smp = agx_texture_sample_to(
+            b, tex, coords, agx_zero(), agx_zero(), agx_immediate(k),
+            agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+            false, false, false, AGX_GATHER_NONE, false);
+         smp->mask = 0x7;
+         agx_instr *sp = agx_split(b, 4, tex);
+         for (unsigned c = 0; c < 4; ++c)
+            sp->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+         for (unsigned c = 0; c < 3; ++c)
+            acc[c] = agx_fadd(b, acc[c], sp->dest[c]);
+      }
+
+      agx_index out = agx_mov_imm(b, 32, 0);
+      for (unsigned c = 0; c < 3; ++c) {
+         agx_index v = agx_fmul(b, acc[c], vig);
+         agx_index inv =
+            agx_rcp(b, agx_fadd(b, v, agx_mov_imm(b, 32, 0x3f800000)));
+         agx_index tm = agx_exp2(b, agx_log2(b, agx_fmul(b, v, inv)));
+         out = agx_fadd(b, out, tm);
+      }
+      for (unsigned i = 0; i < 45; ++i)
+         out = agx_fadd(b, out, live[i]);
+      agx_unit_test(b, out);
+
+      agx_validate(b->shader, "before");
+      const unsigned peak_before = block_peak_halves(b->shader, s.body);
+      const unsigned step_before =
+         agx_occupancy_for_register_count(peak_before).max_registers;
+      EXPECT_GT(peak_before, 104u);
+      EXPECT_LE(peak_before, 112u);
+      EXPECT_EQ(step_before, 112u);
+
+      agx_ilp_schedule(b->shader);
+      agx_validate(b->shader, "after");
+
+      const unsigned peak_after = block_peak_halves(b->shader, s.body);
+      const unsigned step_after =
+         agx_occupancy_for_register_count(peak_after).max_registers;
+      EXPECT_LE(peak_after, 112u);
+      EXPECT_EQ(step_after, step_before);
+      ralloc_free(s.mem);
+   }
+}
+
+/* AGX3B SFU latency applies only to non-preamble fragment shaders; a G16G
+ * compute loop's FADD/RSQRT/FADD sequence must remain untouched. */
+TEST(M5CopySchedule, Agx3bComputeLoopSfuOrderUnchanged)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_COMPUTE, true);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.chip = AGX_CHIP_G16G;
+   agx_builder *b = s.b;
+
+   b->cursor = agx_after_block(agx_start_block(b->shader));
+   agx_index a = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index c = agx_preload(b, agx_register(4, AGX_SIZE_32));
+   agx_index d = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index e = agx_preload(b, agx_register(8, AGX_SIZE_32));
+
+   b->cursor = agx_after_block(s.body);
+   agx_index f0 = agx_fadd(b, a, c);
+   agx_index r0 = agx_rsqrt(b, d);
+   agx_index f1 = agx_fadd(b, a, e);
+   agx_unit_test(b, f0);
+   agx_unit_test(b, r0);
+   agx_unit_test(b, f1);
+
+   agx_validate(b->shader, "before");
+   agx_ilp_schedule(b->shader);
+   agx_validate(b->shader, "after");
+
+   std::vector<enum agx_opcode> ops;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_FADD || I->op == AGX_OPCODE_RSQRT)
+         ops.push_back(I->op);
+   }
+   ASSERT_EQ(ops.size(), 3u);
+   EXPECT_EQ(ops[0], AGX_OPCODE_FADD);
+   EXPECT_EQ(ops[1], AGX_OPCODE_RSQRT);
+   EXPECT_EQ(ops[2], AGX_OPCODE_FADD);
+   ralloc_free(s.mem);
+}
+
+/* Mixed block: two relocatable 2D samples before class-12 WAIT_PIX followed by
+ * a non-relocatable 3D sample feeding st_tile after WAIT_PIX. The 3D sample
+ * must never be hoisted ahead of WAIT_PIX. */
+TEST(M5CopySchedule, Agx3bFragmentWaitPixBlocksMixed3dSampleHoist)
+{
+   copy_shader s;
+   copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+   s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   s.key.dev.chip = AGX_CHIP_G16G;
+   agx_builder *b = s.b;
+   b->cursor = agx_after_block(s.body);
+
+   agx_index vig_in = agx_preload(b, agx_register(8, AGX_SIZE_32));
+   agx_index x2 = agx_preload(b, agx_register(2, AGX_SIZE_32));
+   agx_index y2 = agx_preload(b, agx_register(4, AGX_SIZE_32));
+   agx_index x3 = agx_preload(b, agx_register(10, AGX_SIZE_32));
+   agx_index y3 = agx_preload(b, agx_register(12, AGX_SIZE_32));
+   agx_index z3 = agx_preload(b, agx_register(6, AGX_SIZE_32));
+   agx_index coords2d = agx_vec_temp(b->shader, AGX_SIZE_32, 2);
+   agx_instr *c2 = agx_collect_to(b, coords2d, 2);
+   c2->src[0] = x2;
+   c2->src[1] = y2;
+   agx_index coords3d = agx_vec_temp(b->shader, AGX_SIZE_32, 3);
+   agx_instr *c3 = agx_collect_to(b, coords3d, 3);
+   c3->src[0] = x3;
+   c3->src[1] = y3;
+   c3->src[2] = z3;
+
+   agx_index vig = agx_fmul(b, vig_in, vig_in);
+   vig = agx_fadd(b, vig, vig_in);
+
+   agx_index sum[4];
+   agx_index tex0 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *smp0 = agx_texture_sample_to(
+      b, tex0, coords2d, agx_zero(), agx_zero(), agx_immediate(0),
+      agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+      false, false, false, AGX_GATHER_NONE, false);
+   smp0->mask = 0xf;
+   agx_instr *sp0 = agx_split(b, 4, tex0);
+   for (unsigned c = 0; c < 4; ++c)
+      sp0->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+   agx_index tex1 = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *smp1 = agx_texture_sample_to(
+      b, tex1, coords2d, agx_zero(), agx_zero(), agx_immediate(1),
+      agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+      false, false, false, AGX_GATHER_NONE, false);
+   smp1->mask = 0xf;
+   agx_instr *sp1 = agx_split(b, 4, tex1);
+   for (unsigned c = 0; c < 4; ++c)
+      sp1->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+   for (unsigned c = 0; c < 4; ++c) {
+      agx_index v = agx_fmul(b, agx_fadd(b, sp0->dest[c], sp1->dest[c]), vig);
+      agx_index inv = agx_rcp(b, agx_fadd(b, v, agx_mov_imm(b, 32, 0x3f800000)));
+      sum[c] = agx_exp2(b, agx_log2(b, agx_fmul(b, v, inv)));
+   }
+
+   agx_wait_pix(b, 0xC);
+
+   agx_index tex3d = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *smp3d = agx_texture_sample_to(
+      b, tex3d, coords3d, agx_zero(), agx_zero(), agx_immediate(2),
+      agx_immediate(0), agx_null(), AGX_DIM_3D, AGX_LOD_MODE_AUTO_LOD, 0,
+      false, false, false, AGX_GATHER_NONE, false);
+   smp3d->mask = 0xf;
+   agx_instr *sp3d = agx_split(b, 4, tex3d);
+   for (unsigned c = 0; c < 4; ++c)
+      sp3d->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+
+   agx_index out_ch[4];
+   for (unsigned c = 0; c < 4; ++c)
+      out_ch[c] = agx_fadd(b, sum[c], sp3d->dest[c]);
+   agx_index out_vec = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+   agx_instr *col = agx_collect_to(b, out_vec, 4);
+   for (unsigned c = 0; c < 4; ++c)
+      col->src[c] = out_ch[c];
+   agx_st_tile(b, out_vec, agx_immediate(0xff), agx_null(),
+               AGX_FORMAT_I32, 0xf, 0, false, 0);
+
+   agx_validate(b->shader, "before");
+   agx_ilp_schedule(b->shader);
+   agx_validate(b->shader, "after");
+
+   bool saw_wait_pix = false;
+   unsigned before_wait = 0, after_wait = 0;
+   bool saw_3d_after_wait = false;
+   agx_foreach_instr_in_block(s.body, I) {
+      if (I->op == AGX_OPCODE_WAIT_PIX) {
+         saw_wait_pix = true;
+      } else if (I->op == AGX_OPCODE_TEXTURE_SAMPLE) {
+         if (!saw_wait_pix) {
+            before_wait++;
+            EXPECT_NE(I->dim, AGX_DIM_3D);
+         } else {
+            after_wait++;
+            if (I->dim == AGX_DIM_3D)
+               saw_3d_after_wait = true;
+         }
+      }
+   }
+   EXPECT_TRUE(saw_wait_pix);
+   EXPECT_EQ(before_wait, 2u);
+   EXPECT_EQ(after_wait, 1u);
+   EXPECT_TRUE(saw_3d_after_wait);
+   ralloc_free(s.mem);
+}
+
+/* Pre-RA peak above 256 halves must bail cleanly before querying the occupancy
+ * table (no UNREACHABLE abort) and leave the block schedule unchanged. */
+TEST(M5CopySchedule, Agx3bFragmentHighPressureOver256NoAbort)
+{
+   for (unsigned nr_samples : {2u, 4u}) {
+      SCOPED_TRACE(nr_samples);
+      copy_shader s;
+      copy_shader_init(&s, MESA_SHADER_FRAGMENT, false);
+      s.key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+      s.key.dev.chip = AGX_CHIP_G16G;
+      agx_builder *b = s.b;
+      b->cursor = agx_after_block(s.body);
+
+      agx_index vig_in = agx_preload(b, agx_register(6, AGX_SIZE_32));
+      agx_index coords = make_2d_coords(b, 2, 4);
+
+      /* 135 extra live f32 values (270 halves) exceed 256 pre-RA halves. */
+      agx_index live[135];
+      for (unsigned i = 0; i < 135; ++i)
+         live[i] = agx_mov_imm(b, 32, 0x3f800000u + i);
+
+      agx_index vig = agx_fmul(b, vig_in, vig_in);
+      vig = agx_fadd(b, vig, vig_in);
+
+      agx_index acc[3] = {agx_mov_imm(b, 32, 0), agx_mov_imm(b, 32, 0),
+                          agx_mov_imm(b, 32, 0)};
+      for (unsigned k = 0; k < nr_samples; ++k) {
+         agx_index tex = agx_vec_temp(b->shader, AGX_SIZE_32, 4);
+         agx_instr *smp = agx_texture_sample_to(
+            b, tex, coords, agx_zero(), agx_zero(), agx_immediate(k),
+            agx_immediate(0), agx_null(), AGX_DIM_2D, AGX_LOD_MODE_AUTO_LOD, 0,
+            false, false, false, AGX_GATHER_NONE, false);
+         smp->mask = 0x7;
+         agx_instr *sp = agx_split(b, 4, tex);
+         for (unsigned c = 0; c < 4; ++c)
+            sp->dest[c] = agx_temp(b->shader, AGX_SIZE_32);
+         for (unsigned c = 0; c < 3; ++c)
+            acc[c] = agx_fadd(b, acc[c], sp->dest[c]);
+      }
+
+      agx_index out = agx_mov_imm(b, 32, 0);
+      for (unsigned c = 0; c < 3; ++c) {
+         agx_index v = agx_fmul(b, acc[c], vig);
+         agx_index inv =
+            agx_rcp(b, agx_fadd(b, v, agx_mov_imm(b, 32, 0x3f800000)));
+         agx_index tm = agx_exp2(b, agx_log2(b, agx_fmul(b, v, inv)));
+         out = agx_fadd(b, out, tm);
+      }
+      for (unsigned i = 0; i < 135; ++i)
+         out = agx_fadd(b, out, live[i]);
+      agx_unit_test(b, out);
+
+      agx_validate(b->shader, "before");
+      const unsigned peak_before = block_peak_halves(b->shader, s.body);
+      ASSERT_GT(peak_before, 256u);
+
+      std::vector<const agx_instr *> order_before;
+      agx_foreach_instr_in_block(s.body, I)
+         order_before.push_back(I);
+
+      agx_ilp_schedule(b->shader);
+      agx_validate(b->shader, "after");
+
+      std::vector<const agx_instr *> order_after;
+      agx_foreach_instr_in_block(s.body, I)
+         order_after.push_back(I);
+      EXPECT_EQ(order_after, order_before);
+      ralloc_free(s.mem);
+   }
+}

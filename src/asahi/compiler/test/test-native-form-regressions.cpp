@@ -5636,6 +5636,42 @@ TEST(NativeForms, M5GemmMixedOperandExecutionWitnesses)
    }
 }
 
+TEST(NativeForms, M5IGemm16x16x16EncodingAndAlignment)
+{
+   struct {
+      agx3_matrix_input_type a, b;
+      bool sat;
+      uint8_t expected[10];
+   } cases[] = {
+      {AGX3_MATRIX_INPUT_U8, AGX3_MATRIX_INPUT_U8, false, {0xa7,0x30,0x25,0x01,0x22,0x02,0xa1,0x02,0x00,0x02}},
+      {AGX3_MATRIX_INPUT_S8, AGX3_MATRIX_INPUT_U8, false, {0xa7,0x30,0x25,0x01,0x22,0x02,0xa1,0x02,0x40,0x02}},
+      {AGX3_MATRIX_INPUT_U8, AGX3_MATRIX_INPUT_S8, false, {0xa7,0x30,0x25,0x01,0x22,0x0a,0xa1,0x02,0x00,0x02}},
+      {AGX3_MATRIX_INPUT_S8, AGX3_MATRIX_INPUT_S8, false, {0xa7,0x30,0x25,0x01,0x22,0x0a,0xa1,0x02,0x40,0x02}},
+      {AGX3_MATRIX_INPUT_U8, AGX3_MATRIX_INPUT_U8, true,  {0xa7,0x30,0x25,0x01,0x22,0x02,0xa1,0x02,0x10,0x02}},
+      {AGX3_MATRIX_INPUT_S8, AGX3_MATRIX_INPUT_S8, true,  {0xa7,0x30,0x25,0x01,0x22,0x0a,0xa1,0x02,0x50,0x02}},
+   };
+   for (const auto &c : cases) {
+      agx3_matrix_gemm16_desc d = {};
+      d.dest = 16; d.a = 32; d.b = 8; d.wait_mask = 0xc;
+      d.input_type = c.a; d.b_input_type = c.b; d.saturate = c.sat;
+      uint8_t bytes[10], length;
+      ASSERT_TRUE(agx3_matrix_encode_gemm16(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+      ASSERT_EQ(length, 10u);
+      EXPECT_EQ(std::vector<uint8_t>(bytes, bytes + length), std::vector<uint8_t>(c.expected, c.expected + 10));
+   }
+
+   /* 4-half-reg aligned A/B accepted; 2-half-reg aligned or float/int mix rejected */
+   agx3_matrix_gemm16_desc d = {};
+   d.dest = 16; d.a = 36; d.b = 12; d.input_type = AGX3_MATRIX_INPUT_S8; d.b_input_type = AGX3_MATRIX_INPUT_S8;
+   uint8_t bytes[10], length;
+   EXPECT_TRUE(agx3_matrix_encode_gemm16(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+   EXPECT_FALSE(agx3_matrix_encode_gemm16(AGX_ISA_ENCODING_AGX3B, &d, bytes, &length));
+   d.a = 34;
+   EXPECT_FALSE(agx3_matrix_encode_gemm16(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+   d.a = 36; d.b_input_type = AGX3_MATRIX_INPUT_F16;
+   EXPECT_FALSE(agx3_matrix_encode_gemm16(AGX_ISA_ENCODING_AGX3C, &d, bytes, &length));
+}
+
 TEST(NativeForms, M5VectorAccumulatorCopiesEveryComponent)
 {
    for (unsigned channels : {2u, 4u, 8u}) {
@@ -7547,8 +7583,8 @@ TEST(NativeForms, Agx3bFfmaKeepsUnmodifiedHalfGprNative)
        false, 1u, true, false, false, false},
       {"agx3b_abs_widened", AGX_ISA_ENCODING_AGX3B, false, MESA_SHADER_COMPUTE,
        false, 1u, false, true, false, false},
-      {"agx3b_uniform_mixed_widened", AGX_ISA_ENCODING_AGX3B, false,
-       MESA_SHADER_COMPUTE, false, 1u, false, false, true, false},
+      {"agx3b_uniform_mixed_native", AGX_ISA_ENCODING_AGX3B, false,
+       MESA_SHADER_COMPUTE, false, 1u, false, false, true, true},
       {"agx3c_compute_src0_native", AGX_ISA_ENCODING_AGX3C, false,
        MESA_SHADER_COMPUTE, false, 1u, false, false, false, true},
       {"agx3c_vertex_src0_widened", AGX_ISA_ENCODING_AGX3C, false,

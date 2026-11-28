@@ -2032,67 +2032,90 @@ hk_CmdBindDescriptorSets2KHR(
    }
 }
 
-static void
-hk_push_constants(struct hk_cmd_buffer *cmd,
-                  struct hk_descriptor_state *desc,
-                  const VkPushConstantsInfoKHR *info)
+static inline void
+hk_push_constants_raw(struct hk_cmd_buffer *cmd,
+                      struct hk_descriptor_state *desc, uint32_t offset,
+                      uint32_t size, const void *values, bool is_cs)
 {
-   const uint32_t first_dw = info->offset >> 2;
-   const uint32_t dw_count = info->size >> 2;
-   if (first_dw < 64 && dw_count > 0) {
+   const uint32_t first_dw = offset >> 2;
+   const uint32_t dw_count = size >> 2;
+   if (likely(first_dw < 64 && dw_count > 0)) {
       const uint32_t clamped = MIN2(dw_count, 64 - first_dw);
       const uint64_t mask =
          clamped == 64 ? UINT64_MAX : ((UINT64_C(1) << clamped) - 1);
       desc->push_written_dwords |= mask << first_dw;
    }
 
-   if (!cmd->in_meta && desc == &cmd->state.cs.descriptors &&
-       info->offset < HK_COMPUTE_OPT_PUSH_BYTES) {
-      unsigned size = MIN2(info->size, HK_COMPUTE_OPT_PUSH_BYTES - info->offset);
-      desc->identity_copy4_push_mask |= BITFIELD64_MASK(size) << info->offset;
+   if (is_cs && !cmd->in_meta && offset < HK_COMPUTE_OPT_PUSH_BYTES) {
+      unsigned clamped_size = MIN2(size, HK_COMPUTE_OPT_PUSH_BYTES - offset);
+      desc->identity_copy4_push_mask |= BITFIELD64_MASK(clamped_size) << offset;
    }
 
    /* D3D translation layers re-push unchanged constants before most draws.
     * While the root is clean the uploaded root holds exactly these bytes, so
     * an identical push changes nothing; keep the root and every preparation
-    * keyed to the current descriptor generation. Fast-path common 4/8/16-byte
-    * push updates (root constants and root CBV VAs) to avoid PLT memcmp/memcpy
-    * overhead on hot draw loops. */
-   uint8_t *dst = desc->root.push + info->offset;
-   if (info->size == 8) {
-      uint64_t cur, val;
-      memcpy(&cur, dst, 8);
-      memcpy(&val, info->pValues, 8);
-      if (cur == val)
+    * keyed to the current descriptor generation. Specialize the common small
+    * sizes (4, 8, 16 B) to avoid PLT memcmp/memcpy calls in draw loops. */
+   uint8_t *dst = desc->root.push + offset;
+   if (size == 16) {
+      uint64_t old0, old1, new0, new1;
+      memcpy(&old0, dst, 8);
+      memcpy(&old1, dst + 8, 8);
+      memcpy(&new0, values, 8);
+      memcpy(&new1, (const uint8_t *)values + 8, 8);
+      if (((old0 ^ new0) | (old1 ^ new1)) == 0)
          return;
-      memcpy(dst, &val, 8);
-   } else if (info->size == 4) {
-      uint32_t cur, val;
-      memcpy(&cur, dst, 4);
-      memcpy(&val, info->pValues, 4);
-      if (cur == val)
+      memcpy(dst, &new0, 8);
+      memcpy(dst + 8, &new1, 8);
+   } else if (size == 4) {
+      uint32_t old0, new0;
+      memcpy(&old0, dst, 4);
+      memcpy(&new0, values, 4);
+      if (old0 == new0)
          return;
-      memcpy(dst, &val, 4);
-   } else if (info->size == 16) {
-      uint64_t c0, c1, v0, v1;
-      memcpy(&c0, dst, 8);
-      memcpy(&c1, dst + 8, 8);
-      memcpy(&v0, info->pValues, 8);
-      memcpy(&v1, (const uint8_t *)info->pValues + 8, 8);
-      if (c0 == v0 && c1 == v1)
+      memcpy(dst, &new0, 4);
+   } else if (size == 8) {
+      uint64_t old0, new0;
+      memcpy(&old0, dst, 8);
+      memcpy(&new0, values, 8);
+      if (old0 == new0)
          return;
-      memcpy(dst, &v0, 8);
-      memcpy(dst + 8, &v1, 8);
+      memcpy(dst, &new0, 8);
    } else {
-      if (memcmp(dst, info->pValues, info->size) == 0)
+      if (memcmp(dst, values, size) == 0)
          return;
-      memcpy(dst, info->pValues, info->size);
+      memcpy(dst, values, size);
    }
-   hk_root_mark_push_dirty_range(desc, info->offset, info->size);
+
+   hk_root_mark_push_dirty_range(desc, offset, size);
    /* non_push_generation intentionally does not advance on push constants
     * (push constants carry no tracked resource addresses; BDA transfers
     * already set sync.xfer_any). */
    desc->generation++;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+hk_CmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                    VkShaderStageFlags stageFlags, uint32_t offset,
+                    uint32_t size, const void *pValues)
+{
+   VK_FROM_HANDLE(hk_cmd_buffer, cmd, commandBuffer);
+
+   if (stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
+                     VK_SHADER_STAGE_TASK_BIT_EXT |
+                     VK_SHADER_STAGE_MESH_BIT_EXT))
+      hk_push_constants_raw(cmd, &cmd->state.gfx.descriptors, offset, size,
+                            pValues, false);
+
+   if (stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+      hk_push_constants_raw(cmd, &cmd->state.cs.descriptors, offset, size,
+                            pValues, true);
+
+   if (unlikely(stageFlags & HK_RT_SHADER_STAGES)) {
+      cmd->used_rt = true;
+      hk_push_constants_raw(cmd, &cmd->rt.descriptors, offset, size, pValues,
+                            false);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2103,14 +2126,23 @@ hk_CmdPushConstants2KHR(VkCommandBuffer commandBuffer,
 
    if (pPushConstantsInfo->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS |
        VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT))
-      hk_push_constants(cmd, &cmd->state.gfx.descriptors, pPushConstantsInfo);
+      hk_push_constants_raw(cmd, &cmd->state.gfx.descriptors,
+                            pPushConstantsInfo->offset,
+                            pPushConstantsInfo->size,
+                            pPushConstantsInfo->pValues, false);
 
    if (pPushConstantsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
-      hk_push_constants(cmd, &cmd->state.cs.descriptors, pPushConstantsInfo);
+      hk_push_constants_raw(cmd, &cmd->state.cs.descriptors,
+                            pPushConstantsInfo->offset,
+                            pPushConstantsInfo->size,
+                            pPushConstantsInfo->pValues, true);
 
-   if (pPushConstantsInfo->stageFlags & HK_RT_SHADER_STAGES) {
+   if (unlikely(pPushConstantsInfo->stageFlags & HK_RT_SHADER_STAGES)) {
       cmd->used_rt = true;
-      hk_push_constants(cmd, &cmd->rt.descriptors, pPushConstantsInfo);
+      hk_push_constants_raw(cmd, &cmd->rt.descriptors,
+                            pPushConstantsInfo->offset,
+                            pPushConstantsInfo->size,
+                            pPushConstantsInfo->pValues, false);
    }
 }
 
@@ -4559,6 +4591,117 @@ hk_agx3_multi_draw_ioto_finish(struct hk_cmd_buffer *cmd,
    u_foreach_bit(r, tpl->draw_id_mask)
       cached->loader_ranges[r].address = draw_id_ptr;
    cached->loader_program = pipeline_program;
+}
+
+bool
+hk_agx3_push_bypass_ioto_prepare(struct hk_cmd_buffer *cmd, struct hk_shader *s,
+                                 struct hk_linked_shader *linked,
+                                 struct hk_agx3_direct_draw_fast *fast)
+{
+   struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   struct hk_graphics_state *gfx = &cmd->state.gfx;
+   struct hk_g17p_graphics_ioto_cache_entry *cached = &gfx->g17p_ioto[0];
+
+   s = hk_linked_shader_source(s, linked);
+   if ((!agx_chip_native_hal200(dev->dev.chip) &&
+        !agx_chip_g17_m5(dev->dev.chip)) ||
+       s->info.stage != MESA_SHADER_VERTEX || s->info.agx3_gen1_fragment_rq ||
+       !gfx->root || gfx->g17p_hoisted_preamble_va)
+      return false;
+
+   struct hk_g17p_launch *launch = hk_g17p_launch_slot(cmd, 0, linked);
+   const uint8_t flags = hk_g17p_launch_flags(cmd, s);
+   if (!launch->valid || !launch->root_bypass_ok || !launch->push_size_B ||
+       (unsigned)launch->push_min_B + launch->push_size_B > HK_MAX_PUSH_SIZE ||
+       !hk_g17p_launch_matches(dev, cmd, launch, s, linked, flags, NULL))
+      return false;
+
+   if (launch->has_general_root &&
+       (s->info.agx3_root_reads & (HK_ROOT_READS_ADDRESS | HK_ROOT_READS_PUSH)))
+      return false;
+
+   const struct hk_g17p_gfx_loader *l =
+      launch->bypass_loader ? launch->bypass_loader : launch->loader;
+   if (!l || !l->length || l->length > sizeof(fast->ioto_bytes) ||
+       launch->count != l->plan.range_count ||
+       launch->count > HK_G17P_PATCH_MAX_RANGES ||
+       cached->loader != l || cached->loader_linked != linked ||
+       !cached->loader_program)
+      return false;
+
+   const uint64_t slice_origin =
+      hk_root_descriptor_offset(push) + launch->push_min_B;
+   uint32_t push_mask = 0;
+   uint8_t push_range_count = 0;
+   for (unsigned i = 0; i < launch->count; ++i) {
+      if (launch->source[i] == HK_G17P_RANGE_SOURCE_PUSH) {
+         if (launch->offset[i] < slice_origin ||
+             launch->offset[i] - slice_origin > UINT16_MAX)
+            return false;
+         push_mask |= BITFIELD_BIT(i);
+         fast->push_ranges[push_range_count++] =
+            (struct hk_agx3_push_range_sync){
+               .range = (uint8_t)i,
+               .rel_offset = (uint16_t)(launch->offset[i] - slice_origin),
+            };
+      }
+   }
+   if (!push_mask)
+      return false;
+
+   /* Static ranges remain at cached->loader_ranges[]. Require that no push
+    * range shares a patch-plan cluster with any non-push range, and that any
+    * push ranges sharing a cluster with each other keep the exact same
+    * relative spacing in the contiguous push slice as in the plan. */
+   if (l->plan.shared) {
+      for (unsigned i = 0; i < l->plan.range_count; ++i) {
+         const unsigned leader = l->plan.leader[i];
+         const bool i_push = (push_mask & BITFIELD_BIT(i)) != 0;
+         const bool l_push = (push_mask & BITFIELD_BIT(leader)) != 0;
+         if (i_push != l_push)
+            return false;
+         if (i_push && i != leader &&
+             (launch->offset[i] - launch->offset[leader]) !=
+                (l->plan.address[i] - l->plan.address[leader]))
+            return false;
+      }
+   }
+
+   if (!hk_g17p_patch_plan_fits(&l->plan, cached->loader_ranges))
+      return false;
+
+   uint8_t push_reloc_count = 0;
+   for (unsigned r = 0; r < l->plan.reloc_count; ++r) {
+      const struct hk_g17p_patch_reloc *rel = &l->plan.relocs[r];
+      if (!(push_mask & BITFIELD_BIT(rel->range)))
+         continue;
+      const uint64_t rel_off =
+         (launch->offset[rel->range] - slice_origin) + rel->delta;
+      if (rel_off > UINT32_MAX)
+         return false;
+      fast->push_relocs[push_reloc_count++] = (struct hk_agx3_push_ioto_reloc){
+         .dest = {rel->dest[0], rel->dest[1]},
+         .delta = (uint32_t)rel_off,
+         .offset = rel->offset,
+         .short_mask = rel->short_mask,
+      };
+   }
+   if (!push_reloc_count)
+      return false;
+
+   /* Bake all static relocations once into the template bytes. */
+   memcpy(fast->ioto_bytes, l->bytes, l->length);
+   hk_g17p_patch_plan_apply(&l->plan, cached->loader_ranges, fast->ioto_bytes);
+
+   fast->loader = l;
+   fast->linked_vs = linked;
+   fast->ioto_length = l->length;
+   fast->push_min_B = launch->push_min_B;
+   fast->push_size_B = launch->push_size_B;
+   fast->push_reloc_count = push_reloc_count;
+   fast->push_range_count = push_range_count;
+   fast->cached_cmd_mem = hk_g17p_cached_cmd_memory(&dev->dev);
+   return true;
 }
 
 static bool

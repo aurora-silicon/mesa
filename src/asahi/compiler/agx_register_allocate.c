@@ -4535,6 +4535,11 @@ agx_ra(agx_context *ctx)
             continue;
 
          agx_foreach_ssa_src(I, s) {
+            const unsigned src_comps =
+               (I->op == AGX_OPCODE_MATMAD16_AGX3 && s < 2 &&
+                agx3_matrix_input_is_int8(I->matrix_type & 15))
+                  ? 2
+                  : mat_comps;
             /* The accumulator is a copy (agx_lower_agx3_matrix_sources) */
             agx_instr *def = defs[I->src[s].value];
             if (def && def->op == AGX_OPCODE_MOV &&
@@ -4542,12 +4547,12 @@ agx_ra(agx_context *ctx)
                def = defs[def->src[0].value];
 
             if (!def || def->op != AGX_OPCODE_COLLECT ||
-                def->nr_srcs != mat_comps)
+                def->nr_srcs != src_comps)
                continue;
 
             struct matrix_group group = {0};
             bool valid = true;
-            for (unsigned k = 0; k < mat_comps && valid; ++k) {
+            for (unsigned k = 0; k < src_comps && valid; ++k) {
                const agx_index src = def->src[k];
                valid = src.type == AGX_INDEX_NORMAL && !src.memory &&
                        agx_channels(src) == 1 &&
@@ -4565,7 +4570,7 @@ agx_ra(agx_context *ctx)
                continue;
 
             group.size = agx_size_align_16(def->src[0].size);
-            group.count = mat_comps;
+            group.count = src_comps;
             util_dynarray_append(&matrix_groups, group);
             const unsigned id = util_dynarray_num_elements(
                &matrix_groups, struct matrix_group);
@@ -4573,7 +4578,7 @@ agx_ra(agx_context *ctx)
                (void)util_dynarray_pop(&matrix_groups, struct matrix_group);
                continue;
             }
-            for (unsigned k = 0; k < mat_comps; ++k)
+            for (unsigned k = 0; k < src_comps; ++k)
                web_matrix_group[group.root[k]] = id;
          }
       }
@@ -4760,6 +4765,27 @@ agx_ra(agx_context *ctx)
       if (agx_isa_is_agx3(ctx->key->dev.encoding) &&
           I->op == AGX_OPCODE_LOG2 && I->src[0].type == AGX_INDEX_NORMAL)
          BITSET_SET(log2_gpr, I->src[0].value);
+
+      /* AGX3B narrow int2flt (agx3_alu_narrow_int_to_float) encodes both its
+       * destination and half source in halves 0..191. Bound them in RA so high
+       * register pressure cannot refuse after native U8/S8/U16/S16 converts. */
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          I->op == AGX_OPCODE_CONVERT && I->nr_dests == 1 && I->nr_srcs == 2 &&
+          I->src[0].type == AGX_INDEX_IMMEDIATE &&
+          I->src[1].size == AGX_SIZE_16 &&
+          (I->src[0].value == AGX_CONVERT_U8_TO_F ||
+           I->src[0].value == AGX_CONVERT_S8_TO_F ||
+           (I->dest[0].size == AGX_SIZE_16 &&
+            (I->src[0].value == AGX_CONVERT_U16_TO_F ||
+             I->src[0].value == AGX_CONVERT_S16_TO_F)))) {
+         if (I->dest[0].type == AGX_INDEX_NORMAL)
+            BITSET_SET(log2_gpr, I->dest[0].value);
+         if (I->src[1].type == AGX_INDEX_NORMAL) {
+            BITSET_SET(log2_gpr, I->src[1].value);
+            if (split_source[I->src[1].value])
+               BITSET_SET(log2_gpr, split_source[I->src[1].value] - 1);
+         }
+      }
 
       /* agx3_tex_stage_cube_array_lod encodes the layer register (coords + 6
        * halves) in seven bits; keep such coordinate vectors below half 128. */
