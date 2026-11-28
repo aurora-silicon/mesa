@@ -370,6 +370,81 @@ test_loop_bound_through_i2i32(void)
    ralloc_free(b.shader);
 }
 
+enum loop_swizzle {
+   SWIZZLE_LIMIT,
+   SWIZZLE_STEP,
+   SWIZZLE_NOT,
+};
+
+static nir_def *
+use_y(nir_def *def, unsigned src, nir_def *vec)
+{
+   nir_alu_instr *alu = nir_def_as_alu(def);
+   nir_src_rewrite(&alu->src[src].src, vec);
+   alu->src[src].swizzle[0] = 1;
+   return def;
+}
+
+/* Each of 16 threads must fill two dwords, at k = lid and k = lid + 16.
+ * Give the selected and unselected lanes opposite coverage. */
+static bool
+loop_fill_with_swizzle(enum loop_swizzle swizzle, bool full)
+{
+   nir_builder b = new_cs(16, 1, 1, 128);
+   nir_def *lid = nir_load_local_invocation_index(&b);
+   nir_def *limit = nir_imm_ivec2(&b, full ? 16 : 32, full ? 32 : 16);
+   nir_def *step = nir_imm_ivec2(&b, full ? 32 : 16, full ? 16 : 32);
+   nir_variable *var = nir_local_variable_create(b.impl, glsl_uint_type(), "k");
+   nir_store_var(&b, var, lid, 0x1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *k = nir_load_var(&b, var);
+      nir_def *cond;
+      if (swizzle == SWIZZLE_NOT) {
+         nir_def *cmp = nir_ilt(&b, k, limit);
+         cond = use_y(nir_inot(&b, nir_imm_false(&b)), 0, cmp);
+      } else {
+         cond = nir_ige_imm(&b, k, 32);
+         if (swizzle == SWIZZLE_LIMIT)
+            use_y(cond, 1, limit);
+      }
+      nir_break_if(&b, cond);
+      nir_store_shared(&b, nir_imm_int(&b, 42), nir_ishl_imm(&b, k, 2),
+                       .write_mask = 0x1, .align_mul = 4);
+
+      nir_def *next = nir_iadd_imm(&b, k, 16);
+      if (swizzle == SWIZZLE_STEP)
+         use_y(next, 1, step);
+      nir_store_var(&b, var, next, 0x1);
+   }
+   nir_pop_loop(&b, loop);
+   emit_wg_shared_barrier(&b);
+   nir_lower_vars_to_ssa(b.shader);
+   nir_validate_shader(b.shader, "loop swizzle test");
+
+   bool covered = hk_nir_shared_memory_fully_initialized(b.shader);
+   ralloc_free(b.shader);
+   return covered;
+}
+
+static void
+test_loop_swizzles(void)
+{
+   T("loop bound .y covers all shared memory",
+     loop_fill_with_swizzle(SWIZZLE_LIMIT, true));
+   T("loop bound .y with partial coverage keeps zero-init",
+     !loop_fill_with_swizzle(SWIZZLE_LIMIT, false));
+   T("loop step .y covers all shared memory",
+     loop_fill_with_swizzle(SWIZZLE_STEP, true));
+   T("loop step .y with partial coverage keeps zero-init",
+     !loop_fill_with_swizzle(SWIZZLE_STEP, false));
+   T("inot of comparison .y covers all shared memory",
+     loop_fill_with_swizzle(SWIZZLE_NOT, true));
+   T("inot of comparison .y with partial coverage keeps zero-init",
+     !loop_fill_with_swizzle(SWIZZLE_NOT, false));
+}
+
 int
 main(void)
 {
@@ -381,6 +456,7 @@ main(void)
    test_negative_cases();
    test_eval_widths();
    test_loop_bound_through_i2i32();
+   test_loop_swizzles();
    glsl_type_singleton_decref();
    printf("%u tests, %u failures\n", tests, failures);
    return failures ? EXIT_FAILURE : EXIT_SUCCESS;

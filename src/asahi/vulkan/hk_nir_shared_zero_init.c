@@ -33,7 +33,8 @@ eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
          uint32_t z, uint32_t idx, uint32_t iv_val, unsigned depth,
          uint32_t *out)
 {
-   if (!def || depth > HK_SHARED_ZERO_INIT_MAX_DEPTH)
+   if (!def || swiz >= def->num_components ||
+       depth > HK_SHARED_ZERO_INIT_MAX_DEPTH)
       return false;
 
    if (iv && def == iv) {
@@ -47,7 +48,7 @@ eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
    switch (instr->type) {
    case nir_instr_type_load_const: {
       nir_load_const_instr *lc = nir_instr_as_load_const(instr);
-      if (swiz >= def->num_components || def->bit_size > 32)
+      if (def->bit_size > 32)
          return false;
       *out = (uint32_t)nir_const_value_as_uint(lc->value[swiz], def->bit_size);
       return true;
@@ -80,9 +81,6 @@ eval_u32(nir_def *def, uint8_t swiz, nir_def *iv, uint32_t x, uint32_t y,
 
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
-      if (swiz >= alu->def.num_components)
-         return false;
-
       if (alu->op == nir_op_vec2 || alu->op == nir_op_vec3 ||
           alu->op == nir_op_vec4) {
          return eval_u32(alu->src[swiz].src.ssa, alu->src[swiz].swizzle[0], iv,
@@ -213,46 +211,72 @@ is_workgroup_shared_barrier(const nir_instr *instr)
           (nir_intrinsic_memory_semantics(intr) & NIR_MEMORY_RELEASE);
 }
 
-static nir_def *
-chase_mov(nir_def *def)
+static nir_scalar
+chase_mov(nir_scalar s)
 {
-   for (unsigned depth = 0; def && depth < HK_SHARED_ZERO_INIT_MAX_DEPTH;
-        ++depth) {
-      nir_instr *instr = nir_def_instr(def);
-      if (instr->type != nir_instr_type_alu)
+   for (unsigned depth = 0; depth < HK_SHARED_ZERO_INIT_MAX_DEPTH; ++depth) {
+      if (!s.def || s.comp >= s.def->num_components)
          break;
-      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      nir_alu_instr *alu = nir_def_as_alu_or_null(s.def);
       /* Only plain moves: a conversion would change the width or signedness
        * the caller reads a constant at. */
-      if (alu->op == nir_op_mov && alu->src[0].swizzle[0] == 0) {
-         def = alu->src[0].src.ssa;
-         continue;
-      }
-      break;
+      if (!alu || alu->op != nir_op_mov)
+         return s;
+
+      s = nir_get_scalar(alu->src[0].src.ssa, alu->src[0].swizzle[s.comp]);
    }
-   return def;
+   return (nir_scalar){0};
+}
+
+/* The matched comparisons and iadd are per-component ALU operations. */
+static nir_scalar
+chase_alu_src(const nir_alu_src *src, unsigned comp)
+{
+   return chase_mov(nir_get_scalar(src->src.ssa, src->swizzle[comp]));
+}
+
+static bool
+match_iv_const(nir_alu_instr *alu, unsigned comp, nir_def *iv,
+               bool *iv_lhs, nir_scalar *constant)
+{
+   const nir_scalar lhs = chase_alu_src(&alu->src[0], comp);
+   const nir_scalar rhs = chase_alu_src(&alu->src[1], comp);
+
+   *iv_lhs = lhs.def == iv && lhs.comp == 0;
+   if (!*iv_lhs && (rhs.def != iv || rhs.comp != 0))
+      return false;
+
+   *constant = *iv_lhs ? rhs : lhs;
+   return constant->def && constant->def->bit_size == iv->bit_size &&
+          nir_scalar_is_const(*constant);
 }
 
 static bool
 match_break_cond(nir_def *cond, bool invert, nir_def *iv, int64_t *limit_out,
                  bool *unsigned_out)
 {
-   cond = chase_mov(cond);
-   if (nir_def_instr(cond)->type != nir_instr_type_alu)
-      return false;
-   nir_alu_instr *alu = nir_instr_as_alu(nir_def_instr(cond));
-   if (alu->op == nir_op_inot)
-      return match_break_cond(alu->src[0].src.ssa, !invert, iv, limit_out,
-                              unsigned_out);
+   nir_scalar s = chase_mov(nir_get_scalar(cond, 0));
+   nir_alu_instr *alu;
+   for (unsigned depth = 0; ; ++depth) {
+      if (depth >= HK_SHARED_ZERO_INIT_MAX_DEPTH || !s.def)
+         return false;
+      alu = nir_def_as_alu_or_null(s.def);
+      if (!alu)
+         return false;
+      if (alu->op != nir_op_inot)
+         break;
 
-   if (nir_op_infos[alu->op].num_inputs != 2)
+      invert = !invert;
+      s = chase_alu_src(&alu->src[0], s.comp);
+   }
+
+   if (alu->op != nir_op_ige && alu->op != nir_op_uge &&
+       alu->op != nir_op_ilt && alu->op != nir_op_ult)
       return false;
 
-   nir_def *s0 = chase_mov(alu->src[0].src.ssa);
-   nir_def *s1 = chase_mov(alu->src[1].src.ssa);
-   const bool iv_lhs = (s0 == iv && alu->src[0].swizzle[0] == 0);
-   const bool iv_rhs = (s1 == iv && alu->src[1].swizzle[0] == 0);
-   if (!iv_lhs && !iv_rhs)
+   bool iv_lhs;
+   nir_scalar constant;
+   if (!match_iv_const(alu, s.comp, iv, &iv_lhs, &constant))
       return false;
 
    /* Break condition:
@@ -282,14 +306,9 @@ match_break_cond(nir_def *cond, bool invert, nir_def *iv, int64_t *limit_out,
       }
    }
 
-   nir_def *lim_def = iv_lhs ? s1 : s0;
-   if (nir_def_instr(lim_def)->type != nir_instr_type_load_const)
-      return false;
-   nir_load_const_instr *lc = nir_instr_as_load_const(nir_def_instr(lim_def));
-   const unsigned bs = lim_def->bit_size;
    const int64_t lim =
-      (is_unsigned ? (int64_t)nir_const_value_as_uint(lc->value[0], bs)
-                   : nir_const_value_as_int(lc->value[0], bs)) +
+      (is_unsigned ? (int64_t)nir_scalar_as_uint(constant)
+                   : nir_scalar_as_int(constant)) +
       adj;
    if (lim <= 0 || lim > (int64_t)HK_SHARED_ZERO_INIT_MAX_BYTES)
       return false;
@@ -372,27 +391,17 @@ match_counting_loop(nir_loop *loop, struct count_loop *out)
                             &is_unsigned))
          continue;
 
-      latch_def = chase_mov(latch_def);
-      if (nir_def_instr(latch_def)->type != nir_instr_type_alu)
-         continue;
-      nir_alu_instr *step_alu = nir_instr_as_alu(nir_def_instr(latch_def));
-      if (step_alu->op != nir_op_iadd)
-         continue;
-      nir_def *s0 = chase_mov(step_alu->src[0].src.ssa);
-      nir_def *s1 = chase_mov(step_alu->src[1].src.ssa);
-      nir_def *step_def = NULL;
-      if (s0 == &phi->def && step_alu->src[0].swizzle[0] == 0)
-         step_def = s1;
-      else if (s1 == &phi->def && step_alu->src[1].swizzle[0] == 0)
-         step_def = s0;
-      else
+      const nir_scalar next = chase_mov(nir_get_scalar(latch_def, 0));
+      nir_alu_instr *step_alu = next.def ? nir_def_as_alu_or_null(next.def)
+                                       : NULL;
+      if (!step_alu || step_alu->op != nir_op_iadd)
          continue;
 
-      if (nir_def_instr(step_def)->type != nir_instr_type_load_const)
+      bool iv_lhs;
+      nir_scalar constant;
+      if (!match_iv_const(step_alu, next.comp, &phi->def, &iv_lhs, &constant))
          continue;
-      nir_load_const_instr *step_lc =
-         nir_instr_as_load_const(nir_def_instr(step_def));
-      const int64_t step = nir_const_value_as_int(step_lc->value[0], 32);
+      const int64_t step = nir_scalar_as_int(constant);
       if (step <= 0 || step > (int64_t)HK_SHARED_ZERO_INIT_MAX_BYTES)
          continue;
 
