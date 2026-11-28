@@ -68,29 +68,39 @@ util_idalloc_fini(struct util_idalloc *buf)
    free(buf->data);
 }
 
+static bool
+util_idalloc_try_alloc(struct util_idalloc *buf, unsigned max_elements,
+                      unsigned *id)
+{
+   unsigned num_elements = MIN2(buf->num_elements, max_elements);
+
+   unsigned i = buf->lowest_free_idx;
+   while (i < num_elements && buf->data[i] == UINT32_MAX)
+      i++;
+
+   buf->lowest_free_idx = i;
+   if (i >= max_elements)
+      return false;
+
+   if (i == num_elements)
+      util_idalloc_resize(buf, MIN2(MAX2(num_elements, 1) * 2, max_elements));
+
+   unsigned bit = ffs(~buf->data[i]) - 1;
+   buf->data[i] |= 1u << bit;
+   buf->num_set_elements = MAX2(buf->num_set_elements, i + 1);
+   *id = i * 32 + bit;
+   return true;
+}
+
 unsigned
 util_idalloc_alloc(struct util_idalloc *buf)
 {
-   unsigned num_elements = buf->num_elements;
-
-   for (unsigned i = buf->lowest_free_idx; i < num_elements; i++) {
-      if (buf->data[i] == 0xffffffff)
-         continue;
-
-      unsigned bit = ffs(~buf->data[i]) - 1;
-      buf->data[i] |= 1u << bit;
-      buf->lowest_free_idx = i;
-      buf->num_set_elements = MAX2(buf->num_set_elements, i + 1);
-      return i * 32 + bit;
+   unsigned id;
+   if (!util_idalloc_try_alloc(buf, UINT32_MAX / 32 + 1, &id)) {
+      fprintf(stderr, "mesa: util_idalloc_alloc: all 2^32 IDs are used\n");
+      abort();
    }
-
-   /* No slots available, resize and return the first free. */
-   util_idalloc_resize(buf, MAX2(num_elements, 1) * 2);
-
-   buf->lowest_free_idx = num_elements;
-   buf->data[num_elements] |= 1;
-   buf->num_set_elements = MAX2(buf->num_set_elements, num_elements + 1);
-   return num_elements * 32;
+   return id;
 }
 
 static unsigned
@@ -257,11 +267,13 @@ unsigned
 util_idalloc_sparse_alloc(struct util_idalloc_sparse *buf)
 {
    unsigned max_ids = UTIL_IDALLOC_MAX_IDS_PER_SEGMENT(buf);
+   unsigned max_elements = UTIL_IDALLOC_MAX_ELEMS_PER_SEGMENT(buf);
 
+   /* The last word may have filled since the free index was recorded. */
    for (unsigned i = 0; i < ARRAY_SIZE(buf->segment); i++) {
-      if (buf->segment[i].lowest_free_idx <
-          UTIL_IDALLOC_MAX_ELEMS_PER_SEGMENT(buf))
-         return max_ids * i + util_idalloc_alloc(&buf->segment[i]);
+      unsigned id;
+      if (util_idalloc_try_alloc(&buf->segment[i], max_elements, &id))
+         return max_ids * i + id;
    }
 
    fprintf(stderr, "mesa: util_idalloc_sparse_alloc: "
@@ -273,6 +285,9 @@ util_idalloc_sparse_alloc(struct util_idalloc_sparse *buf)
 unsigned
 util_idalloc_sparse_alloc_range(struct util_idalloc_sparse *buf, unsigned num)
 {
+   if (num == 1)
+      return util_idalloc_sparse_alloc(buf);
+
    unsigned max_ids = UTIL_IDALLOC_MAX_IDS_PER_SEGMENT(buf);
    unsigned num_elems = DIV_ROUND_UP(num, 32);
 
