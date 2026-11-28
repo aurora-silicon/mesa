@@ -663,10 +663,173 @@ fixup_border_zs(enum pipe_format orig, union pipe_color_union *c)
    }
 }
 
+/* API sampler state in the native heap records. G17P is the HAL200 record
+ * with its own compare enable. G17G's Gen5 record overlaps the compare
+ * function with the reduction mode and selects the compare interpretation
+ * with compare_mode; the comparison itself is requested by the sample
+ * instruction. This mirrors hk_pack_native_sampler(), including LEQUAL for a
+ * sampler without a comparison. */
+static void
+agx_pack_g17_api_sampler(enum agx_chip chip, void *out,
+                         const struct pipe_sampler_state *state,
+                         enum agx_border_colour border_colour,
+                         bool bias_in_descriptor)
+{
+   const bool compare = state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
+   const enum agx_compare_func compare_func =
+      compare ? agx_compare_funcs[state->compare_func]
+              : AGX_COMPARE_FUNC_LEQUAL;
+
+   if (agx_chip_hal300_path(chip)) {
+      agx_pack(out, SAMPLER_GEN5, cfg) {
+         cfg.minimum_lod = state->min_lod;
+         cfg.maximum_lod = state->max_lod;
+         cfg.maximum_anisotropy =
+            util_next_power_of_two(MAX2(state->max_anisotropy, 1));
+         cfg.magnify = agx_filters[state->mag_img_filter];
+         cfg.minify = agx_filters[state->min_img_filter];
+         cfg.mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter);
+         cfg.wrap_s = agx_wrap_from_pipe(state->wrap_s);
+         cfg.wrap_t = agx_wrap_from_pipe(state->wrap_t);
+         cfg.wrap_r = agx_wrap_from_pipe(state->wrap_r);
+         cfg.pixel_coordinates = state->unnormalized_coords;
+         /* The API bias is applied exactly once. When nir_lower_tex sums it
+          * into the shader's own bias -- which it does for every chip but
+          * G17P -- carrying it here as well applies it twice, and the
+          * descriptor field quantises to 1/64 on top of the hardware's own
+          * quantisation of the level it samples at. Measured on G17G with a
+          * level-valued mip pyramid, a sampler bias of one selected level
+          * two and a bias of two selected level four. */
+         if (bias_in_descriptor)
+            cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
+         cfg.seamful_cube_maps = !state->seamless_cube_map;
+         cfg.border_colour = border_colour;
+         cfg.compare_mode = true;
+         cfg.compare_func = compare_func;
+      }
+      return;
+   }
+
+   agx_pack(out, SAMPLER_HAL200, cfg) {
+      cfg.minimum_lod = state->min_lod;
+      cfg.maximum_lod = state->max_lod;
+      cfg.maximum_anisotropy =
+         util_next_power_of_two(MAX2(state->max_anisotropy, 1));
+      cfg.magnify = agx_filters[state->mag_img_filter];
+      cfg.minify = agx_filters[state->min_img_filter];
+      cfg.mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter);
+      cfg.wrap_s = agx_wrap_from_pipe(state->wrap_s);
+      cfg.wrap_t = agx_wrap_from_pipe(state->wrap_t);
+      cfg.wrap_r = agx_wrap_from_pipe(state->wrap_r);
+      cfg.pixel_coordinates = state->unnormalized_coords;
+      cfg.compare_func = agx_compare_funcs[state->compare_func];
+      cfg.compare_enable = compare;
+      if (bias_in_descriptor)
+         cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
+      cfg.seamful_cube_maps = !state->seamless_cube_map;
+      cfg.border_colour = border_colour;
+   }
+}
+
+/* Native table entry for an API sampler, with the given border colour. */
+static struct agx_gallium_native_sampler
+agx_native_sampler_state(const struct pipe_sampler_state *state,
+                         enum agx_border_colour border_colour)
+{
+   const bool compare_enable =
+      state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
+
+   return (struct agx_gallium_native_sampler){
+      .minimum_lod = state->min_lod,
+      .maximum_lod = state->max_lod,
+      .maximum_anisotropy =
+         util_next_power_of_two(MAX2(state->max_anisotropy, 1)),
+      .magnify = agx_filters[state->mag_img_filter],
+      .minify = agx_filters[state->min_img_filter],
+      .mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter),
+      .wrap_s = agx_wrap_from_pipe(state->wrap_s),
+      .wrap_t = agx_wrap_from_pipe(state->wrap_t),
+      .wrap_r = agx_wrap_from_pipe(state->wrap_r),
+      .pixel_coordinates = state->unnormalized_coords,
+      .compare_func = agx_compare_funcs[state->compare_func],
+      .compare_enable = compare_enable,
+      /* An ordinary sample takes the bias as a shader operand, summed with
+       * the shader's own in floating point; only a depth comparison, whose
+       * level has no per-lane form here, keeps it in the descriptor where the
+       * sampler has a bias field. See agx_create_context(). */
+      .lod_bias = compare_enable ? CLAMP(state->lod_bias, -16.0, 16.0) : 0.0f,
+      .seamful_cube_maps = !state->seamless_cube_map,
+      .border_colour = border_colour,
+   };
+}
+
+static bool
+agx_pack_native_sampler_variant(const struct agx_context *ctx,
+                                const struct agx_sampler_state *so,
+                                enum agx_native_sampler_valid variant,
+                                struct agx_gallium_sampler_descriptor *out)
+{
+   const struct agx_device *dev = agx_device(ctx->base.screen);
+   const enum agx_chip chip = dev->chip;
+   const struct pipe_sampler_state *state = &so->base;
+   const enum agx_border_colour ordinary_border =
+      so->uses_custom_border ? AGX_BORDER_COLOUR_OPAQUE_WHITE
+                             : so->border_colour;
+
+   memset(out, 0, sizeof(*out));
+
+   switch (variant) {
+   case AGX_NATIVE_SAMPLER_DESC:
+      if (agx_chip_hal300_path(chip)) {
+         if (agx_chip_sampler_heap_element_size(chip) != sizeof(*out))
+            return false;
+         agx_pack_g17_api_sampler(chip, out, state, ordinary_border,
+                                  !ctx->support_lod_bias);
+         return true;
+      } else {
+         const struct agx_gallium_native_sampler native =
+            agx_native_sampler_state(state, ordinary_border);
+         return agx_gallium_pack_native_sampler(chip, out, &native);
+      }
+   case AGX_NATIVE_SAMPLER_CLAMP:
+      if (agx_chip_hal300_path(chip)) {
+         if (agx_chip_sampler_heap_element_size(chip) != sizeof(*out))
+            return false;
+         agx_pack_g17_api_sampler(chip, out, state,
+                                  AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
+                                  !ctx->support_lod_bias);
+         return true;
+      } else {
+         struct agx_gallium_native_sampler clamp_state =
+            agx_native_sampler_state(state,
+                                     AGX_BORDER_COLOUR_TRANSPARENT_BLACK);
+         if (agx_shadow_gather_custom_border(chip))
+            clamp_state.compare_enable = false;
+         return agx_gallium_pack_native_sampler(chip, out, &clamp_state);
+      }
+   case AGX_NATIVE_SAMPLER_PROBE: {
+      struct agx_gallium_native_sampler probe_state =
+         agx_native_sampler_state(state, AGX_BORDER_COLOUR_OPAQUE_WHITE);
+      probe_state.compare_enable = false;
+      return agx_gallium_pack_native_sampler(chip, out, &probe_state);
+   }
+   case AGX_NATIVE_SAMPLER_QUERY_LOD: {
+      struct agx_gallium_native_sampler query_state =
+         agx_native_sampler_state(state, ordinary_border);
+      query_state.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
+      return agx_gallium_pack_native_sampler(chip, out, &query_state);
+   }
+   default:
+      UNREACHABLE("Invalid sampler variant");
+   }
+}
+
 static void *
 agx_create_sampler_state(struct pipe_context *pctx,
                          const struct pipe_sampler_state *state)
 {
+   struct agx_context *ctx = agx_context(pctx);
+   struct agx_device *dev = agx_device(pctx->screen);
    struct agx_sampler_state *so = CALLOC_STRUCT(agx_sampler_state);
    so->base = *state;
 
@@ -731,6 +894,40 @@ agx_create_sampler_state(struct pipe_context *pctx,
    if (so->uses_custom_border) {
       /* Neutralize the bindless-safe descriptor. XXX: This is a hack. */
       so->desc_without_custom_border.opaque[1] &= ~(1u << 23);
+   }
+
+   /* Pre-pack immutable AGX3 native sampler descriptors once at creation so
+    * agx_upload_samplers() can copy them directly instead of repacking on
+    * every sampler-dirty draw.
+    */
+   const enum agx_chip chip = dev->chip;
+   const bool hal300 = agx_chip_hal300_path(chip);
+   const bool native = !hal300 && agx_chip_native_agx3(chip);
+
+   if (hal300 || native) {
+      if (agx_pack_native_sampler_variant(ctx, so, AGX_NATIVE_SAMPLER_DESC,
+                                          &so->native_desc))
+         so->native_desc_valid |= AGX_NATIVE_SAMPLER_DESC;
+
+      if (native && agx_chip_sampler_has_lod_bias(chip)) {
+         if (agx_pack_native_sampler_variant(ctx, so,
+                                             AGX_NATIVE_SAMPLER_QUERY_LOD,
+                                             &so->native_query_lod_desc))
+            so->native_desc_valid |= AGX_NATIVE_SAMPLER_QUERY_LOD;
+      }
+
+      if (so->uses_custom_border) {
+         if (agx_pack_native_sampler_variant(ctx, so, AGX_NATIVE_SAMPLER_CLAMP,
+                                             &so->native_clamp_desc))
+            so->native_desc_valid |= AGX_NATIVE_SAMPLER_CLAMP;
+
+         if (native && agx_shadow_gather_custom_border(chip)) {
+            if (agx_pack_native_sampler_variant(ctx, so,
+                                                AGX_NATIVE_SAMPLER_PROBE,
+                                                &so->native_probe_desc))
+               so->native_desc_valid |= AGX_NATIVE_SAMPLER_PROBE;
+         }
+      }
    }
 
    return so;
@@ -7180,15 +7377,32 @@ agx_upload_textures(struct agx_batch *batch, struct agx_compiled_shader *cs,
          return;
       }
 
-      /* Re-emit state because the layout might have changed from under us.
-       * TODO: optimize this somehow?
+      /* Repack only when the view has not been packed for this descriptor
+       * generation yet or the resource's backing storage/layout generation
+       * advanced since the cached pack.
        */
-      if (!agx_pack_texture(descriptor_generation, &tex->desc, rsrc,
-                            tex->format, &tex->base))
-         {
+      const uint64_t rsrc_gen = p_atomic_read(&rsrc->desc_generation);
+      if (tex->desc_packed_gen != descriptor_generation ||
+          tex->desc_generation != rsrc_gen) {
+         if (!agx_pack_texture(descriptor_generation, &tex->desc, rsrc,
+                               tex->format, &tex->base)) {
+            tex->desc_packed_gen = AGX_DESCRIPTOR_GENERATION_UNKNOWN;
             agx_native_descriptor_reject_batch(batch, "sampled texture");
             return;
          }
+         tex->desc_packed_gen = descriptor_generation;
+         tex->desc_generation = rsrc_gen;
+      } else if (unlikely(dev->debug & AGX_DBG_VERIFY)) {
+         struct agx_gallium_texture_descriptor fresh;
+         if (!agx_pack_texture(descriptor_generation, &fresh, rsrc,
+                               tex->format, &tex->base) ||
+             memcmp(&fresh, &tex->desc, descriptor_size) != 0) {
+            mesa_loge("asahi: cached texture descriptor differs from fresh "
+                      "pack (gen=%" PRIu64 ", rsrc=%p)",
+                      rsrc_gen, rsrc);
+            assert(!"cached texture descriptor mismatch");
+         }
+      }
 
       memcpy(texture, &tex->desc, descriptor_size);
       if (buffer_metadata.cpu && tex->base.target == PIPE_BUFFER) {
@@ -7416,113 +7630,37 @@ agx_sampler_heap_add(struct agx_device *dev, struct agx_sampler_heap *heap,
    return heap->count++;
 }
 
-/* API sampler state in the native heap records. G17P is the HAL200 record
- * with its own compare enable. G17G's Gen5 record overlaps the compare
- * function with the reduction mode and selects the compare interpretation
- * with compare_mode; the comparison itself is requested by the sample
- * instruction. This mirrors hk_pack_native_sampler(), including LEQUAL for a
- * sampler without a comparison. */
 static void
-agx_pack_g17_api_sampler(enum agx_chip chip, void *out,
-                         const struct pipe_sampler_state *state,
-                         enum agx_border_colour border_colour,
-                         bool bias_in_descriptor)
+agx_verify_native_sampler(struct agx_context *ctx,
+                          const struct agx_sampler_state *sampler,
+                          const uint8_t *cached, size_t sampler_length,
+                          enum agx_native_sampler_valid variant,
+                          const uint8_t *ordinary)
 {
-   const bool compare = state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
-   const enum agx_compare_func compare_func =
-      compare ? agx_compare_funcs[state->compare_func]
-              : AGX_COMPARE_FUNC_LEQUAL;
+   struct agx_device *dev = agx_device(ctx->base.screen);
+   struct agx_gallium_sampler_descriptor fresh = {0};
+   bool ok = agx_pack_native_sampler_variant(ctx, sampler, variant, &fresh);
 
-   if (agx_chip_hal300_path(chip)) {
-      agx_pack(out, SAMPLER_GEN5, cfg) {
-         cfg.minimum_lod = state->min_lod;
-         cfg.maximum_lod = state->max_lod;
-         cfg.maximum_anisotropy =
-            util_next_power_of_two(MAX2(state->max_anisotropy, 1));
-         cfg.magnify = agx_filters[state->mag_img_filter];
-         cfg.minify = agx_filters[state->min_img_filter];
-         cfg.mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter);
-         cfg.wrap_s = agx_wrap_from_pipe(state->wrap_s);
-         cfg.wrap_t = agx_wrap_from_pipe(state->wrap_t);
-         cfg.wrap_r = agx_wrap_from_pipe(state->wrap_r);
-         cfg.pixel_coordinates = state->unnormalized_coords;
-         /* The API bias is applied exactly once. When nir_lower_tex sums it
-          * into the shader's own bias -- which it does for every chip but
-          * G17P -- carrying it here as well applies it twice, and the
-          * descriptor field quantises to 1/64 on top of the hardware's own
-          * quantisation of the level it samples at. Measured on G17G with a
-          * level-valued mip pyramid, a sampler bias of one selected level
-          * two and a bias of two selected level four. */
-         if (bias_in_descriptor)
-            cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
-         cfg.seamful_cube_maps = !state->seamless_cube_map;
-         cfg.border_colour = border_colour;
-         cfg.compare_mode = true;
-         cfg.compare_func = compare_func;
+   if (!ok || memcmp(&fresh, cached, sampler_length) != 0) {
+      mesa_loge("asahi: cached native sampler variant %u differs from fresh "
+                "pack on %s",
+                variant, agx_chip_name(dev->chip));
+      assert(!"cached native sampler mismatch");
+   }
+
+   if (variant == AGX_NATIVE_SAMPLER_QUERY_LOD && ordinary) {
+      struct agx_gallium_sampler_descriptor unpacked = {0};
+      agx_unpack(NULL, ordinary, SAMPLER_HAL200, cfg);
+      cfg.lod_bias = CLAMP(sampler->base.lod_bias, -16.0, 16.0);
+      AGX_SAMPLER_HAL200_pack(unpacked.opaque, &cfg);
+      if (memcmp(&unpacked, cached, sampler_length) != 0) {
+         mesa_loge("asahi: query-lod sampler differs from HAL200 unpack/repack "
+                   "on %s",
+                   agx_chip_name(dev->chip));
+         assert(!"query-lod HAL200 round-trip mismatch");
       }
-      return;
-   }
-
-   agx_pack(out, SAMPLER_HAL200, cfg) {
-      cfg.minimum_lod = state->min_lod;
-      cfg.maximum_lod = state->max_lod;
-      cfg.maximum_anisotropy =
-         util_next_power_of_two(MAX2(state->max_anisotropy, 1));
-      cfg.magnify = agx_filters[state->mag_img_filter];
-      cfg.minify = agx_filters[state->min_img_filter];
-      cfg.mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter);
-      cfg.wrap_s = agx_wrap_from_pipe(state->wrap_s);
-      cfg.wrap_t = agx_wrap_from_pipe(state->wrap_t);
-      cfg.wrap_r = agx_wrap_from_pipe(state->wrap_r);
-      cfg.pixel_coordinates = state->unnormalized_coords;
-      cfg.compare_func = agx_compare_funcs[state->compare_func];
-      cfg.compare_enable = compare;
-      if (bias_in_descriptor)
-         cfg.lod_bias = CLAMP(state->lod_bias, -16.0, 16.0);
-      cfg.seamful_cube_maps = !state->seamless_cube_map;
-      cfg.border_colour = border_colour;
    }
 }
-
-/* Native table entry for an API sampler, with the given border colour. */
-static struct agx_gallium_native_sampler
-agx_native_sampler_state(const struct pipe_sampler_state *state,
-                         enum agx_border_colour border_colour)
-{
-   const bool compare_enable =
-      state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
-
-   return (struct agx_gallium_native_sampler){
-      .minimum_lod = state->min_lod,
-      .maximum_lod = state->max_lod,
-      .maximum_anisotropy =
-         util_next_power_of_two(MAX2(state->max_anisotropy, 1)),
-      .magnify = agx_filters[state->mag_img_filter],
-      .minify = agx_filters[state->min_img_filter],
-      .mip_filter = agx_mip_filter_from_pipe(state->min_mip_filter),
-      .wrap_s = agx_wrap_from_pipe(state->wrap_s),
-      .wrap_t = agx_wrap_from_pipe(state->wrap_t),
-      .wrap_r = agx_wrap_from_pipe(state->wrap_r),
-      .pixel_coordinates = state->unnormalized_coords,
-      .compare_func = agx_compare_funcs[state->compare_func],
-      .compare_enable = compare_enable,
-      /* An ordinary sample takes the bias as a shader operand, summed with
-       * the shader's own in floating point; only a depth comparison, whose
-       * level has no per-lane form here, keeps it in the descriptor where the
-       * sampler has a bias field. See agx_create_context(). */
-      .lod_bias = compare_enable ? CLAMP(state->lod_bias, -16.0, 16.0) : 0.0f,
-      .seamful_cube_maps = !state->seamless_cube_map,
-      .border_colour = border_colour,
-   };
-}
-
-
-/* API sampler state in the native heap records. G17P is the HAL200 record
- * with its own compare enable. G17G's Gen5 record overlaps the compare
- * function with the reduction mode and selects the compare interpretation
- * with compare_mode; the comparison itself is requested by the sample
- * instruction. This mirrors hk_pack_native_sampler(), including LEQUAL for a
- * sampler without a comparison. */
 
 static void
 agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
@@ -7578,19 +7716,12 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
          struct agx_sampler_state *sampler = ctx->stage[stage].samplers[i];
          uint8_t *out = (uint8_t *)T.cpu + sampler_length * (i + 1);
          if (sampler) {
-            const struct pipe_sampler_state *state = &sampler->base;
-            const struct agx_gallium_native_sampler native =
-               agx_native_sampler_state(
-                  state, sampler->uses_custom_border
-                            ? AGX_BORDER_COLOUR_OPAQUE_WHITE
-                            : sampler->border_colour);
-            if (g18)
-               agx_pack_g17_api_sampler(dev->chip, out, state,
-                                        native.border_colour,
-                                        !ctx->support_lod_bias);
-            else if (!agx_gallium_pack_native_sampler(dev->chip, (void *)out,
-                                                      &native))
+            if (!(sampler->native_desc_valid & AGX_NATIVE_SAMPLER_DESC))
                agx_native_descriptor_rejected(dev, "sampler");
+            memcpy(out, &sampler->native_desc, sampler_length);
+            if (unlikely(dev->debug & AGX_DBG_VERIFY))
+               agx_verify_native_sampler(ctx, sampler, out, sampler_length,
+                                         AGX_NATIVE_SAMPLER_DESC, NULL);
 
             if (sampler->uses_custom_border) {
                uint16_t clamp_handle;
@@ -7603,37 +7734,30 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
                uint8_t *clamp = (uint8_t *)T.cpu +
                                 sampler_length * clamp_handle;
-               struct agx_gallium_native_sampler clamp_state =
-                  agx_native_sampler_state(
-                     state, AGX_BORDER_COLOUR_TRANSPARENT_BLACK);
-               if (g18) {
-                  agx_pack_g17_api_sampler(dev->chip, clamp, state,
-                                           AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
-                                           !ctx->support_lod_bias);
-                  continue;
-               }
-               if (agx_shadow_gather_custom_border(dev->chip))
-                  clamp_state.compare_enable = false;
-               if (!agx_gallium_pack_native_sampler(dev->chip, (void *)clamp,
-                                                    &clamp_state))
-                  agx_native_descriptor_rejected(dev,
-                                                 "custom-border sampler");
+               if (!(sampler->native_desc_valid & AGX_NATIVE_SAMPLER_CLAMP))
+                  agx_native_descriptor_rejected(dev, "custom-border sampler");
+               memcpy(clamp, &sampler->native_clamp_desc, sampler_length);
+               if (unlikely(dev->debug & AGX_DBG_VERIFY))
+                  agx_verify_native_sampler(ctx, sampler, clamp, sampler_length,
+                                            AGX_NATIVE_SAMPLER_CLAMP, NULL);
 
-               if (agx_shadow_gather_custom_border(dev->chip)) {
-                  clamp_state.border_colour = AGX_BORDER_COLOUR_OPAQUE_WHITE;
+               if (!g18 && agx_shadow_gather_custom_border(dev->chip)) {
                   uint8_t *probe = (uint8_t *)T.cpu + sampler_length *
                      (AGX_GALLIUM_G17P_BORDER_NONCOMPARE_BASE + i);
-                  if (!agx_gallium_pack_native_sampler(dev->chip, (void *)probe,
-                                                       &clamp_state))
+                  if (!(sampler->native_desc_valid & AGX_NATIVE_SAMPLER_PROBE))
                      agx_native_descriptor_rejected(dev,
                                                     "custom-border probe sampler");
+                  memcpy(probe, &sampler->native_probe_desc, sampler_length);
+                  if (unlikely(dev->debug & AGX_DBG_VERIFY))
+                     agx_verify_native_sampler(ctx, sampler, probe,
+                                               sampler_length,
+                                               AGX_NATIVE_SAMPLER_PROBE, NULL);
                }
             }
          } else {
             if (g18) {
                /* An unbound slot keeps the texel-fetch sampler's state. */
-               agx_gallium_pack_g17p_txf_sampler(
-                  dev->chip, (struct agx_gallium_sampler_descriptor *)out);
+               memcpy(out, T.cpu, sampler_length);
                continue;
             }
             const struct agx_gallium_native_sampler null_state = {
@@ -7653,6 +7777,7 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
       }
 
       if (query_lod) {
+         const bool has_lod_bias = agx_chip_sampler_has_lod_bias(dev->chip);
          for (unsigned i = 0; i < ctx->stage[stage].sampler_count; ++i) {
             const struct agx_sampler_state *sampler =
                ctx->stage[stage].samplers[i];
@@ -7662,14 +7787,25 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
                (AGX_GALLIUM_G17P_QUERY_LOD_BASE + i);
             /* A Gen4 sampler has no bias field to carry the API bias into
              * the LOD query, so the query reads the ordinary entry. */
-            if (!agx_chip_sampler_has_lod_bias(dev->chip)) {
+            if (!has_lod_bias || !sampler) {
                memcpy(query, ordinary, sampler_length);
                continue;
             }
-            agx_unpack(NULL, ordinary, SAMPLER_HAL200, cfg);
-            cfg.lod_bias = sampler ? CLAMP(sampler->base.lod_bias, -16.0, 16.0)
-                                   : 0.0;
-            AGX_SAMPLER_HAL200_pack((uint32_t *)query, &cfg);
+            /* G18G's samplers are not packed ahead: carry the bias over
+             * its ordinary entry. */
+            if (g18) {
+               agx_unpack(NULL, ordinary, SAMPLER_HAL200, cfg);
+               cfg.lod_bias = CLAMP(sampler->base.lod_bias, -16.0, 16.0);
+               AGX_SAMPLER_HAL200_pack((uint32_t *)query, &cfg);
+               continue;
+            }
+            if (!(sampler->native_desc_valid & AGX_NATIVE_SAMPLER_QUERY_LOD))
+               agx_native_descriptor_rejected(dev, "query-lod sampler");
+            memcpy(query, &sampler->native_query_lod_desc, sampler_length);
+            if (unlikely(dev->debug & AGX_DBG_VERIFY))
+               agx_verify_native_sampler(ctx, sampler, query, sampler_length,
+                                         AGX_NATIVE_SAMPLER_QUERY_LOD,
+                                         ordinary);
          }
       }
 
@@ -7702,12 +7838,12 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
          struct agx_sampler_state *sampler = ctx->stage[stage].samplers[i];
          uint8_t *out = (uint8_t *)T.cpu + sampler_length * (i + 1);
          if (sampler) {
-            const struct pipe_sampler_state *state = &sampler->base;
-            agx_pack_g17_api_sampler(dev->chip, out, state,
-                                     sampler->uses_custom_border
-                                        ? AGX_BORDER_COLOUR_OPAQUE_WHITE
-                                        : sampler->border_colour,
-                                     !ctx->support_lod_bias);
+            if (!(sampler->native_desc_valid & AGX_NATIVE_SAMPLER_DESC))
+               agx_native_descriptor_rejected(dev, "sampler");
+            memcpy(out, &sampler->native_desc, sampler_length);
+            if (unlikely(dev->debug & AGX_DBG_VERIFY))
+               agx_verify_native_sampler(ctx, sampler, out, sampler_length,
+                                         AGX_NATIVE_SAMPLER_DESC, NULL);
 
             if (sampler->uses_custom_border) {
                uint16_t clamp_handle;
@@ -7720,14 +7856,16 @@ agx_upload_samplers(struct agx_batch *batch, struct agx_compiled_shader *cs,
 
                uint8_t *clamp = (uint8_t *)T.cpu +
                                 sampler_length * clamp_handle;
-               agx_pack_g17_api_sampler(dev->chip, clamp, state,
-                                        AGX_BORDER_COLOUR_TRANSPARENT_BLACK,
-                                        !ctx->support_lod_bias);
+               if (!(sampler->native_desc_valid & AGX_NATIVE_SAMPLER_CLAMP))
+                  agx_native_descriptor_rejected(dev, "custom-border sampler");
+               memcpy(clamp, &sampler->native_clamp_desc, sampler_length);
+               if (unlikely(dev->debug & AGX_DBG_VERIFY))
+                  agx_verify_native_sampler(ctx, sampler, clamp, sampler_length,
+                                            AGX_NATIVE_SAMPLER_CLAMP, NULL);
             }
          } else {
             /* An unbound slot keeps the texel-fetch sampler's state. */
-            agx_gallium_pack_g17p_txf_sampler(
-               dev->chip, (struct agx_gallium_sampler_descriptor *)out);
+            memcpy(out, T.cpu, sampler_length);
          }
       }
 

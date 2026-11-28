@@ -206,6 +206,8 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
    if (!rsc)
       return NULL;
 
+   rsc->desc_generation = 1;
+
    rsc->modifier = whandle->modifier == DRM_FORMAT_MOD_INVALID
                       ? DRM_FORMAT_MOD_LINEAR
                       : whandle->modifier;
@@ -792,6 +794,8 @@ agx_resource_create_with_modifiers(struct pipe_screen *screen,
    if (!nresource)
       return NULL;
 
+   nresource->desc_generation = 1;
+
    nresource->base.b = *templ;
    nresource->base.b.screen = screen;
 
@@ -1024,6 +1028,7 @@ agx_shadow(struct agx_context *ctx, struct agx_resource *rsrc, bool needs_copy)
    /* Swap the pointers, dropping a reference */
    agx_bo_unreference(dev, rsrc->bo);
    rsrc->bo = new_;
+   agx_resource_bump_desc_generation(rsrc);
    BITSET_ZERO(rsrc->invalidated_levels);
 
    /* Reemit descriptors using this resource */
@@ -1101,6 +1106,7 @@ agx_replace_buffer_storage(struct pipe_context *pctx,
    dst->layout = src->layout;
    dst->modifier = src->modifier;
    dst->shadowed_bytes = 0;
+   agx_resource_bump_desc_generation(dst);
 
    BITSET_SET(dst->data_valid, 0);
    agx_valid_buffer_range_add(dst, 0, pdst->width0);
@@ -1864,6 +1870,7 @@ transition_resource(struct pipe_context *pctx, struct agx_resource *rsrc,
    rsrc->modifier = new_res->modifier;
    rsrc->bo = new_res->bo;
    new_res->bo = old;
+   agx_resource_bump_desc_generation(rsrc);
 
    /* Any sampler view or image already bound to a stage keeps pointing at rsrc,
     * so force descriptor re-upload after the BO/layout swap. */
@@ -3769,7 +3776,9 @@ static void
 agx_resource_set_stencil(struct pipe_resource *prsrc,
                          struct pipe_resource *stencil)
 {
-   agx_resource(prsrc)->separate_stencil = agx_resource(stencil);
+   struct agx_resource *rsrc = agx_resource(prsrc);
+   rsrc->separate_stencil = agx_resource(stencil);
+   agx_resource_bump_desc_generation(rsrc);
 }
 
 static struct pipe_resource *
