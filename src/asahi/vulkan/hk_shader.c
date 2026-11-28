@@ -7312,6 +7312,9 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s,
       _mesa_hash_table_destroy(s->uvs_linked, NULL);
    }
 
+   memset(s->linked.fast, 0, sizeof(s->linked.fast));
+   s->linked.fast_count = 0;
+
    if (s->linked.ht) {
       hash_table_foreach(s->linked.ht, entry) {
          hk_destroy_linked_shader(dev, entry->data);
