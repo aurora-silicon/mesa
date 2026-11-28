@@ -11341,6 +11341,17 @@ agx_nir_limit_heavy_branch_unroll(nir_shader *nir)
    return any;
 }
 
+/* Where agx_compile_variant_nir() hoists loop invariants: every AGX3 stage
+ * (agx_nir_opt_licm), and AGX2 application compute shaders, whose integer
+ * terms agx_nir_opt_licm_agx2_integer hoists.
+ */
+static bool
+agx_hoists_loop_invariants(const nir_shader *nir, bool agx3)
+{
+   return agx3 || (mesa_shader_stage_is_compute(nir->info.stage) &&
+                   !nir->info.internal);
+}
+
 /*
  * Standard NIR optimization loop. This is run in agx_preprocess_nir, then once
  * again at shader variant compile time. Unless there was a complex shader key,
@@ -12810,6 +12821,13 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    };
    bool progress = false;
    bool pre_fuse_dirty = false;
+   /* See the reassociation below the fusion loop. */
+   const unsigned reassoc_flags =
+      nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
+      (agx_hoists_loop_invariants(nir, agx3b || m5)
+          ? nir_reassociate_loop_invariant |
+               nir_reassociate_loop_invariant_first
+          : 0);
 
    if (pre_preamble_optimized) {
       if (epilog_has_alu) {
@@ -12830,9 +12848,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
          NIR_PASS(_, nir, nir_opt_undef);
       }
       if (preamble_size && (epilog_has_alu || preamble_newly_enabled)) {
-         nir_opt_reassociate_loop(
-            nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-                    ((agx3b || m5) ? nir_reassociate_loop_invariant : 0));
+         nir_opt_reassociate_loop(nir, reassoc_flags);
          agx_factor_loop_mac(nir);
       }
       if (epilog_has_alu)
@@ -13296,18 +13312,22 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
    NIR_PASS(_, nir, agx_nir_lower_fdiv_late);
 
    /* Reassociate before forming preambles because it makes preambles more
-    * effective. Clean up after. On AGX3, also order the loop-invariant terms of
-    * a chain in a loop first, so accumulations of per-iteration constants
-    * (robustness loops add the same size queries every iteration) are summed
-    * once in the preamble instead of once per term and iteration.
+    * effective. Clean up after. Where loop invariants are hoisted, also order
+    * the loop-invariant terms of a chain in a loop first, so accumulations of
+    * per-iteration constants (robustness loops add the same size queries
+    * every iteration) are summed once in the preamble instead of once per
+    * term and iteration.
+    *
+    * AGX has no scalar ALU in the main shader: in a loop a convergent term is
+    * vector math like any other. Rank invariance above convergence, so
+    * that a shared-memory address of uniform and per-lane parts plus a loop
+    * counter (coopMatLoad in a K loop) adds only the counter in the loop.
     *
     * When nir_opt_reassociate_loop() returns true, its final cleanup loop ran
     * algebraic/constant-folding/copy-prop/CSE/DCE to a fixpoint, leaving the
     * shader CSE/DCE-clean on return.
     */
-   if (nir_opt_reassociate_loop(
-          nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic |
-                  ((agx3b || m5) ? nir_reassociate_loop_invariant : 0)))
+   if (nir_opt_reassociate_loop(nir, reassoc_flags))
       pre_fuse_dirty = false;
 
    if (has_loops)

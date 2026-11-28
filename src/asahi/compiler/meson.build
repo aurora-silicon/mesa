@@ -882,6 +882,7 @@ if with_tests
          'test/test-m5-half-widen-once.cpp',
          'test/test-shrink-memory-loads.cpp',
          'test/test-m5-byte-to-float.cpp',
+         'test/test-compute-licm.cpp',
          'test/test-agx3b-byte-unpack.cpp',
          'test/test-fold-narrowed-half.cpp',
          'test/test-m5-float-minmax-reduce.cpp',
