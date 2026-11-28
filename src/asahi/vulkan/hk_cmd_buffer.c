@@ -4770,17 +4770,87 @@ hk_g18g_upload_graphics_program(struct hk_cmd_buffer *cmd,
       return 0;
    }
 
-   struct hk_agx3_g17p_graphics_program program;
-   if (!hk_agx3_g17g_basic_graphics_program_generate(dev->dev.chip, &desc,
-                                                     &program)) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return 0;
-   }
-   if (program.length > capacity) {
-      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
-      return 0;
-   }
    if (dev->dev.chip == AGX_CHIP_G18G) {
+      struct g18_gfx_cache_key {
+         uint64_t shader_va;
+         uint32_t shader_binary_size;
+         uint32_t scratch_size;
+         uint32_t compiler_d;
+         uint32_t tib_sample_size_B;
+         uint32_t tib_nr_samples;
+         uint32_t tib_tile_size;
+         uint32_t usc_clusters;
+         uint16_t nr_gprs;
+         uint8_t flags;
+         uint8_t colour_classes;
+         uint8_t range_count;
+         uint16_t start_halfs[8];
+         uint16_t size_halfs[8];
+         uint32_t hi[8];
+      };
+      struct g18_gfx_cache_entry {
+         struct g18_gfx_cache_key key;
+         uint16_t len;
+         uint16_t lo_off[8];
+         uint8_t valid;
+         uint8_t bytes[768];
+      };
+      static _Thread_local struct g18_gfx_cache_entry g18_gfx_cache[32];
+      static _Thread_local unsigned g18_gfx_cache_next = 0;
+
+      bool gcache_eligible = !desc.cprog_inputs &&
+                             desc.constant_program.code_size == 0 &&
+                             range_count <= 8;
+      for (unsigned r = 0; gcache_eligible && r < range_count; ++r) {
+         if ((uint32_t)ranges[r].address <= 0xffffu)
+            gcache_eligible = false;
+      }
+      struct g18_gfx_cache_key gkey;
+      if (gcache_eligible) {
+         memset(&gkey, 0, sizeof(gkey));
+         gkey.shader_va = desc.shader_va;
+         gkey.shader_binary_size = desc.shader_binary_size;
+         gkey.scratch_size = desc.scratch_size;
+         gkey.compiler_d = desc.compiler_d;
+         gkey.tib_sample_size_B = desc.imageblock.sample_size_B;
+         gkey.tib_nr_samples = desc.imageblock.nr_samples;
+         gkey.tib_tile_size = desc.imageblock.tile_size_px;
+         gkey.usc_clusters = desc.usc_clusters;
+         gkey.nr_gprs = desc.nr_gprs;
+         gkey.flags = (desc.compiler_d_valid ? 1u : 0u) |
+                      (desc.fragment ? 2u : 0u) |
+                      (desc.writes_sample_mask ? 4u : 0u) |
+                      (desc.preloaded_root ? 8u : 0u) |
+                      (desc.patchable ? 16u : 0u);
+         gkey.colour_classes = desc.colour_classes;
+         gkey.range_count = (uint8_t)range_count;
+         for (unsigned r = 0; r < range_count; ++r) {
+            gkey.start_halfs[r] = ranges[r].start_halfs;
+            gkey.size_halfs[r] = ranges[r].size_halfs;
+            gkey.hi[r] = (uint32_t)(ranges[r].address >> 32);
+         }
+         for (unsigned e = 0; e < 32; ++e) {
+            const struct g18_gfx_cache_entry *ce = &g18_gfx_cache[e];
+            if (ce->valid && ce->len <= reserve_capacity &&
+                !memcmp(&ce->key, &gkey, sizeof(gkey))) {
+               memcpy(reservation.map, ce->bytes, ce->len);
+               for (unsigned r = 0; r < range_count; ++r) {
+                  uint32_t lo = (uint32_t)ranges[r].address;
+                  memcpy((uint8_t *)reservation.map + ce->lo_off[r], &lo, 4);
+               }
+               return hk_cmd_publish_ioto_program(cmd, &reservation, ce->len);
+            }
+         }
+      }
+
+      struct hk_agx3_g17p_graphics_program program;
+      if (!hk_agx3_g17g_basic_graphics_program_generate(dev->dev.chip, &desc,
+                                                        &program) ||
+          program.length > capacity) {
+         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+         return 0;
+      }
+
       /* G18G consumes the canonical GPU1 record re-encoded as agx3d. The
        * G17G program embeds no address of its own, so the longer text
        * stays position-independent (agx_ioto_capacity). */
@@ -4806,10 +4876,55 @@ hk_g18g_upload_graphics_program(struct hk_cmd_buffer *cmd,
          return 0;
       }
       const size_t published_size = code.size;
+      if (gcache_eligible && published_size <= sizeof(g18_gfx_cache[0].bytes)) {
+         const uint8_t *cb = code.data;
+         uint16_t lo_off[8] = {0};
+         bool ok_patch = true;
+         for (unsigned r = 0; r < range_count; ++r) {
+            uint32_t want = (uint32_t)ranges[r].address;
+            unsigned matches = 0;
+            for (unsigned o = 0; o + 6 <= published_size; o += 2) {
+               uint8_t op = cb[o] & 0x7fu;
+               if (op != 0x11u && op != 0x51u)
+                  continue;
+               uint32_t v;
+               memcpy(&v, cb + o + 2, 4);
+               if (v == want) {
+                  lo_off[r] = (uint16_t)(o + 2);
+                  matches++;
+               }
+            }
+            if (matches != 1) {
+               ok_patch = false;
+               break;
+            }
+         }
+         if (ok_patch) {
+            struct g18_gfx_cache_entry *ce =
+               &g18_gfx_cache[g18_gfx_cache_next++ & 31u];
+            ce->key = gkey;
+            ce->len = (uint16_t)published_size;
+            for (unsigned r = 0; r < range_count; ++r)
+               ce->lo_off[r] = lo_off[r];
+            memcpy(ce->bytes, cb, published_size);
+            ce->valid = 1;
+         }
+      }
       memcpy(reservation.map, code.data, code.size);
       util_dynarray_fini(&code);
       return hk_cmd_publish_ioto_program(cmd, &reservation,
                                          published_size);
+   }
+
+   struct hk_agx3_g17p_graphics_program program;
+   if (!hk_agx3_g17g_basic_graphics_program_generate(dev->dev.chip, &desc,
+                                                     &program)) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return 0;
+   }
+   if (program.length > capacity) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return 0;
    }
    memcpy(reservation.map, program.bytes, program.length);
    return hk_cmd_publish_ioto_program(cmd, &reservation, program.length);

@@ -2220,6 +2220,95 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
                    struct agx3_g17p_graphics_program *program)
 {
    if (dev->dev.chip == AGX_CHIP_G18G) {
+      struct g18_tile_cache_key {
+         uint64_t shader_va;
+         uint32_t shader_binary_size;
+         uint32_t scratch_size;
+         uint32_t compiler_d;
+         uint32_t tib_sample_size_B;
+         uint32_t tib_nr_samples;
+         uint32_t tib_tile_size;
+         uint32_t threadgroup_memory_size_B;
+         uint32_t usc_clusters;
+         uint16_t nr_gprs;
+         uint16_t shader_gprs;
+         uint8_t flags;
+         uint8_t colour_classes;
+         uint8_t store;
+         uint8_t range_count;
+         uint16_t start_halfs[2];
+         uint16_t size_halfs[2];
+         uint32_t hi[2];
+         int64_t delta01;
+      };
+      struct g18_tile_cache_entry {
+         struct g18_tile_cache_key key;
+         uint16_t len;
+         uint16_t lo_off[2];
+         uint8_t has_lo[2];
+         uint8_t valid;
+         uint8_t bytes[512];
+      };
+      static _Thread_local struct g18_tile_cache_entry g18_tile_cache[16];
+      static _Thread_local unsigned g18_tile_cache_next = 0;
+
+      const unsigned range_count = d->uniform_range_count;
+      const bool tcache_eligible =
+         !d->cprog_inputs && !d->preshader &&
+         d->constant_program.code_size == 0 &&
+         range_count >= 1 && range_count <= 2 &&
+         (uint32_t)d->uniform_ranges[0].address > 0xffffu &&
+         (range_count == 1 ||
+          (uint32_t)d->uniform_ranges[1].address > 0xffffu);
+      struct g18_tile_cache_key tkey;
+      if (tcache_eligible) {
+         memset(&tkey, 0, sizeof(tkey));
+         tkey.shader_va = d->shader_va;
+         tkey.shader_binary_size = d->shader_binary_size;
+         tkey.scratch_size = d->scratch_size;
+         tkey.compiler_d = d->compiler_d;
+         tkey.tib_sample_size_B = d->imageblock.sample_size_B;
+         tkey.tib_nr_samples = d->imageblock.nr_samples;
+         tkey.tib_tile_size = d->imageblock.tile_size_px;
+         tkey.threadgroup_memory_size_B = d->threadgroup_memory_size_B;
+         tkey.usc_clusters = d->usc_clusters;
+         tkey.nr_gprs = d->nr_gprs;
+         tkey.shader_gprs = (uint16_t)shader->info.nr_gprs;
+         tkey.flags = (d->compiler_d_valid ? 1u : 0u) |
+                      (d->fragment ? 2u : 0u) |
+                      (d->writes_sample_mask ? 4u : 0u) |
+                      (d->preloaded_root ? 8u : 0u) |
+                      (d->patchable ? 16u : 0u);
+         tkey.colour_classes = d->colour_classes;
+         tkey.store = store ? 1 : 0;
+         tkey.range_count = (uint8_t)range_count;
+         for (unsigned r = 0; r < range_count; ++r) {
+            tkey.start_halfs[r] = d->uniform_ranges[r].start_halfs;
+            tkey.size_halfs[r] = d->uniform_ranges[r].size_halfs;
+            tkey.hi[r] = (uint32_t)(d->uniform_ranges[r].address >> 32);
+         }
+         tkey.delta01 =
+            range_count == 2
+               ? (int64_t)(d->uniform_ranges[1].address -
+                           d->uniform_ranges[0].address)
+               : 0;
+         for (unsigned e = 0; e < 16; ++e) {
+            const struct g18_tile_cache_entry *ce = &g18_tile_cache[e];
+            if (ce->valid && ce->len <= sizeof(program->bytes) &&
+                !memcmp(&ce->key, &tkey, sizeof(tkey))) {
+               memcpy(program->bytes, ce->bytes, ce->len);
+               for (unsigned r = 0; r < range_count; ++r) {
+                  if (ce->has_lo[r]) {
+                     uint32_t lo = (uint32_t)d->uniform_ranges[r].address;
+                     memcpy(program->bytes + ce->lo_off[r], &lo, 4);
+                  }
+               }
+               program->length = ce->len;
+               return true;
+            }
+         }
+      }
+
       if (!agx3_g18g_general_tile_program_generate(d, store, program))
          return false;
       struct util_dynarray code;
@@ -2242,6 +2331,48 @@ hk_m5_tile_program(struct hk_device *dev, struct agx_bg_eot_shader *shader,
                    why ? why : "longer than program buffer", at);
       }
       util_dynarray_fini(&code);
+      if (ok && tcache_eligible &&
+          program->length <= sizeof(g18_tile_cache[0].bytes)) {
+         uint16_t lo_off[2] = {0, 0};
+         uint8_t has_lo[2] = {0, 0};
+         bool ok_patch = true;
+         for (unsigned r = 0; r < range_count; ++r) {
+            uint32_t want = (uint32_t)d->uniform_ranges[r].address;
+            unsigned matches = 0;
+            for (unsigned o = 0; o + 6 <= program->length; o += 2) {
+               uint8_t op = program->bytes[o] & 0x7fu;
+               if (op != 0x11u && op != 0x51u)
+                  continue;
+               uint32_t v;
+               memcpy(&v, program->bytes + o + 2, 4);
+               if (v == want) {
+                  lo_off[r] = (uint16_t)(o + 2);
+                  matches++;
+               }
+            }
+            if (matches == 1) {
+               has_lo[r] = 1;
+            } else if (r == 1 && matches == 0 && has_lo[0] &&
+                       tkey.delta01 >= 0 && tkey.delta01 <= 64) {
+               has_lo[r] = 0;
+            } else {
+               ok_patch = false;
+               break;
+            }
+         }
+         if (ok_patch && has_lo[0]) {
+            struct g18_tile_cache_entry *ce =
+               &g18_tile_cache[g18_tile_cache_next++ & 15u];
+            ce->key = tkey;
+            ce->len = (uint16_t)program->length;
+            ce->lo_off[0] = lo_off[0];
+            ce->lo_off[1] = lo_off[1];
+            ce->has_lo[0] = has_lo[0];
+            ce->has_lo[1] = has_lo[1];
+            memcpy(ce->bytes, program->bytes, program->length);
+            ce->valid = 1;
+         }
+      }
       return ok;
    }
 
