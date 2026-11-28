@@ -285,6 +285,9 @@ util_idalloc_sparse_alloc(struct util_idalloc_sparse *buf)
 unsigned
 util_idalloc_sparse_alloc_range(struct util_idalloc_sparse *buf, unsigned num)
 {
+   if (num == 1)
+      return util_idalloc_sparse_alloc(buf);
+
    unsigned max_ids = UTIL_IDALLOC_MAX_IDS_PER_SEGMENT(buf);
    unsigned num_elems = DIV_ROUND_UP(num, 32);
 

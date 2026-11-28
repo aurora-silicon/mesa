@@ -500,6 +500,7 @@ if with_tests
     'tests/u_debug_stack_test.cpp',
     'tests/u_debug_test.cpp',
     'tests/u_dl_test.cpp',
+    'tests/u_idalloc_test.cpp',
     'tests/u_memstream_test.cpp',
     'tests/u_printf_test.cpp',
     'tests/u_qsort_test.cpp',
