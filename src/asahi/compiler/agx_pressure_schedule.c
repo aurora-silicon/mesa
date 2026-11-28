@@ -2793,6 +2793,11 @@ hoist_uniform_store_conflict(const agx_instr *store, const agx_instr *instr)
 static bool
 hoist_can_cross(const agx_instr *P, const agx_instr *instr)
 {
+   /* Non-coherent device_loads may cross threadgroup_barrier without checking
+    * P->memory_can_reorder (unlike agx_insert_waits): any NIR barrier with
+    * global/device memory scope emits a preceding AGX_OPCODE_MEMORY_BARRIER,
+    * which has a non-NONE schedule class and stops hoisting there. A bare
+    * threadgroup_barrier orders only workgroup execution and local memory. */
    if (P->op == AGX_OPCODE_THREADGROUP_BARRIER ||
        P->op == AGX_OPCODE_LOCAL_LOAD || P->op == AGX_OPCODE_LOCAL_STORE)
       return true;
