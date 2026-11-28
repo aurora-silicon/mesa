@@ -5107,6 +5107,7 @@ hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
                                unsigned barrier)
 {
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
+   assert(plane < image->plane_count);
    struct ail_layout *layout = (struct ail_layout *)&image->planes[plane].layout;
    if (!hk_g17p_decompress_image_type_supported(image->vk.image_type) ||
        !ail_is_level_logically_compressed(layout, level))
@@ -5214,16 +5215,17 @@ hk_agx3_decompress_image_level(struct hk_cmd_buffer *cmd,
 
 static bool
 hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
-                              struct hk_device *dev,
                               const struct hk_rendering_state *render,
                               const struct hk_image *image,
-                              struct ail_layout *layout,
+                              unsigned image_plane,
                               unsigned level, unsigned layer,
-                              uint32_t layer_count, uint64_t base,
+                              uint32_t layer_count,
                               VkAttachmentLoadOp load_op,
                               VkRenderingFlags rendering_flags,
                               bool incomplete_render_area)
 {
+   assert(image_plane < image->plane_count);
+
    /* A resumed dynamic render pass preserves pixels rendered by the suspended
     * pass even when loadOp is CLEAR/DONT_CARE, and a sparse multiview mask
     * leaves untouched layers live, so never drop existing tiles in those cases. */
@@ -5237,11 +5239,8 @@ hk_agx3_decompress_attachment(struct hk_cmd_buffer *cmd,
       u_minify(image->vk.extent.height, level) == render->cr.height &&
       (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
        load_op == VK_ATTACHMENT_LOAD_OP_CLEAR);
-   unsigned plane = (unsigned)(layout - &image->planes[0].layout);
-   assert(plane < image->plane_count &&
-          hk_image_base_address(image, plane) == base);
    return hk_agx3_decompress_image_level(
-      cmd, image, plane, level, layer, layer_count, discard,
+      cmd, image, image_plane, level, layer, layer_count, discard,
       AGX_BARRIER_ALL | AGX_PREGFX);
 }
 
@@ -5916,8 +5915,8 @@ hk_begin_rendering(VkCommandBuffer commandBuffer,
                     layout->sample_count_sa == 1 &&
                     ail_get_blocksize_B(layout) == 16)) {
                   if (!hk_agx3_decompress_attachment(
-                         cmd, dev, render, image, layout, level, layer,
-                         layer_count, base,
+                         cmd, render, image, image_plane, level, layer,
+                         layer_count,
                          pRenderingInfo->pColorAttachments[i].loadOp,
                          pRenderingInfo->flags, incomplete_render_area)) {
                      mesa_loge_once("AGX3: spilled render pass with a "
