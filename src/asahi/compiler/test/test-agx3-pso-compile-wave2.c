@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
 #include "agx3_slot_core.h"
 #include "agx_compile.h"
 #include "agx_nir.h"
@@ -497,9 +501,74 @@ test_agx_backend_compile_wave2_g17p_and_g17s(void)
    return true;
 }
 
-int
-main(void)
+static bool
+test_licm_sparse_liveness(void)
 {
+   glsl_type_singleton_init_or_ref();
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, &agx_nir_options, "licm_sparse_liveness");
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_def *addr = nir_load_preamble(&b, 1, 64, .base = 0);
+
+   /* Make the dense slab hundreds of MiB while keeping live sets small. */
+   for (unsigned i = 1; i <= 12000; ++i) {
+      nir_push_if(&b, nir_ult_imm(&b, id, i));
+      nir_store_global(&b, nir_ior_imm(&b, id, i), addr, .align_mul = 4);
+      nir_pop_if(&b, NULL);
+   }
+
+   nir_def *limit = nir_load_preamble(&b, 1, 32, .base = 4);
+   nir_def *angle = nir_load_preamble(&b, 1, 32, .base = 6);
+   nir_variable *index =
+      nir_local_variable_create(b.impl, glsl_uint_type(), "index");
+   nir_store_var(&b, index, nir_imm_int(&b, 0), 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   nir_def *i = nir_load_var(&b, index);
+   nir_break_if(&b, nir_uge(&b, i, limit));
+   nir_def *invariant = nir_fsinc_agx3(&b, angle);
+   nir_def *varying = nir_fmul(&b, invariant, nir_u2f32(&b, i));
+   nir_store_global(&b, varying, addr, .align_mul = 4);
+   nir_store_var(&b, index, nir_iadd_imm(&b, i, 1), 1);
+   nir_pop_loop(&b, loop);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_opt_dce(b.shader);
+   nir_validate_shader(b.shader, "before sparse LICM");
+   nir_metadata_require(b.impl, nir_metadata_block_index);
+
+   nir_block *preheader = nir_loop_predecessor_block(loop);
+   nir_block *body = nir_def_block(varying);
+   CHECK((uint64_t)b.impl->num_blocks * BITSET_WORDS(b.impl->ssa_alloc) >
+         262144);
+   CHECK(nir_def_block(invariant) == body);
+
+#ifdef __linux__
+   struct rusage before, after;
+   CHECK(getrusage(RUSAGE_SELF, &before) == 0);
+#endif
+   CHECK(agx_nir_opt_licm(b.shader, 64, false));
+#ifdef __linux__
+   /* The dense slab alone would grow peak RSS by more than 256 MiB. */
+   CHECK(getrusage(RUSAGE_SELF, &after) == 0);
+   CHECK(after.ru_maxrss - before.ru_maxrss < 256 * 1024);
+#endif
+
+   CHECK(nir_def_block(invariant) == preheader);
+   CHECK(nir_def_block(varying) == body);
+   nir_validate_shader(b.shader, "after sparse LICM");
+
+   ralloc_free(b.shader);
+   glsl_type_singleton_decref();
+   return true;
+}
+
+int
+main(int argc, char **argv)
+{
+   if (argc == 2 && strcmp(argv[1], "--licm-sparse-liveness") == 0)
+      return test_licm_sparse_liveness() ? 0 : 1;
+
    bool ok = true;
    ok &= test_nir_search_comm_pruning();
    ok &= test_nir_opt_dce_fastpaths();
