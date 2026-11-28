@@ -3271,7 +3271,7 @@ agx3_alu_int_to_float(enum agx_isa_encoding enc, uint16_t dest,
    struct agx3_field_kv fields[15] = {
       {2, dest}, {18, src}, {27, hint == AGX3_ALU_HINT_CACHE},
       {29, hint == AGX3_ALU_HINT_DISCARD}, {30, is_signed},
-      {11, m5 && dest_cache},
+      {11, dest_cache},
    };
    unsigned n = 6;
    for (unsigned i = 0; i < (m5 ? 8 : 6); ++i)
@@ -3418,7 +3418,7 @@ agx3_alu_f16_to_int32(enum agx_isa_encoding enc, uint16_t dest, uint16_t src,
 static bool
 agx3_alu_bfeil_width(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
                uint16_t shift, bool shift_is_register, uint8_t width,
-               bool source_16, bool shift_16,
+               bool source_16, bool shift_16, bool dest_cache,
                const enum agx3_alu_hint hints[2], uint16_t wait_mask,
                uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *length)
 {
@@ -3436,13 +3436,13 @@ agx3_alu_bfeil_width(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
       /* M5 SRL retains the extract width in f57 and uses its own dispatch. */
       {58,3},{59,183},
    };
-   struct agx3_field_kv fields[19] = {
-      {2,dest},{16,source},{25,hints[0] == AGX3_ALU_HINT_CACHE},
+   struct agx3_field_kv fields[20] = {
+      {2,dest},{11,dest_cache},{16,source},{25,hints[0] == AGX3_ALU_HINT_CACHE},
       {27,hints[0] == AGX3_ALU_HINT_DISCARD},
       {38,shift_is_register ? 2 : 1},{shift_is_register ? 31 : 30,shift},
       {44,0},{57,width},
    };
-   unsigned count=8;
+   unsigned count=9;
    if (shift_is_register) {
       fields[count++] = (struct agx3_field_kv){40,hints[1] == AGX3_ALU_HINT_CACHE};
       fields[count++] = (struct agx3_field_kv){42,hints[1] == AGX3_ALU_HINT_DISCARD};
@@ -3454,13 +3454,24 @@ agx3_alu_bfeil_width(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
 }
 
 bool
+agx3_alu_bfeil_cached(enum agx_isa_encoding enc, uint16_t dest, bool dest_cache,
+                      uint16_t source, uint16_t shift, bool shift_is_register,
+                      uint8_t width, const enum agx3_alu_hint hints[2],
+                      uint16_t wait_mask, uint8_t out[AGX3_ALU_MAX_LENGTH],
+                      uint8_t *length)
+{
+   return agx3_alu_bfeil_width(enc,dest,source,shift,shift_is_register,width,
+                               false,false,dest_cache,hints,wait_mask,out,length);
+}
+
+bool
 agx3_alu_bfeil(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
                uint16_t shift, bool shift_is_register, uint8_t width,
                const enum agx3_alu_hint hints[2], uint16_t wait_mask,
                uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *length)
 {
-   return agx3_alu_bfeil_width(enc,dest,source,shift,shift_is_register,width,
-                              false,false,hints,wait_mask,out,length);
+   return agx3_alu_bfeil_cached(enc,dest,false,source,shift,shift_is_register,
+                                width,hints,wait_mask,out,length);
 }
 
 bool
@@ -3471,8 +3482,8 @@ agx3_alu_bfeil_m5(uint16_t dest, uint16_t source, bool source_16,
                   uint8_t *length)
 {
    return agx3_alu_bfeil_width(AGX_ISA_ENCODING_AGX3C,dest,source,shift,
-                              shift_is_register,width,source_16,shift_16,
-                              hints,wait_mask,out,length);
+                               shift_is_register,width,source_16,shift_16,
+                               false,hints,wait_mask,out,length);
 }
 
 bool

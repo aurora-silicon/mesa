@@ -658,6 +658,12 @@ bool agx3_alu_bfeil(enum agx_isa_encoding enc, uint16_t dest, uint16_t source,
                     uint16_t shift, bool shift_is_register, uint8_t width,
                     const enum agx3_alu_hint hints[2], uint16_t wait_mask,
                     uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *length);
+bool agx3_alu_bfeil_cached(enum agx_isa_encoding enc, uint16_t dest,
+                           bool dest_cache, uint16_t source, uint16_t shift,
+                           bool shift_is_register, uint8_t width,
+                           const enum agx3_alu_hint hints[2],
+                           uint16_t wait_mask,
+                           uint8_t out[AGX3_ALU_MAX_LENGTH], uint8_t *length);
 
 /* Extract32 bits from a low/high register pair at an immediate offset1..31.
  * Native EXTRACT is one instruction and carries both source hints and waits. */

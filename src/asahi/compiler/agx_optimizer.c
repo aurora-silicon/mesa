@@ -256,26 +256,84 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
             def->src[0].type == AGX_INDEX_UNIFORM && !def->src[0].memory &&
             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg &&
             agx_can_fold_half_uniform(ins, defs);
-         bool allow_agx3b_ffma_gpr =
+         const bool agx3b_plain_half_gpr =
             ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-            ins->op == AGX_OPCODE_FFMA && !ins->saturate &&
-            ins->nr_dests == 1 && !ins->dest[0].memory &&
+            !ins->saturate && ins->nr_dests == 1 && !ins->dest[0].memory &&
             ins->dest[0].size == AGX_SIZE_32 &&
             agx_channels(ins->dest[0]) == 1 &&
             (def->src[0].type == AGX_INDEX_NORMAL ||
              def->src[0].type == AGX_INDEX_REGISTER) &&
             !def->src[0].memory && agx_channels(def->src[0]) == 1 &&
             !def->src[0].abs && !def->src[0].neg && !src.abs && !src.neg;
+         bool allow_agx3b_ffma_gpr =
+            agx3b_plain_half_gpr && ins->op == AGX_OPCODE_FFMA &&
+            ins->nr_srcs == 3;
          if (allow_agx3b_ffma_gpr) {
+            agx_index eff[3];
+            bool all_regs = true;
+            bool all_regs_or_u32 = !ctx->is_preamble;
+            bool has_u32 = false;
+            unsigned other_half_regs = 0;
             agx_foreach_src(ins, k) {
-               if ((ins->src[k].type != AGX_INDEX_NORMAL &&
-                    ins->src[k].type != AGX_INDEX_REGISTER) ||
-                   ins->src[k].memory || agx_channels(ins->src[k]) != 1 ||
-                   ins->src[k].abs || ins->src[k].neg) {
-                  allow_agx3b_ffma_gpr = false;
-                  break;
+               agx_index opnd = ins->src[k];
+               if (k != s && opnd.type == AGX_INDEX_NORMAL && !opnd.abs &&
+                   !opnd.neg && !opnd.memory) {
+                  agx_instr *odef = defs[opnd.value];
+                  if (odef && agx_is_fmov(odef) && !odef->saturate &&
+                      !odef->src[0].abs && !odef->src[0].neg &&
+                      !odef->src[0].memory &&
+                      (odef->src[0].type == AGX_INDEX_UNIFORM ||
+                       odef->src[0].type == AGX_INDEX_IMMEDIATE))
+                     opnd = odef->src[0];
                }
+               eff[k] = opnd;
+               const bool is_reg =
+                  (opnd.type == AGX_INDEX_NORMAL ||
+                   opnd.type == AGX_INDEX_REGISTER) &&
+                  !opnd.memory && agx_channels(opnd) == 1 && !opnd.abs &&
+                  !opnd.neg;
+               const bool is_u32 =
+                  opnd.type == AGX_INDEX_UNIFORM &&
+                  opnd.size == AGX_SIZE_32 && !opnd.memory &&
+                  !(opnd.value & 1) && opnd.value < 512 &&
+                  agx_channels(opnd) == 1 && !opnd.abs && !opnd.neg;
+               all_regs &= is_reg;
+               all_regs_or_u32 &= is_reg || is_u32;
+               has_u32 |= is_u32;
+               if (k != s && is_reg && opnd.size == AGX_SIZE_16)
+                  other_half_regs++;
             }
+            const bool two_imm =
+               s < 2 &&
+               eff[2].type == AGX_INDEX_IMMEDIATE && eff[2].value <= 255 &&
+               !eff[2].abs && !eff[2].neg && !eff[2].memory &&
+               eff[1 - s].type == AGX_INDEX_IMMEDIATE &&
+               eff[1 - s].value <= 255 && !eff[1 - s].abs &&
+               !eff[1 - s].neg && !eff[1 - s].memory;
+            allow_agx3b_ffma_gpr =
+               all_regs ||
+               (all_regs_or_u32 && has_u32 && other_half_regs == 0) || two_imm;
+         }
+         bool allow_agx3b_fmul_gpr =
+            agx3b_plain_half_gpr && ins->op == AGX_OPCODE_FMUL &&
+            ins->nr_srcs == 2;
+         if (allow_agx3b_fmul_gpr) {
+            agx_index other = ins->src[1 - s];
+            if (other.type == AGX_INDEX_NORMAL && !other.abs && !other.neg &&
+                !other.memory) {
+               agx_instr *odef = defs[other.value];
+               if (odef && agx_is_fmov(odef) && !odef->saturate &&
+                   !odef->src[0].abs && !odef->src[0].neg &&
+                   !odef->src[0].memory &&
+                   (odef->src[0].type == AGX_INDEX_UNIFORM ||
+                    odef->src[0].type == AGX_INDEX_IMMEDIATE))
+                  other = odef->src[0];
+            }
+            allow_agx3b_fmul_gpr =
+               (other.type == AGX_INDEX_NORMAL ||
+                other.type == AGX_INDEX_REGISTER) &&
+               !other.memory && other.size == AGX_SIZE_32 &&
+               agx_channels(other) == 1 && !other.abs && !other.neg;
          }
          bool allow_agx3b_fadd_gpr = false;
          if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
@@ -295,7 +353,7 @@ agx_optimizer_fmov(agx_context *ctx, agx_instr **defs, agx_instr *ins)
                agx_channels(other) == 1 && !other.abs && !other.neg;
          }
          if (!allow_half_uniform && !allow_agx3b_ffma_gpr &&
-             !allow_agx3b_fadd_gpr)
+             !allow_agx3b_fmul_gpr && !allow_agx3b_fadd_gpr)
             continue;
       }
 
@@ -399,6 +457,72 @@ image_write_source_can_be_immediate(agx_instr *I, unsigned s)
  * bits of their 16-bit source register. When an unpacked byte lane masks with
  * 0xff before converting to float, drop the mask and convert directly from the
  * raw packed half register. */
+/* Fold nested immediate bit-ANDs: (x & m1) & m2 -> x & (m1 & m2), or alias
+ * the inner AND directly when m1 is already a subset of m2 (e.g. a 32-bit
+ * shift-count mask & 31 following an explicit & 15). */
+static void
+agx_optimizer_bitop_and(agx_context *ctx, agx_instr **defs, agx_instr *I)
+{
+   if (!ctx->key || ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       I->op != AGX_OPCODE_BITOP || I->truth_table != UTIL_LUT2(a & b) ||
+       I->saturate || I->nr_dests != 1 || I->nr_srcs != 2 ||
+       I->dest[0].size != AGX_SIZE_32 || I->dest[0].memory ||
+       agx_channels(I->dest[0]) != 1)
+      return;
+
+   unsigned imm_idx;
+   if (I->src[0].type == AGX_INDEX_IMMEDIATE &&
+       I->src[1].type == AGX_INDEX_NORMAL)
+      imm_idx = 0;
+   else if (I->src[1].type == AGX_INDEX_IMMEDIATE &&
+            I->src[0].type == AGX_INDEX_NORMAL)
+      imm_idx = 1;
+   else
+      return;
+
+   const agx_index m2 = I->src[imm_idx];
+   const agx_index v = I->src[1 - imm_idx];
+   if (m2.abs || m2.neg || v.abs || v.neg || v.memory ||
+       v.size != I->dest[0].size || agx_channels(v) != 1)
+      return;
+
+   agx_instr *def = defs[v.value];
+   if (!def || def->op != AGX_OPCODE_BITOP ||
+       def->truth_table != UTIL_LUT2(a & b) || def->saturate ||
+       def->nr_dests != 1 || def->nr_srcs != 2 ||
+       def->dest[0].size != v.size)
+      return;
+
+   unsigned inner_imm_idx;
+   if (def->src[0].type == AGX_INDEX_IMMEDIATE &&
+       (def->src[1].type == AGX_INDEX_NORMAL ||
+        def->src[1].type == AGX_INDEX_REGISTER))
+      inner_imm_idx = 0;
+   else if (def->src[1].type == AGX_INDEX_IMMEDIATE &&
+            (def->src[0].type == AGX_INDEX_NORMAL ||
+             def->src[0].type == AGX_INDEX_REGISTER))
+      inner_imm_idx = 1;
+   else
+      return;
+
+   const agx_index m1 = def->src[inner_imm_idx];
+   const agx_index inner = def->src[1 - inner_imm_idx];
+   if (m1.abs || m1.neg || inner.abs || inner.neg || inner.memory ||
+       inner.size != v.size || agx_channels(inner) != 1)
+      return;
+
+   const uint32_t combined = m1.value & m2.value;
+   if (combined == m1.value) {
+      I->op = AGX_OPCODE_MOV;
+      I->nr_srcs = 1;
+      I->src[0] = v;
+      I->truth_table = 0;
+   } else {
+      I->src[1 - imm_idx] = inner;
+      I->src[imm_idx] = agx_immediate(combined);
+   }
+}
+
 static void
 agx_optimizer_convert_u8(agx_context *ctx, agx_instr **defs, agx_instr *I)
 {
@@ -2174,6 +2298,7 @@ agx_optimizer_forward(agx_context *ctx)
           I->op != AGX_OPCODE_UNIFORM_STORE && I->op != AGX_OPCODE_EXPORT)
          agx_optimizer_inline_imm(ctx, defs, I);
 
+      agx_optimizer_bitop_and(ctx, defs, I);
       agx_optimizer_convert_u8(ctx, defs, I);
       agx_optimizer_minifloat_select(ctx, defs, I);
 
