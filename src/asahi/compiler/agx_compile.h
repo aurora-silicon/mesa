@@ -407,6 +407,10 @@ agx_compact_kernel_info(struct agx_shader_info *info)
 {
    assert(info->has_preamble == (info->nr_preamble_gprs > 0));
    assert(info->texture_state_count <= 8 && "static maximum, no need to plumb");
+   assert(info->scratch_size <= UINT16_MAX &&
+          "precompiled kernel scratch_size overflows uint16_t");
+   assert(info->agx3_spectpr_scratch_size <= UINT16_MAX &&
+          "precompiled kernel agx3_spectpr_scratch_size overflows uint16_t");
 
    return (struct agx_precompiled_kernel_info){
       .preamble_offset = info->preamble_offset,
@@ -507,17 +511,7 @@ struct agx_device_key {
     * the instruction encoding, notably formatted PBE store inputs. */
    enum agx_chip chip;
 
-   /*
-    * Binary encoding of the instruction set to emit.
-    *
-    * Every part this compiler supports is AGX2, so the packer accepts only
-    * that and asserts on anything else. Carrying it explicitly is what makes
-    * a future AGX3 table a dispatch rather than a rewrite, and it means a
-    * caller that reaches the compiler with an unsupported part is caught in
-    * the compiler instead of producing an instruction stream for the wrong
-    * hardware. See agx_chip.h for why the encoding, rather than the chip, is
-    * the thing that decides.
-    */
+   /* Encoding used by the instruction packer, before any transcoding. */
    enum agx_isa_encoding encoding;
 
    /* Does the target GPU need explicit cluster coherency for atomics?
@@ -542,6 +536,17 @@ struct agx_device_key {
     */
    bool emit_agx3d;
 };
+
+/* AGX3D uses the AGX3C packer and transcodes its output. Resolve the
+ * physical target once for both runtime and precompiled shaders. */
+static inline void
+agx_device_key_set_target(struct agx_device_key *dev, enum agx_chip chip)
+{
+   const enum agx_isa_encoding encoding = agx_chip_isa_encoding(chip);
+   dev->emit_agx3d = encoding == AGX_ISA_ENCODING_AGX3D;
+   dev->chip = dev->emit_agx3d ? AGX_CHIP_G17G : chip;
+   dev->encoding = dev->emit_agx3d ? AGX_ISA_ENCODING_AGX3C : encoding;
+}
 
 /*
  * Is this a compile for the M6 GPU (G18G)? G18G compiles with the G17G key
@@ -576,8 +581,8 @@ struct agx_shader_key {
    bool has_scratch;
 
    /* Maximum thread-private scratch/spill frame in bytes admitted by the
-    * driver for this AGX3 shader. Zero defaults to AGX3_G17P_MAX_SPILL_B
-    * (4 KiB). Ignored on AGX2, which stays capped at AGX2_MAX_SPILL_SLOTS. */
+    * driver for this shader. Zero defaults to AGX3_G17P_MAX_SPILL_B (4 KiB) on
+    * AGX3 and AGX2_MAX_SPILL_SLOTS (4 KiB) of spill slots on AGX2. */
    uint32_t max_scratch_B;
 
    /* Whether we're compiling the helper program used for scratch allocation.
@@ -769,6 +774,11 @@ extern "C" {
 uint64_t agx_gather_texcoords(nir_shader *nir);
 
 void agx_preprocess_nir(nir_shader *nir);
+/* Generic preprocessing with an explicit ISA encoding so frontends that keep
+ * the generic lowering mode (such as Gallium on AGX3B) still inherit AGX3B's
+ * early branch-preservation and conditional-load-sinking policy. */
+void agx_preprocess_nir_for_encoding(nir_shader *nir,
+                                     enum agx_isa_encoding encoding);
 void agx_preprocess_nir_g17p(nir_shader *nir);
 /* For any native AGX3 chip (agx_chip_native_agx3); passes validated on G17P
  * alone check chip. */
@@ -783,8 +793,13 @@ void agx_preprocess_nir_post_lower(nir_shader *nir, enum agx_chip chip);
 /* Access private (scratch) memory in whole 32-bit words, the only width the
  * AGX3 stack protocol encodes. agx_preprocess_nir_g17p() runs it. */
 bool agx3_nir_lower_scratch_words(nir_shader *nir);
+/* Single-die M5 (G17G) convenience entry points for unit tests without a
+ * device; runtime callers must use the _chip variants below. */
 void agx_preprocess_nir_m5(nir_shader *nir);
 void agx_preprocess_nir_m5_defer_idiv(nir_shader *nir);
+/* For any M5 chip (agx_chip_g17_m5); per-chip capabilities check chip. */
+void agx_preprocess_nir_m5_chip(nir_shader *nir, enum agx_chip chip);
+void agx_preprocess_nir_m5_defer_idiv_chip(nir_shader *nir, enum agx_chip chip);
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 /* TARGET/LIVE retain their normal semantics. This flag records the proof that
@@ -839,6 +854,11 @@ bool agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 bool agx_compile_shader_nir_capture(nir_shader *nir, struct agx_shader_key *key,
                                     struct agx_shader_part *out,
                                     struct blob *pre_preamble_blob);
+bool agx_compile_shader_nir_capture_ex(nir_shader *nir,
+                                       struct agx_shader_key *key,
+                                       struct agx_shader_part *out,
+                                       struct blob *pre_preamble_blob,
+                                       nir_shader **post_opt_nir_out);
 void agx_prepare_preoptimized_epilog_nir(nir_shader *nir,
                                          const struct agx_shader_key *key);
 bool agx_compile_shader_nir_preoptimized(nir_shader *nir,
@@ -846,6 +866,8 @@ bool agx_compile_shader_nir_preoptimized(nir_shader *nir,
                                          struct agx_shader_part *out,
                                          bool epilog_has_alu,
                                          bool preamble_newly_enabled);
+bool agx_compile_shader_nir_postopt(nir_shader *nir, struct agx_shader_key *key,
+                                    struct agx_shader_part *out);
 
 struct agx_occupancy {
    unsigned max_registers;
@@ -877,7 +899,6 @@ agx_round_registers(unsigned halfregs)
 }
 
 static const nir_shader_compiler_options agx_nir_options = {
-   .lower_fdiv = true,
    .float_mul_add16 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .float_mul_add32 = nir_float_muladd_support_has_ffma | nir_float_muladd_support_fuse,
    .lower_flrp16 = true,

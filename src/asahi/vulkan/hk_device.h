@@ -25,6 +25,7 @@
 #include "hk_private.h"
 
 #include "hk_descriptor_table.h"
+#include "hk_gpu_waits.h"
 #include "hk_host_alias.h"
 #include "hk_native_sampler.h"
 #include "hk_queue.h"
@@ -133,19 +134,41 @@ struct hk_compute_kick;
 struct hk_device {
    struct vk_device vk;
    struct agx_device dev;
+   /* Same-queue binary semaphore waits ordered on the GPU. */
+   struct hk_gpu_waits gpu_waits;
    /* Scratch-filled sparse VA (M5: bounded by sparseAddressSpaceSize). */
    uint64_t sparse_scratch_B;
+   /* Live resources through which memory has or may have a second GPU virtual
+    * address, on every chip: buffers and image planes with an address of
+    * their own (hk_device_va_alias_get()), fd/dma-buf imports, and host
+    * imports that may alias (hk_host_import_track()). Atomic. Read by the
+    * compute paths that take disjoint addresses for disjoint memory; barrier
+    * scope follows alias_live instead (hk_cdm_alias_scope()). */
+   uint32_t va_alias_resources;
    /* Whether anything this device enabled can map memory at a second GPU
     * virtual address at any time, decided at creation
     * (hk_device_may_alias_memory()). Left false with host_alias.dynamic,
     * see hk_cdm_alias_scope(). */
    bool may_alias_memory;
+   /* The kernel runs a render's fragment work after the previous render's
+    * on a queue, partial renders included
+    * (DRM_ASAHI_FEATURE_ORDERED_PARTIAL_RENDERS): a render that only loads
+    * whole tiles an earlier render stores waits for it in its fragment half
+    * alone (hk_sync.h, tile hazards). */
+   bool load_hazard_frag;
    /* With host_alias.dynamic: live resources through which memory has or
     * may have a second GPU address (hk_device_alias_get()), atomic: buffers
     * and image planes with an address of their own, fd and dma-buf imports,
     * and host imports that may alias. hk_cdm_alias_scope() asks for memory
     * scope while it is not 0. */
    uint32_t alias_live;
+
+   /* Monotonic counter incremented atomically whenever a buffer is first bound
+    * to an hk_device_memory that already has an image binding. Checked at
+    * submit time so command buffers recorded before a post-record buffer bind
+    * conservatively upgrade their aliased attachment renders to
+    * HK_SYNC_GFX_MEM. */
+   uint32_t buffer_alias_mem_gen;
    struct {
       /* VA-tagged caches (hk_va_tagged_caches()): the device enabled a
        * feature through which memory can get a second address, so the scope
@@ -323,6 +346,8 @@ struct hk_device {
       uint64_t heap;
    } rodata;
 
+   uint32_t heap_next_slot;
+
    struct hk_internal_shaders prolog_epilog;
    struct hk_internal_shaders kernels;
    struct hk_api_shader *null_fs;
@@ -380,6 +405,15 @@ struct hk_device {
       size_t prune_threshold;
    } query_stamps;
 
+   /* Device-wide slab allocator for VkEvent status words, bound once per slab
+    * as a kernel timestamp buffer on HAL200/M5 so vkCmdSetEvent2 can ride on
+    * the producing stream's retirement timestamp without a CDM store. */
+   struct {
+      bool ready;
+      simple_mtx_t lock;
+      struct list_head slabs;
+   } events;
+
    /* Native G17P indirect compute grid helper.  A compact indirect helper
     * record carries no dimensions and no resource table, so the only way a
     * runtime grid can reach the main record is for this program to publish
@@ -404,23 +438,31 @@ struct hk_device {
    /* Indirected for common secondary emulation */
    struct vk_device_dispatch_table cmd_dispatch;
 
-   /* Heap used for GPU-side memory allocation for geometry/tessellation.
-    *
-    * Control streams accessing the heap must be serialized. This is not
-    * expected to be a legitimate problem. If it is, we can rework later.
+   /* Heaps used for GPU-side memory allocation for geometry/tessellation and
+    * software index robustness. Each ring slot lazily allocates a full 128 MiB
+    * buffer on first use so per-pass capacity is never reduced while distinct
+    * slots execute without global serialization.
     */
-   struct agx_bo *heap;
-   util_once_flag heap_init_once;
+   struct agx_bo *heap_slots[HK_HEAP_SLOTS];
+   simple_mtx_t heap_lock;
 
    struct {
       struct agx_scratch vs, fs, cs;
       simple_mtx_t lock;
    } scratch;
 
+   /* Set once the device creates a sparse buffer or image; the CDM barrier
+    * then keeps the full word (hk_cdm_cache_flush). */
+   uint32_t sparse_used;
+
    uint32_t perftest;
    /* drirc hk_submit_batch_size: at most this many commands per kernel
     * submission (0: the kernel and batching limits alone). */
    unsigned submit_batch_size;
+   /* The AGX2 CDM_BARRIER flag word emitted at a tracked dependency on
+    * this chip (agx2_cdm_barrier_default_word()): the reduced word on the
+    * dies it was measured on, the full word elsewhere. */
+   uint32_t cdm_barrier_default_mask;
 
    struct {
       struct u_rwlock lock;
@@ -447,10 +489,8 @@ enum hk_perftest {
     * upgrading it to a strong cache flush, when memory is unaliased and no
     * host or pending graphics transfer dependency is involved. */
    HK_PERF_WEAKBARRIER = BITFIELD_BIT(5),
-   /* Unconditional per-launch CDM barrier (disables tracking). */
-   HK_PERF_ALWAYSCDMBARRIER = BITFIELD_BIT(9),
-   /* Opt into dependency tracking on chips where it is not the default. */
-   HK_PERF_TRACKCDMBARRIER = BITFIELD_BIT(10),
+   /* Force the full CDM barrier word on every chip (perftest only). */
+   HK_PERF_FULLCDMBARRIER = BITFIELD_BIT(11),
 };
 
 #define HK_PERF(dev, flag) unlikely((dev)->perftest &HK_PERF_##flag)
@@ -469,12 +509,14 @@ hk_va_tagged_caches(enum agx_chip chip)
  * application compute/transfer barrier needs the memory-scoped strong flush
  * (hk_cdm_visibility_flush()).
  *
- * Devices that enable aliasing-capable features (sparse,
- * VK_EXT_buffer_device_address capture/replay, fd/dma-buf, writable host
- * imports) track live aliasing resources in alias_live under
- * host_alias.dynamic (or force memory scope via may_alias_memory /
- * ASAHI_M5_HOST_ALIAS_STATIC=1, also on G17P). Barriers recorded while
- * alias_live == 0 record patch sites (struct hk_alias_site): the 4-byte
+ * Devices whose barriers always take memory scope
+ * (agx_cdm_ordering_memory_scope(), multi-die M5) take it on every barrier
+ * and in every launch's ordering record. Other devices that enable
+ * aliasing-capable features (sparse, VK_EXT_buffer_device_address
+ * capture/replay, fd/dma-buf, writable host imports) track live aliasing
+ * resources in alias_live under host_alias.dynamic (or force memory scope via
+ * may_alias_memory / on M5 ASAHI_M5_HOST_ALIAS_STATIC=1). Barriers recorded
+ * while alias_live == 0 record patch sites (struct hk_alias_site): the 4-byte
  * barrier record, upgraded in place when alias_live leaves 0 or at
  * submission. A command buffer that waits for an event the host may set keeps
  * memory scope throughout while dynamic mode is active.
@@ -491,7 +533,8 @@ static inline bool
 hk_cdm_alias_scope(const struct hk_device *dev)
 {
    return hk_va_tagged_caches(dev->dev.chip) &&
-          (dev->may_alias_memory || p_atomic_read(&dev->alias_live));
+          (agx_cdm_ordering_memory_scope(&dev->dev) ||
+           dev->may_alias_memory || p_atomic_read(&dev->alias_live));
 }
 
 /* Whether the CDM strong flush has a memory-scoped form, which memory
@@ -587,6 +630,22 @@ hk_device_alias_put(struct hk_device *dev, uint32_t n)
       p_atomic_add(&dev->alias_live, -(int32_t)n);
 }
 
+/* A buffer or image plane that maps memory at a GPU address of its own
+ * (va_alias_resources), from its creation to its destruction. */
+static inline void
+hk_device_va_alias_get(struct hk_device *dev, enum hk_alias_cause cause)
+{
+   p_atomic_inc(&dev->va_alias_resources);
+   hk_device_alias_get(dev, 1, cause);
+}
+
+static inline void
+hk_device_va_alias_put(struct hk_device *dev)
+{
+   p_atomic_dec(&dev->va_alias_resources);
+   hk_device_alias_put(dev, 1);
+}
+
 /* At submission, while an import may alias: writes the patch sites of the
  * submitted command buffers, before submit packing copies their streams. */
 void hk_submit_patch_alias_sites(struct hk_device *dev,
@@ -647,6 +706,9 @@ hk_device_alloc_scratch(struct hk_device *dev, mesa_shader_stage stage,
  * launch programs (hk_cmd_draw.c). */
 void hk_g17p_bg_eot_dev_cache_init(struct hk_device *dev);
 void hk_g17p_bg_eot_dev_cache_finish(struct hk_device *dev);
+
+/* Alignment of every hk_code_alloc() offset. */
+#define HK_CODE_ALIGNMENT 256
 
 /* Allocate size bytes of executable memory. Returns a reference to the chunk
  * BO holding it, with the allocation at *offset; release it with

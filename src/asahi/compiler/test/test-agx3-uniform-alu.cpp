@@ -10,6 +10,7 @@
 #include "agx3_alu_core.h"
 #include "agx3_cf_core.h"
 #include "agx3_uniform_alu.h"
+#include "agx3_falu_mod_core.h"
 #include "agx3_stage_core.h"
 #include "agx3_isel_core.h"
 #include "agx3_tex_core.h"
@@ -1220,15 +1221,21 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortAluArmOnAgx3)
       enum agx_chip chip;
       bool emit_agx3d;
       mesa_shader_stage stage;
+      bool uniform_cond;
       bool expect_jump;
    } cases[] = {
-      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_FRAGMENT, false},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_FRAGMENT, false},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_FRAGMENT, true},
-      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_COMPUTE, true},
-      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_FRAGMENT, true},
-      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, false},
-      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_FRAGMENT, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_FRAGMENT, false, false},
+      {AGX_ISA_ENCODING_AGX2, AGX_CHIP_G13G, false, MESA_SHADER_COMPUTE, true, false},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G15G, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G16G, false, MESA_SHADER_COMPUTE, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3B, AGX_CHIP_G17P, false, MESA_SHADER_COMPUTE, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_FRAGMENT, false, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, false, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17S, false, MESA_SHADER_COMPUTE, true, true},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_FRAGMENT, false, false},
+      {AGX_ISA_ENCODING_AGX3C, AGX_CHIP_G17G, true, MESA_SHADER_COMPUTE, true, false},
    };
 
    for (const auto &c : cases) {
@@ -1243,8 +1250,10 @@ TEST(AGX3PixelTests, EmptyExecutionSkipsShortAluArmOnAgx3)
       agx_block *entry = list_first_entry(&b->shader->blocks, agx_block, link);
       agx_block *body = agx_test_block(b->shader);
       agx_block *end = agx_test_block(b->shader);
-      agx_if_icmp(b, agx_register(0, AGX_SIZE_16), agx_immediate(0),
-                  1, AGX_ICOND_UEQ, true, end);
+      agx_instr *if_ = agx_if_icmp(b, agx_register(0, AGX_SIZE_16),
+                                   agx_immediate(0), 1, AGX_ICOND_UEQ, true,
+                                   end);
+      if_->uniform_cond = c.uniform_cond;
       agx_builder middle = agx_init_builder(b->shader, agx_after_block(body));
       for (unsigned i = 0; i < 12; ++i)
          agx_iadd_to(&middle, agx_register(2, AGX_SIZE_32),
@@ -1590,8 +1599,11 @@ TEST(AGX3UniformALU, M5SelectKeepsWitnessedUniformComparand)
                                        exchanged ? imm : y,
                                        (enum agx_fcond)cond);
          agx_lower_uniform_sources(b->shader);
-         EXPECT_EQ(I->src[0].type == AGX_INDEX_UNIFORM,
-                   zero && cond != AGX_FCOND_EQ);
+         /* GE/LE against a selected zero is the fself32 uniform-first form;
+          * every other case packs as `x op' u ? ...` with the uniform as the
+          * second comparand (agx3_m5_fcmpsel_gpu1_desc). Either way the
+          * uniform is read in place. */
+         EXPECT_EQ(I->src[0].type, AGX_INDEX_UNIFORM) << cond << " " << zero;
          ralloc_free(mem);
       }
    }
@@ -2373,4 +2385,106 @@ TEST(AGX3UniformALU, OpenCodedPack4x8LowersToPack2x16)
          ralloc_free(b.shader);
       }
    }
+}
+
+TEST(AGX3UniformALU, Agx3bHalfGprInF32Fma)
+{
+   for (unsigned slot = 0; slot < 3; ++slot) {
+      for (unsigned reg : {0u, 1u, 127u, 255u}) {
+         std::set<std::string> encodings;
+         for (unsigned wait = 0; wait < 64; ++wait) {
+            agx3_uniform_float_src src[3] = {};
+            for (unsigned i = 0; i < 3; ++i) {
+               if (i == slot) {
+                  src[i].kind = AGX3_FLOAT_REGISTER;
+                  src[i].value = reg;
+                  src[i].half = true;
+                  src[i].discard = (reg & 1) != 0;
+               } else {
+                  src[i].kind = AGX3_FLOAT_UNIFORM;
+                  src[i].value = 12 + 2 * i;
+               }
+            }
+            uint8_t bytes[16], length = 0;
+            ASSERT_TRUE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3B,
+                                                  AGX3_UNIFORM_FMA, 0, src,
+                                                  false, true, wait, bytes,
+                                                  &length))
+               << "slot=" << slot << " reg=" << reg << " wait=" << wait;
+            EXPECT_TRUE(encodings.insert(std::string((char *)bytes, length)).second);
+         }
+      }
+   }
+
+   /* M5 refuses mixed half-GPR uniform FMA; AGX3B refuses combining a half GPR
+    * with a half uniform or saturate. */
+   agx3_uniform_float_src src[3] = {};
+   src[0].kind = AGX3_FLOAT_REGISTER;
+   src[0].value = 1;
+   src[0].half = true;
+   src[1].kind = src[2].kind = AGX3_FLOAT_UNIFORM;
+   src[1].value = 12;
+   src[2].value = 14;
+   uint8_t bytes[16], length = 0;
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3C,
+                                          AGX3_UNIFORM_FMA, 0, src, false,
+                                          false, 0, bytes, &length));
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3B,
+                                          AGX3_UNIFORM_FMA, 0, src, true,
+                                          false, 0, bytes, &length));
+   src[1].half = true;
+   EXPECT_FALSE(agx3_uniform_float_encode(AGX_ISA_ENCODING_AGX3B,
+                                          AGX3_UNIFORM_FMA, 0, src, false,
+                                          false, 0, bytes, &length));
+}
+
+TEST(AGX3UniformALU, Agx3bTwoImmFmaHalfSource)
+{
+   for (unsigned reg : {0u, 1u, 127u, 255u}) {
+      std::set<std::string> encodings;
+      for (unsigned wait = 0; wait < 64; ++wait) {
+         agx3_falu_runtime rt = {};
+         rt.dest_cache = true;
+         rt.discard[0] = (reg & 1) != 0;
+         rt.wait_mask = wait;
+         uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], len = 0;
+         ASSERT_TRUE(agx3_falu_fma_two_imm_half(AGX_ISA_ENCODING_AGX3B, 0, reg,
+                                                0x40, 0x30, &rt, bytes, &len))
+            << "reg=" << reg << " wait=" << wait;
+         EXPECT_TRUE(encodings.insert(std::string((char *)bytes, len)).second);
+      }
+   }
+   agx3_falu_runtime rt = {};
+   uint8_t bytes[AGX3_FALU_MOD_MAX_LENGTH], len = 0;
+   EXPECT_FALSE(agx3_falu_fma_two_imm_half(AGX_ISA_ENCODING_AGX3C, 0, 1,
+                                           0x40, 0x30, &rt, bytes, &len));
+}
+
+TEST(AGX3UniformALU, Agx3bIselImmComparandKeepsUniformSelects)
+{
+   void *mem_ctx = ralloc_context(NULL);
+   agx_builder *bp = agx_test_builder(mem_ctx);
+   agx_context *ctx = bp->shader;
+   struct agx_shader_key key = {};
+   key.dev.encoding = AGX_ISA_ENCODING_AGX3B;
+   ctx->key = &key;
+   agx_builder b = *bp;
+
+   agx_index cond = agx_preload(&b, agx_register(0, AGX_SIZE_32));
+   agx_index dst = agx_temp(ctx, AGX_SIZE_32);
+   agx_icmpsel_to(&b, dst, cond, agx_immediate(0), agx_uniform(4, AGX_SIZE_32),
+                  agx_uniform(6, AGX_SIZE_32), AGX_ICOND_UEQ);
+   agx_unit_test(&b, dst);
+
+   agx_lower_uniform_sources(ctx);
+
+   agx_instr *isel = NULL;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_ICMPSEL)
+         isel = I;
+   }
+   ASSERT_NE(isel, nullptr);
+   EXPECT_EQ(isel->src[2].type, AGX_INDEX_UNIFORM);
+   EXPECT_EQ(isel->src[3].type, AGX_INDEX_UNIFORM);
+   ralloc_free(mem_ctx);
 }

@@ -423,15 +423,21 @@ libagx_draw_robust_index_batch(constant struct libagx_robust_index_draw *draws,
                                uint64_t in_buf_ptr, uint64_t in_buf_range_B,
                                ushort restart, uint32_t restart_index,
                                enum agx_chip chip, enum agx_primitive topology,
-                               enum agx_index_size index_size__3)
+                               enum agx_index_size index_size__3,
+                               uint32_t batch_count)
 {
-   constant struct libagx_robust_index_draw *draw = draws + get_group_id(0);
+   uint g = get_group_id(0);
+   constant struct libagx_robust_index_draw *draw = draws + g;
+   uint64_t empty_draw_jump =
+      get_sub_group_local_id() == 0
+         ? libagx_robust_index_coalesce_empty_jump(draws, g, batch_count, chip)
+         : 0;
    libagx_draw_robust_index_impl(
       (global uint32_t *)draw->vdm, heap, printf_buffer,
       (constant VkDrawIndexedIndirectCommand *)draw->command, in_buf_ptr,
       in_buf_range_B, restart, restart_index, chip, topology,
-      draw->draw_state_offset,
-      draw->render_state_emitted, draw->empty_draw_jump, index_size__3);
+      draw->draw_state_offset, draw->render_state_emitted, empty_draw_jump,
+      index_size__3);
 }
 
 /*
@@ -633,4 +639,66 @@ libagx_trace_rays_indirect_setup(global uint32_t *out_record_dims,
       .y = groups_xy.y,
       .z = depth,
    };
+}
+
+/* Minimal 1-thread no-op helper used as the zero-grid fallback launch on G18G
+ * so an indirect compute stream never submits an empty or zero-sized launch. */
+KERNEL(1)
+libagx_g18_noop(global uint32_t *scratch)
+{
+   *scratch = 0u;
+}
+
+/* Materialize a 48-byte sealed G18G direct CDM stream (40-byte direct launch +
+ * 4-byte strong barrier + 4-byte terminate) from an indirect grid buffer.
+ * mode_local == 0 (INDIRECT_GLOBAL): in_grid[0..2] are group counts, local size
+ * comes from local_{x,y,z}; in_grid[3..5] are not read.
+ * mode_local != 0 (INDIRECT_LOCAL): in_grid[0..2] are global thread counts and
+ * in_grid[3..5] are local sizes.
+ * If any dimension is zero, emit the pre-built 1-thread no-op launch instead. */
+KERNEL(1)
+libagx_g18_indirect_launch(constant uint32_t *in_grid,
+                           constant uint32_t *tmpl,
+                           constant uint32_t *noop_tmpl,
+                           global uint32_t *out_stream,
+                           uint32_t local_x,
+                           uint32_t local_y,
+                           uint32_t local_z,
+                           uint32_t mode_local)
+{
+   uint32_t gx = in_grid[0];
+   uint32_t gy = in_grid[1];
+   uint32_t gz = in_grid[2];
+   uint32_t lx = local_x;
+   uint32_t ly = local_y;
+   uint32_t lz = local_z;
+   if (mode_local) {
+      lx = in_grid[3];
+      ly = in_grid[4];
+      lz = in_grid[5];
+   }
+
+   uint32_t tx = mode_local ? gx : (gx * lx);
+   uint32_t ty = mode_local ? gy : (gy * ly);
+   uint32_t tz = mode_local ? gz : (gz * lz);
+   bool run = (gx != 0u) && (gy != 0u) && (gz != 0u) &&
+              (lx != 0u) && (ly != 0u) && (lz != 0u);
+
+   constant uint32_t *src = run ? tmpl : noop_tmpl;
+   uint32_t word0 = src[0];
+   if (run && ty < 2u && tz < 2u)
+      word0 &= 0xfff1ffffu;
+
+   out_stream[0] = word0;
+   out_stream[1] = src[1];
+   out_stream[2] = src[2];
+   out_stream[3] = src[3];
+   out_stream[4] = run ? tx : src[4];
+   out_stream[5] = run ? ty : src[5];
+   out_stream[6] = run ? tz : src[6];
+   out_stream[7] = run ? lx : src[7];
+   out_stream[8] = run ? ly : src[8];
+   out_stream[9] = run ? lz : src[9];
+   out_stream[10] = src[10];
+   out_stream[11] = src[11];
 }

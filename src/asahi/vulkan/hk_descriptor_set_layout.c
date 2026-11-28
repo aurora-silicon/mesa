@@ -99,7 +99,7 @@ hk_descriptor_stride_align_for_type(
        * heap indices and 24 bytes of buffer size/offset/address metadata.
        * The shader must never decode AGX2 software fields from Gen9 bytes.
        */
-      if (agx_chip_native_or_m5(pdev->dev.chip)) {
+      if (agx_chip_agx3_path(pdev->dev.chip)) {
          *stride = AGX_G17P_BUFFER_TEXTURE_DESCRIPTOR_SIZE;
          /* Texel-buffer stores address the PBE through the set's PBE heap,
           * like storage images. */
@@ -139,7 +139,7 @@ hk_descriptor_stride_align_for_type(
                hk_sampled_image_descriptor_layout(generation).stride;
          } else {
             *stride = HK_MAX_DESCRIPTOR_SIZE;
-            *alignment = agx_chip_native_or_m5(pdev->dev.chip)
+            *alignment = agx_chip_agx3_path(pdev->dev.chip)
                             ? HK_G17P_STORAGE_ALIGNMENT
                             : 8;
          }
@@ -330,7 +330,13 @@ hk_CreateDescriptorSetLayout(VkDevice device,
    layout->binding_count = num_bindings;
    layout->descriptor_generation =
       agx_chip_descriptor_generation(pdev->dev.chip);
-   layout->native_sampler_indices = agx_chip_native_or_m5(pdev->dev.chip);
+   layout->native_sampler_indices = agx_chip_agx3_path(pdev->dev.chip);
+   const VkDescriptorBindingFlags late_binding_flags =
+      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+      VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+   layout->has_update_after_bind =
+      (pCreateInfo->flags &
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) != 0;
 
    for (uint32_t j = 0; j < pCreateInfo->bindingCount; j++) {
       const VkDescriptorSetLayoutBinding *binding = &pCreateInfo->pBindings[j];
@@ -370,11 +376,31 @@ hk_CreateDescriptorSetLayout(VkDevice device,
          continue;
 
       layout->binding[b].type = binding->descriptorType;
+      layout->binding[b].stage_flags = binding->stageFlags;
+
+      const bool is_vs_image_binding =
+         (binding->stageFlags & VK_SHADER_STAGE_VERTEX_BIT) &&
+         (binding->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT);
 
       if (binding_flags_info && binding_flags_info->bindingCount > 0) {
          assert(binding_flags_info->bindingCount == pCreateInfo->bindingCount);
          layout->binding[b].flags = binding_flags_info->pBindingFlags[info_idx];
+         if (layout->binding[b].flags & late_binding_flags) {
+            layout->has_update_after_bind = true;
+            if (is_vs_image_binding)
+               layout->has_uab_vs_images = true;
+         }
       }
+      if (is_vs_image_binding &&
+          (pCreateInfo->flags &
+           VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT))
+         layout->has_uab_vs_images = true;
 
       layout->binding[b].array_size = binding->descriptorCount;
 
@@ -660,7 +686,7 @@ hk_descriptor_set_layout_deserialize(struct hk_device *dev,
     * blob cannot hold was not written by the serializer. */
    if (blob->overrun ||
        descriptor_generation != agx_chip_descriptor_generation(chip) ||
-       native_sampler_indices != agx_chip_native_or_m5(chip) ||
+       native_sampler_indices != agx_chip_agx3_path(chip) ||
        binding_count > (size_t)(blob->end - blob->current) /
                           HK_SERIALIZED_BINDING_MIN_SIZE)
       return NULL;
@@ -675,6 +701,12 @@ hk_descriptor_set_layout_deserialize(struct hk_device *dev,
    layout->vk.destroy = hk_descriptor_set_layout_destroy;
    layout->descriptor_generation = descriptor_generation;
    layout->native_sampler_indices = native_sampler_indices;
+   const VkDescriptorBindingFlags late_binding_flags =
+      VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+      VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+   layout->has_update_after_bind =
+      (info.flags &
+       VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) != 0;
    layout->non_variable_descriptor_buffer_size = non_variable_size;
    layout->max_buffer_size = max_buffer_size;
    layout->binding_count = binding_count;
@@ -682,6 +714,8 @@ hk_descriptor_set_layout_deserialize(struct hk_device *dev,
       struct hk_descriptor_set_binding_layout *binding = &layout->binding[b];
       binding->type = blob_read_uint32(blob);
       binding->flags = blob_read_uint32(blob);
+      if (binding->flags & late_binding_flags)
+         layout->has_update_after_bind = true;
       binding->array_size = blob_read_uint32(blob);
       binding->offset = blob_read_uint32(blob);
       binding->stride = blob_read_uint16(blob);

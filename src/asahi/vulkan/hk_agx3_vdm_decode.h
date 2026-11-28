@@ -39,12 +39,13 @@ extern "C" {
  * when compute shaders carry packed vec4 alternates, and to 50 when they
  * carry compute-pair state in a third variant byte. AGX3 moves to 51 and
  * classic to 39 when compute-pair binaries also carry the producer state
- * needed to compile fused variants. */
-#define HK_AGX3_SHADER_BINARY_VERSION 51u
-#define HK_CLASSIC_SHADER_BINARY_VERSION 39u
+ * needed to compile fused variants, and to 52 / 40 when compute shaders
+ * carry their proven submit-pack loop bounds. */
+#define HK_AGX3_SHADER_BINARY_VERSION 54u
+#define HK_CLASSIC_SHADER_BINARY_VERSION 41u
 /* AGX2 binaries include attachmentless layer-zero root lowering, fs.reads_layer,
  * and per-pipeline vertex input robustness in hk_shader_info.vs. */
-#define HK_AGX2_SHADER_BINARY_VERSION 38u
+#define HK_AGX2_SHADER_BINARY_VERSION 39u
 
 static inline uint32_t
 hk_shader_binary_version(enum agx_chip chip)

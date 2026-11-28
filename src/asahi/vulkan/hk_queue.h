@@ -7,13 +7,16 @@
 
 #pragma once
 
+#include "hk_pack.h"
 #include "hk_private.h"
 #include "hk_sync.h"
+#include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "vk_queue.h"
 
 struct hk_device;
 struct hk_packed_submit;
+struct hk_render_packet;
 
 /* Queues advertised per family when the kernel reports independent queues
  * (DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES), and the most Vulkan queues of one
@@ -59,6 +62,12 @@ struct hk_queue {
        * signalled, updated monotonically via hk_queue_note_signalled(). Every
        * value at or below it is complete. */
       uint64_t signalled_value;
+      /* Monotonic timestamp (ns) and highest timeline point covered by it,
+       * advanced monotonically by hk_queue_note_signalled() before publishing
+       * signalled_value so observed-duration retirement never uses a stale
+       * timestamp from an earlier point. */
+      uint64_t signalled_ns;
+      uint64_t signalled_ns_point;
 
       /* Latest timeline point that received the waits of a submission
        * without control streams (queue_submit_empty()), 0 once it is known
@@ -109,6 +118,10 @@ struct hk_queue {
 
    /* Kinds of streams this queue has ever run, see hk_sync.h. */
    struct hk_sync_queue sync;
+   /* Counts restarts of sync's ordinals (a new kernel queue or sibling use):
+    * a binary semaphore's record of them is only valid in its generation
+    * (hk_gpu_waits.h). */
+   uint64_t gpu_wait_generation;
 
    /* Scratch for queue_submit: the resolved sync fields of each stream
     * occurrence of the submission being built (hk_sync_resolve_submit()). */
@@ -121,12 +134,32 @@ struct hk_queue {
       struct util_dynarray commands;
       /* Per member: the fused compute-pair plan and its elision state. */
       struct util_dynarray fused;
+      struct util_dynarray plans;
+      struct util_dynarray planned_suppressed;
+      struct util_dynarray suppressed_arr;
+      struct util_dynarray run_sup;
       /* Buffers the packets read until they complete: their streams, the
        * fused shaders' code, uniform loaders and root tables. */
       struct util_dynarray extra_bos;
       struct hk_packed_submit *packets;
       unsigned packets_cap;
+      /* Observed completion durations for repeated multi-CB looping
+       * submissions, used to budget packets safely below firmware timeouts. */
+      struct hk_pack_obs_entry obs[HK_PACK_OBS_SLOTS];
+      uint32_t obs_pending;
+      uint64_t obs_epoch;
+      uint64_t obs_tick;
    } pack;
+
+   /* Reusable scratch and packets for submit-time render packing
+    * (hk_render_pack_runs()). */
+   struct {
+      struct util_dynarray commands;
+      struct util_dynarray runs;
+      struct util_dynarray targets;
+      struct hk_render_packet *packets;
+      unsigned packets_cap;
+   } rpack;
 
    /* Compute kick (hk_compute_kick.c). watched is set at device creation
     * for a queue whose priority class has a kick queue. The rest is
@@ -179,9 +212,31 @@ hk_queue_device(struct hk_queue *queue)
 }
 
 static inline void
-hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+hk_queue_note_signalled_at(struct hk_queue *queue, uint64_t point,
+                           uint64_t now_ns)
 {
    uint64_t seen = p_atomic_read(&queue->drm.signalled_value);
+   if (seen >= point)
+      return;
+
+   uint64_t seen_ns = p_atomic_read(&queue->drm.signalled_ns);
+   while (seen_ns < now_ns) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_ns, seen_ns, now_ns);
+      if (prev == seen_ns)
+         break;
+      seen_ns = prev;
+   }
+
+   uint64_t seen_pt = p_atomic_read(&queue->drm.signalled_ns_point);
+   while (seen_pt < point) {
+      const uint64_t prev =
+         p_atomic_cmpxchg(&queue->drm.signalled_ns_point, seen_pt, point);
+      if (prev == seen_pt)
+         break;
+      seen_pt = prev;
+   }
+
    while (seen < point) {
       const uint64_t prev =
          p_atomic_cmpxchg(&queue->drm.signalled_value, seen, point);
@@ -189,6 +244,14 @@ hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
          break;
       seen = prev;
    }
+}
+
+static inline void
+hk_queue_note_signalled(struct hk_queue *queue, uint64_t point)
+{
+   if (p_atomic_read(&queue->drm.signalled_value) >= point)
+      return;
+   hk_queue_note_signalled_at(queue, point, (uint64_t)os_time_get_nano());
 }
 
 

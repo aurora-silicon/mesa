@@ -563,6 +563,88 @@ agx_g17p_private_compression_allowed(const struct agx_device *dev,
    return false;
 }
 
+/* The colour formats the Gen10 compressed 2x/4x multisample PBE encodes
+ * (agx_pbe_agx3_2d_multisample_pack()): RGBA8/BGRA8 UNORM and sRGB, RGBA16
+ * FLOAT and UINT, and R32 UINT.
+ */
+static bool
+agx_gen10_msaa_compression_color_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_SRGB:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_SRGB:
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:
+   case PIPE_FORMAT_R16G16B16A16_UINT:
+   case PIPE_FORMAT_R32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* AGX_CAP_GEN10_2D_COMPRESSION colour: a private, single-level,
+ * single-layer 2D image, at 1x of agx_g17p_compression_color_format() and at
+ * 2x/4x of agx_gen10_msaa_compression_color_format(). It is written by the
+ * compressed Gen10 2D or 2x/4x multisample PBE (end-of-tile stores, blits,
+ * staging uploads) and read by the compressed texture descriptor. As on
+ * Gen9, nothing decompresses it in place: a spilling MRT framebuffer,
+ * feedback loop or shader-image binding reallocates it uncompressed through
+ * agx_decompress().
+ */
+static bool
+agx_gen10_private_compression_allowed(const struct agx_device *dev,
+                                      const struct pipe_resource *templ)
+{
+   const bool msaa = templ->nr_samples > 1;
+
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION) &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 &&
+          (!msaa || templ->nr_samples == 2 || templ->nr_samples == 4) &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
+          !(templ->bind &
+            ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET)) &&
+          (msaa ? agx_gen10_msaa_compression_color_format(templ->format)
+                : agx_g17p_compression_color_format(templ->format));
+}
+
+/* AGX_CAP_GEN10_2D_COMPRESSION depth: a private, single-level, single-layer
+ * 2D depth buffer (including the separated Z32_FLOAT plane of Z32F_S8 and
+ * Z24S8), Z32_FLOAT or Z16_UNORM at 1x and Z32_FLOAT at 2x/4x.
+ *
+ * The M5 kernel validates every render's ZLS form. It admits compressed
+ * depth on a single-layer 2x/4x render only when it reports
+ * DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION, and refuses the submission
+ * with EOPNOTSUPP otherwise, so without that bit a multisample depth buffer
+ * stays plain. Borealis checks the same bit
+ * (hk_m5_depth_msaa_compression_eligible()).
+ */
+static bool
+agx_gen10_private_depth_compression_allowed(const struct agx_device *dev,
+                                            const struct pipe_resource *templ)
+{
+   const bool format_ok =
+      templ->nr_samples <= 1
+         ? templ->format == PIPE_FORMAT_Z32_FLOAT ||
+              templ->format == PIPE_FORMAT_Z16_UNORM
+         : (templ->nr_samples == 2 || templ->nr_samples == 4) &&
+              templ->format == PIPE_FORMAT_Z32_FLOAT &&
+              (dev->params.features &
+               DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION);
+
+   return agx_chip_has_cap(dev->chip, AGX_CAP_GEN10_2D_COMPRESSION) &&
+          templ->target == PIPE_TEXTURE_2D && templ->depth0 == 1 &&
+          templ->array_size <= 1 && templ->last_level == 0 && format_ok &&
+          templ->width0 >= 16 && templ->height0 >= 16 &&
+          !(templ->bind & ~(PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DEPTH_STENCIL));
+}
+
 static bool
 agx_compression_allowed(const struct agx_resource *pres)
 {
@@ -580,13 +662,16 @@ agx_compression_allowed(const struct agx_resource *pres)
     * descriptor of it. AGX2 handles any compressed image, decompressing in
     * place where needed (agx_gallium_shared_compression_supported()). AGX3
     * has no in-place decompression, so it compresses only the private images
-    * admitted by agx_chip_gen9_color_compression() (G16G/G17P colour) and
-    * AGX_CAP_GEN9_2D_COMPRESSION (G17P depth) that never need it.
+    * that never need it: those admitted by agx_chip_gen9_color_compression()
+    * (G16G/G17P colour) and AGX_CAP_GEN9_2D_COMPRESSION (G17P depth), and by
+    * AGX_CAP_GEN10_2D_COMPRESSION (M5 colour and depth).
     */
    if (agx_gallium_descriptor_generation_is_agx3(generation)) {
       if (!agx_g17p_private_compression_allowed(dev, &pres->base.b) &&
-          !agx_g17p_private_depth_compression_allowed(dev, &pres->base.b)) {
-         rsrc_debug(pres, "No compression: outside the G17P policy\n");
+          !agx_g17p_private_depth_compression_allowed(dev, &pres->base.b) &&
+          !agx_gen10_private_compression_allowed(dev, &pres->base.b) &&
+          !agx_gen10_private_depth_compression_allowed(dev, &pres->base.b)) {
+         rsrc_debug(pres, "No compression: outside the private AGX3 policy\n");
          return false;
       }
    } else if (!agx_gallium_shared_compression_supported(generation)) {
@@ -856,10 +941,10 @@ agx_batch_track_image(struct agx_batch *batch, struct pipe_image_view *image)
       batch->incoherent_writes = true;
 
       if (rsrc->base.b.target == PIPE_BUFFER) {
-         agx_batch_writes_range(batch, rsrc, image->u.buf.offset,
-                                image->u.buf.size);
+         agx_batch_writes_storage_range(batch, rsrc, image->u.buf.offset,
+                                        image->u.buf.size);
       } else {
-         agx_batch_writes(batch, rsrc, image->u.tex.level);
+         agx_batch_writes_storage(batch, rsrc, image->u.tex.level);
       }
    } else {
       agx_batch_reads(batch, rsrc);
@@ -2654,6 +2739,9 @@ agx_destroy_context(struct pipe_context *pctx)
    agx_swtnl_destroy(ctx);
    agx_destroy_oq_heap_ctx(ctx);
 
+   for (unsigned i = 0; i < LIBAGX_NUM_PROGRAMS; ++i)
+      agx_g17p_compute_templates_free(&ctx->g17p_precomp_templates[i]);
+
    if (ctx->submit_quarantined) {
       slab_destroy_child(&ctx->transfer_pool);
       slab_destroy_child(&ctx->transfer_pool_unsync);
@@ -2682,6 +2770,8 @@ agx_destroy_context(struct pipe_context *pctx)
 
    drmSyncobjDestroy(dev->fd, ctx->in_sync_obj);
    drmSyncobjDestroy(dev->fd, ctx->dummy_syncobj);
+   if (ctx->last_submit_fence)
+      drmSyncobjDestroy(dev->fd, ctx->last_submit_fence);
    if (ctx->in_sync_fd != -1)
       close(ctx->in_sync_fd);
 
@@ -2704,6 +2794,12 @@ agx_destroy_context(struct pipe_context *pctx)
    agx_scratch_fini(&ctx->scratch_cs);
 
    agx_destroy_command_queue(dev, ctx->queue_id);
+   for (unsigned i = 1; i < ARRAY_SIZE(ctx->sib.id); ++i) {
+      if (ctx->sib.id[i] != UINT32_MAX)
+         agx_destroy_command_queue(dev, ctx->sib.id[i]);
+   }
+   if (ctx->sib.anchor)
+      drmSyncobjDestroy(dev->fd, ctx->sib.anchor);
 
    slab_destroy_child(&ctx->transfer_pool);
    slab_destroy_child(&ctx->transfer_pool_unsync);
@@ -2915,6 +3011,27 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
                                     : PIPE_CONTEXT_PRIORITY_MEDIUM;
    ctx->virt_ring_idx = priority + 1;
 
+   /* Sibling kernel queues are created on first use (agx_batch.c). Without
+    * the private cumulative anchor that keeps completion ordered across
+    * them, the context keeps to its own queue. */
+   ctx->sib.id[0] = ctx->queue_id;
+   for (unsigned i = 1; i < ARRAY_SIZE(ctx->sib.id); ++i)
+      ctx->sib.id[i] = UINT32_MAX;
+   ctx->sib.count = 1;
+   ctx->sib.priority = priority;
+   if (agx_sibling_compute_supported(agx_device(screen))) {
+      uint64_t first_point = 1;
+      if (!drmSyncobjCreate(agx_device(screen)->fd, 0, &ctx->sib.anchor) &&
+          !drmSyncobjTimelineSignal(agx_device(screen)->fd, &ctx->sib.anchor,
+                                    &first_point, 1)) {
+         ctx->sib.anchor_point = ctx->sib.anchor_signalled = first_point;
+         ctx->sib.count = AGX_SIBLING_COMPUTE_QUEUES;
+      } else if (ctx->sib.anchor) {
+         drmSyncobjDestroy(agx_device(screen)->fd, ctx->sib.anchor);
+         ctx->sib.anchor = 0;
+      }
+   }
+
    slab_create_child(&ctx->transfer_pool, &agx_screen(screen)->transfer_pool);
    slab_create_child(&ctx->transfer_pool_unsync,
                      &agx_screen(screen)->transfer_pool);
@@ -2929,6 +3046,8 @@ agx_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    pctx->blit = agx_blit;
    if (screen->caps.generate_mipmap)
       pctx->generate_mipmap = agx_generate_mipmap;
+   if (agx_chip_native_agx3(agx_device(screen)->chip))
+      pctx->image_copy_buffer = agx_image_copy_buffer;
    pctx->flush_resource = agx_flush_resource;
 
    pctx->buffer_map = u_transfer_helper_transfer_map;
@@ -3756,8 +3875,8 @@ agx_screen_create(int fd, struct renderonly *ro,
    /* parse driconf configuration now for device specific overrides */
    driParseConfigFiles(config->options, config->options_info,
                        &(driConfigFileParseParams) {
-                          .driverName = "aurora",
-                          .driverNameAlias = "asahi",
+                          .driverName = AGX_DRM_DRIVER_NAME,
+                          .driverNameAlias = AGX_DRM_DRIVER_NAME_LEGACY,
                        });
 
    agx_screen->dev.fd = fd;
@@ -3766,6 +3885,17 @@ agx_screen_create(int fd, struct renderonly *ro,
 
    /* Try to open an AGX device */
    if (!agx_open_device(agx_screen, &agx_screen->dev)) {
+      ralloc_free(agx_screen);
+      return NULL;
+   }
+
+   /* GL on a chip whose row says so runs through zink over Borealis, which
+    * the loader picks for it from the same row; this driver's paths have
+    * not run there (agx_chip_gl_through_zink()). */
+   if (agx_chip_gl_through_zink(agx_screen->dev.chip)) {
+      fprintf(stderr, "Apple %s: GL runs through zink\n",
+              agx_chip_name(agx_screen->dev.chip));
+      agx_close_device(&agx_screen->dev);
       ralloc_free(agx_screen);
       return NULL;
    }

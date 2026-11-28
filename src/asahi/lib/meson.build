@@ -352,6 +352,18 @@ if with_tests
     suite : ['asahi'],
   )
   test(
+    'asahi-agx-cdm-barrier-word',
+    executable(
+      'asahi-agx-cdm-barrier-word',
+      files('tests/test-agx-cdm-barrier-word.c'),
+      include_directories : [inc_include, inc_src, inc_asahi],
+      link_with : [libasahi_lib],
+      c_args : [c_msvc_compat_args],
+      gnu_symbol_visibility : 'hidden',
+    ),
+    suite : ['asahi'],
+  )
+  test(
     'asahi-agx-chip-caps',
     executable(
       'asahi-agx-chip-caps',
@@ -790,9 +802,15 @@ endif
 if with_tests
   test('agx3_m5_instructions', executable('agx3_m5_instructions',
     '../compiler/test/test-agx3-m5-instructions.c',
-    include_directories: [inc_include, inc_src, inc_asahi],
-    dependencies: [idep_mesautil, idep_nir, idep_agx_opcodes_h],
-    link_with: [libasahi_compiler, libasahi_lib]), suite: ['asahi'])
+    include_directories: [
+      inc_include, inc_src, inc_asahi, libasahi_lib_includes,
+      include_directories('../libagx'),
+    ],
+    dependencies: [
+      idep_mesautil, idep_nir, idep_agx_opcodes_h, idep_libagx_shaders_h,
+      idep_agx_pack,
+    ],
+    link_with: [libasahi_compiler, libasahi_lib, libasahi_layout]), suite: ['asahi'])
 endif
 
 if with_tests

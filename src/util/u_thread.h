@@ -92,6 +92,22 @@ util_set_current_thread_affinity(const uint32_t *mask,
                                    num_mask_bits);
 }
 
+/**
+ * Raise the calling thread's minimum utilisation clamp (uclamp.min of
+ * sched_setattr(2)) to at least \p util_min, on the scale where the largest
+ * CPU has a capacity of 1024.
+ *
+ * A stronger clamp the thread already has is kept, as are its policy, its
+ * parameters, its maximum clamp and whether it resets them on fork. Nothing
+ * is done when the thread runs under a seccomp filter, which may kill the
+ * process for the scheduler calls (Chromium's GPU process does), or when that
+ * cannot be determined.
+ *
+ * \return  true when the thread's minimum clamp is at least \p util_min
+ */
+bool
+util_thread_raise_min_util_clamp(unsigned util_min);
+
 /*
  * Thread statistics.
  */

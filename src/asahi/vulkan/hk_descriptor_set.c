@@ -24,6 +24,7 @@
 #include "hk_image.h"
 #include "hk_physical_device.h"
 #include "hk_sampler.h"
+#include "hk_sync.h"
 #include "asahi/compiler/agx_nir.h"
 
 #include "util/cache_ops.h"
@@ -171,6 +172,48 @@ hk_border_swizzle_word(const struct hk_image_view *view)
 }
 
 static inline bool
+hk_descriptor_type_is_image(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+          type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+          type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+          type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+          type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+          type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
+}
+
+static inline void
+hk_descriptor_set_note_vs_image(struct hk_descriptor_set *set, uint32_t binding,
+                                const struct vk_image *vk_img)
+{
+   if (!vk_img || !set->layout || binding >= set->layout->binding_count)
+      return;
+   if (!(set->layout->binding[binding].stage_flags & VK_SHADER_STAGE_VERTEX_BIT))
+      return;
+   const struct hk_image *image = container_of(vk_img, struct hk_image, vk);
+   const VkImageCreateFlags unsafe_flags =
+      VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+   if ((vk_img->create_flags & unsafe_flags) || vk_img->external_handle_types ||
+       vk_img->tiling == VK_IMAGE_TILING_LINEAR || image->swapchain_memory ||
+       image->plane_count == 0) {
+      __atomic_store_n(&set->vs_img_unsafe, true, __ATOMIC_RELAXED);
+      return;
+   }
+   uint64_t bloom = 0;
+   for (uint8_t p = 0; p < image->plane_count; ++p) {
+      if (!image->planes[p].addr) {
+         __atomic_store_n(&set->vs_img_unsafe, true, __ATOMIC_RELAXED);
+         return;
+      }
+      bloom |= hk_sync_image_bloom(image->planes[p].addr);
+   }
+   if (bloom)
+      __atomic_fetch_or(&set->vs_img_bloom, bloom, __ATOMIC_RELAXED);
+}
+
+static inline bool
 write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
                                           const VkDescriptorImageInfo *info,
                                           uint32_t binding, uint32_t elem,
@@ -254,6 +297,7 @@ write_sampled_image_view_desc_g17p_single(struct hk_descriptor_set *set,
    else
       desc.sw.border[0] = hk_border_swizzle_word(view);
 
+   hk_descriptor_set_note_vs_image(set, binding, view->vk.image);
    write_desc(set, binding, elem, &desc, sizeof(desc));
    return true;
 }
@@ -293,6 +337,7 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
    if (descriptor_type != VK_DESCRIPTOR_TYPE_SAMPLER && info &&
        info->imageView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(hk_image_view, view, info->imageView);
+      hk_descriptor_set_note_vs_image(set, binding, view->vk.image);
 
       plane_count = view->plane_count;
       view_planes = view->plane_count;
@@ -383,7 +428,8 @@ write_sampled_image_view_desc(struct hk_descriptor_set *set,
           * image plane. G17P consumes the native heap index directly. */
          desc[plane].sw.sampler_index = hk_sampler_descriptor_index(
             set->layout, sampler->planes[sampler_plane].hw->index);
-         if (set->layout->descriptor_generation == 9)
+         if (set->layout->descriptor_generation == 9 ||
+             set->layout->descriptor_generation == 10)
             write_g17p_sampler_bias(&desc[plane].sw, sampler, sampler_plane);
          else
             desc[plane].sw.sampler = sampler->planes[sampler_plane].hw->key;
@@ -471,6 +517,7 @@ write_storage_image_view_desc(struct hk_descriptor_set *set,
 
    if (info && info->imageView != VK_NULL_HANDLE) {
       VK_FROM_HANDLE(hk_image_view, view, info->imageView);
+      hk_descriptor_set_note_vs_image(set, binding, view->vk.image);
 
       /* Gate on what the PBE packer accepts (storage_pbe_valid carries every
        * real constraint) plus the shape limits of this fallback; any
@@ -554,7 +601,7 @@ get_buffer_address(const VkDescriptorBufferInfo *const info, bool read_only)
    if (!read_only && buffer && buffer->sparse_map &&
        agx_chip_g17_m5(
           ((const struct hk_device *)buffer->vk.base.device)->dev.chip)) {
-      const uint64_t map_addr = buffer->sparse_map->va->addr;
+      const uint64_t map_addr = hk_buffer_sparse_map_addr(buffer);
       assert((map_addr % AIL_PAGESIZE) == 0);
       assert((map_addr / AIL_PAGESIZE) <= UINT32_MAX);
       sparse_map_page = map_addr / AIL_PAGESIZE;
@@ -690,6 +737,11 @@ write_buffer_view_desc(struct hk_descriptor_set *set,
       hk_storage_image_descriptor_layout(generation);
    uint32_t heap_index = 0;
 
+   if (bufferView != VK_NULL_HANDLE && set->layout &&
+       binding < set->layout->binding_count &&
+       (set->layout->binding[binding].stage_flags & VK_SHADER_STAGE_VERTEX_BIT))
+      __atomic_store_n(&set->vs_img_unsafe, true, __ATOMIC_RELAXED);
+
    /* Native buffer-image reads use the same texture heap and software
     * metadata as uniform texel buffers. A missing writable PBE must not
     * replace their readable texture with the null descriptor. */
@@ -765,6 +817,7 @@ static ATTRIBUTE_NOINLINE void
 hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   struct hk_descriptor_set *last_dst = NULL;
    for (uint32_t i = 0; i < descriptorCopyCount; i++) {
       const VkCopyDescriptorSet *copy = &pDescriptorCopies[i];
       VK_FROM_HANDLE(hk_descriptor_set, src, copy->srcSet);
@@ -786,6 +839,8 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          dst->storage_backings[copy->dstBinding] = backing;
       }
 
+      bool updated = false;
+
       /* Equal strides make the existing per-record copies contiguous. Vulkan
        * requires source and destination descriptor ranges not to overlap,
        * including when they belong to the same descriptor set.
@@ -806,6 +861,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
             else
                memcpy(dst_map, src_map, size);
             hk_descriptor_set_publish(dst, dst_map, size);
+            updated = copy->descriptorCount > 0;
          }
       } else if (dst_binding_layout->stride > 0 && src_binding_layout->stride > 0) {
          for (uint32_t j = 0; j < copy->descriptorCount; j++) {
@@ -821,6 +877,7 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
 
             memcpy(dst_map, src_map, copy_size);
             hk_descriptor_set_publish(dst, dst_map, copy_size);
+            updated = true;
          }
       }
 
@@ -832,8 +889,30 @@ hk_copy_descriptor_sets(uint32_t descriptorCopyCount,
          typed_memcpy(&dst->dynamic_buffers[dst_dyn_start],
                       &src->dynamic_buffers[src_dyn_start],
                       copy->descriptorCount);
+         updated |= copy->descriptorCount > 0;
+      }
+
+      if ((dst_binding_layout->stage_flags & VK_SHADER_STAGE_VERTEX_BIT) &&
+          hk_descriptor_type_is_image(dst_binding_layout->type)) {
+         if (src->layout->has_uab_vs_images ||
+             !(src_binding_layout->stage_flags & VK_SHADER_STAGE_VERTEX_BIT) ||
+             __atomic_load_n(&src->vs_img_unsafe, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&dst->vs_img_unsafe, true, __ATOMIC_RELAXED);
+         } else {
+            uint64_t b = __atomic_load_n(&src->vs_img_bloom, __ATOMIC_RELAXED);
+            if (b)
+               __atomic_fetch_or(&dst->vs_img_bloom, b, __ATOMIC_RELAXED);
+         }
+      }
+
+      if (updated) {
+         if (last_dst != NULL && last_dst != dst)
+            p_atomic_inc(&last_dst->update_seq);
+         last_dst = dst;
       }
    }
+   if (last_dst != NULL)
+      p_atomic_inc(&last_dst->update_seq);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -842,9 +921,18 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
                         uint32_t descriptorCopyCount,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
+   struct hk_descriptor_set *last_set = NULL;
    for (uint32_t w = 0; w < descriptorWriteCount; w++) {
       const VkWriteDescriptorSet *write = &pDescriptorWrites[w];
       VK_FROM_HANDLE(hk_descriptor_set, set, write->dstSet);
+
+      if (write->descriptorCount == 0)
+         continue;
+
+      if (last_set != NULL && last_set != set) {
+         p_atomic_inc(&last_set->update_seq);
+         last_set = NULL;
+      }
 
       switch (write->descriptorType) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -926,9 +1014,13 @@ hk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       }
 
       default:
-         break;
+         continue;
       }
+
+      last_set = set;
    }
+   if (last_set != NULL)
+      p_atomic_inc(&last_set->update_seq);
 
    if (descriptorCopyCount)
       hk_copy_descriptor_sets(descriptorCopyCount, pDescriptorCopies);
@@ -944,6 +1036,11 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
                              struct hk_descriptor_set_layout *layout,
                              struct hk_descriptor_set *set)
 {
+   if (memcmp(push_set->layout_hash, layout->vk.blake3,
+              sizeof(push_set->layout_hash)) != 0) {
+      push_set->vs_img_bloom = 0;
+      push_set->vs_img_unsafe = false;
+   }
    memcpy(push_set->layout_hash, layout->vk.blake3,
           sizeof(push_set->layout_hash));
    push_set->layout_flags = layout->vk.flags;
@@ -953,6 +1050,7 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
                 layout->non_variable_descriptor_buffer_size,
                 sizeof(push_set->data));
       push_set->size = 0;
+      hk_push_descriptor_set_reset_upload(push_set);
       return false;
    }
 
@@ -961,6 +1059,8 @@ hk_push_descriptor_set_begin(struct hk_push_descriptor_set *push_set,
       .layout = layout,
       .size = sizeof(push_set->data),
       .mapped_ptr = push_set->data,
+      .vs_img_bloom = push_set->vs_img_bloom,
+      .vs_img_unsafe = push_set->vs_img_unsafe,
    };
    return true;
 }
@@ -1036,6 +1136,8 @@ hk_push_descriptor_set_update(struct hk_push_descriptor_set *push_set,
       }
    }
 
+   push_set->vs_img_bloom |= set.vs_img_bloom;
+   push_set->vs_img_unsafe |= set.vs_img_unsafe;
    return true;
 }
 
@@ -1158,10 +1260,8 @@ hk_CreateDescriptorPool(VkDevice _device,
        * the recording core. */
       pool->cpu_cached = hk_g17p_cached_cmd_memory(&dev->dev);
       const enum agx_bo_flags pool_flags =
-         agx_chip_native_agx3(dev->dev.chip)
-            ? AGX_BO_ZERO_ON_REUSE |
-                 (pool->cpu_cached ? AGX_BO_WRITEBACK : 0)
-            : 0;
+         (agx_chip_native_agx3(dev->dev.chip) ? AGX_BO_ZERO_ON_REUSE : 0) |
+         (pool->cpu_cached ? AGX_BO_WRITEBACK : 0);
       pool->bo =
          agx_bo_create(&dev->dev, bo_size, 0, pool_flags, "Descriptor pool");
       if (!pool->bo) {
@@ -1404,13 +1504,16 @@ hk_ResetDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool,
    return VK_SUCCESS;
 }
 
-static void
+static bool
 hk_descriptor_set_write_template(
    struct hk_descriptor_set *set,
    const struct vk_descriptor_update_template *template, const void *data)
 {
+   bool updated = false;
    for (uint32_t i = 0; i < template->entry_count; i++) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      if (entry->array_count == 0)
+         continue;
 
       switch (entry->type) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -1491,9 +1594,12 @@ hk_descriptor_set_write_template(
          break;
 
       default:
-         break;
+         continue;
       }
+
+      updated = true;
    }
+   return updated;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1505,7 +1611,8 @@ hk_UpdateDescriptorSetWithTemplate(
    VK_FROM_HANDLE(vk_descriptor_update_template, template,
                   descriptorUpdateTemplate);
 
-   hk_descriptor_set_write_template(set, template, pData);
+   if (hk_descriptor_set_write_template(set, template, pData))
+      p_atomic_inc(&set->update_seq);
 }
 
 bool
@@ -1519,6 +1626,8 @@ hk_push_descriptor_set_update_template(
       return false;
 
    hk_descriptor_set_write_template(&tmp_set, template, data);
+   push_set->vs_img_bloom |= tmp_set.vs_img_bloom;
+   push_set->vs_img_unsafe |= tmp_set.vs_img_unsafe;
    return true;
 }
 
@@ -1547,7 +1656,7 @@ hk_GetDescriptorEXT(VkDevice _device,
    layout->descriptor_generation =
       agx_chip_descriptor_generation(dev->dev.chip);
    layout->native_sampler_indices =
-      agx_chip_native_or_m5(dev->dev.chip);
+      agx_chip_agx3_path(dev->dev.chip);
    layout->binding_count = 1;
    layout->binding[0] = (struct hk_descriptor_set_binding_layout){
       .type = type,

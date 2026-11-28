@@ -171,7 +171,7 @@ instr_mem_space(const agx_instr *I)
 static struct dag *
 create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniforms,
            struct util_dynarray *all_nodes, struct sched_dag_state *state,
-           bool reorder_loads)
+           bool reorder_loads, bool reorder_indep_loads)
 {
    struct dag *dag = dag_create(ctx);
    struct util_dynarray nodes;
@@ -196,6 +196,11 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
     * serialize all spaces. */
    struct sched_node *memory_load[SCHED_MEM_NUM] = {NULL};
    struct sched_node *memory_store[SCHED_MEM_NUM] = {NULL};
+   struct util_dynarray pending_loads[SCHED_MEM_NUM];
+   if (reorder_indep_loads) {
+      for (unsigned sp = 0; sp < SCHED_MEM_NUM; ++sp)
+         util_dynarray_init(&pending_loads[sp], memctx);
+   }
 
    /* Last unified-vertex-store write, to keep UVS writeout in program order.
     *
@@ -273,21 +278,48 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
 
       if (barrier) {
          for (unsigned sp = 0; sp < SCHED_MEM_NUM; ++sp) {
+            if (reorder_indep_loads) {
+               util_dynarray_foreach(&pending_loads[sp], struct sched_node *, l)
+                  add_dep(node, *l);
+               util_dynarray_clear(&pending_loads[sp]);
+            }
             serialize(node, &memory_load[sp]);
             serialize(node, &memory_store[sp]);
          }
       } else {
          const enum sched_mem_space sp = instr_mem_space(I);
 
-         if (dep == AGX_SCHEDULE_CLASS_STORE)
-            add_dep(node, memory_load[sp]);
-         else if (dep == AGX_SCHEDULE_CLASS_ATOMIC)
-            serialize(node, &memory_load[sp]);
+         /* Independent non-coherent device/local loads have no RAR hazard
+          * with each other: order them after prior stores/atomics/barriers
+          * while allowing outer loads in two-level indirect chains to issue
+          * ahead of inner dependent loads. Stores, atomics, barriers, and
+          * coherent loads still flush pending_loads to preserve WAR/RAW. */
+         if (reorder_indep_loads && dep == AGX_SCHEDULE_CLASS_LOAD &&
+             !I->coherent &&
+             (I->op == AGX_OPCODE_DEVICE_LOAD ||
+              I->op == AGX_OPCODE_LOCAL_LOAD)) {
+            add_dep(node, memory_store[sp]);
+            util_dynarray_append(&pending_loads[sp], node);
+         } else {
+            if (reorder_indep_loads &&
+                (dep == AGX_SCHEDULE_CLASS_LOAD ||
+                 dep == AGX_SCHEDULE_CLASS_STORE ||
+                 dep == AGX_SCHEDULE_CLASS_ATOMIC)) {
+               util_dynarray_foreach(&pending_loads[sp], struct sched_node *, l)
+                  add_dep(node, *l);
+               util_dynarray_clear(&pending_loads[sp]);
+            }
 
-         if (dep == AGX_SCHEDULE_CLASS_LOAD ||
-             dep == AGX_SCHEDULE_CLASS_STORE ||
-             dep == AGX_SCHEDULE_CLASS_ATOMIC)
-            serialize(node, &memory_store[sp]);
+            if (dep == AGX_SCHEDULE_CLASS_STORE)
+               add_dep(node, memory_load[sp]);
+            else if (dep == AGX_SCHEDULE_CLASS_ATOMIC)
+               serialize(node, &memory_load[sp]);
+
+            if (dep == AGX_SCHEDULE_CLASS_LOAD ||
+                dep == AGX_SCHEDULE_CLASS_STORE ||
+                dep == AGX_SCHEDULE_CLASS_ATOMIC)
+               serialize(node, &memory_store[sp]);
+         }
       }
 
       if (dep == AGX_SCHEDULE_CLASS_COVERAGE || barrier)
@@ -320,35 +352,6 @@ create_dag(agx_context *ctx, agx_block *block, void *memctx, bool native_uniform
  *
  *      live_in = (live_out - KILL) + GEN
  */
-static signed
-calculate_pressure_delta(const agx_instr *I, struct u_sparse_bitset *live)
-{
-   signed delta = 0;
-
-   /* Destinations must be unique */
-   agx_foreach_ssa_dest(I, d) {
-      if (u_sparse_bitset_test(live, I->dest[d].value))
-         delta -= agx_index_size_16(I->dest[d]);
-   }
-
-   agx_foreach_ssa_src(I, src) {
-      /* Filter duplicates */
-      bool dupe = false;
-
-      for (unsigned i = 0; i < src; ++i) {
-         if (agx_is_equiv(I->src[i], I->src[src])) {
-            dupe = true;
-            break;
-         }
-      }
-
-      if (!dupe && !u_sparse_bitset_test(live, I->src[src].value))
-         delta += agx_index_size_16(I->src[src]);
-   }
-
-   return delta;
-}
-
 static signed
 calculate_pressure_delta_dense(const agx_instr *I, const BITSET_WORD *live)
 {
@@ -627,7 +630,7 @@ agx_pressure_schedule(agx_context *ctx)
 
       util_dynarray_clear(&all_nodes);
       sctx.dag = create_dag(ctx, block, memctx, native_uniforms, &all_nodes,
-                            &dag_state, false);
+                            &dag_state, false, false);
       /* Preserve the original order if a complete dependency graph cannot be
        * built (invalid range or workspace allocation failure). */
       if (!sctx.dag)
@@ -690,7 +693,7 @@ agx_pressure_schedule(agx_context *ctx)
 /* Whether an AGX3B sample or texel fetch can allocate disjoint
  * staging banks in agx3_pack_binary.c and genuinely overlap in flight.
  * Non-relocatable forms (register-descriptor 2D_ARRAY samples, 3D or cube
- * samples, gradient/register-LOD/dynamic-offset samples, and multisample or
+ * samples, gradient/min-lod/dynamic-offset samples, and multisample or
  * register-LOD fetches) stay pinned to staging bank 0, where hoisting only
  * inflates GPR pressure and forces serializing result-wait barriers between
  * consecutive samples. */
@@ -704,9 +707,8 @@ ilp_agx3b_sample_relocatable(const agx_instr *I)
 
       const bool lod_ok =
          I->lod_mode == AGX_LOD_MODE_AUTO_LOD ||
-         ((I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
-           I->lod_mode == AGX_LOD_MODE_LOD_MIN) &&
-          I->src[1].type == AGX_INDEX_IMMEDIATE);
+         I->lod_mode == AGX_LOD_MODE_AUTO_LOD_BIAS ||
+         I->lod_mode == AGX_LOD_MODE_LOD_MIN;
       if (!lod_ok)
          return false;
 
@@ -726,6 +728,7 @@ ilp_agx3b_sample_relocatable(const agx_instr *I)
    case AGX_OPCODE_IMAGE_LOAD:
       if (I->nr_srcs < 2 ||
           (I->dim != AGX_DIM_2D && I->dim != AGX_DIM_2D_ARRAY &&
+           I->dim != AGX_DIM_2D_MS && I->dim != AGX_DIM_2D_MS_ARRAY &&
            I->dim != AGX_DIM_3D))
          return false;
 
@@ -774,7 +777,8 @@ ilp_is_hoisted(const agx_context *ctx, const agx_instr *I, bool loads)
 }
 
 static unsigned
-ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
+ilp_latency(const agx_context *ctx, const agx_instr *I, unsigned alu,
+            unsigned load)
 {
    switch (I->op) {
    case AGX_OPCODE_DEVICE_LOAD:
@@ -787,6 +791,23 @@ ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
    case AGX_OPCODE_ATOMIC:
    case AGX_OPCODE_LOCAL_ATOMIC:
       return load;
+   case AGX_OPCODE_RSQRT:
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+           ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) ||
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+           !ctx->key->dev.emit_agx3d))
+         return 3 * alu;
+      return alu;
+   case AGX_OPCODE_RCP:
+   case AGX_OPCODE_LOG2:
+   case AGX_OPCODE_EXP2:
+   case AGX_OPCODE_SIN_PT_2:
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+           ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) ||
+          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+           !ctx->key->dev.emit_agx3d))
+         return 2 * alu;
+      return alu;
    case AGX_OPCODE_SPLIT:
       return 0;
    default:
@@ -796,17 +817,153 @@ ilp_latency(const agx_instr *I, unsigned alu, unsigned load)
 
 static signed
 ilp_max_pressure(struct sched_node **order, unsigned n,
-                 struct u_sparse_bitset *live_end,
-                 struct u_sparse_bitset *scratch)
+                 const BITSET_WORD *live_end, BITSET_WORD *scratch,
+                 size_t live_bytes)
 {
-   u_sparse_bitset_dup(scratch, live_end);
+   memcpy(scratch, live_end, live_bytes);
    signed pressure = 0, max_pressure = 0;
    for (unsigned i = n; i-- > 0;) {
-      pressure += calculate_pressure_delta(order[i]->instr, scratch);
+      pressure += calculate_pressure_delta_dense(order[i]->instr, scratch);
       max_pressure = MAX2(pressure, max_pressure);
-      agx_liveness_ins_update(scratch, order[i]->instr);
+      sched_liveness_update_dense(scratch, order[i]->instr);
    }
    return max_pressure;
+}
+
+static bool
+ilp_tile_store_live_fits(const BITSET_WORD *live, unsigned alloc,
+                         const uint8_t *tile_width, unsigned bank,
+                         unsigned reserved, unsigned *peak_out)
+{
+   unsigned buckets[4] = {0};
+   unsigned exact_halves = 0;
+   unsigned extra_halves = 0;
+   unsigned v;
+   BITSET_FOREACH_SET(v, live, alloc) {
+      const unsigned w = tile_width[v];
+      if (!w)
+         continue;
+      exact_halves += w;
+      const unsigned aligned = util_next_power_of_two(w);
+      if (aligned <= 8)
+         buckets[util_logbase2(aligned)]++;
+      else
+         extra_halves += aligned;
+   }
+   if (exact_halves > *peak_out)
+      *peak_out = exact_halves;
+   if (exact_halves > bank || extra_halves > 0)
+      return false;
+
+   uint64_t busy = reserved >= 64 ? ~0ULL :
+                   (reserved ? ((1ULL << reserved) - 1ULL) : 0ULL);
+   for (int b = 3; b >= 0; --b) {
+      const unsigned align = 1u << b;
+      const uint64_t mask = (1ULL << align) - 1ULL;
+      for (unsigned k = 0; k < buckets[b]; ++k) {
+         bool placed = false;
+         for (unsigned pos = 0; pos + align <= bank; pos += align) {
+            if ((busy & (mask << pos)) == 0) {
+               busy |= mask << pos;
+               placed = true;
+               break;
+            }
+         }
+         if (!placed)
+            return false;
+      }
+   }
+   return true;
+}
+
+static unsigned
+ilp_tile_store_bank_demand(struct sched_node **order, unsigned n,
+                           const BITSET_WORD *live_end, BITSET_WORD *scratch,
+                           unsigned alloc, const uint8_t *tile_width,
+                           unsigned bank, unsigned reserved, bool *overflows)
+{
+   memcpy(scratch, live_end, BITSET_WORDS(alloc) * sizeof(BITSET_WORD));
+   unsigned peak = 0;
+   bool ovf = !ilp_tile_store_live_fits(scratch, alloc, tile_width, bank,
+                                        reserved, &peak);
+   for (unsigned i = n; i-- > 0;) {
+      sched_liveness_update_dense(scratch, order[i]->instr);
+      ovf |= !ilp_tile_store_live_fits(scratch, alloc, tile_width, bank,
+                                       reserved, &peak);
+   }
+   *overflows = ovf;
+   return peak;
+}
+
+/* On AGX3, ST_TILE reads its payload from a bounded low-register bank
+ * (agx3_tile_store_bank(), 16/32/64 halves) with natural power-of-two
+ * alignment above agx_reserved_registers(). Reject any candidate schedule
+ * whose simultaneously live ST_TILE payloads overflow that bank (when the
+ * original order fits, or with higher peak demand than the original order). */
+static bool
+ilp_tile_store_bank_overflows(agx_context *ctx, struct sched_node **nodes,
+                              struct sched_node **order, unsigned n,
+                              const BITSET_WORD *live_end,
+                              BITSET_WORD *scratch, void *memctx)
+{
+   if (!agx_isa_is_agx3(ctx->key->dev.encoding) ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble)
+      return false;
+
+   /* A split channel takes its vector's register, and RA places the whole
+    * vector of a stored channel in the bank (see low_gpr in agx_ra()): a
+    * per-sample reload of an R32 target stores channel 0 of each eight-half
+    * 2D_MS texel fetch. Count the vector while it is live, not only the
+    * stored channel. */
+   uint8_t *tile_width = NULL;
+   agx_index *split_parent = NULL;
+   agx_foreach_instr_global(ctx, I) {
+      if (I->op == AGX_OPCODE_SPLIT && I->src[0].type == AGX_INDEX_NORMAL &&
+          I->src[0].value < ctx->alloc) {
+         if (!split_parent) {
+            split_parent =
+               rzalloc_array(memctx, agx_index, MAX2(ctx->alloc, 1));
+            if (!split_parent)
+               return true;
+         }
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < ctx->alloc)
+               split_parent[I->dest[d].value] = I->src[0];
+         }
+      }
+      if (I->op != AGX_OPCODE_ST_TILE || I->src[0].type != AGX_INDEX_NORMAL ||
+          I->src[0].value >= ctx->alloc)
+         continue;
+      if (!tile_width) {
+         tile_width = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
+         if (!tile_width) {
+            ralloc_free(split_parent);
+            return true;
+         }
+      }
+      tile_width[I->src[0].value] = agx_index_size_16(I->src[0]);
+      if (split_parent && split_parent[I->src[0].value].type ==
+                             AGX_INDEX_NORMAL) {
+         const agx_index vec = split_parent[I->src[0].value];
+         tile_width[vec.value] =
+            MAX2(tile_width[vec.value], agx_index_size_16(vec));
+      }
+   }
+   ralloc_free(split_parent);
+   if (!tile_width)
+      return false;
+
+   const unsigned bank = agx3_tile_store_bank(ctx);
+   const unsigned reserved = agx_reserved_registers(ctx);
+   bool before_ovf = false, after_ovf = false;
+   const unsigned before_peak = ilp_tile_store_bank_demand(
+      nodes, n, live_end, scratch, ctx->alloc, tile_width, bank, reserved,
+      &before_ovf);
+   const unsigned after_peak = ilp_tile_store_bank_demand(
+      order, n, live_end, scratch, ctx->alloc, tile_width, bank, reserved,
+      &after_ovf);
+   ralloc_free(tile_width);
+   return after_ovf && (!before_ovf || after_peak > before_peak);
 }
 
 /*
@@ -1089,6 +1246,31 @@ ilp_instr_pipe(const agx_instr *I)
    }
 }
 
+/* Mark hoisted loads feeding SSA value v as consumed, walking through any
+ * transitive COLLECT chains (which regroup split/collected channels without
+ * consuming them). */
+static void
+ilp_mark_consumed_ssa(unsigned v, const int *load_node,
+                      agx_instr *const *collect_def, bool *consumed,
+                      unsigned *consumed_loads)
+{
+   const int l = load_node[v];
+   if (l >= 0) {
+      if (!consumed[l]) {
+         consumed[l] = true;
+         (*consumed_loads)++;
+      }
+      return;
+   }
+   const agx_instr *col = collect_def[v];
+   if (!col)
+      return;
+   agx_foreach_ssa_src(col, cj) {
+      ilp_mark_consumed_ssa(col->src[cj].value, load_node, collect_def,
+                            consumed, consumed_loads);
+   }
+}
+
 static bool
 ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool native_uniforms, unsigned alu_latency,
@@ -1097,13 +1279,14 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    bool order_edges_free, signed fwd_cap,
                    unsigned hoist_samples, bool hoist_past_writes,
                    bool hoist_loads, bool loads_in_flight, bool interleave_alu,
-                   bool interleave_in_flight,
+                   bool interleave_in_flight, bool chained_loads,
                    struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
    struct dag *dag = create_dag(ctx, block, memctx, native_uniforms, &all,
-                                dag_state, hoist_past_writes);
+                                dag_state, hoist_past_writes,
+                                chained_loads && hoist_loads && loads_in_flight);
    if (!dag)
       return false;
 
@@ -1115,14 +1298,20 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    unsigned *ndeps = rzalloc_array(memctx, unsigned, n);
    unsigned *height = rzalloc_array(memctx, unsigned, n);
    unsigned *ready = rzalloc_array(memctx, unsigned, n);
+   const unsigned ready_words = BITSET_WORDS(n);
+   BITSET_WORD ready_bits_stack[BITSET_WORDS(2048)];
+   BITSET_WORD *ready_bits =
+      ready_words <= ARRAY_SIZE(ready_bits_stack)
+         ? ready_bits_stack
+         : ralloc_array(memctx, BITSET_WORD, ready_words);
    bool *has_alu_dep = rzalloc_array(memctx, bool, n);
-   bool *done = rzalloc_array(memctx, bool, n);
    struct util_dynarray *dependents =
       rzalloc_array(memctx, struct util_dynarray, n);
    struct sched_node **order = rzalloc_array(memctx, struct sched_node *, n);
-   if (!ndeps || !height || !ready || !has_alu_dep || !done || !dependents ||
-       !order)
+   if (!ndeps || !height || !ready || !ready_bits || !has_alu_dep ||
+       !dependents || !order)
       return false;
+   memset(ready_bits, 0, ready_words * sizeof(BITSET_WORD));
 
    for (unsigned i = 0; i < n; ++i)
       util_dynarray_init(&dependents[i], memctx);
@@ -1140,7 +1329,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
     * a reverse sweep computes the critical-path height. */
    for (unsigned i = n; i-- > 0;) {
       const unsigned lat =
-         ilp_latency(nodes[i]->instr, alu_latency, load_latency);
+         ilp_latency(ctx, nodes[i]->instr, alu_latency, load_latency);
       unsigned h = lat;
       util_dynarray_foreach(&dependents[i], unsigned, d) {
          const bool data = !order_edges_free ||
@@ -1186,6 +1375,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    unsigned *uses_left = NULL;
    bool *dies = NULL;
    signed live = 0;
+   signed eff_fwd_cap = fwd_cap;
    if (fwd_cap > 0) {
       uses_left = rzalloc_array(memctx, unsigned, ctx->alloc);
       dies = rzalloc_array(memctx, bool, ctx->alloc);
@@ -1207,6 +1397,21 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          agx_foreach_ssa_src(I, si)
             dies[I->src[si].value] = false;
       }
+      /* Loop-carried PHIs in loop headers are already live on block entry; do
+       * not charge live ones against the forward budget for temporaries added
+       * inside this block. Dead PHIs contribute 0 net live halves, and non-loop
+       * merge PHIs keep the original fwd_cap brake intact. */
+      if (block->loop_header) {
+         for (unsigned i = 0; i < n; ++i) {
+            if (nodes[i]->instr->op != AGX_OPCODE_PHI)
+               continue;
+            agx_foreach_ssa_dest(nodes[i]->instr, d) {
+               const unsigned v = nodes[i]->instr->dest[d].value;
+               if (uses_left[v] > 0 || !dies[v])
+                  eff_fwd_cap += agx_index_size_16(nodes[i]->instr->dest[d]);
+            }
+         }
+      }
    }
 
    /* With loads_in_flight, the window starts at the number of hoisted loads
@@ -1217,11 +1422,13 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    const bool in_flight = hoist_samples && loads_in_flight;
    unsigned consumed_loads = 0;
    int *load_node = NULL;
+   agx_instr **collect_def = NULL;
    bool *consumed = NULL;
    if (in_flight) {
       load_node = ralloc_array(memctx, int, MAX2(ctx->alloc, 1));
+      collect_def = rzalloc_array(memctx, agx_instr *, MAX2(ctx->alloc, 1));
       consumed = rzalloc_array(memctx, bool, n);
-      if (!load_node || !consumed)
+      if (!load_node || !collect_def || !consumed)
          return false;
       for (unsigned v = 0; v < ctx->alloc; ++v)
          load_node[v] = -1;
@@ -1231,12 +1438,61 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                load_node[nodes[i]->instr->dest[d].value] = i;
          } else if (nodes[i]->instr->op == AGX_OPCODE_SPLIT &&
                     nodes[i]->instr->src[0].type == AGX_INDEX_NORMAL) {
-            const int l = load_node[nodes[i]->instr->src[0].value];
+            const unsigned sv = nodes[i]->instr->src[0].value;
+            const int l = load_node[sv];
             if (l >= 0) {
                agx_foreach_ssa_dest(nodes[i]->instr, d)
                   load_node[nodes[i]->instr->dest[d].value] = l;
+            } else if (collect_def[sv]) {
+               agx_instr *col = collect_def[sv];
+               bool exact_channels = col->nr_srcs == nodes[i]->instr->nr_dests;
+               if (exact_channels) {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d) {
+                     if (agx_index_size_16(col->src[d]) !=
+                         agx_index_size_16(nodes[i]->instr->dest[d])) {
+                        exact_channels = false;
+                        break;
+                     }
+                  }
+               }
+               if (exact_channels) {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d) {
+                     if (col->src[d].type != AGX_INDEX_NORMAL)
+                        continue;
+                     const unsigned cv = col->src[d].value;
+                     const unsigned dv = nodes[i]->instr->dest[d].value;
+                     if (load_node[cv] >= 0)
+                        load_node[dv] = load_node[cv];
+                     else if (collect_def[cv])
+                        collect_def[dv] = collect_def[cv];
+                  }
+               } else {
+                  agx_foreach_ssa_dest(nodes[i]->instr, d)
+                     collect_def[nodes[i]->instr->dest[d].value] = col;
+               }
+            }
+         } else if (nodes[i]->instr->op == AGX_OPCODE_COLLECT) {
+            bool from_load = false;
+            agx_foreach_ssa_src(nodes[i]->instr, si) {
+               const unsigned sv = nodes[i]->instr->src[si].value;
+               if (load_node[sv] >= 0 || collect_def[sv]) {
+                  from_load = true;
+                  break;
+               }
+            }
+            if (from_load) {
+               agx_foreach_ssa_dest(nodes[i]->instr, d)
+                  collect_def[nodes[i]->instr->dest[d].value] = nodes[i]->instr;
             }
          }
+      }
+   }
+
+   unsigned ready_count = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      if (ndeps[i] == 0) {
+         BITSET_SET(ready_bits, i);
+         ready_count++;
       }
    }
 
@@ -1244,20 +1500,45 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    bool changed = false;
    enum ilp_alu_pipe prev_pipe = ILP_PIPE_OTHER;
    for (unsigned step = 0; step < n; ++step) {
+      if (ready_count == 0)
+         return false; /* cycle in the DAG: leave the block alone */
+
       int best = -1;
       unsigned best_t = 0;
       signed best_grow = 0;
+      signed best_dest_grow = 0;
       bool best_fits = true;
-      for (unsigned i = 0; i < n; ++i) {
-         if (done[i] || ndeps[i])
-            continue;
+      unsigned i;
+      BITSET_FOREACH_SET(i, ready_bits, n) {
          const unsigned t = MAX2(ready[i], cycle);
+         signed dest_grow = 0;
          signed grow = 0;
          if (fwd_cap > 0) {
-            agx_foreach_ssa_dest(nodes[i]->instr, d)
-               grow += agx_index_size_16(nodes[i]->instr->dest[d]);
+            const agx_instr *I = nodes[i]->instr;
+            agx_foreach_ssa_dest(I, d)
+               dest_grow += agx_index_size_16(I->dest[d]);
+            grow = dest_grow;
+            agx_foreach_ssa_src(I, si) {
+               const unsigned v = I->src[si].value;
+               if (!dies[v])
+                  continue;
+               unsigned occ = 0;
+               bool seen_before = false;
+               agx_foreach_ssa_src(I, sj) {
+                  if (I->src[sj].value == v) {
+                     if (sj < si) {
+                        seen_before = true;
+                        break;
+                     }
+                     occ++;
+                  }
+               }
+               if (!seen_before && uses_left[v] == occ)
+                  grow -= agx_index_size_16(I->src[si]);
+            }
          }
-         const bool fits = fwd_cap <= 0 || grow == 0 || live + grow <= fwd_cap;
+         const bool fits =
+            fwd_cap <= 0 || grow <= 0 || live + grow <= eff_fwd_cap;
          bool better;
          if (best < 0)
             better = true;
@@ -1275,15 +1556,17 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             const bool hoist_b = first_sample[best] < window;
             if (hoist_i != hoist_b)
                better = hoist_i;
-            else if (interleave_in_flight && in_flight && !hoist_i &&
-                     first_sample[i] == ~0u && first_sample[best] == ~0u &&
-                     t != best_t)
-               /* Among ready work that consumes no load, prefer what is
-                * ready earlier, so independent ALU chains interleave while
-                * loads are in flight instead of issuing in source order. */
+            else if (interleave_in_flight && t != best_t &&
+                     ((in_flight && chained_loads && hoist_i) ||
+                      (!hoist_i && first_sample[i] == ~0u &&
+                       first_sample[best] == ~0u)))
+               /* Among ready work inside the hoist window of a two-level
+                * indirect load chain (such as an independent outer load vs an
+                * ALU consumer stalled on an earlier load) or ready work that
+                * consumes no load, prefer what is ready earlier. */
                better = t < best_t;
             else
-               better = i < (unsigned)best;
+               better = false;
          } else if (!interleave_alu) {
             better = t < best_t || (t == best_t && height[i] > height[best]);
          } else if (t != best_t) {
@@ -1324,17 +1607,18 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
             best = i;
             best_t = t;
             best_grow = grow;
+            best_dest_grow = dest_grow;
             best_fits = fits;
          }
       }
-      if (best < 0)
-         return false; /* cycle in the DAG: leave the block alone */
 
+      BITSET_CLEAR(ready_bits, best);
+      ready_count--;
       prev_pipe = ilp_instr_pipe(nodes[best]->instr);
 
       if (fwd_cap > 0) {
          const agx_instr *B = nodes[best]->instr;
-         live += best_grow;
+         live += best_dest_grow;
          agx_foreach_ssa_src(B, si) {
             const unsigned v = B->src[si].value;
             if (--uses_left[v] == 0 && dies[v])
@@ -1347,16 +1631,13 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
          }
       }
 
-      done[best] = true;
       order[step] = nodes[best];
       issued_samples += ilp_is_hoisted(ctx, nodes[best]->instr, hoist_loads);
-      if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT) {
+      if (in_flight && nodes[best]->instr->op != AGX_OPCODE_SPLIT &&
+          nodes[best]->instr->op != AGX_OPCODE_COLLECT) {
          agx_foreach_ssa_src(nodes[best]->instr, si) {
-            const int l = load_node[nodes[best]->instr->src[si].value];
-            if (l >= 0 && !consumed[l]) {
-               consumed[l] = true;
-               consumed_loads++;
-            }
+            ilp_mark_consumed_ssa(nodes[best]->instr->src[si].value, load_node,
+                                  collect_def, consumed, &consumed_loads);
          }
       }
       issued_writes += nodes[best]->instr->op == AGX_OPCODE_IMAGE_WRITE ||
@@ -1367,11 +1648,15 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
       const bool best_is_phi =
          interleave_alu && nodes[best]->instr->op == AGX_OPCODE_PHI;
       const unsigned lat =
-         best_is_phi ? 0 : ilp_latency(nodes[best]->instr, alu_latency, load_latency);
+         best_is_phi ? 0 : ilp_latency(ctx, nodes[best]->instr, alu_latency,
+                                       load_latency);
       util_dynarray_foreach(&dependents[best], unsigned, d) {
          const bool data = !order_edges_free ||
             ilp_reads_result(nodes[*d]->instr, nodes[best]->instr);
-         ndeps[*d]--;
+         if (--ndeps[*d] == 0) {
+            BITSET_SET(ready_bits, *d);
+            ready_count++;
+         }
          ready[*d] = MAX2(ready[*d], best_t + (data ? lat : 1));
          if (interleave_alu && !best_is_phi &&
              ilp_reads_result(nodes[*d]->instr, nodes[best]->instr))
@@ -1398,10 +1683,21 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
 
    /* Live set at the logical end: walk back over the trailing control-flow
     * and export instructions, which stay where they are. */
-   struct u_sparse_bitset live_end, scratch;
-   u_sparse_bitset_init(&live_end, ctx->alloc, memctx);
-   u_sparse_bitset_init(&scratch, ctx->alloc, memctx);
-   u_sparse_bitset_dup(&live_end, &block->live_out);
+   const unsigned live_words = BITSET_WORDS(ctx->alloc);
+   const size_t live_bytes = live_words * sizeof(BITSET_WORD);
+   BITSET_WORD live_end_stack[BITSET_WORDS(2048)];
+   BITSET_WORD scratch_stack[BITSET_WORDS(2048)];
+   BITSET_WORD *live_end = live_words <= ARRAY_SIZE(live_end_stack)
+                              ? live_end_stack
+                              : ralloc_array(memctx, BITSET_WORD, live_words);
+   BITSET_WORD *scratch = live_words <= ARRAY_SIZE(scratch_stack)
+                             ? scratch_stack
+                             : ralloc_array(memctx, BITSET_WORD, live_words);
+   if (!live_end || !scratch)
+      return false;
+   memset(live_end, 0, live_bytes);
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v)
+      BITSET_SET(live_end, v);
    agx_instr *first_after = NULL;
    agx_foreach_instr_in_block(block, I) {
       if (instr_after_logical_end(I)) {
@@ -1411,7 +1707,7 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    }
    if (first_after) {
       agx_foreach_instr_in_block_rev(block, I) {
-         agx_liveness_ins_update(&live_end, I);
+         sched_liveness_update_dense(live_end, I);
          if (I == first_after)
             break;
       }
@@ -1420,14 +1716,21 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    /* Both peaks are relative to the values live at the logical end. The cap
     * bounds the registers the block needs, which includes those values: they
     * hold their registers through the whole block. */
-   const signed before = ilp_max_pressure(nodes, n, &live_end, &scratch);
-   const signed after = ilp_max_pressure(order, n, &live_end, &scratch);
+   const signed before =
+      ilp_max_pressure(nodes, n, live_end, scratch, live_bytes);
+   const signed after =
+      ilp_max_pressure(order, n, live_end, scratch, live_bytes);
    signed live_past_end = 0;
    if (cap > 0) {
-      U_SPARSE_BITSET_FOREACH_SET(&live_end, v)
+      unsigned v;
+      BITSET_FOREACH_SET(v, live_end, ctx->alloc)
          live_past_end += size16[v];
    }
    if (after > before + slack && (cap <= 0 || live_past_end + after > cap))
+      return false;
+
+   if (ilp_tile_store_bank_overflows(ctx, nodes, order, n, live_end, scratch,
+                                     memctx))
       return false;
 
    for (unsigned i = 0; i < n; ++i)
@@ -1498,76 +1801,78 @@ ilp_block_samples(const agx_context *ctx, const agx_block *block)
 }
 
 static unsigned
-ilp_block_compute_loads(const agx_block *block)
+ilp_block_sfu_ops(const agx_block *block)
 {
-   unsigned loads = 0;
-   agx_foreach_instr_in_block(block, I)
-      loads += I->op == AGX_OPCODE_DEVICE_LOAD ||
-               I->op == AGX_OPCODE_LOCAL_LOAD;
-   return loads;
+   unsigned n = 0;
+   agx_foreach_instr_in_block(block, I) {
+      switch (I->op) {
+      case AGX_OPCODE_RSQRT:
+      case AGX_OPCODE_RCP:
+      case AGX_OPCODE_LOG2:
+      case AGX_OPCODE_EXP2:
+      case AGX_OPCODE_SIN_PT_2:
+         n++;
+         break;
+      default:
+         break;
+      }
+   }
+   return n;
 }
 
-/* True when a block emits multiple ST_TILE stores to the same pixel_offset and
- * at least one of those stores carries a sample-dependent payload. On AGX3B,
- * agx3_tile_store_bank() counts each pixel_offset once under the assumption
- * that per-sample stores to one colour target are serialized and reuse one
- * register vector in r0..r7; hoisting independent sample loads across those
- * stores keeps multiple sample payloads live simultaneously and can push
- * later ST_TILE sources past the 16-half bank. */
-static bool
-ilp_block_has_multi_sample_tile_stores(const agx_context *ctx,
-                                       const agx_block *block, void *memctx)
+static unsigned
+ilp_block_compute_loads(const agx_block *block, unsigned *device_loads)
 {
-   BITSET_WORD *sample_dep =
-      rzalloc_array(memctx, BITSET_WORD, BITSET_WORDS(MAX2(ctx->alloc, 1)));
-   if (!sample_dep)
-      return true;
-
-   BITSET_DECLARE(seen_offsets, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   BITSET_DECLARE(sample_offsets, AGX_G17P_MAX_BYTES_PER_SAMPLE) = {0};
-   bool result = false;
-
+   unsigned local_loads = 0;
+   *device_loads = 0;
    agx_foreach_instr_in_block(block, I) {
-      bool dep = ilp_is_sample(ctx, I);
-      if (!dep) {
-         agx_foreach_ssa_src(I, s) {
-            if (BITSET_TEST(sample_dep, I->src[s].value)) {
-               dep = true;
-               break;
-            }
-         }
-      }
-      if (dep) {
-         agx_foreach_ssa_dest(I, d)
-            BITSET_SET(sample_dep, I->dest[d].value);
-      }
+      *device_loads += I->op == AGX_OPCODE_DEVICE_LOAD;
+      local_loads += I->op == AGX_OPCODE_LOCAL_LOAD;
+   }
+   return *device_loads + local_loads;
+}
 
-      if (I->op != AGX_OPCODE_ST_TILE)
-         continue;
+/* True when a compute block contains a two-level indirect load chain where a
+ * device/local load consumes an SSA value derived from an earlier device/local
+ * load in the same block. */
+static bool
+ilp_block_has_chained_loads(const agx_context *ctx, const agx_block *block,
+                            void *memctx)
+{
+   bool *from_load = rzalloc_array(memctx, bool, MAX2(ctx->alloc, 1));
+   if (!from_load)
+      return false;
 
-      const bool uses_sample = I->src[0].type == AGX_INDEX_NORMAL &&
-                               BITSET_TEST(sample_dep, I->src[0].value);
-      if (I->pixel_offset >= AGX_G17P_MAX_BYTES_PER_SAMPLE) {
-         if (uses_sample) {
-            result = true;
+   bool chained = false;
+   agx_foreach_instr_in_block(block, I) {
+      if (instr_after_logical_end(I))
+         break;
+
+      bool reads_load = false;
+      agx_foreach_ssa_src(I, s) {
+         if (I->src[s].value < ctx->alloc && from_load[I->src[s].value]) {
+            reads_load = true;
             break;
          }
-         continue;
       }
 
-      if (BITSET_TEST(seen_offsets, I->pixel_offset) &&
-          (uses_sample || BITSET_TEST(sample_offsets, I->pixel_offset))) {
-         result = true;
+      const bool is_load = I->op == AGX_OPCODE_DEVICE_LOAD ||
+                           I->op == AGX_OPCODE_LOCAL_LOAD;
+      if (is_load && reads_load) {
+         chained = true;
          break;
       }
 
-      BITSET_SET(seen_offsets, I->pixel_offset);
-      if (uses_sample)
-         BITSET_SET(sample_offsets, I->pixel_offset);
+      if (is_load || reads_load) {
+         agx_foreach_ssa_dest(I, d) {
+            if (I->dest[d].value < ctx->alloc)
+               from_load[I->dest[d].value] = true;
+         }
+      }
    }
 
-   ralloc_free(sample_dep);
-   return result;
+   ralloc_free(from_load);
+   return chained;
 }
 
 /* Register halves the block's sample results occupy together. */
@@ -1660,6 +1965,8 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
          break;
       switch (I->op) {
       case AGX_OPCODE_LD_TILE:
+         if (I->sample_groups)
+            return false;
          ++loads;
          load_target = I->colour_target;
          break;
@@ -1698,6 +2005,39 @@ ilp_single_tile_blend(const agx_context *ctx, const agx_block *block)
       }
    }
    return loads == 1 && stores == 1 && load_target == store_target;
+}
+
+static bool
+ilp_block_has_discard_or_zs(const agx_block *block)
+{
+   agx_foreach_instr_in_block(block, I) {
+      if (I->op == AGX_OPCODE_SAMPLE_MASK ||
+          I->op == AGX_OPCODE_SAMPLE_MASK_AGX3 ||
+          I->op == AGX_OPCODE_ZS_EMIT ||
+          I->op == AGX_OPCODE_ZS_EMIT_AGX3)
+         return true;
+   }
+   return false;
+}
+
+/* True when WAIT_PIX precedes any texture sample/load or image load in the
+ * block (e.g. a fragment shader interlock critical section), including
+ * non-relocatable forms such as 3D samples, where hoisting could move a sample
+ * ahead of WAIT_PIX. Trailing epilog WAIT_PIX emitted before st_tile after all
+ * samples is unaffected. */
+static bool
+ilp_block_has_wait_pix_before_sample(const agx_block *block)
+{
+   bool saw_wait_pix = false;
+   agx_foreach_instr_in_block(block, I) {
+      if (I->op == AGX_OPCODE_WAIT_PIX)
+         saw_wait_pix = true;
+      else if (saw_wait_pix && (I->op == AGX_OPCODE_TEXTURE_SAMPLE ||
+                                I->op == AGX_OPCODE_TEXTURE_LOAD ||
+                                I->op == AGX_OPCODE_IMAGE_LOAD))
+         return true;
+   }
+   return false;
 }
 
 /* M5 compute sample-issue budget: register halves kept free below an
@@ -1739,17 +2079,24 @@ static signed
 ilp_block_peak(agx_context *ctx, agx_block *block, const uint8_t *size16,
                void *memctx)
 {
-   struct u_sparse_bitset live;
-   u_sparse_bitset_init(&live, ctx->alloc, memctx);
-   u_sparse_bitset_dup(&live, &block->live_out);
+   const unsigned live_words = BITSET_WORDS(ctx->alloc);
+   BITSET_WORD live_stack[BITSET_WORDS(2048)];
+   BITSET_WORD *live = live_words <= ARRAY_SIZE(live_stack)
+                          ? live_stack
+                          : ralloc_array(memctx, BITSET_WORD, live_words);
+   if (!live)
+      return 0;
+   memset(live, 0, live_words * sizeof(BITSET_WORD));
    signed out = 0;
-   U_SPARSE_BITSET_FOREACH_SET(&live, v)
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, v) {
+      BITSET_SET(live, v);
       out += size16[v];
+   }
    signed pressure = 0, peak = 0;
    agx_foreach_instr_in_block_rev(block, I) {
-      pressure += calculate_pressure_delta(I, &live);
+      pressure += calculate_pressure_delta_dense(I, live);
       peak = MAX2(peak, pressure);
-      agx_liveness_ins_update(&live, I);
+      sched_liveness_update_dense(live, I);
    }
    return out + peak;
 }
@@ -1822,9 +2169,13 @@ agx_ilp_agx3b_fragment_cap(agx_context *ctx, uint8_t **size16_out, void *memctx)
    if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > max_halves)
       return 0;
 
-   return agx_occupancy_for_register_count(
-             program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers -
-          AGX_ILP_M5_OCCUPANCY_MARGIN;
+   const int step_top =
+      agx_occupancy_for_register_count(program_peak).max_registers;
+   const int bound = MIN2(step_top, max_halves);
+   if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN > bound)
+      return 0;
+
+   return bound - AGX_ILP_M5_OCCUPANCY_MARGIN;
 }
 
 /* Work within the shader's physical budget, retaining space for later
@@ -1962,11 +2313,14 @@ agx_ilp_schedule(agx_context *ctx)
    /* Keep the legacy fragment policy for shaders outside Dynamic Caching ILP. */
    const bool m5_fragment = m5 && !ctx->is_preamble &&
       ctx->stage == MESA_SHADER_FRAGMENT;
+   const bool m5_fragment_ilp = m5_fragment && !ctx->key->dev.emit_agx3d;
+   const bool m5_vertex_ilp = m5 && !ctx->key->dev.emit_agx3d &&
+      !ctx->is_preamble && ctx->stage == MESA_SHADER_VERTEX;
 
    uint8_t *size16 = NULL;
    signed occupancy_cap = 0, load_cap = 0, program_peak = 0;
    const bool measure_peak =
-      shared_compute_loads || geometry_copy || m5_fragment;
+      m5_compute || shared_compute_loads || geometry_copy || m5_fragment;
    if (measure_peak || ctx->is_preamble) {
       size16 = rzalloc_array(memctx, uint8_t, MAX2(ctx->alloc, 1));
       if (!size16) {
@@ -1999,6 +2353,25 @@ agx_ilp_schedule(agx_context *ctx)
    }
 
    const unsigned budget = dynamic ? agx3_register_budget(ctx) : 0;
+   const signed device_load_cap =
+      shared_compute_loads ? agx_ilp_m5_device_load_cap(program_peak) : 0;
+   /* Wider windows for two-level indirect load chains stay inside the
+    * program's occupancy step, and that step ends where the register file
+    * the allocator can use ends: AGX3B's file ends at half 191, inside the
+    * table's 512-thread step, so a program already at the top of the file
+    * has no step left to grow into, and growing it only spills. */
+   signed chained_step_cap = 0;
+   if (shared_compute_loads) {
+      const signed file_halves = is_agx3 ? (signed)agx3_register_budget(ctx)
+                                         : AGX_ILP_M5_MAX_HALVES;
+      if (program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN <= file_halves) {
+         chained_step_cap =
+            MIN2((signed)agx_occupancy_for_register_count(
+                    program_peak + AGX_ILP_M5_OCCUPANCY_MARGIN).max_registers,
+                 file_halves) -
+            AGX_ILP_M5_OCCUPANCY_MARGIN;
+      }
+   }
 
    agx_foreach_block(ctx, block) {
       if (block->index >= nr_blocks)
@@ -2014,20 +2387,29 @@ agx_ilp_schedule(agx_context *ctx)
        * load at a time, as it would for samples. A copy block keeps its own
        * schedule. Exclude G18G (AGX3C with emit_agx3d). */
       const bool compute_loads = shared_compute_loads && !copy;
-      const unsigned loads = compute_loads ? ilp_block_compute_loads(block) : 0;
+      unsigned device_loads = 0;
+      const unsigned loads =
+         compute_loads ? ilp_block_compute_loads(block, &device_loads) : 0;
       const unsigned samples = ilp_block_samples(ctx, block);
+      const bool small_loop_loads =
+         compute_loads && in_loop[block->index] &&
+         loads >= AGX_ILP_M5_LOOP_MIN_SAMPLES &&
+         samples + loads < AGX_ILP_FS_MIN_SAMPLES &&
+         device_load_cap > 0 &&
+         (!ctx->nir || !ctx->nir->info.cs.has_cooperative_matrix);
       const bool take_compute_hoist =
          (m5_compute || copy || loop_samples) ||
          (dynamic && shared_compute_loads &&
           samples >= AGX_ILP_FS_MIN_SAMPLES) ||
          (compute_loads && (!in_loop[block->index] || loads) &&
-          samples + loads >= AGX_ILP_FS_MIN_SAMPLES);
+          (samples + loads >= AGX_ILP_FS_MIN_SAMPLES || small_loop_loads));
       if (take_compute_hoist) {
          if ((!in_loop[block->index] || copy || loop_samples || loads ||
               (dynamic && samples >= AGX_ILP_FS_MIN_SAMPLES)) &&
-             samples + loads >=
-                (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
-                              : AGX_ILP_FS_MIN_SAMPLES)) {
+             (samples + loads >=
+                 (loop_samples ? AGX_ILP_M5_LOOP_MIN_SAMPLES
+                               : AGX_ILP_FS_MIN_SAMPLES) ||
+              small_loop_loads)) {
             const signed peak = ilp_block_peak(ctx, block, size16, memctx);
             const unsigned sample_halves = dynamic || loop_samples
                ? ilp_block_sample_halves(ctx, block) : 0;
@@ -2059,23 +2441,52 @@ agx_ilp_schedule(agx_context *ctx)
                 * one no instruction has read yet, whichever first fits the
                 * register budget. This ranks candidates; register
                 * pressure and scoreboard waits remain what keeps the schedule
-                * safe. */
-               static const unsigned windows[] = {4, 2, 1};
+                * safe. Wider windows for indirect chains and AGX3B device
+                * loads must fit inside the program's current occupancy step. */
+               static const unsigned flat_windows[] = {8, 6, 4, 2, 1};
+               static const unsigned chained_windows[] = {12, 8, 4, 2, 1};
+               const bool chained =
+                  ctx->key->has_scratch &&
+                  (!ctx->nir || !ctx->nir->info.internal) &&
+                  ilp_block_has_chained_loads(ctx, block, memctx);
+               const unsigned *windows =
+                  chained ? chained_windows : flat_windows;
+               const unsigned nwindows =
+                  chained ? ARRAY_SIZE(chained_windows)
+                          : ARRAY_SIZE(flat_windows);
                /* Allow room for the load window's operands and results. */
                const signed load_growth = dynamic
                   ? ilp_dynamic_growth(program_peak, peak, budget,
                                        AGX_ILP_FS_SAMPLE_HALVES)
                   : MAX2(load_cap - peak, 0);
+               const bool wide_flat =
+                  ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                    device_loads == loads && loads > 4 &&
+                    device_load_cap > peak) ||
+                   (m5_compute && !ctx->key->dev.emit_agx3d &&
+                    in_loop[block->index] && device_loads > 4 &&
+                    device_load_cap > peak));
+               const signed step_cap = small_loop_loads || !chained
+                                          ? device_load_cap : chained_step_cap;
                /* Each window first tries interleaving independent ALU chains
                 * while loads are in flight, then the source order. */
                bool scheduled = false;
-               for (unsigned w = 0; w < ARRAY_SIZE(windows) && !scheduled; ++w) {
+               for (unsigned w = 0; w < nwindows && !scheduled; ++w) {
+                  if (!chained && windows[w] > 4 && !wide_flat)
+                     continue;
+
+                  const bool occ_cap = windows[w] > 4 || small_loop_loads;
+                  const signed w_growth =
+                     occ_cap ? MIN2(load_growth, MAX2(step_cap - peak, 0))
+                             : load_growth;
+                  if (occ_cap && w_growth <= 0)
+                     continue;
                   for (unsigned pass = 0; pass < 2 && !scheduled; ++pass) {
                      scheduled = ilp_schedule_block(
                         ctx, block, memctx, native_uniforms, alu_latency,
-                        16 * alu_latency, load_growth, 0, NULL, false, true,
+                        16 * alu_latency, w_growth, 0, NULL, false, true,
                         AGX_ILP_FS_SAMPLE_HALVES, windows[w], false, true, true,
-                        false, pass == 0, &dag_state);
+                        false, pass == 0, chained, &dag_state);
                   }
                }
             } else {
@@ -2084,12 +2495,56 @@ agx_ilp_schedule(agx_context *ctx)
                                   NULL, false, true, AGX_ILP_FS_SAMPLE_HALVES,
                                   copy ? AGX_ILP_M5_COPY_SAMPLES
                                        : AGX_ILP_FS_HOIST_SAMPLES,
-                                  copy, loads > 0, false, false, false,
+                                  copy, loads > 0, false, false, false, false,
                                   &dag_state);
             }
          }
          continue;
       }
+
+      /* On AGX3C (non-G18G) graphics shaders:
+       * - Vertex loop bodies (e.g. morph-target / multi-bone skinning loops)
+       *   batch in-flight device loads and interleave independent ALU/SFU
+       *   chains, keeping straight-line vertex blocks tight.
+       * - Fragment blocks with >= 2 device loads and < 4 texture samples
+       *   (no discard/zs_emit/single-tile-blend) batch in-flight device loads
+       *   within the shader's occupancy step so memory latency overlaps
+       *   instead of serializing one load at a time. */
+      const bool gfx_ilp_candidate =
+         (m5_vertex_ilp && in_loop[block->index] && !copy && !loop_samples &&
+          (dynamic || occupancy_cap > 0)) ||
+         (m5_fragment_ilp && occupancy_cap > 0 &&
+          samples < AGX_ILP_FS_MIN_SAMPLES &&
+          !ilp_single_tile_blend(ctx, block) &&
+          !ilp_block_has_discard_or_zs(block));
+      if (gfx_ilp_candidate) {
+         unsigned gfx_device_loads = 0;
+         ilp_block_compute_loads(block, &gfx_device_loads);
+         if (gfx_device_loads >= 2) {
+            const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+            const signed load_growth = dynamic
+               ? ilp_dynamic_growth(program_peak, peak, budget,
+                                    AGX_ILP_FS_SAMPLE_HALVES)
+               : MAX2(occupancy_cap - peak, 0);
+            if (load_growth > 0) {
+               static const unsigned gfx_windows[] = {8, 6, 4, 2, 1};
+               bool scheduled = false;
+               for (unsigned w = 0; w < ARRAY_SIZE(gfx_windows) && !scheduled;
+                    ++w) {
+                  for (unsigned pass = 0; pass < 2 && !scheduled; ++pass) {
+                     scheduled = ilp_schedule_block(
+                        ctx, block, memctx, native_uniforms, alu_latency,
+                        16 * alu_latency, load_growth, 0, NULL, false, true,
+                        AGX_ILP_FS_SAMPLE_HALVES, gfx_windows[w], false, true,
+                        true, false, pass == 0, false, &dag_state);
+                  }
+               }
+               if (scheduled)
+                  continue;
+            }
+         }
+      }
+
       /* Treat every ordered memory operation and barrier as memory across all
        * generations so pure-ALU loop scheduling never reorders protocol/helper
        * barriers, stack adjustments, or RT polling blocks. */
@@ -2107,46 +2562,95 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, NULL, is_agx3,
                             false, 0, 0, false, false, false, is_agx3 && !m5,
-                            false, &dag_state);
+                            false, false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, NULL, is_agx3, false, 0, 0,
-                            false, false, false, false, false, &dag_state);
+                            false, false, false, false, false, false,
+                            &dag_state);
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
-                 /* On AGX3B, agx3_tile_store_bank() assumes per-sample ST_TILE
-                  * stores to the same pixel_offset are serialized in r0..r7;
-                  * skip sample hoisting when a block stores multiple samples
-                  * to one target (background reloads and unrolled MSAA FS). */
-                 !(ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-                   ilp_block_has_multi_sample_tile_stores(ctx, block, memctx)) &&
-                 ilp_block_samples(ctx, block) >= AGX_ILP_FS_MIN_SAMPLES) {
+                 (samples >= AGX_ILP_FS_MIN_SAMPLES ||
+                  (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+                   samples >= 2 && !ilp_block_has_discard_or_zs(block) &&
+                   !ilp_block_has_wait_pix_before_sample(block) &&
+                   ilp_block_sfu_ops(block) >= 3))) {
          /* The pressure schedule places each sample's consumers right after
           * it, so the program waits for one sample before issuing the next.
           * Apple's fragment programs issue independent samples back to back
           * and consume the results afterwards: move each sample and what it
-          * depends on up, and keep the pressure order for everything else. */
+          * depends on up, and keep the pressure order for everything else.
+          *
+          * On AGX3B, also cover 2-3 sample SFU-heavy fragment shaders without
+          * discard, zs_emit, or WAIT_PIX interlocks strictly inside their
+          * current occupancy step, and interleave independent post-sample
+          * SFU/ALU chains across channels as on AGX3C. */
+         const bool agx3b_fragment =
+            ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B;
+         const bool agx3b_sfu_only =
+            agx3b_fragment && samples < AGX_ILP_FS_MIN_SAMPLES;
          signed slack = AGX_ILP_FS_SAMPLE_SLACK;
+         signed peak = 0;
          if (m5_fragment) {
-            const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+            peak = ilp_block_peak(ctx, block, size16, memctx);
             slack = MAX2(slack, occupancy_cap - peak);
-         } else if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B) {
+         } else if (agx3b_fragment) {
             if (!agx3b_frag_cap_ready) {
                agx3b_frag_cap =
                   agx_ilp_agx3b_fragment_cap(ctx, &size16, memctx);
                agx3b_frag_cap_ready = true;
             }
             if (size16) {
-               const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+               peak = ilp_block_peak(ctx, block, size16, memctx);
                slack = MAX2(slack, agx3b_frag_cap - peak);
             }
          }
-         ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
-                            16 * alu_latency, slack, 0, NULL, false,
-                            true, AGX_ILP_FS_SAMPLE_HALVES,
-                            AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
-                            false, false, &dag_state);
+         const signed agx3b_strict_slack =
+            agx3b_frag_cap > peak ? MIN2(slack, agx3b_frag_cap - peak) : 0;
+         bool scheduled = false;
+         if (m5_fragment_ilp && !ilp_block_has_discard_or_zs(block)) {
+            const signed tight_slack =
+               occupancy_cap > peak ? MIN2(slack, occupancy_cap - peak) : 8;
+            unsigned pbr_device_loads = 0;
+            ilp_block_compute_loads(block, &pbr_device_loads);
+            if (pbr_device_loads >= 2) {
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, alu_latency,
+                  16 * alu_latency, tight_slack, 0, NULL, false, true,
+                  AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
+                  true, false, false, true, false, &dag_state);
+            }
+            if (!scheduled) {
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, alu_latency,
+                  16 * alu_latency, tight_slack, 0, NULL, false, true,
+                  AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
+                  false, false, false, true, false, &dag_state);
+            }
+         } else if (agx3b_fragment && !ilp_block_has_discard_or_zs(block) &&
+                    !ilp_block_has_wait_pix_before_sample(block)) {
+            if (agx3b_strict_slack > 0) {
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, alu_latency,
+                  16 * alu_latency, agx3b_strict_slack, 0, NULL, false, true,
+                  AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
+                  false, false, false, true, false, &dag_state);
+            }
+         }
+         if (!scheduled && !agx3b_sfu_only &&
+             !(agx3b_fragment && ilp_block_has_wait_pix_before_sample(block))) {
+            const signed fallback_slack =
+               agx3b_fragment ? agx3b_strict_slack : slack;
+            if (!agx3b_fragment || fallback_slack > 0) {
+               ilp_schedule_block(ctx, block, memctx, native_uniforms,
+                                  alu_latency, 16 * alu_latency, fallback_slack,
+                                  0, NULL, false, true,
+                                  AGX_ILP_FS_SAMPLE_HALVES,
+                                  AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
+                                  false, false, false, &dag_state);
+            }
+         }
       } else if (!in_loop[block->index] && ctx->is_preamble) {
          /* A constant program's device loads are mostly independent, but the
           * pressure schedule places each right before its uniform store, so
@@ -2177,7 +2681,7 @@ agx_ilp_schedule(agx_context *ctx)
                                16 * alu_latency, cprog_slack,
                                cprog_cap, size16, false, true,
                                cprog_cap - 16, 0, false, false, false,
-                               false, false, &dag_state);
+                               false, false, false, &dag_state);
          }
       }
    }
@@ -2189,4 +2693,140 @@ agx_ilp_schedule(agx_context *ctx)
 
    free(dag_state.last_write);
    ralloc_free(memctx);
+}
+
+#define AGX_HOIST_WINDOW 64
+
+static bool
+hoist_uniform_store_conflict(const agx_instr *store, const agx_instr *instr)
+{
+   if (store->src[1].type != AGX_INDEX_IMMEDIATE)
+      return true;
+
+   unsigned lo = store->src[1].value, hi = lo + 16;
+
+   agx_foreach_src(instr, s) {
+      agx_index src = instr->src[s];
+      if (src.type != AGX_INDEX_UNIFORM)
+         continue;
+
+      unsigned src_lo = src.value, src_hi = src_lo + agx_index_size_16(src);
+      if (src_lo < hi && lo < src_hi)
+         return true;
+   }
+
+   return false;
+}
+
+static bool
+hoist_can_cross(const agx_instr *P, const agx_instr *instr)
+{
+   if (P->op == AGX_OPCODE_THREADGROUP_BARRIER ||
+       P->op == AGX_OPCODE_LOCAL_LOAD || P->op == AGX_OPCODE_LOCAL_STORE)
+      return true;
+
+   if (P->op == AGX_OPCODE_DEVICE_LOAD)
+      return !P->coherent;
+
+   if (P->op == AGX_OPCODE_UNIFORM_STORE)
+      return !hoist_uniform_store_conflict(P, instr);
+
+   const struct agx_opcode_info *info = &agx_opcodes_info[P->op];
+   return info->schedule_class == AGX_SCHEDULE_CLASS_NONE &&
+          info->can_reorder && info->can_eliminate;
+}
+
+static bool
+hoist_is_pure_addr_producer(const agx_instr *P)
+{
+   if (P->op == AGX_OPCODE_PHI || P->op == AGX_OPCODE_PRELOAD ||
+       P->nr_dests == 0)
+      return false;
+
+   const struct agx_opcode_info *info = &agx_opcodes_info[P->op];
+   if (info->schedule_class != AGX_SCHEDULE_CLASS_NONE ||
+       !info->can_reorder || !info->can_eliminate)
+      return false;
+
+   agx_foreach_dest(P, d) {
+      if (!agx_is_null(P->dest[d]) && P->dest[d].type != AGX_INDEX_NORMAL)
+         return false;
+   }
+
+   agx_foreach_src(P, s) {
+      if (agx_is_null(P->src[s]))
+         continue;
+      enum agx_index_type t = P->src[s].type;
+      if (t != AGX_INDEX_NORMAL && t != AGX_INDEX_UNIFORM &&
+          t != AGX_INDEX_IMMEDIATE)
+         return false;
+   }
+
+   return true;
+}
+
+void
+agx_hoist_loads(agx_context *ctx)
+{
+   agx_foreach_block(ctx, block) {
+      agx_foreach_instr_in_block_safe(block, I) {
+         if (instr_after_logical_end(I))
+            break;
+
+         if (I->op != AGX_OPCODE_DEVICE_LOAD || I->coherent)
+            continue;
+
+         agx_instr *chain[4];
+         unsigned chain_len = 1;
+         chain[0] = I;
+
+         agx_instr *best_target = NULL;
+         unsigned best_chain_len = 0;
+         unsigned n = 0;
+
+         for (agx_instr *P = list_entry(I->link.prev, agx_instr, link);
+              &P->link != &block->instructions && n < AGX_HOIST_WINDOW;
+              P = list_entry(P->link.prev, agx_instr, link), ++n) {
+
+            bool dep = false;
+            for (unsigned ci = 0; ci < chain_len && !dep; ++ci) {
+               agx_foreach_ssa_dest(P, d) {
+                  agx_foreach_ssa_src(chain[ci], s) {
+                     if (chain[ci]->src[s].value == P->dest[d].value)
+                        dep = true;
+                  }
+               }
+            }
+
+            if (dep) {
+               if (chain_len < ARRAY_SIZE(chain) &&
+                   hoist_is_pure_addr_producer(P)) {
+                  chain[chain_len++] = P;
+                  continue;
+               }
+               break;
+            }
+
+            bool can_cross_all = true;
+            for (unsigned ci = 0; ci < chain_len; ++ci) {
+               if (!hoist_can_cross(P, chain[ci])) {
+                  can_cross_all = false;
+                  break;
+               }
+            }
+            if (!can_cross_all)
+               break;
+
+            best_target = P;
+            best_chain_len = chain_len;
+         }
+
+         if (best_target) {
+            for (int ci = (int)best_chain_len - 1; ci >= 0; --ci) {
+               agx_remove_instruction(chain[ci]);
+               list_addtail(&chain[ci]->link, &best_target->link);
+            }
+         }
+      }
+   }
 }
