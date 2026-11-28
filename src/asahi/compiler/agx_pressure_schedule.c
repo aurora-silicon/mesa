@@ -792,9 +792,10 @@ ilp_latency(const agx_context *ctx, const agx_instr *I, unsigned alu,
    case AGX_OPCODE_LOCAL_ATOMIC:
       return load;
    case AGX_OPCODE_RSQRT:
-      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-           ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) ||
-          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble)
+         return MAX2(3 * alu, 5u);
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
            !ctx->key->dev.emit_agx3d) ||
           sfu_ilp)
          return 3 * alu;
@@ -805,9 +806,10 @@ ilp_latency(const agx_context *ctx, const agx_instr *I, unsigned alu,
    case AGX_OPCODE_LOG2:
    case AGX_OPCODE_EXP2:
    case AGX_OPCODE_SIN_PT_2:
-      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-           ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble) ||
-          (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
+      if (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
+          ctx->stage == MESA_SHADER_FRAGMENT && !ctx->is_preamble)
+         return MAX2(2 * alu, 4u);
+      if ((ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3C &&
            !ctx->key->dev.emit_agx3d) ||
           sfu_ilp)
          return 2 * alu;
@@ -1287,7 +1289,8 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                    unsigned hoist_samples, bool hoist_past_writes,
                    bool hoist_loads, bool loads_in_flight, bool interleave_alu,
                    bool interleave_in_flight, bool chained_loads,
-                   bool sfu_ilp, struct sched_dag_state *dag_state)
+                   bool sfu_ilp, bool pin_tile_loads,
+                   struct sched_dag_state *dag_state)
 {
    struct util_dynarray all;
    util_dynarray_init(&all, memctx);
@@ -1301,6 +1304,30 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
    if (n < 3)
       return false;
    struct sched_node **nodes = all.data;
+
+   if (pin_tile_loads) {
+      bool has_load = false;
+      unsigned last_load = 0;
+      for (unsigned i = 0; i < n; ++i) {
+         const enum agx_opcode op = nodes[i]->instr->op;
+         if (op == AGX_OPCODE_LD_TILE || op == AGX_OPCODE_TEXTURE_SAMPLE ||
+             op == AGX_OPCODE_TEXTURE_LOAD || op == AGX_OPCODE_IMAGE_LOAD) {
+            last_load = i;
+            has_load = true;
+         }
+      }
+      if (has_load) {
+         /* Keep the prefix through the last tile/texture read in pressure order
+          * so loads and their immediate format conversions never hoist across
+          * each other, reorder across a preceding WAIT_PIX, or grow live load
+          * state; schedule the post-load SFU/ALU body strictly inside the
+          * block's register granule. */
+         for (unsigned i = 1; i <= last_load; ++i)
+            add_dep(nodes[i], nodes[i - 1]);
+         for (unsigned i = last_load + 1; i < n; ++i)
+            add_dep(nodes[i], nodes[last_load]);
+      }
+   }
 
    unsigned *ndeps = rzalloc_array(memctx, unsigned, n);
    unsigned *height = rzalloc_array(memctx, unsigned, n);
@@ -1572,6 +1599,19 @@ ilp_schedule_block(agx_context *ctx, agx_block *block, void *memctx,
                 * ALU consumer stalled on an earlier load) or ready work that
                 * consumes no load, prefer what is ready earlier. */
                better = t < best_t;
+            else
+               better = false;
+         } else if (pin_tile_loads) {
+            /* Latency-driven interleaving with pressure-order tie-breaking:
+             * fill SFU stall cycles with the earliest ready independent work
+             * without hoisting unrelated consumers across the block. When
+             * generous headroom remains below the forward cap, break
+             * equal-ready ties by critical-path height so symmetric multi-
+             * channel SFU chains launch together. */
+            if (t != best_t)
+               better = t < best_t;
+            else if (fwd_cap > 0 && live + 12 <= eff_fwd_cap)
+               better = height[i] > height[best];
             else
                better = false;
          } else if (!interleave_alu) {
@@ -2066,6 +2106,89 @@ ilp_block_has_wait_pix_before_sample(const agx_block *block)
    return false;
 }
 
+/* True for AGX3B fragment blocks with multiple SFU operations paired with
+ * either multi-RT on-chip tile reads (deferred tile 1x and MSAA PIXINFO loops)
+ * or a single texture read (such as single-source tonemapping), and no other
+ * memory traffic, interlocks, or barriers. Blocks with >= 2 texture samples
+ * stay on the multi-sample hoist path below. Pinning the load/sample prefix
+ * and scheduling the post-load body strictly inside the block's register
+ * granule hides SFU latency without hoisting loads, crossing a preceding
+ * WAIT_PIX, or crossing a register allocation boundary. */
+static bool
+ilp_agx3b_tile_read_sfu_block(const agx_context *ctx, const agx_block *block)
+{
+   if (ctx->key->dev.encoding != AGX_ISA_ENCODING_AGX3B ||
+       ctx->stage != MESA_SHADER_FRAGMENT || ctx->is_preamble ||
+       ctx->any_interlock || ilp_block_has_discard_or_zs(block))
+      return false;
+
+   unsigned tile_loads = 0;
+   unsigned samples = 0;
+   unsigned sfu_ops = 0;
+   bool saw_wait_pix = false;
+   bool saw_non_read_wait_pix = false;
+   agx_foreach_instr_in_block(block, I) {
+      if (instr_after_logical_end(I))
+         break;
+      switch (I->op) {
+      case AGX_OPCODE_LD_TILE:
+         /* Allow the standard tile-read wait (writeout == 0x8) ahead of
+          * LD_TILE since pin_tile_loads pins 0..last_load in exact order;
+          * bail on any other WAIT_PIX (such as a 0xC interlock) before
+          * LD_TILE. */
+         if (I->sample_groups || saw_non_read_wait_pix)
+            return false;
+         tile_loads++;
+         break;
+      case AGX_OPCODE_TEXTURE_SAMPLE:
+      case AGX_OPCODE_TEXTURE_LOAD:
+         if (saw_wait_pix)
+            return false;
+         samples++;
+         break;
+      case AGX_OPCODE_ST_TILE:
+         break;
+      case AGX_OPCODE_WAIT_PIX:
+         saw_wait_pix = true;
+         if (I->writeout != 0x8)
+            saw_non_read_wait_pix = true;
+         break;
+      case AGX_OPCODE_RSQRT:
+      case AGX_OPCODE_RCP:
+      case AGX_OPCODE_LOG2:
+      case AGX_OPCODE_EXP2:
+      case AGX_OPCODE_SIN_PT_2:
+         sfu_ops++;
+         break;
+      case AGX_OPCODE_DEVICE_LOAD:
+      case AGX_OPCODE_DEVICE_STORE:
+      case AGX_OPCODE_ATOMIC:
+      case AGX_OPCODE_LOCAL_LOAD:
+      case AGX_OPCODE_LOCAL_STORE:
+      case AGX_OPCODE_LOCAL_ATOMIC:
+      case AGX_OPCODE_IMAGE_LOAD:
+      case AGX_OPCODE_IMAGE_WRITE:
+      case AGX_OPCODE_STACK_LOAD:
+      case AGX_OPCODE_STACK_STORE:
+      case AGX_OPCODE_BLOCK_IMAGE_STORE:
+         return false;
+      default: {
+         const enum agx_schedule_class cls =
+            agx_opcodes_info[I->op].schedule_class;
+         if (cls == AGX_SCHEDULE_CLASS_LOAD ||
+             cls == AGX_SCHEDULE_CLASS_STORE ||
+             cls == AGX_SCHEDULE_CLASS_ATOMIC ||
+             cls == AGX_SCHEDULE_CLASS_BARRIER)
+            return false;
+         break;
+      }
+      }
+   }
+   if (tile_loads >= 2 && samples == 0 && sfu_ops >= 3)
+      return true;
+   return tile_loads == 0 && samples == 1 && sfu_ops >= 3;
+}
+
 /* M5 compute sample-issue budget: register halves kept free below an
  * occupancy bucket for allocation alignment, and the register file size. */
 #define AGX_ILP_M5_OCCUPANCY_MARGIN 8
@@ -2146,6 +2269,17 @@ ilp_static_compute_cap(const agx_context *ctx)
 /* Highest occupancy step inside AGX3B's 192-half register file (also matching
  * the 2D_MS_ARRAY cap in RA). */
 #define AGX_ILP_AGX3B_MAX_HALVES 184
+
+/* First AGX3B hardware register-file granule (48 halves = r0l..r23h,
+ * max_reg <= 47). Small SFU-heavy fragment blocks stay strictly inside this
+ * granule so RA keeps nr_gprs <= 48 and concurrent TA/FS overlap does not
+ * lose a hardware granule. */
+#define AGX_ILP_AGX3B_GRANULE_HALVES     48
+#define AGX_ILP_AGX3B_TILE_GRANULE_CAP   (AGX_ILP_AGX3B_GRANULE_HALVES - 10)
+#define AGX_ILP_AGX3B_TILE_FWD_FLOOR     (AGX_ILP_AGX3B_GRANULE_HALVES / 2)
+#define AGX_ILP_AGX3B_TILE_FWD_MIN       (AGX_ILP_AGX3B_TILE_FWD_FLOOR - 6)
+#define AGX_ILP_AGX3B_SAMPLE_GRANULE_CAP (AGX_ILP_AGX3B_GRANULE_HALVES - 4)
+#define AGX_ILP_AGX3B_SAMPLE_GRANULE_FWD (AGX_ILP_AGX3B_GRANULE_HALVES - 6)
 
 static int
 agx_ilp_agx3b_fragment_max_halves(const agx_context *ctx)
@@ -2519,7 +2653,7 @@ agx_ilp_schedule(agx_context *ctx)
                         ctx, block, memctx, native_uniforms, alu_latency,
                         16 * alu_latency, w_growth, 0, NULL, false, true,
                         AGX_ILP_FS_SAMPLE_HALVES, windows[w], false, true, true,
-                        false, pass == 0, chained, false, &dag_state);
+                        false, pass == 0, chained, false, false, &dag_state);
                   }
                }
             } else {
@@ -2529,7 +2663,7 @@ agx_ilp_schedule(agx_context *ctx)
                                   copy ? AGX_ILP_M5_COPY_SAMPLES
                                        : AGX_ILP_FS_HOIST_SAMPLES,
                                   copy, loads > 0, false, false, false, false,
-                                  false, &dag_state);
+                                  false, false, &dag_state);
             }
          }
          continue;
@@ -2569,7 +2703,8 @@ agx_ilp_schedule(agx_context *ctx)
                         ctx, block, memctx, native_uniforms, alu_latency,
                         16 * alu_latency, load_growth, 0, NULL, false, true,
                         AGX_ILP_FS_SAMPLE_HALVES, gfx_windows[w], false, true,
-                        true, false, pass == 0, false, false, &dag_state);
+                        true, false, pass == 0, false, false, false,
+                        &dag_state);
                   }
                }
                if (scheduled)
@@ -2595,18 +2730,52 @@ agx_ilp_schedule(agx_context *ctx)
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, AGX_ILP_SLACK, 0, NULL, is_agx3,
                             false, 0, 0, false, false, false, is_agx3 && !m5,
-                            false, false, false, &dag_state);
+                            false, false, false, false, &dag_state);
       } else if (!in_loop[block->index] && ilp_single_tile_blend(ctx, block)) {
          /* Hardware-qualified color-only budget; leave loop pressure alone. */
          ilp_schedule_block(ctx, block, memctx, native_uniforms, alu_latency,
                             4 * alu_latency, 8, 0, NULL, is_agx3, false, 0, 0,
-                            false, false, false, false, false, false,
+                            false, false, false, false, false, false, false,
                             false, &dag_state);
+      } else if (ilp_agx3b_tile_read_sfu_block(ctx, block)) {
+         /* Keep the load/sample prefix pinned and schedule post-load SFU/ALU
+          * chains strictly inside the block's 48-half register granule
+          * (nr_gprs <= 48, max_reg <= 47) so concurrent TA/FS overlap never
+          * loses a hardware granule. */
+         if (!agx3b_frag_cap_ready) {
+            agx3b_frag_cap = agx_ilp_agx3b_fragment_cap(
+               ctx, &size16, memctx, &agx3b_frag_program_peak);
+            agx3b_frag_cap_ready = true;
+         }
+         if (size16 && agx3b_frag_cap > 0) {
+            const signed peak = ilp_block_peak(ctx, block, size16, memctx);
+            const signed hard_cap =
+               peak <= AGX_ILP_AGX3B_TILE_GRANULE_CAP
+                  ? MIN2(agx3b_frag_cap, AGX_ILP_AGX3B_TILE_GRANULE_CAP)
+               : peak <= AGX_ILP_AGX3B_GRANULE_HALVES
+                  ? MIN2(agx3b_frag_cap, peak)
+                  : agx3b_frag_cap;
+            const signed base_fwd =
+               MAX2(hard_cap, AGX_ILP_AGX3B_TILE_FWD_FLOOR);
+            bool scheduled = false;
+            for (signed drop = 0; drop <= 16 && !scheduled; drop += 2) {
+               const signed fwd =
+                  MAX2(base_fwd - drop, AGX_ILP_AGX3B_TILE_FWD_MIN);
+               /* Use unit ALU latency so only multi-cycle SFU operations
+                * trigger local reordering out of pressure order, hiding SFU
+                * stalls without inflating GPR count. */
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, 1, 1, 0, hard_cap,
+                  size16, in_loop[block->index], false, fwd, 0, false, false,
+                  false, false, false, false, false, true, &dag_state);
+            }
+         }
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
                  ctx->stage == MESA_SHADER_FRAGMENT &&
                  (samples >= AGX_ILP_FS_MIN_SAMPLES ||
                   (ctx->key->dev.encoding == AGX_ISA_ENCODING_AGX3B &&
-                   samples >= 2 && !ilp_block_has_discard_or_zs(block) &&
+                   samples >= 2 && !ctx->any_interlock &&
+                   !ilp_block_has_discard_or_zs(block) &&
                    !ilp_block_has_wait_pix_before_sample(block) &&
                    ilp_block_sfu_ops(block, false) >= 3))) {
          /* The pressure schedule places each sample's consumers right after
@@ -2639,8 +2808,31 @@ agx_ilp_schedule(agx_context *ctx)
                slack = MAX2(slack, agx3b_frag_cap - peak);
             }
          }
+         const bool agx3b_wait_pix_interlock =
+            agx3b_fragment &&
+            (ctx->any_interlock || ilp_block_has_wait_pix_before_sample(block));
+         const bool agx3b_sfu_block =
+            agx3b_fragment && size16 && agx3b_frag_cap > 0 &&
+            samples >= AGX_ILP_FS_MIN_SAMPLES &&
+            !agx3b_wait_pix_interlock &&
+            !ilp_block_has_discard_or_zs(block) &&
+            ilp_block_sfu_ops(block, false) >= 3;
+         signed agx3b_cap = agx3b_frag_cap;
+         signed agx3b_fwd = AGX_ILP_FS_SAMPLE_HALVES;
+         if (agx3b_sfu_block && peak >= AGX_ILP_AGX3B_SAMPLE_GRANULE_CAP &&
+             peak <= AGX_ILP_AGX3B_GRANULE_HALVES) {
+            /* A 4+ sample SFU block already sitting in the top margin of the
+             * 48-half granule (44..48 halves) has no headroom left to hoist
+             * four samples inside 48 halves; cap #1293 and both retries at
+             * peak so RA stays inside the 48-half granule instead of jumping
+             * to 72 halves, while smaller blocks (peak < 44) keep #1293's
+             * occupancy-step hoisting. */
+            agx3b_cap = MIN2(agx3b_frag_cap, peak);
+            agx3b_fwd =
+               MIN2(AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_AGX3B_SAMPLE_GRANULE_FWD);
+         }
          const signed agx3b_strict_slack =
-            agx3b_frag_cap > peak ? MIN2(slack, agx3b_frag_cap - peak) : 0;
+            agx3b_cap > peak ? MIN2(slack, agx3b_cap - peak) : 0;
          bool scheduled = false;
          if (m5_fragment_ilp && !ilp_block_has_discard_or_zs(block)) {
             const signed tight_slack =
@@ -2652,36 +2844,53 @@ agx_ilp_schedule(agx_context *ctx)
                   ctx, block, memctx, native_uniforms, alu_latency,
                   16 * alu_latency, tight_slack, 0, NULL, false, true,
                   AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
-                  true, false, false, true, false, false, &dag_state);
+                  true, false, false, true, false, false, false, &dag_state);
             }
             if (!scheduled) {
                scheduled = ilp_schedule_block(
                   ctx, block, memctx, native_uniforms, alu_latency,
                   16 * alu_latency, tight_slack, 0, NULL, false, true,
                   AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
-                  false, false, false, true, false, false, &dag_state);
+                  false, false, false, true, false, false, false, &dag_state);
             }
-         } else if (agx3b_fragment && !ilp_block_has_discard_or_zs(block) &&
-                    !ilp_block_has_wait_pix_before_sample(block)) {
+         } else if (agx3b_fragment && !agx3b_wait_pix_interlock &&
+                    !ilp_block_has_discard_or_zs(block)) {
             if (agx3b_strict_slack > 0) {
                scheduled = ilp_schedule_block(
                   ctx, block, memctx, native_uniforms, alu_latency,
-                  16 * alu_latency, agx3b_strict_slack, 0, NULL, false, true,
-                  AGX_ILP_FS_SAMPLE_HALVES, AGX_ILP_FS_HOIST_SAMPLES, false,
-                  false, false, false, true, false, false, &dag_state);
+                  16 * alu_latency, agx3b_strict_slack,
+                  size16 && agx3b_cap > 0 ? agx3b_cap : 0,
+                  size16 && agx3b_cap > 0 ? size16 : NULL, false, true,
+                  agx3b_fwd, AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
+                  false, true, false, false, false, &dag_state);
+            }
+            if (!scheduled && agx3b_sfu_block) {
+               /* When full ALU+sample interleaving exceeds the shader's
+                * register cap or has zero slack above peak (e.g. large
+                * multi-sample deferred lighting), fall back to unit ALU
+                * latency with hard cap agx3b_cap so post-sample SFU chains
+                * still interleave strictly inside the applicable bound. */
+               scheduled = ilp_schedule_block(
+                  ctx, block, memctx, native_uniforms, 1, 16,
+                  agx3b_strict_slack, agx3b_cap, size16, false, true, agx3b_fwd,
+                  AGX_ILP_FS_HOIST_SAMPLES, false, false, false, false, true,
+                  false, false, false, &dag_state);
             }
          }
-         if (!scheduled && !agx3b_sfu_only &&
-             !(agx3b_fragment && ilp_block_has_wait_pix_before_sample(block))) {
+         if (!scheduled && !agx3b_sfu_only && !agx3b_wait_pix_interlock) {
             const signed fallback_slack =
                agx3b_fragment ? agx3b_strict_slack : slack;
-            if (!agx3b_fragment || fallback_slack > 0) {
+            if (!agx3b_fragment ||
+                (size16 && agx3b_cap > 0 && fallback_slack > 0)) {
                ilp_schedule_block(ctx, block, memctx, native_uniforms,
                                   alu_latency, 16 * alu_latency, fallback_slack,
-                                  0, NULL, false, true,
-                                  AGX_ILP_FS_SAMPLE_HALVES,
+                                  agx3b_fragment ? agx3b_cap : 0,
+                                  agx3b_fragment ? size16 : NULL, false, true,
+                                  agx3b_fragment ? agx3b_fwd
+                                                 : AGX_ILP_FS_SAMPLE_HALVES,
                                   AGX_ILP_FS_HOIST_SAMPLES, false, false, false,
-                                  false, false, false, false, &dag_state);
+                                  false, false, false, false, false,
+                                  &dag_state);
             }
          }
       } else if (!in_loop[block->index] && !ctx->is_preamble &&
@@ -2720,7 +2929,7 @@ agx_ilp_schedule(agx_context *ctx)
                                   alu_latency, 4 * alu_latency, sfu_slack,
                                   sfu_cap, size16, false, false, 0, 0,
                                   false, false, false, false, false, false,
-                                  true, &dag_state);
+                                  true, false, &dag_state);
             }
          }
       } else if (!in_loop[block->index] && ctx->is_preamble) {
@@ -2753,7 +2962,7 @@ agx_ilp_schedule(agx_context *ctx)
                                16 * alu_latency, cprog_slack,
                                cprog_cap, size16, false, true,
                                cprog_cap - 16, 0, false, false, false,
-                               false, false, false, false, &dag_state);
+                               false, false, false, false, false, &dag_state);
          }
       }
    }
