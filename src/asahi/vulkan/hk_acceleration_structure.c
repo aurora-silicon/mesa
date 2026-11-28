@@ -2017,7 +2017,22 @@ static const struct vk_acceleration_structure_build_ops hk_native_as_build_ops =
    .encode = hk_encode,
 };
 
+/* PLOC merges clusters in rounds that workgroups wait on each other to
+ * finish, and Apple GPUs do not guarantee a waiting workgroup lets the
+ * others run: on the M3 a 16K-triangle PLOC build never finished and the
+ * GPU had to stop. H-PLOC builds the same kind of tree bottom-up without
+ * those waits; the native builder already uses it.
+ */
+static void
+hk_soft_build_config(VkDevice device,
+                     struct vk_acceleration_structure_build_state *state)
+{
+   if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_PLOC)
+      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
+}
+
 static const struct vk_acceleration_structure_build_ops hk_as_build_ops = {
+   .get_build_config = hk_soft_build_config,
    .get_as_size = hk_get_as_size,
    .get_encode_scratch_size = hk_get_encode_scratch_size,
    .encode = hk_encode,
