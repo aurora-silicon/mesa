@@ -7422,6 +7422,48 @@ build_stereo_sad_u8_kernel(nir_builder *b,
    nir_pop_if(b, NULL);
 }
 
+/* Keep the tiled and fused Sobel's stores bit-identical. The fused
+ * kernel also retains the exact u16 magnitude in its shared tile. */
+static void
+sobel_3x3_outputs(nir_builder *b, nir_def *gx_i, nir_def *gy_i,
+                  nir_def *c_lo, nir_def *c_hi, nir_def **mag_f32,
+                  nir_def **dir, nir_def **mag_u16)
+{
+   nir_def *agy_i = nir_iabs(b, gy_i);
+   nir_def *agx_i = nir_iabs(b, gx_i);
+
+   /* Exact L1 magnitude in i16 ([0, 2040]) -> f32. */
+   nir_def *mag = nir_iadd(b, agy_i, agx_i);
+   *mag_f32 = nir_u2f32(b, mag);
+   if (mag_u16)
+      *mag_u16 = mag;
+
+   /* Replace SFU frcp(gy) with cross-multiplied threshold comparisons:
+    * |gx / gy| < c_lo  <=>  |gx| < |gy| * c_lo
+    * c_hi < |gx / gy|  <=>  |gy| * c_hi < |gx|
+    * Bit-exact across all (gx, gy) in [-1020, 1020]^2 including gy == 0
+    * (both (0, 0) -> false/false and (gx != 0, 0) -> false/true).
+    * Direction constants include the final (q + 6) & 7 rotation. */
+   nir_def *agx = nir_u2f32(b, agx_i);
+   nir_def *agy = nir_u2f32(b, agy_i);
+   nir_def *lt_lo = nir_flt(b, agx, nir_fmul(b, agy, c_lo));
+   nir_def *gt_hi = nir_flt(b, nir_fmul(b, agy, c_hi), agx);
+
+   nir_def *gx_neg = nir_ilt_imm(b, gx_i, 0);
+   nir_def *gy_neg = nir_ilt_imm(b, gy_i, 0);
+   nir_def *d_neg_gy =
+      nir_bcsel(b, gx_neg, nir_imm_int(b, 3), nir_imm_int(b, 1));
+   nir_def *d_pos_gy =
+      nir_bcsel(b, gx_neg, nir_imm_int(b, 5), nir_imm_int(b, 7));
+   nir_def *diag = nir_bcsel(b, gy_neg, d_neg_gy, d_pos_gy);
+   nir_def *q0 = nir_bcsel(
+      b, lt_lo,
+      nir_bcsel(b, gy_neg, nir_imm_int(b, 2), nir_imm_int(b, 6)), diag);
+   *dir = nir_bcsel(
+      b, gt_hi,
+      nir_bcsel(b, gx_neg, nir_imm_int(b, 4), nir_imm_int(b, 0)), q0);
+}
+
 /* 2D shared-memory 3x3 Sobel gradient magnitude + quantized direction:
  *   Tile 128x8 (1024 px/WG), WG 256x1x1 (32x8 logical, 4 horizontal px/thread).
  *   Shared memory: 10 rows x 35 u8x4 (= 140 B/row >= 130 B, odd u32 stride)
@@ -7613,36 +7655,8 @@ build_sobel_3x3_u8_kernel(nir_builder *b,
 
          nir_def *gy_i = nir_isub(b, top, bot);
          nir_def *gx_i = nir_isub(b, lft, rgt);
-         nir_def *agy_i = nir_iabs(b, gy_i);
-         nir_def *agx_i = nir_iabs(b, gx_i);
-
-         /* Exact L1 magnitude in i16 ([0, 2040]) -> f32. */
-         mag_out[t] = nir_u2f32(b, nir_iadd(b, agy_i, agx_i));
-
-         /* Replace SFU frcp(gy) with cross-multiplied threshold comparisons:
-          * |gx / gy| < c_lo  <=>  |gx| < |gy| * c_lo
-          * c_hi < |gx / gy|  <=>  |gy| * c_hi < |gx|
-          * Bit-exact across all (gx, gy) in [-1020, 1020]^2 including gy == 0
-          * (both (0, 0) -> false/false and (gx != 0, 0) -> false/true).
-          * Direction constants include the final (q + 6) & 7 rotation. */
-         nir_def *agx = nir_u2f32(b, agx_i);
-         nir_def *agy = nir_u2f32(b, agy_i);
-         nir_def *lt_lo = nir_flt(b, agx, nir_fmul(b, agy, c_lo));
-         nir_def *gt_hi = nir_flt(b, nir_fmul(b, agy, c_hi), agx);
-
-         nir_def *gx_neg = nir_ilt_imm(b, gx_i, 0);
-         nir_def *gy_neg = nir_ilt_imm(b, gy_i, 0);
-         nir_def *d_neg_gy =
-            nir_bcsel(b, gx_neg, nir_imm_int(b, 3), nir_imm_int(b, 1));
-         nir_def *d_pos_gy =
-            nir_bcsel(b, gx_neg, nir_imm_int(b, 5), nir_imm_int(b, 7));
-         nir_def *diag = nir_bcsel(b, gy_neg, d_neg_gy, d_pos_gy);
-         nir_def *q0 = nir_bcsel(
-            b, lt_lo,
-            nir_bcsel(b, gy_neg, nir_imm_int(b, 2), nir_imm_int(b, 6)), diag);
-         dir_out[t] = nir_bcsel(
-            b, gt_hi,
-            nir_bcsel(b, gx_neg, nir_imm_int(b, 4), nir_imm_int(b, 0)), q0);
+         sobel_3x3_outputs(b, gx_i, gy_i, c_lo, c_hi, &mag_out[t],
+                           &dir_out[t], NULL);
       }
 
       nir_def *wm1 = nir_iadd_imm(b, width, -1);
@@ -8045,6 +8059,457 @@ hk_nir_build_tiled_2d_stencil(void *mem_ctx, const nir_shader *orig_nir,
 
    nir_lower_vars_to_ssa(b.shader);
    nir_validate_shader(b.shader, "after hk_nir_build_tiled_2d_stencil");
+   return b.shader;
+}
+
+/* ---------------------------------------------------------------------------
+ * Fused 3x3 Sobel + Canny NMS (hk_2d_stencil.h, hk_nir_build_sobel_nms())
+ * --------------------------------------------------------------------------- */
+
+#define SOBEL_NMS_TILE_W   128
+#define SOBEL_NMS_TILE_H   8
+/* Source window: two pixels on each side of the tile (the Sobel of the
+ * one-pixel magnitude ring needs one more). Row stride 35 u8x4 (odd). */
+#define SOBEL_NMS_SRC_ROWS (SOBEL_NMS_TILE_H + 4)
+#define SOBEL_NMS_SRC_W    (SOBEL_NMS_TILE_W + 4)
+#define SOBEL_NMS_SRC_U4   35
+/* Magnitude window: the tile and a one-pixel ring, as u16 (|gx| + |gy| is at
+ * most 2040). Column c holds x = tile_x - 4 + c, so the tile starts at the
+ * 8-byte aligned column 4 and the ring is at columns 3 and 132. */
+#define SOBEL_NMS_MAG_ROWS (SOBEL_NMS_TILE_H + 2)
+#define SOBEL_NMS_MAG_W    136
+/* Ring cells: two rows of 130 and two columns of 8. */
+#define SOBEL_NMS_RING     (2 * (SOBEL_NMS_TILE_W + 2) + 2 * SOBEL_NMS_TILE_H)
+
+bool
+hk_2d_stencil_sobel_nms_supported(const struct hk_2d_stencil_plan *plan)
+{
+   return plan && plan->kind == HK_2D_STENCIL_SOBEL_3X3_U8 &&
+          plan->tile_w == SOBEL_NMS_TILE_W && plan->tile_h == SOBEL_NMS_TILE_H &&
+          plan->width_pc_offset_B + 4u <= HK_SOBEL_NMS_PUSH_OFFSET_B &&
+          plan->height_pc_offset_B + 4u <= HK_SOBEL_NMS_PUSH_OFFSET_B &&
+          plan->stride_pc_offset_B + 4u <= HK_SOBEL_NMS_PUSH_OFFSET_B;
+}
+
+static nir_def *
+sobel_nms_pc(nir_builder *b, unsigned field)
+{
+   return load_pc_i32(b, HK_SOBEL_NMS_PUSH_OFFSET_B + 4 * field);
+}
+
+/* gx and gy of the 3x3 taps p[row][col], as build_sobel_3x3_u8_kernel()
+ * computes them. */
+static void
+sobel_nms_grad(nir_builder *b, nir_def *const p[3][3], nir_def **gx,
+               nir_def **gy)
+{
+   nir_def *top = nir_iadd(b, nir_iadd(b, p[0][0], p[0][2]),
+                           nir_ishl_imm(b, p[0][1], 1));
+   nir_def *bot = nir_iadd(b, nir_iadd(b, p[2][0], p[2][2]),
+                           nir_ishl_imm(b, p[2][1], 1));
+   nir_def *lft = nir_iadd(b, nir_iadd(b, p[0][0], p[2][0]),
+                           nir_ishl_imm(b, p[1][0], 1));
+   nir_def *rgt = nir_iadd(b, nir_iadd(b, p[0][2], p[2][2]),
+                           nir_ishl_imm(b, p[1][2], 1));
+   *gy = nir_isub(b, top, bot);
+   *gx = nir_isub(b, lft, rgt);
+}
+
+/* Whether (x, y) is a pixel the Sobel computes: not on the image border. */
+static nir_def *
+sobel_nms_interior(nir_builder *b, nir_def *x, nir_def *y, nir_def *width,
+                   nir_def *height)
+{
+   return nir_iand(
+      b,
+      nir_iand(b, nir_ige_imm(b, x, 1), nir_ilt(b, x, nir_iadd_imm(b, width, -1))),
+      nir_iand(b, nir_ige_imm(b, y, 1), nir_ilt(b, y, nir_iadd_imm(b, height, -1))));
+}
+
+static nir_def *
+sobel_nms_mag_idx(nir_builder *b, nir_def *mrow, nir_def *mcol)
+{
+   return nir_iadd(b, nir_imul_imm(b, mrow, SOBEL_NMS_MAG_W), mcol);
+}
+
+/* One pixel's NMS class from the magnitude window, as eval_nms_pixel()
+ * computes it from mag and dir in memory: 0 unless mag > low and mag is
+ * greater than both neighbors along dir, then 2 if mag > high, else 1. The
+ * magnitudes are exact integers, so the neighbor comparisons are integer
+ * ones. */
+static nir_def *
+sobel_nms_class(nir_builder *b, nir_deref_instr *sh_mag, nir_def *mrow,
+                nir_def *mcol, nir_def *m16, nir_def *d, nir_def *dx_lut,
+                nir_def *dy_lut, nir_def *lo_f, nir_def *hi_f)
+{
+   nir_def *mf = nir_u2f32(b, m16);
+   nir_def *sh = nir_iand_imm(b, nir_ishl_imm(b, d, 1), 31);
+   nir_def *two = nir_imm_int(b, 2);
+   nir_def *dx = nir_iadd_imm(b, nir_ubitfield_extract(b, dx_lut, sh, two), -1);
+   nir_def *dy = nir_iadd_imm(b, nir_ubitfield_extract(b, dy_lut, sh, two), -1);
+   nir_def *m1 = load_sh_u16(
+      b, sh_mag, sobel_nms_mag_idx(b, nir_iadd(b, mrow, dy),
+                                   nir_iadd(b, mcol, dx)));
+   nir_def *m2 = load_sh_u16(
+      b, sh_mag, sobel_nms_mag_idx(b, nir_isub(b, mrow, dy),
+                                   nir_isub(b, mcol, dx)));
+   nir_def *is_max = nir_iand(b, nir_ult(b, m1, m16), nir_ult(b, m2, m16));
+   nir_def *cls = nir_bcsel(b, nir_flt(b, hi_f, mf), nir_imm_intN_t(b, 2, 8),
+                            nir_imm_intN_t(b, 1, 8));
+   return nir_bcsel(b, nir_iand(b, is_max, nir_flt(b, lo_f, mf)), cls,
+                    nir_imm_intN_t(b, 0, 8));
+}
+
+static void
+store_global_u8(nir_builder *b, nir_def *base, nir_def *idx, nir_def *val,
+                unsigned align)
+{
+   nir_store_global(b, val, nir_iadd(b, base, nir_u2u64(b, idx)),
+                    .align_mul = align, .write_mask = BITFIELD_MASK(val->num_components),
+                    .access = ACCESS_NON_READABLE);
+}
+
+static void
+build_sobel_nms_kernel(nir_builder *b, const struct hk_2d_stencil_plan *plan,
+                       nir_address_format ssbo_addr_format)
+{
+   const unsigned WG = 256;
+   const unsigned SH_B = SOBEL_NMS_SRC_U4 * 4;
+
+   b->shader->info.workgroup_size[0] = WG;
+   b->shader->info.workgroup_size[1] = 1;
+   b->shader->info.workgroup_size[2] = 1;
+   b->shader->info.workgroup_size_variable = false;
+   b->shader->info.shared_size = 0;
+
+   nir_variable *sh_src_var = nir_variable_create(
+      b->shader, nir_var_mem_shared,
+      glsl_array_type(glsl_vector_type(GLSL_TYPE_UINT8, 4),
+                      SOBEL_NMS_SRC_ROWS * SOBEL_NMS_SRC_U4, 0),
+      "sh_sobel_nms_src");
+   nir_deref_instr *sh_src = nir_build_deref_var(b, sh_src_var);
+   nir_variable *sh_mag_var = nir_variable_create(
+      b->shader, nir_var_mem_shared,
+      glsl_array_type(glsl_uint16_t_type(),
+                      SOBEL_NMS_MAG_ROWS * SOBEL_NMS_MAG_W, 0),
+      "sh_sobel_nms_mag");
+   nir_deref_instr *sh_mag = nir_build_deref_var(b, sh_mag_var);
+
+   nir_deref_instr *src_u8 = build_ssbo_base_deref(
+      b, &plan->bufs[0], ssbo_addr_format, glsl_uint8_t_type(), 1);
+   nir_deref_instr *src_u8x4 = build_ssbo_base_deref(
+      b, &plan->bufs[0], ssbo_addr_format,
+      glsl_vector_type(GLSL_TYPE_UINT8, 4), 1);
+   nir_deref_instr *dir_u32 = build_ssbo_base_deref(
+      b, &plan->bufs[1], ssbo_addr_format, glsl_uint_type(), 4);
+   nir_deref_instr *dir_u32x4 = build_ssbo_base_deref(
+      b, &plan->bufs[1], ssbo_addr_format, glsl_uvec4_type(), 4);
+   nir_deref_instr *mag_u32 = build_ssbo_base_deref(
+      b, &plan->bufs[2], ssbo_addr_format, glsl_uint_type(), 4);
+   nir_deref_instr *mag_u32x4 = build_ssbo_base_deref(
+      b, &plan->bufs[2], ssbo_addr_format, glsl_uvec4_type(), 4);
+
+   nir_def *width = load_pc_i32(b, plan->width_pc_offset_B);
+   nir_def *height = load_pc_i32(b, plan->height_pc_offset_B);
+   nir_def *stride = load_pc_i32(b, plan->stride_pc_offset_B);
+   nir_def *dst = nir_pack_64_2x32_split(b, sobel_nms_pc(b, 0), sobel_nms_pc(b, 1));
+   nir_def *dx_lut = sobel_nms_pc(b, 2);
+   nir_def *dy_lut = sobel_nms_pc(b, 3);
+   nir_def *lo_f = sobel_nms_pc(b, 4);
+   nir_def *hi_f = sobel_nms_pc(b, 5);
+
+   nir_def *tid = nir_channel(b, nir_load_local_invocation_id(b), 0);
+   nir_def *wgid = nir_load_workgroup_id(b);
+   nir_def *tile_x = nir_imul_imm(b, nir_channel(b, wgid, 0), SOBEL_NMS_TILE_W);
+   nir_def *tile_y = nir_imul_imm(b, nir_channel(b, wgid, 1), SOBEL_NMS_TILE_H);
+   nir_def *x_start = nir_iadd_imm(b, tile_x, -2);
+   nir_def *y_start = nir_iadd_imm(b, tile_y, -2);
+
+   nir_def *lane32 = nir_iand_imm(b, tid, 31);
+   nir_def *warp8 = nir_ushr_imm(b, tid, 5);
+
+   /* Phase 0: the 12 x 132 source window into sh_src. Bytes outside the
+    * image are left unset; they only reach pixels the Sobel does not
+    * compute, whose values are not taken. */
+   nir_def *tile_fast = nir_iand(
+      b,
+      nir_iand(b, nir_ige_imm(b, x_start, 0),
+               nir_ige(b, width, nir_iadd_imm(b, x_start, SOBEL_NMS_SRC_W))),
+      nir_iand(b, nir_ige_imm(b, y_start, 0),
+               nir_ige(b, height, nir_iadd_imm(b, y_start, SOBEL_NMS_SRC_ROWS))));
+
+   nir_push_if(b, tile_fast);
+   {
+      nir_def *gx_main = nir_iadd(b, x_start, nir_ishl_imm(b, lane32, 2));
+      nir_def *gx_tail = nir_iadd_imm(b, x_start, 128);
+      for (unsigned pass = 0; pass < 2; pass++) {
+         nir_def *sy = pass == 0 ? warp8 : nir_iadd_imm(b, warp8, 8);
+         if (pass == 1)
+            nir_push_if(b, nir_ilt_imm(b, sy, SOBEL_NMS_SRC_ROWS));
+         nir_def *row_off = nir_imul(b, nir_iadd(b, y_start, sy), stride);
+         nir_def *sh_u4_row = nir_imul_imm(b, sy, SOBEL_NMS_SRC_U4);
+         store_sh_u8x4(b, sh_src, nir_iadd(b, sh_u4_row, lane32),
+                       load_ssbo_u8x4(b, src_u8x4, nir_iadd(b, row_off, gx_main)));
+         nir_push_if(b, nir_ieq_imm(b, lane32, 0));
+         {
+            store_sh_u8x4(
+               b, sh_src, nir_iadd_imm(b, sh_u4_row, 32),
+               load_ssbo_u8x4(b, src_u8x4, nir_iadd(b, row_off, gx_tail)));
+         }
+         nir_pop_if(b, NULL);
+         if (pass == 1)
+            nir_pop_if(b, NULL);
+      }
+   }
+   nir_push_else(b, NULL);
+   {
+      /* Edge tiles: single bytes, rows warp8 and warp8 + 8, columns lane32
+       * + 32j. Unrolled, so the kernel has no loop and the queue may fuse
+       * any number of pairs in a run (hk_pack_fusion_fits_run()). */
+      for (unsigned pass = 0; pass < 2; pass++) {
+         nir_def *sy = nir_iadd_imm(b, warp8, 8 * pass);
+         nir_def *gy = nir_iadd(b, y_start, sy);
+         nir_def *row_ok = nir_iand(b, nir_ige_imm(b, gy, 0), nir_ilt(b, gy, height));
+         if (pass == 1)
+            row_ok = nir_iand(b, row_ok, nir_ilt_imm(b, sy, SOBEL_NMS_SRC_ROWS));
+         nir_push_if(b, row_ok);
+         {
+            nir_def *row_off = nir_imul(b, gy, stride);
+            nir_def *sh_row = nir_imul_imm(b, sy, SH_B);
+            for (unsigned j = 0; j < DIV_ROUND_UP(SOBEL_NMS_SRC_W, 32); j++) {
+               nir_def *cx = nir_iadd_imm(b, lane32, 32 * j);
+               nir_def *gx = nir_iadd(b, x_start, cx);
+               nir_def *ok = nir_iand(b, nir_ige_imm(b, gx, 0), nir_ilt(b, gx, width));
+               if (32 * (j + 1) > SOBEL_NMS_SRC_W)
+                  ok = nir_iand(b, ok, nir_ilt_imm(b, cx, SOBEL_NMS_SRC_W));
+               nir_push_if(b, ok);
+               {
+                  store_sh_u8x4_byte(
+                     b, sh_src, nir_iadd(b, sh_row, cx),
+                     load_ssbo_u8(b, src_u8, nir_iadd(b, row_off, gx)));
+               }
+               nir_pop_if(b, NULL);
+            }
+         }
+         nir_pop_if(b, NULL);
+      }
+   }
+   nir_pop_if(b, NULL);
+
+   emit_shared_barrier(b);
+
+   /* Phase 1: each thread's 4 horizontal pixels, stored to dir and mag as
+    * build_sobel_3x3_u8_kernel() stores them, and their magnitudes (0 on the
+    * border) into the magnitude window. */
+   nir_def *bx = lane32;
+   nir_def *row = warp8;
+   nir_def *x0 = nir_iadd(b, tile_x, nir_ishl_imm(b, bx, 2));
+   nir_def *py = nir_iadd(b, tile_y, row);
+   nir_def *mrow = nir_iadd_imm(b, row, 1);
+   nir_def *mcol0 = nir_iadd_imm(b, nir_ishl_imm(b, bx, 2), 4);
+
+   /* Shared source bytes 4bx + 1 .. 4bx + 6 of rows row + 1 .. row + 3 hold
+    * the 3 x 6 taps of the 4 pixels. */
+   nir_def *p[3][6];
+   for (unsigned dy = 0; dy < 3; dy++) {
+      nir_def *sh_u4 = nir_iadd(
+         b, nir_imul_imm(b, nir_iadd_imm(b, row, 1 + dy), SOBEL_NMS_SRC_U4), bx);
+      nir_def *v0 = load_sh_u8x4(b, sh_src, sh_u4);
+      nir_def *v1 = load_sh_u8x4(b, sh_src, nir_iadd_imm(b, sh_u4, 1));
+      p[dy][0] = nir_u2u16(b, nir_channel(b, v0, 1));
+      p[dy][1] = nir_u2u16(b, nir_channel(b, v0, 2));
+      p[dy][2] = nir_u2u16(b, nir_channel(b, v0, 3));
+      p[dy][3] = nir_u2u16(b, nir_channel(b, v1, 0));
+      p[dy][4] = nir_u2u16(b, nir_channel(b, v1, 1));
+      p[dy][5] = nir_u2u16(b, nir_channel(b, v1, 2));
+   }
+
+   nir_def *c_lo = nir_imm_int(b, 0x3ed413cdu);
+   nir_def *c_hi = nir_imm_int(b, 0x401a827au);
+   nir_def *zero_mag = nir_imm_intN_t(b, 0, 16);
+   nir_def *dir_out[4], *mag_out[4], *int_px[4];
+   for (unsigned t = 0; t < 4; t++) {
+      nir_def *taps[3][3];
+      for (unsigned r = 0; r < 3; r++)
+         for (unsigned c = 0; c < 3; c++)
+            taps[r][c] = p[r][t + c];
+      nir_def *gx, *gy, *mag;
+      sobel_nms_grad(b, taps, &gx, &gy);
+      sobel_3x3_outputs(b, gx, gy, c_lo, c_hi, &mag_out[t], &dir_out[t], &mag);
+      int_px[t] = sobel_nms_interior(b, nir_iadd_imm(b, x0, t), py, width, height);
+      nir_def *m = nir_bcsel(b, int_px[t], mag, zero_mag);
+      store_sh_u16(b, sh_mag, sobel_nms_mag_idx(b, mrow, nir_iadd_imm(b, mcol0, t)), m);
+   }
+
+   nir_def *wm1 = nir_iadd_imm(b, width, -1);
+   nir_def *hm1 = nir_iadd_imm(b, height, -1);
+   nir_def *y_int = nir_iand(b, nir_ige_imm(b, py, 1), nir_ilt(b, py, hm1));
+   nir_def *out_row = nir_imul(b, py, width);
+
+   nir_push_if(b, nir_ilt(b, py, height));
+   {
+      nir_def *all_int = nir_iand(
+         b, y_int,
+         nir_iand(b, nir_ige_imm(b, x0, 1),
+                  nir_ilt(b, nir_iadd_imm(b, x0, 3), wm1)));
+      nir_push_if(b, all_int);
+      {
+         nir_def *off = nir_iadd(b, out_row, x0);
+         store_ssbo_u32x4(b, dir_u32x4, off, nir_vec(b, dir_out, 4));
+         store_ssbo_u32x4(b, mag_u32x4, off, nir_vec(b, mag_out, 4));
+      }
+      nir_push_else(b, NULL);
+      {
+         for (unsigned t = 0; t < 4; t++) {
+            nir_def *px = nir_iadd_imm(b, x0, t);
+            nir_push_if(b, nir_ilt(b, px, width));
+            {
+               nir_def *off = nir_iadd(b, out_row, px);
+               nir_push_if(b, int_px[t]);
+               {
+                  store_ssbo_u32(b, dir_u32, off, dir_out[t]);
+                  store_ssbo_u32(b, mag_u32, off, mag_out[t]);
+               }
+               nir_push_else(b, NULL);
+               {
+                  store_ssbo_u32(b, mag_u32, off, nir_imm_int(b, 0));
+               }
+               nir_pop_if(b, NULL);
+            }
+            nir_pop_if(b, NULL);
+         }
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+
+   /* The magnitude ring: rows tile_y - 1 and tile_y + 8 (130 cells each from
+    * x = tile_x - 1), then columns tile_x - 1 and tile_x + 128 (8 cells
+    * each). Thread k takes cell k, and threads below 20 also cell k + 256. */
+   for (unsigned pass = 0; pass < 2; pass++) {
+      nir_def *k = pass == 0 ? tid : nir_iadd_imm(b, tid, 256);
+      if (pass == 1)
+         nir_push_if(b, nir_ilt_imm(b, k, SOBEL_NMS_RING));
+      const unsigned rw = SOBEL_NMS_TILE_W + 2;
+      nir_def *is_top = nir_ilt_imm(b, k, rw);
+      nir_def *is_bot = nir_ilt_imm(b, k, 2 * rw);
+      nir_def *is_left = nir_ilt_imm(b, k, 2 * rw + SOBEL_NMS_TILE_H);
+      nir_def *k_side = nir_iadd_imm(b, k, -(int)(2 * rw));
+      nir_def *k_side_r = nir_iadd_imm(b, k_side, -(int)SOBEL_NMS_TILE_H);
+      /* (column, row) in the magnitude window. */
+      nir_def *mc = nir_bcsel(
+         b, is_top, nir_iadd_imm(b, k, 3),
+         nir_bcsel(b, is_bot, nir_iadd_imm(b, k, 3 - (int)rw),
+                   nir_bcsel(b, is_left, nir_imm_int(b, 3),
+                             nir_imm_int(b, SOBEL_NMS_TILE_W + 4))));
+      nir_def *mr = nir_bcsel(
+         b, is_top, nir_imm_int(b, 0),
+         nir_bcsel(b, is_bot, nir_imm_int(b, SOBEL_NMS_TILE_H + 1),
+                   nir_bcsel(b, is_left, nir_iadd_imm(b, k_side, 1),
+                             nir_iadd_imm(b, k_side_r, 1))));
+      nir_def *hx = nir_iadd(b, tile_x, nir_iadd_imm(b, mc, -4));
+      nir_def *hy = nir_iadd(b, tile_y, nir_iadd_imm(b, mr, -1));
+      /* The cell's source byte is at row mr + 1, column mc - 2. */
+      nir_def *taps[3][3];
+      for (unsigned r = 0; r < 3; r++) {
+         nir_def *byte_row = nir_imul_imm(b, nir_iadd_imm(b, mr, r), SH_B);
+         for (unsigned c = 0; c < 3; c++) {
+            taps[r][c] = nir_u2u16(
+               b, load_sh_u8x4_byte(b, sh_src,
+                                    nir_iadd(b, byte_row,
+                                             nir_iadd_imm(b, mc, (int)c - 3))));
+         }
+      }
+      nir_def *gx, *gy;
+      sobel_nms_grad(b, taps, &gx, &gy);
+      nir_def *m = nir_bcsel(b, sobel_nms_interior(b, hx, hy, width, height),
+                            nir_iadd(b, nir_iabs(b, gx), nir_iabs(b, gy)),
+                            zero_mag);
+      store_sh_u16(b, sh_mag, sobel_nms_mag_idx(b, mr, mc), m);
+      if (pass == 1)
+         nir_pop_if(b, NULL);
+   }
+
+   emit_shared_barrier(b);
+
+   /* Phase 2: NMS of the 4 pixels from the magnitude window, as
+    * build_canny_nms_kernel() writes it: 0 on the border. */
+   nir_push_if(b, nir_ilt(b, py, height));
+   {
+      nir_def *m16[4], *live[4];
+      nir_def *any = nir_imm_false(b);
+      for (unsigned t = 0; t < 4; t++) {
+         m16[t] = load_sh_u16(b, sh_mag,
+                              sobel_nms_mag_idx(b, mrow, nir_iadd_imm(b, mcol0, t)));
+         live[t] = nir_iand(b, int_px[t],
+                            nir_flt(b, lo_f, nir_u2f32(b, m16[t])));
+         any = nir_ior(b, any, live[t]);
+      }
+
+      nir_def *z8 = nir_imm_intN_t(b, 0, 8);
+      nir_variable *ov = nir_local_variable_create(
+         b->impl, glsl_vector_type(GLSL_TYPE_UINT8, 4), "nms_ov");
+      nir_store_var(b, ov, nir_vec4(b, z8, z8, z8, z8), 0xf);
+      nir_push_if(b, any);
+      {
+         nir_def *o[4];
+         for (unsigned t = 0; t < 4; t++) {
+            nir_def *cls = sobel_nms_class(
+               b, sh_mag, mrow, nir_iadd_imm(b, mcol0, t), m16[t], dir_out[t],
+               dx_lut, dy_lut, lo_f, hi_f);
+            o[t] = nir_bcsel(b, int_px[t], cls, z8);
+         }
+         nir_store_var(b, ov, nir_vec(b, o, 4), 0xf);
+      }
+      nir_pop_if(b, NULL);
+
+      /* One word where the 4 bytes are a whole aligned word: every quad
+       * when width is a multiple of 4, else rows alternate. */
+      nir_def *out = nir_load_var(b, ov);
+      nir_def *qoff = nir_iadd(b, out_row, x0);
+      nir_def *aligned = nir_ieq_imm(
+         b, nir_iand_imm(b, nir_iadd(b, nir_unpack_64_2x32_split_x(b, dst), qoff), 3), 0);
+      nir_push_if(b, nir_iand(b, aligned, nir_ilt(b, nir_iadd_imm(b, x0, 3), width)));
+      {
+         store_global_u8(b, dst, qoff, out, 4);
+      }
+      nir_push_else(b, NULL);
+      {
+         for (unsigned t = 0; t < 4; t++) {
+            nir_def *px = nir_iadd_imm(b, x0, t);
+            nir_push_if(b, nir_ilt(b, px, width));
+            {
+               store_global_u8(b, dst, nir_iadd(b, out_row, px),
+                               nir_channel(b, out, t), 1);
+            }
+            nir_pop_if(b, NULL);
+         }
+      }
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
+nir_shader *
+hk_nir_build_sobel_nms(void *mem_ctx, const nir_shader *orig_nir,
+                       const struct hk_2d_stencil_plan *plan,
+                       nir_address_format ssbo_addr_format)
+{
+   if (!hk_2d_stencil_sobel_nms_supported(plan))
+      return NULL;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, orig_nir->options, "%s_sobel_nms",
+      orig_nir->info.name ? orig_nir->info.name : "stencil_2d");
+   b.shader->info.internal = false;
+   ralloc_steal(mem_ctx, b.shader);
+   b.shader->info.zero_initialize_shared_memory =
+      orig_nir->info.zero_initialize_shared_memory;
+
+   build_sobel_nms_kernel(&b, plan, ssbo_addr_format);
+
+   nir_lower_vars_to_ssa(b.shader);
+   nir_validate_shader(b.shader, "after hk_nir_build_sobel_nms");
    return b.shader;
 }
 

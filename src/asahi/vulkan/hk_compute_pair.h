@@ -271,12 +271,24 @@ struct hk_compute_pair_im2col {
    uint32_t ph;
 };
 
+/* A tiled Sobel (HK_COMPUTE_PAIR_SOBEL3X3: bindings src, dir, mag) or Canny
+ * NMS (HK_COMPUTE_PAIR_CANNY_NMS: bindings dir, mag, dst) dispatch. */
+struct hk_compute_pair_canny {
+   int32_t width, height, stride;
+   /* NMS: the plan's dx_lut, dy_lut, low and high threshold bits. */
+   uint32_t params[4];
+   /* Sobel: its fused Sobel + NMS shader (hk_2d_stencil_variant), owned by
+    * the pipeline, which outlives every submission of this record. */
+   struct hk_shader *fused;
+};
+
 struct hk_compute_pair_dispatch {
    struct hk_compute_pair_info info;
    union {
       struct hk_compute_pair_copy4 copy4;
       struct hk_compute_pair_pad4 pad4;
       struct hk_compute_pair_im2col im2col;
+      struct hk_compute_pair_canny canny;
    } extra;
    struct hk_storage_backing bindings[4];
    uint32_t groups[3];       /* Original API workgroup counts (for footprint) */

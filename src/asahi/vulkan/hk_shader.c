@@ -7328,6 +7328,8 @@ hk_api_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
    }
    if (obj->stencil_2d) {
       hk_shader_destroy(dev, &obj->stencil_2d->shader, owns_payload);
+      if (obj->stencil_2d->has_sobel_nms)
+         hk_shader_destroy(dev, &obj->stencil_2d->sobel_nms, owns_payload);
       free(obj->stencil_2d);
    }
    if (obj->compute_opt) {
@@ -9023,6 +9025,9 @@ struct hk_byte_stencil_candidate {
 struct hk_2d_stencil_candidate {
    struct hk_2d_stencil_plan plan;
    nir_shader *tiled_nir;
+   /* hk_nir_build_sobel_nms() of a Sobel plan, or NULL. A ralloc child of
+    * tiled_nir, so it goes with it. */
+   nir_shader *sobel_nms_nir;
 };
 
 static bool
@@ -9065,6 +9070,9 @@ hk_maybe_build_2d_stencil(struct hk_device *dev, const nir_shader *nir,
       info->robustness->null_storage_buffer_descriptor,
       hk_ssbo_addr_has_map(dev->dev.chip));
    out->tiled_nir = hk_nir_build_tiled_2d_stencil(NULL, nir, &out->plan,
+                                                  ssbo_addr_format);
+   if (out->tiled_nir && hk_2d_stencil_sobel_nms_supported(&out->plan))
+      out->sobel_nms_nir = hk_nir_build_sobel_nms(out->tiled_nir, nir, &out->plan,
                                                   ssbo_addr_format);
    return out->tiled_nir != NULL;
 }
@@ -10224,7 +10232,11 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
       }
       if (s2d_cand && s2d_cand->tiled_nir && sw_stage == MESA_SHADER_COMPUTE) {
          nir_shader *tiled_nir = s2d_cand->tiled_nir;
+         nir_shader *sobel_nms_nir = s2d_cand->sobel_nms_nir;
          s2d_cand->tiled_nir = NULL;
+         s2d_cand->sobel_nms_nir = NULL;
+         if (sobel_nms_nir)
+            ralloc_steal(NULL, sobel_nms_nir);
          struct hk_2d_stencil_variant *s2d = calloc(1, sizeof(*s2d));
          if (s2d) {
             s2d->plan = s2d_cand->plan;
@@ -10237,6 +10249,23 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
                info->set_layout_count, static_set_mask);
             if (s2d_res == VK_SUCCESS) {
                obj->stencil_2d = s2d;
+               /* Optional: without it the queue just never fuses this
+                * Sobel. */
+               if (sobel_nms_nir) {
+                  hk_lower_nir(dev, sobel_nms_nir, info->robustness, false,
+                               info->next_stage_mask, info->set_layout_count,
+                               info->set_layouts, features);
+                  VkResult fused_res = hk_compile_nir(
+                     dev, pAllocator, sobel_nms_nir, info->flags,
+                     info->robustness, key, features, &s2d->sobel_nms,
+                     sw_stage, true, NULL, info->set_layout_count,
+                     static_set_mask);
+                  sobel_nms_nir = NULL;
+                  if (fused_res == VK_SUCCESS)
+                     s2d->has_sobel_nms = true;
+                  else
+                     hk_shader_destroy(dev, &s2d->sobel_nms, true);
+               }
             } else {
                hk_shader_destroy(dev, &s2d->shader, true);
                free(s2d);
@@ -10244,6 +10273,7 @@ hk_compile_shader_impl(struct hk_device *dev, struct vk_shader_compile_info *inf
          } else {
             ralloc_free(tiled_nir);
          }
+         ralloc_free(sobel_nms_nir);
       }
       if (co_cand && co_cand->opt_nir && sw_stage == MESA_SHADER_COMPUTE) {
          nir_shader *opt_nir = co_cand->opt_nir;
@@ -12871,6 +12901,21 @@ hk_deserialize_api_shader_impl(struct vk_device *vk_dev,
          return s2d_res;
       }
       obj->stencil_2d = s2d;
+      const uint8_t has_sobel_nms = blob_read_uint8(blob);
+      if (blob->overrun || has_sobel_nms > 1) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+      }
+      if (has_sobel_nms) {
+         s2d_res = hk_deserialize_shader(dev, blob, &s2d->sobel_nms, false,
+                                         cache_candidate);
+         if (s2d_res != VK_SUCCESS) {
+            hk_shader_destroy(dev, &s2d->sobel_nms, true);
+            hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+            return s2d_res;
+         }
+         s2d->has_sobel_nms = true;
+      }
    }
 
    if (has_compute_opt) {
@@ -13028,6 +13073,13 @@ hk_shader_binary_payload_cacheable(struct hk_api_shader *obj)
    if (obj->stencil_2d && obj->stencil_2d->shader.compiled) {
       const struct hk_shader *s2d = &obj->stencil_2d->shader;
       if (s2d->bo || s2d->only_linked || !s2d->linked.ht)
+         return false;
+   }
+
+   if (obj->stencil_2d && obj->stencil_2d->has_sobel_nms &&
+       obj->stencil_2d->sobel_nms.compiled) {
+      const struct hk_shader *fused = &obj->stencil_2d->sobel_nms;
+      if (fused->bo || fused->only_linked || !fused->linked.ht)
          return false;
    }
 
@@ -13227,18 +13279,22 @@ hk_shader_binary_cache_clone(struct hk_device *dev,
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
       s2d->plan = src_obj->stencil_2d->plan;
-      struct hk_shader *dst = &s2d->shader;
-      const struct hk_shader *src = &src_obj->stencil_2d->shader;
-      *dst = *src;
-      memset(&dst->linked, 0, sizeof(dst->linked));
-      dst->only_linked = NULL;
-      dst->uvs_linked = NULL;
-      dst->bo = NULL;
-      dst->g17p_mono_nir = NULL;
-      dst->g17p_mono_nir_size = 0;
-      dst->g17p_mono_postopt_nir = NULL;
-      simple_mtx_init(&dst->linked.lock, mtx_plain);
-      dst->linked.lazy_ht = src->compiled;
+      s2d->has_sobel_nms = src_obj->stencil_2d->has_sobel_nms;
+      for (unsigned v = 0; v < (s2d->has_sobel_nms ? 2 : 1); ++v) {
+         struct hk_shader *dst = v ? &s2d->sobel_nms : &s2d->shader;
+         const struct hk_shader *src = v ? &src_obj->stencil_2d->sobel_nms
+                                         : &src_obj->stencil_2d->shader;
+         *dst = *src;
+         memset(&dst->linked, 0, sizeof(dst->linked));
+         dst->only_linked = NULL;
+         dst->uvs_linked = NULL;
+         dst->bo = NULL;
+         dst->g17p_mono_nir = NULL;
+         dst->g17p_mono_nir_size = 0;
+         dst->g17p_mono_postopt_nir = NULL;
+         simple_mtx_init(&dst->linked.lock, mtx_plain);
+         dst->linked.lazy_ht = src->compiled;
+      }
       obj->stencil_2d = s2d;
    }
 
@@ -13616,6 +13672,9 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
       blob_write_bytes(blob, &obj->stencil_2d->plan,
                        sizeof(obj->stencil_2d->plan));
       hk_shader_serialize(vk_dev, &obj->stencil_2d->shader, blob);
+      blob_write_uint8(blob, obj->stencil_2d->has_sobel_nms);
+      if (obj->stencil_2d->has_sobel_nms)
+         hk_shader_serialize(vk_dev, &obj->stencil_2d->sobel_nms, blob);
    }
 
    if (obj->compute_opt) {
