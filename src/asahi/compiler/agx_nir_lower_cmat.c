@@ -219,12 +219,24 @@ shuffle_xor_values(nir_builder *b, nir_def **in, nir_def **out, unsigned count,
    for (unsigned i = 0; i < count; ++i) {
       if (in[i]->bit_size == 32) {
          out[i] = nir_shuffle_xor(b, in[i], m);
-      } else if (i + 1 < count) {
-         nir_def *pair = nir_shuffle_xor(b, nir_pack_32_2x16_split(b, in[i], in[i + 1]), m);
-         out[i] = nir_unpack_32_2x16_split_x(b, pair);
-         out[++i] = nir_unpack_32_2x16_split_y(b, pair);
+      } else if (in[i]->bit_size == 16) {
+         if (i + 1 < count) {
+            nir_def *pair = nir_shuffle_xor(b, nir_pack_32_2x16_split(b, in[i], in[i + 1]), m);
+            out[i] = nir_unpack_32_2x16_split_x(b, pair);
+            out[++i] = nir_unpack_32_2x16_split_y(b, pair);
+         } else {
+            out[i] = nir_u2u16(b, nir_shuffle_xor(b, nir_u2u32(b, in[i]), m));
+         }
       } else {
-         out[i] = nir_u2u16(b, nir_shuffle_xor(b, nir_u2u32(b, in[i]), m));
+         assert(in[i]->bit_size == 8);
+         unsigned n = MIN2(4u, count - i);
+         nir_def *packed = nir_u2u32(b, in[i]);
+         for (unsigned k = 1; k < n; ++k)
+            packed = nir_ior(b, packed, nir_ishl_imm(b, nir_u2u32(b, in[i + k]), 8 * k));
+         nir_def *shuf = nir_shuffle_xor(b, packed, m);
+         for (unsigned k = 0; k < n; ++k)
+            out[i + k] = nir_u2u8(b, k ? nir_ushr_imm(b, shuf, 8 * k) : shuf);
+         i += n - 1;
       }
    }
 }
@@ -350,13 +362,28 @@ convert_matrix_value(nir_builder *b, nir_def *value,
    }
    if (dst == GLSL_TYPE_BFLOAT16) {
       if (src != GLSL_TYPE_FLOAT)
-         value = nir_f2f32(b, value);
+         value = convert_matrix_value(b, value, src, GLSL_TYPE_FLOAT);
       return nir_f2bf(b, value);
    }
    nir_op op = nir_type_conversion_op(nir_get_nir_type_for_glsl_base_type(src),
                                       nir_get_nir_type_for_glsl_base_type(dst),
                                       nir_rounding_mode_undef);
    return nir_build_alu1(b, op, value);
+}
+
+static nir_def *
+pack_8x8_to_2x32(nir_builder *b, nir_def *v)
+{
+   assert(v->bit_size == 8 && v->num_components == 8);
+   nir_def *w[2];
+   for (unsigned i = 0; i < 2; ++i) {
+      nir_def *b0 = nir_u2u32(b, nir_channel(b, v, 4 * i + 0));
+      nir_def *b1 = nir_ishl_imm(b, nir_u2u32(b, nir_channel(b, v, 4 * i + 1)), 8);
+      nir_def *b2 = nir_ishl_imm(b, nir_u2u32(b, nir_channel(b, v, 4 * i + 2)), 16);
+      nir_def *b3 = nir_ishl_imm(b, nir_u2u32(b, nir_channel(b, v, 4 * i + 3)), 24);
+      w[i] = nir_ior(b, nir_ior(b, b0, b1), nir_ior(b, b2, b3));
+   }
+   return nir_vec2(b, w[0], w[1]);
 }
 
 static bool
@@ -446,12 +473,34 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
       return true;
    }
    case nir_intrinsic_cmat_muladd: {
-      assert(!nir_intrinsic_saturate(intr));
-      enum glsl_base_type input = matrix_desc(intr->src[1]).element_type;
-      enum glsl_base_type input_b = matrix_desc(intr->src[2]).element_type;
-      enum glsl_base_type accum = matrix_desc(intr->src[3]).element_type;
-      enum glsl_base_type result = matrix_desc(intr->src[0]).element_type;
+      const nir_cmat_signed signed_mask = nir_intrinsic_cmat_signed_mask(intr);
+      enum glsl_base_type input = glsl_apply_signedness_to_base_type(
+         matrix_desc(intr->src[1]).element_type, signed_mask & NIR_CMAT_A_SIGNED);
+      enum glsl_base_type input_b = glsl_apply_signedness_to_base_type(
+         matrix_desc(intr->src[2]).element_type, signed_mask & NIR_CMAT_B_SIGNED);
+      enum glsl_base_type accum = glsl_apply_signedness_to_base_type(
+         matrix_desc(intr->src[3]).element_type, signed_mask & NIR_CMAT_C_SIGNED);
+      enum glsl_base_type result = glsl_apply_signedness_to_base_type(
+         matrix_desc(intr->src[0]).element_type, signed_mask & NIR_CMAT_RESULT_SIGNED);
       const unsigned rows = matrix_desc(intr->src[1]).rows;
+      if (input == GLSL_TYPE_INT8 || input == GLSL_TYPE_UINT8) {
+         assert(rows == 16 &&
+                (input_b == GLSL_TYPE_INT8 || input_b == GLSL_TYPE_UINT8) &&
+                (accum == GLSL_TYPE_INT || accum == GLSL_TYPE_UINT) &&
+                result == accum &&
+                (!nir_intrinsic_saturate(intr) || accum == GLSL_TYPE_INT));
+         nir_def *a = pack_8x8_to_2x32(b, load_matrix(b, intr->src[1]));
+         nir_def *bb = pack_8x8_to_2x32(b, load_matrix(b, intr->src[2]));
+         nir_def *c = load_matrix(b, intr->src[3]);
+         nir_def *value = nir_cmat_muladd_agx(
+            b, a, bb, c,
+            .src_type = input == GLSL_TYPE_INT8 ? nir_type_int8 : nir_type_uint8,
+            .src_type2 = input_b == GLSL_TYPE_INT8 ? nir_type_int8 : nir_type_uint8,
+            .saturate = nir_intrinsic_saturate(intr));
+         store_matrix(b, intr->src[0], value);
+         break;
+      }
+      assert(!nir_intrinsic_saturate(intr));
       /* 8x8 matmad has a single input-type field, so mixed A/B types
        * cannot be encoded. f16 and bf16 both widen to f32 exactly;
        * promote both operands to f32 and use that form. 16x16 gemm
@@ -545,14 +594,19 @@ lower_matrix_instr(nir_builder *b, nir_instr *instr, struct hash_table *types,
       /* Convert where the elements are narrower */
       bool convert_first = glsl_base_type_bit_size(dst.element_type) <
                            glsl_base_type_bit_size(src.element_type);
+      const nir_cmat_signed signed_mask = nir_intrinsic_cmat_signed_mask(intr);
+      enum glsl_base_type src_type = glsl_apply_signedness_to_base_type(
+         src.element_type, signed_mask & NIR_CMAT_A_SIGNED);
+      enum glsl_base_type dst_type = glsl_apply_signedness_to_base_type(
+         dst.element_type, signed_mask & NIR_CMAT_RESULT_SIGNED);
       b->fp_math_ctrl = nir_intrinsic_fp_math_ctrl(intr);
       nir_def *value = load_matrix(b, intr->src[1]);
       if (convert_first)
-         value = convert_matrix_value(b, value, src.element_type, dst.element_type);
+         value = convert_matrix_value(b, value, src_type, dst_type);
       if (move)
          value = permute_matrix(b, value, from, to);
       if (!convert_first)
-         value = convert_matrix_value(b, value, src.element_type, dst.element_type);
+         value = convert_matrix_value(b, value, src_type, dst_type);
       store_matrix(b, intr->src[0], value);
       b->fp_math_ctrl = nir_fp_fast_math;
       break;

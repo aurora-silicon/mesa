@@ -14995,11 +14995,15 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                 agx_channels(I->dest[0]) != 8 ||
                 I->dest[0].value != I->src[2].value)
                AGX3_REFUSE(I);
+            const bool is_int8 = agx3_matrix_input_is_int8(I->matrix_type & 15);
             for (unsigned s = 0; s < 3; ++s) {
                const agx_index src = I->src[s];
+               const unsigned exp_ch = (s < 2 && is_int8) ? 2 : 8;
+               const enum agx_size exp_sz =
+                  (s == 2 || is_int8) ? AGX_SIZE_32 : AGX_SIZE_16;
                if (!agx3_src_is_register(src) || src.memory || src.abs ||
-                   src.neg || agx_channels(src) != 8 ||
-                   src.size != (s == 2 ? AGX_SIZE_32 : AGX_SIZE_16))
+                   src.neg || agx_channels(src) != exp_ch ||
+                   src.size != exp_sz)
                   AGX3_REFUSE(I);
             }
             struct agx3_matrix_gemm16_desc d = {
@@ -15011,6 +15015,7 @@ agx3_pack_binary(agx_context *ctx, struct util_dynarray *emission)
                .wait_mask = wait,
                .preserve_a = !I->src[0].discard,
                .preserve_b = !I->src[1].discard,
+               .saturate = (I->matrix_type & AGX3_MATRIX_SATURATE) != 0,
             };
             uint8_t bytes[10], length;
             if (!agx3_matrix_encode_gemm16(enc, &d, bytes, &length) ||

@@ -19,6 +19,7 @@
 #include "asahi/lib/agx_chip_caps.h"
 #include "agx3_compute_program.h"
 #include "agx3_copy_core.h"
+#include "agx3_matrix_core.h"
 #include "agx_builder.h"
 #include "agx_compile.h"
 #include "agx_compiler.h"
@@ -4516,6 +4517,11 @@ agx_ra(agx_context *ctx)
             continue;
 
          agx_foreach_ssa_src(I, s) {
+            const unsigned src_comps =
+               (I->op == AGX_OPCODE_MATMAD16_AGX3 && s < 2 &&
+                agx3_matrix_input_is_int8(I->matrix_type & 15))
+                  ? 2
+                  : mat_comps;
             /* The accumulator is a copy (agx_lower_agx3_matrix_sources) */
             agx_instr *def = defs[I->src[s].value];
             if (def && def->op == AGX_OPCODE_MOV &&
@@ -4523,12 +4529,12 @@ agx_ra(agx_context *ctx)
                def = defs[def->src[0].value];
 
             if (!def || def->op != AGX_OPCODE_COLLECT ||
-                def->nr_srcs != mat_comps)
+                def->nr_srcs != src_comps)
                continue;
 
             struct matrix_group group = {0};
             bool valid = true;
-            for (unsigned k = 0; k < mat_comps && valid; ++k) {
+            for (unsigned k = 0; k < src_comps && valid; ++k) {
                const agx_index src = def->src[k];
                valid = src.type == AGX_INDEX_NORMAL && !src.memory &&
                        agx_channels(src) == 1 &&
@@ -4546,7 +4552,7 @@ agx_ra(agx_context *ctx)
                continue;
 
             group.size = agx_size_align_16(def->src[0].size);
-            group.count = mat_comps;
+            group.count = src_comps;
             util_dynarray_append(&matrix_groups, group);
             const unsigned id = util_dynarray_num_elements(
                &matrix_groups, struct matrix_group);
@@ -4554,7 +4560,7 @@ agx_ra(agx_context *ctx)
                (void)util_dynarray_pop(&matrix_groups, struct matrix_group);
                continue;
             }
-            for (unsigned k = 0; k < mat_comps; ++k)
+            for (unsigned k = 0; k < src_comps; ++k)
                web_matrix_group[group.root[k]] = id;
          }
       }
